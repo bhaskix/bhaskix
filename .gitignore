@@ -1,0 +1,40 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.orig
+*.rs.bk
+
+# Build output
+/build/
+*.iso
+*.img
+*.elf
+*.bin
+*.o
+*.a
+
+# Bootloader (fetched by tools/setup-dev.sh, not vendored)
+/boot/limine/limine/
+/boot/limine/*.sys
+/boot/limine/*.bin
+/boot/limine/*.EFI
+
+# QEMU / debugging
+*.log
+serial.out
+qemu.pid
+*.core
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local overrides — never commit machine-specific config
+/config.local.mk
+/.env
+
+# Local tooling context is excluded via .git/info/exclude, not here —
+# .gitignore is a published file and must stay free of tooling references.

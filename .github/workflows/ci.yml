@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Bhaskix continuous integration.
+#
+# Ordered cheapest-first: a formatting mistake fails in seconds rather than
+# after a QEMU boot. Every gate here is one a human reviewer should not have to
+# be (docs/coding-style.md §10).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings everywhere, not just where clippy is invoked explicitly.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # --- fast feedback ------------------------------------------------------
+
+  format:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show active-toolchain   # honours rust-toolchain.toml
+      - run: cargo fmt --all --check
+
+  gates:
+    name: project invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootloader containment, vendor strings, SPDX headers
+        run: tools/check-containment.sh
+      - name: Unsafe budgets and SAFETY comments
+        run: tools/check-unsafe-budget.py
+      - name: Dependency direction and external crates
+        run: tools/check-deps.py
+
+  # --- correctness --------------------------------------------------------
+
+  lint:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - name: Clippy (freestanding target)
+        run: cargo clippy --release --target x86_64-unknown-none --lib --bins -- -D warnings
+      - name: Clippy (host, including tests)
+        run: |
+          cargo clippy --target x86_64-unknown-linux-gnu --all-targets \
+            -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -- -D warnings
+
+  test-host:
+    name: host unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: cargo test --target x86_64-unknown-linux-gnu -p bhaskix-boot -p bhaskix-kernel
+
+  # --- does it actually boot ---------------------------------------------
+
+  boot:
+    name: boot (${{ matrix.firmware }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        firmware: [bios, uefi]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+
+      - name: Install QEMU, xorriso, OVMF
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 xorriso mtools ovmf
+
+      - name: Fetch Limine
+        run: |
+          git clone --branch v8.x-binary --depth 1 \
+            https://github.com/limine-bootloader/limine.git boot/limine/limine
+          make -C boot/limine/limine
+
+      - name: Build bootable image
+        run: make iso
+
+      - name: Boot and assert on serial output
+        run: tests/qemu/boot-test.sh ${{ matrix.firmware }}
+
+      - name: Upload kernel image on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bhaskix-${{ matrix.firmware }}-failed
+          path: |
+            build/bhaskix.iso
+            target/x86_64-unknown-none/release/bhaskix
+          retention-days: 7

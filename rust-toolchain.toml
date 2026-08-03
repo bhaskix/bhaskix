@@ -1,0 +1,14 @@
+# Pinned toolchain for Bhaskix.
+#
+# Do not override this locally. A kernel that builds differently on different
+# machines produces bugs that only one person can reproduce.
+#
+# Policy (docs/coding-style.md §1): stable Rust wherever possible. Any nightly
+# feature we adopt must be listed in docs/nightly-features.md with a
+# justification and a stabilisation-tracking issue.
+
+[toolchain]
+channel = "1.90.0"
+components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]
+targets = ["x86_64-unknown-none"]
+profile = "minimal"

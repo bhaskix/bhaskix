@@ -1,0 +1,21 @@
+[package]
+name = "bhaskix-boot"
+description = "The Bhaskix boot handoff contract. Owned by the project; independent of any bootloader."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_boot"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Pure data types. There is no reason for this crate to ever contain `unsafe`,
+# and the crate root forbids it outright.
+unsafe_budget = 0

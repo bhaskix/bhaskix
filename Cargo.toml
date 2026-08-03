@@ -1,0 +1,69 @@
+# Bhaskix workspace.
+#
+# Crate members are added as their milestones land (docs/roadmap.md).
+# Dependency direction is enforced in CI:
+#
+#     arch  -> (nothing)
+#     mm    -> arch
+#     sched -> arch, mm
+#     kernel-> arch, mm, sched
+#     fs, net, drivers -> kernel   (via the service interface only)
+#
+# Cycles are a build failure, not a review comment.
+
+[workspace]
+resolver = "3"
+members = [
+    # M1 — docs/roadmap.md
+    "boot/handoff",
+    "boot/shim",
+    "arch/x86_64",
+    "kernel",
+
+    # M3
+    # "mm",
+
+    # M4
+    # "sched",
+
+    # M6
+    # "fs",
+    # "drivers",
+
+    # Phase 2
+    # "net",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+# Open decision A1, resolved 2026-08-02 — see docs/rfc/0001-license-apache-2.0.md.
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+# Kernel builds must not unwind: there is no unwinder, and a panic in the
+# nucleus is a denial of service (docs/coding-style.md §4).
+[profile.dev]
+panic = "abort"
+overflow-checks = true
+debug = true
+
+[profile.release]
+panic = "abort"
+overflow-checks = true   # kept ON in release: an integer overflow in a page
+                         # table index is worse than the branch it costs.
+lto = "fat"
+codegen-units = 1
+debug = true             # symbols for kernel debugging; stripped from images

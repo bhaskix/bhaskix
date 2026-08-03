@@ -1,0 +1,28 @@
+Bhaskix
+Copyright 2026 Tarun Kumar Kushwaha and the Bhaskix contributors
+
+This product includes software developed by the Bhaskix project
+(https://github.com/bhaskix/bhaskix).
+
+Licensed under the Apache License, Version 2.0. See LICENSE for the full text.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+Bhaskix does not vendor third-party source code into this repository. The
+following components are fetched at build time by tools/setup-dev.sh and are
+distributed under their own licenses. They are build and boot dependencies; no
+part of them is linked into the Bhaskix kernel.
+
+  Limine bootloader
+    https://github.com/limine-bootloader/limine
+    Licensed under the BSD 2-Clause License.
+    Used only as a boot protocol implementation. The Bhaskix kernel consumes
+    bhaskix_boot::Handoff, a project-owned structure; see docs/architecture.md §1.
+    Limine is replaceable and is scheduled for replacement by bhaskixboot.efi in
+    Phase 2 (docs/roadmap.md).
+
+Contributors retain copyright in their contributions. Bhaskix does not require
+copyright assignment; contributions are made under the Developer Certificate of
+Origin. See CONTRIBUTING.md.

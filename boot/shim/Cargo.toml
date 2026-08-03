@@ -1,0 +1,30 @@
+[package]
+name = "bhaskix-boot-shim"
+description = "Translates the Limine boot protocol into bhaskix_boot::Handoff. The only crate that knows Limine exists."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+# The kernel binary. `boot/shim` is the top of the dependency graph, not the
+# kernel: the shim owns the ELF entry point and the panic handler, and calls
+# into the nucleus. That is what keeps `kernel/` free of any mention of a
+# bootloader (docs/architecture.md §1).
+[[bin]]
+name = "bhaskix"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-boot = { path = "../handoff" }
+bhaskix-kernel = { path = "../../kernel" }
+bhaskix-arch-x86-64 = { path = "../../arch/x86_64" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Reading bootloader-owned memory through raw pointers is inherently unsafe and
+# is the entire job of this crate. Confined to `limine.rs`.
+unsafe_budget = 60

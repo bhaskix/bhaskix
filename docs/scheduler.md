@@ -1,0 +1,233 @@
+# Bhaskix — Scheduler
+
+*Status: draft for review. Prerequisite reading: [architecture.md](architecture.md).*
+
+The scheduler decides which thread runs on which CPU, and for how long. It is designed for a machine
+that is simultaneously running latency-sensitive services, batch compute, containers, and virtual
+machine vCPUs — because in our design ([architecture.md](architecture.md) §4) those are all just
+threads in domains.
+
+---
+
+## 1. Requirements, in priority order
+
+1. **Correctness under SMP.** No lost wakeups, no runnable thread stranded off a runqueue, no
+   priority inversion that can deadlock the system.
+2. **Bounded latency for the RT class.** A real-time thread's wakeup-to-run latency must be bounded
+   and measurable, or the hypervisor and edge editions are not viable.
+3. **Fair sharing between domains**, not just between threads. A domain with 100 threads must not
+   out-schedule a domain with 1.
+4. **Predictable, explainable decisions.** Every scheduling decision must be attributable — this is
+   what makes [ai-native.md](ai-native.md) possible and what makes debugging possible.
+5. **Throughput.** Last, deliberately. Throughput work follows measurement.
+
+---
+
+## 2. Structure
+
+### Per-CPU runqueues with work stealing
+
+```rust
+pub struct Cpu {
+    id: CpuId,
+    rt:       RtRunqueue,        // fixed priority, 0..=99
+    fair:     FairRunqueue,      // virtual-deadline tree
+    batch:    BatchRunqueue,     // FIFO, only runs when nothing else can
+    idle:     Thread,
+    current:  *mut Thread,
+    lock:     SpinLock<()>,      // rank: SCHED_RQ
+    load:     AtomicU64,         // published for the balancer, read without the lock
+}
+```
+
+A single global runqueue is simpler and does not scale past about four CPUs. Per-CPU queues with
+stealing is the design that works; we start there rather than migrating later.
+
+### Strict class priority
+
+```
+RT        ── runs if any RT thread is runnable. Always.
+  ↓
+Fair      ── the default class. Virtual-deadline ordering.
+  ↓
+Batch     ── runs only when Fair is empty.
+  ↓
+Idle      ── halts the CPU (MWAIT / HLT), enters the tickless path.
+```
+
+Strict priority between classes, not weighted. An RT thread starving a Fair thread is *the intended
+behaviour*; the mitigation is admission control on RT (a bounded RT utilisation budget per CPU),
+not softening the priority rule.
+
+---
+
+## 3. The Fair class
+
+Virtual-deadline scheduling (EEVDF-family), not round-robin and not plain vruntime.
+
+Each runnable thread has:
+
+- `vruntime` — service received, scaled by weight (from nice / domain share).
+- `deadline` — `vruntime + slice/weight`. The thread with the earliest deadline runs.
+- `lag` — how much service the thread is owed relative to its fair share.
+
+Why this rather than CFS-style pure vruntime: a virtual deadline lets a thread declare that it needs
+*small* slices *soon* (interactive) versus *large* slices *eventually* (compute), without the
+scheduler having to guess from behaviour. `latency_nice` is a first-class per-thread property rather
+than a heuristic inferred from sleep patterns. Inferred interactivity heuristics are exactly the kind
+of thing that works on the developer's machine and fails in production.
+
+Ordering structure: an augmented red-black tree keyed by deadline, with min-lag tracking. `O(log n)`
+pick, `O(log n)` insert.
+
+### Domain-level fairness
+
+Threads do not compete directly across domain boundaries. The runqueue is **two-level**:
+
+```
+CPU
+ └─ domain entities, ordered by domain weight and domain vruntime
+     └─ threads within a domain, ordered by thread deadline
+```
+
+Picking a thread means picking a domain entity, then picking within it. A domain's CPU share is set
+by its `ResourceEnvelope` and is honoured regardless of how many threads it spawns. This is cgroup
+CPU control, present from the first version rather than grafted on — because containers are a
+first-class concept, not an add-on.
+
+---
+
+## 4. The RT class
+
+- Fixed priorities 0–99, higher wins.
+- `FIFO` (runs until it blocks or yields) and `RR` (runs until it blocks, yields, or exhausts its
+  quantum) policies.
+- **Priority inheritance on kernel locks.** A low-priority thread holding a lock an RT thread wants
+  temporarily inherits the RT priority. Without this, unbounded priority inversion makes the latency
+  bound a lie.
+- **Admission control:** total RT utilisation per CPU is capped (default 95%). Exceeding it fails the
+  scheduling-parameter syscall rather than hanging the machine. The remaining 5% guarantees that
+  Fair-class threads — including the ones that would let an operator log in and fix things — still
+  run.
+
+**Latency budget, to be measured and enforced by a test, not asserted:** wakeup-to-run for the
+highest-priority RT thread on an otherwise busy machine, target < 50 µs at the 99.9th percentile.
+The QEMU test suite measures this on every PR and fails on regression. A number nobody measures is
+a number nobody meets.
+
+---
+
+## 5. Load balancing
+
+Runs periodically and on wakeup, cheapest option first:
+
+1. **Wakeup placement.** Prefer the CPU where the thread last ran (cache-warm), unless it is busy and
+   an idle sibling shares the LLC. Topology comes from ACPI/CPUID: SMT sibling → same LLC → same NUMA
+   node → other node, in that order of preference.
+2. **Idle pull.** A CPU entering idle steals from the busiest CPU in its domain before halting. This
+   is where most balancing should happen — it is free, since the CPU had nothing to do.
+3. **Periodic push.** A timer-driven pass that corrects imbalance the above missed, at a coarse
+   interval (default 100 ms per scheduling domain level). Deliberately infrequent: aggressive
+   periodic balancing destroys cache locality and burns CPU proving it is busy.
+
+Migration cost is charged: a thread is not migrated unless the estimated imbalance improvement
+exceeds its measured migration cost. NUMA migrations are charged much more than LLC-local ones.
+
+---
+
+## 6. Context switching
+
+The switch itself is assembly (`arch/x86_64/asm/switch.S`). It:
+
+1. Saves callee-saved registers and RSP into the outgoing `Context`.
+2. Switches the kernel stack.
+3. Switches `CR3` if the address space differs (with PCID, without a full flush).
+4. Restores callee-saved registers and RSP from the incoming `Context`.
+5. Returns into the new thread.
+
+Deliberate design points:
+
+- **Caller-saved registers are not saved.** The compiler already spilled anything live across the
+  call. Saving them is wasted work — a mistake many hand-written switchers make.
+- **FPU/SSE/AVX state is switched lazily** via `CR0.TS` / `XSAVE`, not eagerly. AVX-512 state is
+  2.5 KiB; switching it on every context switch for threads that never touch it is a large,
+  invisible cost.
+- **The switch path allocates nothing and can take no locks that may sleep.** Enforced by type.
+- **Kernel stacks have guard pages.** Stack overflow in the kernel becomes a clean panic with a
+  backtrace instead of silent corruption of whatever was allocated below.
+
+---
+
+## 7. Timers and ticklessness
+
+- Per-CPU deadline timers via the local APIC in TSC-deadline mode where available.
+- **Tickless when a single thread is runnable** and no timer is pending: no periodic interrupt at
+  all. This matters for VM domains (a ticking guest wastes host CPU across every idle VM) and for
+  edge/battery devices.
+- A hierarchical timer wheel for the many-short-timers case; a per-CPU binary heap for the
+  few-precise-timers case. Both, because network stacks and RT threads have opposite profiles.
+- `CLOCK_MONOTONIC` from TSC with invariant-TSC detection, falling back to HPET. TSC
+  synchronisation across sockets is verified at boot and the fallback is taken if it fails, rather
+  than assumed.
+
+---
+
+## 8. The policy hook
+
+This is the scheduler's contribution to [ai-native.md](ai-native.md), and the boundary is strict.
+
+```rust
+pub trait SchedPolicy: Send + Sync {
+    /// Called with the set of candidate CPUs the scheduler has already
+    /// determined to be LEGAL for this thread. May reorder. May not extend.
+    fn rank_placement(&self, t: &ThreadSummary, candidates: &mut [CpuId]);
+
+    /// Suggest a time slice within [min, max] the scheduler already computed.
+    /// Values outside the range are clamped, not honoured.
+    fn suggest_slice(&self, t: &ThreadSummary, bounds: SliceBounds) -> Duration;
+
+    /// Predict how long this thread will run before blocking. Advisory only —
+    /// used to improve placement, never to preempt early or late.
+    fn predict_runtime(&self, t: &ThreadSummary) -> Option<Duration>;
+}
+```
+
+The rules, which are the whole point:
+
+- The policy **never sees a candidate the scheduler did not already approve.** It cannot place a
+  thread on a CPU excluded by affinity, isolation, or a domain's envelope.
+- Every returned value is **clamped to bounds the scheduler computed**. A malicious or broken policy
+  can make the system slow. It cannot make the system incorrect or unfair beyond the envelope.
+- The policy **runs in the calling context with a hard time budget** (default 2 µs). Exceeding it
+  disables the policy, logs the event, and reverts to the default heuristic — permanently, until an
+  operator re-enables it.
+- **The default policy is a real, complete heuristic**, not a stub. The AI policy is an optimisation
+  over a system that already works. If the AI subsystem never ships, the scheduler is still good.
+
+---
+
+## 9. What we are explicitly not doing (yet)
+
+- Gang scheduling for vCPUs. Needed eventually for VM domains (lock-holder preemption is a real
+  problem); deferred to Phase 3 with the rest of virtualization.
+- Energy-aware scheduling / big.LITTLE. Needed for the edge and embedded editions on AArch64. The
+  scheduling-domain hierarchy is designed to accommodate it; no code yet.
+- Deadline (EDF) class for hard real-time. The RT class covers soft real-time. EDF is additive.
+
+---
+
+## 10. Testing strategy
+
+| Property | Test |
+|---|---|
+| No lost wakeups | Stress test: N threads ping-ponging on IPC across M CPUs for 10⁷ iterations; assert no thread stalls. |
+| No stranded threads | Invariant checker in debug builds: every non-running runnable thread is on exactly one runqueue. |
+| Fairness | Two domains with a 3:1 weight ratio, each CPU-saturating; assert measured CPU time is 3:1 ± 2%. |
+| Domain fairness vs thread count | Domain A with 1 thread vs domain B with 64, equal weight; assert 1:1 split. |
+| RT latency | Cyclictest-equivalent under load; assert p99.9 < 50 µs. |
+| Priority inversion | RT thread blocks on a lock held by a Fair thread while a mid-priority thread spins; assert bounded latency. |
+| Policy containment | A deliberately hostile `SchedPolicy` (returns garbage, sleeps, panics); assert the system stays correct and the policy is disabled. |
+| Lock ordering | Debug-build rank assertions active in all scheduler tests. |
+
+The fairness and latency tests produce numbers that are recorded per-commit. Regressions are a
+failing build, not a discussion.

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build configuration for the Bhaskix kernel.
+
+[build]
+# Default to the freestanding target so a plain `cargo build` does the right
+# thing. Host unit tests override this with an explicit `--target`; see the
+# `test-host` rule in the Makefile.
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    # The kernel is linked at a fixed higher-half address by
+    # boot/shim/linker.ld, so it is not position independent. The target
+    # defaults to PIE, which would produce relocations the bootloader is not
+    # asked to process.
+    "-C", "relocation-model=static",
+
+    # The `kernel` code model assumes all symbols live in the top 2 GiB of the
+    # address space, which is exactly where linker.ld puts them. It lets the
+    # compiler use 32-bit signed displacements instead of 64-bit absolute
+    # addresses -- smaller and faster than the target's default `large` model,
+    # and correct only because of where we link.
+    "-C", "code-model=kernel",
+]
+
+[alias]
+# Convenience wrappers matching the Makefile, for people who prefer cargo.
+kbuild = "build --release"
+kcheck = "clippy --release -- -D warnings"
