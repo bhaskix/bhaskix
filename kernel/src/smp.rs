@@ -15,16 +15,26 @@
 //! it can answer inter-processor interrupts — which is what makes TLB
 //! shootdown possible.
 //!
-//! It does **not** run threads. The scheduler still takes raw pointers into a
-//! static thread table on the assumption that one CPU is inside it, and per-CPU
-//! runqueues have to land before that assumption can be dropped.
+//! It then registers its own runqueue, starts its own APIC timer, and idles.
+//! From that point it is a full scheduling CPU: threads created on it are
+//! preempted by its own timer, out of its own queue, with no lock shared with
+//! any other processor.
 //!
-//! # Order matters here
+//! # Order matters here, in a way that is easy to get wrong
 //!
-//! Per-CPU data is established *first*, because the CPU's dense identifier is
-//! what selects its GDT and TSS. Getting this backwards means every CPU builds
-//! table zero and the second one to arrive faults on `ltr` against a descriptor
-//! the first already marked busy.
+//! A CPU must claim its per-CPU slot *before* building its descriptor tables,
+//! because the dense identifier is what selects which GDT and TSS it builds —
+//! get that backwards and every CPU builds table zero, and the second one to
+//! arrive faults on `ltr` against a descriptor the first already marked busy.
+//!
+//! But it must point `GS` at that slot *after* loading the GDT, because
+//! loading any selector into `GS` — including the null selector the GDT reload
+//! writes — resets `GS.base` to zero. Doing it before means the base is
+//! silently wiped and the next `gs:`-relative read dereferences address zero,
+//! from inside whatever ran next.
+//!
+//! So: claim, build tables, activate. The two halves of per-CPU setup bracket
+//! the GDT load rather than preceding it.
 
 use bhaskix_arch::{apic, cpu, gdt, idt, percpu};
 
@@ -49,19 +59,59 @@ extern "C" fn secondary_main(lapic_id: u32) -> ! {
         // fault here cannot collide with one on another processor.
         gdt::init_cpu(cpu_id as usize);
         idt::load_on_secondary();
+
+        // Only now: the GDT load above cleared GS.base, so pointing GS at the
+        // per-CPU area has to happen after it rather than before.
+        percpu::activate(cpu_id);
+
         apic::enable_this_cpu();
+
+        // This CPU's runqueue, with the code currently executing as its first
+        // thread -- otherwise the first preemption would have nowhere to save
+        // the context it is running on.
+        crate::sched::init_cpu("idle");
+
+        // Its own timer. The tick rate was calibrated once by the bootstrap
+        // CPU and applies here unchanged; what is per-CPU is the timer itself,
+        // and therefore the preemption.
+        apic::start_timer(crate::trap::TIMER_HZ);
+        crate::sched::start();
 
         // Only now is it safe to take an interrupt at all.
         cpu::enable_interrupts();
     }
 
     // Idle, but interruptible. `hlt` with interrupts enabled is what lets this
-    // CPU answer a shootdown IPI; halting with them disabled -- which is what
-    // this did before it had its own TSS -- makes the CPU unreachable and any
-    // shootdown wait forever.
+    // CPU answer a shootdown IPI and be preempted into any thread its queue
+    // holds; halting with them disabled -- which is what this did before it
+    // had its own TSS -- makes the CPU unreachable entirely.
     loop {
-        // SAFETY: interrupts are enabled, so this halt is woken by any IPI.
+        // SAFETY: interrupts are enabled, so this halt is woken by the timer
+        // or by any IPI.
         unsafe { cpu::halt() };
+    }
+}
+
+/// Establishes the bootstrap CPU's per-CPU area.
+///
+/// Must run **before interrupts are enabled**, not merely before secondaries
+/// start. The timer interrupt calls into the scheduler, which asks which CPU
+/// it is on — and asking that before a `GS` base exists dereferences address
+/// zero, from inside an interrupt handler.
+///
+/// Returns whether it succeeded.
+pub fn init_bsp(lapic_id: u32) -> bool {
+    // SAFETY: called once, on the bootstrap CPU, after its GDT is loaded and
+    // before any secondary exists. Activation follows the claim immediately
+    // because nothing reloads GS in between.
+    unsafe {
+        match percpu::install(lapic_id) {
+            Some(cpu_id) => {
+                percpu::activate(cpu_id);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -69,13 +119,6 @@ extern "C" fn secondary_main(lapic_id: u32) -> ! {
 ///
 /// Returns the number that came online, not counting the bootstrap CPU.
 pub fn start_secondaries(handoff: &bhaskix_boot::Handoff) -> u32 {
-    // SAFETY: the bootstrap CPU's own per-CPU area, installed before any
-    // secondary exists.
-    if unsafe { percpu::install(handoff.bsp_lapic_id) }.is_none() {
-        println!("    smp            FAILED to install the bootstrap CPU area");
-        return 0;
-    }
-
     let Some(start) = handoff.start_secondaries else {
         println!("    smp            loader reported no way to start secondaries");
         return 0;

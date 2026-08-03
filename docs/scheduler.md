@@ -43,6 +43,13 @@ pub struct Cpu {
 A single global runqueue is simpler and does not scale past about four CPUs. Per-CPU queues with
 stealing is the design that works; we start there rather than migrating later.
 
+> **Implemented, in part, as of M4-06.** `kernel/src/sched.rs` has one lock-per-CPU runqueue, and a
+> thread is *owned* by the CPU whose queue holds it. That ownership is what makes the switch path
+> sound on more than one processor: a CPU takes raw pointers to contexts in its own queue only, so
+> there is no cross-CPU sharing to race against rather than a race that is prevented. What exists is
+> a single round-robin list per CPU, not the four classes above — no RT, no Fair tree, no Batch, and
+> **no stealing**, so an idle CPU stays idle while another has a queue. §5 is unbuilt.
+
 ### Strict class priority
 
 ```
@@ -231,3 +238,9 @@ The rules, which are the whole point:
 
 The fairness and latency tests produce numbers that are recorded per-commit. Regressions are a
 failing build, not a discussion.
+
+Of that table, **none** is running yet: every row needs blocking, IPC, or a scheduling class, and
+none of those exist. What the boot test does check, at `-smp 4`, is the one property this milestone
+actually claims — that each worker thread ran on the CPU it was created on, and that the timer
+preempted it there. The test was verified by breaking it: forcing every thread onto CPU 0 makes it
+fail, which is what distinguishes a per-CPU runqueue from a global one that happens to work.

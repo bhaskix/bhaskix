@@ -41,4 +41,11 @@ workspace = true
 # 354 at M3-12, for the user-copy calls in the self-tests. Those are unsafe by
 # nature: they hand a deliberately bad pointer to a routine whose contract is
 # that bad pointers are ordinary input.
-unsafe_budget = 400
+# 430 at M4-06, per-CPU runqueues. Two sources, neither avoidable. Secondary
+# bring-up is a fixed sequence of operations that are individually unsafe and
+# only correct in one order -- claim identity, load descriptor tables, activate
+# GS -- and expressing it as one `unsafe` block per step is what makes each
+# ordering constraint documentable where it applies. The rest is the switch
+# path: raw context pointers taken out of a runqueue and handed to assembly
+# that changes RSP, which no safe signature can describe.
+unsafe_budget = 430

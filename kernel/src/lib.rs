@@ -108,6 +108,15 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
         bhaskix_arch::idt::init();
     }
     trap::init();
+
+    // Per-CPU data before interrupts, not merely before secondaries: the timer
+    // handler calls the scheduler, which asks which CPU it is running on, and
+    // that question cannot be answered before a GS base exists.
+    if !smp::init_bsp(handoff.bsp_lapic_id) {
+        println!("  FATAL: could not establish per-CPU data for the bootstrap CPU");
+        cpu::halt_forever();
+    }
+
     println!("  cpu");
     println!("    gdt + tss      loaded (double fault and NMI on dedicated stacks)");
     println!("    idt            loaded (256 vectors)");
@@ -301,7 +310,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
 
     println!();
     println!("  M4 in progress. Nothing left to do at this milestone -- halting.");
-    println!("  Next: SMP bring-up and the fair scheduling class (docs/roadmap.md).");
+    println!("  Next: blocking and wakeup, then the fair scheduling class (docs/roadmap.md).");
 
     cpu::halt_forever()
 }
@@ -554,42 +563,59 @@ fn report_memory(handoff: &Handoff) {
     );
 }
 
-/// Per-worker counters for the scheduling self-test.
-static WORK: [core::sync::atomic::AtomicU64; 3] = [
+/// Per-worker progress counters.
+static WORK: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Which CPU each worker actually observed itself running on.
+///
+/// Recorded rather than assumed. A scheduler that dispatched every thread on
+/// the bootstrap CPU would produce identical counters, so the counters alone
+/// cannot distinguish per-CPU scheduling from a global queue.
+static OBSERVED_CPU: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+];
+
 /// A worker that never yields.
 ///
-/// Never yielding is the point. If its counter advances, the only thing that
-/// can have put it on the CPU is the timer interrupt — which is precisely the
-/// property under test, and is not something a cooperative scheduler could
-/// fake.
+/// Never yielding is the point: if its counter advances, only its CPU's timer
+/// can have put it there.
 extern "C" fn worker(id: u64) -> ! {
+    use core::sync::atomic::Ordering;
     loop {
         if let Some(counter) = WORK.get(id as usize) {
-            counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(slot) = OBSERVED_CPU.get(id as usize) {
+            slot.store(u64::from(bhaskix_arch::percpu::cpu_id()), Ordering::Relaxed);
         }
         core::hint::spin_loop();
     }
 }
 
-/// Spawns threads and checks that the timer really preempts them.
+/// Spawns one worker per CPU and checks each ran on the CPU it was created on.
 fn scheduling_self_test(hhdm_base: u64) -> bool {
     use core::sync::atomic::Ordering;
 
-    sched::init_boot_thread("boot");
+    // The bootstrap CPU's own runqueue. Secondaries registered theirs during
+    // bring-up.
+    sched::init_cpu("boot");
 
-    for id in 0..WORK.len() as u64 {
-        let name = match id {
-            0 => "worker-0",
-            1 => "worker-1",
-            _ => "worker-2",
-        };
-        if let Err(error) = sched::spawn(name, worker, id, hhdm_base) {
-            println!("    threads        FAILED to spawn: {error:?}");
+    let cpus = bhaskix_arch::percpu::online_count().min(WORK.len() as u32);
+    const NAMES: [&str; 4] = ["worker-0", "worker-1", "worker-2", "worker-3"];
+
+    for id in 0..cpus {
+        if let Err(error) =
+            sched::spawn_on(id, NAMES[id as usize], worker, u64::from(id), hhdm_base)
+        {
+            println!("    threads        FAILED to spawn on cpu {id}: {error:?}");
             return false;
         }
     }
@@ -597,52 +623,50 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
     let switches_before = sched::switches();
     sched::start();
 
-    // Run for a fixed number of timer ticks. The boot thread is itself in the
-    // runqueue, so it is preempted too and simply resumes here.
-    let deadline = trap::ticks() + 25;
+    // Run for a fixed number of ticks. Every CPU contributes to the counter,
+    // so this is shorter in wall-clock terms on a bigger machine -- which is
+    // fine, since what is being measured is progress rather than duration.
+    let deadline = trap::ticks() + 60;
     let mut spins = 0u64;
     while trap::ticks() < deadline && spins < 2_000_000_000 {
         spins += 1;
         core::hint::spin_loop();
     }
 
-    sched::stop();
+    sched::stop_all();
 
     let switches = sched::switches() - switches_before;
-    let counts: [u64; 3] = [
-        WORK[0].load(Ordering::Relaxed),
-        WORK[1].load(Ordering::Relaxed),
-        WORK[2].load(Ordering::Relaxed),
-    ];
-    let all_ran = counts.iter().all(|&c| c > 0);
 
-    if !all_ran || switches == 0 {
-        println!(
-            "    threads        FAILED (switches {switches}, counts {} {} {})",
-            counts[0], counts[1], counts[2]
-        );
-        return false;
+    let mut ok = true;
+    for id in 0..cpus as usize {
+        let count = WORK[id].load(Ordering::Relaxed);
+        let observed = OBSERVED_CPU[id].load(Ordering::Relaxed);
+
+        if count == 0 {
+            println!("    threads        FAILED: worker {id} never ran");
+            ok = false;
+        } else if observed != id as u64 {
+            // The property that distinguishes per-CPU runqueues from a global
+            // one: a thread created on CPU n must run on CPU n.
+            println!("    threads        FAILED: worker {id} ran on cpu {observed}, expected {id}");
+            ok = false;
+        }
     }
 
-    println!(
-        "    threads        {switches} preemptions; all {} workers ran without yielding",
-        counts.len()
-    );
+    if switches == 0 {
+        println!("    threads        FAILED: no context switches occurred");
+        ok = false;
+    }
 
-    // Round-robin should give roughly equal turns. Reported rather than
-    // asserted: this is not yet the fair scheduler `docs/scheduler.md`
-    // specifies, and a tight bound here would be measuring the timer's jitter
-    // rather than any fairness property worth defending.
-    let smallest = counts.iter().copied().min().unwrap_or(0);
-    let largest = counts.iter().copied().max().unwrap_or(1).max(1);
-    println!(
-        "    fairness       spread {}% (round-robin, not the fair class yet)",
-        100 - (smallest * 100 / largest)
-    );
+    if ok {
+        println!(
+            "    threads        {switches} preemptions across {cpus} cpus; each worker ran on its own cpu"
+        );
+    }
 
-    sched::for_each(|id, name, state, runs| {
-        println!("      thread {id}  {name:<9} {state:?}  {runs} runs");
+    sched::for_each(|cpu, id, name, state, runs| {
+        println!("      cpu {cpu}  thread {id}  {name:<9} {state:?}  {runs} runs");
     });
 
-    true
+    ok
 }

@@ -126,6 +126,15 @@ pub unsafe fn allocate(hhdm_base: u64, index: u64) -> Result<GuardedStack, VmErr
                 let _ = pmm.free(pfn, 0);
                 return Err(VmError::Paging(error));
             }
+
+            // Shoot down even though this is a *new* mapping rather than a
+            // removed one. A CPU is architecturally permitted to cache the
+            // absence of a translation, and this stack will very likely be
+            // first touched by a different CPU from the one that mapped it --
+            // the bootstrap CPU creates stacks for threads that run elsewhere.
+            // A stale negative entry there would fault on a page that is
+            // genuinely mapped, which is a confusing way to lose an afternoon.
+            crate::tlb::shootdown(address);
         }
         Ok(())
     })

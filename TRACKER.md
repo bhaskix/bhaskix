@@ -96,9 +96,10 @@ fairness within 2% for two equal-weight workloads.
 | M4-02 | Per-thread guarded kernel stacks | ✅ `DONE` | Each thread gets its own slot with a guard page |
 | M4-03 | Round-robin runqueue | ✅ `DONE` | 7/7/7 runs across three workers |
 | M4-04 | Timer-driven preemption | ✅ `DONE` | **Negative-tested**: removing the `preempt` call zeroes every worker counter |
-| M4-05 | SMP bring-up, per-CPU areas | ✅ `DONE` | 1, 2, 4 and 8 CPUs all come online; boot test asserts N-of-N. Secondaries **park** — see below. |
+| M4-05 | SMP bring-up, per-CPU areas | ✅ `DONE` | 1, 2, 4 and 8 CPUs all come online; boot test asserts N-of-N. Secondaries schedule as of M4-06. |
 | M4-05b | Per-CPU GDT and TSS | ✅ `DONE` | Each CPU builds its own, with its own IST stacks; secondaries now idle with interrupts *enabled* |
-| M4-06 | Per-CPU runqueues, work stealing | ⬜ `TODO` | **The last thing blocking threads on secondaries.** Both its prerequisites have landed. |
+| M4-06 | Per-CPU runqueues | ✅ `DONE` | One lock-per-CPU queue; threads are *owned* by a CPU. **Negative-tested**: forcing every thread onto CPU 0 fails the gate. |
+| M4-06b | Work stealing and migration | ⬜ `TODO` | A thread runs on its creating CPU forever; an idle CPU stays idle while another has a queue. `docs/scheduler.md` §5. |
 | M4-07 | Fair class (virtual deadline), RT class | ⬜ `TODO` | Currently plain round-robin |
 | M4-08 | Lock ranking, active in debug builds | ⬜ `TODO` | `docs/coding-style.md` §7 requires it |
 | M4-09 | Sleeping, wait queues, blocking | ⬜ `TODO` | A thread is runnable or finished; nothing waits |
@@ -115,35 +116,46 @@ fairness within 2% for two equal-weight workloads.
    the timer never fired again, and there was no crash to look at: no exception, no triple fault,
    just a halt. Diagnosed from QEMU's interrupt trace ending at a timer vector with nothing after.
    Fixed with an `sti` in the thread trampoline.
-2. **My own trampoline design was internally inconsistent** — it expected the entry point in `rax`,
+2. **Loading the GDT silently wiped the per-CPU `GS` base.** Secondaries set their `GS` base and
+   *then* built their descriptor tables — but loading any selector into `GS`, including the null
+   selector a GDT reload writes, resets the base to zero. Every later `gs:`-relative read therefore
+   dereferenced address zero, and it surfaced as three page faults at `CR2 = 0` deep inside
+   unrelated code, plus two "address space lock held" reports from a fault handler that could not
+   service them. Found by resolving the faulting RIP through the KASLR slide back to a symbol and
+   disassembling it: the faulting instruction was `mov %gs:0x0,%rcx`, and the GDT load sat between
+   it and the `wrmsr` that was supposed to have made it valid. Fixed by splitting per-CPU setup into
+   `install` (claim the identity, which the GDT build needs) and `activate` (point `GS` at it), so
+   the two halves *bracket* the GDT load instead of preceding it. Negative-tested: putting
+   `activate` back before the load reproduces all three faults.
+3. **My own trampoline design was internally inconsistent** — it expected the entry point in `rax`,
    which the context switch does not restore. Caught while writing it; entry point and argument now
    travel in `r12` and `rbx`, which are callee-saved and therefore actually preserved.
 
 ### Honest notes on what is *not* proven
 
-- **Secondary CPUs idle rather than run threads.** They have their own descriptor tables and answer
-  IPIs, but the scheduler is still single-CPU by construction — it takes raw pointers into a static
-  thread table on the assumption that one CPU is inside it. Per-CPU runqueues are the last thing
-  blocking work on secondaries, and both of that work's prerequisites have now landed.
+- **Secondary CPUs run threads, but only threads created on them.** There is no migration and no
+  work stealing, so an idle CPU stays idle while another has a queue, and the fairness that does
+  exist is fairness *within* one CPU. The boot test spawns evenly by hand, which is precisely the
+  balancing the kernel cannot yet do for itself.
 - **Shootdown is one address per IPI round trip, and one shootdown at a time.** Tearing down a range
   costs a round trip per page, which is the wrong shape for address-space teardown; batching is the
   obvious next step and deliberately untaken until there is a workload to measure. Teardown avoids
   the cost entirely today by skipping shootdown for address spaces no CPU has loaded.
 - **`is_active` checks only this CPU's `CR3`.** Sufficient because secondaries never load an address
   space, and wrong the moment they do — it must become a per-space "loaded on" mask.
-- **The locking has still never been contended.** Secondaries idle in `hlt`, so the `SpinLock` is
-  exercised by one CPU plus brief IPI handlers. Nothing has stress-tested it.
+- **The locking is barely contended.** Each runqueue lock is taken by exactly one CPU plus its own
+  timer interrupt, which is by design — but it means the only genuinely multi-CPU lock traffic is
+  the console and the shootdown path. Nothing has stress-tested any of it.
 
 - **This is round-robin, not the scheduler `docs/scheduler.md` specifies.** No priorities, no
   fairness weighting, no virtual deadlines, no RT class, no admission control. The fairness figure
   printed at boot is reported rather than asserted, because a tight bound on round-robin would be
   measuring timer jitter rather than any property worth defending.
-- **One CPU.** Everything about per-CPU runqueues, load balancing and work stealing is untouched,
-  and the scheduler takes raw pointers into a static thread table on the assumption that only one
-  CPU is inside it.
+- **Load balancing and work stealing are untouched.** The runqueues are per-CPU and sound, but
+  nothing moves a thread between them; `docs/scheduler.md` §5 is entirely unbuilt.
 - **Threads cannot block.** There is no sleep, no wait queue and no wakeup path, so "no lost
   wakeups" — half the exit criterion — is not merely unproven but not yet expressible.
-- **Thread capacity is fixed at 16** and stacks are never reclaimed. `exit` marks a thread finished
+- **Thread capacity is fixed at 8 per CPU** and stacks are never reclaimed. `exit` marks a thread finished
   but its stack stays mapped, so thread creation is effectively one-way.
 - **No lock ranking**, which `docs/coding-style.md` §7 requires and which becomes load-bearing the
   moment there are enough locks to order.
@@ -213,6 +225,31 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M4-06, per-CPU runqueues)
+
+- **One runqueue per CPU, each with its own lock.** The throughput argument for this is real and is
+  not why it landed now. The single-queue scheduler was *unsound* on more than one processor: it
+  took raw pointers into a shared thread table and switched to them after releasing the lock, which
+  is correct only if exactly one CPU is ever inside it. Making the queues per-CPU removes the
+  sharing rather than protecting it — a CPU touches only its own threads' contexts, so there is
+  nothing to race against.
+- **Secondaries are now full scheduling CPUs.** Each registers its own queue with its current
+  execution as the first thread, starts its own APIC timer, and idles interruptibly. Threads created
+  on a secondary are preempted by that secondary's own timer, out of its own queue, with no lock
+  shared with any other processor.
+- **The boot test asserts the property, not the mechanism.** A global runqueue would still preempt;
+  what distinguishes this is *where* threads run. The test spawns one worker per online CPU and
+  requires worker *i* to observe itself on CPU *i*. Verified by breaking it: forcing every spawn
+  onto CPU 0 produces three failures, and the gate goes red.
+- **A page fault at `CR2 = 0` traced to segment-load semantics** — see M4 bug 2. The general lesson
+  is that establishing per-CPU state is not one step: the identity is needed *before* the
+  descriptor tables are built, and the `GS` base can only be set *after*, because building them
+  destroys it.
+- **`unsafe` budget for `bhaskix-kernel` raised 400 → 430**, with the reason recorded in
+  `kernel/Cargo.toml` as the gate requires: an ordering-critical bring-up sequence where one
+  `unsafe` block per step is what makes each ordering constraint documentable at the point it
+  applies, plus the switch path's raw context pointers.
 
 ### 2026-08-03 (M4-05b and M4-11, per-CPU tables and shootdown)
 

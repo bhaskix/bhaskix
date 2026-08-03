@@ -22,10 +22,12 @@
 //!   on kernel entry and the kernel base will live in `IA32_KERNEL_GS_BASE`,
 //!   swapped on every transition. Getting that wrong in either direction is a
 //!   privilege-escalation bug, so it lands with the syscall path, not before.
-//! - **Per-CPU GDT and TSS.** Both are still shared. That is safe only because
-//!   secondary CPUs do not take interrupts yet; see `docs/scheduler.md`.
+//! - **`IA32_KERNEL_GS_BASE` as a scratch slot.** The kernel base is written
+//!   directly to `IA32_GS_BASE` today. Once `swapgs` lands, the two MSRs
+//!   change roles on every kernel entry and exit, and every path that reloads
+//!   `GS` has to know which of them it is disturbing.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::cell::BootCell;
 use crate::msr;
@@ -70,14 +72,39 @@ static AREAS: BootCell<[PerCpu; MAX_CPUS]> = BootCell::new([const { PerCpu::new(
 /// CPUs that have completed bring-up.
 static ONLINE: AtomicU32 = AtomicU32::new(0);
 
-/// Claims the next free slot and installs it as this CPU's area.
+/// Whether *any* CPU has installed an area yet.
+///
+/// Guards the `gs:` read in [`current`]. Before the first install the GS base
+/// is zero, so reading `gs:[0]` dereferences address zero and page-faults —
+/// and the caller is usually an interrupt handler, which makes it a fault
+/// while handling a fault. This flag turns that into an ordinary `None`.
+///
+/// It is deliberately global rather than per-CPU, and that is only sound
+/// because of the second check below. A CPU that has not yet run [`activate`]
+/// has a zero base no matter what other CPUs have done, so this flag alone
+/// would let it through once any *other* CPU had installed. What actually
+/// makes the read safe is that a zero base makes `gs:[0]` read address zero,
+/// which is unmapped in every address space — so the null test catches it. The
+/// flag only avoids the fault during the window before the very first area
+/// exists, when there is no `None` to return yet.
+static ANY_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Claims a slot and fills in this CPU's area, **without** activating it.
+///
+/// Splitting claim from activation is not tidiness. Loading *any* selector
+/// into `GS` — including the null selector, which is exactly what reloading
+/// the GDT does — resets `GS.base` to zero. So a CPU that sets its base and
+/// then loads its descriptor tables silently loses it, and the next
+/// `gs:`-relative read dereferences address zero.
+///
+/// The two steps therefore bracket the GDT load: claim, load the GDT,
+/// [`activate`]. Anything else is a null dereference waiting for a reorder.
 ///
 /// Returns the dense CPU id, or `None` if [`MAX_CPUS`] is exhausted.
 ///
 /// # Safety
 ///
-/// Must be called exactly once per CPU, before anything reads `gs:`-relative
-/// data on it.
+/// Must be called exactly once per CPU.
 pub unsafe fn install(lapic_id: u32) -> Option<u32> {
     // A plain atomic increment hands out slots, so two CPUs racing here cannot
     // receive the same one. This is the first place in the kernel where that
@@ -96,21 +123,45 @@ pub unsafe fn install(lapic_id: u32) -> Option<u32> {
         area.cpu_id = cpu_id;
         area.lapic_id = lapic_id;
         area.online = true;
-
-        msr::write(IA32_GS_BASE, area.self_pointer);
     }
 
     Some(cpu_id)
 }
 
+/// Points `GS` at this CPU's area.
+///
+/// Must run **after** the last thing that loads a segment selector into `GS`,
+/// which in practice means after the GDT is loaded. See [`install`].
+///
+/// # Safety
+///
+/// `cpu_id` must be the value [`install`] returned on this CPU, and nothing
+/// may load a `GS` selector afterwards without calling this again.
+pub unsafe fn activate(cpu_id: u32) {
+    if cpu_id as usize >= MAX_CPUS {
+        return;
+    }
+    // SAFETY: this CPU owns the element `install` claimed for it; the table is
+    // a `static` that never moves.
+    unsafe {
+        let area = &AREAS.get()[cpu_id as usize];
+        msr::write(IA32_GS_BASE, area.self_pointer);
+    }
+    ANY_INSTALLED.store(true, Ordering::Release);
+}
+
 /// This CPU's private area, or `None` before [`install`] has run on it.
 #[must_use]
 pub fn current() -> Option<&'static PerCpu> {
+    if !ANY_INSTALLED.load(Ordering::Acquire) {
+        return None;
+    }
+
     let pointer: u64;
-    // SAFETY: reads the first quadword of whatever `GS` points at. Before
-    // `install` the base is zero, so this reads address 0 -- which is unmapped,
-    // and would fault rather than return nonsense. That is why the base is set
-    // as the last step of `install` and why nothing calls this before it.
+    // SAFETY: reads the first quadword of whatever `GS` points at. Every CPU
+    // runs `activate` with interrupts disabled and before anything on it can
+    // call in here, so a base is either established or still zero -- and zero
+    // is the case the `ANY_INSTALLED` guard covers.
     unsafe {
         core::arch::asm!(
             "mov {}, gs:[0]",

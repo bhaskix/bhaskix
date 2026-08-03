@@ -226,10 +226,15 @@ else
     status=1
 fi
 
-if grep -qE "threads +[0-9]+ preemptions; all [0-9]+ workers ran" "$LOG"; then
-    pass "threads preempted by the timer"
+# Two properties in one line, and both matter. The preemption count says the
+# timer drove a switch at all; "each worker ran on its own cpu" says the
+# runqueues are genuinely per-CPU. A single global queue would still preempt --
+# it would just run every worker wherever a slot came free, which is exactly
+# what this milestone claims to have stopped doing.
+if grep -qE "threads +[0-9]+ preemptions across [0-9]+ cpus; each worker ran on its own cpu" "$LOG"; then
+    pass "threads preempted by the timer, each on its own runqueue"
 else
-    fail "timer-driven preemption did not work"
+    fail "per-CPU timer-driven preemption did not work"
     status=1
 fi
 
