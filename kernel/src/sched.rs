@@ -18,12 +18,42 @@
 //! about. A CPU touches only its own threads' contexts, so there is nothing
 //! for a second CPU to race against.
 //!
+//! # Work stealing, and how it keeps that property
+//!
+//! Stealing appears to give the sharing straight back: a thief reaches into
+//! another CPU's queue. It does not, because what it moves is *ownership*. A
+//! thread is removed from the victim's queue and inserted into the thief's
+//! under the two locks, one at a time, and only in a state where no CPU is
+//! touching its context. After the move it is owned by the thief exactly as if
+//! it had been created there. At no point do two CPUs hold pointers to the
+//! same context.
+//!
+//! Three rules make that true, and each rules out a specific way to corrupt a
+//! thread ([`RunQueue::stealable`] and [`try_steal`]):
+//!
+//! 1. **Only `Ready` threads move.** A `Running` thread's context is not
+//!    merely stale, it is the stack the victim is executing on.
+//! 2. **Never from a CPU that is mid-switch.** A thread is marked `Ready`
+//!    *before* the switch that saves its context, and the runqueue lock is
+//!    released in between — it has to be, since the incoming thread will take
+//!    it. So "`Ready`" alone admits a thread whose registers have not been
+//!    written yet. [`RunQueue::switching`] closes that window.
+//! 3. **The thread a CPU booted on never moves.** It is running on the stack
+//!    the bootloader gave that CPU, and on secondaries it is the idle thread —
+//!    take it away and the CPU has nothing to run when its queue drains.
+//!
+//! Only ever one lock is held at a time, and the victim's is taken with
+//! `try_lock`, so two CPUs stealing from each other cannot deadlock: they both
+//! fail and both give up.
+//!
 //! # What is still missing
 //!
-//! - **No migration and no work stealing.** A thread runs on the CPU it was
-//!   created on, forever. An idle CPU stays idle while another has a queue.
-//!   `docs/scheduler.md` §5 describes the balancing this needs; none of it is
-//!   here, and the fairness this does provide is only within one CPU.
+//! - **Balancing is pull-only and topology-blind.** A CPU steals when it would
+//!   otherwise run only its idle thread; nothing pushes work, and nothing
+//!   knows which CPUs share a cache. `docs/scheduler.md` §5 wants wakeup
+//!   placement by LLC and NUMA distance, a periodic push pass, and migration
+//!   cost accounting. None of that is here, so a steal is as likely to cross
+//!   a socket as stay on one.
 //! - **No priorities, no fair class.** Still round-robin.
 //! - **No blocking.** A thread is runnable or finished; there is no sleep and
 //!   no wakeup, so "no lost wakeups" remains not merely unproven but
@@ -64,6 +94,13 @@ pub struct Thread {
     pub state: State,
     /// Times this thread has been switched to.
     pub runs: u64,
+    /// Times this thread has been moved between CPUs.
+    pub migrations: u64,
+    /// Whether this thread may never migrate.
+    ///
+    /// True for the thread each CPU registers for itself: it runs on the stack
+    /// that CPU booted on, so "move it elsewhere" is not a meaningful request.
+    pub pinned: bool,
 }
 
 /// One CPU's runqueue.
@@ -73,6 +110,13 @@ struct RunQueue {
     current: usize,
     /// Whether this CPU may preempt yet.
     started: bool,
+    /// Whether this CPU is between choosing a switch and completing it.
+    ///
+    /// Set under the lock before the lock is released for the switch, and
+    /// cleared once the outgoing context has actually been written. While it
+    /// is set, one thread in this queue is marked `Ready` but its saved
+    /// registers are not yet valid, so nothing may be stolen from here.
+    switching: bool,
 }
 
 impl RunQueue {
@@ -81,7 +125,58 @@ impl RunQueue {
             threads: [const { None }; MAX_THREADS_PER_CPU],
             current: 0,
             started: false,
+            switching: false,
         }
+    }
+
+    /// Threads on this queue that could run: the load figure balancing uses.
+    fn runnable(&self) -> usize {
+        self.threads
+            .iter()
+            .flatten()
+            .filter(|thread| thread.state != State::Finished)
+            .count()
+    }
+
+    /// Which thread, if any, a CPU with `thief_load` runnable threads may take
+    /// from this queue.
+    ///
+    /// The whole steal policy, in one place and with no side effects, because
+    /// every rule here is one that is invisible when broken. Removing the
+    /// `pinned` test does not fail a boot; it strands a CPU minutes later,
+    /// once its queue happens to drain. Removing the `switching` test corrupts
+    /// a thread only when the timing lines up. Neither is something a boot
+    /// test can be relied on to provoke, so they are unit-tested instead.
+    fn steal_candidate(&self, thief_load: usize) -> Option<usize> {
+        // Rule 2: a CPU partway through a switch has a thread already marked
+        // `Ready` whose registers have not been written yet, and nothing here
+        // distinguishes it from one that has been parked for a while.
+        if self.switching {
+            return None;
+        }
+
+        // Worth moving at all? See `STEAL_IMBALANCE`.
+        if self.runnable() < thief_load + STEAL_IMBALANCE {
+            return None;
+        }
+
+        self.threads.iter().position(|slot| {
+            slot.as_ref().is_some_and(|thread| {
+                // Rule 1: `Running` is the stack the victim is executing on.
+                // `Finished` is not worth moving and would confuse the load
+                // figure at the far end.
+                thread.state == State::Ready
+                    // Rule 3: the thread a CPU booted on runs on the stack
+                    // that CPU was given, and on a secondary it is also the
+                    // only thing left to run when the queue drains.
+                    && !thread.pinned
+            })
+        })
+    }
+
+    /// First unused slot.
+    fn free_slot(&self) -> Option<usize> {
+        self.threads.iter().position(Option::is_none)
     }
 
     /// Next runnable thread after `from`, round-robin within this CPU.
@@ -112,6 +207,18 @@ static NEXT_THREAD: AtomicU64 = AtomicU64::new(0);
 /// Context switches performed, across every CPU.
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 
+/// Threads moved from one CPU's queue to another's.
+static STEALS: AtomicU64 = AtomicU64::new(0);
+
+/// How much busier a CPU must be before its work is worth taking.
+///
+/// Two, not one. At one, a thief with a single thread would take from a CPU
+/// with two, leaving both with two and one — and the victim, now the lighter
+/// of the pair, would take it straight back. The thread would then spend its
+/// life migrating instead of running. Requiring a gap of two means the move
+/// leaves the pair no more unbalanced than it found them, so it converges.
+const STEAL_IMBALANCE: usize = 2;
+
 /// Why a thread could not be created.
 #[derive(Clone, Copy, Debug)]
 pub enum SpawnError {
@@ -135,6 +242,10 @@ pub fn init_cpu(name: &'static str) {
     }
     let id = NEXT_THREAD.fetch_add(1, Ordering::Relaxed) as u32;
 
+    // Idempotent, and every CPU runs this before any thread can be created on
+    // it, which is the ordering the hook requires.
+    bhaskix_arch::context::set_thread_entered(thread_entered);
+
     let mut queue = QUEUES[cpu].lock();
     queue.threads[0] = Some(Thread {
         id,
@@ -142,6 +253,11 @@ pub fn init_cpu(name: &'static str) {
         context: Context::new(),
         state: State::Running,
         runs: 1,
+        migrations: 0,
+        // This thread *is* the CPU's boot context, executing on the stack the
+        // bootloader handed it. Migrating it would move a stack out from under
+        // the processor standing on it.
+        pinned: true,
     });
     queue.current = 0;
 }
@@ -196,8 +312,109 @@ pub fn spawn_on(
         context,
         state: State::Ready,
         runs: 0,
+        migrations: 0,
+        pinned: false,
     });
     Ok(id)
+}
+
+/// Creates a thread on whichever CPU is currently least loaded.
+///
+/// This is placement, not balancing: it is the one chance to get a thread onto
+/// a quiet CPU without paying to move it later, and it is much cheaper than
+/// the stealing that would otherwise have to correct it. `docs/scheduler.md`
+/// §5 wants this to prefer a cache-warm CPU over a merely idle one; there is
+/// no topology information yet, so every CPU looks equally distant.
+///
+/// # Errors
+///
+/// As [`spawn_on`].
+pub fn spawn(
+    name: &'static str,
+    entry: extern "C" fn(u64) -> !,
+    argument: u64,
+    hhdm_base: u64,
+) -> Result<u32, SpawnError> {
+    let online = percpu::online_count() as usize;
+    let mut best = 0;
+    let mut best_load = usize::MAX;
+
+    for (cpu, queue) in QUEUES.iter().enumerate().take(online) {
+        // `try_lock`: a queue that is busy right now is not one we want to
+        // pick anyway, so treating contention as "skip" costs nothing.
+        if let Some(queue) = queue.try_lock() {
+            let load = queue.runnable();
+            if load < best_load {
+                best_load = load;
+                best = cpu;
+            }
+        }
+    }
+
+    spawn_on(best as u32, name, entry, argument, hhdm_base)
+}
+
+/// Moves one thread from a busier CPU's queue into `mine`, if that is worth
+/// doing. Returns the slot it landed in.
+///
+/// The caller holds `mine`'s lock and no other. Victims are probed with
+/// `try_lock`, so two CPUs that pick each other both fail rather than
+/// deadlock; the cost of losing that race is one skipped steal.
+fn try_steal(cpu: usize, mine: &mut RunQueue) -> Option<usize> {
+    let online = percpu::online_count() as usize;
+    if online < 2 {
+        return None;
+    }
+
+    let my_load = mine.runnable();
+    let free = mine.free_slot()?;
+
+    // Start at the next CPU rather than at zero, so that CPUs going idle
+    // together do not all descend on the same victim.
+    for offset in 1..online {
+        let victim = (cpu + offset) % online;
+
+        let mut theirs = match QUEUES[victim].try_lock() {
+            Some(queue) => queue,
+            None => continue,
+        };
+
+        let Some(slot) = theirs.steal_candidate(my_load) else {
+            continue;
+        };
+        let Some(mut thread) = theirs.threads[slot].take() else {
+            continue;
+        };
+        drop(theirs);
+
+        thread.migrations += 1;
+        mine.threads[free] = Some(thread);
+        STEALS.fetch_add(1, Ordering::Relaxed);
+        return Some(free);
+    }
+
+    None
+}
+
+/// Records that the switch this CPU began has finished.
+///
+/// Called on the way out of every switch: from [`preempt`] for a thread that
+/// has run before, and from the trampoline via `bhaskix_thread_entered` for
+/// one that has not. Until it runs, no other CPU will steal from here — so
+/// missing a path does not corrupt anything, it quietly stops balancing.
+fn finish_switch() {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu < MAX_CPUS {
+        QUEUES[cpu].lock().switching = false;
+    }
+}
+
+/// Hook the thread trampoline calls before a brand-new thread starts.
+///
+/// A new thread never returns into [`bhaskix_context_switch`], so this is the
+/// only place its arrival can be observed.
+extern "C" fn thread_entered() {
+    finish_switch();
 }
 
 /// Allows the calling CPU to start preempting.
@@ -251,9 +468,16 @@ pub fn preempt() {
         }
 
         let current = queue.current;
-        let next = queue.next_runnable(current);
+        let mut next = queue.next_runnable(current);
         if next == current {
-            return;
+            // Nothing else here to run. This is the cheapest moment to
+            // balance and the only one implemented: the CPU is about to have
+            // no work, so anything it takes costs nothing to run.
+            // `docs/scheduler.md` §5 calls this the idle pull.
+            match try_steal(cpu, &mut queue) {
+                Some(stolen) => next = stolen,
+                None => return,
+            }
         }
 
         if let Some(thread) = queue.threads[current].as_mut()
@@ -266,6 +490,11 @@ pub fn preempt() {
             thread.runs += 1;
         }
         queue.current = next;
+
+        // Everything from here until `finish_switch` is the window rule 2
+        // exists for: `current` is marked `Ready`, the lock is about to be
+        // released, and its registers have not been saved yet.
+        queue.switching = true;
 
         // Raw pointers to the two contexts, taken one at a time so each borrow
         // ends before the next begins.
@@ -292,12 +521,18 @@ pub fn preempt() {
 
     if let Some((from, to)) = switch {
         SWITCHES.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: both pointers address `Context` fields inside this CPU's own
-        // static runqueue, which outlives every thread; `to` was prepared by
-        // `spawn_on` or saved by a previous switch on this same CPU.
-        // Interrupts are disabled -- this is only reached from an interrupt
-        // gate or with them masked.
+        // SAFETY: both pointers address `Context` fields inside a static
+        // runqueue, which outlives every thread. Both were taken from *this*
+        // CPU's queue under its lock, and `switching` stops any other CPU
+        // moving either of them out from under this switch. `to` was prepared
+        // by `spawn_on` or saved by a previous switch.
         unsafe { bhaskix_context_switch(from, to) };
+
+        // Reached when this thread is scheduled again, which may be much later
+        // and -- since stealing -- on a different CPU. `finish_switch` reads
+        // the CPU afresh rather than trusting `cpu` above, which by now may
+        // name the processor this thread used to be on.
+        finish_switch();
     }
 }
 
@@ -328,8 +563,35 @@ pub fn switches() -> u64 {
     SWITCHES.load(Ordering::Relaxed)
 }
 
-/// Runs `f` for each live thread: `(cpu, id, name, state, runs)`.
-pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64)) {
+/// Total threads moved between CPUs.
+#[must_use]
+pub fn steals() -> u64 {
+    STEALS.load(Ordering::Relaxed)
+}
+
+/// Which CPU's queue holds thread `id`, if any still does.
+///
+/// Only meaningful as a snapshot: the answer can change the moment it is
+/// returned, which is the whole point of migration.
+#[must_use]
+pub fn cpu_of(id: u32) -> Option<u32> {
+    for (cpu, queue) in QUEUES
+        .iter()
+        .enumerate()
+        .take(percpu::online_count() as usize)
+    {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        if queue.threads.iter().flatten().any(|thread| thread.id == id) {
+            return Some(cpu as u32);
+        }
+    }
+    None
+}
+
+/// Runs `f` for each live thread: `(cpu, id, name, state, runs, migrations)`.
+pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64)) {
     for (cpu, queue) in QUEUES
         .iter()
         .enumerate()
@@ -345,7 +607,96 @@ pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64)) {
                 thread.name,
                 thread.state,
                 thread.runs,
+                thread.migrations,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A queue holding `states`, none pinned, with slot 0 as the pinned thread
+    /// every CPU has.
+    fn with(states: &[State]) -> RunQueue {
+        let mut queue = RunQueue::new();
+        for (slot, state) in states.iter().enumerate() {
+            queue.threads[slot] = Some(Thread {
+                id: slot as u32,
+                name: "t",
+                context: Context::new(),
+                state: *state,
+                runs: 0,
+                migrations: 0,
+                pinned: slot == 0,
+            });
+        }
+        queue
+    }
+
+    #[test]
+    fn finished_threads_do_not_count_towards_load() {
+        let queue = with(&[State::Running, State::Ready, State::Finished]);
+        assert_eq!(queue.runnable(), 2);
+    }
+
+    #[test]
+    fn the_thread_a_cpu_booted_on_is_never_stolen() {
+        // Slot 0 is pinned and Ready -- the only tempting candidate. Taking it
+        // would move a CPU's own boot stack to another processor, and leave a
+        // secondary with nothing to run once its queue drained.
+        let mut queue = with(&[State::Ready, State::Running, State::Ready, State::Ready]);
+        queue.current = 1;
+        assert_eq!(queue.steal_candidate(1), Some(2));
+    }
+
+    #[test]
+    fn a_running_thread_is_never_stolen() {
+        // Its context is not stale -- it is the stack the victim is on.
+        let queue = with(&[State::Ready, State::Running, State::Running]);
+        assert_eq!(queue.steal_candidate(0), None);
+    }
+
+    #[test]
+    fn a_finished_thread_is_never_stolen() {
+        let queue = with(&[State::Ready, State::Finished, State::Finished]);
+        assert_eq!(queue.steal_candidate(0), None);
+    }
+
+    #[test]
+    fn nothing_is_stolen_from_a_cpu_midway_through_a_switch() {
+        // The `Ready` thread in slot 1 has been marked but not yet saved.
+        let mut queue = with(&[State::Running, State::Ready, State::Ready, State::Ready]);
+        assert!(queue.steal_candidate(1).is_some());
+        queue.switching = true;
+        assert_eq!(queue.steal_candidate(1), None);
+    }
+
+    #[test]
+    fn a_steal_never_makes_the_imbalance_worse() {
+        // Victim 2, thief 1. Moving one leaves 1 and 2 -- the same gap, the
+        // other way round -- so the thread would migrate forever.
+        let queue = with(&[State::Running, State::Ready]);
+        assert_eq!(queue.runnable(), 2);
+        assert_eq!(queue.steal_candidate(1), None);
+
+        // Victim 3, thief 1. Moving one leaves 2 and 2, which is stable.
+        let queue = with(&[State::Running, State::Ready, State::Ready]);
+        assert_eq!(queue.steal_candidate(1), Some(1));
+    }
+
+    #[test]
+    fn an_idle_cpu_takes_from_a_queue_of_three() {
+        let queue = with(&[State::Running, State::Ready, State::Ready]);
+        assert_eq!(queue.steal_candidate(0), Some(1));
+    }
+
+    #[test]
+    fn free_slot_finds_the_first_gap() {
+        let mut queue = with(&[State::Running, State::Ready, State::Ready]);
+        assert_eq!(queue.free_slot(), Some(3));
+        queue.threads[1] = None;
+        assert_eq!(queue.free_slot(), Some(1));
     }
 }

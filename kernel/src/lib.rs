@@ -583,6 +583,13 @@ static OBSERVED_CPU: [core::sync::atomic::AtomicU64; 4] = [
     core::sync::atomic::AtomicU64::new(u64::MAX),
 ];
 
+/// Set once the pinning phase is done, to retire its workers.
+///
+/// The migration phase needs CPUs that are genuinely idle, and a worker that
+/// spins forever is not idle. Retiring them is also the only exercise `exit`
+/// gets.
+static RETIRE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// A worker that never yields.
 ///
 /// Never yielding is the point: if its counter advances, only its CPU's timer
@@ -590,6 +597,9 @@ static OBSERVED_CPU: [core::sync::atomic::AtomicU64; 4] = [
 extern "C" fn worker(id: u64) -> ! {
     use core::sync::atomic::Ordering;
     loop {
+        if RETIRE.load(Ordering::Relaxed) {
+            sched::exit();
+        }
         if let Some(counter) = WORK.get(id as usize) {
             counter.fetch_add(1, Ordering::Relaxed);
         }
@@ -598,6 +608,149 @@ extern "C" fn worker(id: u64) -> ! {
         }
         core::hint::spin_loop();
     }
+}
+
+/// Every CPU each migration worker has observed itself on, as a bitmask.
+///
+/// A set rather than a latest value, because the question is whether a thread
+/// created on one CPU ever ran on another — and by the time the test reads
+/// this, a migrated thread would look identical to one created where it ended
+/// up.
+///
+/// Four entries for three migrants: the load-placement thread shares the same
+/// worker body and needs a slot of its own. Giving it index 0 made it write
+/// into migrant 0's set, which recorded a migration that never happened.
+static MIGRANT_CPUS: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index in [`MIGRANT_CPUS`] belonging to the load-placement thread.
+const PLACED_SLOT: u64 = 3;
+
+/// A worker for the migration phase. Records where it runs, never yields.
+extern "C" fn migrant(id: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    loop {
+        if let Some(seen) = MIGRANT_CPUS.get(id as usize) {
+            seen.fetch_or(1 << bhaskix_arch::percpu::cpu_id(), Ordering::Relaxed);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Spins until `ticks` timer interrupts have elapsed, or a bound is hit.
+///
+/// The bound matters: a test that hangs a machine reports nothing at all,
+/// which is strictly worse than a test that fails.
+fn wait_ticks(ticks: u64) {
+    let deadline = trap::ticks() + ticks;
+    let mut spins = 0u64;
+    while trap::ticks() < deadline && spins < 2_000_000_000 {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+}
+
+/// Checks that work moves from a loaded CPU to idle ones.
+///
+/// Every worker is created on CPU 0 on purpose. Nothing balances at creation
+/// here — the imbalance is the input. If the other CPUs stay idle while CPU 0
+/// holds four runnable threads, there is no balancing, and the previous
+/// milestone's test would not have noticed: a thread that never leaves the CPU
+/// it was created on is exactly what that test asserts.
+fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("    migration      skipped, only one cpu online");
+        return true;
+    }
+
+    // Sampled before the spawns, not after. Balancing is not deferred to the
+    // wait below: the other CPUs are idle and their timers are running, so
+    // they steal the first migrant while this CPU is still allocating a stack
+    // for the second. Sampling after the spawns measured a window in which
+    // everything had already happened, and reported zero.
+    let steals_before = sched::steals();
+
+    const NAMES: [&str; 3] = ["migrant-0", "migrant-1", "migrant-2"];
+    for (id, name) in NAMES.iter().enumerate() {
+        if let Err(error) = sched::spawn_on(0, name, migrant, id as u64, hhdm_base) {
+            println!("    migration      FAILED to spawn on cpu 0: {error:?}");
+            return false;
+        }
+    }
+
+    // With CPU 0 now holding four runnable threads and every other CPU one,
+    // load-aware placement has exactly one correct answer: not CPU 0. Checked
+    // before anything runs, so this measures the placement decision rather
+    // than whatever balancing happens afterwards.
+    let placed = match sched::spawn("placed", migrant, PLACED_SLOT, hhdm_base) {
+        Ok(id) => id,
+        Err(error) => {
+            println!("    migration      FAILED to place a thread: {error:?}");
+            return false;
+        }
+    };
+    let placed_on = sched::cpu_of(placed);
+
+    wait_ticks(80);
+    let steals = sched::steals() - steals_before;
+
+    let mut ok = true;
+
+    if steals == 0 {
+        println!("    migration      FAILED: no thread was stolen");
+        ok = false;
+    }
+
+    if placed_on == Some(0) || placed_on.is_none() {
+        println!(
+            "    migration      FAILED: load-aware spawn chose cpu {placed_on:?}, not an idle one"
+        );
+        ok = false;
+    }
+
+    // The property: at least one thread created on CPU 0 ran somewhere else.
+    // The steal counter alone would not prove it -- a counter can be
+    // incremented by a steal that moved a thread nowhere useful.
+    let mut moved = 0u64;
+    for (id, seen) in MIGRANT_CPUS.iter().enumerate().take(NAMES.len()) {
+        let mask = seen.load(Ordering::Relaxed);
+        if mask == 0 {
+            println!("    migration      FAILED: migrant {id} never ran");
+            ok = false;
+        } else if mask & !1 != 0 {
+            moved += 1;
+        }
+    }
+
+    if moved == 0 {
+        println!("    migration      FAILED: every migrant stayed on cpu 0 ({steals} steals)");
+        ok = false;
+    }
+
+    // The counter and the per-thread flags are written together under the
+    // same lock, so they cannot legitimately disagree. If they do, one of the
+    // two is being updated on a path the other is not.
+    if moved > steals {
+        println!(
+            "    migration      FAILED: {moved} threads moved but only {steals} steals counted"
+        );
+        ok = false;
+    }
+
+    if ok {
+        println!(
+            "    migration      {steals} threads stolen; {moved} of 3 ran off their creating cpu; placement chose cpu {}",
+            placed_on.unwrap_or(u32::MAX)
+        );
+    }
+
+    ok
 }
 
 /// Spawns one worker per CPU and checks each ran on the CPU it was created on.
@@ -626,14 +779,7 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
     // Run for a fixed number of ticks. Every CPU contributes to the counter,
     // so this is shorter in wall-clock terms on a bigger machine -- which is
     // fine, since what is being measured is progress rather than duration.
-    let deadline = trap::ticks() + 60;
-    let mut spins = 0u64;
-    while trap::ticks() < deadline && spins < 2_000_000_000 {
-        spins += 1;
-        core::hint::spin_loop();
-    }
-
-    sched::stop_all();
+    wait_ticks(60);
 
     let switches = sched::switches() - switches_before;
 
@@ -660,12 +806,24 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
 
     if ok {
         println!(
-            "    threads        {switches} preemptions across {cpus} cpus; each worker ran on its own cpu"
+            "    threads        {switches} preemptions across {cpus} cpus; each worker ran on the cpu it was created on"
         );
     }
 
-    sched::for_each(|cpu, id, name, state, runs| {
-        println!("      cpu {cpu}  thread {id}  {name:<9} {state:?}  {runs} runs");
+    // Retire the pinning workers before measuring migration. They are pinned
+    // only by circumstance -- one per CPU, so no CPU is ever idle enough to
+    // steal -- and leaving them running would mean the migration phase found
+    // a perfectly balanced machine and correctly did nothing.
+    RETIRE.store(true, Ordering::Release);
+    wait_ticks(30);
+
+    ok &= migration_self_test(hhdm_base, cpus);
+
+    sched::stop_all();
+
+    sched::for_each(|cpu, id, name, state, runs, migrations| {
+        let moved = if migrations > 0 { " (migrated)" } else { "" };
+        println!("      cpu {cpu}  thread {id}  {name:<9} {state:?}  {runs} runs{moved}");
     });
 
     ok

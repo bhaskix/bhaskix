@@ -231,10 +231,23 @@ fi
 # runqueues are genuinely per-CPU. A single global queue would still preempt --
 # it would just run every worker wherever a slot came free, which is exactly
 # what this milestone claims to have stopped doing.
-if grep -qE "threads +[0-9]+ preemptions across [0-9]+ cpus; each worker ran on its own cpu" "$LOG"; then
+if grep -qE "threads +[0-9]+ preemptions across [0-9]+ cpus; each worker ran on the cpu it was created on" "$LOG"; then
     pass "threads preempted by the timer, each on its own runqueue"
 else
     fail "per-CPU timer-driven preemption did not work"
+    status=1
+fi
+
+# Balancing. The previous assertion requires threads to stay where they were
+# created; this one requires them to move. They are not in tension: the first
+# runs with one thread per CPU, where there is no imbalance to correct, and
+# this one deliberately creates every thread on CPU 0. A kernel that pinned
+# threads forever would pass the first and fail this; a kernel that scattered
+# them at random would pass this and fail the first.
+if grep -qE "migration +[0-9]+ threads stolen; [1-9][0-9]* of [0-9]+ ran off their creating cpu" "$LOG"; then
+    pass "idle CPUs steal work from a loaded one"
+else
+    fail "work stealing did not move any thread"
     status=1
 fi
 

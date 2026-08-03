@@ -99,7 +99,8 @@ fairness within 2% for two equal-weight workloads.
 | M4-05 | SMP bring-up, per-CPU areas | ✅ `DONE` | 1, 2, 4 and 8 CPUs all come online; boot test asserts N-of-N. Secondaries schedule as of M4-06. |
 | M4-05b | Per-CPU GDT and TSS | ✅ `DONE` | Each CPU builds its own, with its own IST stacks; secondaries now idle with interrupts *enabled* |
 | M4-06 | Per-CPU runqueues | ✅ `DONE` | One lock-per-CPU queue; threads are *owned* by a CPU. **Negative-tested**: forcing every thread onto CPU 0 fails the gate. |
-| M4-06b | Work stealing and migration | ⬜ `TODO` | A thread runs on its creating CPU forever; an idle CPU stays idle while another has a queue. `docs/scheduler.md` §5. |
+| M4-06b | Work stealing and migration | ✅ `DONE` | Idle pull plus load-aware placement. **Negative-tested**: each of the three steal rules and the imbalance threshold has a unit test that fails when that rule alone is removed. |
+| M4-06c | Topology-aware balancing, periodic push | ⬜ `TODO` | No ACPI topology, so every CPU is equidistant; balancing is pull-only. `docs/scheduler.md` §5.1 and §5.3. |
 | M4-07 | Fair class (virtual deadline), RT class | ⬜ `TODO` | Currently plain round-robin |
 | M4-08 | Lock ranking, active in debug builds | ⬜ `TODO` | `docs/coding-style.md` §7 requires it |
 | M4-09 | Sleeping, wait queues, blocking | ⬜ `TODO` | A thread is runnable or finished; nothing waits |
@@ -133,10 +134,14 @@ fairness within 2% for two equal-weight workloads.
 
 ### Honest notes on what is *not* proven
 
-- **Secondary CPUs run threads, but only threads created on them.** There is no migration and no
-  work stealing, so an idle CPU stays idle while another has a queue, and the fairness that does
-  exist is fairness *within* one CPU. The boot test spawns evenly by hand, which is precisely the
-  balancing the kernel cannot yet do for itself.
+- **Balancing is pull-only, topology-blind and uncharged.** A CPU steals when it would otherwise
+  run only the thread already on it; nothing pushes work, nothing runs periodically, and there is
+  no ACPI topology, so a steal is as likely to cross a socket as to stay on one. Migration cost is
+  not measured, so `docs/scheduler.md` §5's rule that a move must pay for itself is not enforced —
+  the only brake is the imbalance threshold.
+- **Convergence rests on one constant.** `STEAL_IMBALANCE = 2` is what stops a thread migrating
+  back and forth forever. It is unit-tested and argued for in `docs/scheduler.md` §5, but it has
+  never been tested against a workload that changes shape while it runs.
 - **Shootdown is one address per IPI round trip, and one shootdown at a time.** Tearing down a range
   costs a round trip per page, which is the wrong shape for address-space teardown; batching is the
   obvious next step and deliberately untaken until there is a workload to measure. Teardown avoids
@@ -151,8 +156,10 @@ fairness within 2% for two equal-weight workloads.
   fairness weighting, no virtual deadlines, no RT class, no admission control. The fairness figure
   printed at boot is reported rather than asserted, because a tight bound on round-robin would be
   measuring timer jitter rather than any property worth defending.
-- **Load balancing and work stealing are untouched.** The runqueues are per-CPU and sound, but
-  nothing moves a thread between them; `docs/scheduler.md` §5 is entirely unbuilt.
+- **The `switching` handshake has not been observed doing its job.** It is the rule that stops a
+  thief taking a thread whose registers are not yet saved, and it is the one hazard here that
+  corrupts state rather than merely stranding it. Removing it fails a unit test, which proves the
+  policy encodes the rule — not that the race it guards against was ever reached.
 - **Threads cannot block.** There is no sleep, no wait queue and no wakeup path, so "no lost
   wakeups" — half the exit criterion — is not merely unproven but not yet expressible.
 - **Thread capacity is fixed at 8 per CPU** and stacks are never reclaimed. `exit` marks a thread finished
@@ -225,6 +232,38 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M4-06b, work stealing and migration)
+
+- **A CPU that would otherwise idle takes work from a busier one.** `docs/scheduler.md` §5 calls
+  this the idle pull and expects most balancing to happen here, because it is free: the CPU had
+  nothing to do. Creation also places a thread on the least-loaded CPU, which is cheaper than
+  moving it afterwards.
+- **Stealing moves ownership, which is what keeps the previous milestone's soundness argument.**
+  A thread leaves the victim's queue and enters the thief's, under one lock at a time, and is
+  afterwards owned by the thief exactly as if it had been created there. At no point do two CPUs
+  hold pointers to the same context.
+- **Three rules make that true, and every one of them is invisible when broken.** Only `Ready`
+  threads move; never from a CPU partway through a switch; never the thread a CPU booted on. The
+  middle one is the subtle one: a thread is marked `Ready` *before* the switch that saves its
+  registers, and the runqueue lock is released in between — it has to be, since the incoming thread
+  takes it — so `Ready` alone admits a thread whose context is not yet written.
+- **The policy is unit-tested, not boot-tested, and that was a deliberate correction.** The first
+  attempt at a negative test removed the pinned-thread rule and the boot test still passed: the
+  hazard is a race that a single boot cannot be relied on to provoke. Extracting the decision into
+  one pure function made each rule fail a specific test when removed, which is the difference
+  between a rule that is enforced and a rule that is merely written down.
+- **`STEAL_IMBALANCE = 2`, not 1.** At one, a thief with a single thread takes from a CPU with two,
+  leaving two and one — and the victim, now lighter, takes it straight back. The thread migrates
+  forever instead of running.
+- **A bug in the test, found by a consistency check in the test.** The steal counter and the
+  per-thread migration counters are written together under one lock and cannot legitimately
+  disagree; asserting that caught the load-placement thread writing into migrant 0's record,
+  because both were passed the same index. Without that check the phase would have reported success
+  on two runs out of three.
+- **Latent stack misalignment in the thread trampoline, fixed in passing.** It called the entry
+  point with RSP 0 modulo 16, where the ABI promises 8. Nothing had noticed because the target
+  disables SSE, and nothing would have until the first aligned vector access.
 
 ### 2026-08-03 (M4-06, per-CPU runqueues)
 

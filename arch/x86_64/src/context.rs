@@ -24,7 +24,20 @@
 //!   touch it is a large invisible cost.
 //! - **`CR3`.** Every thread currently shares the kernel address space. Address
 //!   space switching belongs with processes in M5.
-//! - **Per-CPU state.** There is one CPU.
+//!
+//! # The hook a scheduler may register
+//!
+//! Every way out of a switch returns into [`bhaskix_context_switch`]'s caller
+//! — except one. A thread that has never run is entered through the
+//! trampoline and never returns there at all, so a scheduler has no way to
+//! observe that the switch completed. [`set_thread_entered`] registers a
+//! callback the trampoline invokes for exactly that case.
+//!
+//! It matters to anything that migrates threads: a CPU partway through a
+//! switch is holding a thread whose registers are not yet saved, and the
+//! moment that stops being true is the only safe point to say so.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// A suspended thread's saved state.
 ///
@@ -70,9 +83,13 @@ impl Context {
     ) {
         // One dead slot at the very top. After the `ret` in `switch`, RSP will
         // be `stack_top - 8`, which is 8 modulo 16 -- exactly the alignment
-        // the SysV ABI guarantees at a function's first instruction. Skipping
-        // this yields a 16-aligned RSP instead, and the resulting misaligned
-        // SSE accesses surface deep inside unrelated code.
+        // the SysV ABI guarantees at a function's first instruction, and so
+        // exactly what the trampoline is entitled to assume. Skipping this
+        // yields a 16-aligned RSP instead, and the resulting misaligned SSE
+        // accesses surface deep inside unrelated code.
+        //
+        // The trampoline re-aligns from there before calling the entry point,
+        // because a `call` needs RSP 0 modulo 16 to hand the callee 8.
         let mut sp = stack_top - 8;
 
         // SAFETY: the caller guarantees the stack is mapped and large enough;
@@ -123,6 +140,38 @@ unsafe extern "C" {
     /// Never called directly; [`Context::prepare`] arranges for the switch to
     /// `ret` into it.
     pub fn bhaskix_thread_trampoline();
+}
+
+/// Registered callback for "a brand-new thread has started".
+///
+/// A pointer rather than a linker-level override: a weak symbol in this crate
+/// and a strong one in the kernel end up in the same object under LTO, which
+/// is a link error rather than an override. This keeps the dependency pointing
+/// the right way — the kernel knows about the arch crate, not the reverse —
+/// without asking the linker to arbitrate.
+static THREAD_ENTERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers the callback the thread trampoline invokes.
+///
+/// Idempotent, and safe to call from every CPU. Must be registered before the
+/// first thread is created; a switch into a new thread with no callback
+/// registered is not an error, it simply reports nothing.
+pub fn set_thread_entered(hook: extern "C" fn()) {
+    THREAD_ENTERED.store(hook as usize, Ordering::Release);
+}
+
+/// Called by the trampoline, with interrupts still disabled.
+#[unsafe(no_mangle)]
+extern "C" fn bhaskix_thread_entered() {
+    let hook = THREAD_ENTERED.load(Ordering::Acquire);
+    if hook == 0 {
+        return;
+    }
+    // SAFETY: the value is either zero, handled above, or was written by
+    // `set_thread_entered` from an `extern "C" fn()` -- the only writer, and
+    // the only type it accepts.
+    let hook: extern "C" fn() = unsafe { core::mem::transmute(hook) };
+    hook();
 }
 
 /// Convenience wrapper over [`bhaskix_context_switch`].
@@ -186,6 +235,21 @@ bhaskix_context_switch:
 .globl bhaskix_thread_trampoline
 .align 16
 bhaskix_thread_trampoline:
+    // Align for the two calls below. On entry RSP is 8 modulo 16 -- what the
+    // ABI guarantees at a function's first instruction -- and `call` pushes
+    // eight more, so RSP must be 0 modulo 16 *before* a call for the callee to
+    // see the alignment it is entitled to. Without this the entry point runs
+    // one quadword out, which is invisible until the first aligned SSE access
+    // and then faults somewhere with no relation to the cause.
+    sub rsp, 8
+
+    // Tell the scheduler the switch that brought us here has completed. Every
+    // other path out of a switch returns into `bhaskix_context_switch`'s
+    // caller, which can do this itself; a brand-new thread never returns
+    // there, so without this call its CPU would stay marked mid-switch and no
+    // other CPU would steal from it again.
+    call bhaskix_thread_entered
+
     // Interrupts must be re-enabled by hand here, and getting this wrong is a
     // silent hang rather than a crash.
     //
@@ -195,9 +259,13 @@ bhaskix_thread_trampoline:
     // which cleared IF on entry. Without this `sti` the first thread scheduled
     // would run with interrupts disabled forever -- so the timer that would
     // preempt it never fires again, and the machine simply stops.
+    //
+    // It comes *after* the call above so that the scheduler bookkeeping runs
+    // with interrupts still masked, and cannot be preempted halfway.
     sti
     mov rdi, rbx
     call r12
     ud2
+
 "#
 );

@@ -47,8 +47,8 @@ stealing is the design that works; we start there rather than migrating later.
 > thread is *owned* by the CPU whose queue holds it. That ownership is what makes the switch path
 > sound on more than one processor: a CPU takes raw pointers to contexts in its own queue only, so
 > there is no cross-CPU sharing to race against rather than a race that is prevented. What exists is
-> a single round-robin list per CPU, not the four classes above — no RT, no Fair tree, no Batch, and
-> **no stealing**, so an idle CPU stays idle while another has a queue. §5 is unbuilt.
+> a single round-robin list per CPU, not the four classes above — no RT, no Fair tree, no Batch.
+> Idle pull (§5.2) landed at M4-06b; the rest of §5 is unbuilt.
 
 ### Strict class priority
 
@@ -139,6 +139,27 @@ Runs periodically and on wakeup, cheapest option first:
 
 Migration cost is charged: a thread is not migrated unless the estimated imbalance improvement
 exceeds its measured migration cost. NUMA migrations are charged much more than LLC-local ones.
+
+> **Implemented, in part, as of M4-06b.** Idle pull (2) exists: a CPU whose queue holds nothing but
+> the thread already on it takes one from a CPU with at least two more, and creation places a thread
+> on the least-loaded CPU, which is a crude stand-in for (1). Nothing pushes, nothing runs
+> periodically, and nothing knows the topology — there is no ACPI parsing yet, so every CPU is
+> equidistant and a steal is as likely to cross a socket as to stay on one. Migration cost is not
+> measured and therefore not charged; the only brake is the imbalance threshold below.
+>
+> **Why the threshold is two and not one.** At one, a CPU with a single thread would take from a CPU
+> with two, leaving two and one — and the victim, now the lighter of the pair, would take it back on
+> its next tick. The thread would spend its life migrating instead of running. Requiring a gap of
+> two means a move leaves the pair no more unbalanced than it found them. This is the whole of the
+> convergence argument today, which is why it is unit-tested rather than left to a comment.
+>
+> **What makes a steal safe.** Moving a thread is moving *ownership*: it leaves the victim's queue
+> and enters the thief's, under one lock at a time, and afterwards is owned by the thief exactly as
+> if created there. Three rules keep that true, and each is unit-tested by removing it — only
+> `Ready` threads move (a `Running` thread's context is the stack the victim is standing on); never
+> from a CPU partway through a switch (a thread is marked `Ready` *before* its registers are saved,
+> and the lock is released in between); and never the thread a CPU booted on. The victim's lock is
+> taken with `try_lock`, so two CPUs that pick each other both fail rather than deadlock.
 
 ---
 
@@ -244,3 +265,12 @@ none of those exist. What the boot test does check, at `-smp 4`, is the one prop
 actually claims — that each worker thread ran on the CPU it was created on, and that the timer
 preempted it there. The test was verified by breaking it: forcing every thread onto CPU 0 makes it
 fail, which is what distinguishes a per-CPU runqueue from a global one that happens to work.
+
+A second boot assertion covers balancing, and deliberately requires the opposite: every thread is
+created on CPU 0, and at least one must end up elsewhere. The two are not in tension — the first
+runs one thread per CPU, where there is no imbalance to correct. A kernel that pinned threads
+forever passes the first and fails the second; one that scattered them at random does the reverse.
+
+The steal *policy* is unit-tested rather than boot-tested, because every rule in it is invisible
+when broken: dropping the pinned check does not fail a boot, it strands a CPU minutes later when its
+queue happens to drain. Each rule has a test that fails when that rule alone is removed.
