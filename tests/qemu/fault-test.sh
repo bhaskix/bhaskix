@@ -46,7 +46,8 @@ faulting address
 page not present
 while writing'
   [df]='EXCEPTION: double fault (#DF)
-second fault occurred while delivering
+kernel stack overflow
+guard page
 own IST stack'
 )
 

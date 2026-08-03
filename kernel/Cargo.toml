@@ -30,7 +30,9 @@ workspace = true
 # The last increase is the APIC and PIC setup sequence in `trap::enable` and
 # the end-of-interrupt calls in the dispatcher, none of which can be expressed
 # safely -- they are device register writes with ordering requirements.
-# 197 used at M3. The increase is `memory.rs` turning a physical address into
-# the `&'static mut [Frame]` backing the frame database, and `vm.rs` driving
-# the page-table walker and zeroing freshly allocated frames.
-unsafe_budget = 220
+# 249 used at M3. The increases are `memory.rs` turning a physical address into
+# the `&'static mut [Frame]` backing the frame database, `vm.rs` driving the
+# page-table walker and zeroing freshly allocated frames, and `stack.rs`
+# switching RSP -- which no safe abstraction can express, since changing the
+# stack pointer invalidates every local in the frame doing it.
+unsafe_budget = 280

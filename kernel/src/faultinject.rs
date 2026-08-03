@@ -148,43 +148,31 @@ fn page_fault() {
     unsafe { core::ptr::write_volatile(address, 0x1234) };
 }
 
-/// Triggers a double fault by pushing onto an unmapped stack.
+/// Overflows the kernel stack, which faults on its guard page.
 ///
-/// The `push` raises a page fault. Delivering that page fault requires pushing
-/// an exception frame — onto the same unmapped stack — which faults again, and
-/// a fault during fault delivery is a double fault. `IST1` gives the
-/// double-fault handler a known-good stack, which is why this reports instead
-/// of resetting the machine (`arch::gdt`).
+/// This is the realistic cause of a double fault, and until M3 it could not be
+/// tested at all: the kernel ran on the bootloader's stack, which has no guard
+/// page, so an overflow silently scribbled over the page tables until the
+/// machine died in a way no handler could report. With a guarded stack
+/// (`crate::stack`) the overflow faults on the guard instead.
 ///
-/// # Why not recursion
+/// The escalation is the point. The guard page raises a page fault; delivering
+/// it requires pushing an exception frame onto the stack that just ran out, so
+/// that faults too; a fault during fault delivery is a double fault, and the
+/// double-fault handler runs on `IST1` with a known-good stack. Which is why
+/// this reports rather than resetting the machine.
 ///
-/// The realistic cause of a double fault is kernel stack overflow, and the
-/// obvious test is unbounded recursion. That does not work yet, and the reason
-/// is worth recording: **the kernel stack has no guard page.** It is the stack
-/// the bootloader provided, and the higher-half direct map means the memory
-/// below it is mapped and writable — so an overflowing stack silently scribbles over
-/// whatever is there (in practice, the page tables) until the machine dies in
-/// a way no handler can report.
-///
-/// Guard pages need virtual memory management, which is M3. Until then this
-/// deterministic trigger tests the same mechanism — IST1 and the double-fault
-/// handler — without depending on memory management that does not exist.
-/// Testing the genuine stack-overflow path is tracked as an M3 task.
+/// The unconditional recursion is the mechanism, not an oversight.
+#[allow(unconditional_recursion)]
 fn double_fault() {
-    // A canonical higher-half address well outside both the HHDM and the
-    // kernel image, so it is reliably unmapped.
-    const UNMAPPED_STACK: u64 = 0xffff_9000_dead_0000;
-
-    // SAFETY: deliberately points RSP at unmapped memory and pushes, which is
-    // guaranteed to fault and then escalate. Nothing after this executes, and
-    // `noreturn` tells the compiler so -- there is no state to preserve
-    // because control never comes back to Rust on this stack.
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, {bad_stack}",
-            "push 0",
-            bad_stack = in(reg) UNMAPPED_STACK,
-            options(noreturn),
-        );
-    }
+    // A volatile write to a local in every frame, so the recursion cannot be
+    // flattened into a loop by tail-call optimisation -- which would spin
+    // forever instead of consuming stack.
+    let mut anchor = [0u64; 16];
+    // SAFETY: `anchor` is a live local; the write is only here to force the
+    // frame to be allocated and retained.
+    unsafe { core::ptr::write_volatile(&raw mut anchor[0], 1) };
+    double_fault();
+    // SAFETY: as above. Unreachable, but keeps the frame live across the call.
+    unsafe { core::ptr::write_volatile(&raw mut anchor[15], 2) };
 }

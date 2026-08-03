@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-03 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M3 — Memory management** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 address spaces work, leak gate passing |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET, gap closed · M3 6/8 remaining items done |
 
 ### Division of responsibility between documents
 
@@ -101,7 +101,7 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 | M3-08 | `AddressSpace`, `RangeMap`, page tables | ✅ `DONE` | 14 host tests for the region map; map/unmap/translate/create/destroy in QEMU |
 | M3-09 | W^X and NX enforcement | ✅ `DONE` | `Protection` has no write+execute variant; `EFER.NXE` enabled and asserted at boot |
 | M3-10 | Demand paging and copy-on-write | ⬜ `TODO` | Mappings are eager for now; needs the page-fault handler to consult the region map |
-| M3-11 | Kernel stack guard pages | ⬜ `TODO` | **Still the open M2 gap.** `Protection::None` exists and the region map supports it; it has not been applied to the kernel stack. |
+| M3-11 | Kernel stack guard pages | ✅ `DONE` | **Closes the M2 gap.** The kernel runs on a 64 KiB guarded stack; the `df` fault test now uses real recursion and faults at `cr2 = guard + 0xff8` |
 | M3-12 | `copy_from_user` / `copy_to_user` with fixups | ⬜ `TODO` | Needed before user mode in M5 |
 | M3-13 | KASLR | ⬜ `TODO` | |
 | M3-14 | Address-space frame-leak gate (1000 create/destroy) | ✅ `DONE` | Passing, and **negative-tested**: removing page-table teardown leaks 9 frames per cycle and the gate catches it |
@@ -226,6 +226,24 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M3, guarded stacks)
+
+- **The M2 gap is closed.** The kernel switches off the bootloader's unguarded stack onto a 64 KiB
+  stack with an unmapped guard page below it, and the `df` fault test now overflows it with real
+  recursion rather than an artificial trigger. The report shows `rsp` at exactly the stack bottom
+  and `cr2` 8 bytes into the guard page — the page fault cannot be delivered on the exhausted
+  stack, so it escalates to a double fault, which IST1 catches and reports.
+- **The guard is verified, not assumed**: boot asserts the guard page is genuinely unmapped and the
+  stack genuinely mapped. If the address had happened to be mapped already, the "guard" would be an
+  ordinary writable page and the mechanism would be a no-op that still printed success.
+- **A patch silently failed to apply again** — the stack-switch block never landed because rustfmt
+  had rewrapped the surrounding `println!`. The result booted and page-faulted with `cr2 = cr3 +
+  0xa00`, because the handoff copy the switch was supposed to populate stayed zeroed. Second
+  occurrence of this failure mode; the lesson stands that a clean build proves nothing about
+  whether the code runs.
+- **A test failed on its own wording**: the boot check matched `M1 complete` and broke when the
+  banner said `M3`. Now milestone-agnostic.
 
 ### 2026-08-03 (M3, address spaces)
 

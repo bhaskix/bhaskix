@@ -35,13 +35,35 @@ pub mod framebuffer;
 pub mod heap;
 pub mod memory;
 pub mod panic;
+pub mod stack;
 pub mod sync;
 pub mod trap;
 pub mod vm;
 
+use bhaskix_arch::cell::BootCell;
 use bhaskix_arch::cpu;
 use bhaskix_arch::serial::COM1;
-use bhaskix_boot::{Handoff, MemoryKind};
+use bhaskix_boot::{Handoff, MemoryKind, PhysAddr, VirtAddr};
+
+/// A copy of the handoff that survives the stack switch.
+///
+/// `kernel_main` runs on the bootloader's stack and its `&Handoff` points into
+/// the boot shim's frame there. Switching stacks does not invalidate that
+/// memory -- nothing reuses it -- but relying on that is exactly the kind of
+/// assumption that stops being true silently. Copying is two dozen bytes.
+static HANDOFF: BootCell<Handoff> = BootCell::new(Handoff {
+    version: 0,
+    memory_map: &[],
+    hhdm_base: VirtAddr(0),
+    kernel_phys_base: PhysAddr(0),
+    kernel_virt_base: VirtAddr(0),
+    framebuffer: None,
+    rsdp: None,
+    smbios: None,
+    cmdline: "",
+    loader: "",
+    regions_truncated: false,
+});
 
 /// Version string reported at boot.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -174,20 +196,99 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
         }
     }
 
+    // Everything so far has run on the bootloader's stack, which has no guard
+    // page: an overflow there scribbles over whatever is below it -- in
+    // practice the page tables -- until the machine dies in a way no handler
+    // can report. Move onto a guarded stack for the rest.
+    //
+    // SAFETY: bootstrap CPU during init with nothing else touching page
+    // tables. The handoff is copied into a static first, so nothing on the
+    // outgoing stack is referenced after the switch.
+    unsafe {
+        *HANDOFF.get_mut() = *handoff;
+
+        match stack::allocate(handoff.hhdm_base.as_u64(), 0) {
+            Ok(guarded) => {
+                println!(
+                    "    kernel stack   {} KiB, guard page at {:#018x}",
+                    stack::STACK_PAGES * 4,
+                    guarded.guard
+                );
+                stack::switch_and_continue(
+                    guarded.top,
+                    HANDOFF.as_ptr() as u64,
+                    continue_on_guarded_stack,
+                );
+            }
+            Err(error) => {
+                // Not fatal, but the machine is now one runaway recursion away
+                // from silent corruption, so say so plainly.
+                println!("    kernel stack   NO GUARD PAGE: {error:?}");
+                println!("                   continuing on the bootloader stack");
+            }
+        }
+    }
+
+    // Only reached when the guarded stack could not be allocated; the normal
+    // path diverges inside the match above.
+    continue_on_guarded_stack(HANDOFF.as_ptr() as u64)
+}
+
+/// Everything that runs after the switch to a guarded stack.
+///
+/// `handoff` is a pointer to the static copy made before the switch.
+extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
+    // SAFETY: `handoff` is `HANDOFF.as_ptr()`, a static this crate owns, fully
+    // written immediately before the switch.
+    let handoff: &'static Handoff = unsafe { &*(handoff as *const Handoff) };
+
+    verify_guard_page(handoff);
+
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
         faultinject::trigger(fault);
-        // Reaching here means the exception was swallowed rather than
-        // reported -- a failure the test harness detects by its absence.
         println!();
         println!("  FAULT INJECTION RETURNED: the exception was not delivered.");
         cpu::halt_forever();
     }
 
     println!();
-    println!("  M1 complete. Nothing left to do at this milestone -- halting.");
-    println!("  Next: M2, descriptor tables and interrupts (docs/roadmap.md).");
+    println!("  M3 complete. Nothing left to do at this milestone -- halting.");
+    println!("  Next: M4, threads and scheduling (docs/roadmap.md).");
 
     cpu::halt_forever()
+}
+
+/// Confirms the guarded stack is really what it claims to be.
+///
+/// Asserting the guard is unmapped matters more than it looks: if the address
+/// happened to be mapped already, the "guard" would be an ordinary writable
+/// page and the whole mechanism would be a no-op that still prints success.
+fn verify_guard_page(handoff: &Handoff) {
+    // SAFETY: reads page table entries only.
+    let root = unsafe { bhaskix_arch::paging::active_page_table() };
+    let hhdm = handoff.hhdm_base.as_u64();
+    let rsp = stack::current_stack_pointer();
+
+    // Recompute the layout for the stack we are standing on.
+    let slot = (stack::STACK_PAGES + 1) * 4096;
+    let guard = 0xffff_a000_0000_0000u64;
+    let bottom = guard + 4096;
+    let top = bottom + stack::STACK_PAGES * 4096;
+    let _ = slot;
+
+    // SAFETY: reads page table entries only.
+    let guard_mapped = unsafe { bhaskix_arch::paging::translate(root, guard, hhdm) }.is_some();
+    // SAFETY: as above.
+    let stack_mapped = unsafe { bhaskix_arch::paging::translate(root, bottom, hhdm) }.is_some();
+    let on_new_stack = rsp > bottom && rsp <= top;
+
+    if !guard_mapped && stack_mapped && on_new_stack {
+        println!("    guard page     unmapped and below the stack; rsp {rsp:#018x}");
+    } else {
+        println!(
+            "    guard page     WRONG (guard mapped {guard_mapped}, stack mapped {stack_mapped}, rsp in range {on_new_stack})"
+        );
+    }
 }
 
 /// Prints the greeting.

@@ -80,12 +80,16 @@ for marker in "${FAILURE_MARKERS[@]}"; do
     fi
 done
 
-# Reaching the last line proves kernel_main ran to completion rather than
+# Reaching the last line proves the kernel ran to completion rather than
 # faulting somewhere in the middle -- which a greeting alone would not show.
-if grep -qF "M1 complete" "$LOG"; then
+#
+# Deliberately milestone-agnostic: an earlier version matched "M1 complete" and
+# broke the moment the banner said M3, which is a test failing on its own
+# wording rather than on the kernel.
+if grep -qF "complete. Nothing left to do at this milestone" "$LOG"; then
     pass "kernel_main ran to completion"
 else
-    fail "kernel_main did not reach the end of M1"
+    fail "the kernel did not run to completion"
     status=1
 fi
 
