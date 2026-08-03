@@ -53,6 +53,38 @@ def crates() -> list[tuple[str, pathlib.Path, int | None]]:
     return sorted(found)
 
 
+def strip_test_modules(lines: list[str]) -> list[str]:
+    """Blank out `#[cfg(test)] mod ... { ... }` blocks, keeping line numbers.
+
+    Test code does not ship, so counting its `unsafe` against a crate's budget
+    distorts the number the budget exists to track: the auditable surface of
+    the kernel as deployed. Blanking rather than deleting keeps reported line
+    numbers pointing at the real file.
+    """
+    output = list(lines)
+    index = 0
+    while index < len(lines):
+        if lines[index].strip().startswith("#[cfg(test)]"):
+            # Find the opening brace of the module that follows.
+            brace = index
+            while brace < len(lines) and "{" not in lines[brace]:
+                brace += 1
+            if brace >= len(lines):
+                break
+            depth = 0
+            end = brace
+            for end in range(brace, len(lines)):
+                depth += lines[end].count("{") - lines[end].count("}")
+                if depth <= 0:
+                    break
+            for blank in range(index, min(end + 1, len(lines))):
+                output[blank] = ""
+            index = end + 1
+            continue
+        index += 1
+    return output
+
+
 def scan(source: str) -> tuple[int, list[int]]:
     """Return (lines inside unsafe blocks, line numbers missing // SAFETY:).
 
@@ -61,7 +93,7 @@ def scan(source: str) -> tuple[int, list[int]]:
     stable and comparable between commits -- and a scanner that anyone can
     read is worth more here than one that is exactly right.
     """
-    lines = source.splitlines()
+    lines = strip_test_modules(source.splitlines())
     unsafe_lines = 0
     missing: list[int] = []
     depth = 0

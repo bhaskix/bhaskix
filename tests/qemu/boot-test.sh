@@ -27,7 +27,8 @@ EXPECT_GREETING="Hello from Bhaskix"
 
 # Strings that mean the boot went wrong even if the greeting appeared.
 FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
-                 "unexpected interrupt on vector" "NO TICKS")
+                 "unexpected interrupt on vector" "NO TICKS"
+                 "LEAK:" "INVARIANT VIOLATED")
 
 fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2; }
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
@@ -102,6 +103,22 @@ if grep -qF "hlt wakes on interrupt" "$LOG"; then
     pass "hlt wakes on interrupt (idle path)"
 else
     fail "hlt did not wake on a timer interrupt"
+    status=1
+fi
+
+# M3: the physical allocator and the heap, asserted on real memory rather than
+# only in host unit tests.
+if grep -qF "self test      passed, no frames leaked" "$LOG"; then
+    pass "buddy allocator: no frames leaked"
+else
+    fail "physical allocator self test did not pass"
+    status=1
+fi
+
+if grep -qF "heap           alloc works, no frames leaked" "$LOG"; then
+    pass "kernel heap: Box and Vec work, no frames leaked"
+else
+    fail "kernel heap self test did not pass"
     status=1
 fi
 

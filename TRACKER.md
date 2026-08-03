@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-03 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M3 — Memory management** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 physical memory done, virtual memory next |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 heap works, virtual memory next |
 
 ### Division of responsibility between documents
 
@@ -97,7 +97,7 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 | M3-04 | Bump → buddy handover | ✅ `DONE` | Consumed ranges tracked and excluded *before* frames reach a free list |
 | M3-05 | Invariant checker | ✅ `DONE` | Walks every free list; caught the handover bug on first run |
 | M3-06 | Boot-time frame-leak self test | ✅ `DONE` | Runs on every boot, not only under test |
-| M3-07 | Slab allocator as `GlobalAlloc` | ⬜ `TODO` | **Blocks the exit criterion** — `Box`/`Vec`/`BTreeMap` do not work yet |
+| M3-07 | Slab allocator as `GlobalAlloc` | ✅ `DONE` | 12 host tests over real page-aligned memory; `Box` and `Vec` verified working in QEMU on BIOS and UEFI |
 | M3-08 | `AddressSpace`, `RangeMap`, page tables | ⬜ `TODO` | Blocks the exit criterion |
 | M3-09 | W^X and NX enforcement | ⬜ `TODO` | `Protection` type must make W+X unrepresentable |
 | M3-10 | Demand paging and copy-on-write | ⬜ `TODO` | |
@@ -108,6 +108,10 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 
 ### Bugs found and fixed during M3
 
+0. **The kernel's `#[global_allocator]` broke the host test suite.** The attribute applies to the
+   whole binary, so under `cargo test` it replaced the *host* harness's allocator with one backed by
+   physical memory that does not exist — the harness failed to allocate 4 bytes before running a
+   single test. Now registered only under `cfg(not(test))`.
 1. **The bump→buddy handover corrupted the free lists.** Marking bump-allocated frames reserved
    *after* adding their regions to the free lists left frames that were simultaneously on a free
    list and reserved. The invariant checker caught it on its first run, which is the entire reason
@@ -138,6 +142,14 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
   platform has a sparse map.
 - **Nothing has been tested above 4 GiB of RAM**, so the `u32` PFN limit (16 TiB) and the zone
   fallback path are untried in practice.
+- **`Frame` grew from 20 to 36 bytes** when `SlabInfo` was added, taking the frame database from
+  1.28 MiB to 2.25 MiB on a 256 MiB machine — about 0.9% of RAM. Linux overlays these fields in a
+  union instead. Worth doing, not yet done.
+- **No red zones, poisoning, or quarantine** in the slab allocator. `docs/memory.md` §4 specifies
+  them for debug builds. They are debugging aids rather than correctness, and were left until the
+  `alloc` machinery worked well enough to test them against.
+- **The slab has never been exercised under memory pressure** — every test had ample free frames, so
+  the out-of-memory paths inside `grow` are covered only by the deliberate-exhaustion unit test.
 
 ### Blockers
 
@@ -203,6 +215,21 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M3, kernel heap)
+
+- **`alloc` works in the kernel.** Slab allocator over the buddy allocator, wired to
+  `#[global_allocator]`; `Box` and `Vec` verified on real hardware paths in QEMU under both BIOS and
+  UEFI, with a boot assertion that no frames leak.
+- **Slab metadata lives in the frame database, not in the slab page**, as `docs/memory.md` §4
+  requires: metadata sharing a page with the objects it describes can be corrupted by an overflow of
+  those objects, and a corrupted free-list head hands the same memory out twice.
+- **12 more host tests**, over a real page-aligned buffer so the pointer arithmetic is exercised
+  rather than modelled — including a 20,000-operation mixed-traffic test that writes through every
+  allocation to catch overlap, and asserts every slab page returns to the buddy allocator.
+- **The `unsafe` budget now excludes test code**, which was distorting the number it exists to
+  produce: the auditable surface of the kernel *as deployed*. `docs/coding-style.md` §3 updated, and
+  the checker re-negative-tested to confirm it still catches unjustified blocks in shipped code.
 
 ### 2026-08-03 (M3, physical memory)
 

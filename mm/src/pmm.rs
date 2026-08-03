@@ -95,11 +95,17 @@ pub struct Frame {
     next: Pfn,
     /// Previous frame on the same free list, or [`NONE`].
     prev: Pfn,
+    /// Slab bookkeeping, valid only while this frame backs a slab.
+    pub slab: SlabInfo,
 }
 
 impl Frame {
     /// A frame that is reserved and on no list.
-    const fn reserved() -> Self {
+    ///
+    /// Public so that a frame database can be constructed for tests without
+    /// exposing any of the allocator's internals.
+    #[must_use]
+    pub const fn reserved() -> Self {
         Self {
             state: FrameState::Reserved,
             order: 0,
@@ -108,12 +114,57 @@ impl Frame {
             owner: NO_OWNER,
             next: NONE,
             prev: NONE,
+            slab: SlabInfo::empty(),
         }
     }
 }
 
 /// Owner value for frames belonging to no domain — the kernel's own.
 pub const NO_OWNER: u32 = u32::MAX;
+
+/// Offset sentinel meaning "no object", used as the null of a slab free list.
+pub const NO_OFFSET: u16 = u16::MAX;
+
+/// Slab bookkeeping for a frame that is backing a slab.
+///
+/// Lives here, in the frame database, rather than in a header at the start of
+/// the slab page. `docs/memory.md` §4 requires that: metadata sharing a page
+/// with the objects it describes can be corrupted by an overflow of those
+/// objects, and a corrupted free-list head is an allocator that hands out the
+/// same memory twice. Keeping it in a separate allocation costs one indirection
+/// on free and removes that entire class of bug.
+///
+/// Meaningless unless the frame is [`FrameState::Allocated`] and was handed to
+/// the slab allocator.
+#[derive(Clone, Copy, Debug)]
+pub struct SlabInfo {
+    /// Byte offset within the page of the first free object, or [`NO_OFFSET`].
+    pub free_head: u16,
+    /// Objects currently handed out from this slab.
+    pub in_use: u16,
+    /// Which size class this slab serves.
+    pub class: u8,
+    /// Next slab in its cache's list, or [`NONE`].
+    pub next: Pfn,
+    /// Previous slab in its cache's list, or [`NONE`].
+    pub prev: Pfn,
+}
+
+impl SlabInfo {
+    /// An entry describing no slab.
+    pub const fn empty() -> Self {
+        Self {
+            free_head: NO_OFFSET,
+            in_use: 0,
+            class: 0,
+            next: NO_FRAME,
+            prev: NO_FRAME,
+        }
+    }
+}
+
+/// Public spelling of the free-list null, for callers threading slab lists.
+pub const NO_FRAME: Pfn = NONE;
 
 /// Which physical range an allocation may come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -455,6 +506,20 @@ impl Pmm {
     #[must_use]
     pub fn frame(&self, pfn: Pfn) -> Option<&Frame> {
         self.frames.get(pfn as usize)
+    }
+
+    /// Slab bookkeeping for a frame, for the slab allocator's use.
+    #[must_use]
+    pub fn slab(&self, pfn: Pfn) -> Option<&SlabInfo> {
+        self.frames.get(pfn as usize).map(|frame| &frame.slab)
+    }
+
+    /// Mutable slab bookkeeping for a frame.
+    #[must_use]
+    pub fn slab_mut(&mut self, pfn: Pfn) -> Option<&mut SlabInfo> {
+        self.frames
+            .get_mut(pfn as usize)
+            .map(|frame| &mut frame.slab)
     }
 
     /// Records which domain a frame is charged to.

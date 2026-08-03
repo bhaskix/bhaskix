@@ -71,6 +71,12 @@ Rejected in review:
 - `// SAFETY: see above`
 - A comment that restates the code (`// SAFETY: writes zeroes to the frame`)
 
+**Test code is excluded** from both the budget and the `// SAFETY:`
+requirement. The budget tracks the auditable surface of the kernel *as
+deployed*, and test code does not ship — counting it would distort the number
+the budget exists to produce. The checker blanks `#[cfg(test)]` modules before
+counting.
+
 **`unsafe` is confined by crate.** It is permitted in `arch`, `mm`, the allocator internals, and each
 driver's `hal` submodule. It is forbidden everywhere else, at the crate root, by the compiler.
 

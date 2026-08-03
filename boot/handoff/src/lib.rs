@@ -18,12 +18,21 @@
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
-// Tests are exempt from the `unwrap`/`expect`/`panic` bans, as
-// docs/coding-style.md §4 specifies: those exist to stop a fallible operation
-// from taking down the nucleus, and a test that cannot panic cannot fail.
-// The workspace lint table cannot express a cfg-conditional allow, so it is
-// stated here.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+// Tests are exempt from the `unwrap`/`expect`/`panic` bans and from the
+// SAFETY-comment requirement, as docs/coding-style.md §3 and §4 specify. The
+// panic bans exist to stop a fallible operation taking down the nucleus, and a
+// test that cannot panic cannot fail; the `unsafe` budget tracks the auditable
+// surface of the kernel as deployed, and test code does not ship. The workspace
+// lint table cannot express a cfg-conditional allow, so it is stated here.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::undocumented_unsafe_blocks
+    )
+)]
 
 use core::fmt;
 

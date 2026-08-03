@@ -19,6 +19,12 @@ bhaskix-boot = { path = "../boot/handoff" }
 workspace = true
 
 [package.metadata.bhaskix]
-# The bump allocator is pure arithmetic over the memory map and needs no
-# `unsafe` at all. That changes in M3, when frames are handed out and written.
-unsafe_budget = 0
+# The bump allocator and the buddy allocator are pure arithmetic over the
+# memory map and the frame database, and the crate root denies `unsafe` so they
+# stay that way.
+#
+# The slab allocator opts back in, and only it: threading a free list through
+# the free objects themselves is the one thing here no safe abstraction can
+# express. 15 lines at M3. Test code is excluded from the count -- it does not
+# ship, so counting it would distort the number this budget exists to track.
+unsafe_budget = 25

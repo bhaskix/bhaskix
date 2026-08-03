@@ -215,3 +215,47 @@ pub fn self_test(pmm: &mut Pmm) -> bool {
 
     recovered && consistent
 }
+
+/// Exercises the kernel heap through the `alloc` types themselves.
+///
+/// Testing the slab allocator directly is what the host unit tests do. This
+/// checks the layer above it — that `#[global_allocator]` is actually wired
+/// up, that `Box` and `Vec` reach it, and that the memory they hand back is
+/// real and writable on this machine. A slab allocator that passes its own
+/// tests but is not connected to `alloc` would look identical from below.
+pub fn heap_self_test() {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    let before = crate::heap::free_frames();
+
+    // A boxed value, read back to prove the memory is genuinely writable.
+    let boxed = Box::new(0xB4A5_C123_u64);
+    let boxed_ok = *boxed == 0xB4A5_C123_u64;
+    drop(boxed);
+
+    // A vector that grows across several size classes, forcing reallocation
+    // and therefore both the allocate and free paths.
+    let mut values: Vec<u64> = Vec::new();
+    for index in 0..512u64 {
+        values.push(index * index);
+    }
+    let vector_ok = values.len() == 512
+        && values[0] == 0
+        && values[511] == 511 * 511
+        && values
+            .iter()
+            .enumerate()
+            .all(|(i, v)| *v == (i as u64) * (i as u64));
+    drop(values);
+
+    let after = crate::heap::free_frames();
+
+    if boxed_ok && vector_ok && before == after {
+        println!("    heap           alloc works, no frames leaked");
+    } else {
+        println!(
+            "    heap           FAILED (box {boxed_ok}, vec {vector_ok}, frames {before} -> {after})"
+        );
+    }
+}
