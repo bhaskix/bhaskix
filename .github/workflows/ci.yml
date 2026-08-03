@@ -2,9 +2,14 @@
 #
 # Bhaskix continuous integration.
 #
-# Ordered cheapest-first: a formatting mistake fails in seconds rather than
-# after a QEMU boot. Every gate here is one a human reviewer should not have to
-# be (docs/coding-style.md §10).
+# Every job invokes a Makefile target rather than repeating its commands.
+# That is deliberate: an earlier version spelled the cargo invocations out
+# here, drifted from the Makefile, and silently stopped running an entire
+# crate's tests. `make` is the single source of truth for what a check *is*;
+# this file only decides when to run it and on what.
+#
+# Ordered cheapest-first, so a formatting mistake fails in seconds rather than
+# after a QEMU boot.
 
 name: ci
 
@@ -16,8 +21,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Fail on warnings everywhere, not just where clippy is invoked explicitly.
-  RUSTFLAGS: -D warnings
 
 jobs:
   # --- fast feedback ------------------------------------------------------
@@ -27,21 +30,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install toolchain
-        run: rustup show active-toolchain   # honours rust-toolchain.toml
-      - run: cargo fmt --all --check
+      - run: rustup show active-toolchain   # honours rust-toolchain.toml
+      - run: make fmt
 
   gates:
     name: project invariants
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Bootloader containment, vendor strings, SPDX headers
-        run: tools/check-containment.sh
-      - name: Unsafe budgets and SAFETY comments
-        run: tools/check-unsafe-budget.py
-      - name: Dependency direction and external crates
-        run: tools/check-deps.py
+      - name: Containment, vendor strings, SPDX, unsafe budgets, dependencies
+        run: make gates
 
   # --- correctness --------------------------------------------------------
 
@@ -51,12 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
-      - name: Clippy (freestanding target)
-        run: cargo clippy --release --target x86_64-unknown-none --lib --bins -- -D warnings
-      - name: Clippy (host, including tests)
-        run: |
-          cargo clippy --target x86_64-unknown-linux-gnu --all-targets \
-            -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -- -D warnings
+      - run: make clippy
 
   test-host:
     name: host unit tests
@@ -64,17 +57,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
-      - run: cargo test --target x86_64-unknown-linux-gnu -p bhaskix-boot -p bhaskix-kernel
+      - run: make test-host
 
   # --- does it actually boot ---------------------------------------------
 
   boot:
-    name: boot (${{ matrix.firmware }})
+    name: boot (${{ matrix.firmware }}, ${{ matrix.cpu }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         firmware: [bios, uefi]
+        # Two CPU models on purpose, and it is a real test rather than
+        # belt-and-braces: `qemu64` predates x2APIC, so the kernel takes the
+        # xAPIC path and has to map the APIC register page itself; `max`
+        # exposes x2APIC on QEMU versions that implement it, taking the
+        # MSR-addressed path instead. Those are two genuinely different code
+        # paths in arch::apic and only one of them can be exercised on any
+        # given machine.
+        cpu: [qemu64, max]
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
@@ -83,6 +84,15 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-system-x86 xorriso mtools ovmf
+
+      - name: Record the environment
+        # Printed because the two failures that matter here -- which APIC path
+        # is taken, and whether the firmware image exists -- are decided by the
+        # QEMU version and the packaging, not by our code.
+        run: |
+          qemu-system-x86_64 --version
+          echo "--- OVMF images present ---"
+          ls -la /usr/share/OVMF/ 2>/dev/null || echo "no /usr/share/OVMF"
 
       - name: Fetch Limine
         run: |
@@ -94,14 +104,37 @@ jobs:
         run: make iso
 
       - name: Boot and assert on serial output
+        env:
+          QEMU_CPU: ${{ matrix.cpu }}
         run: tests/qemu/boot-test.sh ${{ matrix.firmware }}
 
-      - name: Upload kernel image on failure
+      - name: Upload the image on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: bhaskix-${{ matrix.firmware }}-failed
+          name: bhaskix-${{ matrix.firmware }}-${{ matrix.cpu }}-failed
           path: |
             build/bhaskix.iso
             target/x86_64-unknown-none/release/bhaskix
           retention-days: 7
+
+  faults:
+    name: fault injection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+
+      - name: Install QEMU, xorriso
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 xorriso mtools
+
+      - name: Fetch Limine
+        run: |
+          git clone --branch v8.x-binary --depth 1 \
+            https://github.com/limine-bootloader/limine.git boot/limine/limine
+          make -C boot/limine/limine
+
+      - name: Every exception reports rather than triple-faulting
+        run: make test-faults
