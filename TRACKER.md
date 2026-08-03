@@ -103,7 +103,7 @@ fairness within 2% for two equal-weight workloads.
 | M4-06b | Work stealing and migration | ✅ `DONE` | Idle pull plus load-aware placement. **Negative-tested**: each of the three steal rules and the imbalance threshold has a unit test that fails when that rule alone is removed. |
 | M4-06c | Topology-aware balancing, periodic push | ⬜ `TODO` | No ACPI topology, so every CPU is equidistant; balancing is pull-only. `docs/scheduler.md` §5.1 and §5.3. |
 | M4-07 | Fair class (virtual deadline), RT class | ⬜ `TODO` | Currently plain round-robin |
-| M4-08 | Lock ranking, active in debug builds | ⬜ `TODO` | `docs/coding-style.md` §7 requires it |
+| M4-08 | Lock ranking | ✅ `DONE` | Rank given at construction, so a lock cannot be added without one. ~7,400 acquisitions checked per boot, 0 violations. **Negative-tested**: mis-ranking a real lock produces violations; disabling the detector fails the "detector verified" claim. Deviates from "panic" — see `docs/coding-style.md` §7. |
 | M4-09 | Sleeping, wait queues, blocking | ⬜ `TODO` | A thread is runnable or finished; nothing waits |
 | M4-10 | Tickless idle, timer wheel | ⬜ `TODO` | Timer is a fixed 100 Hz tick |
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
@@ -157,6 +157,12 @@ fairness within 2% for two equal-weight workloads.
   fairness weighting, no virtual deadlines, no RT class, no admission control. The fairness figure
   printed at boot is reported rather than asserted, because a tight bound on round-robin would be
   measuring timer jitter rather than any property worth defending.
+- **Lock ranking does not stop a thread being preempted while holding a spinlock.** It makes the
+  *order* safe; it does not make holding a spinlock across a context switch safe. A thread
+  preempted while holding the heap leaves every other thread spinning for it until it is scheduled
+  again — progress, but by luck of the timer rather than by design. Linux disables preemption
+  inside `spin_lock` for exactly this reason and Bhaskix does not, which is a real gap that ranking
+  made visible without addressing.
 - **The `switching` handshake has not been observed doing its job.** It is the rule that stops a
   thief taking a thread whose registers are not yet saved, and it is the one hazard here that
   corrupts state rather than merely stranding it. Removing it fails a unit test, which proves the
@@ -233,6 +239,42 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M4-08, lock ranking)
+
+- **Every lock now declares its rank at construction.** `SpinLock::new` takes a `Rank`, so a lock
+  cannot be added without saying where it sits — which is the rule `docs/coding-style.md` §7 asked
+  for, expressed as a type signature rather than as a convention.
+- **The declared order was recovered from the code, not invented, and two entries are not where
+  intuition puts them.** `heap::HEAP` ranks *outside* `tlb::SENDER`, because unmapping frees frames
+  inside `heap::with` and must shoot down before the frame is reused. And `sched::QUEUES` ranks
+  *inside* the heap: a thread can be preempted while holding the heap, and the switch path then
+  blocks on a runqueue. `sched::spawn_on` had already arrived at the same constraint independently
+  by allocating outside the runqueue lock.
+- **`try_lock` is exempt, and that is the load-bearing part.** A deadlock is a cycle in which every
+  edge is a blocking wait, so a non-blocking acquisition can never be one. It matters because
+  interrupt handlers acquire locks where the hardware chooses: a timer can land while any lock is
+  held, so every lock taken in interrupt context is out of rank with respect to something.
+- **The boot line reports what was checked, not just what was found.** Zero violations is exactly
+  what a checker that never ran also reports, so the kernel states the number of acquisitions it
+  checked (~7,400) and then proves the detector fires by provoking a deliberate inversion on a pair
+  of locks created for that purpose.
+- **Held ranks belong to the thread, not the CPU.** A thread preempted while holding the heap
+  carries its held set with it; without that, the next thread to run on that CPU would inherit an
+  ordering constraint it had no part in.
+- **Deviation from the documented rule, recorded rather than quiet.** §7 said debug builds should
+  panic; this reports and continues, as `lockdep` does. Halting on the first report discards the
+  rest of the boot's coverage, and a rank violation is a latent risk rather than present
+  corruption. `docs/coding-style.md` §7 and `docs/architecture.md` §6 now say so.
+- **A bug I introduced and then caught the slow way.** The violation predicate had the mask
+  direction backwards, so the checker was inert: it reported nothing on any input. The unit tests
+  written alongside it encode the correct direction and would have failed immediately — I had not
+  run them before booting. Running the host tests before the emulator would have found it in
+  seconds instead of a boot cycle.
+- **One unexplained hang, not carried forward as fixed.** A single `-smp 4` boot stopped after the
+  TLB line while the checker was inert. Six consecutive runs afterwards were clean, and the
+  evidence points to a partially built ISO rather than the kernel. It is recorded here because
+  "could not reproduce" is the honest status, not "fixed".
 
 ### 2026-08-03 (RFC 0005 drafted, Linux ABI compatibility)
 

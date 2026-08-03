@@ -177,8 +177,23 @@ Avoid Hungarian notation, avoid abbreviations that are not universal in the fiel
 
 Restated from [architecture.md](architecture.md) §6 because they are style rules too.
 
-- **Declare lock ranks.** Every lock has a static rank; debug builds panic on out-of-rank
-  acquisition. Add your lock to the rank list in the same PR that adds the lock.
+- **Declare lock ranks.** Every lock has a static rank, passed to `SpinLock::new` so that a lock
+  cannot be added without declaring where it sits. The rank list lives in `kernel/src/sync.rs`.
+  A blocking acquisition of a lock ranked at or inside one already held is **reported and counted**;
+  the boot test requires the count to be zero.
+- **`try_lock` is exempt from ranking**, and this is load-bearing rather than convenient. A deadlock
+  is a cycle in which every edge is a blocking wait, so a non-blocking acquisition can never be one.
+  It matters because interrupt handlers acquire locks at points the hardware chooses: a timer can
+  land while any lock is held, so every lock taken in interrupt context is out of rank with respect
+  to *something*. Acquire from interrupt context with `try_lock`, or not at all.
+
+> **Deviation, M4-08.** This rule previously said debug builds *panic* on an out-of-rank
+> acquisition. The implementation reports and continues, for the reason `lockdep` does: the report
+> is the entire value, and halting on the first one discards the coverage of the rest of the boot.
+> A rank violation is a latent risk rather than present corruption — panicking trades a possible
+> future deadlock for a certain immediate one. The guarantee is unchanged, because the boot test
+> fails on a non-zero count; only the failure mode is more informative. Reverting to a panic is a
+> one-line change if the original rule is preferred.
 - **Never sleep in interrupt context.** Enforced by the `SleepGuard` marker type.
 - **Prefer, in order:** per-CPU data → read-mostly (RCU-style) → lock. Reach for a lock last.
 - **Hold locks for the shortest possible span.** Never `await` while holding a spinlock — the type

@@ -238,6 +238,17 @@ else
     status=1
 fi
 
+# Lock ordering. Three claims in one line, and only the last is the one people
+# quote: that acquisitions were actually *checked* (zero violations is what a
+# checker that never ran also reports), that the detector fires when given a
+# deliberate inversion, and that the real count is zero.
+if grep -qE "lock order +[1-9][0-9]* acquisitions checked, detector verified, 0 violations" "$LOG"; then
+    pass "lock ordering declared and enforced, no violations"
+else
+    fail "lock ordering check did not pass"
+    status=1
+fi
+
 # Balancing. The previous assertion requires threads to stay where they were
 # created; this one requires them to move. They are not in tension: the first
 # runs with one thread per CPU, where there is no imbalance to correct, and

@@ -35,7 +35,7 @@ pub struct Cpu {
     batch:    BatchRunqueue,     // FIFO, only runs when nothing else can
     idle:     Thread,
     current:  *mut Thread,
-    lock:     SpinLock<()>,      // rank: SCHED_RQ
+    lock:     SpinLock<()>,      // rank: Rank::SchedRunqueue
     load:     AtomicU64,         // published for the balancer, read without the lock
 }
 ```
@@ -255,7 +255,7 @@ The rules, which are the whole point:
 | RT latency | Cyclictest-equivalent under load; assert p99.9 < 50 µs. |
 | Priority inversion | RT thread blocks on a lock held by a Fair thread while a mid-priority thread spins; assert bounded latency. |
 | Policy containment | A deliberately hostile `SchedPolicy` (returns garbage, sleeps, panics); assert the system stays correct and the policy is disabled. |
-| Lock ordering | Debug-build rank assertions active in all scheduler tests. |
+| Lock ordering | **Implemented at M4-08.** Ranks declared at construction, checked on every blocking acquisition; the boot test requires zero violations across ~7,400 checked acquisitions, and the check itself is verified by provoking a deliberate inversion. The runqueue lock ranks *inside* the heap — see `kernel/src/sync.rs`. |
 
 The fairness and latency tests produce numbers that are recorded per-commit. Regressions are a
 failing build, not a discussion.

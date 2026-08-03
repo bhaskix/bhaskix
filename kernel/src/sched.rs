@@ -65,7 +65,7 @@ use bhaskix_arch::context::{Context, bhaskix_context_switch};
 use bhaskix_arch::percpu::{self, MAX_CPUS};
 
 use crate::stack;
-use crate::sync::SpinLock;
+use crate::sync::{Rank, SpinLock};
 
 /// Threads per CPU. Small on purpose: the switch path must not allocate, so
 /// each queue is a fixed array rather than a heap-backed list.
@@ -96,6 +96,12 @@ pub struct Thread {
     pub runs: u64,
     /// Times this thread has been moved between CPUs.
     pub migrations: u64,
+    /// Lock ranks this thread holds while it is not running.
+    ///
+    /// Held locks belong to the thread, not the processor. A thread preempted
+    /// while holding the heap must take that fact with it, or the next thread
+    /// to run on that CPU inherits an ordering constraint it had no part in.
+    pub held_locks: u64,
     /// Whether this thread may never migrate.
     ///
     /// True for the thread each CPU registers for itself: it runs on the stack
@@ -195,7 +201,7 @@ impl RunQueue {
 
 /// One queue per CPU, each independently locked.
 static QUEUES: [SpinLock<RunQueue>; MAX_CPUS] =
-    [const { SpinLock::new(RunQueue::new()) }; MAX_CPUS];
+    [const { SpinLock::new(Rank::SchedRunqueue, RunQueue::new()) }; MAX_CPUS];
 
 /// Hands out globally unique thread identifiers and stack slots.
 ///
@@ -254,6 +260,7 @@ pub fn init_cpu(name: &'static str) {
         state: State::Running,
         runs: 1,
         migrations: 0,
+        held_locks: 0,
         // This thread *is* the CPU's boot context, executing on the stack the
         // bootloader handed it. Migrating it would move a stack out from under
         // the processor standing on it.
@@ -313,6 +320,7 @@ pub fn spawn_on(
         state: State::Ready,
         runs: 0,
         migrations: 0,
+        held_locks: 0,
         pinned: false,
     });
     Ok(id)
@@ -491,6 +499,15 @@ pub fn preempt() {
         }
         queue.current = next;
 
+        // Held locks travel with the thread, not the CPU. Saved for the
+        // outgoing thread and installed for the incoming one, both under this
+        // lock so the swap cannot be observed half-done.
+        let incoming_locks = queue.threads[next].as_ref().map_or(0, |t| t.held_locks);
+        if let Some(thread) = queue.threads[current].as_mut() {
+            thread.held_locks = crate::sync::held_mask();
+        }
+        crate::sync::set_held_mask(incoming_locks);
+
         // Everything from here until `finish_switch` is the window rule 2
         // exists for: `current` is marked `Ready`, the lock is about to be
         // released, and its registers have not been saved yet.
@@ -629,6 +646,7 @@ mod tests {
                 state: *state,
                 runs: 0,
                 migrations: 0,
+                held_locks: 0,
                 pinned: slot == 0,
             });
         }

@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bhaskix_arch::{apic, paging, percpu};
 
-use crate::sync::SpinLock;
+use crate::sync::{Rank, SpinLock};
 
 /// Vector the shootdown IPI is delivered on.
 ///
@@ -46,7 +46,7 @@ static ADDRESS: AtomicU64 = AtomicU64::new(0);
 static PENDING: AtomicU32 = AtomicU32::new(0);
 
 /// Serialises shootdowns, since there is one shared address slot.
-static SENDER: SpinLock<()> = SpinLock::new(());
+static SENDER: SpinLock<()> = SpinLock::new(Rank::TlbSender, ());
 
 /// Shootdowns that completed with every CPU acknowledging.
 static COMPLETED: AtomicU64 = AtomicU64::new(0);

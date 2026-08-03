@@ -301,6 +301,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("    scheduler      FAILED");
     }
 
+    if !lock_ordering_self_test() {
+        println!("    lock order     FAILED");
+    }
+
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
         faultinject::trigger(fault);
         println!();
@@ -313,6 +317,62 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     println!("  Next: blocking and wakeup, then the fair scheduling class (docs/roadmap.md).");
 
     cpu::halt_forever()
+}
+
+/// Confirms lock ranking is declared, enforced, and currently clean.
+///
+/// Three separate claims, and reporting only the last would be the weakest
+/// possible version of this: zero violations is exactly what a checker that
+/// never ran also reports. So this states how many acquisitions were actually
+/// checked, and then proves the detector fires by provoking an inversion on a
+/// pair of locks created for the purpose.
+fn lock_ordering_self_test() -> bool {
+    use crate::sync::{Rank, SpinLock};
+
+    let real = sync::violations();
+    let checked = sync::acquisitions();
+
+    // Two locks of this function's own, so provoking the inversion cannot
+    // deadlock against anything: nobody else can hold them.
+    let inner = SpinLock::new(Rank::AddressSpace, ());
+    let outer = SpinLock::new(Rank::Heap, ());
+
+    // Silence the report -- this violation is expected, and a kernel that
+    // prints "LOCK ORDER" during a passing boot trains the reader to ignore
+    // it. Save and clear the held set too, so the probe measures only what it
+    // does itself.
+    sync::set_reporting(false);
+    let saved = sync::held_mask();
+    sync::set_held_mask(0);
+    {
+        let _held = outer.lock(); // Heap
+        let _bad = inner.lock(); // AddressSpace, which ranks above it
+    }
+    sync::set_held_mask(saved);
+    sync::set_reporting(true);
+
+    let detected = sync::violations() - real;
+    // Drop the deliberate one; leaving it would fail the gate that exists to
+    // catch real ones.
+    sync::reset_violations();
+
+    if real != 0 {
+        println!("    lock order     FAILED: {real} real ordering violations before the probe");
+        return false;
+    }
+    if detected != 1 {
+        println!(
+            "    lock order     FAILED: deliberate inversion produced {detected} reports, expected 1"
+        );
+        return false;
+    }
+    if checked == 0 {
+        println!("    lock order     FAILED: no acquisition was ever rank-checked");
+        return false;
+    }
+
+    println!("    lock order     {checked} acquisitions checked, detector verified, 0 violations");
+    true
 }
 
 /// Confirms the guarded stack is really what it claims to be.

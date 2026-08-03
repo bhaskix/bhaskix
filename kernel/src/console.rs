@@ -26,14 +26,14 @@ use bhaskix_arch::SerialPort;
 use bhaskix_boot::Framebuffer;
 
 use crate::framebuffer::FbConsole;
-use crate::sync::SpinLock;
+use crate::sync::{Rank, SpinLock};
 
 /// The global console.
 ///
 /// Starts empty so that `print!` before initialisation is a silent no-op
 /// rather than a fault. That matters: the code that runs before the console
 /// exists is exactly the code most likely to want to say something.
-static CONSOLE: SpinLock<Console> = SpinLock::new(Console::empty());
+static CONSOLE: SpinLock<Console> = SpinLock::new(Rank::Console, Console::empty());
 
 /// A multiplexed output sink.
 pub struct Console {

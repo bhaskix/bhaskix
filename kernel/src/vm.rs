@@ -28,7 +28,7 @@ use bhaskix_mm::vm::{
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 use crate::heap;
-use crate::sync::SpinLock;
+use crate::sync::{Rank, SpinLock};
 
 /// First address belonging to the kernel half.
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
@@ -385,10 +385,10 @@ pub fn self_test(hhdm_base: u64, iterations: u32) -> bool {
 ///
 /// The page-fault handler needs the region map to decide whether a fault is
 /// legal, and it has no other way to find it.
-static ACTIVE: SpinLock<Option<AddressSpace>> = SpinLock::new(None);
+static ACTIVE: SpinLock<Option<AddressSpace>> = SpinLock::new(Rank::AddressSpace, None);
 
 /// The page table to restore when the installed space is removed.
-static PREVIOUS_ROOT: SpinLock<u64> = SpinLock::new(0);
+static PREVIOUS_ROOT: SpinLock<u64> = SpinLock::new(Rank::AddressSpacePrevious, 0);
 
 /// What the fault handler did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

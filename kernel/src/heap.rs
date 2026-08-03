@@ -22,7 +22,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use bhaskix_mm::pmm::Pmm;
 use bhaskix_mm::slab::Heap;
 
-use crate::sync::SpinLock;
+use crate::sync::{Rank, SpinLock};
 
 /// The heap, once physical memory is up.
 ///
@@ -30,7 +30,7 @@ use crate::sync::SpinLock;
 /// rather than dereferencing something uninitialised. Code that allocates
 /// before the memory manager exists is a bug, and a null return surfaces it
 /// immediately.
-static HEAP: SpinLock<Option<Heap>> = SpinLock::new(None);
+static HEAP: SpinLock<Option<Heap>> = SpinLock::new(Rank::Heap, None);
 
 /// Rust's global allocator hook.
 ///

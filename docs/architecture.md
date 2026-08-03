@@ -248,9 +248,13 @@ Cycles are a build failure, not a review comment.
   take them. Bring-up is single-CPU, but no data structure assumes it.
 - **No sleeping in interrupt context.** IRQ handlers do the minimum and wake a thread. Enforced by
   a marker type: functions that may sleep take `&mut SleepGuard`, which IRQ context cannot produce.
-- **Lock ordering is declared, not remembered.** Every lock has a static rank; acquiring out of rank
-  order panics in debug builds. This kills the entire class of deadlock bugs that eats kernel
-  projects at month six.
+- **Lock ordering is declared, not remembered.** Every lock has a static rank, given at construction
+  so it cannot be omitted; blocking on a lock at or inside one already held is reported and counted,
+  and a non-zero count fails the boot test. This kills the entire class of deadlock bugs that eats
+  kernel projects at month six. `try_lock` is exempt, because a non-blocking acquisition cannot be
+  an edge in a deadlock cycle — which is what makes locking from interrupt context expressible at
+  all. Implemented at M4-08; the rank list is in `kernel/src/sync.rs` and
+  [coding-style.md](coding-style.md) §7 records where it deviates from the original rule.
 - **Prefer per-CPU over shared.** Then RCU-style read-mostly structures. Then locks. In that order.
 - **`async` for I/O paths**, plain blocking threads for compute. Drivers are `async`.
 
