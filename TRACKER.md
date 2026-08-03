@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-03 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M4 — Threads and scheduling** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 threads preempt · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 threads preempt, CPUs online · CI green |
 
 ### Division of responsibility between documents
 
@@ -96,13 +96,14 @@ fairness within 2% for two equal-weight workloads.
 | M4-02 | Per-thread guarded kernel stacks | ✅ `DONE` | Each thread gets its own slot with a guard page |
 | M4-03 | Round-robin runqueue | ✅ `DONE` | 7/7/7 runs across three workers |
 | M4-04 | Timer-driven preemption | ✅ `DONE` | **Negative-tested**: removing the `preempt` call zeroes every worker counter |
-| M4-05 | SMP bring-up (AP trampoline, per-CPU areas) | ⬜ `TODO` | **Blocks the exit criterion** |
-| M4-06 | Per-CPU runqueues, work stealing | ⬜ `TODO` | Needs M4-05 |
+| M4-05 | SMP bring-up, per-CPU areas | ✅ `DONE` | 1, 2, 4 and 8 CPUs all come online; boot test asserts N-of-N. Secondaries **park** — see below. |
+| M4-05b | Per-CPU GDT and TSS | ⬜ `TODO` | **Blocks secondaries doing anything.** A shared TSS means shared IST stacks. |
+| M4-06 | Per-CPU runqueues, work stealing | ⬜ `TODO` | Needs M4-05b and M4-11 first |
 | M4-07 | Fair class (virtual deadline), RT class | ⬜ `TODO` | Currently plain round-robin |
 | M4-08 | Lock ranking, active in debug builds | ⬜ `TODO` | `docs/coding-style.md` §7 requires it |
 | M4-09 | Sleeping, wait queues, blocking | ⬜ `TODO` | A thread is runnable or finished; nothing waits |
 | M4-10 | Tickless idle, timer wheel | ⬜ `TODO` | Timer is a fixed 100 Hz tick |
-| M4-11 | TLB shootdown | ⬜ `TODO` | **Correctness bug the moment a second CPU exists** — `unmap_page` invalidates only the local TLB |
+| M4-11 | TLB shootdown | ⬜ `TODO` | **Now a live correctness bug** — a second CPU exists. Safe only because secondaries never touch memory. |
 | M4-12 | Per-CPU frame reserve for the fault path | ⬜ `TODO` | Would let a fault be serviced while the allocator lock is held |
 
 ### Bugs found and fixed during M4
@@ -119,6 +120,19 @@ fairness within 2% for two equal-weight workloads.
    travel in `r12` and `rbx`, which are callee-saved and therefore actually preserved.
 
 ### Honest notes on what is *not* proven
+
+- **Secondary CPUs come online and then do nothing.** They establish identity, enable their APIC,
+  and halt with interrupts disabled. Three things have to land before they can run anything, and all
+  three are correctness issues rather than features:
+  1. **Per-CPU GDT and TSS.** Both are shared, so the `IST` stacks are shared: two CPUs taking a
+     double fault at once would land on the same stack and destroy each other's report. A secondary
+     cannot safely take *any* interrupt until this is fixed.
+  2. **TLB shootdown.** `unmap_page` invalidates only the local TLB, so another CPU can keep using a
+     translation this one removed. Harmless today only because secondaries never touch memory.
+  3. **The scheduler is single-CPU by construction**, taking raw pointers into a static thread table
+     on the assumption that one CPU is inside it.
+- **Nothing has been tested for races.** Every CPU but one is halted, so the locking has never been
+  under contention. The `SpinLock` is written for SMP and has never been used that way.
 
 - **This is round-robin, not the scheduler `docs/scheduler.md` specifies.** No priorities, no
   fairness weighting, no virtual deadlines, no RT class, no admission control. The fairness figure
@@ -199,6 +213,21 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M4-05, CPUs online)
+
+- **Secondary CPUs come online.** 1, 2, 4 and 8 all work; each claims a per-CPU area through an
+  atomic and installs it as its `GS` base, so `gs:[0]` reaches different state on every processor
+  with no lock and no lookup. The boot tests now run with four CPUs and assert N-of-N came online —
+  asserting "more than one" would read as success on a machine that happens to be smaller.
+- **The bootloader starts them.** Doing it by hand means a real-mode trampoline and an INIT/SIPI
+  sequence with its own timing requirements; worth owning eventually, not before the kernel can use
+  a second CPU for anything. The mechanism stays in `boot/shim` — the kernel receives a callback and
+  never learns how a CPU is started.
+- **They park, deliberately, and the tracker says why.** Shared GDT/TSS means shared IST stacks, the
+  TLB shootdown gap is now a live bug rather than a theoretical one, and the scheduler assumes one
+  CPU. Bringing CPUs up while being explicit that they idle is more honest than scheduling on them
+  and finding all three in production.
 
 ### 2026-08-03 (M4, threads preempt)
 

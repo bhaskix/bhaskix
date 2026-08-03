@@ -36,6 +36,7 @@ pub mod heap;
 pub mod memory;
 pub mod panic;
 pub mod sched;
+pub mod smp;
 pub mod stack;
 pub mod sync;
 pub mod trap;
@@ -63,6 +64,9 @@ static HANDOFF: BootCell<Handoff> = BootCell::new(Handoff {
     smbios: None,
     cmdline: "",
     loader: "",
+    cpu_count: 1,
+    bsp_lapic_id: 0,
+    start_secondaries: None,
     regions_truncated: false,
 });
 
@@ -272,6 +276,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     } else {
         println!("    demand paging  FAILED");
     }
+
+    let secondaries = smp::start_secondaries(handoff);
+    smp::report(handoff);
+    let _ = secondaries;
 
     if scheduling_self_test(handoff.hhdm_base.as_u64()) {
         println!("    scheduler      timer-driven preemption works");

@@ -35,7 +35,7 @@ pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 
 [[ -f "$ISO" ]] || { fail "$ISO not found -- run 'make iso' first"; exit 1; }
 
-QEMU_ARGS=(-M q35 -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom "$ISO" -boot d
+QEMU_ARGS=(-M q35 -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
            -serial "file:$LOG" -display none)
 
 if [[ "$MODE" == "uefi" ]]; then
@@ -202,6 +202,16 @@ fi
 # Threads exist and the timer preempts them. The workers never yield, so a
 # counter that advanced can only have been put on the CPU by the timer --
 # negative-tested by removing the preempt call, which zeroes every count.
+# Every reported CPU must come online. Asserting "N of N" rather than
+# "more than one" catches a CPU that silently never arrives, which otherwise
+# reads as success on a machine that happens to be smaller.
+if grep -qE "cpus +([0-9]+) online of \1 reported" "$LOG"; then
+    pass "all reported CPUs came online"
+else
+    fail "not every reported CPU came online"
+    status=1
+fi
+
 if grep -qE "threads +[0-9]+ preemptions; all [0-9]+ workers ran" "$LOG"; then
     pass "threads preempted by the timer"
 else

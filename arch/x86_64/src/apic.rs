@@ -401,3 +401,36 @@ pub unsafe fn version() -> u32 {
     // SAFETY: `init` has run per the caller's obligation.
     unsafe { read(REG_VERSION) & 0xff }
 }
+
+/// Enables the calling CPU's Local APIC.
+///
+/// Every CPU has its own APIC with its own register file, but they are reached
+/// through the same MSRs or the same physical page — so the mode and base
+/// established by [`init`] on the bootstrap CPU apply here unchanged, and only
+/// the per-CPU enable bits need setting.
+///
+/// # Safety
+///
+/// [`init`] must have completed on the bootstrap CPU, and this must run once
+/// per secondary CPU with interrupts disabled.
+pub unsafe fn enable_this_cpu() {
+    // SAFETY: `init` established the mode; the registers below belong to the
+    // calling CPU's own APIC.
+    unsafe {
+        let base = msr::read(msr::IA32_APIC_BASE);
+        if MODE.load(Ordering::Acquire) == mode::X2APIC {
+            msr::write(
+                msr::IA32_APIC_BASE,
+                base | APIC_BASE_ENABLE | APIC_BASE_X2APIC,
+            );
+        } else {
+            msr::write(msr::IA32_APIC_BASE, base | APIC_BASE_ENABLE);
+        }
+
+        write(REG_SPURIOUS, SPURIOUS_ENABLE | u32::from(SPURIOUS_VECTOR));
+        write(REG_LVT_TIMER, LVT_MASKED);
+        write(REG_LVT_LINT0, LVT_MASKED);
+        write(REG_LVT_LINT1, LVT_MASKED);
+        write(REG_LVT_ERROR, u32::from(ERROR_VECTOR));
+    }
+}

@@ -182,6 +182,27 @@ struct FramebufferResponse {
     framebuffers: *const *const LimineFramebuffer,
 }
 
+/// Called on each secondary CPU once the bootloader has brought it up.
+type GotoAddress = extern "C" fn(*mut MpInfo) -> !;
+
+#[repr(C)]
+struct MpInfo {
+    processor_id: u32,
+    lapic_id: u32,
+    reserved: u64,
+    goto_address: *mut GotoAddress,
+    extra_argument: u64,
+}
+
+#[repr(C)]
+struct MpResponse {
+    revision: u64,
+    flags: u32,
+    bsp_lapic_id: u32,
+    cpu_count: u64,
+    cpus: *const *mut MpInfo,
+}
+
 #[repr(C)]
 struct RsdpResponse {
     revision: u64,
@@ -285,6 +306,7 @@ request!(
     0xad97_e90e_83f1_ed67,
     0x31eb_5d1c_5ff2_3b69
 );
+request!(MP, MpResponse, 0x95a6_7b81_9a1b_857e, 0xa0b6_1b72_3b6a_73e0);
 
 // --- Translation into the Bhaskix handoff --------------------------------
 
@@ -318,6 +340,73 @@ static MEMORY_MAP: BootStatic<[MemoryRegion; MAX_MEMORY_REGIONS]> = BootStatic(U
 ));
 
 static LOADER_NAME: BootStatic<[u8; 96]> = BootStatic(UnsafeCell::new([0; 96]));
+
+/// Where secondary CPUs should jump once the loader has them in long mode.
+///
+/// Written once by [`start_secondaries`] before any CPU is released, and read
+/// by each of them afterwards, so the ordering is established by the write to
+/// `goto_address` that follows it.
+static AP_ENTRY: BootStatic<Option<extern "C" fn(u32) -> !>> = BootStatic(UnsafeCell::new(None));
+
+/// Trampoline every secondary CPU lands on.
+///
+/// Exists only to convert the bootloader's calling convention into ours, so
+/// that nothing above `boot/` has to know what shape the loader hands a CPU
+/// over in.
+extern "C" fn secondary_trampoline(info: *mut MpInfo) -> ! {
+    // SAFETY: the loader passes a pointer to the `MpInfo` it built for this
+    // CPU, valid for as long as its bootloader-reclaimable memory is.
+    let lapic_id = unsafe { (*info).lapic_id };
+
+    // SAFETY: written before any CPU was released, and only read here.
+    let entry = unsafe { *AP_ENTRY.0.get() };
+
+    match entry {
+        Some(entry) => entry(lapic_id),
+        // Nothing to jump to. Halting is the only safe option: returning would
+        // fall off the end of a stack the loader owns.
+        None => loop {
+            // SAFETY: `hlt` at CPL 0 with interrupts disabled parks the CPU.
+            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+        },
+    }
+}
+
+/// Releases every secondary CPU to `entry`. Returns how many were started.
+///
+/// The bootstrap CPU is skipped -- it is already running this code.
+fn start_secondaries(entry: extern "C" fn(u32) -> !) -> u32 {
+    let Some(response) = MP.response() else {
+        return 0;
+    };
+
+    // SAFETY: single-threaded; no CPU has been released yet, so nothing else
+    // can observe this write.
+    unsafe { *AP_ENTRY.0.get() = Some(entry) };
+
+    let mut started = 0;
+    for index in 0..response.cpu_count as usize {
+        // SAFETY: the protocol guarantees `cpus` points to `cpu_count` valid
+        // `MpInfo` pointers.
+        let info = unsafe { &mut **response.cpus.add(index) };
+        if info.lapic_id == response.bsp_lapic_id {
+            continue;
+        }
+
+        // Writing `goto_address` is what actually releases the CPU, so it must
+        // be the last thing to happen and must be a volatile write -- the
+        // compiler has no idea another processor is spinning on this word.
+        // SAFETY: the field belongs to this CPU's `MpInfo` and nothing else
+        // writes it.
+        unsafe {
+            (&raw mut info.goto_address)
+                .cast::<u64>()
+                .write_volatile(secondary_trampoline as usize as u64);
+        }
+        started += 1;
+    }
+    started
+}
 
 /// Reads a NUL-terminated string into a `&'static str`.
 ///
@@ -529,6 +618,9 @@ pub unsafe fn collect_handoff() -> Handoff {
         smbios,
         cmdline,
         loader,
+        cpu_count: MP.response().map_or(1, |r| r.cpu_count as u32),
+        bsp_lapic_id: MP.response().map_or(0, |r| r.bsp_lapic_id),
+        start_secondaries: MP.response().map(|_| start_secondaries as _),
         regions_truncated: truncated,
     }
 }

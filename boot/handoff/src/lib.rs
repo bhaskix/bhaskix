@@ -239,6 +239,16 @@ impl Framebuffer {
     }
 }
 
+/// Starts every secondary CPU at `entry`, returning how many were started.
+///
+/// A function pointer rather than a list of CPU descriptors, because *how* a
+/// CPU is started is a bootloader detail and the kernel must not learn it
+/// (`docs/architecture.md` §1). The shim keeps the mechanism; the kernel keeps
+/// the policy of what a secondary CPU should do.
+///
+/// `entry` receives the CPU's local APIC identifier and must never return.
+pub type StartSecondaries = fn(entry: extern "C" fn(u32) -> !) -> u32;
+
 /// Everything the kernel is given at entry.
 ///
 /// Constructed by the boot shim and consumed exactly once, by
@@ -266,6 +276,12 @@ pub struct Handoff {
     pub cmdline: &'static str,
     /// Name and version of whatever loaded us, for diagnostics only.
     pub loader: &'static str,
+    /// Processors the firmware reported, including the bootstrap one.
+    pub cpu_count: u32,
+    /// Local APIC identifier of the CPU the kernel booted on.
+    pub bsp_lapic_id: u32,
+    /// Starts the secondary CPUs, if the loader can.
+    pub start_secondaries: Option<StartSecondaries>,
     /// Whether the shim had to drop memory regions it could not represent.
     ///
     /// Must be reported, never ignored. A memory map that is quietly short is
@@ -446,6 +462,9 @@ mod tests {
             smbios: None,
             cmdline: "",
             loader: "test",
+            cpu_count: 1,
+            bsp_lapic_id: 0,
+            start_secondaries: None,
             regions_truncated: false,
         }
     }

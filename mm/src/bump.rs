@@ -259,6 +259,9 @@ mod tests {
             smbios: None,
             cmdline: "",
             loader: "test",
+            cpu_count: 1,
+            bsp_lapic_id: 0,
+            start_secondaries: None,
             regions_truncated: false,
         }
     }

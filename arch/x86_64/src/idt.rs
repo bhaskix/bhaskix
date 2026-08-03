@@ -173,3 +173,24 @@ pub const fn exception_name(vector: u64) -> Option<&'static str> {
 pub const fn has_error_code(vector: u64) -> bool {
     matches!(vector, 8 | 10..=14 | 17 | 21 | 29 | 30)
 }
+
+/// Loads the shared IDT on a secondary CPU.
+///
+/// Sharing is correct here in a way it is not for the GDT: the IDT is
+/// read-only once built, and every CPU wants the same handlers. The IST
+/// *indices* in its gates are shared too, but they resolve through each CPU's
+/// own task register — which is exactly why secondary CPUs must have their own
+/// TSS before they take interrupts.
+///
+/// # Safety
+///
+/// Must run once per secondary CPU, after the bootstrap CPU has built the IDT.
+pub unsafe fn load_on_secondary() {
+    let pointer = DescriptorTablePointer {
+        limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
+        base: IDT.as_ptr() as u64,
+    };
+    // SAFETY: built by `init` on the bootstrap CPU before any secondary was
+    // released; read-only thereafter.
+    unsafe { load_idt(&pointer) };
+}

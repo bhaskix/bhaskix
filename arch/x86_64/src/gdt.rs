@@ -301,3 +301,30 @@ unsafe fn load_task_register(selector: u16) {
         core::arch::asm!("ltr {0:x}", in(reg) selector, options(nomem, nostack, preserves_flags));
     }
 }
+
+/// Loads the shared GDT on a secondary CPU.
+///
+/// Deliberately does **not** load the task register. The TSS is still shared,
+/// and `ltr` marks a TSS descriptor busy — a second `ltr` against a busy
+/// descriptor raises `#GP`, so a secondary CPU doing what the bootstrap CPU
+/// did would fault immediately.
+///
+/// The deeper problem is that a shared TSS means shared `IST` stacks: two CPUs
+/// taking a double fault at once would land on the same stack and corrupt each
+/// other's report. Secondary CPUs therefore must not enable interrupts until
+/// each has its own GDT and TSS. That is a prerequisite for running threads on
+/// them, and it is not done yet.
+///
+/// # Safety
+///
+/// Must run once per secondary CPU, with interrupts disabled, after the
+/// bootstrap CPU has built the GDT.
+pub unsafe fn load_on_secondary() {
+    let pointer = DescriptorTablePointer {
+        limit: (size_of::<Gdt>() - 1) as u16,
+        base: GDT.as_ptr() as u64,
+    };
+    // SAFETY: the table was fully built by `init` on the bootstrap CPU before
+    // any secondary was released, and is only read from here.
+    unsafe { load_gdt(&pointer) };
+}
