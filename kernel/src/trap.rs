@@ -195,6 +195,18 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             // before `enable` succeeds -- and this acknowledges exactly the
             // interrupt currently in service.
             unsafe { apic::end_of_interrupt() };
+
+            // Preemption, after the acknowledgement. The order matters: the
+            // switch does not return until this thread is scheduled again, and
+            // an unacknowledged interrupt would block every later one in the
+            // meantime -- including the timer that would eventually schedule
+            // it back.
+            //
+            // Switching from inside the handler works because the outgoing
+            // stack still holds this interrupt's frame. When the thread is
+            // resumed the switch returns here, the handler unwinds normally,
+            // and `iretq` returns to wherever that thread was interrupted.
+            crate::sched::preempt();
         }
 
         // Spurious interrupts get no acknowledgement. The APIC never placed

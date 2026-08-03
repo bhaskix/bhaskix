@@ -35,6 +35,7 @@ pub mod framebuffer;
 pub mod heap;
 pub mod memory;
 pub mod panic;
+pub mod sched;
 pub mod stack;
 pub mod sync;
 pub mod trap;
@@ -272,6 +273,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("    demand paging  FAILED");
     }
 
+    if scheduling_self_test(handoff.hhdm_base.as_u64()) {
+        println!("    scheduler      timer-driven preemption works");
+    } else {
+        println!("    scheduler      FAILED");
+    }
+
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
         faultinject::trigger(fault);
         println!();
@@ -280,8 +287,8 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     }
 
     println!();
-    println!("  M3 complete. Nothing left to do at this milestone -- halting.");
-    println!("  Next: M4, threads and scheduling (docs/roadmap.md).");
+    println!("  M4 in progress. Nothing left to do at this milestone -- halting.");
+    println!("  Next: SMP bring-up and the fair scheduling class (docs/roadmap.md).");
 
     cpu::halt_forever()
 }
@@ -532,4 +539,97 @@ fn report_memory(handoff: &Handoff) {
         "    bootloader-reclaimable {} KiB -- NOT yet free (docs/memory.md §1)",
         reclaimable / 1024
     );
+}
+
+/// Per-worker counters for the scheduling self-test.
+static WORK: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// A worker that never yields.
+///
+/// Never yielding is the point. If its counter advances, the only thing that
+/// can have put it on the CPU is the timer interrupt — which is precisely the
+/// property under test, and is not something a cooperative scheduler could
+/// fake.
+extern "C" fn worker(id: u64) -> ! {
+    loop {
+        if let Some(counter) = WORK.get(id as usize) {
+            counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Spawns threads and checks that the timer really preempts them.
+fn scheduling_self_test(hhdm_base: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    sched::init_boot_thread("boot");
+
+    for id in 0..WORK.len() as u64 {
+        let name = match id {
+            0 => "worker-0",
+            1 => "worker-1",
+            _ => "worker-2",
+        };
+        if let Err(error) = sched::spawn(name, worker, id, hhdm_base) {
+            println!("    threads        FAILED to spawn: {error:?}");
+            return false;
+        }
+    }
+
+    let switches_before = sched::switches();
+    sched::start();
+
+    // Run for a fixed number of timer ticks. The boot thread is itself in the
+    // runqueue, so it is preempted too and simply resumes here.
+    let deadline = trap::ticks() + 25;
+    let mut spins = 0u64;
+    while trap::ticks() < deadline && spins < 2_000_000_000 {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+
+    sched::stop();
+
+    let switches = sched::switches() - switches_before;
+    let counts: [u64; 3] = [
+        WORK[0].load(Ordering::Relaxed),
+        WORK[1].load(Ordering::Relaxed),
+        WORK[2].load(Ordering::Relaxed),
+    ];
+    let all_ran = counts.iter().all(|&c| c > 0);
+
+    if !all_ran || switches == 0 {
+        println!(
+            "    threads        FAILED (switches {switches}, counts {} {} {})",
+            counts[0], counts[1], counts[2]
+        );
+        return false;
+    }
+
+    println!(
+        "    threads        {switches} preemptions; all {} workers ran without yielding",
+        counts.len()
+    );
+
+    // Round-robin should give roughly equal turns. Reported rather than
+    // asserted: this is not yet the fair scheduler `docs/scheduler.md`
+    // specifies, and a tight bound here would be measuring the timer's jitter
+    // rather than any fairness property worth defending.
+    let smallest = counts.iter().copied().min().unwrap_or(0);
+    let largest = counts.iter().copied().max().unwrap_or(1).max(1);
+    println!(
+        "    fairness       spread {}% (round-robin, not the fair class yet)",
+        100 - (smallest * 100 / largest)
+    );
+
+    sched::for_each(|id, name, state, runs| {
+        println!("      thread {id}  {name:<9} {state:?}  {runs} runs");
+    });
+
+    true
 }

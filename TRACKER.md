@@ -7,8 +7,8 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 |---|---|
 | **Last updated** | 2026-08-03 |
 | **Phase** | Phase 1 — Foundation |
-| **Active milestone** | **M3 — Memory management** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · **M3 exit criterion MET** · CI green |
+| **Active milestone** | **M4 — Threads and scheduling** |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 threads preempt · CI green |
 
 ### Division of responsibility between documents
 
@@ -81,133 +81,58 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 
 ---
 
-## 3. Active milestone — M3: Memory management
+## 3. Active milestone — M4: Threads and scheduling
 
-**M3 is complete.** The exit criterion was met earlier — host property tests for the buddy allocator
-and slab pass, the frame-leak gate passes in QEMU, `alloc` types work throughout the kernel — and
-every remaining scope item has now landed.
+**Threads exist and the timer preempts them.** The exit criterion is not met and will not be until
+SMP lands — it requires N threads across M CPUs, and there is one CPU.
 
-**Milestone exit criterion** ([docs/roadmap.md](docs/roadmap.md) M3): host property tests for buddy
-and slab pass; the frame-leak test passes in QEMU; `alloc` types usable throughout the kernel.
+**Milestone exit criterion** ([docs/roadmap.md](docs/roadmap.md) M4): N threads across M CPUs,
+10⁷ ping-pong iterations, no lost wakeups, no stranded threads, lock-rank assertions clean;
+fairness within 2% for two equal-weight workloads.
 
 | ID | Task | Status | Verified by |
 |---|---|---|---|
-| M3-01 | Frame database, one entry per frame | ✅ `DONE` | 65,503 entries / 1.28 MiB on a 256 MiB machine |
-| M3-02 | Buddy allocator, orders 0–10 | ✅ `DONE` | 26 host tests incl. a 20,000-operation randomised leak/coalescing property test |
-| M3-03 | DMA32 zone, never satisfied from above 4 GiB | ✅ `DONE` | Dedicated tests for the boundary and for no block straddling it |
-| M3-04 | Bump → buddy handover | ✅ `DONE` | Consumed ranges tracked and excluded *before* frames reach a free list |
-| M3-05 | Invariant checker | ✅ `DONE` | Walks every free list; caught the handover bug on first run |
-| M3-06 | Boot-time frame-leak self test | ✅ `DONE` | Runs on every boot, not only under test |
-| M3-07 | Slab allocator as `GlobalAlloc` | ✅ `DONE` | 12 host tests over real page-aligned memory; `Box` and `Vec` verified working in QEMU on BIOS and UEFI |
-| M3-08 | `AddressSpace`, `RangeMap`, page tables | ✅ `DONE` | 14 host tests for the region map; map/unmap/translate/create/destroy in QEMU |
-| M3-09 | W^X and NX enforcement | ✅ `DONE` | `Protection` has no write+execute variant; `EFER.NXE` enabled and asserted at boot |
-| M3-10 | Demand paging and copy-on-write | ✅ `DONE` | Faults serviced from the region map in a live address space. **Negative-tested**: breaking the demand-paging arm produces an unhandled page fault. |
-| M3-11 | Kernel stack guard pages | ✅ `DONE` | **Closes the M2 gap.** The kernel runs on a 64 KiB guarded stack; the `df` fault test now uses real recursion and faults at `cr2 = guard + 0xff8` |
-| M3-12 | `copy_from_user` / `copy_to_user` with fixups | ✅ `DONE` | Exception table; **negative-tested** — disabling it faults at exactly the test's bad pointer. SMEP and SMAP enabled. |
-| M3-13 | KASLR | ✅ `DONE` | Kernel built as a PIE; loader slides it and fixes up 403 relocations. Verified varying across boots; boot test asserts a non-zero slide. |
-| M3-14 | Address-space frame-leak gate (1000 create/destroy) | ✅ `DONE` | Passing, and **negative-tested**: removing page-table teardown leaks 9 frames per cycle and the gate catches it |
+| M4-01 | `Context` and `bhaskix_context_switch` | ✅ `DONE` | Threads run and resume correctly |
+| M4-02 | Per-thread guarded kernel stacks | ✅ `DONE` | Each thread gets its own slot with a guard page |
+| M4-03 | Round-robin runqueue | ✅ `DONE` | 7/7/7 runs across three workers |
+| M4-04 | Timer-driven preemption | ✅ `DONE` | **Negative-tested**: removing the `preempt` call zeroes every worker counter |
+| M4-05 | SMP bring-up (AP trampoline, per-CPU areas) | ⬜ `TODO` | **Blocks the exit criterion** |
+| M4-06 | Per-CPU runqueues, work stealing | ⬜ `TODO` | Needs M4-05 |
+| M4-07 | Fair class (virtual deadline), RT class | ⬜ `TODO` | Currently plain round-robin |
+| M4-08 | Lock ranking, active in debug builds | ⬜ `TODO` | `docs/coding-style.md` §7 requires it |
+| M4-09 | Sleeping, wait queues, blocking | ⬜ `TODO` | A thread is runnable or finished; nothing waits |
+| M4-10 | Tickless idle, timer wheel | ⬜ `TODO` | Timer is a fixed 100 Hz tick |
+| M4-11 | TLB shootdown | ⬜ `TODO` | **Correctness bug the moment a second CPU exists** — `unmap_page` invalidates only the local TLB |
+| M4-12 | Per-CPU frame reserve for the fault path | ⬜ `TODO` | Would let a fault be serviced while the allocator lock is held |
 
-### Bugs found and fixed during M3
+### Bugs found and fixed during M4
 
-0. **The kernel's `#[global_allocator]` broke the host test suite.** The attribute applies to the
-   whole binary, so under `cargo test` it replaced the *host* harness's allocator with one backed by
-   physical memory that does not exist — the harness failed to allocate 4 bytes before running a
-   single test. Now registered only under `cfg(not(test))`.
-1. **The bump→buddy handover corrupted the free lists.** Marking bump-allocated frames reserved
-   *after* adding their regions to the free lists left frames that were simultaneously on a free
-   list and reserved. The invariant checker caught it on its first run, which is the entire reason
-   it was written before the code that needed it. Fixed by having the bump allocator record what it
-   consumed and subtracting those ranges before any frame reaches a free list.
-2. **The frame database could not be allocated.** It must be one unbroken array, but the first
-   usable region on a PC is a ~300 KiB fragment below the legacy hole. Frame-by-frame allocation
-   silently produced a database split across the gap. Fixed with `allocate_contiguous`, which skips
-   regions that cannot hold the whole run.
-3. **A patch silently did not apply.** An earlier edit to wire in `memory::init` did not match, so
-   the module compiled as dead code and the boot output simply lacked a section. Caught only by
-   reading the boot log rather than trusting the build. Worth remembering: a clean build proves
-   nothing about whether the code runs.
-4. **The `unsafe` checker rejected a justification that was present.** rustfmt wrapped a long `let`
-   across two lines, putting code between the SAFETY comment and its block. The scanner now
-   continues past statement continuations and stops at a real statement boundary — and was
-   negative-tested to confirm it still catches genuinely unjustified blocks.
+1. **New threads started with interrupts disabled, and the machine simply stopped.** A thread that
+   has run before resumes through `iretq`, which restores `RFLAGS` and with it the interrupt flag.
+   A brand-new thread has no such frame — it is entered by a `ret` from inside the timer's interrupt
+   gate, which cleared `IF` on entry. So the first thread scheduled ran with interrupts off forever,
+   the timer never fired again, and there was no crash to look at: no exception, no triple fault,
+   just a halt. Diagnosed from QEMU's interrupt trace ending at a timer vector with nothing after.
+   Fixed with an `sti` in the thread trampoline.
+2. **My own trampoline design was internally inconsistent** — it expected the entry point in `rax`,
+   which the context switch does not restore. Caught while writing it; entry point and argument now
+   travel in `r12` and `rbx`, which are callee-saved and therefore actually preserved.
 
 ### Honest notes on what is *not* proven
 
-- ~~**No address space has ever been switched to.**~~ ✅ Closed by M3-10: the demand-paging test
-  loads `CR3` with a space Bhaskix built, so the higher-half copy that keeps the kernel mapped is
-  now exercised in the only way that matters.
-- ~~**Mappings are eager, not demand-paged.**~~ ✅ Closed by M3-10.
-- **W^X is enforced but not *attacked*.** The `Protection` type cannot express write+execute and NX
-  is on, but nothing yet tries to execute a writable page and confirms it faults. The same is true
-  of SMEP: it is enabled and untested, because testing it needs user-mode code to jump to, which is
-  M5. Both belong in the fault-injection suite.
-- **KASLR is real but its entropy is the loader's.** The kernel is position-independent and the
-  bootloader picks the slide, so the quality of the randomness is Limine's business, not ours. It
-  has not been measured, and the slide is confined to the top 2 GiB because the `kernel` code model
-  requires it — which bounds the entropy to roughly 19 bits of page-aligned choice. That is
-  meaningfully less than a 64-bit address space suggests, and it is a property of the code model
-  rather than of the loader.
-- **Nothing else is randomised.** The direct map, the kernel stack area, and the heap all sit at
-  fixed addresses. An attacker who leaks any one of them is not slowed by the image slide.
-- **The exception table has exactly one entry.** It covers the single `rep movsb` in `uaccess`.
-  That is sufficient today and will not stay sufficient — every future routine that touches user
-  memory needs its own entry, and a missing one turns a routine failure into a panic. There is no
-  check that a routine which *should* have an entry has one.
-- **`copy_from_user` has no alignment or overlap requirements and does no partial-copy reporting.**
-  On fault it reports failure without saying how many bytes were transferred, so a caller cannot
-  resume. POSIX-shaped callers in M5 will need that.
-- **Copy-on-write has no refcounting.** The shared original frame is deliberately not freed, because
-  nothing yet tracks how many mappings hold it. That is correct until `fork` exists in M5 and wrong
-  the moment it does — one frame per COW page currently leaks by design, and the test asserts only
-  that frame usage does not *increase*.
-- **The fault handler cannot service a fault taken while the allocator lock is held.** It uses
-  `try_lock` and reports an unserviceable fault rather than spinning, which turns a silent hang into
-  a diagnostic — but it is a real limitation, not a solved problem. A per-CPU frame reserve is the
-  fix, and belongs with the per-CPU work in M4.
-- **All address spaces share the higher-half page tables by pointer.** Creation copies the PML4
-  entries, so a kernel mapping added *after* a space is created is visible to it only if the
-  relevant PML4 entry already existed. That holds today; it will not survive dynamic kernel mappings
-  and needs revisiting in M4.
-
-- **The 4 GiB zone boundary has never been exercised on real memory.** QEMU was given 256 MiB, so
-  every frame is in the DMA32 zone and the `Normal` path is covered only by host tests.
-- **No per-CPU magazines.** `docs/memory.md` §2 specifies them for the order-0 hot path. There is
-  no SMP and no lock yet, so they would be untestable machinery guarding against contention that
-  cannot occur. Deferred to M4 with the second CPU.
-- **The frame database is sized by the highest usable address**, so a machine with a large gap
-  between RAM banks wastes database entries on the hole. Acceptable now; revisit if a target
-  platform has a sparse map.
-- **Nothing has been tested above 4 GiB of RAM**, so the `u32` PFN limit (16 TiB) and the zone
-  fallback path are untried in practice.
-- **`Frame` grew from 20 to 36 bytes** when `SlabInfo` was added, taking the frame database from
-  1.28 MiB to 2.25 MiB on a 256 MiB machine — about 0.9% of RAM. Linux overlays these fields in a
-  union instead. Worth doing, not yet done.
-- **No red zones, poisoning, or quarantine** in the slab allocator. `docs/memory.md` §4 specifies
-  them for debug builds. They are debugging aids rather than correctness, and were left until the
-  `alloc` machinery worked well enough to test them against.
-- **The slab has never been exercised under memory pressure** — every test had ample free frames, so
-  the out-of-memory paths inside `grow` are covered only by the deliberate-exhaustion unit test.
-
-### CI, first runs
-
-The workflow ran for the first time on 2026-08-03 and found two defects that no local run could:
-
-1. **CI had silently stopped running an entire crate's tests.** The workflow spelled out its own
-   cargo invocations rather than calling the Makefile, drifted from it, and `bhaskix-mm`'s 60 host
-   tests — the buddy allocator, the slab, the region map — were never executed in Actions at all.
-   Every job now invokes a Makefile target, so there is one definition of each check and the two
-   cannot diverge again.
-2. **OVMF was searched as two independent files instead of a matched pair.** On distributions
-   shipping only the 4 MB layout — which the runner has — a CODE image was found, no VARS image
-   was, and QEMU was handed `-drive file=<nonexistent>`. It exited before emitting a byte, so a
-   packaging difference presented as a kernel that would not boot. The images must also be
-   size-matched or the *firmware* rejects them, which is a worse place to find out.
-
-Worth recording *how* the second one was found: the boot job was split into a matrix over firmware
-and CPU model. BIOS passed on both CPU models and UEFI failed on both, which ruled out the kernel
-and both APIC paths and pointed at the firmware — from the job conclusions alone, with no access to
-a log. The CPU dimension is also the only way the x2APIC path gets exercised at all, since the
-local QEMU masks that CPUID bit.
+- **This is round-robin, not the scheduler `docs/scheduler.md` specifies.** No priorities, no
+  fairness weighting, no virtual deadlines, no RT class, no admission control. The fairness figure
+  printed at boot is reported rather than asserted, because a tight bound on round-robin would be
+  measuring timer jitter rather than any property worth defending.
+- **One CPU.** Everything about per-CPU runqueues, load balancing and work stealing is untouched,
+  and the scheduler takes raw pointers into a static thread table on the assumption that only one
+  CPU is inside it.
+- **Threads cannot block.** There is no sleep, no wait queue and no wakeup path, so "no lost
+  wakeups" — half the exit criterion — is not merely unproven but not yet expressible.
+- **Thread capacity is fixed at 16** and stacks are never reclaimed. `exit` marks a thread finished
+  but its stack stays mapped, so thread creation is effectively one-way.
+- **No lock ranking**, which `docs/coding-style.md` §7 requires and which becomes load-bearing the
+  moment there are enough locks to order.
 
 ### Blockers
 
@@ -215,7 +140,7 @@ local QEMU masks that CPUID bit.
 |---|---|---|
 | M1-17 | Physical UEFI machine with serial. QEMU cannot substitute. | Tarun Kumar Kushwaha |
 | Repo metadata | GitHub description and topics are unset, and `main` has no branch protection — `GOVERNANCE.md` §2 requires review for non-trivial changes and nothing enforces it. Deploy keys have no API scope, so these need the web UI. | Tarun Kumar Kushwaha |
-| CI log access | Reading Actions logs needs authentication; the unauthenticated API allows 60 requests/hour and only exposes pass/fail. A fine-grained token with `Actions: read` would remove both limits. | Tarun Kumar Kushwaha |
+| CI log access | Reading Actions logs needs authentication; unauthenticated API gives 60 requests/hour and only pass/fail. A fine-grained token with `Actions: read` would remove both limits. | Tarun Kumar Kushwaha |
 
 ## 4. Upcoming milestones
 
@@ -274,6 +199,20 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M4, threads preempt)
+
+- **Threads exist and the timer preempts them.** Real kernel threads, each on its own guarded stack,
+  switched by `bhaskix_context_switch`. Three workers that never yield all made progress, which only
+  the timer can have caused — negative-tested by removing the `preempt` call, which zeroes every
+  counter.
+- **One bug worth the whole exercise.** New threads started with interrupts disabled: a thread that
+  has run before resumes through `iretq` and gets `RFLAGS` back, but a brand-new one is entered by a
+  `ret` from inside an interrupt gate that cleared `IF`. The first thread scheduled therefore ran
+  with interrupts off forever and the machine stopped — no exception, no triple fault, nothing to
+  read. Found in QEMU's interrupt trace, which simply ended.
+- **This is round-robin, not the fair scheduler**, and the tracker says so rather than letting the
+  milestone name imply otherwise.
 
 ### 2026-08-03 (M3-13, KASLR — M3 complete)
 

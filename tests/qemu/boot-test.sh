@@ -121,7 +121,7 @@ done
 # Deliberately milestone-agnostic: an earlier version matched "M1 complete" and
 # broke the moment the banner said M3, which is a test failing on its own
 # wording rather than on the kernel.
-if grep -qF "complete. Nothing left to do at this milestone" "$LOG"; then
+if grep -qF "Nothing left to do at this milestone" "$LOG"; then
     pass "kernel_main ran to completion"
 else
     fail "the kernel did not run to completion"
@@ -199,6 +199,16 @@ fi
 # A single boot cannot prove the base is *random*, only that a slide was
 # applied at all -- which is the part that can silently regress. Losing KASLR
 # looks identical to having it unless the number is checked.
+# Threads exist and the timer preempts them. The workers never yield, so a
+# counter that advanced can only have been put on the CPU by the timer --
+# negative-tested by removing the preempt call, which zeroes every count.
+if grep -qE "threads +[0-9]+ preemptions; all [0-9]+ workers ran" "$LOG"; then
+    pass "threads preempted by the timer"
+else
+    fail "timer-driven preemption did not work"
+    status=1
+fi
+
 if grep -qE "kaslr +slid 0x[0-9a-f]+ bytes" "$LOG" \
    && ! grep -qF "kaslr           NOT APPLIED" "$LOG"; then
     pass "KASLR applied (kernel image slid from its link-time base)"

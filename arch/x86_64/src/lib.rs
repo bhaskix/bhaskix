@@ -29,6 +29,7 @@
 
 pub mod apic;
 pub mod cell;
+pub mod context;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
@@ -40,5 +41,6 @@ pub mod serial;
 pub mod trap;
 pub mod uaccess;
 
+pub use context::Context;
 pub use serial::SerialPort;
 pub use trap::TrapFrame;
