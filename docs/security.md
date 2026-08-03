@@ -224,8 +224,12 @@ Audit-specific requirements on top of the telemetry plane:
 
 Do not open a public issue for a security bug.
 
-Report privately to the maintainers (contact and PGP key: `SECURITY.md`, to be added before the
-first public release). We commit to:
+Report privately to the maintainers. Contact details and the current state of the reporting
+channel are in [SECURITY.md](../SECURITY.md), which also records what is *not* a vulnerability yet —
+this project documents its unfinished work in the open, and a report of a protection that is
+tracked as unimplemented costs the reporter time for nothing.
+
+We commit to:
 
 - Acknowledgement within 72 hours.
 - A coordinated disclosure window of 90 days by default, negotiable for severe or complex issues.

@@ -109,6 +109,11 @@ Finding the same flaw in Phase 3 costs a year.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [GOVERNANCE.md](GOVERNANCE.md).
 
+**Found a security bug?** Do not open a public issue — see
+[SECURITY.md](SECURITY.md). Note that Bhaskix is pre-alpha and documents its
+unfinished work openly, so check what is already tracked as unimplemented
+before reporting.
+
 ## Authors
 
 Created and maintained by **Tarun Kumar Kushwaha** — original author and project lead.
