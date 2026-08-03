@@ -70,6 +70,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **D4** | Isolation primitive | ✅ Accepted 2026-08-02 | **Domains** — containers and VMs are the same primitive. | [docs/architecture.md](docs/architecture.md) §4 |
 | **S1** | Storage architecture | ⬜ Draft | Capability-scoped Merkle-checksummed object store; POSIX as one personality. | [RFC 0003](docs/rfc/0003-storage-architecture.md) |
 | **P1** | First deployment target | ⬜ Draft | Operational technology — a hypervisor beneath the customer's existing, uncertifiable OT stack. Reorders the roadmap: virtualization earlier, desktop later, IEC 62443 as the certification path. | [RFC 0004](docs/rfc/0004-ot-security-gateway.md) |
+| **K1** | Storage implementation | ⬜ Draft | **Kosh** — RFC 0003's layers made concrete, plus distribution. Elastic from one node, RF=1…n, block/file/object/key-value, asynchronous geo. Commits to the row RFC 0003 marked *not committed*, and is explicit that the first years are single-node. | [RFC 0006](docs/rfc/0006-kosh-distributed-storage.md) |
 | **C1** | Binary compatibility | ⬜ Draft | Linux `x86_64` ABI as a **domain personality**, not the native interface. First target deliberately narrow: statically linked Go binaries. Answers **A4** by refusing its premise — own ABI natively *and* Linux compatibility as something offered. | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 | **A2** | Syscall ABI shape | ⬜ Open | Capability-invocation only vs a numbered syscall table. | *Blocks M5* |
 | **A3** | IPC style | ⬜ Open | Synchronous rendezvous vs async buffered channels. Which is primitive? | *Blocks M5* |
@@ -253,6 +254,51 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (RFC 0006 drafted, Kosh storage)
+
+- **RFC 0006 drafted**: `Kosh` (कोष, treasury) names the storage system and scopes the distributed
+  tier — elastic from a single node, RF=1…n per volume, block/file/object/key-value over one
+  substrate, heterogeneous geo-replication. Draft, awaiting a decision.
+- **It commits to the row RFC 0003 marked "not committed"**, and does not withdraw that RFC's
+  estimate: Ceph-scale distribution is a decade-scale programme. The document is therefore
+  structured so the first two stages are independently useful and form a clean stopping point — a
+  Merkle-checksummed, copy-on-write, capability-scoped store on one machine, which is what RFC 0003
+  argued an evaluator actually needs.
+- **The claims that cannot be made truthfully are stated first, not last.** RF=1 is not durable and
+  must be reported as `Unprotected`; RF=2 on two nodes cannot survive a partition without a witness
+  or a declared primary; cross-site replication is asynchronous because of the speed of light, so it
+  has a non-zero RPO that must be measured and published rather than implied away; and "universal"
+  describes the interface, not performance on all three workloads at once.
+- **`n = 1` is not a special case** is called out as the hardest constraint. A separate single-node
+  mode is two products with a migration between them, and the migration is the part users discover
+  is risky.
+- **Cluster membership ships before replication, deliberately.** Building both together means the
+  first cluster test cannot distinguish a placement bug from a replication bug.
+- **Automatic cross-site failover and synchronous geo-replication are refused outright**, not
+  deferred, along with Ceph/S3 wire compatibility — which would mean inheriting the semantics RFC
+  0003 exists to avoid.
+- **Data locality is a scheduler decision, not a storage one.** Reads are served from the nearest
+  healthy replica; writes cannot be local, because a synchronous write at RF=n is only durable when
+  every replica has it. The interesting lever is moving the *compute* — Bhaskix schedules VMs and
+  containers as domains and Kosh knows which nodes hold which extents, so "start this VM where its
+  disk already is" is a decision the system can make. It is expressed as a weight the scheduler may
+  trade off, never a constraint: locality and load balancing conflict directly, and a hard
+  constraint turns a busy node into a queue.
+- **Disaster recovery is separated from high availability, with the numbers named.** HA is
+  within-site, synchronous, RPO zero, automatic. DR is cross-site, asynchronous, RPO non-zero and
+  measured, RTO minutes, operator-initiated. Automatic cross-site failover is refused. Rehearsal is
+  a first-class operation, because a failover procedure that has never been run is the thing that
+  fails in the incident; and failback resynchronises by Merkle difference, because a full re-copy
+  after every failover is how sites quietly stop failing back.
+- **Replication is not backup**, and the RFC says so where a reader cannot miss it: replication
+  copies destructive writes faithfully, so RF=3 across three sites is three copies of the ransomware.
+  Snapshots are the answer, and an immutable snapshot means the capability that shortens retention
+  is separate from the one that writes — expressible under the capability model in a way a
+  permission bit is not.
+- **The deepest open question is a capability question, not a storage one**: how authority survives
+  a hop, so that a node holding a replica can serve it without holding authority over everything.
+  It blocks the replication stage.
 
 ### 2026-08-03 (M4-09, sleeping and wait queues)
 
