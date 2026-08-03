@@ -19,6 +19,14 @@ PHDRS
     text    PT_LOAD FLAGS((1 << 2) | (1 << 0));    /* R + X */
     rodata  PT_LOAD FLAGS((1 << 2));               /* R     */
     data    PT_LOAD FLAGS((1 << 2) | (1 << 1));    /* R + W */
+
+    /* Required for KASLR. The kernel is linked as a PIE so the bootloader can
+     * slide it, and a bootloader can only find the relocations through a
+     * PT_DYNAMIC segment. Declaring PHDRS explicitly means nothing is created
+     * implicitly -- omit this and the loader rejects the image with
+     * "ET_DYN, but PT_DYNAMIC segment missing", which is at least an honest
+     * error. */
+    dynamic PT_DYNAMIC FLAGS((1 << 2) | (1 << 1));  /* R + W */
 }
 
 SECTIONS
@@ -39,6 +47,27 @@ SECTIONS
      * make a fault at a known instruction recoverable instead of fatal.
      * Bracketed by symbols so arch::uaccess can walk it, and KEEP so it
      * survives even though nothing references the entries by name. */
+    /* Everything the loader needs to apply the slide. These must live inside
+     * a PT_LOAD segment as well as being reachable from PT_DYNAMIC, or the
+     * loader finds a table it cannot read. */
+    .dynsym   : { *(.dynsym)   } :rodata
+    .dynstr   : { *(.dynstr)   } :rodata
+    .gnu.hash : { *(.gnu.hash) } :rodata
+    .hash     : { *(.hash)     } :rodata
+
+    .rela.dyn : {
+        *(.rela.dyn)
+        *(.rela.text .rela.text.*)
+        *(.rela.rodata .rela.rodata.*)
+        *(.rela.data .rela.data.*)
+    } :rodata
+
+    /* Mapped by the rodata segment and *also* described by PT_DYNAMIC: the
+     * first makes it readable, the second makes it findable. */
+    .dynamic : {
+        *(.dynamic)
+    } :rodata :dynamic
+
     .exception_table : {
         PROVIDE_HIDDEN(__exception_table_start = .);
         KEEP(*(.exception_table))

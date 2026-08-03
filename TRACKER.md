@@ -83,9 +83,9 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 
 ## 3. Active milestone — M3: Memory management
 
-**The exit criterion is MET.** Host property tests for the buddy allocator and slab pass, the
-frame-leak gate passes in QEMU, and `alloc` types work throughout the kernel. Two scope items
-remain — `copy_*_user` and KASLR — and neither is required by the criterion.
+**M3 is complete.** The exit criterion was met earlier — host property tests for the buddy allocator
+and slab pass, the frame-leak gate passes in QEMU, `alloc` types work throughout the kernel — and
+every remaining scope item has now landed.
 
 **Milestone exit criterion** ([docs/roadmap.md](docs/roadmap.md) M3): host property tests for buddy
 and slab pass; the frame-leak test passes in QEMU; `alloc` types usable throughout the kernel.
@@ -104,7 +104,7 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 | M3-10 | Demand paging and copy-on-write | ✅ `DONE` | Faults serviced from the region map in a live address space. **Negative-tested**: breaking the demand-paging arm produces an unhandled page fault. |
 | M3-11 | Kernel stack guard pages | ✅ `DONE` | **Closes the M2 gap.** The kernel runs on a 64 KiB guarded stack; the `df` fault test now uses real recursion and faults at `cr2 = guard + 0xff8` |
 | M3-12 | `copy_from_user` / `copy_to_user` with fixups | ✅ `DONE` | Exception table; **negative-tested** — disabling it faults at exactly the test's bad pointer. SMEP and SMAP enabled. |
-| M3-13 | KASLR | ⬜ `TODO` | |
+| M3-13 | KASLR | ✅ `DONE` | Kernel built as a PIE; loader slides it and fixes up 403 relocations. Verified varying across boots; boot test asserts a non-zero slide. |
 | M3-14 | Address-space frame-leak gate (1000 create/destroy) | ✅ `DONE` | Passing, and **negative-tested**: removing page-table teardown leaks 9 frames per cycle and the gate catches it |
 
 ### Bugs found and fixed during M3
@@ -141,6 +141,14 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
   is on, but nothing yet tries to execute a writable page and confirms it faults. The same is true
   of SMEP: it is enabled and untested, because testing it needs user-mode code to jump to, which is
   M5. Both belong in the fault-injection suite.
+- **KASLR is real but its entropy is the loader's.** The kernel is position-independent and the
+  bootloader picks the slide, so the quality of the randomness is Limine's business, not ours. It
+  has not been measured, and the slide is confined to the top 2 GiB because the `kernel` code model
+  requires it — which bounds the entropy to roughly 19 bits of page-aligned choice. That is
+  meaningfully less than a 64-bit address space suggests, and it is a property of the code model
+  rather than of the loader.
+- **Nothing else is randomised.** The direct map, the kernel stack area, and the heap all sit at
+  fixed addresses. An attacker who leaks any one of them is not slowed by the image slide.
 - **The exception table has exactly one entry.** It covers the single `rep movsb` in `uaccess`.
   That is sufficient today and will not stay sufficient — every future routine that touches user
   memory needs its own entry, and a missing one turns a routine failure into a panic. There is no
@@ -266,6 +274,23 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M3-13, KASLR — M3 complete)
+
+- **KASLR works.** The kernel is now built as a position-independent executable, so the bootloader
+  slides the image and fixes up its 403 relative relocations. Verified across boots: the base moved
+  every time, and the boot test asserts a non-zero slide — losing KASLR otherwise looks identical to
+  having it.
+- **Two things had to change for it.** The exception table now stores self-relative offsets rather
+  than absolute addresses, because an absolute address in a read-only section needs a dynamic
+  relocation the linker refuses to emit there; Linux's table is built the same way for the same
+  reason. And the link script gained an explicit `PT_DYNAMIC` segment — declaring PHDRS by hand
+  means nothing is created implicitly, and the loader rejected the image with "ET_DYN, but
+  PT_DYNAMIC segment missing" until it was added. A precise error message from Limine turned what
+  could have been a long debugging session into a five-minute fix.
+- **A fourth silently-failed patch.** The KASLR reporting edit matched nothing because rustfmt had
+  rewrapped the surrounding `println!` — the same failure mode as three previous occasions. Caught
+  by grepping for the new string rather than trusting the build.
 
 ### 2026-08-03 (M3-12, user access)
 

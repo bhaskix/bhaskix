@@ -10,17 +10,21 @@ target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
 rustflags = [
-    # The kernel is linked at a fixed higher-half address by
-    # boot/shim/linker.ld, so it is not position independent. The target
-    # defaults to PIE, which would produce relocations the bootloader is not
-    # asked to process.
-    "-C", "relocation-model=static",
+    # Position independent, so the bootloader can slide the kernel image and
+    # KASLR is real rather than nominal. The link script's 0xffffffff80000000
+    # is a *preferred* base; the loader applies a random offset and fixes up
+    # the R_X86_64_RELATIVE entries it finds through PT_DYNAMIC.
+    #
+    # This is why the exception table stores self-relative offsets rather than
+    # absolute addresses: an absolute address in a read-only section needs a
+    # dynamic relocation the linker will not emit there.
+    "-C", "relocation-model=pic",
 
-    # The `kernel` code model assumes all symbols live in the top 2 GiB of the
-    # address space, which is exactly where linker.ld puts them. It lets the
-    # compiler use 32-bit signed displacements instead of 64-bit absolute
-    # addresses -- smaller and faster than the target's default `large` model,
-    # and correct only because of where we link.
+    # The `kernel` code model assumes every symbol lives in the top 2 GiB, so
+    # the compiler can use 32-bit signed displacements instead of 64-bit
+    # absolute addresses. That stays correct under KASLR only because the
+    # loader confines the slide to that same 2 GiB window -- a slide outside it
+    # would silently truncate displacements rather than fail to link.
     "-C", "code-model=kernel",
 ]
 

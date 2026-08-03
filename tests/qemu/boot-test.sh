@@ -196,6 +196,17 @@ fi
 
 # SMEP and SMAP turn whole classes of exploitation primitive into faults, and
 # uaccess depends on the exception table existing at all.
+# A single boot cannot prove the base is *random*, only that a slide was
+# applied at all -- which is the part that can silently regress. Losing KASLR
+# looks identical to having it unless the number is checked.
+if grep -qE "kaslr +slid 0x[0-9a-f]+ bytes" "$LOG" \
+   && ! grep -qF "kaslr           NOT APPLIED" "$LOG"; then
+    pass "KASLR applied (kernel image slid from its link-time base)"
+else
+    fail "KASLR was not applied -- the kernel is at its link-time base"
+    status=1
+fi
+
 if grep -qE "supervisor +smep on +smap on" "$LOG"; then
     pass "SMEP and SMAP enabled"
 else

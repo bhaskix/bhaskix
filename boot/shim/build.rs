@@ -19,6 +19,8 @@ fn main() {
     // `-bins` so the script applies to the kernel binary only, and never to a
     // host build script or a test harness.
     println!("cargo:rustc-link-arg-bins=-T{manifest_dir}/linker.ld");
+    println!("cargo:rustc-link-arg-bins=-pie");
+    println!("cargo:rustc-link-arg-bins=--no-dynamic-linker");
 
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=build.rs");

@@ -33,14 +33,36 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// One exception-table entry: a faulting address and where to resume.
+/// One exception-table entry.
+///
+/// Both fields are **self-relative 32-bit offsets**, not addresses. That is
+/// not a space optimisation: an absolute address in a read-only section needs
+/// a dynamic relocation, which is exactly what a position-independent kernel
+/// cannot have there — the linker rejects `R_X86_64_64` against a local symbol
+/// in non-writable memory. Relative offsets need no relocation at all, so the
+/// table works unchanged however far the image is slid. Linux's exception
+/// table is built the same way, for the same reason.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Fixup {
-    /// Address of an instruction that may fault.
-    fault: u64,
-    /// Address to resume at when it does.
-    recovery: u64,
+    /// Offset from this field's own address to the instruction that may fault.
+    fault: i32,
+    /// Offset from this field's own address to where execution resumes.
+    recovery: i32,
+}
+
+impl Fixup {
+    /// Absolute address of the faulting instruction.
+    fn fault_address(&self) -> u64 {
+        let base = (&raw const self.fault) as i64;
+        (base + i64::from(self.fault)) as u64
+    }
+
+    /// Absolute address to resume at.
+    fn recovery_address(&self) -> u64 {
+        let base = (&raw const self.recovery) as i64;
+        (base + i64::from(self.recovery)) as u64
+    }
 }
 
 unsafe extern "C" {
@@ -87,8 +109,8 @@ pub fn fixup_for(rip: u64) -> Option<u64> {
 
     table
         .iter()
-        .find(|entry| entry.fault == rip)
-        .map(|entry| entry.recovery)
+        .find(|entry| entry.fault_address() == rip)
+        .map(Fixup::recovery_address)
 }
 
 /// Number of entries in the exception table, for reporting.
@@ -247,9 +269,11 @@ bhaskix_copy_user:
     ret
 
 .section .exception_table, "a"
-.align 8
-    .quad 3b                 // faulting instruction
-    .quad 6b                 // where to resume
+.align 4
+    // Self-relative, so no relocation is needed and the table survives the
+    // image being slid by the bootloader.
+    .long 3b - .             // faulting instruction
+    .long 6b - .             // where to resume
 .previous
 "#
 );

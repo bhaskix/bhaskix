@@ -447,6 +447,20 @@ fn report_boot_state(handoff: &Handoff, serial: bool, framebuffer: bool) {
         "    kernel virt     {:#018x}",
         handoff.kernel_virt_base.as_u64()
     );
+
+    // The link script's *preferred* base. The kernel is a PIE, so the loader
+    // slides the image away from it and fixes up the relocations it finds
+    // through PT_DYNAMIC. A slide of zero means KASLR did not happen — worth
+    // saying out loud, because either address looks equally plausible and the
+    // difference is the whole protection.
+    const LINK_BASE: u64 = 0xffff_ffff_8000_0000;
+    let slide = handoff.kernel_virt_base.as_u64().wrapping_sub(LINK_BASE);
+    if slide == 0 {
+        println!("    kaslr           NOT APPLIED (image sits at its link-time base)");
+    } else {
+        println!("    kaslr           slid {slide:#x} bytes from {LINK_BASE:#018x}");
+    }
+
     println!("    hhdm base       {:#018x}", handoff.hhdm_base.as_u64());
 
     match handoff.rsdp {
