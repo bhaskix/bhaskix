@@ -103,7 +103,7 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 | M3-09 | W^X and NX enforcement | ✅ `DONE` | `Protection` has no write+execute variant; `EFER.NXE` enabled and asserted at boot |
 | M3-10 | Demand paging and copy-on-write | ✅ `DONE` | Faults serviced from the region map in a live address space. **Negative-tested**: breaking the demand-paging arm produces an unhandled page fault. |
 | M3-11 | Kernel stack guard pages | ✅ `DONE` | **Closes the M2 gap.** The kernel runs on a 64 KiB guarded stack; the `df` fault test now uses real recursion and faults at `cr2 = guard + 0xff8` |
-| M3-12 | `copy_from_user` / `copy_to_user` with fixups | ⬜ `TODO` | Needed before user mode in M5 |
+| M3-12 | `copy_from_user` / `copy_to_user` with fixups | ✅ `DONE` | Exception table; **negative-tested** — disabling it faults at exactly the test's bad pointer. SMEP and SMAP enabled. |
 | M3-13 | KASLR | ⬜ `TODO` | |
 | M3-14 | Address-space frame-leak gate (1000 create/destroy) | ✅ `DONE` | Passing, and **negative-tested**: removing page-table teardown leaks 9 frames per cycle and the gate catches it |
 
@@ -138,8 +138,16 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
   now exercised in the only way that matters.
 - ~~**Mappings are eager, not demand-paged.**~~ ✅ Closed by M3-10.
 - **W^X is enforced but not *attacked*.** The `Protection` type cannot express write+execute and NX
-  is on, but nothing yet tries to execute a writable page and confirms it faults. That test belongs
-  with the fault-injection suite and is not written.
+  is on, but nothing yet tries to execute a writable page and confirms it faults. The same is true
+  of SMEP: it is enabled and untested, because testing it needs user-mode code to jump to, which is
+  M5. Both belong in the fault-injection suite.
+- **The exception table has exactly one entry.** It covers the single `rep movsb` in `uaccess`.
+  That is sufficient today and will not stay sufficient — every future routine that touches user
+  memory needs its own entry, and a missing one turns a routine failure into a panic. There is no
+  check that a routine which *should* have an entry has one.
+- **`copy_from_user` has no alignment or overlap requirements and does no partial-copy reporting.**
+  On fault it reports failure without saying how many bytes were transferred, so a caller cannot
+  resume. POSIX-shaped callers in M5 will need that.
 - **Copy-on-write has no refcounting.** The shared original frame is deliberately not freed, because
   nothing yet tracks how many mappings hold it. That is correct until `fork` exists in M5 and wrong
   the moment it does — one frame per COW page currently leaks by design, and the test asserts only
@@ -258,6 +266,26 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M3-12, user access)
+
+- **`copy_from_user` and `copy_to_user` land, with an exception table.** A fault at the copy
+  instruction resumes at a recovery path and returns an error, so a hostile or simply wrong user
+  pointer is ordinary input rather than a kernel defect. Negative-tested: disabling the table
+  produces an unhandled page fault at exactly the address the test passes in.
+- **SMEP and SMAP are enabled.** SMAP means a kernel access to a user page faults *even when the
+  page is mapped*, so the copy routines bracket their access with `stac`/`clac` inside the assembly
+  — the window is a few instructions wide and cannot be left open by an early return.
+- **A range check, not just a fault check.** A user pointer aimed at kernel memory would otherwise
+  succeed whenever that memory happens to be mapped, which is the confused-deputy bug the check
+  exists to prevent; the fault handler cannot tell a kernel address the caller meant from one an
+  attacker supplied.
+- **Fixed a fault loop I had introduced.** The handler returned `Handled` for an already-present
+  page, which retries the faulting instruction forever. SMAP makes that reachable, since a kernel
+  access to a *mapped* user page faults and the mapping being there is what made it look
+  serviceable.
+- **The demand-paging test now goes through `uaccess`** rather than raw volatile writes, which is
+  both required by SMAP and a better test — it proves demand paging works underneath a user copy.
 
 ### 2026-08-03 (M3 exit criterion met)
 

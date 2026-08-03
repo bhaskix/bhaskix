@@ -72,3 +72,86 @@ pub fn halt_forever() -> ! {
         }
     }
 }
+
+/// `CR4.SMEP` — supervisor mode execution prevention.
+const CR4_SMEP: u64 = 1 << 20;
+/// `CR4.SMAP` — supervisor mode access prevention.
+const CR4_SMAP: u64 = 1 << 21;
+
+/// Reads `CR4`.
+///
+/// # Safety
+///
+/// Safe at CPL 0; unsafe only because the value is meaningless elsewhere.
+#[must_use]
+pub unsafe fn read_cr4() -> u64 {
+    let value: u64;
+    // SAFETY: reading a control register at CPL 0 has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Enables SMEP and SMAP where the CPU supports them.
+///
+/// Returns `(smep, smap)` — which were actually turned on.
+///
+/// SMEP stops the kernel executing user pages; SMAP stops it *reading or
+/// writing* them without deliberately lifting the restriction. Both convert a
+/// large class of exploitation primitive into a fault
+/// (`docs/security.md` §4).
+///
+/// # Safety
+///
+/// Must run during init. Enabling SMAP makes every existing kernel access to a
+/// user page fault, so any code that legitimately touches user memory must
+/// already go through `uaccess`.
+pub unsafe fn enable_supervisor_protections() -> (bool, bool) {
+    let features = crate::msr::features();
+
+    let mut bits = 0;
+    if features.smep {
+        bits |= CR4_SMEP;
+    }
+    if features.smap {
+        bits |= CR4_SMAP;
+    }
+    if bits == 0 {
+        return (false, false);
+    }
+
+    // SAFETY: writing CR4 at CPL 0 with bits the CPU reports as supported.
+    // Only these two are changed; paging and other enables are preserved,
+    // because clearing one of those mid-flight would be immediately fatal.
+    unsafe {
+        let cr4 = read_cr4();
+        core::arch::asm!("mov cr4, {}", in(reg) cr4 | bits, options(nostack, preserves_flags));
+    }
+
+    (features.smep, features.smap)
+}
+
+/// Lifts SMAP for the current CPU by setting the `AC` flag.
+///
+/// # Safety
+///
+/// Leaves user memory accessible from kernel mode until [`clac`] runs. The
+/// window must be as short as possible and must close on every path, including
+/// error paths — which is why `uaccess` does this inside assembly rather than
+/// around a call.
+pub unsafe fn stac() {
+    // SAFETY: `stac` is only encodable when SMAP is supported; the caller
+    // guarantees it has been enabled.
+    unsafe { core::arch::asm!("stac", options(nomem, nostack)) };
+}
+
+/// Restores SMAP by clearing the `AC` flag.
+///
+/// # Safety
+///
+/// Only meaningful on a CPU with SMAP enabled.
+pub unsafe fn clac() {
+    // SAFETY: as `stac`.
+    unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
+}

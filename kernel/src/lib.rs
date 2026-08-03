@@ -180,6 +180,26 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
                 println!("    no-execute     UNAVAILABLE -- W^X cannot be enforced");
             }
 
+            // SMEP stops the kernel executing user pages; SMAP stops it
+            // reading or writing them except through `uaccess`, which lifts
+            // the restriction for a few instructions at a time.
+            //
+            // SAFETY: init, and every deliberate access to user memory already
+            // goes through `uaccess`.
+            let (smep, smap) = unsafe { cpu::enable_supervisor_protections() };
+            bhaskix_arch::uaccess::set_smap_enabled(smap);
+            println!(
+                "    supervisor     smep {}  smap {}  ({} exception-table {})",
+                if smep { "on" } else { "--" },
+                if smap { "on" } else { "--" },
+                bhaskix_arch::uaccess::fixup_count(),
+                if bhaskix_arch::uaccess::fixup_count() == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                }
+            );
+
             const LEAK_CYCLES: u32 = 1000;
             if vm::self_test(handoff.hhdm_base.as_u64(), LEAK_CYCLES) {
                 println!(

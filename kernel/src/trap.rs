@@ -153,7 +153,24 @@ fn handle(frame: &mut TrapFrame) {
 
         match crate::vm::handle_fault(address, write) {
             crate::vm::FaultOutcome::Handled => return,
-            crate::vm::FaultOutcome::NotOurs => {}
+            crate::vm::FaultOutcome::NotOurs => {
+                // The region map could not service it. Before treating the
+                // fault as a bug, check whether the faulting instruction is
+                // one that is *allowed* to fault: the copy routines in
+                // `uaccess` register themselves in the exception table so a
+                // bad user pointer becomes an error return rather than a
+                // panic.
+                //
+                // Checked after the region map, not before, so that a
+                // legitimate demand-paging fault inside a copy is serviced
+                // rather than reported as a bad pointer.
+                if !frame.from_user_mode()
+                    && let Some(recovery) = bhaskix_arch::uaccess::fixup_for(frame.rip)
+                {
+                    frame.rip = recovery;
+                    return;
+                }
+            }
             crate::vm::FaultOutcome::Refused(reason) => {
                 println!();
                 println!("  the region map refused this access: {reason}");

@@ -38,6 +38,7 @@ pub mod pic;
 pub mod port;
 pub mod serial;
 pub mod trap;
+pub mod uaccess;
 
 pub use serial::SerialPort;
 pub use trap::TrapFrame;

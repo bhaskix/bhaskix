@@ -194,6 +194,23 @@ else
     status=1
 fi
 
+# SMEP and SMAP turn whole classes of exploitation primitive into faults, and
+# uaccess depends on the exception table existing at all.
+if grep -qE "supervisor +smep on +smap on" "$LOG"; then
+    pass "SMEP and SMAP enabled"
+else
+    fail "SMEP/SMAP not enabled"
+    status=1
+fi
+
+if grep -qE "exception-table (entry|entries)" "$LOG" \
+   && ! grep -qF "(0 exception-table" "$LOG"; then
+    pass "exception table populated (bad user pointers fault, not panic)"
+else
+    fail "the exception table is empty -- a bad user pointer would panic"
+    status=1
+fi
+
 # The handoff must have been validated, not skipped.
 if grep -qF "handoff version 1" "$LOG"; then
     pass "handoff accepted"

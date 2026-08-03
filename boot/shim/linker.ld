@@ -35,6 +35,16 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    /* The exception table: pairs of (faulting address, recovery address) that
+     * make a fault at a known instruction recoverable instead of fatal.
+     * Bracketed by symbols so arch::uaccess can walk it, and KEEP so it
+     * survives even though nothing references the entries by name. */
+    .exception_table : {
+        PROVIDE_HIDDEN(__exception_table_start = .);
+        KEEP(*(.exception_table))
+        PROVIDE_HIDDEN(__exception_table_end = .);
+    } :rodata
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     /* The Limine requests live in the WRITABLE segment, not rodata.

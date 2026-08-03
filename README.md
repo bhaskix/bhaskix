@@ -14,10 +14,21 @@ later be called calculus, five hundred years before Newton and Leibniz.
 
 The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 
-> **Status: M1 — it boots.**
-> Bhaskix boots on UEFI and BIOS, brings up a serial and framebuffer console, and prints its
-> memory map. It is not yet an operating system: there are no interrupts, no memory manager, no
-> processes. See [TRACKER.md](TRACKER.md) for exactly what works and what is not yet proven.
+**Created and developed by [Tarun Kumar Kushwaha](AUTHORS.md)** — original author and project lead.
+
+> **Status: M3 — memory management.**
+>
+> Boots on UEFI and BIOS. Interrupts and a calibrated timer; every CPU exception produces a decoded
+> diagnostic instead of a triple fault; a buddy physical allocator; a slab heap, so `Box` and `Vec`
+> work; address spaces with W^X enforced by construction; demand paging and copy-on-write serviced
+> from the region map; and a kernel stack with a guard page.
+>
+> **It is still not an operating system.** There is no user mode, no processes, no scheduler, no
+> filesystem, and no networking. Nothing here should run anywhere that matters — see
+> [SECURITY.md](SECURITY.md).
+>
+> [TRACKER.md](TRACKER.md) is the single source of truth for what is *proven* versus what merely
+> compiles, and it records the gaps rather than hiding them.
 >
 > The design documents were written first, deliberately: kernel projects that begin with a clear
 > architecture evolve; those that begin with code rewrite.

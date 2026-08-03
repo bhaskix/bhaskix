@@ -20,6 +20,7 @@
 //! allocator rather than at the mistake.
 
 use bhaskix_arch::paging::{self, MapError, flags};
+use bhaskix_arch::uaccess;
 use bhaskix_boot::VirtAddr;
 use bhaskix_mm::vm::{
     Backing, PAGE_SIZE, Protection, RangeMap, RangeMapError, VirtRange, VmRegion,
@@ -549,11 +550,16 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
                 FaultOutcome::Handled
             }
 
-            // Already present and this is not a COW write: another CPU or an
-            // earlier fault on the same page got there first. Nothing to do.
+            // Present, and not a copy-on-write write. There is nothing to
+            // create, so this handler cannot help -- and saying `Handled`
+            // would retry the same faulting instruction forever.
+            //
+            // That loop is reachable: with SMAP on, a kernel access to a
+            // *mapped* user page faults, and the mapping already being there
+            // is exactly what makes it look serviceable.
             Some(_) => {
                 let _ = pmm.free(pfn, 0);
-                FaultOutcome::Handled
+                FaultOutcome::NotOurs
             }
 
             // Demand paging: the region says this address is valid and the
@@ -644,29 +650,58 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
     // --- demand paging -----------------------------------------------------
     // No mapping exists for this address. Touching it must fault, the handler
     // must consult the region map, and the instruction must then complete.
-    // SAFETY: the region map declares this range readable and writable; if the
-    // handler is broken this faults again and the exception reporter says so,
-    // which is the outcome the test is checking for.
-    unsafe {
-        core::ptr::write_volatile(LAZY as *mut u64, PATTERN);
-    }
-    // SAFETY: just written through the same mapping.
-    let read_back = unsafe { core::ptr::read_volatile(LAZY as *const u64) };
+    // Through `uaccess`, not a raw volatile write. Two reasons: with SMAP on,
+    // a direct kernel write to a user page faults regardless of the mapping;
+    // and this exercises the path real kernel code will use.
+    //
+    // The first touch faults on an *unmapped* page, so this also proves demand
+    // paging works underneath a user copy rather than only for direct access.
+    let mut value = PATTERN;
+    // SAFETY: `value` is a live local of the right size. The destination is
+    // untrusted by contract -- that is the point of the routine.
+    let wrote =
+        unsafe { uaccess::copy_to_user(LAZY, (&raw const value).cast::<u8>(), size_of::<u64>()) };
+    value = 0;
+    // SAFETY: as above, in the other direction.
+    let read =
+        unsafe { uaccess::copy_from_user((&raw mut value).cast::<u8>(), LAZY, size_of::<u64>()) };
+    let read_back = if wrote.is_ok() && read.is_ok() {
+        value
+    } else {
+        0
+    };
 
-    // A second page in the same region, to prove the handler is per-page
-    // rather than per-region.
+    // A second page in the same region, to prove the handler works per page
+    // rather than per region.
+    let mut second = PATTERN ^ 1;
     // SAFETY: as above.
-    unsafe {
-        core::ptr::write_volatile((LAZY + PAGE_SIZE) as *mut u64, PATTERN ^ 1);
-    }
+    let wrote_second = unsafe {
+        uaccess::copy_to_user(
+            LAZY + PAGE_SIZE,
+            (&raw const second).cast::<u8>(),
+            size_of::<u64>(),
+        )
+    };
+    second = 0;
     // SAFETY: as above.
-    let read_back_second = unsafe { core::ptr::read_volatile((LAZY + PAGE_SIZE) as *const u64) };
+    let read_second = unsafe {
+        uaccess::copy_from_user(
+            (&raw mut second).cast::<u8>(),
+            LAZY + PAGE_SIZE,
+            size_of::<u64>(),
+        )
+    };
+    let read_back_second = if wrote_second.is_ok() && read_second.is_ok() {
+        second
+    } else {
+        0
+    };
 
     // --- copy-on-write -----------------------------------------------------
-    // SAFETY: mapped eagerly above.
-    unsafe {
-        core::ptr::write_volatile(EAGER as *mut u64, PATTERN);
-    }
+    let seed = PATTERN;
+    // SAFETY: mapped eagerly above; `seed` is a live local.
+    let _ =
+        unsafe { uaccess::copy_to_user(EAGER, (&raw const seed).cast::<u8>(), size_of::<u64>()) };
 
     let cow_ready = ACTIVE
         .lock()
@@ -676,13 +711,26 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
 
     // This write must fault -- the page is now read-only -- and the handler
     // must copy rather than refuse.
-    // SAFETY: the region is marked copy-on-write, so a write is legal and
+    let replacement = !PATTERN;
+    // SAFETY: the region is marked copy-on-write, so the write is legal and
     // resolves by copying.
-    unsafe {
-        core::ptr::write_volatile(EAGER as *mut u64, !PATTERN);
-    }
+    let cow_wrote = unsafe {
+        uaccess::copy_to_user(
+            EAGER,
+            (&raw const replacement).cast::<u8>(),
+            size_of::<u64>(),
+        )
+    };
+    let mut observed = 0u64;
     // SAFETY: as above.
-    let after_cow = unsafe { core::ptr::read_volatile(EAGER as *const u64) };
+    let cow_read = unsafe {
+        uaccess::copy_from_user((&raw mut observed).cast::<u8>(), EAGER, size_of::<u64>())
+    };
+    let after_cow = if cow_wrote.is_ok() && cow_read.is_ok() {
+        observed
+    } else {
+        0
+    };
 
     let eager_frame_after = ACTIVE
         .lock()
@@ -700,6 +748,10 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
         },
         None => false,
     };
+
+    // While a space is still installed, so the fault paths have somewhere real
+    // to land.
+    let user_access_ok = user_access_self_test();
 
     // SAFETY: restores the page table the kernel was running in.
     let recovered = unsafe { uninstall() };
@@ -726,6 +778,7 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
             eager_frame_after != eager_frame_before,
         ),
         ("the original frame is unchanged", original_intact),
+        ("bad user pointers fault rather than panic", user_access_ok),
     ];
 
     let mut ok = true;
@@ -743,5 +796,94 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
         ok = false;
     }
 
+    ok
+}
+
+/// Checks that a bad user pointer produces an error rather than a panic.
+///
+/// This is the property the exception table exists for: a hostile or simply
+/// wrong pointer from user space is *expected input*, not a kernel defect, and
+/// must not be able to take the machine down.
+///
+/// Run inside an installed address space so the "valid" cases have somewhere
+/// real to land.
+#[must_use]
+pub fn user_access_self_test() -> bool {
+    // Unmapped, but a legitimate user-half address: nothing in the region map
+    // covers it, so the fault is not serviceable and the fixup must catch it.
+    const UNMAPPED_USER: u64 = 0x0000_0000_7000_0000;
+    // Kernel half. Must be refused before any access is attempted -- a user
+    // pointer aimed at kernel memory that merely happens to be mapped would
+    // otherwise succeed, which is the confused-deputy bug the range check
+    // exists to prevent.
+    const KERNEL_ADDRESS: u64 = 0xffff_ffff_8000_0000;
+
+    let mut buffer = 0u64;
+
+    // SAFETY: `buffer` is a live local of the right size; the source address
+    // is untrusted by contract.
+    let unmapped = unsafe {
+        uaccess::copy_from_user(
+            (&raw mut buffer).cast::<u8>(),
+            UNMAPPED_USER,
+            size_of::<u64>(),
+        )
+    };
+
+    // SAFETY: as above.
+    let kernel_source = unsafe {
+        uaccess::copy_from_user(
+            (&raw mut buffer).cast::<u8>(),
+            KERNEL_ADDRESS,
+            size_of::<u64>(),
+        )
+    };
+
+    // SAFETY: `buffer` is a live local; the destination is untrusted.
+    let kernel_destination = unsafe {
+        uaccess::copy_to_user(
+            KERNEL_ADDRESS,
+            (&raw const buffer).cast::<u8>(),
+            size_of::<u64>(),
+        )
+    };
+
+    // A length that wraps the address space. Rejected by the overflow check
+    // rather than by faulting, because a wrapped range would pass a naive
+    // bounds test.
+    // SAFETY: as above.
+    let wrapping =
+        unsafe { uaccess::copy_from_user((&raw mut buffer).cast::<u8>(), u64::MAX - 8, 64) };
+
+    let checks = [
+        (
+            "unmapped user pointer returns a fault",
+            unmapped == Err(uaccess::UserAccessError::Fault),
+        ),
+        (
+            "kernel source is refused",
+            kernel_source == Err(uaccess::UserAccessError::NotUserAddress),
+        ),
+        (
+            "kernel destination is refused",
+            kernel_destination == Err(uaccess::UserAccessError::NotUserAddress),
+        ),
+        (
+            "a wrapping range is refused",
+            wrapping == Err(uaccess::UserAccessError::NotUserAddress),
+        ),
+        (
+            "the exception table is populated",
+            uaccess::fixup_count() > 0,
+        ),
+    ];
+
+    let mut ok = true;
+    for (what, passed) in checks {
+        if !passed {
+            crate::println!("    user access    FAILED: {what}");
+            ok = false;
+        }
+    }
     ok
 }

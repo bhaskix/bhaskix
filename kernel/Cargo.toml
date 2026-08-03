@@ -38,4 +38,7 @@ workspace = true
 # 300 at M3-10. The last increase is the demand-paging and copy-on-write fault
 # path -- copying a frame, and the volatile accesses in the self-test that
 # deliberately touch unmapped memory to make the handler run.
-unsafe_budget = 340
+# 354 at M3-12, for the user-copy calls in the self-tests. Those are unsafe by
+# nature: they hand a deliberately bad pointer to a routine whose contract is
+# that bad pointers are ordinary input.
+unsafe_budget = 400
