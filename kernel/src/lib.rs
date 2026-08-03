@@ -244,6 +244,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
 
     verify_guard_page(handoff);
 
+    // The first time the kernel runs in an address space it built itself, and
+    // the first time a page fault is serviced rather than reported.
+    if vm::demand_paging_self_test(handoff.hhdm_base.as_u64()) {
+        println!("    demand paging  faults serviced from the region map; copy-on-write copies");
+    } else {
+        println!("    demand paging  FAILED");
+    }
+
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
         faultinject::trigger(fault);
         println!();

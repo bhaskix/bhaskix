@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-03 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M3 — Memory management** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET, gap closed · M3 6/8 remaining items done |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · **M3 exit criterion MET** · CI green |
 
 ### Division of responsibility between documents
 
@@ -83,8 +83,9 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 
 ## 3. Active milestone — M3: Memory management
 
-**Physical memory is done. Virtual memory has not been started.** M3's exit criterion is not yet
-met and will not be until address spaces exist.
+**The exit criterion is MET.** Host property tests for the buddy allocator and slab pass, the
+frame-leak gate passes in QEMU, and `alloc` types work throughout the kernel. Two scope items
+remain — `copy_*_user` and KASLR — and neither is required by the criterion.
 
 **Milestone exit criterion** ([docs/roadmap.md](docs/roadmap.md) M3): host property tests for buddy
 and slab pass; the frame-leak test passes in QEMU; `alloc` types usable throughout the kernel.
@@ -100,7 +101,7 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 | M3-07 | Slab allocator as `GlobalAlloc` | ✅ `DONE` | 12 host tests over real page-aligned memory; `Box` and `Vec` verified working in QEMU on BIOS and UEFI |
 | M3-08 | `AddressSpace`, `RangeMap`, page tables | ✅ `DONE` | 14 host tests for the region map; map/unmap/translate/create/destroy in QEMU |
 | M3-09 | W^X and NX enforcement | ✅ `DONE` | `Protection` has no write+execute variant; `EFER.NXE` enabled and asserted at boot |
-| M3-10 | Demand paging and copy-on-write | ⬜ `TODO` | Mappings are eager for now; needs the page-fault handler to consult the region map |
+| M3-10 | Demand paging and copy-on-write | ✅ `DONE` | Faults serviced from the region map in a live address space. **Negative-tested**: breaking the demand-paging arm produces an unhandled page fault. |
 | M3-11 | Kernel stack guard pages | ✅ `DONE` | **Closes the M2 gap.** The kernel runs on a 64 KiB guarded stack; the `df` fault test now uses real recursion and faults at `cr2 = guard + 0xff8` |
 | M3-12 | `copy_from_user` / `copy_to_user` with fixups | ⬜ `TODO` | Needed before user mode in M5 |
 | M3-13 | KASLR | ⬜ `TODO` | |
@@ -132,16 +133,25 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 
 ### Honest notes on what is *not* proven
 
-- **No address space has ever been *switched to*.** Everything is created, mapped, translated
-  through, and destroyed while the kernel runs in the bootloader's address space. Loading `CR3`
-  with one of these is M5's job, and until that happens the higher-half copy is untested in the only
-  way that matters.
+- ~~**No address space has ever been switched to.**~~ ✅ Closed by M3-10: the demand-paging test
+  loads `CR3` with a space Bhaskix built, so the higher-half copy that keeps the kernel mapped is
+  now exercised in the only way that matters.
+- ~~**Mappings are eager, not demand-paged.**~~ ✅ Closed by M3-10.
 - **W^X is enforced but not *attacked*.** The `Protection` type cannot express write+execute and NX
   is on, but nothing yet tries to execute a writable page and confirms it faults. That test belongs
   with the fault-injection suite and is not written.
-- **Mappings are eager, not demand-paged.** The region map is authoritative in structure, but the
-  page-fault handler does not consult it yet, so the design's central claim — that demand paging,
-  COW, and file-backed mappings are one mechanism — is unproven.
+- **Copy-on-write has no refcounting.** The shared original frame is deliberately not freed, because
+  nothing yet tracks how many mappings hold it. That is correct until `fork` exists in M5 and wrong
+  the moment it does — one frame per COW page currently leaks by design, and the test asserts only
+  that frame usage does not *increase*.
+- **The fault handler cannot service a fault taken while the allocator lock is held.** It uses
+  `try_lock` and reports an unserviceable fault rather than spinning, which turns a silent hang into
+  a diagnostic — but it is a real limitation, not a solved problem. A per-CPU frame reserve is the
+  fix, and belongs with the per-CPU work in M4.
+- **All address spaces share the higher-half page tables by pointer.** Creation copies the PML4
+  entries, so a kernel mapping added *after* a space is created is visible to it only if the
+  relevant PML4 entry already existed. That holds today; it will not survive dynamic kernel mappings
+  and needs revisiting in M4.
 
 - **The 4 GiB zone boundary has never been exercised on real memory.** QEMU was given 256 MiB, so
   every frame is in the DMA32 zone and the `Normal` path is covered only by host tests.
@@ -248,6 +258,21 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M3 exit criterion met)
+
+- **Demand paging and copy-on-write work**, which makes the region map authoritative in fact rather
+  than only in structure: a fault consults the map, and demand paging and COW are the same mechanism
+  reading different fields. Negative-tested by breaking the demand-paging arm, which produces an
+  unhandled page fault instead of a quiet pass.
+- **The kernel ran in an address space it built**, loading `CR3` for the first time. That closes the
+  gap recorded when address spaces landed — until now the higher-half copy that keeps the kernel
+  mapped had never been exercised.
+- **The fault path uses `try_lock` throughout.** A fault can interrupt code already holding the
+  allocator lock, and spinning there would hang the machine with no output; it reports an
+  unserviceable fault instead. A limitation made visible rather than solved.
+- **CI is green**, all nine jobs including every firmware/CPU combination. The OVMF pairing fix was
+  correct.
 
 ### 2026-08-03 (published, CI live)
 

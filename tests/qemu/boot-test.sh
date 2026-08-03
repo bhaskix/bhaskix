@@ -177,6 +177,23 @@ else
     status=1
 fi
 
+if grep -qF "guard page     unmapped and below the stack" "$LOG"; then
+    pass "kernel runs on a guarded stack"
+else
+    fail "the kernel is not on a guarded stack"
+    status=1
+fi
+
+# The design's central claim: the region map decides, the page table follows.
+# Negative-tested -- breaking the demand-paging arm produces an unhandled page
+# fault rather than a silent pass.
+if grep -qF "faults serviced from the region map" "$LOG"; then
+    pass "demand paging and copy-on-write work in a live address space"
+else
+    fail "demand paging / copy-on-write did not pass"
+    status=1
+fi
+
 # The handoff must have been validated, not skipped.
 if grep -qF "handoff version 1" "$LOG"; then
     pass "handoff accepted"

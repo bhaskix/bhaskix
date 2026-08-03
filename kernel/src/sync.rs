@@ -50,6 +50,20 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Acquires the lock if it is free, without spinning.
+    ///
+    /// Exists for the page-fault path. A fault can interrupt code that already
+    /// holds this lock, and a fault handler that then spins for it would hang
+    /// the machine with no diagnostic. Returning `None` lets the handler say
+    /// what happened instead — a clear report of an unserviceable fault beats
+    /// a silent lock-up every time.
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinLockGuard { lock: self })
+    }
+
     /// Acquires the lock, spinning until it is free.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self

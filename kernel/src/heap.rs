@@ -89,6 +89,20 @@ pub fn with<R>(f: impl FnOnce(&mut Heap) -> R) -> Option<R> {
     HEAP.lock().as_mut().map(f)
 }
 
+/// Runs `f` with the heap, but only if the lock is free.
+///
+/// For the page-fault path. Demand paging has to allocate a frame, and the
+/// allocator is behind this lock — but a fault can interrupt code that already
+/// holds it. Spinning there would hang the machine with no output, so the
+/// handler uses this and reports an unserviceable fault instead.
+///
+/// Returns `None` if the heap does not exist *or* the lock is held. Those are
+/// different problems, and the caller cannot tell them apart; both mean "not
+/// now", which is all the fault path needs.
+pub fn try_with<R>(f: impl FnOnce(&mut Heap) -> R) -> Option<R> {
+    HEAP.try_lock()?.as_mut().map(f)
+}
+
 /// Frames the physical allocator still has free.
 #[must_use]
 pub fn free_frames() -> u64 {

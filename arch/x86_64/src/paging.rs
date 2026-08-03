@@ -470,3 +470,74 @@ pub unsafe fn destroy_address_space(
     free_frame(root);
     freed + 1
 }
+
+/// Loads `root` into `CR3`, switching address spaces.
+///
+/// Returns the previous value, so a caller can switch back.
+///
+/// # Safety
+///
+/// Catastrophic if `root` does not map everything the current execution needs:
+/// the very next instruction fetch, the stack, and the interrupt tables all
+/// have to be present in the new space, or the CPU faults with no way to
+/// report it. In Bhaskix that means the higher half must have been copied from
+/// a template that already contained them — see [`create_address_space`].
+///
+/// Also invalidates the entire TLB except global entries, which is a real
+/// cost; it is not something to do on a hot path.
+pub unsafe fn switch_address_space(root: u64) -> u64 {
+    // SAFETY: reading CR3 is side-effect free; writing it is the architectural
+    // way to change address space, and the caller owns the obligation that the
+    // new one maps the running code, its stack, and the descriptor tables.
+    unsafe {
+        let previous = active_page_table();
+        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+        previous
+    }
+}
+
+/// Changes the flags on an existing mapping, keeping the frame.
+///
+/// Used by copy-on-write to drop write permission without unmapping, and to
+/// restore it after the copy.
+///
+/// # Errors
+///
+/// [`MapError::NotMapped`] if nothing is mapped there.
+///
+/// # Safety
+///
+/// As [`map_page`].
+pub unsafe fn protect_page(
+    root: u64,
+    virtual_address: u64,
+    entry_flags: u64,
+    hhdm_base: u64,
+) -> Result<u64, MapError> {
+    let indices = indices_of(virtual_address);
+
+    // SAFETY: as `translate`, plus one write to the leaf entry.
+    unsafe {
+        let mut table = (hhdm_base + root) as *mut u64;
+        for &index in &indices[..3] {
+            let value = table.add(index).read_volatile();
+            if value & flags::PRESENT == 0 {
+                return Err(MapError::NotMapped);
+            }
+            if value & flags::HUGE != 0 {
+                return Err(MapError::HugePageInTheWay);
+            }
+            table = (hhdm_base + (value & ADDRESS_MASK)) as *mut u64;
+        }
+
+        let entry = table.add(indices[3]);
+        let leaf = entry.read_volatile();
+        if leaf & flags::PRESENT == 0 {
+            return Err(MapError::NotMapped);
+        }
+        let physical = leaf & ADDRESS_MASK;
+        entry.write_volatile(physical | entry_flags);
+        invalidate(virtual_address);
+        Ok(physical)
+    }
+}

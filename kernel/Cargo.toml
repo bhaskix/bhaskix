@@ -35,4 +35,7 @@ workspace = true
 # page-table walker and zeroing freshly allocated frames, and `stack.rs`
 # switching RSP -- which no safe abstraction can express, since changing the
 # stack pointer invalidates every local in the frame doing it.
-unsafe_budget = 280
+# 300 at M3-10. The last increase is the demand-paging and copy-on-write fault
+# path -- copying a frame, and the volatile accesses in the self-test that
+# deliberately touch unmapped memory to make the handler run.
+unsafe_budget = 340

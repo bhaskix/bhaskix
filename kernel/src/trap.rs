@@ -140,6 +140,31 @@ fn handle(frame: &mut TrapFrame) {
         return;
     }
 
+    // Page faults are the one exception that is routinely *not* a bug. The
+    // region map decides: if it says the address is valid, the fault is
+    // serviced and the faulting instruction retries. Everything else falls
+    // through to the report below.
+    if frame.vector == 14 {
+        // Bit 1 of the architectural error code distinguishes a write from a
+        // read. Taken from the CPU rather than from any kernel bookkeeping,
+        // because bookkeeping is what may be wrong when a fault is handled.
+        let write = frame.error_code & (1 << 1) != 0;
+        let address = read_cr2();
+
+        match crate::vm::handle_fault(address, write) {
+            crate::vm::FaultOutcome::Handled => return,
+            crate::vm::FaultOutcome::NotOurs => {}
+            crate::vm::FaultOutcome::Refused(reason) => {
+                println!();
+                println!("  the region map refused this access: {reason}");
+            }
+            crate::vm::FaultOutcome::Unserviceable(reason) => {
+                println!();
+                println!("  the fault was legal but could not be serviced: {reason}");
+            }
+        }
+    }
+
     report_exception(frame)
 }
 

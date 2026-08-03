@@ -21,10 +21,13 @@
 
 use bhaskix_arch::paging::{self, MapError, flags};
 use bhaskix_boot::VirtAddr;
-use bhaskix_mm::vm::{Backing, Protection, RangeMap, RangeMapError, VirtRange, VmRegion};
+use bhaskix_mm::vm::{
+    Backing, PAGE_SIZE, Protection, RangeMap, RangeMapError, VirtRange, VmRegion,
+};
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 use crate::heap;
+use crate::sync::SpinLock;
 
 /// First address belonging to the kernel half.
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
@@ -344,4 +347,401 @@ pub fn self_test(hhdm_base: u64, iterations: u32) -> bool {
         return false;
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Demand paging and copy-on-write
+// ---------------------------------------------------------------------------
+
+/// The address space currently loaded in `CR3`, if the kernel installed one.
+///
+/// The page-fault handler needs the region map to decide whether a fault is
+/// legal, and it has no other way to find it.
+static ACTIVE: SpinLock<Option<AddressSpace>> = SpinLock::new(None);
+
+/// The page table to restore when the installed space is removed.
+static PREVIOUS_ROOT: SpinLock<u64> = SpinLock::new(0);
+
+/// What the fault handler did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultOutcome {
+    /// A mapping was created or upgraded; the faulting instruction can retry.
+    Handled,
+    /// No installed address space, or no region covers the address. The fault
+    /// is genuinely a bug and belongs in the exception report.
+    NotOurs,
+    /// The region says the access is illegal — a write to a read-only mapping,
+    /// or any access to a guard page.
+    Refused(&'static str),
+    /// The fault is legal but could not be serviced right now.
+    Unserviceable(&'static str),
+}
+
+impl AddressSpace {
+    /// Registers a region without mapping any of its pages.
+    ///
+    /// This is what makes the region map authoritative rather than decorative:
+    /// afterwards the map says the address is valid while the page table says
+    /// nothing is there, and the difference is resolved on first touch.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Region`] if the range overlaps an existing region.
+    pub fn map_anonymous_lazy(
+        &mut self,
+        range: VirtRange,
+        protection: Protection,
+    ) -> Result<(), VmError> {
+        self.regions
+            .insert(VmRegion::new(range, protection, Backing::Anonymous))?;
+        Ok(())
+    }
+
+    /// Marks an already-mapped range copy-on-write.
+    ///
+    /// Drops write permission in the page table while leaving the region's
+    /// declared protection alone. A later write faults, and the handler copies
+    /// the frame rather than refusing — which is the whole trick.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Region`] if no region starts at `start`.
+    pub fn make_copy_on_write(&mut self, start: VirtAddr) -> Result<(), VmError> {
+        let region = *self
+            .regions
+            .find(start)
+            .ok_or(VmError::Region(RangeMapError::NotFound))?;
+
+        let root = self.root;
+        let hhdm = self.hhdm_base;
+        let read_only = Self::entry_flags(Protection::ReadOnly, start.as_u64());
+
+        for page in region.range.pages_iter() {
+            // SAFETY: `root` is this space's PML4; single CPU.
+            let _ = unsafe { paging::protect_page(root, page.as_u64(), read_only, hhdm) };
+        }
+
+        self.regions.remove(region.range.start)?;
+        let mut updated = region;
+        updated.flags.copy_on_write = true;
+        self.regions.insert(updated)?;
+        Ok(())
+    }
+}
+
+/// Installs `space` as the active address space and loads its page table.
+///
+/// Returns the previous `CR3`, which [`uninstall`] restores.
+///
+/// # Safety
+///
+/// The space's higher half must already map the running code, the current
+/// stack, and the descriptor tables — which holds for anything built by
+/// [`AddressSpace::new`] *after* those mappings existed in the template, since
+/// creation copies the higher half rather than sharing a live view of it.
+pub unsafe fn install(space: AddressSpace) {
+    let root = space.root();
+    *ACTIVE.lock() = Some(space);
+    // SAFETY: delegated to the caller's obligation above.
+    let previous = unsafe { paging::switch_address_space(root) };
+    *PREVIOUS_ROOT.lock() = previous;
+}
+
+/// Restores the previous page table and returns the installed space.
+///
+/// # Safety
+///
+/// The previously recorded root must still be a valid page table.
+pub unsafe fn uninstall() -> Option<AddressSpace> {
+    let previous = *PREVIOUS_ROOT.lock();
+    if previous != 0 {
+        // SAFETY: `previous` was read from CR3 by `install`, so it is the page
+        // table the kernel was running in, which by construction maps
+        // everything currently in use.
+        unsafe { paging::switch_address_space(previous) };
+    }
+    ACTIVE.lock().take()
+}
+
+/// Services a page fault against the installed address space.
+///
+/// This is the point of the whole design in `docs/memory.md` §3: the region map
+/// decides whether the access is legal, and only then is the page table
+/// touched. Demand paging and copy-on-write are the same mechanism reading
+/// different fields, not two special cases.
+///
+/// `write` comes from the architectural error code, not from any bookkeeping —
+/// bookkeeping is exactly what may be wrong when a fault is being handled.
+#[must_use]
+pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
+    // `try_lock` throughout. A fault can interrupt code already holding either
+    // lock, and spinning here would hang the machine with no output. Reporting
+    // an unserviceable fault is worse than servicing it and far better than a
+    // silent lock-up.
+    let Some(mut guard) = ACTIVE.try_lock() else {
+        return FaultOutcome::Unserviceable("address space lock held");
+    };
+    let Some(space) = guard.as_mut() else {
+        return FaultOutcome::NotOurs;
+    };
+
+    let page = VirtAddr(address & !(PAGE_SIZE - 1));
+    let Some(region) = space.regions.find(page).copied() else {
+        return FaultOutcome::NotOurs;
+    };
+
+    if !region.protection.present() {
+        return FaultOutcome::Refused("access to a guard page");
+    }
+    if write && !region.protection.writable() && !region.flags.copy_on_write {
+        return FaultOutcome::Refused("write to a read-only mapping");
+    }
+
+    let root = space.root;
+    let hhdm = space.hhdm_base;
+
+    // SAFETY: reads page table entries only.
+    let existing = unsafe { paging::translate(root, page.as_u64(), hhdm) };
+
+    let Some(outcome) = heap::try_with(|heap| {
+        let pmm = heap.pmm_mut();
+
+        let Ok(pfn) = pmm.allocate(0, Zone::Normal) else {
+            return FaultOutcome::Unserviceable("out of physical memory");
+        };
+        let fresh = u64::from(pfn) * FRAME_SIZE;
+
+        match existing {
+            // Copy-on-write: the page is present but write-protected, and the
+            // region says a write should copy rather than fail.
+            Some(old) if write && region.flags.copy_on_write => {
+                // SAFETY: both frames are reachable through the direct map;
+                // `fresh` was just allocated so nothing else refers to it, and
+                // the ranges cannot overlap because they are distinct frames.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (hhdm + (old & !(PAGE_SIZE - 1))) as *const u8,
+                        (hhdm + fresh) as *mut u8,
+                        PAGE_SIZE as usize,
+                    );
+                }
+
+                let entry = AddressSpace::entry_flags(Protection::ReadWrite, page.as_u64());
+                // SAFETY: single CPU; `root` is the installed space's PML4.
+                let replaced = unsafe {
+                    paging::unmap_page(root, page.as_u64(), hhdm).and_then(|_| {
+                        paging::map_page(root, page.as_u64(), fresh, entry, hhdm, &mut || {
+                            pmm.allocate(0, Zone::Normal)
+                                .ok()
+                                .map(|pfn| u64::from(pfn) * FRAME_SIZE)
+                        })
+                    })
+                };
+                if replaced.is_err() {
+                    let _ = pmm.free(pfn, 0);
+                    return FaultOutcome::Unserviceable("could not remap the copied page");
+                }
+
+                // The frame that was shared is released only when nothing else
+                // holds it. Refcounting arrives with fork in M5; until then a
+                // COW region's original frame belongs to whoever mapped it, so
+                // it is deliberately *not* freed here.
+                FaultOutcome::Handled
+            }
+
+            // Already present and this is not a COW write: another CPU or an
+            // earlier fault on the same page got there first. Nothing to do.
+            Some(_) => {
+                let _ = pmm.free(pfn, 0);
+                FaultOutcome::Handled
+            }
+
+            // Demand paging: the region says this address is valid and the
+            // page table says nothing is there. Make it so.
+            None => {
+                // SAFETY: freshly allocated and unaliased, reachable through
+                // the direct map. Zeroing on allocation is required by
+                // `docs/memory.md` §6 -- a frame must never reach a consumer
+                // carrying another domain's data.
+                unsafe {
+                    core::ptr::write_bytes((hhdm + fresh) as *mut u8, 0, PAGE_SIZE as usize);
+                }
+
+                let entry = AddressSpace::entry_flags(region.protection, page.as_u64());
+                // SAFETY: single CPU; `root` is the installed space's PML4.
+                let mapped = unsafe {
+                    paging::map_page(root, page.as_u64(), fresh, entry, hhdm, &mut || {
+                        pmm.allocate(0, Zone::Normal)
+                            .ok()
+                            .map(|pfn| u64::from(pfn) * FRAME_SIZE)
+                    })
+                };
+                if mapped.is_err() {
+                    let _ = pmm.free(pfn, 0);
+                    return FaultOutcome::Unserviceable("could not map the demanded page");
+                }
+                FaultOutcome::Handled
+            }
+        }
+    }) else {
+        return FaultOutcome::Unserviceable("allocator lock held");
+    };
+
+    outcome
+}
+
+/// Exercises demand paging and copy-on-write against a live address space.
+///
+/// Unlike every earlier test in M3, this one **switches `CR3`** — nothing
+/// before it had ever run in an address space Bhaskix built, so the
+/// higher-half copy that keeps the kernel mapped was untested in the only way
+/// that matters.
+///
+/// Returns whether every property held.
+pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
+    const LAZY: u64 = 0x0000_0000_2000_0000;
+    const EAGER: u64 = 0x0000_0000_3000_0000;
+    const PATTERN: u64 = 0xfeed_face_0bad_c0de;
+
+    let baseline = heap::free_frames();
+
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        crate::println!("    demand paging  FAILED to create an address space");
+        return false;
+    };
+
+    let (Some(lazy), Some(eager)) = (
+        VirtRange::from_pages(VirtAddr(LAZY), 2),
+        VirtRange::from_pages(VirtAddr(EAGER), 1),
+    ) else {
+        return false;
+    };
+
+    // Registered, deliberately unmapped. The region map now says this address
+    // is valid while the page table says nothing is there.
+    if space
+        .map_anonymous_lazy(lazy, Protection::ReadWrite)
+        .is_err()
+        || space.map_anonymous(eager, Protection::ReadWrite).is_err()
+    {
+        crate::println!("    demand paging  FAILED to register regions");
+        space.destroy();
+        return false;
+    }
+
+    // Nothing is mapped for the lazy range yet -- that is the premise.
+    let unmapped_before = space.translate(VirtAddr(LAZY)).is_none();
+
+    // Seed the eager page, then make it copy-on-write and remember the frame
+    // so the copy can be proven to be a copy.
+    let eager_frame_before = space.translate(VirtAddr(EAGER));
+
+    // SAFETY: the space's higher half was copied from the running page table
+    // after the kernel, its stack, and the descriptor tables were all mapped
+    // there, so everything currently executing stays addressable.
+    unsafe { install(space) };
+
+    // --- demand paging -----------------------------------------------------
+    // No mapping exists for this address. Touching it must fault, the handler
+    // must consult the region map, and the instruction must then complete.
+    // SAFETY: the region map declares this range readable and writable; if the
+    // handler is broken this faults again and the exception reporter says so,
+    // which is the outcome the test is checking for.
+    unsafe {
+        core::ptr::write_volatile(LAZY as *mut u64, PATTERN);
+    }
+    // SAFETY: just written through the same mapping.
+    let read_back = unsafe { core::ptr::read_volatile(LAZY as *const u64) };
+
+    // A second page in the same region, to prove the handler is per-page
+    // rather than per-region.
+    // SAFETY: as above.
+    unsafe {
+        core::ptr::write_volatile((LAZY + PAGE_SIZE) as *mut u64, PATTERN ^ 1);
+    }
+    // SAFETY: as above.
+    let read_back_second = unsafe { core::ptr::read_volatile((LAZY + PAGE_SIZE) as *const u64) };
+
+    // --- copy-on-write -----------------------------------------------------
+    // SAFETY: mapped eagerly above.
+    unsafe {
+        core::ptr::write_volatile(EAGER as *mut u64, PATTERN);
+    }
+
+    let cow_ready = ACTIVE
+        .lock()
+        .as_mut()
+        .map(|s| s.make_copy_on_write(VirtAddr(EAGER)).is_ok())
+        .unwrap_or(false);
+
+    // This write must fault -- the page is now read-only -- and the handler
+    // must copy rather than refuse.
+    // SAFETY: the region is marked copy-on-write, so a write is legal and
+    // resolves by copying.
+    unsafe {
+        core::ptr::write_volatile(EAGER as *mut u64, !PATTERN);
+    }
+    // SAFETY: as above.
+    let after_cow = unsafe { core::ptr::read_volatile(EAGER as *const u64) };
+
+    let eager_frame_after = ACTIVE
+        .lock()
+        .as_ref()
+        .and_then(|s| s.translate(VirtAddr(EAGER)));
+
+    // The original frame must still hold the old value: that is what makes it
+    // a copy rather than an in-place write.
+    let original_intact = match eager_frame_before {
+        // SAFETY: the frame is still allocated -- COW does not free the shared
+        // original -- and is reachable through the direct map.
+        Some(physical) => unsafe {
+            core::ptr::read_volatile((hhdm_base + (physical & !(PAGE_SIZE - 1))) as *const u64)
+                == PATTERN
+        },
+        None => false,
+    };
+
+    // SAFETY: restores the page table the kernel was running in.
+    let recovered = unsafe { uninstall() };
+
+    let Some(space) = recovered else {
+        crate::println!("    demand paging  FAILED to recover the address space");
+        return false;
+    };
+    space.destroy();
+
+    let after = heap::free_frames();
+
+    let checks = [
+        ("no mapping existed beforehand", unmapped_before),
+        ("demand-paged write read back", read_back == PATTERN),
+        (
+            "second page faulted separately",
+            read_back_second == PATTERN ^ 1,
+        ),
+        ("region became copy-on-write", cow_ready),
+        ("copy-on-write write took effect", after_cow == !PATTERN),
+        (
+            "the page moved to a new frame",
+            eager_frame_after != eager_frame_before,
+        ),
+        ("the original frame is unchanged", original_intact),
+    ];
+
+    let mut ok = true;
+    for (what, passed) in checks {
+        if !passed {
+            crate::println!("    demand paging  FAILED: {what}");
+            ok = false;
+        }
+    }
+
+    // The COW original is deliberately not freed -- there is no refcounting
+    // until fork in M5 -- so one frame per COW page is expected to remain.
+    if after > baseline {
+        crate::println!("    demand paging  frames went UP: {baseline} -> {after}");
+        ok = false;
+    }
+
+    ok
 }
