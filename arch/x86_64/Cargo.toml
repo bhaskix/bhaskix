@@ -46,4 +46,7 @@ workspace = true
 # 634 at M3-12. The increase is `uaccess` -- walking the exception table from
 # two linker-provided symbols, and the copy routines themselves -- plus the
 # CR4 writes that enable SMEP and SMAP.
-unsafe_budget = 700
+# 713 at M4. The increase is per-CPU descriptor tables, the GS-base per-CPU
+# area, and the inter-processor interrupt used for TLB shootdown -- all raw
+# instruction or raw pointer work with no safe expression.
+unsafe_budget = 780

@@ -97,13 +97,13 @@ fairness within 2% for two equal-weight workloads.
 | M4-03 | Round-robin runqueue | ✅ `DONE` | 7/7/7 runs across three workers |
 | M4-04 | Timer-driven preemption | ✅ `DONE` | **Negative-tested**: removing the `preempt` call zeroes every worker counter |
 | M4-05 | SMP bring-up, per-CPU areas | ✅ `DONE` | 1, 2, 4 and 8 CPUs all come online; boot test asserts N-of-N. Secondaries **park** — see below. |
-| M4-05b | Per-CPU GDT and TSS | ⬜ `TODO` | **Blocks secondaries doing anything.** A shared TSS means shared IST stacks. |
-| M4-06 | Per-CPU runqueues, work stealing | ⬜ `TODO` | Needs M4-05b and M4-11 first |
+| M4-05b | Per-CPU GDT and TSS | ✅ `DONE` | Each CPU builds its own, with its own IST stacks; secondaries now idle with interrupts *enabled* |
+| M4-06 | Per-CPU runqueues, work stealing | ⬜ `TODO` | **The last thing blocking threads on secondaries.** Both its prerequisites have landed. |
 | M4-07 | Fair class (virtual deadline), RT class | ⬜ `TODO` | Currently plain round-robin |
 | M4-08 | Lock ranking, active in debug builds | ⬜ `TODO` | `docs/coding-style.md` §7 requires it |
 | M4-09 | Sleeping, wait queues, blocking | ⬜ `TODO` | A thread is runnable or finished; nothing waits |
 | M4-10 | Tickless idle, timer wheel | ⬜ `TODO` | Timer is a fixed 100 Hz tick |
-| M4-11 | TLB shootdown | ⬜ `TODO` | **Now a live correctness bug** — a second CPU exists. Safe only because secondaries never touch memory. |
+| M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ⬜ `TODO` | Would let a fault be serviced while the allocator lock is held |
 
 ### Bugs found and fixed during M4
@@ -121,18 +121,18 @@ fairness within 2% for two equal-weight workloads.
 
 ### Honest notes on what is *not* proven
 
-- **Secondary CPUs come online and then do nothing.** They establish identity, enable their APIC,
-  and halt with interrupts disabled. Three things have to land before they can run anything, and all
-  three are correctness issues rather than features:
-  1. **Per-CPU GDT and TSS.** Both are shared, so the `IST` stacks are shared: two CPUs taking a
-     double fault at once would land on the same stack and destroy each other's report. A secondary
-     cannot safely take *any* interrupt until this is fixed.
-  2. **TLB shootdown.** `unmap_page` invalidates only the local TLB, so another CPU can keep using a
-     translation this one removed. Harmless today only because secondaries never touch memory.
-  3. **The scheduler is single-CPU by construction**, taking raw pointers into a static thread table
-     on the assumption that one CPU is inside it.
-- **Nothing has been tested for races.** Every CPU but one is halted, so the locking has never been
-  under contention. The `SpinLock` is written for SMP and has never been used that way.
+- **Secondary CPUs idle rather than run threads.** They have their own descriptor tables and answer
+  IPIs, but the scheduler is still single-CPU by construction — it takes raw pointers into a static
+  thread table on the assumption that one CPU is inside it. Per-CPU runqueues are the last thing
+  blocking work on secondaries, and both of that work's prerequisites have now landed.
+- **Shootdown is one address per IPI round trip, and one shootdown at a time.** Tearing down a range
+  costs a round trip per page, which is the wrong shape for address-space teardown; batching is the
+  obvious next step and deliberately untaken until there is a workload to measure. Teardown avoids
+  the cost entirely today by skipping shootdown for address spaces no CPU has loaded.
+- **`is_active` checks only this CPU's `CR3`.** Sufficient because secondaries never load an address
+  space, and wrong the moment they do — it must become a per-space "loaded on" mask.
+- **The locking has still never been contended.** Secondaries idle in `hlt`, so the `SpinLock` is
+  exercised by one CPU plus brief IPI handlers. Nothing has stress-tested it.
 
 - **This is round-robin, not the scheduler `docs/scheduler.md` specifies.** No priorities, no
   fairness weighting, no virtual deadlines, no RT class, no admission control. The fairness figure
@@ -213,6 +213,26 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M4-05b and M4-11, per-CPU tables and shootdown)
+
+- **Every CPU builds its own GDT, TSS and IST stacks.** Sharing them was not merely unwise, it does
+  not work: `ltr` marks a TSS descriptor *busy*, so a second CPU claiming the same one faults. And a
+  shared IST means two processors double-faulting at once land on the same stack and destroy each
+  other's report — at exactly the moment the machine is least able to explain itself.
+- **Secondaries now idle with interrupts enabled**, which is what makes them reachable at all.
+  Halting with interrupts disabled — what they did before they had their own TSS — makes a CPU
+  unable to answer anything, and any shootdown wait for it would spin until it gave up.
+- **TLB shootdown works.** An IPI to all-but-self, with the sender waiting for every acknowledgement
+  before returning, because the caller's next act is usually to free the frame. Negative-tested:
+  disabling the receiving handler turns 8 completions into 8 timeouts.
+- **Shootdown is skipped for address spaces no CPU has loaded**, which is a correctness observation
+  before it is an optimisation: a translation can only be cached by a CPU that has run in that
+  space. It is also what stops tearing down a thousand address spaces from costing a thousand
+  rounds of IPIs.
+- **A self-inflicted test bug worth recording.** `"timed out"` was added as a failure marker, and it
+  matches the *success* message `"none timed out"` — so every passing run failed. Substring markers
+  need to be checked against the strings they will actually see.
 
 ### 2026-08-03 (M4-05, CPUs online)
 

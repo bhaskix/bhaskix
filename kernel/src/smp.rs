@@ -10,22 +10,21 @@
 //!
 //! # What a secondary CPU does, and what it deliberately does not
 //!
-//! It establishes its own identity and then **parks with interrupts
-//! disabled**. It does not run threads, and that restraint is the point:
+//! It establishes its own identity, builds **its own GDT, TSS and interrupt
+//! stacks**, enables its Local APIC, and then idles with interrupts enabled so
+//! it can answer inter-processor interrupts — which is what makes TLB
+//! shootdown possible.
 //!
-//! - The **GDT and TSS are still shared**. A shared TSS means shared `IST`
-//!   stacks, so two CPUs taking a double fault at once would land on the same
-//!   stack and destroy each other's report. Per-CPU descriptor tables are a
-//!   prerequisite for a secondary CPU taking any interrupt at all.
-//! - **`unmap_page` invalidates only the local TLB.** With a second CPU
-//!   running, another processor can keep using a translation this one has
-//!   removed. That is a correctness bug, not a missing optimisation, and it
-//!   has to be fixed before any CPU changes a shared mapping.
-//! - **The scheduler takes raw pointers into a static thread table** on the
-//!   assumption that one CPU is inside it.
+//! It does **not** run threads. The scheduler still takes raw pointers into a
+//! static thread table on the assumption that one CPU is inside it, and per-CPU
+//! runqueues have to land before that assumption can be dropped.
 //!
-//! Bringing CPUs online while being explicit that they idle is more honest
-//! than scheduling on them and discovering these three in production.
+//! # Order matters here
+//!
+//! Per-CPU data is established *first*, because the CPU's dense identifier is
+//! what selects its GDT and TSS. Getting this backwards means every CPU builds
+//! table zero and the second one to arrive faults on `ltr` against a descriptor
+//! the first already marked busy.
 
 use bhaskix_arch::{apic, cpu, gdt, idt, percpu};
 
@@ -36,24 +35,34 @@ use crate::println;
 /// Runs on a stack the bootloader provided. Never returns.
 extern "C" fn secondary_main(lapic_id: u32) -> ! {
     // SAFETY: this CPU has just been released and is running alone in this
-    // function. The bootstrap CPU built the GDT and IDT before releasing
-    // anything, so both are complete.
+    // function; each step is called exactly once on it, with interrupts
+    // disabled, and in the order the module header describes.
     unsafe {
-        gdt::load_on_secondary();
-        idt::load_on_secondary();
-
-        if percpu::install(lapic_id).is_none() {
+        // Identity first -- everything below is indexed by it.
+        let Some(cpu_id) = percpu::install(lapic_id) else {
             // More CPUs than the per-CPU table holds. Parking is the only safe
             // response: without an area, `gs:` reads address zero.
             cpu::halt_forever();
-        }
+        };
 
+        // This CPU's own descriptor tables, with its own IST stacks, so a
+        // fault here cannot collide with one on another processor.
+        gdt::init_cpu(cpu_id as usize);
+        idt::load_on_secondary();
         apic::enable_this_cpu();
+
+        // Only now is it safe to take an interrupt at all.
+        cpu::enable_interrupts();
     }
 
-    // Park. Interrupts stay disabled for the reasons in the module header:
-    // this CPU has no TSS of its own, so it has nowhere safe to take a fault.
-    cpu::halt_forever()
+    // Idle, but interruptible. `hlt` with interrupts enabled is what lets this
+    // CPU answer a shootdown IPI; halting with them disabled -- which is what
+    // this did before it had its own TSS -- makes the CPU unreachable and any
+    // shootdown wait forever.
+    loop {
+        // SAFETY: interrupts are enabled, so this halt is woken by any IPI.
+        unsafe { cpu::halt() };
+    }
 }
 
 /// Brings up every secondary CPU the loader reported.
@@ -102,8 +111,48 @@ pub fn report(handoff: &bhaskix_boot::Handoff) {
         let role = if cpu_id == 0 {
             "bootstrap"
         } else {
-            "secondary, parked"
+            "secondary, idle (answers IPIs)"
         };
         println!("      cpu {cpu_id}  lapic {lapic_id}  {role}");
     });
+}
+
+/// Exercises TLB shootdown across every online CPU.
+///
+/// A shootdown that silently reaches no one looks exactly like one that
+/// works, so this checks the acknowledgement count rather than merely that the
+/// call returned.
+#[must_use]
+pub fn shootdown_self_test() -> bool {
+    let (completed_before, timed_out_before) = crate::tlb::statistics();
+
+    // An arbitrary kernel address. Invalidating a translation that is not
+    // cached is architecturally harmless -- `invlpg` on an unmapped address is
+    // defined to do nothing -- so this measures the round trip, not the
+    // mapping.
+    const PROBE: u64 = 0xffff_a000_dead_0000;
+
+    let mut acknowledged = 0;
+    for _ in 0..8 {
+        if crate::tlb::shootdown(PROBE) {
+            acknowledged += 1;
+        }
+    }
+
+    let (completed, timed_out) = crate::tlb::statistics();
+    let new_completions = completed - completed_before;
+    let new_timeouts = timed_out - timed_out_before;
+
+    if acknowledged != 8 || new_timeouts > 0 {
+        println!(
+            "    tlb shootdown  FAILED ({acknowledged}/8 acknowledged, {new_timeouts} timed out)"
+        );
+        return false;
+    }
+
+    println!(
+        "    tlb shootdown  {new_completions} completed across {} cpus, none timed out",
+        percpu::online_count()
+    );
+    true
 }

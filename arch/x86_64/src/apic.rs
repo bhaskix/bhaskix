@@ -47,6 +47,20 @@ const REG_LVT_ERROR: usize = 0x370;
 const REG_TIMER_INITIAL: usize = 0x380;
 const REG_TIMER_CURRENT: usize = 0x390;
 const REG_TIMER_DIVIDE: usize = 0x3e0;
+const REG_ICR_LOW: usize = 0x300;
+const REG_ICR_HIGH: usize = 0x310;
+
+/// Interrupt command: deliver to every CPU except the sender.
+///
+/// A shorthand, so no destination has to be computed. That matters for
+/// correctness as much as convenience — building a destination mask means
+/// knowing every APIC id, and a mask that is stale by one CPU produces a
+/// shootdown that silently misses a processor.
+const ICR_ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
+
+/// Set while an IPI is still being delivered. xAPIC only; in x2APIC the write
+/// is serialising and the bit does not exist.
+const ICR_DELIVERY_PENDING: u32 = 1 << 12;
 
 /// `IA32_APIC_BASE` bit 11: global enable. Clearing it is irreversible until
 /// reset on most parts, which is why nothing here ever clears it.
@@ -432,5 +446,38 @@ pub unsafe fn enable_this_cpu() {
         write(REG_LVT_LINT0, LVT_MASKED);
         write(REG_LVT_LINT1, LVT_MASKED);
         write(REG_LVT_ERROR, u32::from(ERROR_VECTOR));
+    }
+}
+
+/// Sends `vector` to every CPU except this one.
+///
+/// # Safety
+///
+/// [`init`] must have run, and every CPU that could receive this must have an
+/// IDT gate for `vector` — an IPI delivered to a CPU with no handler is a
+/// general protection fault on that CPU, reported nowhere useful.
+pub unsafe fn send_ipi_all_but_self(vector: u8) {
+    let command = ICR_ALL_EXCLUDING_SELF | u32::from(vector);
+
+    // SAFETY: the APIC is initialised per the caller's obligation.
+    unsafe {
+        if in_x2apic_mode() {
+            // One 64-bit MSR write, which is architecturally serialising, so
+            // there is nothing to poll afterwards.
+            write(REG_ICR_LOW, command);
+        } else {
+            // The high half must be written first: writing the low half is
+            // what actually sends, so doing it in the other order sends with a
+            // stale destination.
+            write(REG_ICR_HIGH, 0);
+            write(REG_ICR_LOW, command);
+
+            // Bounded wait for delivery. A dead APIC must not hang the sender.
+            let mut spins = 0u32;
+            while read(REG_ICR_LOW) & ICR_DELIVERY_PENDING != 0 && spins < 1_000_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+        }
     }
 }

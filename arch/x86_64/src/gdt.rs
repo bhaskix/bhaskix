@@ -62,8 +62,19 @@ const IST_STACK_SIZE: usize = 16 * 1024;
 #[repr(C, align(16))]
 struct Stack([u8; IST_STACK_SIZE]);
 
-static DOUBLE_FAULT_STACK: BootCell<Stack> = BootCell::new(Stack([0; IST_STACK_SIZE]));
-static NMI_STACK: BootCell<Stack> = BootCell::new(Stack([0; IST_STACK_SIZE]));
+/// Interrupt stacks, per CPU: `[cpu][0]` is the double-fault stack and
+/// `[cpu][1]` the NMI stack.
+///
+/// Per CPU, not shared, and that is the whole point of this being an array.
+/// A shared IST means two processors taking a double fault at the same moment
+/// land on the *same* stack and overwrite each other's fault frame — turning
+/// two diagnosable faults into one corrupted report, at exactly the moment the
+/// machine is least able to explain itself.
+///
+/// Lives in `.bss`, so it costs address space rather than image size.
+static IST_STACKS: BootCell<[[Stack; 2]; crate::percpu::MAX_CPUS]> = BootCell::new(
+    [const { [Stack([0; IST_STACK_SIZE]), Stack([0; IST_STACK_SIZE])] }; crate::percpu::MAX_CPUS],
+);
 
 /// The 64-bit Task State Segment.
 ///
@@ -102,7 +113,12 @@ impl TaskStateSegment {
     }
 }
 
-static TSS: BootCell<TaskStateSegment> = BootCell::new(TaskStateSegment::new());
+/// One TSS per CPU. The task register is per-CPU state, and `ltr` marks the
+/// descriptor *busy* — a second CPU running `ltr` against a descriptor the
+/// first has already claimed raises `#GP`, so sharing one is not merely
+/// unwise, it does not work.
+static TSSES: BootCell<[TaskStateSegment; crate::percpu::MAX_CPUS]> =
+    BootCell::new([TaskStateSegment::new(); crate::percpu::MAX_CPUS]);
 
 /// The GDT: five 8-byte descriptors plus a 16-byte TSS descriptor.
 #[repr(C, align(16))]
@@ -110,7 +126,13 @@ struct Gdt {
     entries: [u64; 7],
 }
 
-static GDT: BootCell<Gdt> = BootCell::new(Gdt { entries: [0; 7] });
+/// One GDT per CPU, because each embeds a descriptor for that CPU's own TSS.
+///
+/// The five segment descriptors are identical across CPUs; only the TSS
+/// descriptor differs. Duplicating the whole table is simpler than sharing the
+/// segments and splitting the TSS entry, and costs a few hundred bytes per CPU.
+static GDTS: BootCell<[Gdt; crate::percpu::MAX_CPUS]> =
+    BootCell::new([const { Gdt { entries: [0; 7] } }; crate::percpu::MAX_CPUS]);
 
 /// Operand for `lgdt`.
 #[repr(C, packed)]
@@ -170,31 +192,39 @@ const fn data_segment(privilege: u64) -> u64 {
         | LIMIT_HIGH
 }
 
-/// Builds the GDT and TSS, loads them, and reloads every segment register.
+/// Builds and loads this CPU's GDT and TSS.
+///
+/// Every CPU calls this with its own dense identifier. The bootstrap CPU uses
+/// 0; secondaries use the index [`crate::percpu::install`] gave them, which is
+/// why per-CPU data must be established before this runs.
 ///
 /// # Safety
 ///
-/// Must be called exactly once, on the bootstrap CPU, before interrupts are
-/// enabled. It replaces the descriptor tables the bootloader installed, so any
+/// Must be called exactly once per CPU, with interrupts disabled, and
+/// `cpu_id` must be unique and below [`crate::percpu::MAX_CPUS`]. It replaces
+/// whatever descriptor tables were previously loaded on this CPU, so an
 /// interrupt taken partway through would use a half-built GDT.
-pub unsafe fn init() {
-    // SAFETY: single-threaded boot, called once; see the function contract.
+pub unsafe fn init_cpu(cpu_id: usize) {
+    if cpu_id >= crate::percpu::MAX_CPUS {
+        return;
+    }
+
+    // SAFETY: `cpu_id` is unique per the caller's contract, so this CPU is the
+    // only writer of these elements; the arrays are `static` and never move.
     unsafe {
-        let tss = TSS.get_mut();
+        let stacks = &mut IST_STACKS.get_mut()[cpu_id];
+        let double_fault_top = (&raw mut stacks[0]).cast::<u8>().add(IST_STACK_SIZE) as u64;
+        let nmi_top = (&raw mut stacks[1]).cast::<u8>().add(IST_STACK_SIZE) as u64;
 
-        // Stacks grow downward, so the pointer goes at the *top* of each
-        // array. Off-by-one here means the first push lands outside the stack.
-        let df_stack = DOUBLE_FAULT_STACK.as_ptr().cast::<u8>();
-        let nmi_stack = NMI_STACK.as_ptr().cast::<u8>();
-        tss.interrupt_stack_table[(IST_DOUBLE_FAULT - 1) as usize] =
-            df_stack.add(IST_STACK_SIZE) as u64;
-        tss.interrupt_stack_table[(IST_NMI - 1) as usize] = nmi_stack.add(IST_STACK_SIZE) as u64;
+        let tss = &mut TSSES.get_mut()[cpu_id];
+        *tss = TaskStateSegment::new();
+        tss.interrupt_stack_table[(IST_DOUBLE_FAULT - 1) as usize] = double_fault_top;
+        tss.interrupt_stack_table[(IST_NMI - 1) as usize] = nmi_top;
 
-        // RSP0 is left zero until M5. There is no user mode yet, so there is
-        // no privilege transition that could consult it, and a zero here is
-        // more honest than a plausible-looking wrong value.
+        // RSP0 stays zero until M5. There is no user mode yet, so nothing
+        // consults it, and a zero is more honest than a plausible wrong value.
 
-        let tss_base = TSS.as_ptr() as u64;
+        let tss_base = (&raw const *tss) as u64;
         let tss_limit = (size_of::<TaskStateSegment>() - 1) as u64;
 
         // A 64-bit TSS descriptor is 16 bytes: the usual 8-byte descriptor
@@ -206,7 +236,7 @@ pub unsafe fn init() {
             | (0b1001 << 40); // type: 64-bit TSS, available
         let tss_high = tss_base >> 32;
 
-        let gdt = GDT.get_mut();
+        let gdt = &mut GDTS.get_mut()[cpu_id];
         gdt.entries = [
             0,               // 0x00 null
             code_segment(0), // 0x08 kernel code
@@ -223,12 +253,22 @@ pub unsafe fn init() {
 
         let pointer = DescriptorTablePointer {
             limit: (size_of::<Gdt>() - 1) as u16,
-            base: GDT.as_ptr() as u64,
+            base: (&raw const *gdt) as u64,
         };
 
         load_gdt(&pointer);
         load_task_register(TSS_SELECTOR);
     }
+}
+
+/// Builds and loads the bootstrap CPU's GDT and TSS.
+///
+/// # Safety
+///
+/// As [`init_cpu`], with `cpu_id` 0.
+pub unsafe fn init() {
+    // SAFETY: delegated; the bootstrap CPU is always dense id 0.
+    unsafe { init_cpu(0) }
 }
 
 /// Loads the GDT and reloads every segment register.
@@ -300,31 +340,4 @@ unsafe fn load_task_register(selector: u16) {
     unsafe {
         core::arch::asm!("ltr {0:x}", in(reg) selector, options(nomem, nostack, preserves_flags));
     }
-}
-
-/// Loads the shared GDT on a secondary CPU.
-///
-/// Deliberately does **not** load the task register. The TSS is still shared,
-/// and `ltr` marks a TSS descriptor busy — a second `ltr` against a busy
-/// descriptor raises `#GP`, so a secondary CPU doing what the bootstrap CPU
-/// did would fault immediately.
-///
-/// The deeper problem is that a shared TSS means shared `IST` stacks: two CPUs
-/// taking a double fault at once would land on the same stack and corrupt each
-/// other's report. Secondary CPUs therefore must not enable interrupts until
-/// each has its own GDT and TSS. That is a prerequisite for running threads on
-/// them, and it is not done yet.
-///
-/// # Safety
-///
-/// Must run once per secondary CPU, with interrupts disabled, after the
-/// bootstrap CPU has built the GDT.
-pub unsafe fn load_on_secondary() {
-    let pointer = DescriptorTablePointer {
-        limit: (size_of::<Gdt>() - 1) as u16,
-        base: GDT.as_ptr() as u64,
-    };
-    // SAFETY: the table was fully built by `init` on the bootstrap CPU before
-    // any secondary was released, and is only read from here.
-    unsafe { load_gdt(&pointer) };
 }

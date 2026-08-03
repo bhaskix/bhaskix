@@ -209,6 +209,16 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             crate::sched::preempt();
         }
 
+        // TLB shootdown from another CPU. Acknowledged like any delivered
+        // interrupt; the invalidation itself takes no locks, because this CPU
+        // may have been interrupted anywhere.
+        crate::tlb::SHOOTDOWN_VECTOR => {
+            crate::tlb::handle_ipi();
+            // SAFETY: the APIC is initialised -- interrupts cannot be enabled
+            // before it is -- and this acknowledges the interrupt in service.
+            unsafe { apic::end_of_interrupt() };
+        }
+
         // Spurious interrupts get no acknowledgement. The APIC never placed
         // them in service, so an EOI here would clear a *different*
         // interrupt's in-service bit -- losing a real interrupt in a way that

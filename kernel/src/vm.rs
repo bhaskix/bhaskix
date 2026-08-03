@@ -211,16 +211,42 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Whether this address space is currently loaded in `CR3`.
+    ///
+    /// Decides whether unmapping needs a TLB shootdown. A translation can only
+    /// be cached by a CPU that has actually run in this address space, so a
+    /// space no CPU has loaded needs no interruption at all — which is what
+    /// keeps tearing down a thousand address spaces from costing a thousand
+    /// rounds of IPIs.
+    ///
+    /// The check is against *this* CPU's `CR3` only, which is sufficient
+    /// because secondary CPUs never load an address space: they idle in the
+    /// one the bootloader built. That stops being true the moment threads run
+    /// on more than one CPU, and this must become a per-space "loaded on"
+    /// mask when it does.
+    fn is_active(&self) -> bool {
+        // SAFETY: reading CR3 at CPL 0 has no side effects.
+        unsafe { paging::active_page_table() == self.root }
+    }
+
     /// Unmaps and frees the first `count` pages of `range`.
     fn unmap_pages(&mut self, range: VirtRange, count: u64) {
         let root = self.root;
         let hhdm = self.hhdm_base;
+        let active = self.is_active();
 
         heap::with(|heap| {
             let pmm = heap.pmm_mut();
             for page in range.pages_iter().take(count as usize) {
-                // SAFETY: single CPU, and `root` is this space's PML4.
+                // SAFETY: `root` is this space's PML4.
                 if let Ok(physical) = unsafe { paging::unmap_page(root, page.as_u64(), hhdm) } {
+                    // Shoot down *before* the frame is freed. Reversing this
+                    // hands the frame to another allocation while a CPU may
+                    // still be writing through the old translation, which is
+                    // the exact corruption shootdown exists to prevent.
+                    if active {
+                        crate::tlb::shootdown(page.as_u64());
+                    }
                     let _ = pmm.free((physical / FRAME_SIZE) as u32, 0);
                 }
             }
@@ -270,9 +296,10 @@ impl AddressSpace {
                     continue;
                 }
                 for page in region.range.pages_iter() {
-                    // SAFETY: single CPU; `root` is this space's PML4, which is
-                    // not loaded in CR3 -- the kernel runs in the address space
-                    // the bootloader built.
+                    // SAFETY: `root` is this space's PML4, which is not loaded
+                    // in CR3 -- `destroy` consumes the space, and a space
+                    // cannot be destroyed while it is running. No CPU can hold
+                    // a cached translation for it, so no shootdown is needed.
                     if let Ok(physical) = unsafe { paging::unmap_page(root, page.as_u64(), hhdm) } {
                         let _ = pmm.free((physical / FRAME_SIZE) as u32, 0);
                     }

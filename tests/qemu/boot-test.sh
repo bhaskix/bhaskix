@@ -29,6 +29,10 @@ EXPECT_GREETING="Hello from Bhaskix"
 FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
                  "unexpected interrupt on vector" "NO TICKS"
                  "LEAK:" "INVARIANT VIOLATED")
+# Note: "timed out" is deliberately NOT a marker. The success message reads
+# "none timed out" and a substring match on it fails every passing run --
+# which is exactly what happened when it was added. The positive assertion
+# below already requires the "none timed out" wording.
 
 fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2; }
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
@@ -209,6 +213,16 @@ if grep -qE "cpus +([0-9]+) online of \1 reported" "$LOG"; then
     pass "all reported CPUs came online"
 else
     fail "not every reported CPU came online"
+    status=1
+fi
+
+# Shootdown reaching nobody looks exactly like shootdown working, so the
+# acknowledgement count is what gets checked. Negative-tested by disabling the
+# receiving handler, which turns 8 completions into 8 timeouts.
+if grep -qE "tlb shootdown +[0-9]+ completed across [0-9]+ cpus, none timed out" "$LOG"; then
+    pass "TLB shootdown acknowledged by every CPU"
+else
+    fail "TLB shootdown did not complete on every CPU"
     status=1
 fi
 

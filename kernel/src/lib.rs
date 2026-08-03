@@ -39,6 +39,7 @@ pub mod sched;
 pub mod smp;
 pub mod stack;
 pub mod sync;
+pub mod tlb;
 pub mod trap;
 pub mod vm;
 
@@ -280,6 +281,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     let secondaries = smp::start_secondaries(handoff);
     smp::report(handoff);
     let _ = secondaries;
+
+    // Reports its own failure in detail, so there is nothing useful to add
+    // here -- a second, vaguer "FAILED" would only bury the first.
+    let _ = smp::shootdown_self_test();
 
     if scheduling_self_test(handoff.hhdm_base.as_u64()) {
         println!("    scheduler      timer-driven preemption works");
