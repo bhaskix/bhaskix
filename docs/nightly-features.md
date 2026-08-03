@@ -22,7 +22,7 @@ systems project to die.
 
 **None.**
 
-As of M1, Bhaskix compiles on stable Rust 1.90.0 with no `#![feature(...)]`
+As of M1, Bhaskix compiles on stable Rust 1.97.1 with no `#![feature(...)]`
 attributes anywhere in the tree. Everything the kernel needs is stable:
 
 | Capability | How, on stable |

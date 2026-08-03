@@ -39,6 +39,29 @@ pub unsafe fn enable_interrupts() {
     }
 }
 
+/// Whether maskable interrupts are currently enabled on this CPU.
+///
+/// Reads `RFLAGS.IF`. Needed because the interrupt-enable state is *not* part
+/// of a thread's saved context: a thread can yield from ordinary code, with
+/// interrupts enabled, and be resumed from inside an interrupt handler, where
+/// they are not. It then continues with the timer masked, which stops the
+/// clock for the whole machine rather than merely delaying that thread.
+#[must_use]
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: `pushfq` and a pop read the flags register and touch nothing
+    // else. The stack is used and restored within the sequence.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            out(reg) flags,
+            options(nomem, preserves_flags)
+        );
+    }
+    flags & (1 << 9) != 0
+}
+
 /// Halts this CPU until the next interrupt.
 ///
 /// # Safety

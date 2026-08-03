@@ -103,7 +103,8 @@ fairness within 2% for two equal-weight workloads.
 | M4-06 | Per-CPU runqueues | ✅ `DONE` | One lock-per-CPU queue; threads are *owned* by a CPU. **Negative-tested**: forcing every thread onto CPU 0 fails the gate. |
 | M4-06b | Work stealing and migration | ✅ `DONE` | Idle pull plus load-aware placement. **Negative-tested**: each of the three steal rules and the imbalance threshold has a unit test that fails when that rule alone is removed. |
 | M4-06c | Topology-aware balancing, periodic push | ⬜ `TODO` | No ACPI topology, so every CPU is equidistant; balancing is pull-only. `docs/scheduler.md` §5.1 and §5.3. |
-| M4-07 | Fair class (virtual deadline), RT class | ⬜ `TODO` | Currently plain round-robin |
+| M4-07 | Fair class (virtual deadline), RT class | ✅ `DONE` | Strict class priority, weighted fairness (3:1 measured 2.7–3.1x), FIFO/RR, admission control at 95%. **Negative-tested**: 13 unit tests over the pure pick, each failing when its rule alone is removed. |
+| M4-07b | Priority inheritance, domain-level fairness, EEVDF lag | ⬜ `TODO` | PI needs a sleeping lock with an owner; domain fairness needs M5. A crude lead bound stands in for lag. |
 | M4-08 | Lock ranking | ✅ `DONE` | Rank given at construction, so a lock cannot be added without one. ~7,400 acquisitions checked per boot, 0 violations. **Negative-tested**: mis-ranking a real lock produces violations; disabling the detector fails the "detector verified" claim. Deviates from "panic" — see `docs/coding-style.md` §7. |
 | M4-09 | Sleeping, wait queues, blocking | ✅ `DONE` | `Blocked` state, `WaitQueue`, cross-CPU wake. Ring self-test over 4 CPUs. **Negative-tested**: disabling `wake` gives laps `[1,1,1,0]`, 0 wakeups. |
 | M4-09b | Reschedule IPI on wake | ⬜ `TODO` | A cross-CPU wake waits for the target's next tick — up to 10 ms against the §4 target of 50 µs. |
@@ -169,6 +170,14 @@ fairness within 2% for two equal-weight workloads.
   thief taking a thread whose registers are not yet saved, and it is the one hazard here that
   corrupts state rather than merely stranding it. Removing it fails a unit test, which proves the
   policy encodes the rule — not that the race it guards against was ever reached.
+- **Real-time wakeup latency is 120–500 µs against a 50 µs budget.** Measured and printed at every
+  boot rather than omitted. Part of the gap is that this is QEMU's TCG interpreter on a shared build
+  machine and not a latency measurement of anything real; part is the missing reschedule IPI. It is
+  a regression baseline, not a claim to have met `docs/scheduler.md` §4.
+- **Priority inheritance does not exist**, which by §4's own words makes the RT latency bound a lie
+  under contention. It needs a lock with an owner that can sleep; the spinlocks here have neither.
+- **Fairness is between threads, not domains.** A domain that spawns more threads gets more CPU,
+  which is exactly what §3's two-level runqueue exists to prevent. It needs domains, so M5.
 - **A cross-CPU wake is not prompt.** It marks the thread `Ready` and stops; nothing interrupts the
   target CPU, so the woken thread waits for its next timer tick — up to 10 ms at 100 Hz, against
   `docs/scheduler.md` §4's 50 µs target. This is why the ring self-test measures dozens of laps per
@@ -254,6 +263,57 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M4-07, scheduling classes — and four bugs it exposed)
+
+- **Real-time and fair classes, in strict priority.** Fixed priorities 0–99 with `FIFO` and `RR`,
+  weighted proportional share with virtual deadlines beneath them, and an idle class below that. The
+  whole policy is one pure function over the runqueue, so all thirteen class rules are unit-tested on
+  the host and each fails when its own rule is removed.
+- **The deadline earns its place.** A thread asking for a *shorter* slice gets an earlier deadline and
+  so runs sooner and more often for the same total share — how a latency-sensitive thread declares
+  itself rather than being guessed at from its sleep pattern. Measured weight ratio at 3:1 is 2.7–3.1x.
+- **Admission control refuses rather than degrades**, and real-time threads are excluded from work
+  stealing: the budget is per-CPU, so migrating one invalidates it at both ends.
+- **Accounting moved to the TSC**, because a 100 Hz tick cannot distinguish 200 µs from 9 ms and
+  proportional fairness measured in ticks is not proportional fairness.
+
+Four defects surfaced, three of them pre-existing and serious:
+
+1. **The interrupt-enable flag was not part of a thread's context.** A thread yielding voluntarily,
+   with interrupts on, could be resumed from inside an interrupt handler with them off — and then
+   run on with the timer masked. That does not delay one thread, it stops the clock for the whole
+   machine, and every other thread waits on a tick that never comes.
+2. **Voluntary preemption was not atomic against the timer.** A tick landing between choosing the
+   next thread and performing the switch re-entered the scheduler on the same thread; both calls
+   then switched from their own stale view. It surfaced as a #GP on `iretq` from a corrupted
+   interrupt frame — as far from the cause as a symptom gets. Both paths now mask for the duration
+   of the decision and the switch.
+3. **Nothing stopped a thread being preempted while holding a spinlock** — recorded as an open gap
+   at M4-08 and now closed using that milestone's own rank mask, which already tracks what the CPU
+   holds. On one processor this was a deadlock: the holder cannot release until it runs, and the
+   spinner holds nothing, so the scheduler saw nothing wrong and kept choosing the spinner.
+4. **`make iso` did not depend on `CMDLINE`.** Every fault-injection case after the first booted the
+   *previous* case's image, so different subsets failed on different runs and it read as flakiness.
+   This had been quietly weakening the fault gate, and it also explains the unreproducible hang
+   recorded at M4-06.
+
+- **Accounting had to move before the decision, not after.** `preempt` returns early when the running
+  thread is still the right choice, so charging afterwards meant a thread that won one comparison was
+  never charged again: its deadline froze at the winning value and it owned the CPU for ever.
+- **An unbounded virtual-time lead starves.** A thread that once ran alone is far ahead in virtual
+  time, and a group of threads that each run for microseconds before blocking accrue so slowly that
+  it never runs again. Bounded at eight slices — deliberately generous, so it never fires under
+  ordinary contention.
+- **A test assertion was removed for measuring timing rather than policy.** Load-aware placement races
+  with stealing by design, so asserting *which* CPU it chose failed about one run in three. It is
+  reported now; the policy belongs in a unit test, not a live race.
+- **The QEMU harness now polls instead of always waiting out the timeout.** The kernel halts rather
+  than exiting, so every run cost the full timeout — which made the timeout impossible to tune, since
+  long enough for a loaded machine also meant minutes of dead waiting. `make test` went from over ten
+  minutes to 51 seconds, and the timeout went back to being an upper bound.
+- **Toolchain moved to Rust 1.97.1** from 1.90.0, at the user's prompting. Two new lints found real
+  sloppiness: casting a function item straight to an integer, and a hand-rolled checked division.
 
 ### 2026-08-03 (RFC 0006 drafted, Kosh storage)
 

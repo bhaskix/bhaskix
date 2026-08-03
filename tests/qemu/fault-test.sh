@@ -18,7 +18,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-TIMEOUT="${FAULT_TEST_TIMEOUT:-40}"
+TIMEOUT="${FAULT_TEST_TIMEOUT:-120}"
 
 RED=$'\033[1;31m'; GREEN=$'\033[1;32m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 
@@ -61,6 +61,41 @@ FATAL_MARKERS=(
 
 status=0
 
+
+# Runs QEMU until `marker` appears in the log, or the timeout expires.
+#
+# The kernel halts rather than exiting, so waiting for QEMU to finish means
+# waiting the entire timeout on *every* run, pass or fail. That coupling is
+# what made the timeout impossible to tune: long enough to survive a loaded
+# build machine also meant minutes of dead waiting per case. Polling separates
+# the two -- a healthy boot finishes in seconds and the timeout goes back to
+# being an upper bound rather than the running cost.
+run_until() {
+    local logfile="$1" expected="$2" limit="$3"; shift 3
+    : > "$logfile"
+    timeout "$limit" qemu-system-x86_64 "$@" >/dev/null 2>&1 &
+    local pid=$! waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        # Every expected line, not just the first. The exception report is
+        # written a line at a time, so stopping the machine once the header
+        # appears loses the register dump -- which is most of what is being
+        # asserted, and failed exactly that way on a loaded host.
+        local complete=1 line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            grep -qF -- "$line" "$logfile" 2>/dev/null || { complete=0; break; }
+        done <<< "$expected"
+        [[ $complete -eq 1 ]] && break
+
+        sleep 0.25
+        waited=$((waited + 1))
+        [[ $waited -gt $((limit * 4)) ]] && break
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 0
+}
+
 for fault in "${FAULTS[@]}"; do
   if [[ -z "${EXPECT[$fault]+set}" ]]; then
     echo "${RED}FAIL${RESET}  unknown fault '$fault'"
@@ -78,10 +113,10 @@ for fault in "${FAULTS[@]}"; do
 
   log="$(mktemp)"
   qemu_log="$(mktemp)"
-  timeout "$TIMEOUT" qemu-system-x86_64 \
+  run_until "$log" "${EXPECT[$fault]}" "$TIMEOUT" \
       -M q35 -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom build/bhaskix.iso -boot d \
       -serial "file:$log" -display none \
-      -d cpu_reset -D "$qemu_log" >/dev/null 2>&1
+      -d cpu_reset -D "$qemu_log"
 
   failures=()
 

@@ -17,7 +17,7 @@ MODE="${1:-bios}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ISO="$REPO_ROOT/build/bhaskix.iso"
 LOG="$(mktemp)"
-TIMEOUT="${BOOT_TEST_TIMEOUT:-40}"
+TIMEOUT="${BOOT_TEST_TIMEOUT:-120}"
 
 trap 'rm -f "$LOG"' EXIT
 
@@ -33,6 +33,35 @@ FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
 # "none timed out" and a substring match on it fails every passing run --
 # which is exactly what happened when it was added. The positive assertion
 # below already requires the "none timed out" wording.
+
+
+# Runs QEMU until `marker` appears in the log, or the timeout expires.
+#
+# The kernel halts rather than exiting, so waiting for QEMU to finish means
+# waiting the entire timeout on *every* run, pass or fail. That coupling is
+# what made the timeout impossible to tune: long enough to survive a loaded
+# build machine also meant minutes of dead waiting per case. Polling separates
+# the two -- a healthy boot finishes in seconds and the timeout goes back to
+# being an upper bound rather than the running cost.
+run_until() {
+    local logfile="$1" marker="$2" limit="$3"; shift 3
+    : > "$logfile"
+    timeout "$limit" qemu-system-x86_64 "$@" >/dev/null 2>&1 &
+    local pid=$! waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if grep -qF -- "$marker" "$logfile" 2>/dev/null; then
+            # Let the last few lines land before stopping the machine.
+            sleep 1
+            break
+        fi
+        sleep 0.25
+        waited=$((waited + 1))
+        [[ $waited -gt $((limit * 4)) ]] && break
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 0
+}
 
 fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2; }
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
@@ -98,10 +127,8 @@ if [[ "$MODE" == "uefi" ]]; then
                 -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS")
 fi
 
-echo "booting ($MODE), timeout ${TIMEOUT}s..."
-timeout "$TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" >/dev/null 2>&1
-# The kernel halts rather than exiting, so QEMU is always killed by the
-# timeout. That is expected; what matters is what reached the serial port.
+echo "booting ($MODE), up to ${TIMEOUT}s..."
+run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
 
 status=0
 

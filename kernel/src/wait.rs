@@ -68,13 +68,13 @@
 //! - **Not unbounded.** A queue holds [`MAX_WAITERS`] sleepers, because the
 //!   sleep path must not allocate. Beyond that, waiters spin instead — correct
 //!   but not the intent, so the limit is reported rather than silent.
-//! - **Not prompt across CPUs.** Waking a thread on another processor marks it
-//!   `Ready` and stops there. Nothing sends that CPU an interrupt, so the
-//!   woken thread waits for its next timer tick — up to 10 ms at the current
-//!   100 Hz. It is why the ring self-test measures laps in the dozens rather
-//!   than the thousands, and it is a long way from the sub-50 µs wakeup
-//!   latency `docs/scheduler.md` §4 asks for. The fix is a reschedule IPI on
-//!   the wake path, which is the same mechanism TLB shootdown already uses.
+//! - **Not prompt across CPUs.** A wake hands the CPU over immediately when
+//!   the woken thread lands on the *waker's* processor — [`sched::resched`]
+//!   runs after the lock is dropped, which is what gets real-time wakeup
+//!   latency down to microseconds. On any *other* processor it only marks the
+//!   thread `Ready`; nothing interrupts that CPU, so it waits for its next
+//!   timer tick, up to 10 ms at 100 Hz. The fix is a reschedule IPI, using the
+//!   mechanism TLB shootdown already has.
 
 use crate::sched;
 use crate::sync::{Rank, SpinLock};
@@ -228,13 +228,18 @@ impl WaitQueue {
     /// calling this. See the module header.
     pub fn wake_all(&self) -> usize {
         let mut woken = 0;
-        let mut waiters = self.waiters.lock();
-        for entry in &mut waiters.entries {
-            if let Some(waiter) = entry.take()
-                && sched::wake(waiter.id)
-            {
-                woken += 1;
+        {
+            let mut waiters = self.waiters.lock();
+            for entry in &mut waiters.entries {
+                if let Some(waiter) = entry.take()
+                    && sched::wake(waiter.id)
+                {
+                    woken += 1;
+                }
             }
+        }
+        if woken > 0 {
+            sched::resched();
         }
         woken
     }
@@ -246,16 +251,24 @@ impl WaitQueue {
     /// appears under sustained contention, which is the worst time to discover
     /// it.
     pub fn wake_one(&self) -> bool {
-        let mut waiters = self.waiters.lock();
-        for entry in &mut waiters.entries {
-            if let Some(waiter) = *entry {
-                *entry = None;
-                if sched::wake(waiter.id) {
-                    return true;
+        let woken = {
+            let mut waiters = self.waiters.lock();
+            let mut woken = false;
+            for entry in &mut waiters.entries {
+                if let Some(waiter) = *entry {
+                    *entry = None;
+                    if sched::wake(waiter.id) {
+                        woken = true;
+                        break;
+                    }
                 }
             }
+            woken
+        };
+        if woken {
+            sched::resched();
         }
-        false
+        woken
     }
 
     /// Sleepers currently queued.

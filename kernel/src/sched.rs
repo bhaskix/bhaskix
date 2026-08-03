@@ -62,7 +62,9 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use bhaskix_arch::context::{Context, bhaskix_context_switch};
+use bhaskix_arch::cpu;
 use bhaskix_arch::percpu::{self, MAX_CPUS};
+use bhaskix_arch::tsc;
 
 use crate::stack;
 use crate::sync::{Rank, SpinLock};
@@ -98,6 +100,96 @@ impl State {
     }
 }
 
+/// Weight of an ordinary Fair thread.
+///
+/// Ratios are what matter, not the absolute value; 1024 is used because it
+/// leaves room to scale a thread down by three orders of magnitude before the
+/// division below loses meaningful precision.
+pub const BASE_WEIGHT: u64 = 1024;
+
+/// Default slice a Fair thread asks for, in microseconds.
+pub const DEFAULT_SLICE_US: u64 = 3_000;
+
+/// How far ahead of a runqueue's virtual clock a thread may get, in units of
+/// the default slice.
+///
+/// Proportional share on its own has no bound on this, and the consequence is
+/// not theoretical. A thread that ran alone for a while is far ahead in
+/// virtual time; if a group of threads then arrives that each run for
+/// microseconds before blocking, they accrue virtual time so slowly that the
+/// first thread waits for *all* of them to catch up — which took longer than
+/// the test that found it was willing to wait, and read as a hung machine.
+///
+/// Clamping the lead trades a bounded amount of unfairness for a bound on how
+/// long any runnable thread can be passed over. It is deliberately generous,
+/// so that it never fires under ordinary contention — where threads track each
+/// other within a slice or two — and only rescues the pathological case.
+pub const MAX_VRUNTIME_LEAD_SLICES: u64 = 8;
+
+/// Highest real-time priority.
+pub const MAX_RT_PRIORITY: u8 = 99;
+
+/// Share of a CPU real-time threads may claim, in percent.
+///
+/// The remainder is not slack. It is the guarantee that Fair-class threads —
+/// including whatever an operator would use to log in and stop a runaway —
+/// still run. `docs/scheduler.md` §4 sets this at 95%.
+pub const RT_UTILISATION_CAP: u16 = 95;
+
+/// How a real-time thread yields the CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RtPolicy {
+    /// Runs until it blocks or yields. Never preempted by an equal priority.
+    Fifo,
+    /// Also gives way to an equal priority at the end of its quantum.
+    RoundRobin,
+}
+
+/// Which class a thread belongs to, and its parameters within that class.
+///
+/// Classes are in **strict priority order**: any runnable real-time thread
+/// beats every fair thread, and any fair thread beats idle. That an RT thread
+/// can starve a fair one is the intended behaviour rather than a flaw — the
+/// mitigation is admission control on the RT side, not a softened rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// Fixed priority, 0..=[`MAX_RT_PRIORITY`], higher wins.
+    RealTime {
+        /// Fixed priority; higher runs first.
+        priority: u8,
+        /// Whether an equal priority may displace it.
+        policy: RtPolicy,
+        /// Declared share of the CPU, in percent, for admission control.
+        utilisation: u16,
+    },
+    /// Weighted proportional share.
+    Fair {
+        /// Share relative to [`BASE_WEIGHT`]. Twice the weight, twice the CPU.
+        weight: u32,
+    },
+    /// Runs only when nothing else can. One per CPU.
+    Idle,
+}
+
+impl Policy {
+    /// An ordinary thread.
+    #[must_use]
+    pub const fn fair() -> Self {
+        Self::Fair {
+            weight: BASE_WEIGHT as u32,
+        }
+    }
+
+    /// Short tag for the boot report.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::RealTime { .. } => "rt",
+            Self::Fair { .. } => "fair",
+            Self::Idle => "idle",
+        }
+    }
+}
+
 /// One kernel thread. Owned outright by the CPU whose queue holds it.
 pub struct Thread {
     /// Globally unique identifier.
@@ -123,6 +215,44 @@ pub struct Thread {
     /// True for the thread each CPU registers for itself: it runs on the stack
     /// that CPU booted on, so "move it elsewhere" is not a meaningful request.
     pub pinned: bool,
+    /// Class and parameters.
+    pub policy: Policy,
+    /// Service received, scaled by weight. Only meaningful for Fair.
+    ///
+    /// A heavier thread accumulates this more slowly for the same real time,
+    /// so choosing the smallest gives service in proportion to weight. That is
+    /// the whole of proportional fairness.
+    pub vruntime: u64,
+    /// Virtual time by which this thread would like to have run.
+    ///
+    /// `vruntime + slice/weight`. Choosing the earliest is what separates this
+    /// from picking the smallest `vruntime`: a thread that asks for a *short*
+    /// slice earns an earlier deadline and so runs sooner and more often, for
+    /// the same total share. That is how a latency-sensitive thread declares
+    /// itself instead of being guessed at from its sleep pattern.
+    pub deadline: u64,
+    /// Requested slice, in TSC ticks.
+    pub slice_ticks: u64,
+    /// Real CPU ticks consumed.
+    pub cycles: u64,
+    /// TSC reading when this thread was last dispatched.
+    pub last_start: u64,
+}
+
+impl Thread {
+    /// Charges `delta` ticks of real service to this thread.
+    fn charge(&mut self, delta: u64) {
+        self.cycles = self.cycles.saturating_add(delta);
+        if let Policy::Fair { weight } = self.policy {
+            let weight = u64::from(weight.max(1));
+            self.vruntime = self
+                .vruntime
+                .saturating_add(delta.saturating_mul(BASE_WEIGHT) / weight);
+            self.deadline = self
+                .vruntime
+                .saturating_add(self.slice_ticks.saturating_mul(BASE_WEIGHT) / weight);
+        }
+    }
 }
 
 /// One CPU's runqueue.
@@ -132,6 +262,22 @@ struct RunQueue {
     current: usize,
     /// Whether this CPU may preempt yet.
     started: bool,
+    /// This runqueue's virtual clock: the floor a waking or new thread is
+    /// lifted to.
+    ///
+    /// **Monotonic, and that is the whole point.** The obvious implementation
+    /// — take the smallest `vruntime` among threads that can currently run —
+    /// moves *backwards* whenever a long-sleeping thread becomes runnable, and
+    /// a thread that sleeps more than it runs therefore accumulates unbounded
+    /// credit. Four such threads handing work to each other kept their virtual
+    /// time near zero and starved a CPU-bound thread completely; the machine
+    /// looked hung and was in fact scheduling exactly as written.
+    ///
+    /// A floor that never decreases bounds that credit at zero. Latency for
+    /// threads that sleep does not come from virtual-time credit here — it
+    /// comes from asking for a short slice, which earns an earlier deadline.
+    /// That separation is the point of a virtual *deadline*.
+    min_vruntime: u64,
     /// Whether this CPU is between choosing a switch and completing it.
     ///
     /// Set under the lock before the lock is released for the switch, and
@@ -147,6 +293,7 @@ impl RunQueue {
             threads: [const { None }; MAX_THREADS_PER_CPU],
             current: 0,
             started: false,
+            min_vruntime: 0,
             switching: false,
         }
     }
@@ -192,6 +339,13 @@ impl RunQueue {
                     // that CPU was given, and on a secondary it is also the
                     // only thing left to run when the queue drains.
                     && !thread.pinned
+                    // Rule 4: real-time threads do not migrate. Admission
+                    // control is per-CPU, so moving one silently invalidates
+                    // the budget at both ends -- the source keeps reserving
+                    // capacity it no longer needs and the destination admits
+                    // work it never counted. A latency guarantee that a
+                    // background balancer can quietly overcommit is not one.
+                    && !matches!(thread.policy, Policy::RealTime { .. })
             })
         })
     }
@@ -201,17 +355,139 @@ impl RunQueue {
         self.threads.iter().position(Option::is_none)
     }
 
-    /// Next runnable thread after `from`, round-robin within this CPU.
-    fn next_runnable(&self, from: usize) -> usize {
-        for offset in 1..=MAX_THREADS_PER_CPU {
-            let candidate = (from + offset) % MAX_THREADS_PER_CPU;
-            if let Some(thread) = &self.threads[candidate]
-                && thread.state.is_schedulable()
+    /// Slot indices in round-robin order, starting *after* `from`.
+    ///
+    /// Ending at `from` rather than starting there is what makes equal-ranked
+    /// threads rotate: every comparison below is strict, so a peer visited
+    /// earlier wins and the running thread is only kept when nothing ties it.
+    fn slots_from(&self, from: usize) -> impl Iterator<Item = usize> + use<> {
+        (1..=MAX_THREADS_PER_CPU).map(move |offset| (from + offset) % MAX_THREADS_PER_CPU)
+    }
+
+    fn schedulable(&self, slot: usize) -> Option<&Thread> {
+        self.threads[slot]
+            .as_ref()
+            .filter(|thread| thread.state.is_schedulable())
+    }
+
+    /// The thread that should run next on this CPU.
+    ///
+    /// The whole scheduling policy, as a pure function of the queue, so that
+    /// the class rules can be tested exhaustively on the host instead of being
+    /// inferred from how a boot happened to interleave. Returning `from` means
+    /// "no switch".
+    ///
+    /// Strict priority between classes, per `docs/scheduler.md` §2: a runnable
+    /// real-time thread is chosen over every fair thread, and a fair thread
+    /// over idle. There is no weighting *between* classes and there is not
+    /// meant to be.
+    fn pick_next(&self, from: usize) -> usize {
+        // --- Real time: highest priority wins, ties rotate. -----------------
+        let mut best: Option<(u8, usize)> = None;
+        for slot in self.slots_from(from) {
+            if let Some(thread) = self.schedulable(slot)
+                && let Policy::RealTime { priority, .. } = thread.policy
+                && best.is_none_or(|(best_priority, _)| priority > best_priority)
             {
-                return candidate;
+                best = Some((priority, slot));
+            }
+        }
+
+        if let Some((priority, slot)) = best {
+            // FIFO means exactly this: an equal priority does not displace the
+            // running thread. Only a strictly higher one does, and otherwise
+            // it runs until it blocks or exits.
+            if let Some(current) = self.schedulable(from)
+                && let Policy::RealTime {
+                    priority: mine,
+                    policy: RtPolicy::Fifo,
+                    ..
+                } = current.policy
+                && mine >= priority
+            {
+                return from;
+            }
+            return slot;
+        }
+
+        // --- Fair: earliest virtual deadline. -------------------------------
+        let mut best: Option<(u64, usize)> = None;
+        for slot in self.slots_from(from) {
+            if let Some(thread) = self.schedulable(slot)
+                && matches!(thread.policy, Policy::Fair { .. })
+                && best.is_none_or(|(best_deadline, _)| thread.deadline < best_deadline)
+            {
+                best = Some((thread.deadline, slot));
+            }
+        }
+        if let Some((_, slot)) = best {
+            return slot;
+        }
+
+        // --- Idle. ----------------------------------------------------------
+        for slot in self.slots_from(from) {
+            if self.schedulable(slot).is_some() {
+                return slot;
             }
         }
         from
+    }
+
+    /// Advances the virtual clock, never backwards, and bounds how far ahead
+    /// of it any thread may be.
+    fn advance_min_vruntime(&mut self) {
+        let smallest = self.min_fair_vruntime();
+        self.min_vruntime = self.min_vruntime.max(smallest);
+
+        let Some(ceiling) = self
+            .threads
+            .iter()
+            .flatten()
+            .map(|thread| thread.slice_ticks)
+            .max()
+            .map(|slice| {
+                self.min_vruntime
+                    .saturating_add(slice.saturating_mul(MAX_VRUNTIME_LEAD_SLICES))
+            })
+        else {
+            return;
+        };
+
+        for thread in self.threads.iter_mut().flatten() {
+            if matches!(thread.policy, Policy::Fair { .. }) && thread.vruntime > ceiling {
+                thread.vruntime = ceiling;
+                thread.charge(0);
+            }
+        }
+    }
+
+    /// Smallest `vruntime` among fair threads that could run.
+    ///
+    /// Only an input to [`RunQueue::advance_min_vruntime`]; the floor itself is
+    /// `min_vruntime`, which clamps this to never decrease.
+    fn min_fair_vruntime(&self) -> u64 {
+        self.threads
+            .iter()
+            .flatten()
+            .filter(|thread| {
+                thread.state.is_schedulable() && matches!(thread.policy, Policy::Fair { .. })
+            })
+            .map(|thread| thread.vruntime)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Real-time utilisation already admitted on this CPU, in percent.
+    fn rt_utilisation(&self) -> u16 {
+        self.threads
+            .iter()
+            .flatten()
+            .filter(|thread| thread.state != State::Finished)
+            .map(|thread| match thread.policy {
+                Policy::RealTime { utilisation, .. } => utilisation,
+                _ => 0,
+            })
+            .sum()
     }
 }
 
@@ -264,6 +540,15 @@ pub enum SpawnError {
     QueueFull(u32),
     /// A guarded stack could not be allocated.
     NoStack(crate::vm::VmError),
+    /// Admitting this real-time thread would exceed the CPU's budget.
+    RtOverCommitted {
+        /// The CPU that refused it.
+        cpu: u32,
+        /// Utilisation already admitted there, in percent.
+        admitted: u16,
+        /// Utilisation this thread asked for, in percent.
+        requested: u16,
+    },
 }
 
 /// Registers the calling CPU's current execution as its first thread.
@@ -271,7 +556,7 @@ pub enum SpawnError {
 /// Every CPU needs this before it can be preempted: without an entry there is
 /// nowhere to save the context of whatever is already running, and the first
 /// switch would lose it.
-pub fn init_cpu(name: &'static str) {
+pub fn init_cpu(name: &'static str, policy: Policy) {
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
@@ -291,11 +576,24 @@ pub fn init_cpu(name: &'static str) {
         runs: 1,
         migrations: 0,
         held_locks: 0,
+        policy,
+        vruntime: 0,
+        deadline: 0,
+        slice_ticks: default_slice_ticks(),
+        cycles: 0,
+        last_start: tsc::read(),
         // This thread *is* the CPU's boot context, executing on the stack the
         // bootloader handed it. Migrating it would move a stack out from under
         // the processor standing on it.
         pinned: true,
     });
+    // Establish the deadline from the slice, exactly as `spawn_on_with` does.
+    // Leaving it at zero gives this thread the earliest deadline that exists,
+    // so it wins every comparison for ever and nothing spawned later runs at
+    // all -- which is precisely what happened.
+    if let Some(thread) = queue.threads[0].as_mut() {
+        thread.charge(0);
+    }
     queue.current = 0;
 }
 
@@ -312,6 +610,92 @@ pub fn spawn_on(
     argument: u64,
     hhdm_base: u64,
 ) -> Result<u32, SpawnError> {
+    spawn_on_with(cpu, name, entry, argument, hhdm_base, SpawnOptions::new())
+}
+
+/// How a thread should be scheduled, beyond where it starts.
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnOptions {
+    /// Class and parameters.
+    pub policy: Policy,
+    /// Requested slice, in microseconds. Shorter means chosen sooner and more
+    /// often for the same total share.
+    pub slice_us: u64,
+    /// Whether the balancer may move this thread to another CPU.
+    pub pinned: bool,
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpawnOptions {
+    /// An ordinary fair thread, movable, with the default slice.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            policy: Policy::fair(),
+            slice_us: DEFAULT_SLICE_US,
+            pinned: false,
+        }
+    }
+
+    /// Sets the class.
+    #[must_use]
+    pub const fn policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Sets the requested slice.
+    #[must_use]
+    pub const fn slice_us(mut self, slice_us: u64) -> Self {
+        self.slice_us = slice_us;
+        self
+    }
+
+    /// Keeps this thread on the CPU it was created on.
+    #[must_use]
+    pub const fn pinned(mut self) -> Self {
+        self.pinned = true;
+        self
+    }
+}
+
+/// The requested slice in TSC ticks, or a fallback if the TSC is uncalibrated.
+///
+/// Without a rate the absolute value is meaningless, but deadlines are only
+/// ever compared with each other -- so a consistent arbitrary unit still
+/// orders threads correctly, and only the *reported* microseconds are wrong.
+fn slice_ticks_for(slice_us: u64) -> u64 {
+    tsc::from_micros(slice_us).unwrap_or(slice_us * 1000).max(1)
+}
+
+fn default_slice_ticks() -> u64 {
+    slice_ticks_for(DEFAULT_SLICE_US)
+}
+
+/// Creates a thread on `cpu` with an explicit scheduling class.
+///
+/// # Errors
+///
+/// As [`spawn_on`], plus [`SpawnError::RtOverCommitted`] if admitting a
+/// real-time thread would take the CPU past [`RT_UTILISATION_CAP`].
+pub fn spawn_on_with(
+    cpu: u32,
+    name: &'static str,
+    entry: extern "C" fn(u64) -> !,
+    argument: u64,
+    hhdm_base: u64,
+    options: SpawnOptions,
+) -> Result<u32, SpawnError> {
+    let SpawnOptions {
+        policy,
+        slice_us,
+        pinned,
+    } = options;
     if cpu as usize >= MAX_CPUS || cpu >= percpu::online_count() {
         return Err(SpawnError::NoSuchCpu(cpu));
     }
@@ -319,12 +703,28 @@ pub fn spawn_on(
     // The slot is reserved under the lock, but the stack is allocated *outside*
     // it. Allocation needs the heap, and holding a runqueue lock across it
     // would order the two locks the opposite way round from every other path.
-    let slot = {
+    let (slot, floor) = {
         let queue = QUEUES[cpu as usize].lock();
+
+        // Admission control, before anything is allocated. `docs/scheduler.md`
+        // §4: exceeding the cap must fail the request rather than hang the
+        // machine, because the capacity being protected is what an operator
+        // would need to *fix* an over-committed machine.
+        if let Policy::RealTime { utilisation, .. } = policy {
+            let admitted = queue.rt_utilisation();
+            if admitted + utilisation > RT_UTILISATION_CAP {
+                return Err(SpawnError::RtOverCommitted {
+                    cpu,
+                    admitted,
+                    requested: utilisation,
+                });
+            }
+        }
+
         let Some(slot) = (0..MAX_THREADS_PER_CPU).find(|&i| queue.threads[i].is_none()) else {
             return Err(SpawnError::QueueFull(cpu));
         };
-        slot
+        (slot, queue.min_vruntime)
     };
 
     // Globally unique, so no two threads on any CPU can share a stack. The +1
@@ -351,8 +751,21 @@ pub fn spawn_on(
         runs: 0,
         migrations: 0,
         held_locks: 0,
-        pinned: false,
+        pinned,
+        policy,
+        // Starting at the floor rather than at zero. A new thread with
+        // `vruntime` of zero is owed every microsecond the CPU has ever run,
+        // and would monopolise it until it caught up.
+        vruntime: floor,
+        deadline: 0,
+        slice_ticks: slice_ticks_for(slice_us),
+        cycles: 0,
+        last_start: 0,
     });
+    // Establishes the deadline from the vruntime and slice just set.
+    if let Some(thread) = queue.threads[slot].as_mut() {
+        thread.charge(0);
+    }
     Ok(id)
 }
 
@@ -390,6 +803,24 @@ pub fn spawn(
     }
 
     spawn_on(best as u32, name, entry, argument, hhdm_base)
+}
+
+/// Real CPU ticks a thread has consumed, if it still exists.
+///
+/// Real, not virtual: proportional-share testing needs the time actually
+/// spent, and `vruntime` is that number already divided by the weight the test
+/// is trying to verify.
+#[must_use]
+pub fn cycles_of(id: u32) -> Option<u64> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        if let Some(thread) = queue.threads.iter().flatten().find(|t| t.id == id) {
+            return Some(thread.cycles);
+        }
+    }
+    None
 }
 
 /// Moves one thread from a busier CPU's queue into `mine`, if that is worth
@@ -489,6 +920,45 @@ pub fn preempt() {
         return;
     }
 
+    // Never take the CPU away from a thread holding a spinlock.
+    //
+    // This is not an optimisation, it is what makes spinlocks work at all on
+    // one processor. A thread preempted while holding a lock can only release
+    // it by running again — and every other thread that wants that lock spins
+    // holding no lock of its own, so the scheduler sees nothing wrong and may
+    // keep choosing the spinner. On a single CPU that is a deadlock; on many
+    // it is a stall until the timing happens to break.
+    //
+    // `docs/architecture.md` §6 prefers per-CPU data and short critical
+    // sections precisely so that this window is small, but small is not zero.
+    // The lock ranks added at M4-08 already track what this CPU holds, so the
+    // check is a load and a comparison — the bookkeeping was already paid for.
+    //
+    // Skipping a preemption is harmless: this runs again on the next tick, and
+    // critical sections here are bounded and never sleep.
+    if crate::sync::held_mask() != 0 {
+        return;
+    }
+
+    // From here to the end of the switch, this must not be re-entered.
+    //
+    // `preempt` is reached two ways: from the timer interrupt, where delivery
+    // is already masked, and voluntarily through `yield_now` and `resched`,
+    // where it is not. On the voluntary path a tick landing between choosing
+    // the next thread and performing the switch re-enters this function on the
+    // same thread, which then switches using *its* decision — and the outer
+    // call resumes and switches again from stale state. The result was a
+    // corrupted interrupt frame and a #GP on `iretq`, a long way from the
+    // cause.
+    //
+    // Masking for the duration makes the decision and the switch one step. The
+    // window is a few hundred instructions and takes no lock that sleeps.
+    let interrupts_were_enabled = cpu::interrupts_enabled();
+    if interrupts_were_enabled {
+        // SAFETY: re-enabled below on every path out.
+        unsafe { cpu::disable_interrupts() };
+    }
+
     // The lock is taken, the decision made, and the lock *released* before the
     // switch. It has to be: the incoming thread will eventually return from
     // its own call to this function and take the same lock.
@@ -499,14 +969,34 @@ pub fn preempt() {
     // is a deadlock against itself.
     let switch = {
         let Some(mut queue) = QUEUES[cpu].try_lock() else {
+            restore_interrupts(interrupts_were_enabled);
             return;
         };
         if !queue.started {
+            restore_interrupts(interrupts_were_enabled);
             return;
         }
 
         let current = queue.current;
-        let mut next = queue.next_runnable(current);
+
+        // Account *before* deciding. The order matters more than it looks:
+        // this function returns early when the running thread is still the
+        // right choice, so charging afterwards means a thread that wins one
+        // comparison is never charged again -- its deadline freezes at the
+        // value that won, and it keeps winning for ever. That is not a
+        // fairness bug, it is a livelock, and it is what happened.
+        //
+        // `last_start` is reset whether or not a switch follows, so the next
+        // charge measures from here rather than double-counting this slice.
+        let now = tsc::read();
+        if let Some(thread) = queue.threads[current].as_mut() {
+            let delta = now.saturating_sub(thread.last_start);
+            thread.charge(delta);
+            thread.last_start = now;
+        }
+        queue.advance_min_vruntime();
+
+        let mut next = queue.pick_next(current);
         if next == current {
             // Nothing else here to run. This is the cheapest moment to
             // balance and the only one implemented: the CPU is about to have
@@ -514,7 +1004,10 @@ pub fn preempt() {
             // `docs/scheduler.md` §5 calls this the idle pull.
             match try_steal(cpu, &mut queue) {
                 Some(stolen) => next = stolen,
-                None => return,
+                None => {
+                    restore_interrupts(interrupts_were_enabled);
+                    return;
+                }
             }
         }
 
@@ -526,6 +1019,7 @@ pub fn preempt() {
         if let Some(thread) = queue.threads[next].as_mut() {
             thread.state = State::Running;
             thread.runs += 1;
+            thread.last_start = now;
         }
         queue.current = next;
 
@@ -555,12 +1049,14 @@ pub fn preempt() {
             .as_mut()
             .map(|thread| &raw mut thread.context)
         else {
+            restore_interrupts(interrupts_were_enabled);
             return;
         };
         let Some(to) = queue.threads[next]
             .as_ref()
             .map(|thread| &raw const thread.context)
         else {
+            restore_interrupts(interrupts_were_enabled);
             return;
         };
         Some((from, to))
@@ -581,10 +1077,42 @@ pub fn preempt() {
         // name the processor this thread used to be on.
         finish_switch();
     }
+
+    // The flag is a local on *this thread's* stack, so it travels with the
+    // thread rather than with the processor -- which is what makes it the
+    // right place to keep a value that must survive a switch.
+    restore_interrupts(interrupts_were_enabled);
+}
+
+/// Re-enables interrupts if they were enabled before a scheduler critical
+/// section masked them.
+fn restore_interrupts(were_enabled: bool) {
+    if were_enabled {
+        // SAFETY: restores the state the caller was already running with.
+        unsafe { cpu::enable_interrupts() };
+    }
 }
 
 /// Gives up the rest of this thread's slice.
 pub fn yield_now() {
+    preempt();
+}
+
+/// Hands the CPU to a higher-ranked thread if one has become runnable.
+///
+/// A voluntary preemption point, called after a wake. Without it a thread
+/// woken on this very CPU still waits for the next timer interrupt before it
+/// runs — which puts real-time wakeup latency at one tick, 10 ms at 100 Hz,
+/// against the 50 µs `docs/scheduler.md` §4 asks for. The tick is not a
+/// scheduling decision, it is a *backstop*; the moment a thread becomes
+/// runnable is when the decision should be taken.
+///
+/// Safe to call unconditionally: [`preempt`] returns without switching when
+/// the running thread is still the right choice, so a wake that changes
+/// nothing costs a lock and a comparison.
+///
+/// Must not be called with a lock held — it may switch.
+pub fn resched() {
     preempt();
 }
 
@@ -637,8 +1165,8 @@ pub fn cpu_of(id: u32) -> Option<u32> {
     None
 }
 
-/// Runs `f` for each live thread: `(cpu, id, name, state, runs, migrations)`.
-pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64)) {
+/// Runs `f` for each live thread: `(cpu, id, name, state, runs, migrations, class)`.
+pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64, &'static str)) {
     for (cpu, queue) in QUEUES
         .iter()
         .enumerate()
@@ -655,6 +1183,7 @@ pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64)) {
                 thread.state,
                 thread.runs,
                 thread.migrations,
+                thread.policy.tag(),
             );
         }
     }
@@ -712,6 +1241,16 @@ pub fn block_self() {
         return;
     }
 
+    // Same reasoning as `preempt`: choosing and switching must be one step
+    // with respect to the timer, or a tick landing in between re-enters the
+    // scheduler on this thread and both calls switch from their own stale
+    // view.
+    let interrupts_were_enabled = cpu::interrupts_enabled();
+    if interrupts_were_enabled {
+        // SAFETY: restored on every path out.
+        unsafe { cpu::disable_interrupts() };
+    }
+
     loop {
         let switch = {
             // `try_lock`, exactly as `preempt` does, and for a second reason
@@ -732,11 +1271,21 @@ pub fn block_self() {
                 // there is nothing to do.
                 _ => {
                     RACES.fetch_add(1, Ordering::Relaxed);
+                    restore_interrupts(interrupts_were_enabled);
                     return;
                 }
             }
 
-            let next = queue.next_runnable(current);
+            // Same ordering rule as `preempt`: charge, then decide.
+            let now = tsc::read();
+            if let Some(thread) = queue.threads[current].as_mut() {
+                let delta = now.saturating_sub(thread.last_start);
+                thread.charge(delta);
+                thread.last_start = now;
+            }
+            queue.advance_min_vruntime();
+
+            let next = queue.pick_next(current);
             if next == current {
                 // Nothing else this CPU can run. Falling through to spin is
                 // correct rather than merely expedient: the thread is blocked
@@ -749,6 +1298,7 @@ pub fn block_self() {
                 if let Some(thread) = queue.threads[next].as_mut() {
                     thread.state = State::Running;
                     thread.runs += 1;
+                    thread.last_start = now;
                 }
                 queue.current = next;
 
@@ -763,12 +1313,14 @@ pub fn block_self() {
                     .as_mut()
                     .map(|thread| &raw mut thread.context)
                 else {
+                    restore_interrupts(interrupts_were_enabled);
                     return;
                 };
                 let Some(to) = queue.threads[next]
                     .as_ref()
                     .map(|thread| &raw const thread.context)
                 else {
+                    restore_interrupts(interrupts_were_enabled);
                     return;
                 };
                 Some((from, to))
@@ -784,11 +1336,22 @@ pub fn block_self() {
                 // stops another CPU moving either out from under the switch.
                 unsafe { bhaskix_context_switch(from, to) };
                 finish_switch();
+                restore_interrupts(interrupts_were_enabled);
                 // Reached only when something made this thread runnable again:
-                // `next_runnable` never selects a blocked thread.
+                // `pick_next` never selects a blocked thread.
                 return;
             }
-            None => core::hint::spin_loop(),
+            None => {
+                // Nothing to run here. Interrupts must be *open* while
+                // waiting, or the tick that would make something runnable can
+                // never be delivered and this loop spins for ever.
+                restore_interrupts(interrupts_were_enabled);
+                core::hint::spin_loop();
+                if interrupts_were_enabled {
+                    // SAFETY: re-masking for the next pass, as at entry.
+                    unsafe { cpu::disable_interrupts() };
+                }
+            }
         }
     }
 }
@@ -822,9 +1385,19 @@ pub fn wake(id: u32) -> bool {
         // One queue lock at a time. Two would be two locks of the same rank,
         // which have no order relative to each other and could close a cycle.
         let mut queue = queue.lock();
+        let floor = queue.min_vruntime;
         for thread in queue.threads.iter_mut().flatten() {
             if thread.id == id && thread.state == State::Blocked {
                 thread.state = State::Ready;
+                // A thread that has slept has a `vruntime` frozen far behind
+                // the ones that stayed awake, and would monopolise the CPU
+                // until it caught up. Advance it to the floor -- it keeps its
+                // deadline advantage, which is what makes a woken interactive
+                // thread run *soon*, without also being owed a backlog.
+                if matches!(thread.policy, Policy::Fair { .. }) {
+                    thread.vruntime = thread.vruntime.max(floor);
+                    thread.charge(0);
+                }
                 WAKEUPS.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
@@ -855,23 +1428,50 @@ pub fn races() -> u64 {
 mod tests {
     use super::*;
 
-    /// A queue holding `states`, none pinned, with slot 0 as the pinned thread
+    fn thread(slot: usize, state: State, policy: Policy) -> Thread {
+        Thread {
+            id: slot as u32,
+            name: "t",
+            context: Context::new(),
+            state,
+            runs: 0,
+            migrations: 0,
+            held_locks: 0,
+            pinned: slot == 0,
+            policy,
+            vruntime: 0,
+            deadline: 0,
+            slice_ticks: 1,
+            cycles: 0,
+            last_start: 0,
+        }
+    }
+
+    /// A queue holding `states`, all fair, with slot 0 as the pinned thread
     /// every CPU has.
     fn with(states: &[State]) -> RunQueue {
         let mut queue = RunQueue::new();
         for (slot, state) in states.iter().enumerate() {
-            queue.threads[slot] = Some(Thread {
-                id: slot as u32,
-                name: "t",
-                context: Context::new(),
-                state: *state,
-                runs: 0,
-                migrations: 0,
-                held_locks: 0,
-                pinned: slot == 0,
-            });
+            queue.threads[slot] = Some(thread(slot, *state, Policy::fair()));
         }
         queue
+    }
+
+    /// A queue built from explicit classes, every thread `Ready`.
+    fn classes(policies: &[Policy]) -> RunQueue {
+        let mut queue = RunQueue::new();
+        for (slot, policy) in policies.iter().enumerate() {
+            queue.threads[slot] = Some(thread(slot, State::Ready, *policy));
+        }
+        queue
+    }
+
+    const fn rt(priority: u8, policy: RtPolicy) -> Policy {
+        Policy::RealTime {
+            priority,
+            policy,
+            utilisation: 10,
+        }
     }
 
     #[test]
@@ -937,5 +1537,210 @@ mod tests {
         assert_eq!(queue.free_slot(), Some(3));
         queue.threads[1] = None;
         assert_eq!(queue.free_slot(), Some(1));
+    }
+
+    #[test]
+    fn any_runnable_real_time_thread_beats_every_fair_one() {
+        // Strict priority between classes, `docs/scheduler.md` §2. Not a
+        // weighting -- there is no number of fair threads that outvotes one
+        // RT thread.
+        let queue = classes(&[Policy::fair(), Policy::fair(), rt(1, RtPolicy::RoundRobin)]);
+        assert_eq!(queue.pick_next(0), 2);
+        assert_eq!(queue.pick_next(1), 2);
+    }
+
+    #[test]
+    fn the_highest_real_time_priority_wins() {
+        let queue = classes(&[
+            rt(10, RtPolicy::RoundRobin),
+            rt(50, RtPolicy::RoundRobin),
+            rt(30, RtPolicy::RoundRobin),
+        ]);
+        assert_eq!(queue.pick_next(0), 1);
+        assert_eq!(queue.pick_next(2), 1);
+    }
+
+    #[test]
+    fn fifo_keeps_the_cpu_against_an_equal_priority() {
+        // The defining property of FIFO: it runs until it blocks or yields,
+        // and a peer of the same priority does not take it away.
+        let queue = classes(&[rt(20, RtPolicy::Fifo), rt(20, RtPolicy::Fifo)]);
+        assert_eq!(queue.pick_next(0), 0);
+        assert_eq!(queue.pick_next(1), 1);
+    }
+
+    #[test]
+    fn fifo_still_yields_to_a_strictly_higher_priority() {
+        // Otherwise "fixed priority" would not be fixed, and the latency
+        // guarantee for the higher thread would be unbounded.
+        let queue = classes(&[rt(20, RtPolicy::Fifo), rt(21, RtPolicy::Fifo)]);
+        assert_eq!(queue.pick_next(0), 1);
+    }
+
+    #[test]
+    fn round_robin_gives_way_to_an_equal_priority() {
+        // The one thing that separates RR from FIFO.
+        let queue = classes(&[rt(20, RtPolicy::RoundRobin), rt(20, RtPolicy::RoundRobin)]);
+        assert_eq!(queue.pick_next(0), 1);
+        assert_eq!(queue.pick_next(1), 0);
+    }
+
+    #[test]
+    fn fair_picks_the_earliest_virtual_deadline() {
+        let mut queue = classes(&[Policy::fair(), Policy::fair(), Policy::fair()]);
+        queue.threads[0].as_mut().unwrap().deadline = 300;
+        queue.threads[1].as_mut().unwrap().deadline = 100;
+        queue.threads[2].as_mut().unwrap().deadline = 200;
+        assert_eq!(queue.pick_next(0), 1);
+
+        // Still slot 1 while it holds the earliest deadline -- the running
+        // thread is not displaced merely for having run. Rotation comes from
+        // the deadline advancing as it consumes service, not from position,
+        // which is the difference between this and round-robin.
+        assert_eq!(queue.pick_next(1), 1);
+
+        queue.threads[1].as_mut().unwrap().deadline = 400;
+        assert_eq!(queue.pick_next(1), 2);
+    }
+
+    #[test]
+    fn a_shorter_slice_earns_an_earlier_deadline_at_equal_weight() {
+        // This is what a virtual deadline buys over picking the smallest
+        // vruntime: two threads with the same share, but the one asking for a
+        // short slice is chosen first and so runs sooner and more often. It is
+        // how a latency-sensitive thread declares itself instead of being
+        // guessed at from its sleep pattern.
+        let mut queue = classes(&[Policy::fair(), Policy::fair()]);
+        for slot in 0..2 {
+            let thread = queue.threads[slot].as_mut().unwrap();
+            thread.vruntime = 1_000;
+            thread.slice_ticks = if slot == 0 { 10_000 } else { 100 };
+            thread.charge(0);
+        }
+        assert!(
+            queue.threads[1].as_ref().unwrap().deadline
+                < queue.threads[0].as_ref().unwrap().deadline
+        );
+        assert_eq!(queue.pick_next(0), 1);
+    }
+
+    #[test]
+    fn weight_scales_virtual_time_inversely() {
+        // Twice the weight must accrue vruntime half as fast, because that is
+        // the entire mechanism by which it receives twice the CPU.
+        let mut light = thread(1, State::Ready, Policy::Fair { weight: 1024 });
+        let mut heavy = thread(2, State::Ready, Policy::Fair { weight: 2048 });
+        light.charge(1_000);
+        heavy.charge(1_000);
+        assert_eq!(light.vruntime, 1_000);
+        assert_eq!(heavy.vruntime, 500);
+        assert_eq!(light.cycles, heavy.cycles, "real time charged is the same");
+    }
+
+    #[test]
+    fn idle_runs_only_when_nothing_else_can() {
+        let mut queue = classes(&[Policy::Idle, Policy::fair()]);
+        assert_eq!(queue.pick_next(0), 1);
+        queue.threads[1].as_mut().unwrap().state = State::Blocked;
+        assert_eq!(
+            queue.pick_next(0),
+            0,
+            "idle is the last resort, not the first"
+        );
+    }
+
+    #[test]
+    fn a_blocked_thread_is_never_picked_whatever_its_class() {
+        // Including the highest real-time priority: blocked outranks class.
+        let mut queue = classes(&[Policy::fair(), rt(99, RtPolicy::Fifo)]);
+        queue.threads[1].as_mut().unwrap().state = State::Blocked;
+        assert_eq!(queue.pick_next(0), 0);
+    }
+
+    #[test]
+    fn real_time_threads_are_never_stolen() {
+        // Admission control is per-CPU, so migrating an RT thread invalidates
+        // the budget at both ends.
+        let mut queue = classes(&[Policy::Idle, rt(50, RtPolicy::Fifo), rt(60, RtPolicy::Fifo)]);
+        assert_eq!(queue.steal_candidate(0), None);
+        queue.threads[2] = Some(thread(2, State::Ready, Policy::fair()));
+        assert_eq!(
+            queue.steal_candidate(0),
+            Some(2),
+            "a fair thread still moves"
+        );
+    }
+
+    #[test]
+    fn admitted_utilisation_sums_only_live_real_time_threads() {
+        let mut queue = classes(&[
+            Policy::fair(),
+            rt(10, RtPolicy::Fifo),
+            rt(20, RtPolicy::Fifo),
+        ]);
+        assert_eq!(queue.rt_utilisation(), 20);
+        queue.threads[2].as_mut().unwrap().state = State::Finished;
+        assert_eq!(
+            queue.rt_utilisation(),
+            10,
+            "a finished thread releases its budget"
+        );
+    }
+
+    #[test]
+    fn the_virtual_clock_never_runs_backwards() {
+        // The bug this exists to prevent: a thread that sleeps far more than
+        // it runs keeps a low `vruntime`, and a floor taken as the live
+        // minimum would follow it down -- handing it unbounded credit and
+        // starving anything CPU-bound. Four such threads did exactly that.
+        let mut queue = classes(&[Policy::fair(), Policy::fair()]);
+        queue.threads[0].as_mut().unwrap().vruntime = 900;
+        queue.threads[1].as_mut().unwrap().vruntime = 900;
+        queue.advance_min_vruntime();
+        assert_eq!(queue.min_vruntime, 900);
+
+        // A sleeper rejoins with a stale, much lower virtual time.
+        queue.threads[1].as_mut().unwrap().vruntime = 5;
+        queue.advance_min_vruntime();
+        assert_eq!(queue.min_vruntime, 900, "the floor must not follow it down");
+    }
+
+    #[test]
+    fn a_thread_cannot_run_unboundedly_far_ahead() {
+        // Without this bound a thread that ran alone is so far ahead in
+        // virtual time that a group of short-lived threads never lets it run
+        // again -- which is starvation that looks exactly like a hang.
+        let mut queue = classes(&[Policy::fair(), Policy::fair()]);
+        queue.threads[0].as_mut().unwrap().slice_ticks = 100;
+        queue.threads[1].as_mut().unwrap().slice_ticks = 100;
+        queue.threads[0].as_mut().unwrap().vruntime = 1_000_000;
+        queue.threads[1].as_mut().unwrap().vruntime = 0;
+
+        queue.advance_min_vruntime();
+
+        let ceiling = 100 * MAX_VRUNTIME_LEAD_SLICES;
+        assert_eq!(queue.min_vruntime, 0);
+        assert_eq!(
+            queue.threads[0].as_ref().unwrap().vruntime,
+            ceiling,
+            "the runaway thread is pulled back to the ceiling"
+        );
+        assert_eq!(
+            queue.threads[1].as_ref().unwrap().vruntime,
+            0,
+            "a thread inside the bound is untouched"
+        );
+    }
+
+    #[test]
+    fn the_vruntime_floor_ignores_threads_that_cannot_run() {
+        // The floor exists to stop a waking thread monopolising the CPU. Taking
+        // it from a blocked thread would set it to that thread's stale value
+        // and defeat the purpose.
+        let mut queue = classes(&[Policy::fair(), Policy::fair()]);
+        queue.threads[0].as_mut().unwrap().vruntime = 500;
+        queue.threads[1].as_mut().unwrap().vruntime = 10;
+        queue.threads[1].as_mut().unwrap().state = State::Blocked;
+        assert_eq!(queue.min_fair_vruntime(), 500);
     }
 }

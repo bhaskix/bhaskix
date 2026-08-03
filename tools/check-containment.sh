@@ -61,6 +61,30 @@ fi
 
 # --- 3. SPDX headers ------------------------------------------------------
 
+# Git history is the part that cannot be fixed later. A file can be edited; a
+# commit message, an author field, a tag or a branch name that has been pushed
+# to a public repository is permanent, mirrored, and indexed. So the whole
+# history is checked on every run, not just the working tree.
+history=$(
+    {
+        git log --all --format='%s%n%b%n%an%n%ae%n%cn%n%ce' 2>/dev/null
+        git tag -l 2>/dev/null
+        git tag -l --format='%(contents)' 2>/dev/null
+        git for-each-ref --format='%(refname)' 2>/dev/null
+    } | grep -niE "$PATTERN" || true
+)
+
+if [[ -n "$history" ]]; then
+    fail "vendor strings found in git history (commit messages, authors, refs)"
+    echo "$history" | head -20 | sed 's/^/          /' >&2
+    echo "        History cannot be edited after a public push. If this is a" >&2
+    echo "        local-only commit, rewrite it now; if it is already pushed," >&2
+    echo "        the repository has to be rewritten and force-pushed." >&2
+    status=1
+else
+    pass "no vendor strings in git history"
+fi
+
 missing=$(git ls-files '*.rs' '*.sh' '*.py' 2>/dev/null | while read -r f; do
     [[ -f "$f" ]] || continue
     head -3 "$f" | grep -q 'SPDX-License-Identifier: Apache-2.0' || echo "$f"

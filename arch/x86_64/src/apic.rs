@@ -280,6 +280,9 @@ unsafe fn calibrate() -> Result<u32, ApicError> {
     const CALIBRATION_MS: u32 = 50;
     const PIT_COUNT: u32 = PIT_FREQUENCY / (1000 / CALIBRATION_MS);
 
+    let tsc_start: u64;
+    let tsc_elapsed: u64;
+
     let pit_control: Port<u8> = Port::new(0x43);
     let pit_channel2: Port<u8> = Port::new(0x42);
     let speaker_gate: Port<u8> = Port::new(0x61);
@@ -309,6 +312,11 @@ unsafe fn calibrate() -> Result<u32, ApicError> {
         write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
         write(REG_TIMER_INITIAL, u32::MAX);
 
+        // The same window measures the time-stamp counter. Opening a second
+        // one would mean programming the PIT twice and adding 50 ms to every
+        // boot for a number this window already contains.
+        tsc_start = crate::tsc::read();
+
         // Poll the PIT output bit. Bounded, so a machine whose PIT never
         // asserts fails calibration instead of hanging the boot -- the same
         // rule the serial driver follows.
@@ -324,10 +332,19 @@ unsafe fn calibrate() -> Result<u32, ApicError> {
         }
 
         let remaining = read(REG_TIMER_CURRENT);
+        tsc_elapsed = crate::tsc::read().saturating_sub(tsc_start);
         write(REG_LVT_TIMER, LVT_MASKED);
 
         u32::MAX - remaining
     };
+
+    // Scale to a second. Published only if plausible: real parts run between
+    // roughly 100 MHz and 10 GHz, and a scheduler accounting slices against a
+    // wrong rate is worse than one that reports it has no clock.
+    let tsc_hertz = (tsc_elapsed).saturating_mul(u64::from(1000 / CALIBRATION_MS));
+    if (100_000_000..=10_000_000_000).contains(&tsc_hertz) {
+        crate::tsc::set_hertz(tsc_hertz);
+    }
 
     // Scale the measurement up to a full second, accounting for the divisor.
     let ticks_per_second = (elapsed as u64)

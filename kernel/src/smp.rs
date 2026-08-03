@@ -69,7 +69,9 @@ extern "C" fn secondary_main(lapic_id: u32) -> ! {
         // This CPU's runqueue, with the code currently executing as its first
         // thread -- otherwise the first preemption would have nowhere to save
         // the context it is running on.
-        crate::sched::init_cpu("idle");
+        // The idle class, so this thread runs only when the CPU has nothing
+        // else at all -- including nothing stolen from a busier processor.
+        crate::sched::init_cpu("idle", crate::sched::Policy::Idle);
 
         // Its own timer. The tick rate was calibrated once by the bootstrap
         // CPU and applies here unchanged; what is per-CPU is the timer itself,

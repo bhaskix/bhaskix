@@ -99,7 +99,11 @@ impl Context {
             // itself but the trampoline, which puts the argument where the ABI
             // wants it before calling through.
             sp -= 8;
-            (sp as *mut u64).write(bhaskix_thread_trampoline as usize as u64);
+            // Via `*const ()`: casting a function *item* straight to an
+            // integer is rejected as of Rust 1.97, because the item type is
+            // zero-sized and the cast reads as a value conversion when it is
+            // really taking an address.
+            (sp as *mut u64).write(bhaskix_thread_trampoline as *const () as usize as u64);
 
             // The six callee-saved registers, in the order `switch` pops them:
             // r15, r14, r13, r12, rbx, rbp -- so they are written in reverse.

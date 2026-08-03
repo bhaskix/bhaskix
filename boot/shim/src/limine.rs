@@ -401,7 +401,7 @@ fn start_secondaries(entry: extern "C" fn(u32) -> !) -> u32 {
         unsafe {
             (&raw mut info.goto_address)
                 .cast::<u64>()
-                .write_volatile(secondary_trampoline as usize as u64);
+                .write_volatile(secondary_trampoline as *const () as u64);
         }
         started += 1;
     }

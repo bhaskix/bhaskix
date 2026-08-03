@@ -47,10 +47,12 @@ stealing is the design that works; we start there rather than migrating later.
 > thread is *owned* by the CPU whose queue holds it. That ownership is what makes the switch path
 > sound on more than one processor: a CPU takes raw pointers to contexts in its own queue only, so
 > there is no cross-CPU sharing to race against rather than a race that is prevented. What exists is
-> a single round-robin list per CPU, not the four classes above — no RT, no Fair tree, no Batch.
-> Idle pull (§5.2) landed at M4-06b; the rest of §5 is unbuilt. Threads can block and be woken as
-> of M4-09, but a cross-CPU wake does not send a reschedule IPI, so the woken thread waits for the
-> target CPU's next tick — up to 10 ms, against the §4 target of 50 µs.
+> the RT and Fair classes in strict priority with an Idle class beneath them, as of M4-07 — but no
+> Batch class, and Fair is a linear scan over a fixed array rather than an augmented tree, because
+> at eight threads per CPU an `O(n)` scan beats an `O(log n)` structure that would have to allocate.
+> Idle pull (§5.2) landed at M4-06b; the rest of §5 is unbuilt. Threads block and wake as of M4-09.
+> A wake on the *waking* CPU hands over immediately; a wake to another CPU sends no IPI, so it waits
+> for that CPU's next tick — up to 10 ms, against the §4 target of 50 µs.
 
 ### Strict class priority
 
@@ -89,6 +91,26 @@ of thing that works on the developer's machine and fails in production.
 Ordering structure: an augmented red-black tree keyed by deadline, with min-lag tracking. `O(log n)`
 pick, `O(log n)` insert.
 
+> **Implemented, in part, as of M4-07.** `vruntime` and `deadline` exist and behave as described:
+> service is scaled by weight, the earliest deadline runs, and a thread asking for a *shorter* slice
+> earns an earlier deadline and so runs sooner and more often for the same total share — which is
+> the property that distinguishes this from picking the smallest `vruntime`, and it is unit-tested.
+> Measured weight ratio at 3:1 is 2.7x–3.1x on an emulated four-CPU machine.
+>
+> **`lag` is not implemented, and eligibility with it.** In its place is a cruder bound: a thread may
+> not get more than eight slices of virtual time ahead of its runqueue's clock. That bound is not
+> tidiness — proportional share alone has no limit on the lead, and a thread that once ran alone can
+> be so far ahead that a group of threads which each run for microseconds before blocking never lets
+> it run again. It presented as a hung machine.
+>
+> **No red-black tree, deliberately.** With `MAX_THREADS_PER_CPU = 8` a linear scan is faster than a
+> tree and allocates nothing, which the switch path requires. The tree becomes right when the queue
+> becomes heap-backed; until then it would be cost with no benefit.
+>
+> **No domain level.** §3's two-level runqueue needs domains, which arrive in M5. Fairness today is
+> between threads only, so a domain that spawns more threads still gets more CPU — exactly what the
+> two-level structure exists to prevent.
+
 ### Domain-level fairness
 
 Threads do not compete directly across domain boundaries. The runqueue is **two-level**:
@@ -123,6 +145,21 @@ first-class concept, not an add-on.
 highest-priority RT thread on an otherwise busy machine, target < 50 µs at the 99.9th percentile.
 The QEMU test suite measures this on every PR and fails on regression. A number nobody measures is
 a number nobody meets.
+
+> **Implemented, and over budget, as of M4-07.** Fixed priorities, `FIFO` and `RR`, and admission
+> control at 95% are all in and unit-tested; a request that would exceed the cap is refused rather
+> than accepted and then missed. Real-time threads are also excluded from work stealing, because
+> admission control is per-CPU and migrating one invalidates the budget at both ends.
+>
+> **Measured worst-case wakeup-to-run is 120–500 µs**, against the 50 µs target — reported at every
+> boot rather than quietly omitted. Two known reasons, in order of size: this is QEMU's TCG
+> interpreter on a shared build machine, which is not a latency measurement of anything real; and a
+> wake to a *different* CPU still waits for that CPU's tick because there is no reschedule IPI
+> (M4-09b). The figure is recorded as a regression baseline, not as a claim to have met the budget.
+>
+> **Priority inheritance is not implemented**, so the §4 statement that its absence makes the
+> latency bound a lie currently applies. It needs a lock that has an owner and can sleep; the
+> spinlocks here have neither.
 
 ---
 

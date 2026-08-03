@@ -36,6 +36,16 @@ QEMU_CPU     ?= max
 # Kernel command line baked into the image. Used by the fault-injection tests
 # to select which exception to trigger; empty for a normal boot.
 CMDLINE      ?=
+
+# The kernel command line is baked into the ISO, so the ISO has to depend on
+# it. It did not, and the consequence was quiet: `make iso CMDLINE=...` with an
+# unchanged kernel left the *previous* image in place, so every fault-injection
+# case after the first booted the case before it. Different subsets failed on
+# different runs, which reads as flakiness rather than as a stale artefact.
+#
+# The stamp is rewritten only when the value actually changes, so this forces a
+# rebuild exactly when it should and never otherwise.
+CMDLINE_STAMP := build/.cmdline
 QEMU_COMMON  := -M q35 -cpu $(QEMU_CPU) -m $(QEMU_MEM) -no-reboot -no-shutdown
 
 # OVMF ships as a CODE/VARS pair that must be size-matched -- a 4 MB CODE with
@@ -50,7 +60,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: all kernel iso run run-uefi test test-host test-boot test-boot-uefi \
+.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi \
         test-faults fmt clippy gates clean distclean help
 
 all: iso
@@ -66,7 +76,13 @@ iso: $(ISO)
 # time rather than when make believes the ELF changed. Regenerating costs under
 # a second; testing a stale image costs an afternoon of chasing a bug that was
 # already fixed. In kernel work that trade is not close.
-$(ISO): kernel boot/limine.conf | $(LIMINE_DIR)
+$(CMDLINE_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(CMDLINE)' | cmp -s - $@ || printf '%s\n' '$(CMDLINE)' > $@
+
+FORCE:
+
+$(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) | $(LIMINE_DIR)
 	@rm -rf $(ISO_ROOT)
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/bhaskix
