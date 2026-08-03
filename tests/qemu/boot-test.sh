@@ -39,24 +39,59 @@ QEMU_ARGS=(-M q35 -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom "$ISO" -boot d
            -serial "file:$LOG" -display none)
 
 if [[ "$MODE" == "uefi" ]]; then
+    # OVMF ships as a CODE/VARS *pair* and they must be searched as one.
+    #
+    # An earlier version looked for each independently, which broke on
+    # distributions that ship only the 4 MB variant: CODE was found, VARS was
+    # not, and QEMU was handed `-drive file=<nonexistent>`. It exited before
+    # producing a byte of output, so the failure looked like a kernel that
+    # would not boot.
+    #
+    # The two images must also be the same size -- a 4 MB CODE with a 2 MB VARS
+    # is rejected by the firmware, not by QEMU, which is a worse place to find
+    # out. Hence pairs, in preference order, newest layout first.
     OVMF_CODE=""
-    for candidate in /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd \
-                     /usr/share/edk2/ovmf/OVMF_CODE.fd; do
-        [[ -f "$candidate" ]] && { OVMF_CODE="$candidate"; break; }
+    OVMF_VARS=""
+    for pair in \
+        "/usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd" \
+        "/usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd" \
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd" \
+        "/usr/share/qemu/OVMF_CODE.fd:/usr/share/qemu/OVMF_VARS.fd"
+    do
+        code="${pair%%:*}"
+        vars="${pair##*:}"
+        if [[ -f "$code" && -f "$vars" ]]; then
+            OVMF_CODE="$code"
+            OVMF_VARS="$vars"
+            break
+        fi
     done
+
     if [[ -z "$OVMF_CODE" ]]; then
-        # Skip rather than fail: a machine without OVMF can still validate the
-        # BIOS path, and pretending otherwise would make CI red for a missing
-        # package rather than a broken kernel.
+        # Distinguish "not installed" from "installed but unusable". The first
+        # is a fine reason to skip; the second is a broken environment and
+        # skipping would hide it.
+        if compgen -G "/usr/share/OVMF/*.fd" >/dev/null 2>&1 \
+           || compgen -G "/usr/share/edk2/ovmf/*.fd" >/dev/null 2>&1; then
+            fail "OVMF is installed but no complete CODE/VARS pair was found"
+            echo "        images present:" >&2
+            ls -1 /usr/share/OVMF/*.fd /usr/share/edk2/ovmf/*.fd 2>/dev/null | sed 's/^/          /' >&2
+            exit 1
+        fi
         printf '\033[1;33mskip\033[0m  uefi boot test (OVMF not installed)\n'
         exit 0
     fi
-    VARS="$REPO_ROOT/build/OVMF_VARS_test.fd"
-    for candidate in /usr/share/OVMF/OVMF_VARS.fd /usr/share/edk2/ovmf/OVMF_VARS.fd; do
-        [[ -f "$candidate" ]] && { cp "$candidate" "$VARS"; break; }
-    done
+
+    echo "using firmware: $(basename "$OVMF_CODE") + $(basename "$OVMF_VARS")"
+
+    # VARS is writable, so it must be a private copy rather than the packaged
+    # image -- the firmware writes its variable store on every boot.
+    mkdir -p "$REPO_ROOT/build"
+    WRITABLE_VARS="$REPO_ROOT/build/OVMF_VARS_${MODE}.fd"
+    cp "$OVMF_VARS" "$WRITABLE_VARS"
+
     QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE"
-                -drive "if=pflash,unit=1,format=raw,file=$VARS")
+                -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS")
 fi
 
 echo "booting ($MODE), timeout ${TIMEOUT}s..."

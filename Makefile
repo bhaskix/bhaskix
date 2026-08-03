@@ -38,11 +38,17 @@ QEMU_CPU     ?= max
 CMDLINE      ?=
 QEMU_COMMON  := -M q35 -cpu $(QEMU_CPU) -m $(QEMU_MEM) -no-reboot -no-shutdown
 
-OVMF_CODE    := $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE.fd \
-                                       /usr/share/ovmf/OVMF.fd \
-                                       /usr/share/edk2/ovmf/OVMF_CODE.fd))
-OVMF_VARS    := $(firstword $(wildcard /usr/share/OVMF/OVMF_VARS.fd \
-                                       /usr/share/edk2/ovmf/OVMF_VARS.fd))
+# OVMF ships as a CODE/VARS pair that must be size-matched -- a 4 MB CODE with
+# a 2 MB VARS is rejected by the firmware, not by QEMU. Selected as a pair for
+# the same reason tests/qemu/boot-test.sh does: searching independently finds a
+# CODE on distributions that ship only the 4 MB layout, finds no VARS, and
+# hands QEMU a nonexistent file.
+OVMF_DIR     := $(dir $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd \
+                                             /usr/share/OVMF/OVMF_CODE.fd \
+                                             /usr/share/edk2/ovmf/OVMF_CODE.fd)))
+OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
+OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
+OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: all kernel iso run run-uefi test test-host test-boot test-boot-uefi \
         test-faults fmt clippy gates clean distclean help
@@ -88,7 +94,9 @@ run: $(ISO)
 	$(QEMU) $(QEMU_COMMON) -cdrom $(ISO) -boot d -serial stdio
 
 run-uefi: $(ISO)
-	@test -n "$(OVMF_CODE)" || { echo "OVMF not found; install the 'ovmf' package" >&2; exit 1; }
+	@test -n "$(OVMF_CODE)" -a -n "$(OVMF_VARS)" || \
+	    { echo "no complete OVMF CODE/VARS pair; install the 'ovmf' package" >&2; exit 1; }
+	@echo "firmware: $(notdir $(OVMF_CODE)) + $(notdir $(OVMF_VARS))"
 	@mkdir -p build
 	@cp $(OVMF_VARS) build/OVMF_VARS.fd
 	$(QEMU) $(QEMU_COMMON) \
