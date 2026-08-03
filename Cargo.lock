@@ -25,4 +25,12 @@ version = "0.0.0"
 dependencies = [
  "bhaskix-arch-x86-64",
  "bhaskix-boot",
+ "bhaskix-mm",
+]
+
+[[package]]
+name = "bhaskix-mm"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-boot",
 ]

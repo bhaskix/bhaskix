@@ -78,7 +78,7 @@ for fault in "${FAULTS[@]}"; do
   log="$(mktemp)"
   qemu_log="$(mktemp)"
   timeout "$TIMEOUT" qemu-system-x86_64 \
-      -M q35 -m 256M -no-reboot -cdrom build/bhaskix.iso -boot d \
+      -M q35 -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom build/bhaskix.iso -boot d \
       -serial "file:$log" -display none \
       -d cpu_reset -D "$qemu_log" >/dev/null 2>&1
 

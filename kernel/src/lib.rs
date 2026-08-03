@@ -62,6 +62,34 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
     println!("  cpu");
     println!("    gdt + tss      loaded (double fault and NMI on dedicated stacks)");
     println!("    idt            loaded (256 vectors)");
+    report_cpu_features();
+
+    // Interrupts. Everything up to this point ran with delivery disabled, so
+    // this is the first time the kernel is re-entered asynchronously.
+    //
+    // The bump allocator exists only to back the one page table this may need
+    // to build, on hardware without x2APIC. It is dropped immediately after.
+    let mut frames = bhaskix_mm::BumpAllocator::new(handoff);
+
+    // SAFETY: bootstrap CPU, called once, IDT loaded, interrupts still
+    // disabled -- exactly what `enable` requires.
+    match unsafe { trap::enable(handoff.hhdm_base, &mut frames) } {
+        Ok(frequency) => {
+            println!(
+                "    local apic     enabled, timer calibrated to {}.{:03} MHz",
+                frequency / 1_000_000,
+                (frequency / 1000) % 1000
+            );
+            println!("    interrupts     ENABLED, timer at {} Hz", trap::TIMER_HZ);
+            verify_timer();
+        }
+        Err(error) => {
+            // Not fatal. A kernel with no clock cannot schedule, but it can
+            // still report why -- which is more useful than halting.
+            println!("    interrupts     UNAVAILABLE: {error:?}");
+            println!("                   continuing without a timer");
+        }
+    }
     println!();
 
     if let Err(error) = handoff.validate() {
@@ -101,6 +129,80 @@ fn banner() {
     println!("  Hello from Bhaskix");
     println!("  version {VERSION} -- x86_64 -- Apache-2.0");
     println!();
+}
+
+/// Reports the hardware features the security model depends on.
+///
+/// Printed rather than assumed. `docs/security.md` §4 treats several of these
+/// as load-bearing, and an operator should be able to see on the console which
+/// guarantees the machine in front of them can actually provide.
+fn report_cpu_features() {
+    let f = bhaskix_arch::msr::features();
+    let mark = |present: bool| if present { "yes" } else { " NO" };
+
+    println!(
+        "    features       apic {}  x2apic {}  nx {}  smep {}  smap {}",
+        mark(f.apic),
+        mark(f.x2apic),
+        mark(f.nx),
+        mark(f.smep),
+        mark(f.smap)
+    );
+    let l1 = bhaskix_arch::msr::cpuid(1);
+    println!(
+        "    cpuid.1        ecx {:#010x}  edx {:#010x}",
+        l1.ecx, l1.edx
+    );
+    println!(
+        "                   umip {}  la57 {}  invariant-tsc {}",
+        mark(f.umip),
+        mark(f.la57),
+        mark(f.invariant_tsc)
+    );
+}
+
+/// Confirms timer interrupts are actually being delivered.
+///
+/// Two separate checks, because they can fail independently and the
+/// distinction matters when debugging:
+///
+/// 1. **Delivery** — poll the tick counter. Bounded, so a timer that never
+///    fires reports a dead timer rather than hanging the boot.
+/// 2. **Wakeup** — `hlt` and confirm an interrupt resumes execution. This is
+///    what the idle path in M4 depends on, and it is worth knowing now
+///    whether it works. Only attempted once delivery is proven, because
+///    halting on a machine whose timer is dead would hang forever.
+fn verify_timer() {
+    const TARGET_TICKS: u64 = 5;
+    // Generous: enough that a slow emulator still reaches the target, small
+    // enough that a dead timer is reported in well under a second.
+    const SPIN_LIMIT: u64 = 500_000_000;
+
+    let mut spins = 0u64;
+    while trap::ticks() < TARGET_TICKS && spins < SPIN_LIMIT {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+
+    if trap::ticks() < TARGET_TICKS {
+        println!("    timer          NO TICKS -- interrupts are not being delivered");
+        return;
+    }
+    println!(
+        "    timer          delivering ({} ticks observed)",
+        trap::ticks()
+    );
+
+    let before = trap::ticks();
+    // SAFETY: interrupts are enabled and the timer has been observed
+    // delivering, so this halt is guaranteed to be woken. Halting with a dead
+    // timer would hang, which is why the delivery check runs first.
+    unsafe { cpu::halt() };
+    if trap::ticks() > before {
+        println!("    timer          hlt wakes on interrupt (idle path works)");
+    } else {
+        println!("    timer          WARNING: hlt returned without a tick");
+    }
 }
 
 fn report_boot_state(handoff: &Handoff, serial: bool, framebuffer: bool) {

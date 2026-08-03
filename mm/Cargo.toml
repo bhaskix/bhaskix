@@ -1,0 +1,24 @@
+[package]
+name = "bhaskix-mm"
+description = "Memory management for Bhaskix. At M2, the boot-time bump allocator only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_mm"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-boot = { path = "../boot/handoff" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# The bump allocator is pure arithmetic over the memory map and needs no
+# `unsafe` at all. That changes in M3, when frames are handed out and written.
+unsafe_budget = 0

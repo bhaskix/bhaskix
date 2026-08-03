@@ -27,10 +27,16 @@ LIMINE_DIR   := boot/limine/limine
 # memory-map output stays readable.
 QEMU_MEM     ?= 256M
 
+# QEMU's default `qemu64` model predates x2APIC (2008) and SMEP, so it does not
+# represent any machine Bhaskix targets. `max` exposes everything the host and
+# TCG can offer, which is what a modern kernel should be developed against.
+# Override to qemu64 to exercise the degraded no-x2APIC path.
+QEMU_CPU     ?= max
+
 # Kernel command line baked into the image. Used by the fault-injection tests
 # to select which exception to trigger; empty for a normal boot.
 CMDLINE      ?=
-QEMU_COMMON  := -M q35 -m $(QEMU_MEM) -no-reboot -no-shutdown
+QEMU_COMMON  := -M q35 -cpu $(QEMU_CPU) -m $(QEMU_MEM) -no-reboot -no-shutdown
 
 OVMF_CODE    := $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE.fd \
                                        /usr/share/ovmf/OVMF.fd \
@@ -101,7 +107,7 @@ test: fmt clippy test-host gates test-boot test-boot-uefi test-faults
 # Host unit tests. The overridden --target is what takes these off the
 # freestanding target and onto something that can run a test harness.
 test-host:
-	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-boot -p bhaskix-kernel
+	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-boot -p bhaskix-kernel -p bhaskix-mm
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios
@@ -123,7 +129,7 @@ fmt:
 clippy:
 	$(CARGO) clippy --profile $(PROFILE) --target $(TARGET) --lib --bins -- -D warnings
 	$(CARGO) clippy --target $(HOST_TARGET) --all-targets \
-	    -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -- -D warnings
+	    -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm -- -D warnings
 
 # The project-specific invariants from docs/. Each one is cheap and catches a
 # class of mistake that review reliably misses.

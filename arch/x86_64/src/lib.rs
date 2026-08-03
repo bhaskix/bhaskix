@@ -12,10 +12,14 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod apic;
 pub mod cell;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
+pub mod msr;
+pub mod paging;
+pub mod pic;
 pub mod port;
 pub mod serial;
 pub mod trap;

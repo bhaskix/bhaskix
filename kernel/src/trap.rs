@@ -16,15 +16,112 @@
 //! stack overflow. Each of those is a question someone would otherwise have to
 //! answer by hand, from a photograph of a screen.
 
-use bhaskix_arch::cpu;
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use bhaskix_arch::idt::{exception_name, has_error_code};
 use bhaskix_arch::trap::TrapFrame;
+use bhaskix_arch::{apic, cpu, msr, paging, pic};
+use bhaskix_boot::{PhysAddr, VirtAddr};
+use bhaskix_mm::BumpAllocator;
 
 use crate::println;
+
+/// Timer ticks since interrupts were enabled.
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Timer interrupts per second.
+///
+/// 100 Hz is deliberately unambitious. It is frequent enough to prove
+/// delivery works and to drive a coarse clock, and slow enough that a bug in
+/// the handler is visible as a stall rather than as a livelock the machine
+/// cannot be interrupted out of. The tickless design in
+/// `docs/scheduler.md` §7 replaces this entirely in M4.
+pub const TIMER_HZ: u32 = 100;
 
 /// Registers this module as the architecture's trap handler.
 pub fn init() {
     bhaskix_arch::trap::set_handler(handle);
+}
+
+/// Timer ticks observed so far.
+#[must_use]
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// Why interrupt bring-up failed.
+#[derive(Clone, Copy, Debug)]
+pub enum InterruptError {
+    /// The CPU reports no Local APIC.
+    NoLocalApic,
+    /// The APIC timer frequency could not be measured.
+    CalibrationFailed,
+    /// The CPU has only xAPIC, and its register page could not be mapped.
+    MapFailed(paging::MapError),
+}
+
+/// Masks the legacy PIC, brings up the Local APIC, and enables interrupts.
+///
+/// Returns the measured APIC timer frequency in hertz.
+///
+/// # Errors
+///
+/// Returns [`InterruptError`] if the CPU has no Local APIC or its timer could
+/// not be calibrated. In either case interrupts are left disabled, which is
+/// survivable — the kernel simply has no clock yet.
+///
+/// # Safety
+///
+/// Must be called once, on the bootstrap CPU, after the IDT is loaded and
+/// while interrupts are still disabled. `hhdm_base` must be the higher-half
+/// direct map base from the boot handoff.
+pub unsafe fn enable(
+    hhdm_base: VirtAddr,
+    frames: &mut BumpAllocator,
+) -> Result<u32, InterruptError> {
+    // SAFETY: single-threaded boot with interrupts disabled, per the contract.
+    unsafe {
+        // The PIC first, and remapped rather than merely masked: a masked PIC
+        // can still deliver spurious interrupts, and unremapped those land on
+        // exception vectors (see `arch::pic`).
+        pic::remap_and_mask();
+
+        if !msr::has_local_apic() {
+            return Err(InterruptError::NoLocalApic);
+        }
+
+        // x2APIC needs no mapping at all. xAPIC does, and the bootloader's
+        // direct map does not cover it -- it maps RAM, and the APIC is not
+        // RAM. So on those machines, map the one page it needs.
+        //
+        // This is the only mapping the kernel creates before M3, and it is
+        // created here rather than in `arch` because only the kernel knows
+        // where physical memory is mapped.
+        let mapped = if apic::has_x2apic() {
+            None
+        } else {
+            let physical = apic::physical_base();
+            let virtual_address = PhysAddr(physical).to_hhdm(hhdm_base).as_u64();
+
+            paging::map_device_page(virtual_address, physical, hhdm_base.as_u64(), &mut || {
+                frames.allocate_frame().ok().map(|f| f.as_u64())
+            })
+            .map_err(InterruptError::MapFailed)?;
+
+            Some(virtual_address as *mut u8)
+        };
+
+        let frequency = apic::init(mapped).map_err(|error| match error {
+            apic::ApicError::NotSupported => InterruptError::NoLocalApic,
+            apic::ApicError::NeedsMmuForXapic => InterruptError::NoLocalApic,
+            apic::ApicError::CalibrationFailed => InterruptError::CalibrationFailed,
+        })?;
+
+        apic::start_timer(TIMER_HZ);
+        cpu::enable_interrupts();
+
+        Ok(frequency)
+    }
 }
 
 /// Handles a trap.
@@ -34,6 +131,55 @@ pub fn init() {
 /// with a full report is the correct behaviour at M2, and this function is
 /// where recoverable cases get added in M3 and M5.
 fn handle(frame: &mut TrapFrame) {
+    // Vectors below 32 are architectural exceptions; everything above is an
+    // interrupt. The split matters because exceptions are faults in the
+    // kernel's own execution and interrupts are not, so only one of them is
+    // fatal.
+    if frame.vector >= 32 {
+        handle_interrupt(frame);
+        return;
+    }
+
+    report_exception(frame)
+}
+
+/// Services a delivered interrupt and returns, so `iretq` resumes the
+/// interrupted code.
+fn handle_interrupt(frame: &mut TrapFrame) {
+    match frame.vector as u8 {
+        apic::TIMER_VECTOR => {
+            TICKS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: the APIC is initialised -- interrupts cannot be enabled
+            // before `enable` succeeds -- and this acknowledges exactly the
+            // interrupt currently in service.
+            unsafe { apic::end_of_interrupt() };
+        }
+
+        // Spurious interrupts get no acknowledgement. The APIC never placed
+        // them in service, so an EOI here would clear a *different*
+        // interrupt's in-service bit -- losing a real interrupt in a way that
+        // is close to impossible to trace back to this line.
+        apic::SPURIOUS_VECTOR => {}
+        vector if pic::is_spurious(u64::from(vector)) => {}
+
+        _ => {
+            // Unexpected, but not fatal: report once and keep running. Halting
+            // the machine over a stray interrupt would be a worse failure than
+            // the stray interrupt.
+            println!();
+            println!(
+                "  unexpected interrupt on vector {:#04x} -- ignoring",
+                frame.vector
+            );
+            // SAFETY: as above; a delivered interrupt above the spurious
+            // vectors was placed in service and must be acknowledged.
+            unsafe { apic::end_of_interrupt() };
+        }
+    }
+}
+
+/// Reports a fatal exception and halts.
+fn report_exception(frame: &mut TrapFrame) {
     println!();
     println!("==================================================================");
     match exception_name(frame.vector) {

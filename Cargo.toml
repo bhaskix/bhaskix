@@ -20,8 +20,8 @@ members = [
     "arch/x86_64",
     "kernel",
 
-    # M3
-    # "mm",
+    # M2-11 (boot-time bump allocator); grows into M3
+    "mm",
 
     # M4
     # "sched",

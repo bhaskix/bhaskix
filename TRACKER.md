@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-03 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M2 — CPU state and interrupts** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 exit criterion MET, scope partially complete |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 exit criterion MET, interrupts live |
 
 ### Division of responsibility between documents
 
@@ -68,6 +68,8 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **D2** | Boot mechanism | ✅ Accepted 2026-08-02 | **Limine protocol**, isolated behind project-owned `bhaskix_boot::Handoff`. Native `bhaskixboot.efi` scheduled for Phase 2. | [docs/architecture.md](docs/architecture.md) §1 |
 | **D3** | Kernel model | ✅ Accepted 2026-08-02 | Capability-based **nucleus with relocatable services**. Not a pure microkernel, not a monolith. | [docs/architecture.md](docs/architecture.md) §2 |
 | **D4** | Isolation primitive | ✅ Accepted 2026-08-02 | **Domains** — containers and VMs are the same primitive. | [docs/architecture.md](docs/architecture.md) §4 |
+| **S1** | Storage architecture | ⬜ Draft | Capability-scoped Merkle-checksummed object store; POSIX as one personality. | [RFC 0003](docs/rfc/0003-storage-architecture.md) |
+| **P1** | First deployment target | ⬜ Draft | Operational technology — a hypervisor beneath the customer's existing, uncertifiable OT stack. Reorders the roadmap: virtualization earlier, desktop later, IEC 62443 as the certification path. | [RFC 0004](docs/rfc/0004-ot-security-gateway.md) |
 | **A2** | Syscall ABI shape | ⬜ Open | Capability-invocation only vs a numbered syscall table. | *Blocks M5* |
 | **A3** | IPC style | ⬜ Open | Synchronous rendezvous vs async buffered channels. Which is primitive? | *Blocks M5* |
 | **A4** | Userspace ABI | ⬜ Open | Own ABI vs POSIX-shaped. Determines what software can ever be ported. | *Blocks M5* |
@@ -98,11 +100,14 @@ fault, a GP fault, and a double fault reports all three correctly and does not r
 | M2-05 | Exception reporter with decoded error codes | ✅ `DONE` | 6 fault types, each asserting on decoded detail not just presence |
 | M2-06 | Fault injection via kernel command line | ✅ `DONE` | `bhaskix.fault=` |
 | M2-07 | Fault-injection test harness | ✅ `DONE` | `tests/qemu/fault-test.sh`; asserts QEMU logged no triple fault |
-| M2-08 | Local APIC, IO-APIC, APIC timer | ⬜ `TODO` | **Not started.** Not required by the exit criterion, but is M2 scope. |
-| M2-09 | Legacy PIC masking | ⬜ `TODO` | Needed before interrupts are enabled |
-| M2-10 | `arch::Arch` trait boundary | ⬜ `TODO` | Deferred; see note |
-| M2-11 | Boot-time bump allocator | ⬜ `TODO` | Moves naturally into M3 with the rest of `mm` |
-| M2-12 | Per-CPU data area | ⬜ `TODO` | Deferred to M4 with SMP bring-up, where it is actually needed |
+| M2-08 | Local APIC + timer, x2APIC and xAPIC paths | ✅ `DONE` | Boot test asserts observed ticks and `hlt` wakeup, on BIOS and UEFI |
+| M2-08b | IO-APIC | ⬜ `DEFERRED` | Needs ACPI MADT parsing, and nothing needs external device IRQs until the M6 keyboard. Deferred to when a driver actually requires it. |
+| M2-09 | Legacy PIC remap and mask | ✅ `DONE` | Remapped *then* masked — a masked-but-unremapped PIC still delivers spurious IRQ7 onto vector 0x0f |
+| M2-10 | `arch::Arch` trait boundary | ⬜ `DEFERRED` | Deliberately; `architecture.md` §7 updated to say why |
+| M2-11 | Boot-time bump allocator | ✅ `DONE` | 9 host unit tests |
+| M2-12 | Per-CPU data area | ⬜ `DEFERRED` | To M4 with SMP bring-up, where it is first actually needed |
+| M2-13 | Minimal page mapper (one MMIO page) | ✅ `DONE` | Unblocked xAPIC; 4 KiB only, no unmap, no huge-page split — deleted when M3 lands |
+| M2-14 | CPU feature reporting | ✅ `DONE` | Prints apic/x2apic/nx/smep/smap/umip/la57/invariant-tsc at boot |
 
 ### Bugs found and fixed during M2
 
@@ -118,6 +123,16 @@ Recorded because each was subtle, cost real time, and would recur:
    QEMU's `-d int` showing `CS base=0xf` and `pc = rip + 0xf`.
 3. **Divide-by-zero never reached the CPU.** `overflow-checks = true` makes Rust emit an explicit
    zero test and panic first. Correct behaviour, kept; the test now issues `div` in assembly.
+4. **The APIC page is not in the bootloader's direct map.** The HHDM maps RAM, and the APIC is not
+   RAM, so the first attempt page-faulted at `hhdm + 0xfee000f0`. The exception reporter named the
+   exact address, which is precisely what M2 was built to do. x2APIC would avoid the mapping
+   entirely — but **QEMU 4.2's TCG does not implement x2APIC** and masks the CPUID bit even when
+   `+x2apic` is requested explicitly, verified by dumping `cpuid.1.ecx` (`0xc6d8220b`: SSE3,
+   POPCNT, RDRAND all set, X2APIC clear). So the xAPIC page had to be mapped, which is what pulled
+   the bump allocator (M2-11) and the minimal page mapper (M2-13) forward.
+5. **A SAFETY comment stopped being adjacent to its block.** Inserting one line between the comment
+   and the `unsafe` block made the checker reject it — correctly, since a justification that is not
+   attached to what it justifies is not a justification.
 
 ### Honest notes on what is *not* proven
 
@@ -127,8 +142,12 @@ Recorded because each was subtle, cost real time, and would recur:
   a way no handler can report. Guard pages need virtual memory management. The `df` test uses a
   deterministic unmapped-stack trigger instead, which exercises IST1 and the handler but *not* the
   overflow path. **Tracked as an M3 task.**
-- **No interrupts have ever been delivered.** Only exceptions. Interrupts stay disabled until the
-  APIC work (M2-08) lands, so the `iretq` return path in `isr_common` is exercised only by `#BP`.
+- **The APIC timer frequency is measured, not verified.** Calibration against PIT channel 2 yields
+  ~65 MHz under QEMU. Nothing checks that the resulting 100 Hz is *actually* 100 Hz against an
+  independent clock; the plausibility band in `apic::calibrate` is wide on purpose. A real
+  wall-clock cross-check needs the HPET or an invariant TSC, neither of which is read yet.
+- **Only the Local APIC timer has ever fired.** No external device interrupt has been delivered,
+  because there is no IO-APIC and no device driver that raises one.
 - **`arch::Arch` (M2-10) is deliberately deferred.** Defining a portability boundary with exactly
   one implementation and no second architecture in sight produces a trait shaped like x86. It is
   more honest to define it when AArch64 work begins than to guess now — this reverses the position
@@ -197,6 +216,19 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M2-08)
+
+- **Interrupts are live.** Legacy PIC remapped and masked, Local APIC enabled, timer calibrated
+  against PIT channel 2 and running at 100 Hz. Boot tests now assert *observed ticks* and `hlt`
+  wakeup rather than merely that the enable code ran, on both BIOS and UEFI.
+- **Both APIC paths implemented** — x2APIC via MSRs (no mapping needed, and required for >255 CPUs
+  in M4) and xAPIC via MMIO. QEMU 4.2 forced the xAPIC path; see §3.
+- **Bump allocator (M2-11) and a minimal page mapper (M2-13) landed early**, pulled forward because
+  mapping the xAPIC register page was the only way to get a timer under this emulator. 9 host tests.
+- **CPU feature reporting added** — the boot log now states which of the guarantees in
+  `security.md` §4 the machine can actually provide, rather than assuming.
+- **RFC 0004 drafted**: operational technology as the first deployment target.
 
 ### 2026-08-03 (later)
 

@@ -27,6 +27,16 @@ workspace = true
 # raw instructions, and the `BootCell` that holds the tables exists precisely
 # to make the single-threaded-boot assumption explicit rather than implicit.
 #
-# The headroom stays deliberately small so M2-08 (APIC) has to raise it
-# consciously and justify it, rather than growing into slack nobody notices.
-unsafe_budget = 230
+# M2-08 raised it again: 218 -> 460, for the APIC, the PIC, MSR and CPUID
+# access, and the minimal page mapper. Every one of those is a raw instruction
+# or a raw pointer walk with no safe expression -- `rdmsr`, `wrmsr`, `cpuid`,
+# `invlpg`, port I/O, and writing page table entries reached through the direct
+# map.
+#
+# Note on the metric: it counts *lines inside* unsafe blocks, so a function
+# that wraps its whole body in one block scores much higher than the same code
+# split into narrow blocks. That makes the number good for spotting growth and
+# poor as an absolute measure of risk. Narrowing the blocks in `apic` and
+# `paging` would cut this substantially and is worth doing when they are next
+# touched.
+unsafe_budget = 480

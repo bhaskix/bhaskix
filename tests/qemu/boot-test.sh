@@ -26,14 +26,15 @@ trap 'rm -f "$LOG"' EXIT
 EXPECT_GREETING="Hello from Bhaskix"
 
 # Strings that mean the boot went wrong even if the greeting appeared.
-FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated")
+FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
+                 "unexpected interrupt on vector" "NO TICKS")
 
 fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2; }
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 
 [[ -f "$ISO" ]] || { fail "$ISO not found -- run 'make iso' first"; exit 1; }
 
-QEMU_ARGS=(-M q35 -m 256M -no-reboot -cdrom "$ISO" -boot d
+QEMU_ARGS=(-M q35 -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom "$ISO" -boot d
            -serial "file:$LOG" -display none)
 
 if [[ "$MODE" == "uefi" ]]; then
@@ -84,6 +85,23 @@ if grep -qF "M1 complete" "$LOG"; then
     pass "kernel_main ran to completion"
 else
     fail "kernel_main did not reach the end of M1"
+    status=1
+fi
+
+# M2: interrupts must actually be delivered, not merely enabled. Asserting on
+# observed ticks rather than on "interrupts ENABLED" is the difference between
+# testing that the code ran and testing that the hardware responded.
+if grep -qF "timer          delivering" "$LOG"; then
+    pass "timer interrupts delivered"
+else
+    fail "no timer interrupts were delivered"
+    status=1
+fi
+
+if grep -qF "hlt wakes on interrupt" "$LOG"; then
+    pass "hlt wakes on interrupt (idle path)"
+else
+    fail "hlt did not wake on a timer interrupt"
     status=1
 fi
 
