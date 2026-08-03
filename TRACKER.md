@@ -71,6 +71,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **S1** | Storage architecture | ⬜ Draft | Capability-scoped Merkle-checksummed object store; POSIX as one personality. | [RFC 0003](docs/rfc/0003-storage-architecture.md) |
 | **P1** | First deployment target | ⬜ Draft | Operational technology — a hypervisor beneath the customer's existing, uncertifiable OT stack. Reorders the roadmap: virtualization earlier, desktop later, IEC 62443 as the certification path. | [RFC 0004](docs/rfc/0004-ot-security-gateway.md) |
 | **K1** | Storage implementation | ⬜ Draft | **Kosh** — RFC 0003's layers made concrete, plus distribution. Elastic from one node, RF=1…n, block/file/object/key-value, asynchronous geo. Commits to the row RFC 0003 marked *not committed*, and is explicit that the first years are single-node. | [RFC 0006](docs/rfc/0006-kosh-distributed-storage.md) |
+| **U1** | Live patching | ⬜ Draft | Nucleus-only, stop-the-world quiescence, declared-patchable functions. Narrows rather than expands: service domains restart instead, and A/B reboot stays the default. Its **P0 prerequisites** — a build identifier and an attestation format that can express "image plus patches" — are cheap now and painful to retrofit. | [RFC 0007](docs/rfc/0007-livepatch.md) |
 | **C1** | Binary compatibility | ⬜ Draft | Linux `x86_64` ABI as a **domain personality**, not the native interface. First target deliberately narrow: statically linked Go binaries. Answers **A4** by refusing its premise — own ABI natively *and* Linux compatibility as something offered. | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 | **A2** | Syscall ABI shape | ⬜ Open | Capability-invocation only vs a numbered syscall table. | *Blocks M5* |
 | **A3** | IPC style | ⬜ Open | Synchronous rendezvous vs async buffered channels. Which is primitive? | *Blocks M5* |
@@ -263,6 +264,37 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (RFC 0007 drafted, live patching)
+
+- **RFC 0007 drafted**: live patching the nucleus, scoped deliberately small. Draft, awaiting a
+  decision.
+- **It narrows the request rather than expanding it.** Bhaskix puts drivers, filesystems, network
+  and storage in relocatable service domains, and a domain can be *restarted* — an ordinary,
+  testable, reversible operation, unlike modifying code that is currently executing. What is left is
+  the nucleus, which is small by design. The best live patch is a small nucleus, and that is an
+  architectural advantage a monolithic kernel cannot claim.
+- **The competitor is stated fairly and is the default.** A/B atomic reboot is already on the Phase 3
+  roadmap and answers most of the same need. The decisive difference is assurance: a live patch runs
+  against a machine state no test reproduced, while a rebooted image runs exactly what was tested.
+  For a system aiming at certification that has to be weighed, not assumed away.
+- **The requirement is real and comes from RFC 0004**: OT availability of 99.99%+ with maintenance
+  windows measured in hours per year. A security gateway that must be taken down to patch itself is
+  one that does not get patched.
+- **The most important consequence is for attestation, not for patching.** `docs/security.md` §8
+  measures the boot image. A live patch changes the running kernel afterwards, so an attestation
+  reporting only the boot image would report a known-good state for a machine running modified code
+  — actively misleading rather than merely incomplete. Measured state must become image *plus* the
+  ordered list of applied patches.
+- **Rust's inlining makes this harder than it is in C.** With LTO there may be no call to redirect
+  and no named copy of the buggy code. Patchability is therefore a property of the *build*, a patch
+  is not portable between builds, and the tooling must answer "is this patchable in this image" from
+  the image rather than the source.
+- **Shadow data, patching service domains, patching the boot path, unsigned patches even in
+  development, and automatic application are all refused** — not deferred.
+- **P0 is the part that matters today**: a stable build identifier and an attestation format that can
+  express applied patches. Both are nearly free now and painful to add to a shipped, certified
+  system, which is the reason to write this RFC long before building the feature.
 
 ### 2026-08-04 (M4-07, scheduling classes — and four bugs it exposed)
 
