@@ -162,12 +162,34 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 - **The slab has never been exercised under memory pressure** — every test had ample free frames, so
   the out-of-memory paths inside `grow` are covered only by the deliberate-exhaustion unit test.
 
+### CI, first runs
+
+The workflow ran for the first time on 2026-08-03 and found two defects that no local run could:
+
+1. **CI had silently stopped running an entire crate's tests.** The workflow spelled out its own
+   cargo invocations rather than calling the Makefile, drifted from it, and `bhaskix-mm`'s 60 host
+   tests — the buddy allocator, the slab, the region map — were never executed in Actions at all.
+   Every job now invokes a Makefile target, so there is one definition of each check and the two
+   cannot diverge again.
+2. **OVMF was searched as two independent files instead of a matched pair.** On distributions
+   shipping only the 4 MB layout — which the runner has — a CODE image was found, no VARS image
+   was, and QEMU was handed `-drive file=<nonexistent>`. It exited before emitting a byte, so a
+   packaging difference presented as a kernel that would not boot. The images must also be
+   size-matched or the *firmware* rejects them, which is a worse place to find out.
+
+Worth recording *how* the second one was found: the boot job was split into a matrix over firmware
+and CPU model. BIOS passed on both CPU models and UEFI failed on both, which ruled out the kernel
+and both APIC paths and pointed at the firmware — from the job conclusions alone, with no access to
+a log. The CPU dimension is also the only way the x2APIC path gets exercised at all, since the
+local QEMU masks that CPUID bit.
+
 ### Blockers
 
 | Task | Blocked on | Owner |
 |---|---|---|
 | M1-17 | Physical UEFI machine with serial. QEMU cannot substitute. | Tarun Kumar Kushwaha |
-| — | GitHub org, crates.io name, and domain for `bhaskix` are **unregistered and unverified**. Account creation requires a human. | Tarun Kumar Kushwaha |
+| Repo metadata | GitHub description and topics are unset, and `main` has no branch protection — `GOVERNANCE.md` §2 requires review for non-trivial changes and nothing enforces it. Deploy keys have no API scope, so these need the web UI. | Tarun Kumar Kushwaha |
+| CI log access | Reading Actions logs needs authentication; the unauthenticated API allows 60 requests/hour and only exposes pass/fail. A fine-grained token with `Actions: read` would remove both limits. | Tarun Kumar Kushwaha |
 
 ## 4. Upcoming milestones
 
@@ -226,6 +248,19 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (published, CI live)
+
+- **Pushed to `github.com/bhaskix/bhaskix`.** 9 commits, 93 files. Verified before publishing that
+  no tooling files were tracked, that no vendor string appears anywhere in history rather than
+  merely in the working tree, and that every commit is authored and DCO-signed by
+  `tarunsoft1@gmail.com`.
+- **`SECURITY.md` added**, because `docs/security.md` §9 promised a reporting channel that went
+  public with no way to act on it. Written to be honest about the stage — it opens by stating the
+  project has never been audited and must not be deployed — and includes a section on what is *not*
+  a vulnerability yet, since this project documents its unfinished work openly and a report of a
+  protection already tracked as unimplemented costs the reporter their time for nothing.
+- **CI ran for the first time and found two real defects.** Details in §3.
 
 ### 2026-08-03 (M3, guarded stacks)
 
