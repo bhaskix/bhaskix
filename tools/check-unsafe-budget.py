@@ -91,10 +91,18 @@ def scan(source: str) -> tuple[int, list[int]]:
                 previous = lines[back].strip()
                 if not previous or previous.startswith("#["):
                     continue
-                if not previous.startswith("//"):
-                    break  # end of the comment block
-                if "SAFETY:" in previous:
-                    found_justification = True
+                if previous.startswith("//"):
+                    if "SAFETY:" in previous:
+                        found_justification = True
+                        break
+                    continue
+                # A line of code. Keep scanning only if it cannot have ended a
+                # statement -- rustfmt often wraps a long `let x: T =` across
+                # lines, putting code between the comment and its `unsafe`
+                # block. Stopping there would reject a justification that is
+                # plainly present, so the scan continues past continuations
+                # and stops at a real statement boundary.
+                if previous.endswith((";", "{", "}")):
                     break
             if not found_justification:
                 missing.append(index + 1)

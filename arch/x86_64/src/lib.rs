@@ -11,6 +11,12 @@
 //! reasoned about in isolation.
 
 #![cfg_attr(not(test), no_std)]
+// Tests are exempt from the `unwrap`/`expect`/`panic` bans, as
+// docs/coding-style.md §4 specifies: those exist to stop a fallible operation
+// from taking down the nucleus, and a test that cannot panic cannot fail.
+// The workspace lint table cannot express a cfg-conditional allow, so it is
+// stated here.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod apic;
 pub mod cell;

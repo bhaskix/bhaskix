@@ -9,11 +9,18 @@
 //! [`Handoff`] built by the boot shim. It never sees the bootloader.
 
 #![cfg_attr(not(test), no_std)]
+// Tests are exempt from the `unwrap`/`expect`/`panic` bans, as
+// docs/coding-style.md §4 specifies: those exist to stop a fallible operation
+// from taking down the nucleus, and a test that cannot panic cannot fail.
+// The workspace lint table cannot express a cfg-conditional allow, so it is
+// stated here.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod console;
 pub mod faultinject;
 pub mod font;
 pub mod framebuffer;
+pub mod memory;
 pub mod panic;
 pub mod sync;
 pub mod trap;
@@ -103,6 +110,31 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
     report_boot_state(handoff, serial_present, framebuffer_present);
     report_memory(handoff);
 
+    // Physical memory. The bump allocator is retired here: it carves out the
+    // frame database, the buddy allocator is built over it, and everything the
+    // bump handed out is then marked permanently reserved
+    // (`docs/memory.md` §1).
+    //
+    // SAFETY: bootstrap CPU, called once, and the handoff is still valid --
+    // nothing has reclaimed bootloader-reclaimable memory yet.
+    match unsafe { memory::init(handoff, &mut frames) } {
+        Ok(mut pmm) => {
+            println!();
+            println!("  physical memory");
+            memory::report(&pmm);
+            if memory::self_test(&mut pmm) {
+                println!("    self test      passed, no frames leaked");
+            } else {
+                println!("    self test      FAILED");
+            }
+        }
+        Err(error) => {
+            println!();
+            println!("  FATAL: physical memory bring-up failed: {error:?}");
+            cpu::halt_forever();
+        }
+    }
+
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
         faultinject::trigger(fault);
         // Reaching here means the exception was swallowed rather than
@@ -147,11 +179,6 @@ fn report_cpu_features() {
         mark(f.nx),
         mark(f.smep),
         mark(f.smap)
-    );
-    let l1 = bhaskix_arch::msr::cpuid(1);
-    println!(
-        "    cpuid.1        ecx {:#010x}  edx {:#010x}",
-        l1.ecx, l1.edx
     );
     println!(
         "                   umip {}  la57 {}  invariant-tsc {}",

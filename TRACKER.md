@@ -7,8 +7,8 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 |---|---|
 | **Last updated** | 2026-08-03 |
 | **Phase** | Phase 1 — Foundation |
-| **Active milestone** | **M2 — CPU state and interrupts** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 exit criterion MET, interrupts live |
+| **Active milestone** | **M3 — Memory management** |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 physical memory done, virtual memory next |
 
 ### Division of responsibility between documents
 
@@ -81,83 +81,70 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 
 ---
 
-## 3. Active milestone — M2: CPU state and interrupts
+## 3. Active milestone — M3: Memory management
 
-**The exit criterion is MET.** Every exception produces a clear diagnostic instead of a triple
-fault, proven by `tests/qemu/fault-test.sh` across six injected fault types. **The milestone scope
-is not fully complete** — the APIC work remains. Both facts are recorded rather than one of them.
+**Physical memory is done. Virtual memory has not been started.** M3's exit criterion is not yet
+met and will not be until address spaces exist.
 
-**Milestone exit criterion** ([docs/roadmap.md](docs/roadmap.md) M2): *"every exception vector
-produces a clear diagnostic instead of a triple fault. A test that deliberately triggers a page
-fault, a GP fault, and a double fault reports all three correctly and does not reboot the machine."*
+**Milestone exit criterion** ([docs/roadmap.md](docs/roadmap.md) M3): host property tests for buddy
+and slab pass; the frame-leak test passes in QEMU; `alloc` types usable throughout the kernel.
 
 | ID | Task | Status | Verified by |
 |---|---|---|---|
-| M2-01 | GDT with kernel/user code and data descriptors | ✅ `DONE` | Boots; SYSRET-compatible ordering for M5 |
-| M2-02 | TSS with IST stacks for double fault and NMI | ✅ `DONE` | The `df` fault test reports instead of resetting |
-| M2-03 | IDT, all 256 vectors populated | ✅ `DONE` | Stub table disassembled and verified: 16-byte spacing, correct error-code handling per vector |
-| M2-04 | Interrupt stubs normalising into a uniform `TrapFrame` | ✅ `DONE` | Register dumps show correct values in fault reports |
-| M2-05 | Exception reporter with decoded error codes | ✅ `DONE` | 6 fault types, each asserting on decoded detail not just presence |
-| M2-06 | Fault injection via kernel command line | ✅ `DONE` | `bhaskix.fault=` |
-| M2-07 | Fault-injection test harness | ✅ `DONE` | `tests/qemu/fault-test.sh`; asserts QEMU logged no triple fault |
-| M2-08 | Local APIC + timer, x2APIC and xAPIC paths | ✅ `DONE` | Boot test asserts observed ticks and `hlt` wakeup, on BIOS and UEFI |
-| M2-08b | IO-APIC | ⬜ `DEFERRED` | Needs ACPI MADT parsing, and nothing needs external device IRQs until the M6 keyboard. Deferred to when a driver actually requires it. |
-| M2-09 | Legacy PIC remap and mask | ✅ `DONE` | Remapped *then* masked — a masked-but-unremapped PIC still delivers spurious IRQ7 onto vector 0x0f |
-| M2-10 | `arch::Arch` trait boundary | ⬜ `DEFERRED` | Deliberately; `architecture.md` §7 updated to say why |
-| M2-11 | Boot-time bump allocator | ✅ `DONE` | 9 host unit tests |
-| M2-12 | Per-CPU data area | ⬜ `DEFERRED` | To M4 with SMP bring-up, where it is first actually needed |
-| M2-13 | Minimal page mapper (one MMIO page) | ✅ `DONE` | Unblocked xAPIC; 4 KiB only, no unmap, no huge-page split — deleted when M3 lands |
-| M2-14 | CPU feature reporting | ✅ `DONE` | Prints apic/x2apic/nx/smep/smap/umip/la57/invariant-tsc at boot |
+| M3-01 | Frame database, one entry per frame | ✅ `DONE` | 65,503 entries / 1.28 MiB on a 256 MiB machine |
+| M3-02 | Buddy allocator, orders 0–10 | ✅ `DONE` | 26 host tests incl. a 20,000-operation randomised leak/coalescing property test |
+| M3-03 | DMA32 zone, never satisfied from above 4 GiB | ✅ `DONE` | Dedicated tests for the boundary and for no block straddling it |
+| M3-04 | Bump → buddy handover | ✅ `DONE` | Consumed ranges tracked and excluded *before* frames reach a free list |
+| M3-05 | Invariant checker | ✅ `DONE` | Walks every free list; caught the handover bug on first run |
+| M3-06 | Boot-time frame-leak self test | ✅ `DONE` | Runs on every boot, not only under test |
+| M3-07 | Slab allocator as `GlobalAlloc` | ⬜ `TODO` | **Blocks the exit criterion** — `Box`/`Vec`/`BTreeMap` do not work yet |
+| M3-08 | `AddressSpace`, `RangeMap`, page tables | ⬜ `TODO` | Blocks the exit criterion |
+| M3-09 | W^X and NX enforcement | ⬜ `TODO` | `Protection` type must make W+X unrepresentable |
+| M3-10 | Demand paging and copy-on-write | ⬜ `TODO` | |
+| M3-11 | Kernel stack guard pages | ⬜ `TODO` | **Closes the M2 gap**: stack-overflow-driven double fault is untestable until this exists |
+| M3-12 | `copy_from_user` / `copy_to_user` with fixups | ⬜ `TODO` | Needed before user mode in M5 |
+| M3-13 | KASLR | ⬜ `TODO` | |
+| M3-14 | Address-space frame-leak gate (1000 create/destroy) | ⬜ `TODO` | The real gate from `memory.md` §7; needs M3-08 |
 
-### Bugs found and fixed during M2
+### Bugs found and fixed during M3
 
-Recorded because each was subtle, cost real time, and would recur:
-
-1. **`lateout` register aliasing in `load_gdt`.** The register allocator reused an input register
-   for the `lateout` temporary, so the `lea` clobbered the data selector and the segment loads used
-   garbage. `lateout` explicitly permits this; `out` does not. Fixed by using `out`.
-2. **Segment limit encoding.** The 20-bit limit is split across bits 0-15 and 48-51. Writing the
-   whole `0xfffff` into the low bits puts `0xf` into the *base address*. In 64-bit mode the base is
-   nominally ignored, so this booted fine right up until the far return in `load_gdt`, where the
-   target landed at base+offset — mid-instruction — and the CPU executed garbage. Diagnosed from
-   QEMU's `-d int` showing `CS base=0xf` and `pc = rip + 0xf`.
-3. **Divide-by-zero never reached the CPU.** `overflow-checks = true` makes Rust emit an explicit
-   zero test and panic first. Correct behaviour, kept; the test now issues `div` in assembly.
-4. **The APIC page is not in the bootloader's direct map.** The HHDM maps RAM, and the APIC is not
-   RAM, so the first attempt page-faulted at `hhdm + 0xfee000f0`. The exception reporter named the
-   exact address, which is precisely what M2 was built to do. x2APIC would avoid the mapping
-   entirely — but **QEMU 4.2's TCG does not implement x2APIC** and masks the CPUID bit even when
-   `+x2apic` is requested explicitly, verified by dumping `cpuid.1.ecx` (`0xc6d8220b`: SSE3,
-   POPCNT, RDRAND all set, X2APIC clear). So the xAPIC page had to be mapped, which is what pulled
-   the bump allocator (M2-11) and the minimal page mapper (M2-13) forward.
-5. **A SAFETY comment stopped being adjacent to its block.** Inserting one line between the comment
-   and the `unsafe` block made the checker reject it — correctly, since a justification that is not
-   attached to what it justifies is not a justification.
+1. **The bump→buddy handover corrupted the free lists.** Marking bump-allocated frames reserved
+   *after* adding their regions to the free lists left frames that were simultaneously on a free
+   list and reserved. The invariant checker caught it on its first run, which is the entire reason
+   it was written before the code that needed it. Fixed by having the bump allocator record what it
+   consumed and subtracting those ranges before any frame reaches a free list.
+2. **The frame database could not be allocated.** It must be one unbroken array, but the first
+   usable region on a PC is a ~300 KiB fragment below the legacy hole. Frame-by-frame allocation
+   silently produced a database split across the gap. Fixed with `allocate_contiguous`, which skips
+   regions that cannot hold the whole run.
+3. **A patch silently did not apply.** An earlier edit to wire in `memory::init` did not match, so
+   the module compiled as dead code and the boot output simply lacked a section. Caught only by
+   reading the boot log rather than trusting the build. Worth remembering: a clean build proves
+   nothing about whether the code runs.
+4. **The `unsafe` checker rejected a justification that was present.** rustfmt wrapped a long `let`
+   across two lines, putting code between the SAFETY comment and its block. The scanner now
+   continues past statement continuations and stops at a real statement boundary — and was
+   negative-tested to confirm it still catches genuinely unjustified blocks.
 
 ### Honest notes on what is *not* proven
 
-- **Kernel stack overflow is still untestable.** The realistic cause of a double fault is stack
-  overflow, and it cannot be tested yet: the kernel stack is Limine's and **has no guard page**, so
-  an overflow scribbles over mapped memory (in practice the page tables) until the machine dies in
-  a way no handler can report. Guard pages need virtual memory management. The `df` test uses a
-  deterministic unmapped-stack trigger instead, which exercises IST1 and the handler but *not* the
-  overflow path. **Tracked as an M3 task.**
-- **The APIC timer frequency is measured, not verified.** Calibration against PIT channel 2 yields
-  ~65 MHz under QEMU. Nothing checks that the resulting 100 Hz is *actually* 100 Hz against an
-  independent clock; the plausibility band in `apic::calibrate` is wide on purpose. A real
-  wall-clock cross-check needs the HPET or an invariant TSC, neither of which is read yet.
-- **Only the Local APIC timer has ever fired.** No external device interrupt has been delivered,
-  because there is no IO-APIC and no device driver that raises one.
-- **`arch::Arch` (M2-10) is deliberately deferred.** Defining a portability boundary with exactly
-  one implementation and no second architecture in sight produces a trait shaped like x86. It is
-  more honest to define it when AArch64 work begins than to guess now — this reverses the position
-  in `architecture.md` §7 and that document should be updated to say so.
+- **The 4 GiB zone boundary has never been exercised on real memory.** QEMU was given 256 MiB, so
+  every frame is in the DMA32 zone and the `Normal` path is covered only by host tests.
+- **No per-CPU magazines.** `docs/memory.md` §2 specifies them for the order-0 hot path. There is
+  no SMP and no lock yet, so they would be untestable machinery guarding against contention that
+  cannot occur. Deferred to M4 with the second CPU.
+- **The frame database is sized by the highest usable address**, so a machine with a large gap
+  between RAM banks wastes database entries on the hole. Acceptable now; revisit if a target
+  platform has a sparse map.
+- **Nothing has been tested above 4 GiB of RAM**, so the `u32` PFN limit (16 TiB) and the zone
+  fallback path are untried in practice.
 
 ### Blockers
 
 | Task | Blocked on | Owner |
 |---|---|---|
 | M1-17 | Physical UEFI machine with serial. QEMU cannot substitute. | Tarun Kumar Kushwaha |
+| — | GitHub org, crates.io name, and domain for `bhaskix` are **unregistered and unverified**. Account creation requires a human. | Tarun Kumar Kushwaha |
 
 ## 4. Upcoming milestones
 
@@ -216,6 +203,18 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M3, physical memory)
+
+- **Buddy allocator and frame database landed.** Orders 0–10, DMA32 and Normal zones, free lists
+  threaded through the frame database so coalescing is O(1) with no auxiliary allocation. 34 host
+  tests in `mm`, including a 20,000-operation randomised property test asserting zero frame leakage
+  and full coalescing.
+- **Boot-time frame-leak self test** runs on every boot: 252 MiB managed on a 256 MiB machine, and
+  the allocator returns to exactly its starting free count.
+- **Two real bugs caught by the invariant checker and by reading the boot log** rather than by the
+  compiler — the handover corruption and the split frame database. Both recorded in §3.
+- **The `unsafe` checker was itself wrong** and is now negative-tested.
 
 ### 2026-08-03 (M2-08)
 

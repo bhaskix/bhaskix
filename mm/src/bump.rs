@@ -27,6 +27,13 @@ use bhaskix_boot::{Handoff, MemoryKind, MemoryRegion, PhysAddr};
 /// Size of a physical frame.
 pub const FRAME_SIZE: u64 = 4096;
 
+/// Most distinct physical ranges the allocator will record as consumed.
+///
+/// One entry per contiguous run it hands out; runs that abut are merged. A
+/// handful of regions is all a real memory map offers, and exceeding this
+/// would mean the boot path is allocating far more than it should.
+const MAX_CONSUMED_RANGES: usize = 16;
+
 /// Allocates frames by walking forward through usable memory, never reusing.
 #[derive(Clone, Copy, Debug)]
 pub struct BumpAllocator {
@@ -37,6 +44,15 @@ pub struct BumpAllocator {
     next: u64,
     /// Frames handed out so far, for reporting.
     allocated: u64,
+    /// Physical `[start, end)` ranges handed out, merged where adjacent.
+    ///
+    /// Recorded because the buddy allocator has to know precisely which
+    /// frames are already in use before it takes over. Marking them reserved
+    /// *after* adding them to the free lists corrupts the lists — a frame can
+    /// be on a free list and reserved at the same time, which the invariant
+    /// checker correctly rejects.
+    consumed: [(u64, u64); MAX_CONSUMED_RANGES],
+    consumed_count: usize,
 }
 
 /// Why an allocation failed.
@@ -58,6 +74,8 @@ impl BumpAllocator {
             region: 0,
             next: 0,
             allocated: 0,
+            consumed: [(0, 0); MAX_CONSUMED_RANGES],
+            consumed_count: 0,
         }
     }
 
@@ -85,6 +103,51 @@ impl BumpAllocator {
         }
     }
 
+    /// Allocates `count` physically contiguous frames.
+    ///
+    /// Needed because the frame database must be one unbroken array, and the
+    /// first usable region on a PC is typically a ~300 KiB fragment below the
+    /// legacy hole — far too small. Allocating frame-by-frame and hoping they
+    /// stay adjacent silently produces a database split across a gap, which
+    /// is a corruption that surfaces much later and nowhere near the cause.
+    ///
+    /// Skips whole regions that cannot satisfy the request rather than
+    /// splitting it, and the skipped remainder is simply never handed out.
+    /// Wasting a few hundred kilobytes once at boot is a fair price for an
+    /// allocator that stays this simple.
+    ///
+    /// # Errors
+    ///
+    /// [`BumpError::OutOfMemory`] if no single usable region has room.
+    pub fn allocate_contiguous(&mut self, count: u64) -> Result<PhysAddr, BumpError> {
+        if count == 0 {
+            return Err(BumpError::OutOfMemory);
+        }
+        let bytes = count * FRAME_SIZE;
+
+        loop {
+            self.advance_to_usable();
+            if self.region >= self.regions.len() {
+                return Err(BumpError::OutOfMemory);
+            }
+
+            let region = self.regions[self.region];
+            if self.next + bytes <= region.end().as_u64() {
+                let base = self.next;
+                self.next += bytes;
+                self.allocated += count;
+                self.record_consumed(base, base + bytes);
+                return Ok(PhysAddr(base));
+            }
+
+            // This region cannot hold the run. Move on; `advance_to_usable`
+            // will position `next` in the following usable region. The index
+            // strictly increases, so this terminates.
+            self.region += 1;
+            self.next = 0;
+        }
+    }
+
     /// Allocates one frame, returning its physical address.
     ///
     /// The frame is **not** zeroed. This crate is `forbid(unsafe_code)` and
@@ -95,15 +158,38 @@ impl BumpAllocator {
     ///
     /// [`BumpError::OutOfMemory`] when no usable memory remains.
     pub fn allocate_frame(&mut self) -> Result<PhysAddr, BumpError> {
-        self.advance_to_usable();
-        if self.region >= self.regions.len() {
-            return Err(BumpError::OutOfMemory);
-        }
+        self.allocate_contiguous(1)
+    }
 
-        let frame = self.next;
-        self.next += FRAME_SIZE;
-        self.allocated += 1;
-        Ok(PhysAddr(frame))
+    /// Notes that `[start, end)` has been handed out, merging with the
+    /// previous range when they abut.
+    fn record_consumed(&mut self, start: u64, end: u64) {
+        if self.consumed_count > 0 {
+            let last = &mut self.consumed[self.consumed_count - 1];
+            if last.1 == start {
+                last.1 = end;
+                return;
+            }
+        }
+        if self.consumed_count < MAX_CONSUMED_RANGES {
+            self.consumed[self.consumed_count] = (start, end);
+            self.consumed_count += 1;
+        }
+        // Silently dropping a range would understate what is in use and let
+        // the buddy allocator hand out live memory, so overflow saturates
+        // instead: the last range is stretched to cover the new one.
+        else {
+            self.consumed[MAX_CONSUMED_RANGES - 1].1 = end;
+        }
+    }
+
+    /// The physical `[start, end)` ranges this allocator has handed out.
+    ///
+    /// Sorted ascending and non-overlapping. The buddy allocator must exclude
+    /// every one of these before taking over.
+    #[must_use]
+    pub fn consumed_ranges(&self) -> &[(u64, u64)] {
+        &self.consumed[..self.consumed_count]
     }
 
     /// Frames handed out so far.
@@ -268,6 +354,121 @@ mod tests {
             total,
             "the allocator handed out a frame twice"
         );
+    }
+
+    #[test]
+    fn contiguous_runs_skip_regions_that_are_too_small() {
+        // Mirrors the real PC layout that broke frame-database setup: a small
+        // fragment below the legacy hole, then the main block of RAM. A run
+        // that does not fit in the fragment must come from the main block
+        // rather than straddling the gap.
+        static SPLIT: [MemoryRegion; 2] = [
+            // Two frames only.
+            MemoryRegion {
+                base: PhysAddr(0x5_3000),
+                length: 0x2000,
+                kind: MemoryKind::Usable,
+            },
+            // Sixteen frames.
+            MemoryRegion {
+                base: PhysAddr(0x10_0000),
+                length: 0x1_0000,
+                kind: MemoryKind::Usable,
+            },
+        ];
+        let mut h = handoff();
+        h.memory_map = &SPLIT;
+
+        let mut allocator = BumpAllocator::new(&h);
+        assert_eq!(allocator.allocate_contiguous(5), Ok(PhysAddr(0x10_0000)));
+    }
+
+    #[test]
+    fn a_run_that_fits_the_first_region_stays_there() {
+        static SPLIT: [MemoryRegion; 2] = [
+            MemoryRegion {
+                base: PhysAddr(0x5_3000),
+                length: 0x2000,
+                kind: MemoryKind::Usable,
+            },
+            MemoryRegion {
+                base: PhysAddr(0x10_0000),
+                length: 0x1_0000,
+                kind: MemoryKind::Usable,
+            },
+        ];
+        let mut h = handoff();
+        h.memory_map = &SPLIT;
+
+        let mut allocator = BumpAllocator::new(&h);
+        assert_eq!(allocator.allocate_contiguous(2), Ok(PhysAddr(0x5_3000)));
+    }
+
+    #[test]
+    fn contiguous_runs_lie_inside_a_single_region() {
+        let mut allocator = BumpAllocator::new(&handoff());
+        let base = allocator.allocate_contiguous(2).unwrap().as_u64();
+        // Must lie wholly inside one usable region.
+        let inside = MAP.iter().any(|r| {
+            r.kind == MemoryKind::Usable
+                && base >= r.base.as_u64()
+                && base + 2 * FRAME_SIZE <= r.end().as_u64()
+        });
+        assert!(inside, "run at {base:#x} crosses a region boundary");
+    }
+
+    #[test]
+    fn a_run_larger_than_any_region_fails() {
+        let mut allocator = BumpAllocator::new(&handoff());
+        assert_eq!(
+            allocator.allocate_contiguous(1000),
+            Err(BumpError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn a_zero_length_run_is_rejected() {
+        let mut allocator = BumpAllocator::new(&handoff());
+        assert_eq!(
+            allocator.allocate_contiguous(0),
+            Err(BumpError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn records_what_it_consumed() {
+        let mut allocator = BumpAllocator::new(&handoff());
+        allocator.allocate_frame().unwrap();
+        allocator.allocate_frame().unwrap();
+        // Two adjacent frames merge into one recorded range.
+        assert_eq!(allocator.consumed_ranges(), &[(0x2000, 0x4000)]);
+    }
+
+    #[test]
+    fn consumed_ranges_split_when_regions_are_skipped() {
+        let mut allocator = BumpAllocator::new(&handoff());
+        // Exhausts the first region (2 frames), then crosses to the next.
+        let all = drain(&mut allocator);
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            allocator.consumed_ranges(),
+            &[(0x2000, 0x4000), (0x20_0000, 0x20_2000)]
+        );
+    }
+
+    #[test]
+    fn every_allocated_frame_lies_inside_a_consumed_range() {
+        // The property the buddy handover depends on: nothing handed out may
+        // escape the record, or it would later be treated as free.
+        let mut allocator = BumpAllocator::new(&handoff());
+        let frames = drain(&mut allocator);
+        let ranges = allocator.consumed_ranges().to_vec();
+        for frame in frames {
+            let covered = ranges
+                .iter()
+                .any(|&(start, end)| frame >= start && frame + FRAME_SIZE <= end);
+            assert!(covered, "frame {frame:#x} was handed out but not recorded");
+        }
     }
 
     #[test]
