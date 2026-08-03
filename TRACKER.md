@@ -70,9 +70,10 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **D4** | Isolation primitive | ✅ Accepted 2026-08-02 | **Domains** — containers and VMs are the same primitive. | [docs/architecture.md](docs/architecture.md) §4 |
 | **S1** | Storage architecture | ⬜ Draft | Capability-scoped Merkle-checksummed object store; POSIX as one personality. | [RFC 0003](docs/rfc/0003-storage-architecture.md) |
 | **P1** | First deployment target | ⬜ Draft | Operational technology — a hypervisor beneath the customer's existing, uncertifiable OT stack. Reorders the roadmap: virtualization earlier, desktop later, IEC 62443 as the certification path. | [RFC 0004](docs/rfc/0004-ot-security-gateway.md) |
+| **C1** | Binary compatibility | ⬜ Draft | Linux `x86_64` ABI as a **domain personality**, not the native interface. First target deliberately narrow: statically linked Go binaries. Answers **A4** by refusing its premise — own ABI natively *and* Linux compatibility as something offered. | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 | **A2** | Syscall ABI shape | ⬜ Open | Capability-invocation only vs a numbered syscall table. | *Blocks M5* |
 | **A3** | IPC style | ⬜ Open | Synchronous rendezvous vs async buffered channels. Which is primitive? | *Blocks M5* |
-| **A4** | Userspace ABI | ⬜ Open | Own ABI vs POSIX-shaped. Determines what software can ever be ported. | *Blocks M5* |
+| **A4** | Userspace ABI | ⬜ Open | Own ABI vs POSIX-shaped. [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) argues this is a false choice: capability-shaped natively, Linux-shaped through a personality that holds no authority its domain lacks. Still needs a decision on the *native* shape. | *Blocks M5* |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | *Blocks M3* |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
@@ -232,6 +233,30 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (RFC 0005 drafted, Linux ABI compatibility)
+
+- **RFC 0005 drafted**: the Linux `x86_64` system-call ABI as a **domain
+  personality** — a translation layer running in a service domain, implementing Linux calls on top
+  of capabilities its domain already holds. Draft, awaiting a decision.
+- **The narrow first target is the proposal, not a caveat.** Statically linked Go binaries with
+  `CGO_ENABLED=0` remove the dynamic linker, `libc`, NSS and locale from the problem in one move,
+  and Go issues raw syscalls, so the surface is the kernel ABI alone. "Enough Linux ABI for static
+  Go" is a far smaller target than "enough for Docker", and choosing the smaller one deliberately
+  is what makes it finishable.
+- **It has to reconcile with RFC 0003, which argues POSIX is the wrong primitive.** The resolution
+  is that the Linux ABI is a *personality*, exactly as POSIX is one row of RFC 0003's Layer 2 table
+  — "paid only by callers who ask". Three rules make that real: no Linux concept enters the
+  nucleus, the personality is never a source of authority, and native software does not link it.
+  The RFC states that if those are ever relaxed for convenience it should be reverted rather than
+  patched.
+- **Docker and Kubernetes are answered by separating two questions.** Running OCI *images* needs
+  no Docker daemon and is already on the Phase 3 roadmap; running `dockerd` would need namespaces,
+  cgroups, overlayfs and seccomp-bpf, and would replace the domain model with Linux's. Position:
+  OCI images yes, Docker daemon never. Kubernetes is named only so nothing forecloses it.
+- **Recorded as decision C1**, and it reframes open decision **A4** (userspace ABI) rather than
+  answering it: the own-ABI-versus-POSIX choice is a false one, but the native shape still needs
+  deciding before M5.
 
 ### 2026-08-03 (M4-06b, work stealing and migration)
 
