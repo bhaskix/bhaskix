@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-03 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M3 — Memory management** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 heap works, virtual memory next |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 address spaces work, leak gate passing |
 
 ### Division of responsibility between documents
 
@@ -98,13 +98,13 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
 | M3-05 | Invariant checker | ✅ `DONE` | Walks every free list; caught the handover bug on first run |
 | M3-06 | Boot-time frame-leak self test | ✅ `DONE` | Runs on every boot, not only under test |
 | M3-07 | Slab allocator as `GlobalAlloc` | ✅ `DONE` | 12 host tests over real page-aligned memory; `Box` and `Vec` verified working in QEMU on BIOS and UEFI |
-| M3-08 | `AddressSpace`, `RangeMap`, page tables | ⬜ `TODO` | Blocks the exit criterion |
-| M3-09 | W^X and NX enforcement | ⬜ `TODO` | `Protection` type must make W+X unrepresentable |
-| M3-10 | Demand paging and copy-on-write | ⬜ `TODO` | |
-| M3-11 | Kernel stack guard pages | ⬜ `TODO` | **Closes the M2 gap**: stack-overflow-driven double fault is untestable until this exists |
+| M3-08 | `AddressSpace`, `RangeMap`, page tables | ✅ `DONE` | 14 host tests for the region map; map/unmap/translate/create/destroy in QEMU |
+| M3-09 | W^X and NX enforcement | ✅ `DONE` | `Protection` has no write+execute variant; `EFER.NXE` enabled and asserted at boot |
+| M3-10 | Demand paging and copy-on-write | ⬜ `TODO` | Mappings are eager for now; needs the page-fault handler to consult the region map |
+| M3-11 | Kernel stack guard pages | ⬜ `TODO` | **Still the open M2 gap.** `Protection::None` exists and the region map supports it; it has not been applied to the kernel stack. |
 | M3-12 | `copy_from_user` / `copy_to_user` with fixups | ⬜ `TODO` | Needed before user mode in M5 |
 | M3-13 | KASLR | ⬜ `TODO` | |
-| M3-14 | Address-space frame-leak gate (1000 create/destroy) | ⬜ `TODO` | The real gate from `memory.md` §7; needs M3-08 |
+| M3-14 | Address-space frame-leak gate (1000 create/destroy) | ✅ `DONE` | Passing, and **negative-tested**: removing page-table teardown leaks 9 frames per cycle and the gate catches it |
 
 ### Bugs found and fixed during M3
 
@@ -131,6 +131,17 @@ and slab pass; the frame-leak test passes in QEMU; `alloc` types usable througho
    negative-tested to confirm it still catches genuinely unjustified blocks.
 
 ### Honest notes on what is *not* proven
+
+- **No address space has ever been *switched to*.** Everything is created, mapped, translated
+  through, and destroyed while the kernel runs in the bootloader's address space. Loading `CR3`
+  with one of these is M5's job, and until that happens the higher-half copy is untested in the only
+  way that matters.
+- **W^X is enforced but not *attacked*.** The `Protection` type cannot express write+execute and NX
+  is on, but nothing yet tries to execute a writable page and confirms it faults. That test belongs
+  with the fault-injection suite and is not written.
+- **Mappings are eager, not demand-paged.** The region map is authoritative in structure, but the
+  page-fault handler does not consult it yet, so the design's central claim — that demand paging,
+  COW, and file-backed mappings are one mechanism — is unproven.
 
 - **The 4 GiB zone boundary has never been exercised on real memory.** QEMU was given 256 MiB, so
   every frame is in the DMA32 zone and the `Normal` path is covered only by host tests.
@@ -215,6 +226,21 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M3, address spaces)
+
+- **The M3 frame-leak gate passes**: 1000 address spaces created, mapped, translated through, and
+  destroyed with the free-frame count returning to exactly its baseline. Negative-tested by removing
+  the page-table teardown, which leaks 9 frames per cycle and fails the gate.
+- **`Protection` makes W+X unrepresentable** — there is no variant for it, so the invariant is
+  checkable by reading the enum rather than by auditing call sites. `EFER.NXE` is enabled before the
+  first mapping and asserted at boot.
+- **`RangeMap` is the source of truth**, with the page table as its cache, per `docs/memory.md` §3.
+  14 host tests, including one checking the binary search against a linear scan across every address
+  in a small space, and one asserting that whatever `find_free` suggests, `insert` accepts.
+- **A deadlock avoided by design, and documented**: the region map is a `Vec`, so touching it
+  allocates through the global allocator, which takes the heap lock the physical allocator lives
+  behind. Region-map work therefore happens strictly outside that lock.
 
 ### 2026-08-03 (M3, kernel heap)
 

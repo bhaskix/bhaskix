@@ -29,6 +29,7 @@
 
 pub mod bump;
 pub mod pmm;
+pub mod vm;
 
 #[allow(unsafe_code)]
 pub mod slab;
@@ -36,3 +37,4 @@ pub mod slab;
 pub use bump::{BumpAllocator, FRAME_SIZE};
 pub use pmm::{Frame, Pmm, Zone};
 pub use slab::{Heap, HeapError};
+pub use vm::{Protection, RangeMap, VirtRange, VmRegion};

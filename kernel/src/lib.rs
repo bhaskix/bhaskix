@@ -37,6 +37,7 @@ pub mod memory;
 pub mod panic;
 pub mod sync;
 pub mod trap;
+pub mod vm;
 
 use bhaskix_arch::cpu;
 use bhaskix_arch::serial::COM1;
@@ -145,6 +146,26 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
             // `alloc` types work.
             heap::init(pmm, handoff.hhdm_base.as_u64());
             memory::heap_self_test();
+
+            // No-execute must be on before any mapping carrying the NX bit is
+            // created, or the CPU treats bit 63 as reserved and the mapping
+            // faults instead of being non-executable.
+            //
+            // SAFETY: bootstrap CPU during init, before the first mapping.
+            if unsafe { bhaskix_arch::paging::enable_no_execute() } {
+                println!("    no-execute     enabled (W^X enforceable)");
+            } else {
+                println!("    no-execute     UNAVAILABLE -- W^X cannot be enforced");
+            }
+
+            const LEAK_CYCLES: u32 = 1000;
+            if vm::self_test(handoff.hhdm_base.as_u64(), LEAK_CYCLES) {
+                println!(
+                    "    address spaces {LEAK_CYCLES} created and destroyed, no frames leaked"
+                );
+            } else {
+                println!("    address spaces FAILED");
+            }
         }
         Err(error) => {
             println!();

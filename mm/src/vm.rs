@@ -1,0 +1,619 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Virtual memory regions and the map that owns them.
+//!
+//! Implements the portable half of `docs/memory.md` §3. The page table is a
+//! *cache* of what this module says; the [`RangeMap`] is the source of truth.
+//!
+//! That inversion is the important design choice. On a page fault the kernel
+//! consults the region map to decide whether the access is legal, and only
+//! then populates the page table. It is what makes demand paging,
+//! copy-on-write, and file-backed mappings one mechanism rather than three
+//! special cases — and it means a missing page table entry is a normal
+//! condition rather than a bug.
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::fmt;
+
+use bhaskix_boot::VirtAddr;
+
+/// Size of a virtual page.
+pub const PAGE_SIZE: u64 = 4096;
+
+/// What a mapping permits.
+///
+/// **Write and execute cannot both be set.** There is no variant for it, no
+/// flag to override it, and no boot parameter that relaxes it
+/// (`docs/memory.md` §3). JIT workloads use two mappings of the same frames
+/// with different protections, which is the standard modern approach and keeps
+/// the invariant checkable by reading this enum rather than by auditing every
+/// call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protection {
+    /// Present but inaccessible — a guard page.
+    ///
+    /// Distinct from "not mapped": the region exists and is reserved, so a
+    /// fault on it is a stack overflow or a deliberate probe rather than a
+    /// wild pointer, and the fault handler can say which.
+    None,
+    /// Readable only.
+    ReadOnly,
+    /// Readable and writable. Not executable.
+    ReadWrite,
+    /// Readable and executable. Not writable.
+    ReadExecute,
+}
+
+impl Protection {
+    /// Whether reads are permitted.
+    #[must_use]
+    pub const fn readable(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether writes are permitted.
+    #[must_use]
+    pub const fn writable(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+
+    /// Whether instruction fetches are permitted.
+    #[must_use]
+    pub const fn executable(self) -> bool {
+        matches!(self, Self::ReadExecute)
+    }
+
+    /// Whether this mapping should be present in the page table at all.
+    #[must_use]
+    pub const fn present(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl fmt::Display for Protection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::None => "---",
+            Self::ReadOnly => "r--",
+            Self::ReadWrite => "rw-",
+            Self::ReadExecute => "r-x",
+        })
+    }
+}
+
+/// A half-open range of virtual addresses, `[start, end)`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VirtRange {
+    /// First address in the range. Page aligned.
+    pub start: VirtAddr,
+    /// One past the last address. Page aligned.
+    pub end: VirtAddr,
+}
+
+impl VirtRange {
+    /// Creates a range, returning `None` unless it is page-aligned and
+    /// non-empty.
+    #[must_use]
+    pub const fn new(start: VirtAddr, end: VirtAddr) -> Option<Self> {
+        if start.as_u64() >= end.as_u64() {
+            return None;
+        }
+        if !start.as_u64().is_multiple_of(PAGE_SIZE) || !end.as_u64().is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+        Some(Self { start, end })
+    }
+
+    /// Creates a range of `pages` pages starting at `start`.
+    #[must_use]
+    pub const fn from_pages(start: VirtAddr, pages: u64) -> Option<Self> {
+        Self::new(start, VirtAddr(start.as_u64() + pages * PAGE_SIZE))
+    }
+
+    /// Length in bytes.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.end.as_u64() - self.start.as_u64()
+    }
+
+    /// Whether the range covers no bytes. Never true for a constructed range.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of pages spanned.
+    #[must_use]
+    pub const fn pages(&self) -> u64 {
+        self.len() / PAGE_SIZE
+    }
+
+    /// Whether `address` falls inside.
+    #[must_use]
+    pub const fn contains(&self, address: VirtAddr) -> bool {
+        address.as_u64() >= self.start.as_u64() && address.as_u64() < self.end.as_u64()
+    }
+
+    /// Whether two ranges share any address.
+    #[must_use]
+    pub const fn overlaps(&self, other: &Self) -> bool {
+        self.start.as_u64() < other.end.as_u64() && other.start.as_u64() < self.end.as_u64()
+    }
+
+    /// Iterates the page-aligned addresses in the range.
+    pub fn pages_iter(&self) -> impl Iterator<Item = VirtAddr> + '_ {
+        (0..self.pages()).map(|index| VirtAddr(self.start.as_u64() + index * PAGE_SIZE))
+    }
+}
+
+impl fmt::Debug for VirtRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:#018x}..{:#018x}",
+            self.start.as_u64(),
+            self.end.as_u64()
+        )
+    }
+}
+
+/// What backs a region's pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backing {
+    /// Zero-filled on first touch.
+    Anonymous,
+    /// A fixed physical range — device registers, or the kernel image.
+    Direct {
+        /// Physical address the region starts at.
+        physical: u64,
+    },
+    /// Reserved address space with nothing behind it. Guard pages.
+    Reserved,
+}
+
+/// Additional properties of a region.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegionFlags {
+    /// Writes fault and copy the frame rather than modifying it.
+    pub copy_on_write: bool,
+    /// Never reclaimed or swapped.
+    pub locked: bool,
+    /// Mapped eagerly rather than on first fault.
+    pub populate: bool,
+}
+
+/// One contiguous mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VmRegion {
+    /// The addresses covered.
+    pub range: VirtRange,
+    /// What access is permitted.
+    pub protection: Protection,
+    /// What the pages are backed by.
+    pub backing: Backing,
+    /// Additional properties.
+    pub flags: RegionFlags,
+}
+
+impl VmRegion {
+    /// A region with default flags.
+    #[must_use]
+    pub const fn new(range: VirtRange, protection: Protection, backing: Backing) -> Self {
+        Self {
+            range,
+            protection,
+            backing,
+            flags: RegionFlags {
+                copy_on_write: false,
+                locked: false,
+                populate: false,
+            },
+        }
+    }
+}
+
+/// Why a region could not be inserted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeMapError {
+    /// The range overlaps an existing region, at this index.
+    Overlaps(usize),
+    /// No region covers the requested range.
+    NotFound,
+    /// Out of memory while growing the map.
+    OutOfMemory,
+}
+
+/// A sorted, non-overlapping set of regions.
+///
+/// A `Vec` with binary search rather than a balanced tree. Address spaces
+/// hold tens of regions, not thousands, and at that size the flat array wins
+/// on both cache behaviour and on being obviously correct — which matters more
+/// here, since this structure decides whether a memory access is legal. If
+/// profiling ever shows the linear insert cost mattering, the interface is
+/// narrow enough to swap the implementation behind.
+#[derive(Clone, Debug, Default)]
+pub struct RangeMap {
+    regions: Vec<VmRegion>,
+}
+
+impl RangeMap {
+    /// An empty map.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+        }
+    }
+
+    /// Number of regions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Whether the map holds no regions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    /// All regions, in ascending address order.
+    pub fn iter(&self) -> impl Iterator<Item = &VmRegion> {
+        self.regions.iter()
+    }
+
+    /// Index of the region containing `address`, if any.
+    fn index_of(&self, address: VirtAddr) -> Option<usize> {
+        // Binary search for the last region starting at or below `address`,
+        // then check that it actually reaches far enough.
+        let mut low = 0usize;
+        let mut high = self.regions.len();
+        while low < high {
+            let mid = (low + high) / 2;
+            if self.regions[mid].range.start.as_u64() <= address.as_u64() {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if low == 0 {
+            return None;
+        }
+        let candidate = low - 1;
+        if self.regions[candidate].range.contains(address) {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    /// The region containing `address`, if any.
+    #[must_use]
+    pub fn find(&self, address: VirtAddr) -> Option<&VmRegion> {
+        self.index_of(address).map(|index| &self.regions[index])
+    }
+
+    /// Inserts `region`, keeping the map sorted.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeMapError::Overlaps`] if it intersects an existing region.
+    /// Overlap is rejected rather than resolved: silently replacing part of a
+    /// mapping is how a region ends up with two owners.
+    pub fn insert(&mut self, region: VmRegion) -> Result<(), RangeMapError> {
+        let position = self.regions.partition_point(|existing| {
+            existing.range.start.as_u64() < region.range.start.as_u64()
+        });
+
+        // Only the neighbours can overlap, because the map is sorted and
+        // already non-overlapping.
+        if position > 0 && self.regions[position - 1].range.overlaps(&region.range) {
+            return Err(RangeMapError::Overlaps(position - 1));
+        }
+        if position < self.regions.len() && self.regions[position].range.overlaps(&region.range) {
+            return Err(RangeMapError::Overlaps(position));
+        }
+
+        self.regions
+            .try_reserve(1)
+            .map_err(|_| RangeMapError::OutOfMemory)?;
+        self.regions.insert(position, region);
+        Ok(())
+    }
+
+    /// Removes the region starting exactly at `start`, returning it.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeMapError::NotFound`] if no region starts there. Partial
+    /// unmapping — splitting a region in two — is deliberately not supported
+    /// yet: it needs the page-table teardown to split with it, and doing one
+    /// without the other leaves the table describing memory the map says is
+    /// gone.
+    pub fn remove(&mut self, start: VirtAddr) -> Result<VmRegion, RangeMapError> {
+        let index = self
+            .regions
+            .iter()
+            .position(|region| region.range.start == start)
+            .ok_or(RangeMapError::NotFound)?;
+        Ok(self.regions.remove(index))
+    }
+
+    /// Removes and returns every region, leaving the map empty.
+    ///
+    /// Used when tearing an address space down, where every mapping has to be
+    /// walked to release its frames.
+    pub fn drain(&mut self) -> Vec<VmRegion> {
+        core::mem::take(&mut self.regions)
+    }
+
+    /// Finds `pages` consecutive free pages within `[low, high)`.
+    ///
+    /// Returns the lowest such range, so allocation is deterministic and
+    /// therefore reproducible in tests. Randomised placement belongs with
+    /// ASLR, which is a policy layered on top rather than a property of this
+    /// structure.
+    #[must_use]
+    pub fn find_free(&self, low: VirtAddr, high: VirtAddr, pages: u64) -> Option<VirtRange> {
+        let needed = pages * PAGE_SIZE;
+        let mut candidate = low.as_u64();
+
+        for region in &self.regions {
+            let start = region.range.start.as_u64();
+            let end = region.range.end.as_u64();
+
+            if end <= candidate {
+                continue; // Entirely below the search cursor.
+            }
+            if start >= high.as_u64() {
+                break; // Beyond the search window; the map is sorted.
+            }
+            if start.saturating_sub(candidate) >= needed {
+                return VirtRange::from_pages(VirtAddr(candidate), pages);
+            }
+            candidate = candidate.max(end);
+        }
+
+        if high.as_u64().saturating_sub(candidate) >= needed {
+            return VirtRange::from_pages(VirtAddr(candidate), pages);
+        }
+        None
+    }
+
+    /// Checks that the map is sorted and non-overlapping.
+    ///
+    /// # Errors
+    ///
+    /// A description of the first invariant that does not hold.
+    pub fn check_invariants(&self) -> Result<(), &'static str> {
+        for pair in self.regions.windows(2) {
+            if pair[1].range.start.as_u64() < pair[0].range.end.as_u64() {
+                return Err("regions overlap or are out of order");
+            }
+        }
+        for region in &self.regions {
+            if region.range.is_empty() {
+                return Err("a region covers no pages");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(start: u64, pages: u64) -> VirtRange {
+        VirtRange::from_pages(VirtAddr(start), pages).unwrap()
+    }
+
+    fn region(start: u64, pages: u64) -> VmRegion {
+        VmRegion::new(
+            range(start, pages),
+            Protection::ReadWrite,
+            Backing::Anonymous,
+        )
+    }
+
+    #[test]
+    fn write_and_execute_cannot_both_be_permitted() {
+        // The guarantee is structural: there is no variant that is both, so
+        // this is checkable by reading the enum rather than by auditing calls.
+        for protection in [
+            Protection::None,
+            Protection::ReadOnly,
+            Protection::ReadWrite,
+            Protection::ReadExecute,
+        ] {
+            assert!(
+                !(protection.writable() && protection.executable()),
+                "{protection:?} permits both writing and execution"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_pages_are_not_present() {
+        assert!(!Protection::None.present());
+        assert!(!Protection::None.readable());
+        assert!(Protection::ReadOnly.present());
+    }
+
+    #[test]
+    fn ranges_must_be_page_aligned_and_non_empty() {
+        assert!(VirtRange::new(VirtAddr(0x1000), VirtAddr(0x2000)).is_some());
+        assert!(VirtRange::new(VirtAddr(0x1001), VirtAddr(0x2000)).is_none());
+        assert!(VirtRange::new(VirtAddr(0x1000), VirtAddr(0x2001)).is_none());
+        assert!(VirtRange::new(VirtAddr(0x2000), VirtAddr(0x2000)).is_none());
+        assert!(VirtRange::new(VirtAddr(0x3000), VirtAddr(0x2000)).is_none());
+    }
+
+    #[test]
+    fn overlap_detection_is_exact_at_the_boundary() {
+        let a = range(0x1000, 2); // 0x1000..0x3000
+        let b = range(0x3000, 1); // abuts, does not overlap
+        let c = range(0x2000, 1); // overlaps
+        assert!(!a.overlaps(&b));
+        assert!(a.overlaps(&c));
+        assert!(c.overlaps(&a));
+    }
+
+    #[test]
+    fn insert_keeps_the_map_sorted() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x5000, 1)).unwrap();
+        map.insert(region(0x1000, 1)).unwrap();
+        map.insert(region(0x3000, 1)).unwrap();
+
+        let starts: Vec<u64> = map.iter().map(|r| r.range.start.as_u64()).collect();
+        assert_eq!(starts, vec![0x1000, 0x3000, 0x5000]);
+        assert_eq!(map.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn insert_rejects_overlap_rather_than_resolving_it() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 4)).unwrap(); // 0x1000..0x5000
+        assert!(matches!(
+            map.insert(region(0x2000, 1)),
+            Err(RangeMapError::Overlaps(_))
+        ));
+        assert!(matches!(
+            map.insert(region(0x1000, 8)),
+            Err(RangeMapError::Overlaps(_))
+        ));
+        // Abutting is fine.
+        assert_eq!(map.insert(region(0x5000, 1)), Ok(()));
+        assert_eq!(map.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn find_locates_the_containing_region() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 2)).unwrap(); // 0x1000..0x3000
+        map.insert(region(0x8000, 1)).unwrap(); // 0x8000..0x9000
+
+        assert!(map.find(VirtAddr(0x1000)).is_some());
+        assert!(map.find(VirtAddr(0x2fff)).is_some());
+        assert!(map.find(VirtAddr(0x3000)).is_none(), "end is exclusive");
+        assert!(map.find(VirtAddr(0x7fff)).is_none());
+        assert!(map.find(VirtAddr(0x8000)).is_some());
+        assert!(map.find(VirtAddr(0x9000)).is_none());
+        assert!(map.find(VirtAddr(0)).is_none());
+    }
+
+    #[test]
+    fn find_agrees_with_a_linear_scan() {
+        // The binary search is the part most likely to be subtly wrong, so it
+        // is checked against the obvious implementation across every address
+        // in a small space.
+        let mut map = RangeMap::new();
+        for start in [0x1000u64, 0x4000, 0x5000, 0x9000] {
+            map.insert(region(start, 1)).unwrap();
+        }
+        for address in (0..0xc000u64).step_by(0x800) {
+            let expected = map
+                .iter()
+                .find(|r| r.range.contains(VirtAddr(address)))
+                .copied();
+            let actual = map.find(VirtAddr(address)).copied();
+            assert_eq!(actual, expected, "disagreement at {address:#x}");
+        }
+    }
+
+    #[test]
+    fn remove_returns_the_region_and_shrinks_the_map() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 1)).unwrap();
+        map.insert(region(0x2000, 1)).unwrap();
+
+        let removed = map.remove(VirtAddr(0x1000)).unwrap();
+        assert_eq!(removed.range.start.as_u64(), 0x1000);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.remove(VirtAddr(0x1000)), Err(RangeMapError::NotFound));
+    }
+
+    #[test]
+    fn drain_empties_the_map_and_yields_everything() {
+        let mut map = RangeMap::new();
+        for start in [0x1000u64, 0x2000, 0x3000] {
+            map.insert(region(start, 1)).unwrap();
+        }
+        let drained = map.drain();
+        assert_eq!(drained.len(), 3);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn find_free_returns_the_lowest_gap_that_fits() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x2000, 1)).unwrap(); // 0x2000..0x3000
+        map.insert(region(0x5000, 1)).unwrap(); // 0x5000..0x6000
+
+        // Below the first region.
+        let found = map
+            .find_free(VirtAddr(0x1000), VirtAddr(0x10000), 1)
+            .unwrap();
+        assert_eq!(found.start.as_u64(), 0x1000);
+
+        // Two pages do not fit at 0x1000, so the gap at 0x3000 is used.
+        let found = map
+            .find_free(VirtAddr(0x1000), VirtAddr(0x10000), 2)
+            .unwrap();
+        assert_eq!(found.start.as_u64(), 0x3000);
+    }
+
+    #[test]
+    fn find_free_never_returns_an_occupied_range() {
+        let mut map = RangeMap::new();
+        for start in [0x2000u64, 0x4000, 0x7000] {
+            map.insert(region(start, 1)).unwrap();
+        }
+        for pages in 1..=3 {
+            if let Some(found) = map.find_free(VirtAddr(0x1000), VirtAddr(0x10000), pages) {
+                for existing in map.iter() {
+                    assert!(
+                        !found.overlaps(&existing.range),
+                        "find_free returned {found:?}, which overlaps {:?}",
+                        existing.range
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_free_reports_failure_when_the_window_is_full() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 1)).unwrap();
+        assert!(
+            map.find_free(VirtAddr(0x1000), VirtAddr(0x2000), 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_freshly_found_range_can_always_be_inserted() {
+        // The property that ties the two operations together: whatever
+        // find_free suggests, insert must accept.
+        let mut map = RangeMap::new();
+        for _ in 0..50 {
+            let Some(found) = map.find_free(VirtAddr(0x1000), VirtAddr(0x100000), 2) else {
+                break;
+            };
+            let inserted = map.insert(VmRegion::new(
+                found,
+                Protection::ReadWrite,
+                Backing::Anonymous,
+            ));
+            assert_eq!(
+                inserted,
+                Ok(()),
+                "find_free suggested {found:?}, which insert rejected"
+            );
+        }
+        assert_eq!(map.check_invariants(), Ok(()));
+    }
+}

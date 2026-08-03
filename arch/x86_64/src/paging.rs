@@ -15,15 +15,12 @@
 //!
 //! - **4 KiB pages only.** No huge-page support and no huge-page splitting. If
 //!   a mapping would land inside an existing huge page, this refuses rather
-//!   than doing something clever. Splitting a huge page correctly requires
-//!   knowing what else lives inside it, which needs the M3 bookkeeping.
-//! - **No unmapping.** Nothing at M2 unmaps anything, and an unmap that does
-//!   not shoot down the TLB on other CPUs would be a latent correctness bug
-//!   waiting for M4.
-//! - **Single-CPU only.** No TLB shootdown, because there is no second CPU.
-//!
-//! Each of those becomes wrong in M3 or M4, which is why this module is small
-//! enough to delete outright when the real one lands.
+//!   than doing something clever. Splitting one correctly requires knowing
+//!   what else lives inside it, which is bookkeeping the region map owns.
+//! - **Single-CPU only.** Unmapping invalidates the local TLB and nothing
+//!   else. On SMP that is a correctness bug, so M4 must add shootdown before
+//!   the second CPU starts.
+//! - **No accessed/dirty tracking.** Needed for reclaim, which is Phase 2.
 
 /// Page table entry flags.
 pub mod flags {
@@ -56,6 +53,60 @@ pub mod flags {
 /// Mask selecting the physical address out of a page table entry.
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
+/// Entries per page table at every level.
+pub const ENTRIES: usize = 512;
+
+/// First PML4 index belonging to the kernel half of the address space.
+///
+/// Entries 0-255 map the lower half and belong to whichever domain is running;
+/// 256-511 map the higher half and are shared by every address space, so that
+/// the kernel stays mapped across a context switch.
+pub const KERNEL_PML4_START: usize = 256;
+
+/// `IA32_EFER` bit 11: no-execute enable.
+///
+/// Without it the CPU treats bit 63 of a page table entry as reserved, so an
+/// entry carrying [`flags::NO_EXECUTE`] faults with a reserved-bit error
+/// instead of being non-executable. W^X therefore depends on this being set
+/// before the first mapping is created (`docs/memory.md` §3).
+const EFER_NXE: u64 = 1 << 11;
+
+/// Enables no-execute page protection.
+///
+/// # Errors
+///
+/// Returns `false` if the CPU does not support NX, in which case W^X cannot be
+/// enforced at all and the caller must treat that as fatal.
+///
+/// # Safety
+///
+/// Must run on the bootstrap CPU during init, before any mapping carrying
+/// [`flags::NO_EXECUTE`] is created.
+pub unsafe fn enable_no_execute() -> bool {
+    if !crate::msr::features().nx {
+        return false;
+    }
+    // SAFETY: `IA32_EFER` is architectural, and the caller guarantees this runs
+    // during single-threaded init. Only the NXE bit is changed; long mode and
+    // syscall enables in the same register are preserved.
+    unsafe {
+        let efer = crate::msr::read(crate::msr::IA32_EFER);
+        crate::msr::write(crate::msr::IA32_EFER, efer | EFER_NXE);
+    }
+    true
+}
+
+/// Whether no-execute is currently enabled.
+///
+/// # Safety
+///
+/// Safe at CPL 0; unsafe only because it reads an MSR.
+#[must_use]
+pub unsafe fn no_execute_enabled() -> bool {
+    // SAFETY: `IA32_EFER` is architectural on every x86-64 CPU.
+    unsafe { crate::msr::read(crate::msr::IA32_EFER) & EFER_NXE != 0 }
+}
+
 /// Why a mapping could not be created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapError {
@@ -67,6 +118,8 @@ pub enum MapError {
     AlreadyMapped,
     /// The frame allocator had nothing left.
     OutOfMemory,
+    /// Nothing is mapped at the address.
+    NotMapped,
 }
 
 /// Reads `CR3`, the physical address of the active top-level page table.
@@ -103,95 +156,317 @@ pub unsafe fn invalidate(virtual_address: u64) {
     }
 }
 
-/// Maps one 4 KiB page of device memory.
+/// Splits a virtual address into its four page-table indices, top down.
+const fn indices_of(virtual_address: u64) -> [usize; 4] {
+    [
+        ((virtual_address >> 39) & 0x1ff) as usize,
+        ((virtual_address >> 30) & 0x1ff) as usize,
+        ((virtual_address >> 21) & 0x1ff) as usize,
+        ((virtual_address >> 12) & 0x1ff) as usize,
+    ]
+}
+
+/// Maps one 4 KiB page into `root`.
 ///
-/// `allocate_frame` supplies zeroed-capable physical frames for any page
-/// tables that have to be created; this function zeroes them itself, since the
-/// allocator cannot write physical memory.
+/// `allocate_frame` supplies physical frames for any page tables that have to
+/// be created. They are zeroed here, before being linked in — the allocator
+/// cannot write physical memory, and a table full of whatever was there before
+/// is a set of mappings to arbitrary memory that the CPU would honour the
+/// instant the link is written.
 ///
 /// # Errors
 ///
-/// See [`MapError`]. Notably, an existing mapping to the *same* frame is
-/// treated as success — mapping the APIC twice is harmless — while a mapping
-/// to a different frame is an error rather than a silent overwrite.
+/// See [`MapError`]. An existing mapping to the *same* frame is success;
+/// mapping to a different frame is [`MapError::AlreadyMapped`] rather than a
+/// silent overwrite, because overwriting loses whoever owned the old frame.
 ///
 /// # Safety
 ///
 /// The caller must ensure:
-/// - `hhdm_base` is the higher-half direct map base, so page tables can be
-///   reached at `hhdm_base + physical`.
-/// - No other CPU is running, and no other code is modifying page tables.
-///   There is no locking here and no TLB shootdown.
-/// - `physical` really is device memory that is safe to map.
+/// - `root` is the physical address of a valid PML4.
+/// - `hhdm_base` is the direct map base, so tables are reachable at
+///   `hhdm_base + physical`.
+/// - No other CPU is running and nothing else is modifying these tables:
+///   there is no locking here and no TLB shootdown.
+pub unsafe fn map_page(
+    root: u64,
+    virtual_address: u64,
+    physical: u64,
+    entry_flags: u64,
+    hhdm_base: u64,
+    allocate_frame: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(), MapError> {
+    if !virtual_address.is_multiple_of(4096) || !physical.is_multiple_of(4096) {
+        return Err(MapError::Misaligned);
+    }
+
+    let indices = indices_of(virtual_address);
+
+    // SAFETY: the caller guarantees `root` is a PML4 and `hhdm_base` maps
+    // physical memory, so every table reached below is a real page table.
+    unsafe {
+        let mut table = (hhdm_base + root) as *mut u64;
+
+        for &index in &indices[..3] {
+            let entry = table.add(index);
+            let value = entry.read_volatile();
+
+            let next = if value & flags::PRESENT == 0 {
+                let frame = allocate_frame().ok_or(MapError::OutOfMemory)?;
+                core::ptr::write_bytes((hhdm_base + frame) as *mut u8, 0, 4096);
+
+                // Intermediate entries are permissive; the leaf decides the
+                // real protection. x86 takes the AND of permissions down the
+                // path, so restricting here would silently constrain unrelated
+                // mappings that happen to share this table.
+                //
+                // USER is included for lower-half addresses for the same
+                // reason: without it, no leaf below could ever be reachable
+                // from user mode.
+                let mut link = frame | flags::PRESENT | flags::WRITABLE;
+                if entry_flags & flags::USER != 0 {
+                    link |= flags::USER;
+                }
+                entry.write_volatile(link);
+                frame
+            } else if value & flags::HUGE != 0 {
+                return Err(MapError::HugePageInTheWay);
+            } else {
+                // An existing intermediate entry may need widening to USER if
+                // this is the first user mapping beneath it.
+                if entry_flags & flags::USER != 0 && value & flags::USER == 0 {
+                    entry.write_volatile(value | flags::USER);
+                }
+                value & ADDRESS_MASK
+            };
+
+            table = (hhdm_base + next) as *mut u64;
+        }
+
+        let entry = table.add(indices[3]);
+        let existing = entry.read_volatile();
+        if existing & flags::PRESENT != 0 {
+            return if existing & ADDRESS_MASK == physical {
+                Ok(())
+            } else {
+                Err(MapError::AlreadyMapped)
+            };
+        }
+
+        entry.write_volatile(physical | entry_flags);
+        invalidate(virtual_address);
+    }
+
+    Ok(())
+}
+
+/// Maps one 4 KiB page of device memory into the active address space.
+///
+/// # Errors
+///
+/// See [`MapError`].
+///
+/// # Safety
+///
+/// As [`map_page`], and `physical` must really be device memory.
 pub unsafe fn map_device_page(
     virtual_address: u64,
     physical: u64,
     hhdm_base: u64,
     allocate_frame: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<(), MapError> {
-    if virtual_address & 0xfff != 0 || physical & 0xfff != 0 {
-        return Err(MapError::Misaligned);
-    }
-
-    // One index per paging level, from the top down.
-    let indices = [
-        ((virtual_address >> 39) & 0x1ff) as usize,
-        ((virtual_address >> 30) & 0x1ff) as usize,
-        ((virtual_address >> 21) & 0x1ff) as usize,
-        ((virtual_address >> 12) & 0x1ff) as usize,
-    ];
-
-    // SAFETY: the caller guarantees `hhdm_base` maps physical memory and that
-    // nothing else is touching the page tables concurrently.
+    // SAFETY: delegated to `map_page`; the active page table is by definition
+    // a valid PML4.
     unsafe {
-        let mut table = (hhdm_base + active_page_table()) as *mut u64;
+        let root = active_page_table();
+        map_page(
+            root,
+            virtual_address,
+            physical,
+            flags::DEVICE,
+            hhdm_base,
+            allocate_frame,
+        )
+    }
+}
 
-        // Descend the three upper levels, creating tables where absent.
+/// Returns the physical address `virtual_address` maps to, if any.
+///
+/// # Safety
+///
+/// `root` must be a valid PML4 and `hhdm_base` the direct map base.
+#[must_use]
+pub unsafe fn translate(root: u64, virtual_address: u64, hhdm_base: u64) -> Option<u64> {
+    let indices = indices_of(virtual_address);
+
+    // SAFETY: the caller guarantees `root` is a PML4 reachable through the
+    // direct map. Every read is of a table entry; nothing is written.
+    unsafe {
+        let mut table = (hhdm_base + root) as *mut u64;
+
         for &index in &indices[..3] {
-            let entry = table.add(index);
-            let value = entry.read_volatile();
+            let value = table.add(index).read_volatile();
+            if value & flags::PRESENT == 0 {
+                return None;
+            }
+            if value & flags::HUGE != 0 {
+                return None; // Not a 4 KiB mapping; out of scope here.
+            }
+            table = (hhdm_base + (value & ADDRESS_MASK)) as *mut u64;
+        }
 
-            let next_physical = if value & flags::PRESENT == 0 {
-                let frame = allocate_frame().ok_or(MapError::OutOfMemory)?;
+        let leaf = table.add(indices[3]).read_volatile();
+        if leaf & flags::PRESENT == 0 {
+            None
+        } else {
+            Some((leaf & ADDRESS_MASK) | (virtual_address & 0xfff))
+        }
+    }
+}
 
-                // Zero it before linking it in. A page table full of whatever
-                // was there before is a set of mappings to arbitrary memory,
-                // and the CPU would honour them the moment the link is
-                // written -- so the order here matters.
-                core::ptr::write_bytes((hhdm_base + frame) as *mut u8, 0, 4096);
+/// Removes the mapping at `virtual_address`, returning the frame it pointed at.
+///
+/// The frame is *not* freed: ownership belongs to whoever mapped it, and this
+/// module has no way to know whether it is anonymous memory, a device
+/// register, or shared with another address space.
+///
+/// # Errors
+///
+/// [`MapError::NotMapped`] if nothing was mapped there.
+///
+/// # Safety
+///
+/// As [`map_page`]. In particular there is **no TLB shootdown**: on SMP, other
+/// CPUs may keep using the stale translation, so this must not be called once
+/// a second CPU is running until M4 adds shootdown.
+pub unsafe fn unmap_page(root: u64, virtual_address: u64, hhdm_base: u64) -> Result<u64, MapError> {
+    let indices = indices_of(virtual_address);
 
-                // Intermediate entries are permissive; the leaf entry decides
-                // the actual protection. This is how x86 paging works: the
-                // effective permission is the AND down the path, so being
-                // restrictive here would silently constrain unrelated
-                // mappings that share this table.
-                entry.write_volatile(frame | flags::PRESENT | flags::WRITABLE);
-                frame
-            } else if value & flags::HUGE != 0 {
-                // Refuse rather than split. Splitting needs to know what else
-                // lives inside the huge page, which is M3 bookkeeping.
+    // SAFETY: as `translate`, plus a single write to clear the leaf entry.
+    unsafe {
+        let mut table = (hhdm_base + root) as *mut u64;
+
+        for &index in &indices[..3] {
+            let value = table.add(index).read_volatile();
+            if value & flags::PRESENT == 0 {
+                return Err(MapError::NotMapped);
+            }
+            if value & flags::HUGE != 0 {
                 return Err(MapError::HugePageInTheWay);
-            } else {
-                value & ADDRESS_MASK
-            };
-
-            table = (hhdm_base + next_physical) as *mut u64;
+            }
+            table = (hhdm_base + (value & ADDRESS_MASK)) as *mut u64;
         }
 
-        // The leaf.
         let entry = table.add(indices[3]);
-        let existing = entry.read_volatile();
-        if existing & flags::PRESENT != 0 {
-            return if existing & ADDRESS_MASK == physical {
-                Ok(()) // Already mapped to exactly this frame.
-            } else {
-                Err(MapError::AlreadyMapped)
-            };
+        let leaf = entry.read_volatile();
+        if leaf & flags::PRESENT == 0 {
+            return Err(MapError::NotMapped);
         }
 
-        entry.write_volatile(physical | flags::DEVICE);
+        entry.write_volatile(0);
         invalidate(virtual_address);
+        Ok(leaf & ADDRESS_MASK)
+    }
+}
+
+/// Creates a fresh address space, sharing the kernel's higher half.
+///
+/// Returns the physical address of the new PML4. The lower half is empty; the
+/// upper half is copied from `template`, so the kernel remains mapped after a
+/// switch to this address space — without which the very next instruction
+/// after loading `CR3` would fault.
+///
+/// # Errors
+///
+/// [`MapError::OutOfMemory`].
+///
+/// # Safety
+///
+/// `template` must be a valid PML4 whose higher half describes the kernel, and
+/// `hhdm_base` the direct map base.
+pub unsafe fn create_address_space(
+    template: u64,
+    hhdm_base: u64,
+    allocate_frame: &mut dyn FnMut() -> Option<u64>,
+) -> Result<u64, MapError> {
+    let frame = allocate_frame().ok_or(MapError::OutOfMemory)?;
+
+    // SAFETY: `frame` was just allocated and is reachable through the direct
+    // map; `template` is a valid PML4 per the caller's obligation. The new
+    // table is fully written before it is usable.
+    unsafe {
+        let new = (hhdm_base + frame) as *mut u64;
+        let old = (hhdm_base + template) as *const u64;
+
+        core::ptr::write_bytes(new.cast::<u8>(), 0, 4096);
+        for index in KERNEL_PML4_START..ENTRIES {
+            new.add(index)
+                .write_volatile(old.add(index).read_volatile());
+        }
     }
 
-    Ok(())
+    Ok(frame)
+}
+
+/// Frees every page-table frame belonging to the lower half of `root`, then
+/// `root` itself. Returns how many frames were freed.
+///
+/// Only the lower half: the higher half is shared with every other address
+/// space, and freeing it would unmap the kernel out from under the machine.
+///
+/// Leaf-mapped frames are **not** freed. They belong to whoever mapped them,
+/// and are released by the region map that owns them.
+///
+/// # Safety
+///
+/// `root` must be a valid PML4 that is not currently loaded in `CR3`, and
+/// nothing may reference it afterwards.
+pub unsafe fn destroy_address_space(
+    root: u64,
+    hhdm_base: u64,
+    free_frame: &mut dyn FnMut(u64),
+) -> u64 {
+    let mut freed = 0u64;
+
+    // SAFETY: the caller guarantees `root` is a valid, inactive PML4 reachable
+    // through the direct map. Only table entries are read.
+    unsafe {
+        let pml4 = (hhdm_base + root) as *const u64;
+
+        for pml4_index in 0..KERNEL_PML4_START {
+            let pdpt_entry = pml4.add(pml4_index).read_volatile();
+            if pdpt_entry & flags::PRESENT == 0 || pdpt_entry & flags::HUGE != 0 {
+                continue;
+            }
+            let pdpt_frame = pdpt_entry & ADDRESS_MASK;
+            let pdpt = (hhdm_base + pdpt_frame) as *const u64;
+
+            for pdpt_index in 0..ENTRIES {
+                let pd_entry = pdpt.add(pdpt_index).read_volatile();
+                if pd_entry & flags::PRESENT == 0 || pd_entry & flags::HUGE != 0 {
+                    continue;
+                }
+                let pd_frame = pd_entry & ADDRESS_MASK;
+                let pd = (hhdm_base + pd_frame) as *const u64;
+
+                for pd_index in 0..ENTRIES {
+                    let pt_entry = pd.add(pd_index).read_volatile();
+                    if pt_entry & flags::PRESENT == 0 || pt_entry & flags::HUGE != 0 {
+                        continue;
+                    }
+                    free_frame(pt_entry & ADDRESS_MASK);
+                    freed += 1;
+                }
+
+                free_frame(pd_frame);
+                freed += 1;
+            }
+
+            free_frame(pdpt_frame);
+            freed += 1;
+        }
+    }
+
+    free_frame(root);
+    freed + 1
 }

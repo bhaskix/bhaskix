@@ -122,6 +122,22 @@ else
     status=1
 fi
 
+if grep -qF "no-execute     enabled" "$LOG"; then
+    pass "no-execute enabled (W^X enforceable)"
+else
+    fail "no-execute is not enabled -- W^X cannot be enforced"
+    status=1
+fi
+
+# The M3 exit gate from docs/memory.md §7. Negative-tested: removing the
+# page-table teardown leaks 9 frames per cycle and this catches it.
+if grep -qF "created and destroyed, no frames leaked" "$LOG"; then
+    pass "1000 address spaces created and destroyed, no frames leaked"
+else
+    fail "address space frame-leak gate did not pass"
+    status=1
+fi
+
 # The handoff must have been validated, not skipped.
 if grep -qF "handoff version 1" "$LOG"; then
     pass "handoff accepted"
