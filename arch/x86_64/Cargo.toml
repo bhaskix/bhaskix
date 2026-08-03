@@ -1,0 +1,32 @@
+[package]
+name = "bhaskix-arch-x86-64"
+description = "x86_64 architecture support for Bhaskix: port I/O, serial, CPU control."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_arch"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# `arch` is one of the places `unsafe` is permitted (docs/coding-style.md §3):
+# port I/O and CPU control instructions cannot be expressed any other way.
+#
+# Set from measurement, not guesswork. M1 used 88 lines; M2 raised it to 218.
+#
+# Why the M2 increase could not be avoided: descriptor tables, the interrupt
+# entry path, and control-register access have no safe expression. `lgdt`,
+# `lidt`, `ltr`, the far return that reloads CS, and the segment loads are all
+# raw instructions, and the `BootCell` that holds the tables exists precisely
+# to make the single-threaded-boot assumption explicit rather than implicit.
+#
+# The headroom stays deliberately small so M2-08 (APIC) has to raise it
+# consciously and justify it, rather than growing into slack nobody notices.
+unsafe_budget = 230

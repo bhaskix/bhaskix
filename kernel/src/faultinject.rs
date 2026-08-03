@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Deliberate fault injection, for testing the exception path.
+//!
+//! M2's exit criterion is that every exception produces a clear diagnostic
+//! instead of a triple fault. That cannot be asserted by inspection — the only
+//! way to know the handler works is to fault on purpose and read what comes
+//! out. This module is how `tests/qemu/fault-test.sh` does that.
+//!
+//! Selected by the kernel command line, so one build covers every case:
+//!
+//! ```text
+//! bhaskix.fault=de   divide error         -- no error code
+//! bhaskix.fault=ud   invalid opcode       -- no error code
+//! bhaskix.fault=bp   breakpoint           -- no error code
+//! bhaskix.fault=gp   general protection   -- error code, selector-shaped
+//! bhaskix.fault=pf   page fault           -- error code, plus CR2
+//! bhaskix.fault=df   double fault         -- via kernel stack overflow
+//! ```
+//!
+//! # Why this ships in the kernel rather than living in a test harness
+//!
+//! There is no way to inject a fault from outside: it has to be code running
+//! in kernel context. Keeping it in the tree, behind an explicit command-line
+//! option that does nothing unless asked, is the honest arrangement — and it
+//! stays useful for anyone bringing Bhaskix up on new hardware, where "does
+//! the exception path work at all" is the first question.
+
+use crate::println;
+
+/// A fault the kernel can be asked to trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// Divide by zero (#DE, vector 0).
+    DivideError,
+    /// Invalid opcode (#UD, vector 6).
+    InvalidOpcode,
+    /// Breakpoint (#BP, vector 3).
+    Breakpoint,
+    /// General protection fault (#GP, vector 13).
+    GeneralProtection,
+    /// Page fault (#PF, vector 14).
+    PageFault,
+    /// Double fault (#DF, vector 8), reached through an unmapped stack.
+    DoubleFault,
+}
+
+impl Fault {
+    /// Parses the value of `bhaskix.fault=`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "de" => Self::DivideError,
+            "ud" => Self::InvalidOpcode,
+            "bp" => Self::Breakpoint,
+            "gp" => Self::GeneralProtection,
+            "pf" => Self::PageFault,
+            "df" => Self::DoubleFault,
+            _ => return None,
+        })
+    }
+}
+
+/// Extracts `bhaskix.fault=<name>` from a kernel command line.
+///
+/// Deliberately tolerant: an unrecognised or malformed option yields `None`
+/// and the kernel boots normally. A boot option that can brick the boot is a
+/// bad boot option.
+#[must_use]
+pub fn from_cmdline(cmdline: &str) -> Option<Fault> {
+    cmdline
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix("bhaskix.fault="))
+        .and_then(Fault::parse)
+}
+
+/// Triggers `fault`. Does not return if the exception path works.
+///
+/// If this *does* return, the exception was silently swallowed, which is
+/// itself a failure the test harness reports.
+pub fn trigger(fault: Fault) {
+    println!();
+    println!("  fault injection: deliberately triggering {fault:?}");
+    println!("  (requested by bhaskix.fault= on the kernel command line)");
+
+    match fault {
+        Fault::DivideError => divide_error(),
+        Fault::InvalidOpcode => invalid_opcode(),
+        Fault::Breakpoint => breakpoint(),
+        Fault::GeneralProtection => general_protection(),
+        Fault::PageFault => page_fault(),
+        Fault::DoubleFault => double_fault(),
+    }
+}
+
+fn divide_error() {
+    // Written in assembly, not as `a / b` in Rust.
+    //
+    // The workspace builds with `overflow-checks = true` even in release
+    // (docs/coding-style.md), so Rust emits an explicit zero test and panics
+    // before the CPU ever executes a division. That is correct behaviour for
+    // kernel code and we do not want to weaken it -- but it means the only way
+    // to reach the *hardware* #DE is to issue the instruction directly.
+    //
+    // SAFETY: `div` by zero is architecturally guaranteed to raise #DE, which
+    // is the intent. The explicit register operands cover everything `div`
+    // reads and writes.
+    unsafe {
+        core::arch::asm!(
+            "xor edx, edx",
+            "div {divisor:e}",
+            divisor = in(reg) 0u32,
+            inout("eax") 1u32 => _,
+            out("edx") _,
+            options(nostack),
+        );
+    }
+}
+
+fn invalid_opcode() {
+    // SAFETY: `ud2` is architecturally guaranteed to raise #UD. That is the
+    // entire point of the instruction, and it is the intent here.
+    unsafe { core::arch::asm!("ud2", options(nomem, nostack)) };
+}
+
+fn breakpoint() {
+    // SAFETY: `int3` raises #BP. Unlike the others this is recoverable in
+    // principle, which makes it a useful check that the handler reports
+    // rather than that the CPU faults.
+    unsafe { core::arch::asm!("int3", options(nomem, nostack)) };
+}
+
+fn general_protection() {
+    // Loading a segment register with a selector far beyond the GDT limit
+    // raises #GP with that selector as the error code -- which also exercises
+    // the selector decoding in the reporter.
+    //
+    // SAFETY: deliberately invalid, and intended to fault. Nothing after this
+    // point depends on the register having been loaded.
+    unsafe { core::arch::asm!("mov ds, {0:x}", in(reg) 0xdead_u64, options(nostack)) };
+}
+
+fn page_fault() {
+    // A non-canonical-adjacent unmapped kernel address. Chosen rather than
+    // null so the report distinguishes "unmapped" from "null dereference",
+    // both of which the reporter special-cases.
+    let address = 0xffff_9000_dead_b000 as *mut u64;
+    // SAFETY: deliberately unmapped, and intended to fault.
+    unsafe { core::ptr::write_volatile(address, 0x1234) };
+}
+
+/// Triggers a double fault by pushing onto an unmapped stack.
+///
+/// The `push` raises a page fault. Delivering that page fault requires pushing
+/// an exception frame — onto the same unmapped stack — which faults again, and
+/// a fault during fault delivery is a double fault. `IST1` gives the
+/// double-fault handler a known-good stack, which is why this reports instead
+/// of resetting the machine (`arch::gdt`).
+///
+/// # Why not recursion
+///
+/// The realistic cause of a double fault is kernel stack overflow, and the
+/// obvious test is unbounded recursion. That does not work yet, and the reason
+/// is worth recording: **the kernel stack has no guard page.** It is the stack
+/// the bootloader provided, and the higher-half direct map means the memory
+/// below it is mapped and writable — so an overflowing stack silently scribbles over
+/// whatever is there (in practice, the page tables) until the machine dies in
+/// a way no handler can report.
+///
+/// Guard pages need virtual memory management, which is M3. Until then this
+/// deterministic trigger tests the same mechanism — IST1 and the double-fault
+/// handler — without depending on memory management that does not exist.
+/// Testing the genuine stack-overflow path is tracked as an M3 task.
+fn double_fault() {
+    // A canonical higher-half address well outside both the HHDM and the
+    // kernel image, so it is reliably unmapped.
+    const UNMAPPED_STACK: u64 = 0xffff_9000_dead_0000;
+
+    // SAFETY: deliberately points RSP at unmapped memory and pushes, which is
+    // guaranteed to fault and then escalate. Nothing after this executes, and
+    // `noreturn` tells the compiler so -- there is no state to preserve
+    // because control never comes back to Rust on this stack.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {bad_stack}",
+            "push 0",
+            bad_stack = in(reg) UNMAPPED_STACK,
+            options(noreturn),
+        );
+    }
+}

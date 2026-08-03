@@ -1,0 +1,32 @@
+[package]
+name = "bhaskix-kernel"
+description = "The Bhaskix nucleus."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_kernel"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-boot = { path = "../boot/handoff" }
+bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Confined to `sync` (the spinlock's UnsafeCell), `framebuffer` (the pixel
+# blitter), `trap` (control-register reads), and `faultinject` (deliberately
+# faulting instructions). No other module may contain `unsafe`; see
+# docs/coding-style.md §3.
+#
+# Measured: 24 lines at M1, 57 at M2. The M2 increase is control-register reads
+# in the exception reporter and the fault-injection instructions themselves --
+# the latter being unsafe *by construction*, since their entire purpose is to
+# execute something the CPU will refuse.
+unsafe_budget = 70
