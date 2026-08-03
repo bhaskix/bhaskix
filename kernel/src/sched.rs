@@ -78,8 +78,24 @@ pub enum State {
     Ready,
     /// Currently executing.
     Running,
+    /// Waiting for a condition. Not schedulable until something wakes it.
+    Blocked,
     /// Finished; never scheduled again.
     Finished,
+}
+
+impl State {
+    /// Whether the scheduler may choose this thread.
+    ///
+    /// `Blocked` and `Finished` are both unschedulable and are *not*
+    /// interchangeable: a blocked thread still owns its stack and its slot and
+    /// will run again, and it must keep counting against nothing at all —
+    /// including the load figure, or an idle CPU would decline to steal from a
+    /// CPU whose threads are all asleep.
+    #[must_use]
+    pub const fn is_schedulable(self) -> bool {
+        matches!(self, Self::Ready | Self::Running)
+    }
 }
 
 /// One kernel thread. Owned outright by the CPU whose queue holds it.
@@ -140,7 +156,7 @@ impl RunQueue {
         self.threads
             .iter()
             .flatten()
-            .filter(|thread| thread.state != State::Finished)
+            .filter(|thread| thread.state.is_schedulable())
             .count()
     }
 
@@ -190,7 +206,7 @@ impl RunQueue {
         for offset in 1..=MAX_THREADS_PER_CPU {
             let candidate = (from + offset) % MAX_THREADS_PER_CPU;
             if let Some(thread) = &self.threads[candidate]
-                && thread.state != State::Finished
+                && thread.state.is_schedulable()
             {
                 return candidate;
             }
@@ -212,6 +228,20 @@ static NEXT_THREAD: AtomicU64 = AtomicU64::new(0);
 
 /// Context switches performed, across every CPU.
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Threads that actually went to sleep.
+static BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// Threads moved from blocked back to ready.
+static WAKEUPS: AtomicU64 = AtomicU64::new(0);
+
+/// Sleeps abandoned because the wakeup arrived before the thread could sleep.
+///
+/// Not a safety counter. By the time this fires the waker has already marked
+/// the thread `Ready`, and a `Ready` thread runs again regardless; what the
+/// recheck saves is a pointless context switch, and a thread with nothing to
+/// switch to from spinning in the block path forever.
+static RACES: AtomicU64 = AtomicU64::new(0);
 
 /// Threads moved from one CPU's queue to another's.
 static STEALS: AtomicU64 = AtomicU64::new(0);
@@ -628,6 +658,197 @@ pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64)) {
             );
         }
     }
+}
+
+/// The identifier of the thread running on this CPU.
+///
+/// `None` before this CPU has a runqueue.
+#[must_use]
+pub fn current_thread_id() -> Option<u32> {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    let queue = QUEUES[cpu].lock();
+    let current = queue.current;
+    queue.threads[current].as_ref().map(|thread| thread.id)
+}
+
+/// Marks the running thread blocked, without yielding.
+///
+/// Split from [`block_self`] because the two happen either side of releasing a
+/// wait queue's lock, and must. This half runs *under* that lock, together
+/// with enqueueing the thread as a waiter — see `wait::Waiters::enqueue_and_block`,
+/// which fuses them so they cannot drift apart. A waker only wakes threads
+/// that are already `Blocked`, so an enqueued thread that is still `Ready` is
+/// a lost wakeup waiting to happen.
+pub fn mark_blocked() {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    let mut queue = QUEUES[cpu].lock();
+    let current = queue.current;
+    if let Some(thread) = queue.threads[current].as_mut() {
+        thread.state = State::Blocked;
+    }
+}
+
+/// Yields the CPU if the calling thread is still blocked.
+///
+/// Between [`mark_blocked`] and this call the wait queue's lock is released —
+/// it has to be, because switching with a spinlock held is how a kernel stops
+/// — so a waker may run in that gap and mark this thread `Ready`.
+///
+/// The recheck below is what lets such a thread *leave*. It is not what makes
+/// the wakeup safe: the waker has already written `Ready`, and a `Ready`
+/// thread is chosen by ordinary round-robin whether or not this switch
+/// happens. But without the recheck a thread woken in the gap with nothing
+/// else runnable on its CPU has no exit from the loop and spins here forever,
+/// which is a hang rather than a slowdown.
+pub fn block_self() {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+
+    loop {
+        let switch = {
+            // `try_lock`, exactly as `preempt` does, and for a second reason
+            // beyond avoiding a deadlock against an interrupt: a blocking
+            // acquisition would join this CPU's held-rank set, and the set is
+            // captured a few lines below as the outgoing thread's. The thread
+            // would then carry a lock it does not hold to wherever it next
+            // runs, and be reported for an inversion on its own runqueue.
+            let Some(mut queue) = QUEUES[cpu].try_lock() else {
+                core::hint::spin_loop();
+                continue;
+            };
+            let current = queue.current;
+
+            match queue.threads[current].as_ref().map(|thread| thread.state) {
+                Some(State::Blocked) => {}
+                // Woken in the window, or never really blocked. Either way
+                // there is nothing to do.
+                _ => {
+                    RACES.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+
+            let next = queue.next_runnable(current);
+            if next == current {
+                // Nothing else this CPU can run. Falling through to spin is
+                // correct rather than merely expedient: the thread is blocked
+                // and will not be chosen, so the CPU has no work, and only an
+                // interrupt or another CPU's waker can change that. Stealing
+                // is not attempted -- a CPU with a blocked thread has no
+                // capacity a thief would want.
+                None
+            } else {
+                if let Some(thread) = queue.threads[next].as_mut() {
+                    thread.state = State::Running;
+                    thread.runs += 1;
+                }
+                queue.current = next;
+
+                let incoming_locks = queue.threads[next].as_ref().map_or(0, |t| t.held_locks);
+                if let Some(thread) = queue.threads[current].as_mut() {
+                    thread.held_locks = crate::sync::held_mask();
+                }
+                crate::sync::set_held_mask(incoming_locks);
+                queue.switching = true;
+
+                let Some(from) = queue.threads[current]
+                    .as_mut()
+                    .map(|thread| &raw mut thread.context)
+                else {
+                    return;
+                };
+                let Some(to) = queue.threads[next]
+                    .as_ref()
+                    .map(|thread| &raw const thread.context)
+                else {
+                    return;
+                };
+                Some((from, to))
+            }
+        };
+
+        match switch {
+            Some((from, to)) => {
+                SWITCHES.fetch_add(1, Ordering::Relaxed);
+                BLOCKS.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: as in `preempt` -- both contexts are in this CPU's
+                // own static runqueue, taken under its lock, and `switching`
+                // stops another CPU moving either out from under the switch.
+                unsafe { bhaskix_context_switch(from, to) };
+                finish_switch();
+                // Reached only when something made this thread runnable again:
+                // `next_runnable` never selects a blocked thread.
+                return;
+            }
+            None => core::hint::spin_loop(),
+        }
+    }
+}
+
+/// Makes a blocked thread runnable again, wherever it is.
+///
+/// Returns whether it changed anything. Waking a thread that is not blocked is
+/// not an error and is the common case under contention.
+///
+/// # Why this searches rather than being told where to look
+///
+/// The obvious design has the waiter record which CPU holds it, so a wake is
+/// one lookup. It is wrong, and subtly: a thread is safe from migration only
+/// while it is `Blocked`, and a thread that sleeps in a loop is `Ready` in
+/// between. A cached CPU therefore goes stale exactly when a woken thread is
+/// stolen before it sleeps again — and the next wake is delivered to a queue
+/// that no longer holds it, which is a lost wakeup with a migration in its
+/// history and nothing in the logs.
+///
+/// That happened. The ring self-test stalled with one station `Blocked` and
+/// marked `(migrated)`, which is what the thread table is for. Searching by
+/// identifier costs a few uncontended lock acquisitions and cannot go stale.
+///
+/// This is the one place a CPU touches a thread in *another* CPU's queue, and
+/// it stays within the ownership rule M4-06 established: it changes a `state`
+/// field under that queue's lock and never reads or writes a context. A woken
+/// thread is scheduled by its own CPU, on its own stack, as it always was.
+pub fn wake(id: u32) -> bool {
+    let online = percpu::online_count() as usize;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        // One queue lock at a time. Two would be two locks of the same rank,
+        // which have no order relative to each other and could close a cycle.
+        let mut queue = queue.lock();
+        for thread in queue.threads.iter_mut().flatten() {
+            if thread.id == id && thread.state == State::Blocked {
+                thread.state = State::Ready;
+                WAKEUPS.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Threads that went to sleep.
+#[must_use]
+pub fn blocks() -> u64 {
+    BLOCKS.load(Ordering::Relaxed)
+}
+
+/// Threads woken from a sleep.
+#[must_use]
+pub fn wakeups() -> u64 {
+    WAKEUPS.load(Ordering::Relaxed)
+}
+
+/// Sleeps abandoned because the wakeup arrived in the window.
+#[must_use]
+pub fn races() -> u64 {
+    RACES.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

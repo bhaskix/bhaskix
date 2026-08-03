@@ -48,7 +48,9 @@ stealing is the design that works; we start there rather than migrating later.
 > sound on more than one processor: a CPU takes raw pointers to contexts in its own queue only, so
 > there is no cross-CPU sharing to race against rather than a race that is prevented. What exists is
 > a single round-robin list per CPU, not the four classes above — no RT, no Fair tree, no Batch.
-> Idle pull (§5.2) landed at M4-06b; the rest of §5 is unbuilt.
+> Idle pull (§5.2) landed at M4-06b; the rest of §5 is unbuilt. Threads can block and be woken as
+> of M4-09, but a cross-CPU wake does not send a reschedule IPI, so the woken thread waits for the
+> target CPU's next tick — up to 10 ms, against the §4 target of 50 µs.
 
 ### Strict class priority
 
@@ -248,7 +250,7 @@ The rules, which are the whole point:
 
 | Property | Test |
 |---|---|
-| No lost wakeups | Stress test: N threads ping-ponging on IPC across M CPUs for 10⁷ iterations; assert no thread stalls. |
+| No lost wakeups | **Implemented at M4-09**, though not yet at this scale. Four threads pass a token round a ring spanning every CPU, sleeping on a wait queue for their turn; a single lost wakeup stops the ring dead rather than slowing it. The gate requires every station to have run, and requires non-zero sleep *and* wake counts, so a ring that spun instead of sleeping fails. Negative-tested: disabling `wake` gives laps `[1,1,1,0]` and zero wakeups. The 10⁷-iteration IPC version waits on IPC. |
 | No stranded threads | Invariant checker in debug builds: every non-running runnable thread is on exactly one runqueue. |
 | Fairness | Two domains with a 3:1 weight ratio, each CPU-saturating; assert measured CPU time is 3:1 ± 2%. |
 | Domain fairness vs thread count | Domain A with 1 thread vs domain B with 64, equal weight; assert 1:1 split. |

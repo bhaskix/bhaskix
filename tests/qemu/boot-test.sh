@@ -238,6 +238,17 @@ else
     status=1
 fi
 
+# Sleeping. Three things have to be true at once, and each hides a different
+# way of passing without working: laps prove no wakeup was lost (the ring stops
+# dead if one is), sleeps prove the threads actually blocked rather than spun,
+# and wakeups prove they were woken rather than merely preempted onto.
+if grep -qE "wait queues +[0-9]+ laps around [0-9]+ cpus, slowest [1-9][0-9]*; [1-9][0-9]* sleeps, [1-9][0-9]* wakeups" "$LOG"; then
+    pass "threads sleep and are woken, no lost wakeups"
+else
+    fail "wait queue / lost wakeup check did not pass"
+    status=1
+fi
+
 # Lock ordering. Three claims in one line, and only the last is the one people
 # quote: that acquisitions were actually *checked* (zero violations is what a
 # checker that never ran also reports), that the detector fires when given a

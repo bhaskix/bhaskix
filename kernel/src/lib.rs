@@ -42,6 +42,7 @@ pub mod sync;
 pub mod tlb;
 pub mod trap;
 pub mod vm;
+pub mod wait;
 
 use bhaskix_arch::cell::BootCell;
 use bhaskix_arch::cpu;
@@ -314,7 +315,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
 
     println!();
     println!("  M4 in progress. Nothing left to do at this milestone -- halting.");
-    println!("  Next: blocking and wakeup, then the fair scheduling class (docs/roadmap.md).");
+    println!("  Next: the fair scheduling class and a reschedule IPI (docs/roadmap.md).");
 
     cpu::halt_forever()
 }
@@ -643,12 +644,19 @@ static OBSERVED_CPU: [core::sync::atomic::AtomicU64; 4] = [
     core::sync::atomic::AtomicU64::new(u64::MAX),
 ];
 
-/// Set once the pinning phase is done, to retire its workers.
+/// Which scheduler test phase is running.
 ///
-/// The migration phase needs CPUs that are genuinely idle, and a worker that
-/// spins forever is not idle. Retiring them is also the only exercise `exit`
-/// gets.
-static RETIRE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Each generation of test threads retires when this moves past it. Phases
+/// have to be separated rather than overlapped: the migration phase needs CPUs
+/// that are genuinely idle, and the wait-queue phase needs CPUs that are not
+/// saturated by spinners, so a worker left running from an earlier phase
+/// quietly invalidates the next one.
+static PHASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Phase numbers, in the order they run.
+const PHASE_PINNING: u64 = 0;
+const PHASE_MIGRATION: u64 = 1;
+const PHASE_WAIT: u64 = 2;
 
 /// A worker that never yields.
 ///
@@ -657,7 +665,7 @@ static RETIRE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::
 extern "C" fn worker(id: u64) -> ! {
     use core::sync::atomic::Ordering;
     loop {
-        if RETIRE.load(Ordering::Relaxed) {
+        if PHASE.load(Ordering::Acquire) > PHASE_PINNING {
             sched::exit();
         }
         if let Some(counter) = WORK.get(id as usize) {
@@ -694,11 +702,158 @@ const PLACED_SLOT: u64 = 3;
 extern "C" fn migrant(id: u64) -> ! {
     use core::sync::atomic::Ordering;
     loop {
+        if PHASE.load(Ordering::Acquire) > PHASE_MIGRATION {
+            sched::exit();
+        }
         if let Some(seen) = MIGRANT_CPUS.get(id as usize) {
             seen.fetch_or(1 << bhaskix_arch::percpu::cpu_id(), Ordering::Relaxed);
         }
         core::hint::spin_loop();
     }
+}
+
+/// Threads in the wait-queue ring.
+const RING_SIZE: u64 = 4;
+
+/// Whose turn it is. The condition every ring thread sleeps on.
+static TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The queue they all sleep on.
+static RING: wait::WaitQueue = wait::WaitQueue::new();
+
+/// Times each ring thread has taken its turn.
+static LAPS: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// One station in the ring: sleep until the token arrives, pass it on, repeat.
+///
+/// Deliberately shaped so that a single lost wakeup stops *everything*. The
+/// token can only move if the thread holding it is running, so a thread that
+/// sleeps through its turn halts the whole ring rather than slowing it — which
+/// makes the failure unmissable instead of statistical.
+extern "C" fn ring_station(id: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    loop {
+        RING.wait_until(|| {
+            TOKEN.load(Ordering::Acquire) == id || PHASE.load(Ordering::Acquire) > PHASE_WAIT
+        });
+
+        if PHASE.load(Ordering::Acquire) > PHASE_WAIT {
+            sched::exit();
+        }
+
+        if let Some(laps) = LAPS.get(id as usize) {
+            laps.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Publish *before* waking. This is the caller's half of the invariant
+        // in `wait`: a waker that wakes first and publishes second reopens
+        // exactly the race the wait queue closes.
+        TOKEN.store((id + 1) % RING_SIZE, Ordering::Release);
+        RING.wake_all();
+    }
+}
+
+/// Checks that threads really sleep, and that no wakeup is ever lost.
+///
+/// Spinning would pass a weaker version of this test, so the numbers that
+/// matter are the sleep and wake counts: a ring that ran without any thread
+/// ever blocking has proved nothing about wait queues.
+fn wait_queue_self_test(hhdm_base: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let blocks_before = sched::blocks();
+    let wakeups_before = sched::wakeups();
+    let races_before = sched::races();
+
+    const NAMES: [&str; 4] = ["ring-0", "ring-1", "ring-2", "ring-3"];
+    for (id, name) in NAMES.iter().enumerate() {
+        // Placed by load, so the ring spans CPUs and the wakeups are genuinely
+        // cross-processor. A ring confined to one CPU would never exercise the
+        // window this test exists for.
+        if let Err(error) = sched::spawn(name, ring_station, id as u64, hhdm_base) {
+            println!("    wait queues    FAILED to spawn {name}: {error:?}");
+            return false;
+        }
+    }
+
+    // Generous, because the budget has to cover the slowest configuration
+    // rather than the fastest. A cross-CPU wake waits for the target CPU's
+    // next tick, and under UEFI the framebuffer console is slow enough that
+    // the ring turns several times slower than it does under BIOS.
+    wait_ticks(200);
+
+    let blocks = sched::blocks() - blocks_before;
+    let wakeups = sched::wakeups() - wakeups_before;
+    let races = sched::races() - races_before;
+
+    let laps: [u64; 4] = core::array::from_fn(|i| LAPS[i].load(Ordering::Relaxed));
+    let slowest = laps.iter().copied().min().unwrap_or(0);
+    let fastest = laps.iter().copied().max().unwrap_or(0);
+    let total: u64 = laps.iter().sum();
+
+    // Retire the ring: publish the phase, then wake, in that order.
+    PHASE.store(PHASE_WAIT + 1, Ordering::Release);
+    RING.wake_all();
+    wait_ticks(20);
+
+    let mut ok = true;
+
+    // The real assertion. A lost wakeup does not slow the ring down, it stops
+    // it -- so the slowest station having gone round at all, repeatedly, is
+    // the property. Checking the total instead would let three fast threads
+    // hide one that never woke.
+    // Two assertions about shape rather than one about speed. How *fast* the
+    // ring turns depends on the console, the firmware and the tick rate, and
+    // tuning a threshold to the fastest configuration is how a test starts
+    // failing on the slowest one. What does not vary is that a healthy ring is
+    // even -- the token visits every station in turn, so no station can be
+    // more than one lap ahead of another -- and that every station goes round
+    // more than once. A lost wakeup breaks both at once: it leaves one station
+    // behind for ever while the rest stop dead waiting for it.
+    if slowest < 2 {
+        // Print everything, because "stalled" has several causes that look
+        // identical from one number: a lost wakeup leaves one station behind,
+        // a ring that never slept shows no blocks, and a ring that slept but
+        // was never woken shows blocks without wakeups.
+        println!(
+            "    wait queues    FAILED: a station stalled -- laps {laps:?}, {blocks} sleeps, {wakeups} wakeups, {races} races"
+        );
+        ok = false;
+    } else if fastest - slowest > 1 {
+        println!(
+            "    wait queues    FAILED: ring uneven -- laps {laps:?}, so the token did not visit every station"
+        );
+        ok = false;
+    }
+
+    if blocks == 0 {
+        println!("    wait queues    FAILED: no thread ever blocked -- the ring spun instead");
+        ok = false;
+    }
+    if wakeups == 0 {
+        println!("    wait queues    FAILED: no thread was ever woken");
+        ok = false;
+    }
+    if RING.overflowed() > 0 {
+        println!(
+            "    wait queues    FAILED: {} sleepers overflowed the queue",
+            RING.overflowed()
+        );
+        ok = false;
+    }
+
+    if ok {
+        println!(
+            "    wait queues    {total} laps around {RING_SIZE} cpus, slowest {slowest}; {blocks} sleeps, {wakeups} wakeups, {races} races caught in the window"
+        );
+    }
+
+    ok
 }
 
 /// Spins until `ticks` timer interrupts have elapsed, or a bound is hit.
@@ -874,10 +1029,19 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
     // only by circumstance -- one per CPU, so no CPU is ever idle enough to
     // steal -- and leaving them running would mean the migration phase found
     // a perfectly balanced machine and correctly did nothing.
-    RETIRE.store(true, Ordering::Release);
+    PHASE.store(PHASE_MIGRATION, Ordering::Release);
     wait_ticks(30);
 
     ok &= migration_self_test(hhdm_base, cpus);
+
+    // Retire the migration workers before the wait-queue phase. They never
+    // sleep, so leaving them spinning would let the ring make progress by
+    // being preempted onto rather than by being woken -- which is the one
+    // thing that phase is trying to distinguish.
+    PHASE.store(PHASE_WAIT, Ordering::Release);
+    wait_ticks(30);
+
+    ok &= wait_queue_self_test(hhdm_base);
 
     sched::stop_all();
 

@@ -104,7 +104,8 @@ fairness within 2% for two equal-weight workloads.
 | M4-06c | Topology-aware balancing, periodic push | ⬜ `TODO` | No ACPI topology, so every CPU is equidistant; balancing is pull-only. `docs/scheduler.md` §5.1 and §5.3. |
 | M4-07 | Fair class (virtual deadline), RT class | ⬜ `TODO` | Currently plain round-robin |
 | M4-08 | Lock ranking | ✅ `DONE` | Rank given at construction, so a lock cannot be added without one. ~7,400 acquisitions checked per boot, 0 violations. **Negative-tested**: mis-ranking a real lock produces violations; disabling the detector fails the "detector verified" claim. Deviates from "panic" — see `docs/coding-style.md` §7. |
-| M4-09 | Sleeping, wait queues, blocking | ⬜ `TODO` | A thread is runnable or finished; nothing waits |
+| M4-09 | Sleeping, wait queues, blocking | ✅ `DONE` | `Blocked` state, `WaitQueue`, cross-CPU wake. Ring self-test over 4 CPUs. **Negative-tested**: disabling `wake` gives laps `[1,1,1,0]`, 0 wakeups. |
+| M4-09b | Reschedule IPI on wake | ⬜ `TODO` | A cross-CPU wake waits for the target's next tick — up to 10 ms against the §4 target of 50 µs. |
 | M4-10 | Tickless idle, timer wheel | ⬜ `TODO` | Timer is a fixed 100 Hz tick |
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ⬜ `TODO` | Would let a fault be serviced while the allocator lock is held |
@@ -167,8 +168,21 @@ fairness within 2% for two equal-weight workloads.
   thief taking a thread whose registers are not yet saved, and it is the one hazard here that
   corrupts state rather than merely stranding it. Removing it fails a unit test, which proves the
   policy encodes the rule — not that the race it guards against was ever reached.
-- **Threads cannot block.** There is no sleep, no wait queue and no wakeup path, so "no lost
-  wakeups" — half the exit criterion — is not merely unproven but not yet expressible.
+- **A cross-CPU wake is not prompt.** It marks the thread `Ready` and stops; nothing interrupts the
+  target CPU, so the woken thread waits for its next timer tick — up to 10 ms at 100 Hz, against
+  `docs/scheduler.md` §4's 50 µs target. This is why the ring self-test measures dozens of laps per
+  second rather than thousands. The fix is a reschedule IPI, using the mechanism shootdown already
+  has.
+- **One safety property is structural because it could not be tested.** Enqueueing a waiter and
+  marking it blocked must happen together; separating them is a real lost-wakeup bug, and it was
+  written deliberately and the ring test *did not catch it* — the window is a few instructions and
+  116 sleeps never landed in it. The two steps are now fused in one function rather than left
+  adjacent under a shared lock. The gate still cannot see that class of bug; the code makes it
+  unwritable instead.
+- **Excluding `Blocked` from scheduling is not covered by a gate.** Making blocked threads
+  schedulable again still passes the ring test at 61 laps: they get scheduled, immediately re-block,
+  and the ring works while burning CPU. It is a sleep-actually-saves-CPU property, and the boot test
+  has no way to measure idle time.
 - **Thread capacity is fixed at 8 per CPU** and stacks are never reclaimed. `exit` marks a thread finished
   but its stack stays mapped, so thread creation is effectively one-way.
 - **No lock ranking**, which `docs/coding-style.md` §7 requires and which becomes load-bearing the
@@ -239,6 +253,52 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-03 (M4-09, sleeping and wait queues)
+
+- **Threads can sleep.** A `Blocked` state, a `WaitQueue` with a bounded intrusive-free waiter list,
+  and a cross-CPU `wake`. Until now the only way to wait was to spin, which cost a processor per
+  waiter and — more to the point — made "no lost wakeups" not merely unproven but *inexpressible*,
+  because nothing ever slept.
+- **Waking stays inside M4-06's ownership rule.** It is the one place a CPU touches a thread in
+  another CPU's queue, and it changes a `state` field under that queue's lock and never reads or
+  writes a context. The woken thread is still scheduled by its own CPU, on its own stack.
+- **The safety property was made structural because the test could not see it.** Enqueueing a
+  waiter and marking it blocked must be one step: a waker only wakes threads already `Blocked`, so
+  an entry belonging to a still-`Ready` thread is worse than no entry — the waker removes it, wakes
+  nothing, and the thread sleeps forever. That bug was written on purpose and **the ring test passed
+  anyway**, 52 laps, because the window is a handful of instructions. The two steps are now fused
+  into one function so they cannot drift apart. A property a test cannot see should not be left to
+  a convention.
+- **A documented mechanism turned out to be documented wrongly.** The recheck in `block_self` was
+  described as what closes the lost-wakeup race. It is not: by then the waker has already written
+  `Ready`, and a `Ready` thread is picked up by round-robin regardless. What it actually provides is
+  the loop's *exit* — deleting it hangs the kernel, because a thread woken in the gap with nothing
+  else runnable on its CPU spins in the block path forever. Establishing that took deleting it and
+  watching the kernel stop.
+- **The gate requires three things at once**, because each hides a different way of passing without
+  working: laps (a lost wakeup stops the ring dead rather than slowing it), non-zero sleeps (a ring
+  that spun instead of sleeping proves nothing), and non-zero wakeups (threads woken rather than
+  merely preempted onto). Negative-tested by disabling `wake`: laps `[1,1,1,0]`, zero wakeups.
+- **A lost wakeup caused by migration, found by the thread table.** The waiter list originally
+  recorded *which CPU* held each sleeper, so a wake could go straight to the right runqueue. That is
+  wrong in a way that only shows up once work stealing exists: a thread is immune to migration only
+  while it is `Blocked`, and a thread sleeping in a loop is `Ready` in between. Stolen in that gap,
+  its recorded CPU goes stale and the next wake searches a queue that no longer holds it. The ring
+  stalled at `[1,1,1,1]` with one station `Blocked` and marked `(migrated)` — which is the only
+  reason it was diagnosable, and an argument for printing provenance in diagnostics. Waiters are now
+  keyed by thread identifier, which is globally unique and cannot go stale; `wake` searches. The
+  earlier claim that recording the CPU was migration-safe was true only *within* a single wait, and
+  is corrected in the source.
+- **A threshold tuned to the fastest configuration failed on the slowest.** The ring gate first
+  required five laps, which BIOS cleared easily and UEFI did not — the framebuffer console is slow
+  enough to turn the ring several times slower. It now asserts *shape* rather than speed: every
+  station went round more than once, and no station is more than one lap ahead of another, which is
+  what a ring guarantees when healthy and what a lost wakeup breaks.
+- **A self-inflicted lock-order violation, caught by the previous milestone's gate.** `block_self`
+  first took the runqueue lock with `lock()` rather than `try_lock()`, so the rank joined the held
+  set and was then captured as the outgoing thread's — which carried a lock it did not hold to
+  wherever it next ran. Twelve reports per boot, from the checker added the day before.
 
 ### 2026-08-03 (M4-08, lock ranking)
 
