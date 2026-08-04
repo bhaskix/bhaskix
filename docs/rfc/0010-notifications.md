@@ -2,11 +2,34 @@
 
 | | |
 |---|---|
-| **Status** | **Draft — for discussion.** |
+| **Status** | ✅ **Accepted 2026-08-04.** Resolves **NF1**. With RFC 0009, completes RFC 0008's answer to **A3**. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`cap`, `notify`, `syscall`, `trap`) |
 | **Milestone** | Phase 2 — required before a user-mode driver, and before any service that must not block its callers |
 | **Depends on** | [RFC 0008](0008-syscall-and-ipc-shape.md) (which promises this), [RFC 0009](0009-shared-memory.md) (the other half of the same answer), [security.md](../security.md) §2 |
+
+---
+
+> **Accepted 2026-08-04 by the project lead.**
+>
+> **What acceptance locks in**, beyond the object itself: **at most one waiter,
+> refused rather than queued.** That is the decision this RFC says is most
+> likely to be argued with, and it is the divergence from seL4 — which queues
+> waiters — that everything else here rests on. It is what keeps the signal
+> path lock-free, and a lock-free signal path is what lets an interrupt handler
+> call it. Adding a queue later means adding a `try_lock` with a deferred-wake
+> fallback, which is machinery M6-04 already built; it is a change with a
+> known shape rather than a corner painted into.
+>
+> Unresolved questions 1, 3 and 4 stay open. Question 2 was already answered by
+> [RFC 0011](0011-irq-handler.md) existing.
+>
+> One correction made at acceptance: the impact section cited
+> `driver-model.md` §5 where it meant §2. A wrong cross-reference is not part
+> of an argument, so it is fixed rather than preserved.
+>
+> The argument below is now immutable, per the document ownership table in
+> `TRACKER.md`. A change of mind is a new RFC that supersedes this one.
 
 ---
 
@@ -263,7 +286,7 @@ it blocks, exactly as IPC does.
 `Notification` joins them, and `ObjectKind::Notification` is already declared
 in `cap.rs` and unused — this RFC is what gives it meaning.
 
-**[driver-model.md](../driver-model.md) §5** assumes a driver in a domain can
+**[driver-model.md](../driver-model.md) §2** assumes a driver in a domain can
 be woken by its device. That assumption has been unfunded since it was
 written; this is half the funding, and the `IRQHandler` object is the other
 half.

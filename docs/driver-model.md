@@ -77,6 +77,11 @@ driver source works in-nucleus and in a userspace domain.
 The nucleus IRQ path does exactly one thing: acknowledge the interrupt controller and signal the
 waiting driver task. It runs with interrupts disabled for a bounded, tiny number of instructions.
 
+"Signal the waiting driver task" is a **notification** ([RFC 0010](rfc/0010-notifications.md),
+accepted): two atomics and a wake, with no lock and no allocation, which is what makes it callable
+from a handler at all. *Who* may receive one — an interrupt line is a hardware resource, and
+claiming it excludes everyone else — is [RFC 0011](rfc/0011-irq-handler.md), still a draft.
+
 This is the top-half/bottom-half split made mandatory instead of optional. It means:
 
 - A slow or buggy driver cannot raise interrupt latency for the whole machine — the RT latency bound

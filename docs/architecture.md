@@ -155,10 +155,16 @@ we will say so in this document rather than quietly dropping the goal.
 There is no user ID in the nucleus. There is no `root`. Authority is a *thing you hold*, not a *thing
 you are*.
 
-Every kernel object — a frame, an address space, a thread, an IPC endpoint, an IRQ line, an MMIO
-range, a DMA window — is named by a **capability**: an unforgeable handle stored in a per-domain
-capability space (CSpace). A domain can perform an operation if and only if it holds a capability
-granting it.
+Every kernel object — a frame, an address space, a thread, an IPC endpoint, a notification, an IRQ
+line, an MMIO range, a DMA window — is named by a **capability**: an unforgeable handle stored in a
+per-domain capability space (CSpace). A domain can perform an operation if and only if it holds a
+capability granting it.
+
+A **notification** ([RFC 0010](rfc/0010-notifications.md), accepted) is the one that is easy to
+overlook and hard to do without: one word of pending bits and at most one waiter, signalled without
+blocking and safely from an interrupt handler. The bits come from the badge, so a receiver learns
+*which* of its senders woke it without trusting any of them. It is how anything asynchronous
+happens here — a doorbell on a shared-memory ring, or a device with something to say.
 
 ```
 Capability {

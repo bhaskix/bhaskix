@@ -77,7 +77,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **A3** | IPC style | ✅ **Accepted** 2026-08-04 | **Synchronous rendezvous** is primitive; async is shared memory plus a notification capability, one layer up. Buffering forces the nucleus to answer "whose memory is it", and every answer is a denial of service or the synchronous behaviour with extra steps. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
 | **A4** | Userspace ABI | ✅ **Accepted** 2026-08-04 | **Capability-shaped**, and the native ABI *is* A2's syscall interface — there is no separate document to write. Consequence: no native `libc`; the roadmap's Phase 2 libc belongs to the Linux personality. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 | **SM1** | Shared memory | ✅ **Accepted** 2026-08-04 | A **`Memory` object**: frames a capability names, mapped into the holder's *own* address space with rights no wider than the capability, unmapped from everywhere before a `revoke` returns. Completes RFC 0008's answer to **A3** — which promised shared memory and did not build it, so bulk data currently moves sixteen bytes per round trip. Its one architectural fork — whether `Untyped` memory exists at all — **was resolved by acceptance**: it does not. | [RFC 0009](docs/rfc/0009-shared-memory.md) |
-| **NF1** | Notifications | ⬜ Draft | A **`Notification` object**: one word of pending badge bits, at most one waiter, signalled without blocking and safely from an interrupt handler. Completes the other half of RFC 0008's answer to **A3**. Its immediate consequence is that `virtio-blk` can stop polling and `input.rs`'s hand-written reader becomes an instance of a general object. Interrupt *delivery* is ready; who may *claim* a line needs an `IRQHandler` object and its own RFC. | [RFC 0010](docs/rfc/0010-notifications.md) |
+| **NF1** | Notifications | ✅ **Accepted** 2026-08-04 | A **`Notification` object**: one word of pending badge bits, at most one waiter, signalled without blocking and safely from an interrupt handler. Completes the other half of RFC 0008's answer to **A3**. Its immediate consequence is that `virtio-blk` can stop polling and `input.rs`'s hand-written reader becomes an instance of a general object. Interrupt *delivery* is ready; who may *claim* a line needs an `IRQHandler` object and its own RFC. | [RFC 0010](docs/rfc/0010-notifications.md) |
 | **IR1** | Interrupt authority | ⬜ Draft | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU, and the RFC says so rather than implying otherwise. | [RFC 0011](docs/rfc/0011-irq-handler.md) |
 | **IO1** | IOMMU | ⬜ Draft | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Asks for a roadmap change**: discovery and per-device domains move from Phase 3 to Phase 2, because they are what make a driver's bugs containable. | [RFC 0012](docs/rfc/0012-iommu.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | *Blocks M3* |
@@ -501,6 +501,29 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (RFC 0010 accepted — A3 is now answered in full)
+
+- **Notifications are decided**, and with RFC 0009 that completes the answer RFC 0008 gave to **A3**
+  fifteen months of milestones ago: *synchronous rendezvous is the primitive, and async is built
+  above it from shared memory plus a notification capability.* Both halves are now accepted
+  decisions rather than promises.
+- **What acceptance locks in, beyond the object: at most one waiter, refused rather than queued.**
+  The RFC names this as the decision most likely to be argued with, so it is worth repeating here.
+  It is the divergence from seL4 — which queues waiters — and everything else rests on it: one
+  waiter is what keeps the signal path lock-free, and a lock-free signal path is what lets an
+  interrupt handler call it. Adding a queue later is a `try_lock` plus a deferred-wake fallback,
+  which is machinery M6-04 already built. A known change, not a corner painted into.
+- **No testing debt**, as with RFC 0009 — everything in the plan concerns code that does not exist,
+  and the fuzz-target answer is a reasoned "none". Two of its negative tests describe bugs this
+  project has already made and fixed in `input.rs`, which is why they are written down.
+- **A cross-reference error, caught at acceptance.** The impact section cited `driver-model.md` §5
+  where it meant §2. Fixed rather than preserved: a wrong pointer is not part of an argument, and
+  the immutability rule protects the reasoning, not the typos.
+- **Two documents changed.** `architecture.md` §3 adds a notification to the list of things a
+  capability can name, with what it is and why it is easy to overlook. `driver-model.md` §2's
+  "signal the waiting driver task" stops being a phrase and names the mechanism — while saying
+  plainly that *who may receive an interrupt* is RFC 0011 and still a draft.
 
 ### 2026-08-04 (RFC 0009 accepted — and a fork closed with it)
 
