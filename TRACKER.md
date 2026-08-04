@@ -123,16 +123,25 @@ fairness within 2% for two equal-weight workloads.
 | M5-02 | `Domain` with `ResourceEnvelope` | ✅ `DONE` | Envelope refuses at allocation time (T10); CPU share **divided** among a domain's threads so it does not grow with thread count; destruction revokes the domain's whole derived subtree. **Negative-tested** in both directions. |
 | M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | ✅ `DONE` | Exercised for real as of M5-04: ten system calls from ring 3 per boot. Built on RFC 0008's recommendation rather than its acceptance. |
 | M5-04 | Ring 3 execution | ✅ `DONE` | A program runs in ring 3, enters the kernel through `SYSCALL`, and is interrupted there. **Negative-tested**: removing the interrupt-entry `swapgs` or leaving `RSP0` zero both fail the gate. |
-| M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`, badges | ⬜ `TODO` | Wait queues from M4-09 are the mechanism. |
+| M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`/`Recv`, badges | ✅ `DONE` | Rendezvous, no buffering. Exercised through the whole syscall path — domain, CSpace, capability, type check, badge. **Negative-tested**: taking the badge from the caller's frame makes the service unable to tell its clients apart. |
+| M5-05b | IPC from ring 3 | ⬜ `TODO` | The user probe has no domain holding an endpoint capability, so user-mode IPC is unexercised. The kernel-thread path covers the dispatcher end to end. |
 | M5-06 | Per-domain capability quotas | 🟡 `PARTIAL` | `ResourceEnvelope::max_capabilities` exists and is unit-tested, but nothing charges it yet — there is no syscall through which a domain derives. Wired up in M5-03. |
 
 ### Honest notes on M5 so far
 
-- **`RSP0` and the syscall stack are per-CPU, not per-thread.** Correct only while at most one
-  thread per CPU can be in the kernel from user mode, which is true today because exactly one
-  thread ever enters ring 3. Two user threads on one CPU would share both stacks and corrupt each
-  other, so this must become per-thread before a second one exists — and certainly before a system
-  call can block, which is M5-05.
+- **`try_lock` on a query is a wrong answer, not a delayed one — three times now.** A read that
+  answers "no such thread" for a thread on a busy CPU is indistinguishable from one that does not
+  exist. It has caused an intermittent failure in `set_domain_weight`, in `start_all` and in
+  `weight_of`/`cycles_of`. `try_lock` belongs where *failing* is a valid outcome — interrupt context,
+  and the switch path — and nowhere else.
+- **IPC has no timeout on `Recv`**, so a service bug hangs its callers indefinitely. RFC 0008
+  records it as unresolved because it needs a policy decision rather than code.
+- **"No message is ever lost" is not gated.** The IPC test asserts that every reply that arrived was
+  correct and that progress was made; it cannot distinguish a lost message from a slow machine
+  inside a boot-length window. Throughput varied seventy-fold between runs on this host, which is
+  why the count is reported and not asserted.
+- **`RSP0` and the syscall stack are now per-thread**, installed on every context switch, which is
+  what a blocking system call requires. Fixed as the first step of M5-05.
 - **A faulting user thread is not contained, it is fatal.** The probe never faults, so nothing
   exercises what happens when ring 3 touches memory it does not have. Today an unserviceable fault
   reports and halts the machine, which for a user-mode fault is exactly wrong: it should kill the
@@ -331,6 +340,42 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M5-05, synchronous IPC — M5 feature-complete)
+
+- **Rendezvous IPC, with no buffer in the nucleus.** A sender and a receiver meet, the message is
+  copied directly, and both continue. What is queued is *threads*, which are already accounted for;
+  buffering a message would force the nucleus to answer "whose memory is this", and every answer is
+  a denial of service or the synchronous behaviour with extra steps.
+- **Exercised through the whole system-call path**, not just the layer underneath: domain lookup,
+  CSpace lookup, capability resolution, type check, badge extraction, then the rendezvous. The test
+  clients call `syscall::dispatch` rather than `ipc::call`, so what is covered is what a user thread
+  would actually take.
+- **The badge is unforgeable by signature, not by checking.** `ipc::call` takes it as a separate
+  parameter that only the dispatcher can produce, from the capability actually presented. Two
+  clients hold differently-badged capabilities to the *same* endpoint and the service tells them
+  apart without asking either. Negative-tested: sourcing the badge from the caller's frame instead
+  makes both read as zero and the service cannot distinguish them.
+- **Per-thread kernel stacks, installed on every context switch.** A blocking system call means a
+  second thread can enter the kernel from user mode while the first is still there, so `RSP0` and
+  the `SYSCALL` stack must belong to the thread rather than the CPU.
+- **A tickless CPU woken by an IPI now re-arms its timer.** It was still armed for the one-second
+  idle backstop, so a thread given to an idle CPU ran without a single interrupt — which is why the
+  ring 3 probe was never preempted in user mode. Found because the ring 3 gate asserts on
+  interrupts taken from ring 3, which is a line added in the previous milestone for exactly this
+  class of miss.
+- **An idle CPU now halts instead of spinning on its runqueue lock.** The old idle path re-took the
+  lock every pass, and a remote CPU trying to deliver an IPC message competed with that loop for the
+  cache line — the lock is not fair, so it could be starved indefinitely. It measured as a
+  rendezvous that completed once and then stopped.
+- **`try_lock` on a query produced a wrong answer for the third time.** `weight_of` reported "no
+  such thread" for a thread on a busy CPU, failing the domain gate intermittently. `try_lock`
+  belongs where failing is a valid outcome; a *query* is not such a place. Recorded in the honest
+  notes because the pattern keeps recurring.
+- **A comment corrected rather than a claim defended.** `sched::deliver` said writing the mailbox
+  before waking prevents a lost wakeup. It does not — every waiter rechecks, so the wrong order
+  costs a wasted switch and nothing else. Reversing it deliberately does not fail the gate, and the
+  comment now says so.
 
 ### 2026-08-04 (M5-04, ring 3 — user mode runs)
 

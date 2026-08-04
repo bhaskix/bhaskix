@@ -36,6 +36,7 @@ pub mod font;
 pub mod framebuffer;
 pub mod frames;
 pub mod heap;
+pub mod ipc;
 pub mod memory;
 pub mod panic;
 pub mod sched;
@@ -320,6 +321,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // here -- a second, vaguer "FAILED" would only bury the first.
     let _ = smp::shootdown_self_test();
 
+    // Everything from here on spawns threads and expects them to run.
+    //
+    // `scheduling_self_test` ends by freezing the world so it can report a
+    // stable thread table, and a thread spawned into a stopped scheduler is
+    // created, is runnable, and is never chosen — which looks exactly like a
+    // thread that failed to start. It cost two milestones to notice twice, so
+    // the restart lives here, once, rather than inside whichever test happens
+    // to need it next.
     if scheduling_self_test(handoff.hhdm_base.as_u64()) {
         println!("    scheduler      timer-driven preemption works");
     } else {
@@ -339,6 +348,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     }
     if !syscall_self_test(handoff.hhdm_base.as_u64()) {
         println!("    syscall        FAILED");
+    }
+    sched::start_all();
+
+    if !ipc_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("    ipc            FAILED");
     }
     if !ring3_self_test(
         handoff.hhdm_base.as_u64(),
@@ -446,6 +463,224 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
     true
 }
 
+/// The endpoint the IPC self-test rendezvouses on.
+static IPC_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Replies the client received, and how many carried the right answer.
+static IPC_REPLIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static IPC_CORRECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Badges the service observed, or-ed together.
+static IPC_BADGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The badges the two client threads present.
+const BADGE_A: u64 = 0x0000_0000_a11c_e000;
+const BADGE_B: u64 = 0x0000_0000_b0b0_0000;
+
+/// Calls a service and checks the answer, through the system-call dispatcher.
+///
+/// Deliberately not `ipc::call` directly. Going through `syscall::dispatch`
+/// exercises the whole path a user thread takes — domain lookup, CSpace
+/// lookup, capability resolution, type check, badge extraction — rather than
+/// only the rendezvous underneath it. The badge in particular is *not* passed
+/// by this thread: it comes from the capability, and the point is that a
+/// caller cannot choose it.
+extern "C" fn ipc_client(which: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    // The index in this domain's CSpace, not the endpoint: a client names a
+    // capability it was given, and the two clients were given differently
+    // badged capabilities to the same endpoint.
+    let slot = which;
+
+    // Unbounded rounds rather than a fixed count. A fixed count turns a slow
+    // machine into a failed test: the assertion then has to be "did it finish
+    // in time", which measures the host. Looping until the phase ends means
+    // slowness costs *rounds*, and every round that happens is still checked
+    // exactly.
+    let mut round = 0u64;
+    loop {
+        if PHASE.load(Ordering::Acquire) > PHASE_IPC {
+            sched::exit();
+        }
+        let request = which * 100 + round;
+        round += 1;
+
+        let mut frame = syscall::SyscallFrame {
+            kind: syscall::Kind::Call as u64,
+            capability: slot,
+            method: request,
+            arg0: request,
+            ..syscall::SyscallFrame::default()
+        };
+        let outcome = syscall::dispatch(&mut frame);
+
+        match outcome.status {
+            syscall::Status::Ok => {
+                IPC_REPLIES.fetch_add(1, Ordering::Relaxed);
+                // The service answers with the request doubled. Checking the
+                // *value* rather than merely that a reply arrived is what
+                // makes this a message and not a signal -- and it catches a
+                // reply delivered to the wrong caller, which two clients
+                // running at once makes possible.
+                if outcome.value == request * 2 {
+                    IPC_CORRECT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            _ => sched::exit(),
+        }
+    }
+}
+
+/// Answers calls until the phase moves on.
+extern "C" fn ipc_service(_argument: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let endpoint = ipc::EndpointId::from_u32(IPC_ENDPOINT.load(Ordering::Acquire) as u32);
+
+    loop {
+        if PHASE.load(Ordering::Acquire) > PHASE_IPC {
+            sched::exit();
+        }
+        match ipc::recv(endpoint) {
+            Ok((message, caller)) => {
+                // The badge says which client this is, and the service never
+                // asked the client who it was.
+                IPC_BADGES.fetch_or(message.badge, Ordering::Relaxed);
+                let answer = ipc::Message {
+                    method: message.method,
+                    args: [message.args[0] * 2, 0, 0, 0],
+                    badge: message.badge,
+                };
+                let _ = ipc::reply(caller, answer);
+            }
+            Err(_) => sched::exit(),
+        }
+    }
+}
+
+/// Checks that two threads can rendezvous, exchange a message, and that the
+/// service can tell its callers apart without asking them.
+fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("    ipc            skipped, needs a cpu that is not running the tests");
+        return true;
+    }
+
+    let Ok(endpoint) = ipc::create() else {
+        println!("    ipc            FAILED to create an endpoint");
+        return false;
+    };
+    IPC_ENDPOINT.store(u64::from(endpoint.as_u32()), Ordering::Release);
+
+    // A domain for the clients, holding two capabilities to the *same*
+    // endpoint with *different* badges. That is the shape a service uses to
+    // tell its clients apart: it hands each one a differently badged
+    // capability, and thereafter neither can claim to be the other, because
+    // neither can read or set its own badge.
+    let Ok(clients) = domain::create("ipc-clients", domain::ResourceEnvelope::new()) else {
+        println!("    ipc            FAILED to create a client domain");
+        return false;
+    };
+
+    let installed = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        let a = arena.derive(root, cap::Rights::ALL, BADGE_A).ok()?;
+        let b = arena.derive(root, cap::Rights::ALL, BADGE_B).ok()?;
+        Some((a, b))
+    });
+    let Some((cap_a, cap_b)) = installed else {
+        println!("    ipc            FAILED to derive endpoint capabilities");
+        return false;
+    };
+    let placed = domain::with(clients, |owner| {
+        owner.cspace.install_at(0, cap_a).is_ok() && owner.cspace.install_at(1, cap_b).is_ok()
+    });
+    if placed != Some(true) {
+        println!("    ipc            FAILED to install the endpoint capabilities");
+        return false;
+    }
+
+    let (delivered_before, replied_before) = ipc::statistics();
+
+    // The service on one CPU and the clients on another, so the rendezvous is
+    // genuinely cross-processor: a same-CPU version would pass with a wake
+    // that never sends an IPI.
+    let service = sched::SpawnOptions::new().pinned();
+    let client = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(clients.as_u32());
+    if sched::spawn_on_with(1, "ipc-svc", ipc_service, 0, hhdm_base, service).is_err()
+        || sched::spawn_on_with(2, "ipc-cli-a", ipc_client, 0, hhdm_base, client).is_err()
+        || sched::spawn_on_with(2, "ipc-cli-b", ipc_client, 1, hhdm_base, client).is_err()
+    {
+        println!("    ipc            FAILED to spawn the participants");
+        return false;
+    }
+
+    // Generous, because the sample must land after the last reply rather than
+    // during it: an earlier version read six replies while the endpoint had
+    // already counted seven, which is a race in the test rather than in the
+    // rendezvous.
+    wait_millis(1200);
+
+    let replies = IPC_REPLIES.load(Ordering::Relaxed);
+    let correct = IPC_CORRECT.load(Ordering::Relaxed);
+    let badges = IPC_BADGES.load(Ordering::Relaxed);
+    let (delivered, replied) = ipc::statistics();
+    let delivered = delivered - delivered_before;
+    let replied = replied - replied_before;
+
+    // Retire the service, then tear the endpoint down and confirm nothing is
+    // left queued on it.
+    PHASE.store(PHASE_IPC + 1, Ordering::Release);
+    let stranded = ipc::destroy(endpoint);
+    wait_millis(200);
+    domain::destroy(clients);
+
+    let mut ok = true;
+    let checks = [
+        // Correctness, not throughput. Every reply that arrived carried the
+        // value the service computed for *that* request, which is what catches
+        // a reply delivered to the wrong caller -- possible precisely because
+        // two clients are in flight at once.
+        ("every reply carried the right value", correct == replies),
+        ("the rendezvous made progress", replies >= 4),
+        // Both badges seen, and neither client could have supplied its own:
+        // the badge is a parameter only the caller of `ipc::call` can set, and
+        // the clients pass the one they were given.
+        (
+            "the service told its two callers apart by badge",
+            badges & BADGE_A != 0 && badges & BADGE_B != 0,
+        ),
+        ("the endpoint counted the rendezvous", delivered >= 8),
+        ("the endpoint counted the replies", replied >= 8),
+    ];
+
+    for (name, passed) in checks {
+        if !passed {
+            println!(
+                "    ipc            FAILED: {name} (replies {replies}, correct {correct}, badges {badges:#x}, delivered {delivered}, replied {replied})"
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!(
+            "    ipc            {delivered} rendezvous, {replied} replies, {correct}/{replies} correct; two badges distinguished, {stranded} stranded on teardown"
+        );
+    }
+    ok
+}
+
 /// Where the ring 3 probe's code and stack live in its address space.
 const USER_CODE: u64 = 0x0000_0000_1000_0000;
 const USER_STACK: u64 = 0x0000_0000_1100_0000;
@@ -536,12 +771,6 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("    ring 3         skipped, needs a cpu that is not running the tests");
         return true;
     }
-
-    // The scheduler self-test froze the world to report on it. A thread
-    // spawned into a stopped scheduler is created, is runnable, and is never
-    // chosen -- which is indistinguishable from one that failed to start, and
-    // was.
-    sched::start_all();
 
     const CPU: u32 = 3;
     /// Slot base for the stack an interrupt from ring 3 lands on.
@@ -1150,6 +1379,7 @@ const PHASE_WAIT: u64 = 2;
 const PHASE_CLASS: u64 = 3;
 const PHASE_TICKLESS: u64 = 4;
 const PHASE_DOMAIN: u64 = 5;
+const PHASE_IPC: u64 = 6;
 
 /// Spin counters for the scheduling-class phase, indexed by thread argument.
 static CLASS_WORK: [core::sync::atomic::AtomicU64; 4] = [

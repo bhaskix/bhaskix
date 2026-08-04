@@ -395,7 +395,7 @@ bhaskix_user_probe_start:
     //
     // `r12` because `syscall` destroys `rcx` and `r11` and every other free
     // register is an argument.
-    mov r12, 0x80000
+    mov r12, 0x300000
 11:
     dec r12
     jnz 11b

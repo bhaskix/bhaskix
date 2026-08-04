@@ -94,17 +94,23 @@ pub enum Rank {
     /// runqueue. Nothing goes the other way — the IPC paths resolve
     /// capabilities before they block, never after.
     Capabilities = 6,
+    /// `ipc::TABLE` — the endpoint table.
+    ///
+    /// Inside the capability arena, because a syscall resolves the endpoint
+    /// capability before it touches the endpoint; outside the runqueues,
+    /// because completing a rendezvous wakes the thread on the other side.
+    Endpoints = 7,
     /// `wait::WaitQueue` — the waiter list of a blocking primitive.
     ///
     /// Outside the runqueues, because both halves of a sleep take them in that
     /// order: a sleeper holds this while marking itself blocked, and a waker
     /// holds it while marking a sleeper ready. Either one taking them the
     /// other way round is the deadlock this ordering exists to make visible.
-    WaitQueue = 7,
+    WaitQueue = 8,
     /// `sched::QUEUES` — one runqueue per CPU.
-    SchedRunqueue = 8,
+    SchedRunqueue = 9,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
-    Console = 9,
+    Console = 10,
 }
 
 impl Rank {
@@ -136,6 +142,7 @@ impl Rank {
             Self::Timers => "time::TIMERS",
             Self::Domains => "domain::TABLE",
             Self::Capabilities => "cap::ARENA",
+            Self::Endpoints => "ipc::TABLE",
             Self::WaitQueue => "wait::WaitQueue",
             Self::SchedRunqueue => "sched::QUEUES",
             Self::Console => "console::CONSOLE",
@@ -427,6 +434,7 @@ mod tests {
             Rank::Timers,
             Rank::Domains,
             Rank::Capabilities,
+            Rank::Endpoints,
             Rank::WaitQueue,
             Rank::SchedRunqueue,
             Rank::Console,

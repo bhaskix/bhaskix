@@ -220,6 +220,20 @@ pub struct Thread {
     /// Kernel threads created before domains exist have no domain, and must
     /// not be swept up by a re-weighting aimed at one.
     pub domain: u32,
+    /// A message delivered to this thread, and who sent it.
+    ///
+    /// One slot, because IPC is a rendezvous: a thread has at most one
+    /// outstanding message at a time by construction, so a queue here would be
+    /// a place for a second one to arrive that the protocol does not allow.
+    pub mailbox: Option<(crate::ipc::Message, u32)>,
+    /// One past this thread's kernel stack, for entry from user mode.
+    ///
+    /// Both the `SYSCALL` stub and the CPU's ring 3 → ring 0 transition need a
+    /// kernel stack, and both must get *this thread's* — not the CPU's. A
+    /// shared one is correct only while at most one thread per CPU can be in
+    /// the kernel from user mode; the moment a system call blocks, a second
+    /// thread enters on the same stack and overwrites the first's frame.
+    pub kernel_stack_top: u64,
     /// Class and parameters.
     pub policy: Policy,
     /// Service received, scaled by weight. Only meaningful for Fair.
@@ -628,6 +642,10 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         migrations: 0,
         held_locks: 0,
         domain: u32::MAX,
+        mailbox: None,
+        // The thread a CPU registers for itself is already running on the
+        // stack the bootloader gave it, and never enters from user mode.
+        kernel_stack_top: 0,
         policy,
         vruntime: 0,
         deadline: 0,
@@ -817,6 +835,8 @@ pub fn spawn_on_with(
         migrations: 0,
         held_locks: 0,
         domain: options.domain,
+        mailbox: None,
+        kernel_stack_top: guarded.top,
         pinned,
         policy,
         // Starting at the floor rather than at zero. A new thread with
@@ -882,6 +902,50 @@ pub fn spawn(
     spawn_on(best as u32, name, entry, argument, hhdm_base)
 }
 
+/// Puts a message in `thread`'s mailbox, from `from`.
+///
+/// Returns whether the thread exists and its mailbox was empty. A full mailbox
+/// is refused rather than overwritten: the protocol permits one outstanding
+/// message per thread, so a second arriving means something has gone wrong,
+/// and silently replacing the first would lose a reply somebody is blocked
+/// waiting for.
+///
+/// Written before the thread is woken, and that ordering is an *optimisation*
+/// rather than a requirement — a distinction worth stating, because the
+/// opposite claim is the intuitive one.
+///
+/// Waking first would let the receiver run and find an empty mailbox. It would
+/// then recheck, find nothing, and block again, because every waiter here
+/// loops rather than trusting a wake — the rule M4-09 arrived at. So the wrong
+/// order costs a wasted switch and loses nothing. Reversing it deliberately
+/// does not fail the IPC gate, and the comment says so instead of implying a
+/// safety property the code does not depend on.
+pub fn deliver(thread: u32, message: crate::ipc::Message, from: u32) -> bool {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            if target.mailbox.is_some() {
+                return false;
+            }
+            target.mailbox = Some((message, from));
+            return true;
+        }
+    }
+    false
+}
+
+/// Takes the message waiting for `thread`, if there is one.
+#[must_use]
+pub fn take_message(thread: u32) -> Option<(crate::ipc::Message, u32)> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            return target.mailbox.take();
+        }
+    }
+    None
+}
+
 /// The domain the calling thread belongs to.
 ///
 /// `None` for a thread created before domains existed, which is the correct
@@ -910,9 +974,13 @@ pub fn current_domain() -> Option<crate::domain::DomainId> {
 #[must_use]
 pub fn weight_of(id: u32) -> Option<u32> {
     for queue in QUEUES.iter().take(percpu::online_count() as usize) {
-        let Some(queue) = queue.try_lock() else {
-            continue;
-        };
+        // Blocking. `try_lock` here reports "no such thread" for a thread that
+        // exists on a busy CPU, and the caller cannot tell the two apart — a
+        // query that answers `None` for "ask again later" is worse than one
+        // that waits. This is the third place the same shortcut has produced
+        // an intermittent wrong answer; see also `set_domain_weight` and
+        // `start_all`.
+        let queue = queue.lock();
         if let Some(thread) = queue.threads.iter().flatten().find(|t| t.id == id) {
             return match thread.policy {
                 Policy::Fair { weight } => Some(weight),
@@ -931,9 +999,8 @@ pub fn weight_of(id: u32) -> Option<u32> {
 #[must_use]
 pub fn cycles_of(id: u32) -> Option<u64> {
     for queue in QUEUES.iter().take(percpu::online_count() as usize) {
-        let Some(queue) = queue.try_lock() else {
-            continue;
-        };
+        // Blocking, for the reason in `weight_of`.
+        let queue = queue.lock();
         if let Some(thread) = queue.threads.iter().flatten().find(|t| t.id == id) {
             return Some(thread.cycles);
         }
@@ -1028,9 +1095,16 @@ pub fn stop() {
 /// never chosen — which looks exactly like a thread that failed to start.
 pub fn start_all() {
     for queue in QUEUES.iter().take(percpu::online_count() as usize) {
-        if let Some(mut queue) = queue.try_lock() {
-            queue.started = true;
-        }
+        // Blocking, not `try_lock`. A CPU whose queue is contended is exactly
+        // one with threads spinning on it -- in `exit`, or waiting for
+        // something to become runnable -- so skipping on contention skips the
+        // CPUs most likely to need starting. It measured as an IPC test where
+        // no thread ran at all, intermittently, which is the second time this
+        // exact shortcut has cost a milestone a day.
+        //
+        // Safe to block: the caller holds nothing, and every scheduler path
+        // reachable from an interrupt uses `try_lock`.
+        queue.lock().started = true;
     }
 }
 
@@ -1163,8 +1237,12 @@ pub fn preempt() {
             thread.last_start = now;
         }
         // A new thread starts a new quantum.
-        if let Some(thread) = queue.threads[next].as_ref() {
-            queue.slice_deadline = now.saturating_add(thread.slice_ticks);
+        if let Some((slice, stack)) = queue.threads[next]
+            .as_ref()
+            .map(|thread| (thread.slice_ticks, thread.kernel_stack_top))
+        {
+            queue.slice_deadline = now.saturating_add(slice);
+            install_kernel_stack(cpu, stack);
         }
         queue.current = next;
 
@@ -1227,6 +1305,28 @@ pub fn preempt() {
     // thread rather than with the processor -- which is what makes it the
     // right place to keep a value that must survive a switch.
     restore_interrupts(interrupts_were_enabled);
+}
+
+/// Points both kernel-entry paths at the incoming thread's stack.
+///
+/// Two places need it and neither can consult the other: `SYSCALL` reads
+/// per-CPU data because it has no stack to compute on, and the CPU reads the
+/// TSS on a privilege change without asking anyone. They must name the same
+/// stack, and it must be the one belonging to the thread about to run.
+///
+/// A stack top of zero means a thread that never enters from user mode — the
+/// one each CPU registered for itself. Installing it would leave both paths
+/// pointing at address zero, so it is skipped.
+fn install_kernel_stack(cpu: usize, top: u64) {
+    if top == 0 {
+        return;
+    }
+    // SAFETY: this CPU is about to run the thread that owns this stack, and
+    // the value is one past a mapped, guarded kernel stack allocated for it.
+    unsafe {
+        percpu::set_kernel_stack(cpu as u32, top);
+        bhaskix_arch::gdt::set_privilege_stack(cpu, top);
+    }
 }
 
 /// Re-enables interrupts if they were enabled before a scheduler critical
@@ -1445,8 +1545,12 @@ pub fn block_self() {
                     thread.runs += 1;
                     thread.last_start = now;
                 }
-                if let Some(thread) = queue.threads[next].as_ref() {
-                    queue.slice_deadline = now.saturating_add(thread.slice_ticks);
+                if let Some((slice, stack)) = queue.threads[next]
+                    .as_ref()
+                    .map(|thread| (thread.slice_ticks, thread.kernel_stack_top))
+                {
+                    queue.slice_deadline = now.saturating_add(slice);
+                    install_kernel_stack(cpu, stack);
                 }
                 queue.current = next;
 
@@ -1494,10 +1598,25 @@ pub fn block_self() {
                 // waiting, or the tick that would make something runnable can
                 // never be delivered and this loop spins for ever.
                 restore_interrupts(interrupts_were_enabled);
-                core::hint::spin_loop();
+
                 if interrupts_were_enabled {
+                    // Halt rather than spin, and the reason is not power.
+                    //
+                    // Spinning here means re-taking this CPU's runqueue lock
+                    // on every pass, in a tight loop, on a CPU that has
+                    // nothing to do. Another CPU trying to reach this queue --
+                    // to deliver an IPC message, say -- competes with that
+                    // loop for the cache line and can be starved indefinitely,
+                    // because the lock is not fair. It measured as an IPC
+                    // rendezvous that completed once and then stopped.
+                    //
+                    // SAFETY: interrupts were enabled on entry and have just
+                    // been restored, so a timer or an IPI will wake this.
+                    unsafe { cpu::halt() };
                     // SAFETY: re-masking for the next pass, as at entry.
                     unsafe { cpu::disable_interrupts() };
+                } else {
+                    core::hint::spin_loop();
                 }
             }
         }
@@ -1713,6 +1832,8 @@ mod tests {
             migrations: 0,
             held_locks: 0,
             domain: u32::MAX,
+            mailbox: None,
+            kernel_stack_top: 0,
             pinned: slot == 0,
             policy,
             vruntime: 0,

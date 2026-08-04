@@ -298,6 +298,30 @@ pub unsafe fn on_tick() {
     unsafe { rearm(cpu, now) };
 }
 
+/// Re-arms this CPU's timer for whatever it now has to do.
+///
+/// Called after an inter-processor interrupt has made something runnable here.
+/// Without it a CPU that went tickless stays armed for the idle backstop — a
+/// whole second — even though it now has a thread to preempt. The thread runs,
+/// and is simply never interrupted.
+///
+/// That is not a small inefficiency. It measured as a user-mode program
+/// completing without a single timer interrupt, which meant the
+/// interrupt-from-ring-3 path was never exercised at all.
+///
+/// # Safety
+///
+/// Must be called from an interrupt handler, after acknowledgement, on a CPU
+/// whose APIC is initialised.
+pub unsafe fn rearm_this_cpu() {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    // SAFETY: per the caller.
+    unsafe { rearm(cpu, now()) };
+}
+
 /// Chooses the next deadline for this CPU and programs the timer for it.
 ///
 /// # Safety

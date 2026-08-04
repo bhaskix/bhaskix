@@ -145,6 +145,10 @@ pub enum Status {
     NotImplemented = 6,
     /// The calling thread belongs to no domain, so it has no CSpace.
     NoDomain = 7,
+    /// The endpoint's queue is full in the direction this call needs.
+    Congested = 8,
+    /// The reply names a caller that is no longer waiting.
+    NoSuchCaller = 9,
 }
 
 impl Status {
@@ -231,10 +235,61 @@ pub fn dispatch_with(frame: &mut SyscallFrame, cspace: &CSpace, arena: &Arena) -
             };
             match resolve(cspace, arena, frame.capability) {
                 Ok((_, actual)) if actual != expected => Outcome::err(Status::WrongObject),
+                // Resolved and type-checked. The operation itself happens in
+                // `dispatch`, after every lock is released, because it blocks
+                // — see `Resolved`.
                 Ok(_) => Outcome::err(Status::NotImplemented),
                 Err(status) => Outcome::err(status),
             }
         }
+    }
+}
+
+/// What a capability resolved to, for an operation that must run unlocked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Resolved {
+    object: crate::cap::ObjectRef,
+    badge: u64,
+}
+
+/// Resolves the capability an IPC syscall names, and its badge.
+///
+/// Returns with every lock released. That is the point: `Call`, `Recv` and
+/// `Reply` all block, and blocking while holding the capability arena is how
+/// M5-04's `Exit` deadlocked the machine. The lesson generalises — resolve,
+/// let go, then act.
+fn resolve_for_ipc(index: u64, expected: ObjectKind) -> Result<Resolved, Status> {
+    let Some(id) = sched::current_domain() else {
+        return Err(Status::NoDomain);
+    };
+
+    let outcome = domain::with(id, |owner| {
+        let cspace = core::mem::take(&mut owner.cspace);
+        let result = cap::with_arena(|arena| {
+            let index = usize::try_from(index).map_err(|_| Status::NoSuchCapability)?;
+            let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
+            let (object, _) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            if object.kind != expected {
+                return Err(Status::WrongObject);
+            }
+            let badge = arena.badge_of(slot).unwrap_or(0);
+            Ok(Resolved { object, badge })
+        });
+        owner.cspace = cspace;
+        result
+    });
+
+    outcome.unwrap_or(Err(Status::NoDomain))
+}
+
+/// Maps an IPC failure onto a status code.
+const fn ipc_status(error: crate::ipc::IpcError) -> Status {
+    match error {
+        crate::ipc::IpcError::NoSuchEndpoint | crate::ipc::IpcError::Exhausted => {
+            Status::NoSuchCapability
+        }
+        crate::ipc::IpcError::Congested => Status::Congested,
+        crate::ipc::IpcError::NoSuchCaller => Status::NoSuchCaller,
     }
 }
 
@@ -277,6 +332,66 @@ pub fn dispatch(frame: &mut SyscallFrame) -> Outcome {
         Some(Kind::Exit) => sched::exit(),
         None => return Outcome::err(Status::BadSyscall),
         Some(_) => {}
+    }
+
+    // The three that block. Each resolves its capability with the locks held,
+    // releases them, and only then performs an operation that may not return
+    // for a long time.
+    match kind {
+        Some(Kind::Call) => {
+            let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Endpoint) {
+                Ok(resolved) => resolved,
+                Err(status) => return Outcome::err(status),
+            };
+            let endpoint = crate::ipc::EndpointId::from_u32(resolved.object.id as u32);
+            // The badge comes from the capability, never from the frame. A
+            // caller that could set it could claim to be anyone.
+            match crate::ipc::call(
+                endpoint,
+                resolved.badge,
+                frame.method,
+                [frame.arg0, frame.arg1, frame.arg2, frame.arg3],
+            ) {
+                Ok(reply) => {
+                    frame.arg0 = reply.args[0];
+                    return Outcome::ok(reply.args[0]);
+                }
+                Err(error) => return Outcome::err(ipc_status(error)),
+            }
+        }
+        Some(Kind::Recv) => {
+            let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Endpoint) {
+                Ok(resolved) => resolved,
+                Err(status) => return Outcome::err(status),
+            };
+            let endpoint = crate::ipc::EndpointId::from_u32(resolved.object.id as u32);
+            match crate::ipc::recv(endpoint) {
+                Ok((message, caller)) => {
+                    // The badge tells the receiver which route the caller
+                    // used, and `arg1` names who to reply to.
+                    frame.method = message.method;
+                    frame.arg0 = message.args[0];
+                    frame.arg1 = u64::from(caller);
+                    frame.arg2 = message.badge;
+                    return Outcome::ok(message.badge);
+                }
+                Err(error) => return Outcome::err(ipc_status(error)),
+            }
+        }
+        Some(Kind::Reply) => {
+            // `arg1` names the caller, as `Recv` returned it.
+            let caller = frame.arg1 as u32;
+            let answer = crate::ipc::Message {
+                method: frame.method,
+                args: [frame.arg0, 0, 0, 0],
+                badge: 0,
+            };
+            return match crate::ipc::reply(caller, answer) {
+                Ok(()) => Outcome::ok(0),
+                Err(error) => Outcome::err(ipc_status(error)),
+            };
+        }
+        _ => {}
     }
 
     let Some(id) = sched::current_domain() else {
@@ -481,5 +596,7 @@ mod tests {
         assert_eq!(Status::InsufficientRights.as_u64(), 5);
         assert_eq!(Status::NotImplemented.as_u64(), 6);
         assert_eq!(Status::NoDomain.as_u64(), 7);
+        assert_eq!(Status::Congested.as_u64(), 8);
+        assert_eq!(Status::NoSuchCaller.as_u64(), 9);
     }
 }

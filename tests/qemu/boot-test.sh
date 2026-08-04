@@ -298,6 +298,18 @@ else
     status=1
 fi
 
+# Synchronous IPC. The assertion is correctness, not throughput: every reply
+# that arrived carried the value computed for *that* request, which catches a
+# reply delivered to the wrong caller — possible precisely because two clients
+# are in flight at once. Round counts vary by seventy times between runs on a
+# loaded host, so a fixed count would measure the host.
+if grep -qE "ipc +[0-9]+ rendezvous, [0-9]+ replies, ([0-9]+)/\1 correct; two badges distinguished" "$LOG"; then
+    pass "synchronous IPC: rendezvous, correct replies, badges distinguish callers"
+else
+    fail "IPC self test did not pass"
+    status=1
+fi
+
 # Ring 3. The evidence is *where* the kernel was entered from: a system call
 # made by user code arrives with a return address inside the user program's
 # page and a stack pointer inside the user stack, neither of which the kernel

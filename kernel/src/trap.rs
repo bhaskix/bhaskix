@@ -228,6 +228,16 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             // SAFETY: the APIC is initialised -- interrupts cannot be enabled
             // before `enable` succeeds.
             unsafe { apic::end_of_interrupt() };
+
+            // This CPU may have been idle and tickless, armed only for the
+            // one-second backstop. It has work now, so it needs a tick to
+            // preempt with -- re-armed before scheduling, because `preempt`
+            // may not return until much later.
+            //
+            // SAFETY: timer interrupt context, after acknowledgement, on a CPU
+            // whose APIC is initialised.
+            unsafe { crate::time::rearm_this_cpu() };
+
             crate::sched::preempt();
         }
 
