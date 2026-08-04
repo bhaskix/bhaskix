@@ -681,6 +681,55 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
     ok
 }
 
+/// The endpoint the ring 3 probe calls, and the service that answers it.
+static RING3_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static RING3_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Calls the service received from ring 3.
+static RING3_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Badges the service saw on those calls, or-ed together.
+static RING3_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Set when ring 3 sent back the value it was told, proving it received it.
+static RING3_ECHOED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The badge on the capability the ring 3 probe holds.
+const BADGE_RING3: u64 = 0x0000_0000_1234_0000;
+/// What the probe asks for, and what it must be told.
+const RING3_REQUEST: u64 = 6;
+
+/// Answers the ring 3 probe.
+extern "C" fn ring3_service(_argument: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let endpoint = ipc::EndpointId::from_u32(RING3_ENDPOINT.load(Ordering::Acquire) as u32);
+
+    loop {
+        if RING3_STOP.load(Ordering::Acquire) {
+            sched::exit();
+        }
+        match ipc::recv(endpoint) {
+            Ok((message, caller)) => {
+                RING3_CALLS.fetch_add(1, Ordering::Relaxed);
+                RING3_BADGE.fetch_or(message.badge, Ordering::Relaxed);
+
+                // Method 8 carries back whatever the probe was told last time.
+                // Checking it here is what proves the reply reached ring 3 and
+                // not merely that the kernel delivered one.
+                if message.method == 8 && message.args[0] == RING3_REQUEST * 2 {
+                    RING3_ECHOED.store(true, Ordering::Release);
+                }
+
+                let answer = ipc::Message {
+                    method: message.method,
+                    args: [message.args[0] * 2, 0, 0, 0],
+                    badge: message.badge,
+                };
+                let _ = ipc::reply(caller, answer);
+            }
+            Err(_) => sched::exit(),
+        }
+    }
+}
+
 /// Where the ring 3 probe's code and stack live in its address space.
 const USER_CODE: u64 = 0x0000_0000_1000_0000;
 const USER_STACK: u64 = 0x0000_0000_1100_0000;
@@ -790,10 +839,57 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // this is set before anything can enter ring 3 on that CPU.
     unsafe { bhaskix_arch::gdt::set_privilege_stack(CPU as usize, privileged.top) };
 
+    // A domain for the probe, holding one badged capability to an endpoint at
+    // index 0. Without this the probe has no CSpace, and a system call that
+    // needs one is refused before it reaches the endpoint -- which is correct,
+    // and is why a user thread could not do IPC until now.
+    let Ok(endpoint) = ipc::create() else {
+        println!("    ring 3         FAILED to create an endpoint");
+        return false;
+    };
+    RING3_ENDPOINT.store(
+        u64::from(endpoint.as_u32()),
+        core::sync::atomic::Ordering::Release,
+    );
+
+    let Ok(realm) = domain::create("ring3", domain::ResourceEnvelope::new()) else {
+        println!("    ring 3         FAILED to create a domain");
+        return false;
+    };
+
+    let derived = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, BADGE_RING3).ok()
+    });
+    let Some(granted) = derived else {
+        println!("    ring 3         FAILED to derive an endpoint capability");
+        return false;
+    };
+    if domain::with(realm, |owner| owner.cspace.install_at(0, granted).is_ok()) != Some(true) {
+        println!("    ring 3         FAILED to install the endpoint capability");
+        return false;
+    }
+
     let (calls_before, refused_before) = syscall::statistics();
     let interrupts_before = bhaskix_arch::trap::interrupts_from_user();
 
-    let options = sched::SpawnOptions::new().pinned();
+    // The service on a different CPU, so the probe's call genuinely blocks and
+    // is woken across processors rather than handed straight back.
+    let service = sched::SpawnOptions::new().pinned();
+    if sched::spawn_on_with(1, "r3-svc", ring3_service, 0, hhdm_base, service).is_err() {
+        println!("    ring 3         FAILED to spawn the service");
+        return false;
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
     if let Err(error) =
         sched::spawn_on_with(CPU, "ring3", ring3_probe, hhdm_base, hhdm_base, options)
     {
@@ -801,7 +897,15 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
-    wait_millis(600);
+    wait_millis(1200);
+
+    let ring3_calls = RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed);
+    let ring3_badge = RING3_BADGE.load(core::sync::atomic::Ordering::Relaxed);
+    let echoed = RING3_ECHOED.load(core::sync::atomic::Ordering::Acquire);
+
+    RING3_STOP.store(true, core::sync::atomic::Ordering::Release);
+    ipc::destroy(endpoint);
+    domain::destroy(realm);
 
     let (calls, refused) = syscall::statistics();
     let calls = calls - calls_before;
@@ -828,6 +932,17 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // is never reached. Removing that `swapgs` passed a version of this
         // test that lacked this line.
         ("the probe was interrupted while in ring 3", interrupts > 0),
+        // The IPC half. Two calls, both from user mode, both carrying the
+        // badge from the capability the probe holds -- which the probe cannot
+        // read or set.
+        ("ring 3 reached a service through IPC", ring3_calls >= 2),
+        (
+            "the service saw the badge from the probe's capability",
+            ring3_badge & BADGE_RING3 != 0,
+        ),
+        // The decisive one: user mode sent back the value it was told, so the
+        // reply reached ring 3 rather than merely being delivered.
+        ("the reply reached user mode", echoed),
     ];
 
     let mut ok = true;
@@ -842,7 +957,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     if ok {
         println!(
-            "    ring 3         {calls} syscalls and {interrupts} interrupts from user mode, {refused} refused; entered at rip {rip:#x}, rsp {rsp:#x}"
+            "    ring 3         {calls} syscalls and {interrupts} interrupts from user mode, {refused} refused; {ring3_calls} ipc calls badged {ring3_badge:#x}, reply reached ring 3"
         );
     }
     ok

@@ -66,6 +66,15 @@ If authority must be presented rather than possessed, the deputy has nothing to 
 There is no path-name-to-authority lookup to race against: you hold a capability to the object or
 you do not.
 
+> **Demonstrated end to end as of M5-05b.** A program in ring 3 invokes a service through a
+> capability it holds at index 0 of its own CSpace, and the service identifies it by a badge the
+> program cannot read or set. Removing the capability, or the domain, leaves the program making the
+> same system calls and reaching nothing — which is the claim above stated as a test rather than as
+> a design intention.
+>
+> Still missing: there is no syscall to **grant, derive or revoke**, so a domain's authority is
+> fixed when it is created. The mechanism exists in the arena and is unreachable from user mode.
+
 ### Rules the implementation must uphold
 
 1. **Unforgeable.** A capability is an index into a kernel-owned CSpace. Userspace holds an integer

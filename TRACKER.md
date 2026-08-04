@@ -124,7 +124,7 @@ fairness within 2% for two equal-weight workloads.
 | M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | ✅ `DONE` | Exercised for real as of M5-04: ten system calls from ring 3 per boot. Built on RFC 0008's recommendation rather than its acceptance. |
 | M5-04 | Ring 3 execution | ✅ `DONE` | A program runs in ring 3, enters the kernel through `SYSCALL`, and is interrupted there. **Negative-tested**: removing the interrupt-entry `swapgs` or leaving `RSP0` zero both fail the gate. |
 | M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`/`Recv`, badges | ✅ `DONE` | Rendezvous, no buffering. Exercised through the whole syscall path — domain, CSpace, capability, type check, badge. **Negative-tested**: taking the badge from the caller's frame makes the service unable to tell its clients apart. |
-| M5-05b | IPC from ring 3 | ⬜ `TODO` | The user probe has no domain holding an endpoint capability, so user-mode IPC is unexercised. The kernel-thread path covers the dispatcher end to end. |
+| M5-05b | IPC from ring 3 | ✅ `DONE` | A user program calls a service by capability, blocks, is woken across CPUs, and receives the reply — proved by sending the value back. **Negative-tested**: with no capability, or no domain, the syscalls still happen and reach nothing. |
 | M5-06 | Per-domain capability quotas | 🟡 `PARTIAL` | `ResourceEnvelope::max_capabilities` exists and is unit-tested, but nothing charges it yet — there is no syscall through which a domain derives. Wired up in M5-03. |
 
 ### Honest notes on M5 so far
@@ -134,6 +134,10 @@ fairness within 2% for two equal-weight workloads.
   exist. It has caused an intermittent failure in `set_domain_weight`, in `start_all` and in
   `weight_of`/`cycles_of`. `try_lock` belongs where *failing* is a valid outcome — interrupt context,
   and the switch path — and nowhere else.
+- **A user thread can call, but cannot yet be *given* a capability at runtime.** The probe's
+  endpoint capability is installed by the kernel before it starts. There is no syscall to grant,
+  derive or revoke, so a domain's authority is fixed at creation — which makes `Rights::GRANT` and
+  the whole delegation story real in the arena and unreachable from user mode.
 - **IPC has no timeout on `Recv`**, so a service bug hangs its callers indefinitely. RFC 0008
   records it as unresolved because it needs a policy decision rather than code.
 - **"No message is ever lost" is not gated.** The IPC test asserts that every reply that arrived was
@@ -340,6 +344,26 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M5-05b, IPC from ring 3 — the loop closes)
+
+- **A user program calls a service and receives the answer.** Ring 3 → `SYSCALL` → domain lookup →
+  CSpace → capability resolution → type check → badge → rendezvous → block → cross-CPU wake →
+  resume → `SYSRET` → ring 3. Every layer built since M5-01 is on that path, and none of it was
+  exercised end to end before.
+- **The proof is that user mode sent the value back.** The service answers the first call with the
+  request doubled; the second call carries that answer *in*. A reply the kernel delivered but ring 3
+  never saw would otherwise be indistinguishable from one that arrived — a distinction the previous
+  milestone's IPC test could not make either, because both ends were kernel threads.
+- **This is also the first system call from ring 3 that blocks and comes back**, which is what
+  per-thread kernel stacks were built for in M5-05 and had until now been justified rather than
+  demonstrated.
+- **The badge on the call is `0x12340000`**, from the capability the probe holds — a value the
+  program cannot read, set, or replace. The service identifies its caller without asking it.
+- **Negative-tested in the way that matters for a capability system.** Remove the capability from
+  the probe's CSpace, or run the probe in no domain at all, and it still makes all twelve system
+  calls — they simply reach nothing. That is the model working: authority is the argument, so a
+  caller without one is not refused by a check, it has nothing to name.
 
 ### 2026-08-04 (M5-05, synchronous IPC — M5 feature-complete)
 

@@ -412,6 +412,30 @@ bhaskix_user_probe_start:
     mov rax, 999
     syscall
 
+    // Two IPC calls to a service, through capability index 0.
+    //
+    // The first asks for six doubled. The second sends the *answer back*, so
+    // the service can check what ring 3 actually received — a reply the kernel
+    // delivered but user mode never saw would otherwise be indistinguishable
+    // from one that arrived.
+    //
+    // `r13` because `syscall` destroys `rcx` and `r11`, and everything else
+    // here is an argument. Blocking in the first call and resuming into the
+    // second is also the first time a system call from ring 3 sleeps and comes
+    // back, which is what per-thread kernel stacks were built for.
+    mov rax, 1                  // Kind::Call
+    xor rdi, rdi                // capability index 0
+    mov rsi, 7                  // method
+    mov rdx, 6                  // argument
+    syscall
+    mov r13, rdx                // the reply value
+
+    mov rax, 1                  // Kind::Call
+    xor rdi, rdi
+    mov rsi, 8                  // method: "here is what I was told"
+    mov rdx, r13
+    syscall
+
     mov rax, 5                  // Kind::Exit
     syscall
 
