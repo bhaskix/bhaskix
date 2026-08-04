@@ -120,14 +120,28 @@ fairness within 2% for two equal-weight workloads.
 |---|---|---|---|
 | M5-00 | Decide the syscall and IPC shape | ⬜ `DRAFT` | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) answers **A2**, **A3** and **A4**. Blocks M5-03 onwards; does *not* block M5-01. |
 | M5-01 | Capability objects, CSpace, derive/revoke | ✅ `DONE` | All four rules of `docs/security.md` §2 enforced and **each negative-tested**. Derivation monotonicity tested over every one of 64×64 rights pairs, not sampled. |
-| M5-02 | `Domain` with `ResourceEnvelope` | ⬜ `TODO` | Needs the object table capabilities currently only name. |
+| M5-02 | `Domain` with `ResourceEnvelope` | ✅ `DONE` | Envelope refuses at allocation time (T10); CPU share **divided** among a domain's threads so it does not grow with thread count; destruction revokes the domain's whole derived subtree. **Negative-tested** in both directions. |
 | M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | ⬜ `TODO` | Blocked on M5-00 being accepted. |
 | M5-04 | Ring 3 execution | ⬜ `TODO` | Needs M5-03. |
 | M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`, badges | ⬜ `TODO` | Wait queues from M4-09 are the mechanism. |
-| M5-06 | Per-domain capability quotas | ⬜ `TODO` | The arena is a fixed global resource; a domain deriving in a loop exhausts it for everyone. |
+| M5-06 | Per-domain capability quotas | 🟡 `PARTIAL` | `ResourceEnvelope::max_capabilities` exists and is unit-tested, but nothing charges it yet — there is no syscall through which a domain derives. Wired up in M5-03. |
 
 ### Honest notes on M5 so far
 
+- **Domain CPU share is an approximation of the two-level runqueue, not a replacement.** Dividing a
+  domain's share among its threads gets the *aggregate* right — which is the property
+  `docs/scheduler.md` §3 claims and the one a per-thread weight silently breaks — and gets the
+  distribution *within* a domain wrong: every thread in a domain is weighted equally, so a domain
+  cannot prioritise among its own threads. That needs the real two-level structure.
+- **A domain's threads are counted, not owned.** Destroying a domain releases its accounting and
+  revokes its authority, and does not stop its threads. A thread outliving its domain holds no
+  capabilities, which contains it, but it still runs and still consumes CPU.
+- **The capability quota is declared and not charged.** `max_capabilities` is enforced by
+  `Domain::charge_capability`, which nothing calls, because a domain has no way to derive anything
+  until there are syscalls. Until M5-03 the arena remains a fixed global resource with no per-domain
+  bound — T10 through a door that is currently closed for a different reason.
+- **A domain records no address space.** The structure `docs/architecture.md` §4 specifies has one;
+  this does not, because binding one needs the object table that M5-02 only begins.
 - **Capabilities name objects that do not exist.** `ObjectRef` carries a kind and an identity, and
   nothing maps an identity to a frame, a thread or an endpoint yet. The authority mechanism is real;
   the things it authorises are not, and until M5-02 the self-test authorises a number.
@@ -301,6 +315,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M5-02, domains and the resource envelope)
+
+- **The envelope refuses.** `docs/security.md` T10 says it is enforced "at allocation and scheduling
+  time, not by best effort", and the wording is doing work: a limit checked after the fact, or
+  treated as a hint to a reclaim policy, does not answer T10 — it describes it. `charge_frames`
+  returns an error and applies nothing, which is the only behaviour that means anything to the
+  *other* domains.
+- **CPU share is divided among a domain's threads, not given to each.** A per-thread weight makes a
+  domain with ten threads take ten times the CPU of a domain with one, which turns the envelope into
+  a suggestion and makes spawning threads a privilege-escalation strategy that needs no bug.
+  `docs/scheduler.md` §3's claim — "honoured regardless of how many threads it spawns" — is now
+  arithmetic rather than aspiration, and §10's one-thread-versus-many comparison is a gate.
+- **Destroying a domain revokes its whole derived subtree**, before `destroy` returns, using M5-01's
+  root capability. Everything a domain was ever granted descends from that one capability, which is
+  what makes teardown total rather than a sweep of somebody's tables.
+- **The gate asserts the mechanism and reports the measurement.** An earlier version asserted the
+  measured CPU ratio and failed about one run in three; the same run showed correct weights and a
+  4.6:1 measured ratio, which settled it — the ratio is emulator noise and the weights are the
+  property. Weights are gated, the ratio is a printed note. Negative-tested: multiplying the share
+  instead of dividing prints `weights [1024, 1024, 1024, 1024], 1024 vs 3072 total`.
+- **A bug found by making the test deterministic.** Re-weighting a domain's threads originally
+  skipped any runqueue whose lock was contended — and the threads being re-weighted are exactly the
+  ones running on that queue, so contention was likely rather than rare. It measured as a domain
+  with three threads taking twice the CPU of one instead of the same. The path blocks now; it holds
+  no other lock, and every scheduler path reachable from an interrupt uses `try_lock`.
 
 ### 2026-08-04 (M5-01, capabilities — and RFC 0008 answering three open decisions)
 

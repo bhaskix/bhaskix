@@ -81,24 +81,30 @@ pub enum Rank {
     /// Outside the runqueues for the same reason the wait queues are: expiring
     /// a timer wakes a thread, which takes a runqueue lock while this is held.
     Timers = 4,
+    /// `domain::TABLE` — the domain table.
+    ///
+    /// Outside the capability arena: destroying a domain revokes its root
+    /// capability, so the table lock is taken first and the arena second.
+    /// Nothing goes the other way.
+    Domains = 5,
     /// `cap::ARENA` — the global capability derivation tree.
     ///
     /// Outside the wait queues: revoking a capability to an endpoint will need
     /// to wake whoever is blocked on it, and that takes a wait queue and then a
     /// runqueue. Nothing goes the other way — the IPC paths resolve
     /// capabilities before they block, never after.
-    Capabilities = 5,
+    Capabilities = 6,
     /// `wait::WaitQueue` — the waiter list of a blocking primitive.
     ///
     /// Outside the runqueues, because both halves of a sleep take them in that
     /// order: a sleeper holds this while marking itself blocked, and a waker
     /// holds it while marking a sleeper ready. Either one taking them the
     /// other way round is the deadlock this ordering exists to make visible.
-    WaitQueue = 6,
+    WaitQueue = 7,
     /// `sched::QUEUES` — one runqueue per CPU.
-    SchedRunqueue = 7,
+    SchedRunqueue = 8,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
-    Console = 8,
+    Console = 9,
 }
 
 impl Rank {
@@ -128,6 +134,7 @@ impl Rank {
             Self::Heap => "heap::HEAP",
             Self::TlbSender => "tlb::SENDER",
             Self::Timers => "time::TIMERS",
+            Self::Domains => "domain::TABLE",
             Self::Capabilities => "cap::ARENA",
             Self::WaitQueue => "wait::WaitQueue",
             Self::SchedRunqueue => "sched::QUEUES",
@@ -418,6 +425,7 @@ mod tests {
             Rank::Heap,
             Rank::TlbSender,
             Rank::Timers,
+            Rank::Domains,
             Rank::Capabilities,
             Rank::WaitQueue,
             Rank::SchedRunqueue,

@@ -215,6 +215,11 @@ pub struct Thread {
     /// True for the thread each CPU registers for itself: it runs on the stack
     /// that CPU booted on, so "move it elsewhere" is not a meaningful request.
     pub pinned: bool,
+    /// The domain this thread belongs to, or `u32::MAX` for none.
+    ///
+    /// Kernel threads created before domains exist have no domain, and must
+    /// not be swept up by a re-weighting aimed at one.
+    pub domain: u32,
     /// Class and parameters.
     pub policy: Policy,
     /// Service received, scaled by weight. Only meaningful for Fair.
@@ -622,6 +627,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         runs: 1,
         migrations: 0,
         held_locks: 0,
+        domain: u32::MAX,
         policy,
         vruntime: 0,
         deadline: 0,
@@ -669,6 +675,8 @@ pub struct SpawnOptions {
     pub slice_us: u64,
     /// Whether the balancer may move this thread to another CPU.
     pub pinned: bool,
+    /// The domain this thread belongs to, or `u32::MAX` for none.
+    pub domain: u32,
 }
 
 impl Default for SpawnOptions {
@@ -685,7 +693,16 @@ impl SpawnOptions {
             policy: Policy::fair(),
             slice_us: DEFAULT_SLICE_US,
             pinned: false,
+            domain: u32::MAX,
         }
+    }
+
+    /// Places the thread in a domain, so its weight follows that domain's
+    /// share.
+    #[must_use]
+    pub const fn in_domain(mut self, domain: u32) -> Self {
+        self.domain = domain;
+        self
     }
 
     /// Sets the class.
@@ -741,6 +758,7 @@ pub fn spawn_on_with(
         policy,
         slice_us,
         pinned,
+        domain: _,
     } = options;
     if cpu as usize >= MAX_CPUS || cpu >= percpu::online_count() {
         return Err(SpawnError::NoSuchCpu(cpu));
@@ -798,6 +816,7 @@ pub fn spawn_on_with(
         runs: 0,
         migrations: 0,
         held_locks: 0,
+        domain: options.domain,
         pinned,
         policy,
         // Starting at the floor rather than at zero. A new thread with
@@ -861,6 +880,27 @@ pub fn spawn(
     }
 
     spawn_on(best as u32, name, entry, argument, hhdm_base)
+}
+
+/// The fair-class weight a thread currently carries.
+///
+/// Lets a test assert the *mechanism* rather than infer it from a CPU-time
+/// measurement, which on an emulated, shared machine is a noisy way to learn
+/// one number.
+#[must_use]
+pub fn weight_of(id: u32) -> Option<u32> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        if let Some(thread) = queue.threads.iter().flatten().find(|t| t.id == id) {
+            return match thread.policy {
+                Policy::Fair { weight } => Some(weight),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// Real CPU ticks a thread has consumed, if it still exists.
@@ -1585,6 +1625,46 @@ pub fn races() -> u64 {
     RACES.load(Ordering::Relaxed)
 }
 
+/// Applies `weight` to every fair thread of `domain`.
+///
+/// Called when a domain gains or loses a thread, because the share is divided
+/// among its threads: leaving the others at their old weight would let a
+/// domain take more CPU simply by spawning, which is the hole
+/// `docs/scheduler.md` §3's two-level runqueue exists to close.
+///
+/// `also` names a thread that should be re-weighted even if its domain field
+/// has not been set yet, for the window during creation. Pass `u32::MAX` for
+/// none.
+pub fn set_domain_weight(domain: u32, weight: u32, also: u32) {
+    if domain == u32::MAX {
+        return;
+    }
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        // Blocking, not `try_lock`. Skipping a contended queue leaves some of
+        // a domain's threads at their old, larger weight -- and since the
+        // threads being re-weighted are precisely the ones running on that
+        // queue, contention is *likely* rather than rare. Measured: a domain
+        // with three threads took twice the CPU of one with a single thread
+        // instead of the same, because the skip left the share multiplied.
+        //
+        // Safe to block: the caller has already released the domain table's
+        // lock, and every scheduler path that runs from an interrupt uses
+        // `try_lock`, so nothing here can be waiting on this thread.
+        let mut queue = queue.lock();
+        for thread in queue.threads.iter_mut().flatten() {
+            if (thread.domain == domain || thread.id == also)
+                && let Policy::Fair { .. } = thread.policy
+            {
+                thread.domain = domain;
+                thread.policy = Policy::Fair { weight };
+                // Recompute the deadline against the new weight, or the thread
+                // keeps competing on the old one until it next runs.
+                thread.charge(0);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1598,6 +1678,7 @@ mod tests {
             runs: 0,
             migrations: 0,
             held_locks: 0,
+            domain: u32::MAX,
             pinned: slot == 0,
             policy,
             vruntime: 0,

@@ -276,6 +276,17 @@ else
     status=1
 fi
 
+# Domains and the resource envelope. `docs/security.md` T10 says the envelope
+# is enforced at allocation time, not by best effort, and §3 says a domain's
+# CPU share holds regardless of how many threads it spawns — the second being
+# the one a per-thread weight silently gets wrong.
+if grep -qE "domains +[0-9]+ created; envelope refuses past its cap; shares divided" "$LOG"; then
+    pass "domains: envelope enforced, CPU share independent of thread count"
+else
+    fail "domain self test did not pass"
+    status=1
+fi
+
 # Capabilities: the load-bearing security mechanism. The rules are proved
 # exhaustively on the host; this asserts they hold against the real global
 # arena, through its lock, and that nothing leaked.

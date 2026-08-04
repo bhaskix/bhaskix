@@ -207,6 +207,20 @@ escape land in the same place: a domain with no capabilities.
 Hardware virtualization (VMX/SVM) is a Phase 3 milestone. The domain abstraction is defined now so
 that nothing built in Phase 1 or 2 has to be undone to accommodate it.
 
+> **Implemented, in part, as of M5-02.** A domain has a CSpace, a `ResourceEnvelope` and a thread
+> count, and is named by a capability — so `ObjectKind::Domain` is the first capability kind that
+> refers to something real. Destroying one revokes everything derived from its root capability
+> before the call returns.
+>
+> **The envelope is enforced rather than recorded.** Memory charges past the cap fail; CPU share is
+> *divided* among the domain's threads so that the domain's total is constant, which is what makes
+> §3's "regardless of how many threads it spawns" true. That division is an approximation of
+> `scheduler.md` §3's two-level runqueue: right in aggregate, and unable to prioritise within a
+> domain.
+>
+> **Not yet:** no address space (the field above), no telemetry channel, no I/O weight enforcement,
+> and threads are counted rather than owned — destroying a domain does not stop them.
+
 ---
 
 ## 5. Crate layout
