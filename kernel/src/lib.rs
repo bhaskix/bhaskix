@@ -31,6 +31,7 @@ extern crate alloc;
 pub mod cap;
 pub mod console;
 pub mod domain;
+pub mod elf;
 pub mod faultinject;
 pub mod font;
 pub mod framebuffer;
@@ -48,6 +49,7 @@ pub mod time;
 pub mod tlb;
 pub mod trap;
 pub mod ustar;
+pub mod vfs;
 pub mod vm;
 pub mod wait;
 
@@ -351,6 +353,19 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !initrd_self_test(handoff) {
         println!("    initrd         FAILED");
     }
+    // The ramdisk becomes the root filesystem. Done here, on the bootstrap
+    // CPU, while the only other CPUs are idling in the scheduler and nothing
+    // has been spawned that could look at a filesystem -- which is what the
+    // `unsafe` on `mount` asks for.
+    if let Some(bytes) = handoff.initrd {
+        // SAFETY: called once, on the bootstrap CPU, before any thread that
+        // could reach the VFS exists, with a slice that borrows the module the
+        // bootloader loaded and never reclaims.
+        unsafe { vfs::mount(bytes) };
+    }
+    if !vfs_self_test(handoff) {
+        println!("    vfs            FAILED");
+    }
     if !syscall_self_test(handoff.hhdm_base.as_u64()) {
         println!("    syscall        FAILED");
     }
@@ -386,8 +401,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     }
 
     println!();
-    println!("  M4 in progress. Nothing left to do at this milestone -- halting.");
-    println!("  Next: M5 -- capabilities, domains, user mode (docs/roadmap.md).");
+    println!("  M6 in progress. Nothing left to do at this milestone -- halting.");
+    println!(
+        "  Next: M6-04 -- a kernel shell, which needs a console that reads (docs/roadmap.md)."
+    );
 
     cpu::halt_forever()
 }
@@ -696,6 +713,22 @@ static RING3_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 static RING3_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Set when ring 3 sent back the value it was told, proving it received it.
 static RING3_ECHOED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// What the probe reports about its own segments; see [`SEGMENT_MAGIC`].
+static RING3_SEGMENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The value in the probe's read-only segment, as `user/probe/src/main.rs`
+/// spells it: ASCII "SEGMENTS".
+///
+/// The probe reads it at an absolute address, checks that its writable segment
+/// arrived zero-filled, stores the value there, reads it back, and sends what
+/// it read. Receiving this number is evidence of four separate things, none of
+/// which a `memcpy` of a flat blob could produce: the read-only segment's
+/// contents came from the file, the writable segment was zero-filled, the
+/// writable segment really is writable, and every one of them landed at the
+/// address the file named rather than wherever the kernel felt like.
+const SEGMENT_MAGIC: u64 = 0x5345_474d_454e_5453;
+/// The method the probe reports that under.
+const RING3_SEGMENT_METHOD: u64 = 11;
 
 /// The badge on the capability the ring 3 probe holds.
 const BADGE_RING3: u64 = 0x0000_0000_1234_0000;
@@ -726,6 +759,13 @@ extern "C" fn ring3_service(_argument: u64) -> ! {
                     RING3_ECHOED.store(true, Ordering::Release);
                 }
 
+                // Method 11 carries what the probe found in its own segments.
+                // Recorded verbatim, including a wrong value, so the test can
+                // say which of the loader's obligations was not met.
+                if message.method == RING3_SEGMENT_METHOD {
+                    RING3_SEGMENTS.store(message.args[0], Ordering::Release);
+                }
+
                 let answer = ipc::Message {
                     method: message.method,
                     args: [message.args[0] * 2, 0, 0, 0],
@@ -739,10 +779,18 @@ extern "C" fn ring3_service(_argument: u64) -> ! {
 }
 
 /// Where the ring 3 probe's code and stack live in its address space.
+///
+/// `USER_CODE` is *not* the kernel's choice any more. It is where
+/// `user/probe/link.ld` says the program goes, repeated here so the test can
+/// check that a system call arrived from inside it. If the two ever disagree,
+/// the ring 3 test fails rather than the loader silently relocating anything.
 const USER_CODE: u64 = 0x0000_0000_1000_0000;
 const USER_STACK: u64 = 0x0000_0000_1100_0000;
 /// One page of stack is ample: the probe pushes nothing.
 const USER_STACK_PAGES: u64 = 1;
+
+/// Where the user program is in the filesystem.
+const USER_PROGRAM: &[u8] = b"bin/probe";
 
 /// Runs the probe program in ring 3, and never returns.
 ///
@@ -761,47 +809,38 @@ extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
         sched::exit()
     };
 
+    // The program comes out of the filesystem, and its own headers decide
+    // where it is mapped and with what permissions. Nothing here chooses:
+    // this thread reads a file and does what it says, within the bounds
+    // `elf::parse` enforces.
+    let Ok(file) = vfs::open(USER_PROGRAM) else {
+        stop()
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop()
+    };
+
     let Ok(mut space) = AddressSpace::new(hhdm_base) else {
         stop()
     };
 
-    let (Some(code), Some(stack)) = (
-        VirtRange::from_pages(VirtAddr(USER_CODE), 1),
-        VirtRange::from_pages(VirtAddr(USER_STACK), USER_STACK_PAGES),
-    ) else {
+    // The stack is the kernel's business rather than the file's: an ELF says
+    // where its code and data go and nothing about where it should be given
+    // room to push.
+    let Some(stack) = VirtRange::from_pages(VirtAddr(USER_STACK), USER_STACK_PAGES) else {
         stop()
     };
-
-    // Read-and-execute, not writable: W^X applies to user pages too, and the
-    // program is written through the kernel's direct map rather than through
-    // the mapping it will run from. A page that is both writable and
-    // executable would be the easiest thing to arrange and the wrong thing to
-    // ship.
-    if space.map_anonymous(code, Protection::ReadExecute).is_err()
-        || space.map_anonymous(stack, Protection::ReadWrite).is_err()
-    {
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
         stop()
     }
 
-    // Copy the probe in through its physical frame. The mapping it will run
-    // from is not writable, and making it so temporarily would mean a moment
-    // where user-executable memory was also user-writable.
-    let Some(physical) = space.translate(VirtAddr(USER_CODE)) else {
+    // Segments are mapped with the protections the file asked for, and their
+    // contents written through the direct map rather than through the mapping
+    // they will run from -- so a code page is never writable, not even for the
+    // instant it is being filled.
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
         stop()
     };
-    let program = bhaskix_arch::syscall::user_probe();
-    if program.len() > bhaskix_mm::FRAME_SIZE as usize {
-        stop()
-    }
-    // SAFETY: `physical` is a frame this address space just mapped, reachable
-    // through the direct map, and the length is checked against a page above.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            program.as_ptr(),
-            (hhdm_base + (physical & !(bhaskix_mm::FRAME_SIZE - 1))) as *mut u8,
-            program.len(),
-        );
-    }
 
     // SAFETY: the higher half is copied from the running page table, so
     // everything currently executing stays addressable.
@@ -809,10 +848,12 @@ extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
 
     let rsp = USER_STACK + USER_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
 
-    // SAFETY: `USER_CODE` is user-executable in the space just installed,
-    // `rsp` is one past user-writable memory in the same, and `RSP0` was set
-    // before this thread was spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(USER_CODE, rsp) }
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed -- `elf::parse` refuses an entry point that is not, and every
+    // segment it accepted was mapped above. `rsp` is one past user-writable
+    // memory in the same space, and `RSP0` was set before this thread was
+    // spawned.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp) }
 }
 
 /// Runs a program in ring 3 and checks that it really was ring 3.
@@ -908,7 +949,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // Three service calls and then the probe exits. Waiting for that rather
     // than for a duration means a slow host costs seconds, not a red gate.
     wait_until(
-        || RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed) >= 3,
+        || RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed) >= 4,
         8_000,
     );
     // A moment more for the revoked call that must fail, which happens after
@@ -918,6 +959,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let ring3_calls = RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let ring3_badge = RING3_BADGE.load(core::sync::atomic::Ordering::Relaxed);
     let echoed = RING3_ECHOED.load(core::sync::atomic::Ordering::Acquire);
+    let segments = RING3_SEGMENTS.load(core::sync::atomic::Ordering::Acquire);
 
     RING3_STOP.store(true, core::sync::atomic::Ordering::Release);
     ipc::destroy(endpoint);
@@ -933,7 +975,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let stack_top = USER_STACK + USER_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
     let checks = [
         // Ten: eight yields, one bad number, one exit.
-        ("the probe made its system calls", calls >= 10),
+        ("the probe made its system calls", calls >= 11),
         ("an unknown syscall number was refused", refused >= 1),
         (
             "the kernel was entered from the user code page",
@@ -949,10 +991,11 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // is never reached. Removing that `swapgs` passed a version of this
         // test that lacked this line.
         ("the probe was interrupted while in ring 3", interrupts > 0),
-        // The IPC half. Three calls reach the service: two through the
-        // capability the kernel installed, one through the capability ring 3
-        // derived for itself. The fourth, after revocation, must not.
-        ("ring 3 reached a service through IPC", ring3_calls == 3),
+        // The IPC half. Four calls reach the service: the segment report and
+        // two exchanges through the capability the kernel installed, and one
+        // through the capability ring 3 derived for itself. The fifth, after
+        // revocation, must not.
+        ("ring 3 reached a service through IPC", ring3_calls == 4),
         (
             "the service saw the badge from the probe's capability",
             ring3_badge & BADGE_RING3 != 0,
@@ -971,13 +1014,22 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // CSpace; the authority behind it is gone, so the call fails rather
         // than reaching a service that is still perfectly willing to answer.
         ("revoking from ring 3 stopped the next call", revoked >= 1),
+        // The loader's obligations, reported by the program itself. Nothing
+        // in the kernel put this number anywhere: it is in the file, in a
+        // segment the loader had to map read-only at the address the file
+        // named, and the probe reached it by absolute address. See
+        // `SEGMENT_MAGIC`.
+        (
+            "the program read its own segments at the addresses its headers named",
+            segments == SEGMENT_MAGIC,
+        ),
     ];
 
     let mut ok = true;
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    ring 3         FAILED: {name} (calls {calls}, refused {refused}, rip {rip:#x}, rsp {rsp:#x})"
+                "    ring 3         FAILED: {name} (calls {calls}, refused {refused}, rip {rip:#x}, rsp {rsp:#x}, segments {segments:#x})"
             );
             ok = false;
         }
@@ -985,7 +1037,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     if ok {
         println!(
-            "    ring 3         {calls} syscalls, {interrupts} interrupts from user mode; {ring3_calls} ipc calls badged {ring3_badge:#x}; ring 3 derived, used and revoked its own capability ({revoked} refused after)"
+            "    ring 3         {calls} syscalls, {interrupts} interrupts from user mode; {ring3_calls} ipc calls badged {ring3_badge:#x}; ring 3 derived, used and revoked its own capability ({revoked} refused after); loaded from bin/probe, three segments as its headers asked"
         );
     }
     ok
@@ -1036,6 +1088,91 @@ fn initrd_self_test(handoff: &Handoff) -> bool {
         println!(
             "    initrd         {} KiB, {members} members, {directories} directories; etc/hostname reads back",
             bytes.len() / 1024
+        );
+    }
+    ok
+}
+
+/// Checks that paths resolve to files, and that bad paths do not.
+///
+/// The interesting half is the refusals. A path layer that resolves what it
+/// should is easy to see working; one that also resolves `../..` looks
+/// identical until something below it walks a tree.
+///
+/// Also parses the user program out of the filesystem — without loading it —
+/// so that a broken image is reported here, as a filesystem and ELF result,
+/// rather than as an unexplained ring 3 failure two tests later.
+fn vfs_self_test(handoff: &Handoff) -> bool {
+    let Some(_) = handoff.initrd else {
+        println!("    vfs            FAILED: nothing to mount");
+        return false;
+    };
+
+    let hostname = vfs::read_all(b"etc/hostname", &mut [0u8; 32]);
+    let mut buffer = [0u8; 16];
+    let read = vfs::open(b"/etc/hostname").map(|mut file| {
+        let count = file.read(&mut buffer);
+        (count, file.position(), file.len())
+    });
+
+    let program = vfs::open(b"bin/probe");
+    let parsed = program.ok().map(|file| elf::parse(file.bytes()));
+
+    let entries = vfs::count(b"");
+    let bin = vfs::count(b"bin");
+
+    let checks = [
+        ("a file opens and reports its length", hostname == Ok(8)),
+        (
+            "a read fills the buffer and advances the cursor",
+            read == Ok((8, 8, 8)),
+        ),
+        (
+            "a leading slash is accepted and means the same thing",
+            vfs::open(b"/hello.txt").is_ok(),
+        ),
+        (
+            "a parent component is refused rather than resolved",
+            vfs::open(b"../etc/hostname").err() == Some(vfs::VfsError::BadPath)
+                && vfs::open(b"etc/../hello.txt").err() == Some(vfs::VfsError::BadPath),
+        ),
+        (
+            "a name that is not there is not found",
+            vfs::open(b"etc/nothing").err() == Some(vfs::VfsError::NotFound),
+        ),
+        (
+            "a directory is not a file",
+            vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
+        ),
+        (
+            "a listing shows what is directly under a directory",
+            entries >= 3 && bin == 1,
+        ),
+        (
+            "the user program is an ELF the loader accepts",
+            matches!(&parsed, Some(Ok(image)) if image.segment_count() == 3),
+        ),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!("    vfs            FAILED: {name}");
+            ok = false;
+        }
+    }
+
+    if ok {
+        // The entry address is printed rather than asserted here. It is
+        // asserted where it matters -- the ring 3 test checks that system
+        // calls arrive from inside the segment this says the file asked for.
+        let entry = match &parsed {
+            Some(Ok(image)) => image.entry,
+            _ => 0,
+        };
+        println!(
+            "    vfs            {entries} entries in /, {bin} in /bin; bin/probe is ELF64, \
+             entry {entry:#x}, 3 segments"
         );
     }
     ok

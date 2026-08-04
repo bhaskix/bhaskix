@@ -287,6 +287,18 @@ else
     status=1
 fi
 
+# The VFS, and the ELF loader's parsing half. The entry address and the segment
+# count are matched exactly rather than loosely: they come out of the file's own
+# program headers, so a loader that stopped reading them -- or read them wrongly
+# -- shows up here as a changed number rather than as a ring 3 failure with no
+# obvious cause.
+if grep -qE "vfs +[0-9]+ entries in /, 1 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+    pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
+else
+    fail "the VFS or the ELF parser did not pass"
+    status=1
+fi
+
 # The fast system-call path. Programmed values are read back from the MSRs
 # rather than trusted, because every one of them is acted on without further
 # checking and three decide what privilege level the machine returns to. The
@@ -326,8 +338,8 @@ fi
 # page and a stack pointer inside the user stack, neither of which the kernel
 # ever executes at or uses as a stack. Counting system calls alone would look
 # identical to calling the dispatcher directly.
-if grep -qE "ring 3 +[0-9]+ syscalls, [1-9][0-9]* interrupts from user mode; [1-9] ipc calls badged 0x[0-9a-f]+; ring 3 derived, used and revoked its own capability \([1-9][0-9]* refused after\)" "$LOG"; then
-    pass "ring 3 calls by capability, delegates, and revokes its own authority"
+if grep -qE "ring 3 +[0-9]+ syscalls, [1-9][0-9]* interrupts from user mode; [1-9] ipc calls badged 0x[0-9a-f]+; ring 3 derived, used and revoked its own capability \([1-9][0-9]* refused after\); loaded from bin/probe, three segments as its headers asked" "$LOG"; then
+    pass "ring 3 runs a program loaded from disk, by capability, and revokes it"
 else
     fail "ring 3 execution did not pass"
     status=1

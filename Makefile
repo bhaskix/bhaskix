@@ -23,7 +23,21 @@ ISO          := build/bhaskix.iso
 ISO_ROOT     := build/iso_root
 INITRD       := build/initrd.tar
 INITRD_DIR   := initrd
+INITRD_ROOT  := build/initrd_root
 LIMINE_DIR   := boot/limine/limine
+
+# The ring 3 probe: a real program, built separately from the kernel and put
+# into the initrd for the kernel to find, parse and load. It is not a workspace
+# member — it needs its own code-generation settings, which a member cannot
+# have (see user/probe/Cargo.toml).
+PROBE_DIR    := user/probe
+PROBE        := $(PROBE_DIR)/target/$(TARGET)/release/probe
+# `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
+# flags rather than adding to them, which is exactly what is wanted here: the
+# kernel's PIC/kernel-code-model settings are wrong for a user program linked
+# at a fixed low address.
+PROBE_FLAGS  := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(PROBE_DIR)/link.ld
 
 # 256 MiB is comfortably more than the kernel needs and small enough that the
 # memory-map output stays readable.
@@ -89,11 +103,21 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort)
-	@mkdir -p $(dir $@)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE)
+	@rm -rf $(INITRD_ROOT)
+	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
+	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
+	cp $(PROBE) $(INITRD_ROOT)/bin/probe
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
-	    --mtime='@0' -cf $@ -C $(INITRD_DIR) .
+	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
 	@echo "built $@ ($$(stat -c%s $@) bytes)"
+
+# Built through a staging directory rather than into `initrd/`, so that a
+# compiled artefact never lands in a source tree that is under version control.
+$(PROBE): $(PROBE_DIR)/src/main.rs $(PROBE_DIR)/link.ld $(PROBE_DIR)/Cargo.toml
+	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
 
 $(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) $(INITRD) | $(LIMINE_DIR)
 	@rm -rf $(ISO_ROOT)
@@ -160,6 +184,7 @@ test-faults:
 
 fmt:
 	$(CARGO) fmt --all --check
+	cd $(PROBE_DIR) && $(CARGO) fmt --all --check
 
 # Two passes, because they cover different things. `--all-targets` cannot be
 # used on the freestanding target: it would try to build the test harness,
@@ -168,6 +193,8 @@ clippy:
 	$(CARGO) clippy --profile $(PROFILE) --target $(TARGET) --lib --bins -- -D warnings
 	$(CARGO) clippy --target $(HOST_TARGET) --all-targets \
 	    -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm -- -D warnings
+	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 
 # The project-specific invariants from docs/. Each one is cheap and catches a
 # class of mistake that review reliably misses.
@@ -180,6 +207,7 @@ gates:
 
 clean:
 	$(CARGO) clean
+	cd $(PROBE_DIR) && $(CARGO) clean
 	rm -rf build
 
 distclean: clean

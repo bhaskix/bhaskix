@@ -226,6 +226,19 @@ Restated per-subsystem in each design doc. The rules:
 > `ustar` reader has been through a million mutated archives on that harness; that is a real number
 > and it is not the same assurance as a fuzzer. When the project accepts a nightly toolchain, or an
 > external fuzzing harness, this becomes the second line of defence rather than the only one.
+>
+> **Measured at M6-03, and worse than expected.** A wrapping bounds check was reintroduced in the
+> ELF parser on purpose and survived *half a million* uniform mutations. For that check to wrap, an
+> offset must land within sixteen of `u64::MAX` — about one draw in 2^60, so the harness was never
+> going to find it, at any iteration count. The fix is to stop sampling uniformly: half of the
+> 64-bit field mutations now come from a fixed list of values that break arithmetic (`u64::MAX` and
+> its neighbours, the sign bit, the kernel-half boundary and its neighbour, zero). The same bug is
+> then caught at seed 424, in under a second.
+>
+> The general rule this buys: **a mutation harness tests the middle of the input space unless it is
+> told where the edges are.** Any new harness in this project seeds the edges explicitly, and a
+> harness is not considered working until a deliberately reintroduced bug of the kind it is meant to
+> catch actually fails it.
 - **Every bug fix adds a regression test.** No exceptions. If the bug was not testable, say what you
   changed to make it testable.
 - QEMU integration tests run on every PR. The frame-leak test

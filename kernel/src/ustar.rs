@@ -288,12 +288,18 @@ impl<'a> Iterator for Archive<'a> {
     }
 }
 
+/// Archive builders, shared with the tests in `vfs`.
+///
+/// `pub(crate)` rather than private because the VFS's own tests need archives
+/// to resolve paths against, and a second builder there would be a second
+/// opinion about what a well-formed `ustar` header looks like. There is one
+/// definition of that, and it belongs next to the parser it feeds.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Builds a well-formed header for `name` with `size` bytes of payload.
-    fn header(name: &[u8], size: usize, kind: u8) -> [u8; BLOCK] {
+    pub(crate) fn header(name: &[u8], size: usize, kind: u8) -> [u8; BLOCK] {
         let mut block = [0u8; BLOCK];
         block[..name.len()].copy_from_slice(name);
         // Mode, uid, gid: plausible octal so the checksum is realistic.
@@ -339,10 +345,19 @@ mod tests {
         block
     }
 
-    fn archive(members: &[(&[u8], &[u8])]) -> alloc::vec::Vec<u8> {
+    pub(crate) fn archive(members: &[(&[u8], &[u8])]) -> alloc::vec::Vec<u8> {
+        let typed: alloc::vec::Vec<_> = members
+            .iter()
+            .map(|(name, data)| (*name, *data, b'0'))
+            .collect();
+        archive_of(&typed)
+    }
+
+    /// The same, with an explicit type flag per member — directories included.
+    pub(crate) fn archive_of(members: &[(&[u8], &[u8], u8)]) -> alloc::vec::Vec<u8> {
         let mut bytes = alloc::vec::Vec::new();
-        for (name, data) in members {
-            bytes.extend_from_slice(&header(name, data.len(), b'0'));
+        for (name, data, kind) in members {
+            bytes.extend_from_slice(&header(name, data.len(), *kind));
             bytes.extend_from_slice(data);
             let padding = (BLOCK - data.len() % BLOCK) % BLOCK;
             bytes.extend(core::iter::repeat_n(0u8, padding));

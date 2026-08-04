@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The ring 3 probe, as a real program.
+#
+# Deliberately **not** a member of the root workspace. It is built with
+# different code-generation settings from everything else — static relocation,
+# the small code model, its own linker script — and a workspace member cannot
+# have its own `rustflags`. Building it separately is also honest about what it
+# is: the first thing Bhaskix compiles that is not the kernel.
+[workspace]
+
+[package]
+name = "bhaskix-user-probe"
+description = "A ring 3 program, loaded from the initrd as an ELF."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "probe"
+path = "src/main.rs"
+
+[package.metadata.bhaskix]
+# One: the `ud2` in the panic handler, which is the only way a ring 3 program
+# with no runtime can stop without asking the kernel's permission. The program
+# itself is a `global_asm!` block, which the budget does not count and could
+# not meaningfully audit -- what keeps it honest is that everything it does is
+# a system call the kernel observes.
+unsafe_budget = 2
+
+[profile.release]
+panic = "abort"
+# No optimisation to reason about: the program is one `global_asm!` block.
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"

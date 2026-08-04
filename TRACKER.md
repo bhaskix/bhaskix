@@ -5,10 +5,10 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 
 | | |
 |---|---|
-| **Last updated** | 2026-08-03 |
+| **Last updated** | 2026-08-04 |
 | **Phase** | Phase 1 — Foundation |
-| **Active milestone** | **M4 — Threads and scheduling** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 threads preempt, CPUs online · CI green |
+| **Active milestone** | **M6 — Filesystem, ELF, shell** |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 3/6 — ring 3 runs an ELF loaded from the ramdisk · CI green |
 
 ### Division of responsibility between documents
 
@@ -84,7 +84,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 
 ---
 
-## 3. Active milestone — M4: Threads and scheduling
+## 3. Milestones in detail — newest first
 
 **Threads exist and the timer preempts them.** The exit criterion is not met and will not be until
 SMP lands — it requires N threads across M CPUs, and there is one CPU.
@@ -119,8 +119,8 @@ fairness within 2% for two equal-weight workloads.
 | ID | Task | Status | Notes |
 |---|---|---|---|
 | M6-01 | Initial ramdisk: bootloader module, `ustar` reader | ✅ `DONE` | First untrusted input the kernel parses end to end. Seeded mutation harness, one million malformed archives, no panic. **Negative-tested**: no module, and one corrupted byte. |
-| M6-02 | VFS layer over the initrd | ⬜ `TODO` | The reader hands out bytes; there is no path resolution, no open file, no cursor. |
-| M6-03 | ELF64 loader, with a fuzz target | ⬜ `TODO` | Ring 3 currently runs a program copied in as raw bytes. |
+| M6-02 | VFS layer over the initrd | ✅ `DONE` | Paths resolve, files open with a cursor, directories list what is directly under them. `..` is **refused rather than resolved** — it cannot escape a flat archive today, and would be a traversal the moment a backend walks a tree. **Negative-tested**: accepting `..` fails the boot gate. |
+| M6-03 | ELF64 loader, with a fuzz target | ✅ `DONE` | Ring 3 now runs `bin/probe`, a separately built ET_EXEC loaded out of the initrd, mapped at the addresses and with the permissions **its own headers** name. **Negative-tested**: dropping one segment fails the gate; a deliberately reintroduced wrap bug is caught by the mutation harness at seed 424. |
 | M6-04 | Kernel shell | ⬜ `TODO` | Needs the console to read as well as write. |
 | M6-05 | User-mode shell over the syscall interface | ⬜ `TODO` | Needs M6-03 and a way to read input from a domain. |
 | M6-06 | `virtio-blk` driver | ⬜ `TODO` | Needs PCIe enumeration, which is Phase 2's driver framework. |
@@ -140,8 +140,32 @@ fairness within 2% for two equal-weight workloads.
 - **A `ustar` member with a `prefix` field is reported under its short name.** Joining the two needs
   a buffer and this parser does not allocate. The build never produces one, so it is wrong in a way
   that cannot currently happen — but it is wrong, and silently.
-- **The initrd is read-only and there is no filesystem above it.** No paths, no directories to open,
-  no cursor, no permissions. `Archive::lookup` is a linear scan of the whole archive per call.
+- **The initrd is read-only, and so is the filesystem over it.** Nothing creates, truncates or
+  appends. Every lookup is still a linear scan of the whole archive, and a listing is a scan per
+  call.
+
+- **`vfs::open` takes no capability.** `docs/security.md` §2 says authority must be held rather than
+  ambient, and this is a place where it is not: anything that can reach the module can read the
+  whole ramdisk. The kernel is the only caller today. Before a domain reaches it, an open must take
+  a capability — recorded here rather than in a comment nobody reads.
+
+- **A uniform-random mutation harness could not find the bug it was written to find.** Reintroducing
+  a wrapping bounds check in the ELF parser survived half a million random mutations, because an
+  offset has to land within sixteen of `u64::MAX` to wrap one — a draw of about one in 2^60. Half
+  the field mutations now come from a list of adversarial constants, and the same bug is found at
+  seed 424. The general lesson is stronger than the fix: a harness that only samples uniformly
+  tests the middle of the space and reports confidence about the edges.
+
+- **The ELF loader refuses two segments that share a page.** A real linker pads, so it never
+  happens; but the refusal is there because merging would mean choosing one of two permission sets,
+  and every choice is weaker than one segment asked for or stronger than the other did. A file
+  produced by a linker Bhaskix does not control could hit this and be rejected for a reason its
+  author will find surprising.
+
+- **The loader does no relocation, so nothing dynamic loads.** `ET_DYN` — which is what a PIE is —
+  is refused outright, which is also what keeps a dynamic loader's attack surface out of the
+  kernel. Position-independent user programs need a decision recorded in an RFC before they need
+  code.
 
 ### M5 — Domains, capabilities, syscalls, user mode
 
@@ -383,6 +407,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M6-02 and M6-03 — a filesystem, and a program loaded from it)
+
+- **Ring 3 now runs a program the kernel did not contain.** `bin/probe` is built separately, put in
+  the initial ramdisk, found by path, parsed as an ELF64 executable, and mapped at the addresses and
+  with the permissions its own program headers name. Until now the same program was a byte array in
+  the kernel image, copied into one page the kernel chose — which proved ring 3 worked and nothing
+  about loading. This meets M6's exit criterion "load and run an ELF binary from disk".
+- **The program proves the loading rather than the kernel asserting it.** Its first system call
+  reports a value it can only have obtained by reading its own read-only segment at an absolute
+  address, finding its writable segment zero-filled, storing there, and reading back. Four of the
+  loader's obligations, in one number, none of which a `memcpy` of a flat blob could produce.
+  **Negative-tested**: dropping a single segment from the mapper fails the gate.
+- **`..` is refused rather than resolved.** It cannot escape a flat archive today. It becomes a
+  directory traversal the moment a backend resolves paths against a tree, and by then the decision
+  to accept it is years old and in a layer nobody rereads. **Negative-tested**: removing the check
+  fails the boot gate.
+- **A uniform-random fuzz harness could not find the bug it exists to find.** A wrapping bounds
+  check, deliberately reintroduced in the ELF parser, survived half a million random mutations: an
+  offset must land within sixteen of `u64::MAX` to wrap one, which is about one draw in 2^60. Half
+  the field mutations now come from a list of adversarial constants, and the same bug is caught at
+  seed 424. The lesson generalises past this parser — sampling uniformly tests the middle of the
+  space and says nothing about the edges, which is where arithmetic breaks.
+- **The loader refuses rather than clamps, everywhere.** A segment running off the end of the file,
+  a `p_memsz` below `p_filesz`, an entry point outside every segment, a mapping in the kernel half,
+  `PF_W | PF_X`, two segments sharing a page: each is a rejection with its own name. Clamping a
+  segment that overruns its file still maps *something* at an address the program will jump to.
+- **`ET_DYN` is refused, so there is no relocation processing in the kernel.** That is the whole of
+  the dynamic-loader attack surface, declined by writing four bytes of comparison.
+- **Bhaskix builds something that is not the kernel.** `user/probe` is outside the workspace, with
+  its own code model, its own linker script, its own `unsafe` budget, and — checked by
+  `tools/check-deps.py` — no dependencies at all. It reaches the kernel only through system calls.
+- **Two gates added to the boot test** (28 assertions, from 26): the VFS and the ELF parser, and a
+  ring 3 line that now names the file the program came from.
 
 ### 2026-08-04 (M6-01, the initial ramdisk — and a lost wakeup it exposed)
 

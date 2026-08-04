@@ -37,6 +37,13 @@ LAYERS = {
     "bhaskix-net": 4,
     "bhaskix-drivers": 4,
     "bhaskix-boot-shim": 5,    # the binary, top of the graph
+
+    # User programs. Layer -1 because they are not in the graph at all: they
+    # run in ring 3 and reach the kernel only through system calls, so a
+    # dependency on any kernel crate would be a category error rather than a
+    # layering violation. Zero is the correct number of dependencies here, and
+    # a lower layer than everything is how this script says so.
+    "bhaskix-user-probe": -1,
 }
 
 # Third-party crates permitted in the tree. Empty on purpose: Bhaskix has no
