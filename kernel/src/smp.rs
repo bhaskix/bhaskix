@@ -64,6 +64,12 @@ extern "C" fn secondary_main(lapic_id: u32) -> ! {
         // per-CPU area has to happen after it rather than before.
         percpu::activate(cpu_id);
 
+        // Fast system-call entry. MSRs only -- the kernel stack this CPU will
+        // switch to is set later, once there is a heap to allocate one from.
+        if let Some(area) = percpu::area_address() {
+            bhaskix_arch::syscall::init(area);
+        }
+
         apic::enable_this_cpu();
 
         // This CPU's runqueue, with the code currently executing as its first
@@ -160,6 +166,39 @@ pub fn report(handoff: &bhaskix_boot::Handoff) {
         };
         println!("      cpu {cpu_id}  lapic {lapic_id}  {role}");
     });
+}
+
+/// Gives every online CPU a guarded stack for the syscall entry path.
+///
+/// `SYSCALL` does not switch stacks, so the entry stub takes one from per-CPU
+/// data. It must be a stack no thread is using: the stub switches to it before
+/// anything has established what the interrupted thread was doing, so sharing
+/// one with a running thread would overwrite that thread's frame.
+///
+/// Guarded, like every other kernel stack — an overflow here happens with a
+/// user-controlled argument count and is exactly the kind of thing that should
+/// fault cleanly rather than corrupt whatever is below.
+///
+/// Returns how many CPUs were given one.
+pub fn init_syscall_stacks(hhdm_base: u64) -> u32 {
+    /// Slot base for syscall stacks, far above the range thread ids use.
+    const SLOT_BASE: u64 = 1024;
+
+    let mut ready = 0;
+    for cpu in 0..percpu::online_count() {
+        // SAFETY: each CPU gets a distinct slot, so no two stacks overlap, and
+        // the mapping is done here on the bootstrap CPU before any of them can
+        // take a system call.
+        let Ok(stack) = (unsafe { crate::stack::allocate(hhdm_base, SLOT_BASE + u64::from(cpu)) })
+        else {
+            continue;
+        };
+        // SAFETY: `cpu` is online, and `stack.top` is one past a freshly
+        // mapped, guarded stack that nothing else uses.
+        unsafe { percpu::set_kernel_stack(cpu, stack.top) };
+        ready += 1;
+    }
+    ready
 }
 
 /// Exercises TLB shootdown across every online CPU.

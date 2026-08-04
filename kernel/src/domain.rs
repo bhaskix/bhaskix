@@ -194,6 +194,15 @@ impl DomainId {
     pub const fn as_u32(self) -> u32 {
         self.0
     }
+
+    /// Rebuilds an identity from a raw index.
+    ///
+    /// Does not check that the domain exists; every operation taking one
+    /// resolves it against the table and fails if it does not.
+    #[must_use]
+    pub const fn from_u32(id: u32) -> Self {
+        Self(id)
+    }
 }
 
 /// The unit of isolation, accounting and scheduling.

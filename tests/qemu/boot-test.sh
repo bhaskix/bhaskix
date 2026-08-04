@@ -276,6 +276,17 @@ else
     status=1
 fi
 
+# The fast system-call path. Programmed values are read back from the MSRs
+# rather than trusted, because every one of them is acted on without further
+# checking and three decide what privilege level the machine returns to. The
+# entry stub itself has no caller until ring 3 exists, and the kernel says so.
+if grep -qE "syscall +entry armed on [1-9][0-9]* cpus" "$LOG"; then
+    pass "SYSCALL entry armed and verified against the GDT"
+else
+    fail "syscall entry was not armed"
+    status=1
+fi
+
 # Domains and the resource envelope. `docs/security.md` T10 says the envelope
 # is enforced at allocation time, not by best effort, and §3 says a domain's
 # CPU share holds regardless of how many threads it spawns — the second being

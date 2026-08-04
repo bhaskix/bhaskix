@@ -39,6 +39,7 @@ pub mod percpu;
 pub mod pic;
 pub mod port;
 pub mod serial;
+pub mod syscall;
 pub mod trap;
 pub mod tsc;
 pub mod uaccess;

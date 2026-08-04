@@ -121,13 +121,23 @@ fairness within 2% for two equal-weight workloads.
 | M5-00 | Decide the syscall and IPC shape | ⬜ `DRAFT` | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) answers **A2**, **A3** and **A4**. Blocks M5-03 onwards; does *not* block M5-01. |
 | M5-01 | Capability objects, CSpace, derive/revoke | ✅ `DONE` | All four rules of `docs/security.md` §2 enforced and **each negative-tested**. Derivation monotonicity tested over every one of 64×64 rights pairs, not sampled. |
 | M5-02 | `Domain` with `ResourceEnvelope` | ✅ `DONE` | Envelope refuses at allocation time (T10); CPU share **divided** among a domain's threads so it does not grow with thread count; destruction revokes the domain's whole derived subtree. **Negative-tested** in both directions. |
-| M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | ⬜ `TODO` | Blocked on M5-00 being accepted. |
+| M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | 🟡 `PARTIAL` | MSRs programmed and **read back**; entry stub written; dispatcher host-tested over every decision. **No caller until ring 3 (M5-04)**, so the assembly path is unexercised. Built on RFC 0008's recommendation rather than its acceptance. |
 | M5-04 | Ring 3 execution | ⬜ `TODO` | Needs M5-03. |
 | M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`, badges | ⬜ `TODO` | Wait queues from M4-09 are the mechanism. |
 | M5-06 | Per-domain capability quotas | 🟡 `PARTIAL` | `ResourceEnvelope::max_capabilities` exists and is unit-tested, but nothing charges it yet — there is no syscall through which a domain derives. Wired up in M5-03. |
 
 ### Honest notes on M5 so far
 
+- **The syscall entry stub has never executed.** `SYSCALL` is only reachable from ring 3, which does
+  not exist until M5-04, so what is tested is the *programming* — MSRs read back and compared, the
+  GDT layout asserted at compile time — and the *dispatcher*, called directly. The forty lines of
+  assembly between them are written, reviewed and unrun. That is the honest status and the reason
+  M5-04 should follow immediately rather than after something else.
+- **The syscall path uses a per-CPU stack, not a per-thread one**, which is correct only while at
+  most one thread per CPU can be inside a system call. True today because none can. It stops being
+  true the moment a syscall blocks, which is M5-05.
+- **`bhaskix-kernel` is at 459 of a 460 `unsafe` budget.** The next line will fail the gate, which is
+  the gate working; it needs a raise with a reason at that point, not before.
 - **Domain CPU share is an approximation of the two-level runqueue, not a replacement.** Dividing a
   domain's share among its threads gets the *aggregate* right — which is the property
   `docs/scheduler.md` §3 claims and the one a per-thread weight silently breaks — and gets the
@@ -315,6 +325,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M5-03, the `SYSCALL` fast path — partial)
+
+- **The MSRs are programmed and read back rather than trusted.** `IA32_EFER.SCE`, `IA32_STAR`,
+  `IA32_LSTAR` and `IA32_FMASK` are each written and then verified at boot, because every one of
+  them is acted on by the CPU without further checking and three of them decide what privilege
+  level the machine returns to. A wrong `IA32_STAR` does not fault; it returns to user mode with a
+  stack descriptor that is really code.
+- **The GDT layout `SYSRET` depends on is a compile-time assertion.** `SYSRET` takes no selector —
+  it derives both from one MSR field, code at `+16` and stack at `+8` — so user data *must* sit
+  immediately before user code. A reordering of `gdt.rs` that looks harmless is a privilege
+  escalation, and it is now a build failure with a message saying which rule broke. Negative-tested
+  by swapping the two selectors.
+- **`IA32_FMASK` clears five flags, and each is a way for user mode to change how kernel code
+  behaves.** `IF`, so an interrupt cannot land in the window between `swapgs` and the stack switch —
+  the classic way this path is exploited. `AC`, or SMAP would be defeated for the whole call. Also
+  `DF`, `TF` and `NT`. Negative-tested: dropping `IF` fails the gate.
+- **The dispatcher is host-tested over every decision it makes**, including that all six syscall
+  numbers decode and that everything outside them is refused as a *value* rather than used as an
+  index.
+- **There is no permission check, and that is the design.** A conventional handler resolves a name
+  and then asks whether the caller is allowed it — two places to get wrong, one of which can race.
+  Here the argument *is* the authority, so what remains is type checking: a thread capability is
+  refused where an endpoint is expected, before anything is dereferenced.
+- **"Never had one" and "had one, revoked" stay distinct status codes.** Collapsing them would make
+  a revocation bug indistinguishable from a caller bug, which is the confusion a security review
+  can least afford.
+- **Built on RFC 0008's recommendation, not its acceptance.** The decision is still a draft awaiting
+  a verdict; if A2 or A3 is answered differently, this is the code that changes.
 
 ### 2026-08-04 (M5-02, domains and the resource envelope)
 

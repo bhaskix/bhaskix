@@ -42,6 +42,7 @@ pub mod sched;
 pub mod smp;
 pub mod stack;
 pub mod sync;
+pub mod syscall;
 pub mod time;
 pub mod tlb;
 pub mod trap;
@@ -120,6 +121,19 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
     if !smp::init_bsp(handoff.bsp_lapic_id) {
         println!("  FATAL: could not establish per-CPU data for the bootstrap CPU");
         cpu::halt_forever();
+    }
+
+    // Fast system-call entry, on the bootstrap CPU. MSRs only for now: the
+    // stack the entry stub switches to needs a heap to allocate from, and is
+    // set once there is one.
+    //
+    // SAFETY: bootstrap CPU, once, after its GDT is loaded, interrupts still
+    // disabled, and the address is this CPU's own per-CPU area.
+    if let Some(area) = bhaskix_arch::percpu::area_address() {
+        // SAFETY: bootstrap CPU, once, after its GDT is loaded, with
+        // interrupts still disabled, and `area` is this CPU's own per-CPU
+        // area -- exactly what `swapgs` must find on kernel entry.
+        unsafe { bhaskix_arch::syscall::init(area) };
     }
 
     println!("  cpu");
@@ -323,6 +337,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("    tickless       FAILED");
     }
+    if !syscall_self_test(handoff.hhdm_base.as_u64()) {
+        println!("    syscall        FAILED");
+    }
     if !capability_self_test() {
         println!("    capabilities   FAILED");
     }
@@ -421,6 +438,66 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
         cpus - 1
     );
     true
+}
+
+/// Checks that the fast system-call path is programmed as intended.
+///
+/// Reads the MSRs back rather than trusting the writes. Every one of them is a
+/// value the CPU acts on without further checking, and three of them decide
+/// what privilege level the machine returns to — a wrong `IA32_STAR` does not
+/// fault, it returns to user mode with a stack descriptor that is really code.
+///
+/// The entry stub itself is not exercised here, because nothing runs in ring 3
+/// until M5-04. That is stated in the report rather than implied by a passing
+/// line.
+fn syscall_self_test(hhdm_base: u64) -> bool {
+    use bhaskix_arch::gdt;
+
+    if !bhaskix_arch::syscall::enabled() {
+        println!("    syscall        FAILED: SYSCALL was never enabled");
+        return false;
+    }
+
+    // SAFETY: `init` ran on this CPU during early boot.
+    let (efer, star, lstar, fmask) = unsafe { bhaskix_arch::syscall::programmed() };
+
+    let stacks = smp::init_syscall_stacks(hhdm_base);
+    let expected_star = (u64::from(gdt::KERNEL_DATA) << 48) | (u64::from(gdt::KERNEL_CODE) << 32);
+
+    let checks = [
+        ("EFER.SCE is set", efer & 1 == 1),
+        (
+            "IA32_STAR selects the kernel and user segments",
+            star == expected_star,
+        ),
+        ("IA32_LSTAR points at the entry stub", lstar != 0),
+        // The four that matter most: interrupts masked so the window between
+        // `swapgs` and the stack switch cannot be interrupted, and AC cleared
+        // so SMAP is not defeated for the whole call.
+        ("IA32_FMASK clears IF", fmask & (1 << 9) != 0),
+        ("IA32_FMASK clears DF", fmask & (1 << 10) != 0),
+        ("IA32_FMASK clears AC", fmask & (1 << 18) != 0),
+        ("IA32_FMASK clears TF", fmask & (1 << 8) != 0),
+        (
+            "every online cpu has a syscall stack",
+            stacks == bhaskix_arch::percpu::online_count(),
+        ),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!("    syscall        FAILED: {name}");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!(
+            "    syscall        entry armed on {stacks} cpus, star {star:#018x}, fmask {fmask:#x}; no ring 3 caller yet"
+        );
+    }
+    ok
 }
 
 /// Exercises capabilities against the real global arena.

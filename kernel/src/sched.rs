@@ -882,6 +882,26 @@ pub fn spawn(
     spawn_on(best as u32, name, entry, argument, hhdm_base)
 }
 
+/// The domain the calling thread belongs to.
+///
+/// `None` for a thread created before domains existed, which is the correct
+/// answer rather than an oversight: such a thread has no CSpace and therefore
+/// no authority to name anything.
+#[must_use]
+pub fn current_domain() -> Option<crate::domain::DomainId> {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    let queue = QUEUES[cpu].try_lock()?;
+    let current = queue.current;
+    let domain = queue.threads[current].as_ref()?.domain;
+    if domain == u32::MAX {
+        return None;
+    }
+    Some(crate::domain::DomainId::from_u32(domain))
+}
+
 /// The fair-class weight a thread currently carries.
 ///
 /// Lets a test assert the *mechanism* rather than infer it from a CPU-time

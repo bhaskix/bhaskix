@@ -49,4 +49,10 @@ workspace = true
 # 713 at M4. The increase is per-CPU descriptor tables, the GS-base per-CPU
 # area, and the inter-processor interrupt used for TLB shootdown -- all raw
 # instruction or raw pointer work with no safe expression.
-unsafe_budget = 780
+# 850 at M5-03, the SYSCALL fast path. Every MSR write is unsafe by nature, and
+# each is a separate block because each has its own precondition -- "after the
+# GDT is loaded", "this CPU's own per-CPU area", "before SCE is set". The entry
+# stub itself is assembly, which the counter does not see; what it counts is
+# the programming around it, and that is exactly the part a reviewer should be
+# able to read one obligation at a time.
+unsafe_budget = 850

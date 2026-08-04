@@ -18,10 +18,12 @@
 //!
 //! # Not yet
 //!
-//! - **`swapgs`.** When user mode arrives in M5, `GS` will hold a user value
-//!   on kernel entry and the kernel base will live in `IA32_KERNEL_GS_BASE`,
-//!   swapped on every transition. Getting that wrong in either direction is a
-//!   privilege-escalation bug, so it lands with the syscall path, not before.
+//! - **`swapgs` is programmed but not yet exercised.** `IA32_KERNEL_GS_BASE`
+//!   holds this CPU's area as of M5-03, and the syscall stub swaps on entry
+//!   and exit — but nothing runs in user mode yet, so `GS` never actually
+//!   holds a user value. The first real swap happens in M5-04, and getting it
+//!   wrong in either direction is a privilege-escalation bug rather than a
+//!   crash.
 //! - **`IA32_KERNEL_GS_BASE` as a scratch slot.** The kernel base is written
 //!   directly to `IA32_GS_BASE` today. Once `swapgs` lands, the two MSRs
 //!   change roles on every kernel entry and exit, and every path that reloads
@@ -52,9 +54,27 @@ pub struct PerCpu {
     pub cpu_id: u32,
     /// Local APIC identifier, which is *not* dense and may skip values.
     pub lapic_id: u32,
+    /// Where the syscall entry stub parks the user stack pointer.
+    ///
+    /// `SYSCALL` does not switch stacks, so on entry `RSP` still points into
+    /// user memory. It has to go somewhere the kernel can reach without using
+    /// a stack, and per-CPU data reached through `GS` is the only such place.
+    pub user_rsp: u64,
+    /// The stack the syscall entry stub switches to.
+    pub kernel_rsp: u64,
     /// Set once this CPU has finished bringing itself up.
     pub online: bool,
 }
+
+// The syscall entry stub addresses these by hand, as `gs:[16]` and `gs:[24]`,
+// because it runs before it has a stack to compute anything on. Assembly
+// cannot see a field name, so the offsets are checked here instead — a
+// reordering of this structure would otherwise make the stub read `lapic_id`
+// as a stack pointer, which is not a crash but a jump to an attacker-chosen
+// address.
+const _: () = assert!(core::mem::offset_of!(PerCpu, self_pointer) == 0);
+const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp) == 16);
+const _: () = assert!(core::mem::offset_of!(PerCpu, kernel_rsp) == 24);
 
 impl PerCpu {
     const fn new() -> Self {
@@ -62,6 +82,8 @@ impl PerCpu {
             self_pointer: 0,
             cpu_id: 0,
             lapic_id: 0,
+            user_rsp: 0,
+            kernel_rsp: 0,
             online: false,
         }
     }
@@ -150,6 +172,23 @@ pub unsafe fn activate(cpu_id: u32) {
     ANY_INSTALLED.store(true, Ordering::Release);
 }
 
+/// Records the stack the syscall entry stub should switch to on this CPU.
+///
+/// # Safety
+///
+/// `cpu_id` must be this CPU's, and `rsp` must be the top of a mapped,
+/// writable kernel stack that no other CPU uses.
+pub unsafe fn set_kernel_stack(cpu_id: u32, rsp: u64) {
+    if cpu_id as usize >= MAX_CPUS {
+        return;
+    }
+    // SAFETY: this CPU owns its own element; the table is a `static` that
+    // never moves.
+    unsafe {
+        AREAS.get_mut()[cpu_id as usize].kernel_rsp = rsp;
+    }
+}
+
 /// This CPU's private area, or `None` before [`install`] has run on it.
 #[must_use]
 pub fn current() -> Option<&'static PerCpu> {
@@ -175,6 +214,15 @@ pub fn current() -> Option<&'static PerCpu> {
     // SAFETY: the value came from `self_pointer`, which `install` set to the
     // address of a `static` element that outlives the program.
     Some(unsafe { &*(pointer as *const PerCpu) })
+}
+
+/// The address of this CPU's per-CPU area.
+///
+/// What `IA32_KERNEL_GS_BASE` must hold, so that `swapgs` on kernel entry
+/// brings this CPU's data into `GS`.
+#[must_use]
+pub fn area_address() -> Option<u64> {
+    current().map(|area| area.self_pointer)
 }
 
 /// This CPU's dense identifier, or 0 if per-CPU data is not up yet.
