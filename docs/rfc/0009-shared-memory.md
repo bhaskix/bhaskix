@@ -377,9 +377,10 @@ is a case where "none" is the true answer rather than the convenient one.
 2. **Must a `Memory` object be physically contiguous?** DMA wants it;
    general sharing does not. Proposal: an attribute set at creation, with
    contiguous allocation allowed to fail. Deferred until the IOMMU RFC.
-3. **Notification capabilities** — the other half of RFC 0008's async answer.
-   Same RFC, or its own? Proposal: its own, because a notification is useful
-   without shared memory and the two have no shared invariants.
+3. ~~**Notification capabilities** — the other half of RFC 0008's async
+   answer. Same RFC, or its own?~~ **Answered:** its own, and written —
+   [RFC 0010](0010-notifications.md). A notification is useful with no shared
+   memory at all, and the two share no invariants.
 4. **`MAX_MAPPINGS = 8`** is a guess. It should be the number that makes the
    revocation walk's worst case acceptable, which is a measurement nobody has
    taken.
