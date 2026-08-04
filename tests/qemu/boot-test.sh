@@ -276,6 +276,16 @@ else
     status=1
 fi
 
+# Capabilities: the load-bearing security mechanism. The rules are proved
+# exhaustively on the host; this asserts they hold against the real global
+# arena, through its lock, and that nothing leaked.
+if grep -qF "derive is monotone, revoke is transitive and immediate" "$LOG"; then
+    pass "capabilities: monotone derivation, immediate transitive revocation"
+else
+    fail "capability self test did not pass"
+    status=1
+fi
+
 # The fault path's per-CPU frame reserve. Held frames prove it is populated;
 # the "fault serviced while the allocator lock was held" property is gated by
 # the demand-paging assertion above, which only prints its success line when

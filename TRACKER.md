@@ -73,9 +73,9 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **K1** | Storage implementation | ⬜ Draft | **Kosh** — RFC 0003's layers made concrete, plus distribution. Elastic from one node, RF=1…n, block/file/object/key-value, asynchronous geo. Commits to the row RFC 0003 marked *not committed*, and is explicit that the first years are single-node. | [RFC 0006](docs/rfc/0006-kosh-distributed-storage.md) |
 | **U1** | Live patching | ⬜ Draft | Nucleus-only, stop-the-world quiescence, declared-patchable functions. Narrows rather than expands: service domains restart instead, and A/B reboot stays the default. Its **P0 prerequisites** — a build identifier and an attestation format that can express "image plus patches" — are cheap now and painful to retrofit. | [RFC 0007](docs/rfc/0007-livepatch.md) |
 | **C1** | Binary compatibility | ⬜ Draft | Linux `x86_64` ABI as a **domain personality**, not the native interface. First target deliberately narrow: statically linked Go binaries. Answers **A4** by refusing its premise — own ABI natively *and* Linux compatibility as something offered. | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
-| **A2** | Syscall ABI shape | ⬜ Open | Capability-invocation only vs a numbered syscall table. | *Blocks M5* |
-| **A3** | IPC style | ⬜ Open | Synchronous rendezvous vs async buffered channels. Which is primitive? | *Blocks M5* |
-| **A4** | Userspace ABI | ⬜ Open | Own ABI vs POSIX-shaped. [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) argues this is a false choice: capability-shaped natively, Linux-shaped through a personality that holds no authority its domain lacks. Still needs a decision on the *native* shape. | *Blocks M5* |
+| **A2** | Syscall ABI shape | ⬜ Draft | **Capability invocation**, six syscall kinds, all authority arriving as a capability argument. A numbered table is ambient authority and discards the project's central claim on the first syscall. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
+| **A3** | IPC style | ⬜ Draft | **Synchronous rendezvous** is primitive; async is shared memory plus a notification capability, one layer up. Buffering forces the nucleus to answer "whose memory is it", and every answer is a denial of service or the synchronous behaviour with extra steps. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
+| **A4** | Userspace ABI | ⬜ Draft | **Capability-shaped**, and the native ABI *is* A2's syscall interface — there is no separate document to write. Consequence: no native `libc`; the roadmap's Phase 2 libc belongs to the Linux personality. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | *Blocks M3* |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
@@ -113,6 +113,32 @@ fairness within 2% for two equal-weight workloads.
 | M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape; there is no network stack. |
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
+
+### M5 — Domains, capabilities, syscalls, user mode
+
+| ID | Task | Status | Notes |
+|---|---|---|---|
+| M5-00 | Decide the syscall and IPC shape | ⬜ `DRAFT` | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) answers **A2**, **A3** and **A4**. Blocks M5-03 onwards; does *not* block M5-01. |
+| M5-01 | Capability objects, CSpace, derive/revoke | ✅ `DONE` | All four rules of `docs/security.md` §2 enforced and **each negative-tested**. Derivation monotonicity tested over every one of 64×64 rights pairs, not sampled. |
+| M5-02 | `Domain` with `ResourceEnvelope` | ⬜ `TODO` | Needs the object table capabilities currently only name. |
+| M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | ⬜ `TODO` | Blocked on M5-00 being accepted. |
+| M5-04 | Ring 3 execution | ⬜ `TODO` | Needs M5-03. |
+| M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`, badges | ⬜ `TODO` | Wait queues from M4-09 are the mechanism. |
+| M5-06 | Per-domain capability quotas | ⬜ `TODO` | The arena is a fixed global resource; a domain deriving in a loop exhausts it for everyone. |
+
+### Honest notes on M5 so far
+
+- **Capabilities name objects that do not exist.** `ObjectRef` carries a kind and an identity, and
+  nothing maps an identity to a frame, a thread or an endpoint yet. The authority mechanism is real;
+  the things it authorises are not, and until M5-02 the self-test authorises a number.
+- **Revocation is `O(arena × depth)`, by choice.** A sweep to fixed point rather than child pointers:
+  child links make revocation `O(subtree)` but require insertion to maintain a second invariant that
+  must be exactly right, and a missed branch is a privilege-escalation bug. The sweep is obviously
+  complete. Revisit if a workload revokes hot.
+- **No per-domain quota.** `MAX_CAPABILITIES` is global, so a domain that derives in a loop denies
+  service to every other domain. This belongs in `ResourceEnvelope` and is M5-06.
+- **The badge is unreadable by its holder because no function returns it to them** — which is the
+  right enforcement today and becomes a real access-control decision once syscalls exist.
 
 ### Bugs found and fixed during M4
 
@@ -275,6 +301,36 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M5-01, capabilities — and RFC 0008 answering three open decisions)
+
+- **RFC 0008 drafted**, resolving **A2**, **A3** and **A4** together, because they are one decision
+  seen from three angles: the nucleus provides mechanism that cannot be *named* without authority,
+  and refuses to hold state on anyone's behalf.
+  - **A2 — capability invocation, not a numbered table.** Six syscall kinds, ever. A numbered table
+    makes an operation available because of what the caller *is*, which is ambient authority and
+    discards the project's central security claim on the first syscall.
+  - **A3 — synchronous rendezvous is primitive.** Buffering forces the nucleus to answer "whose
+    memory is this message in", and every answer is either a denial of service or the synchronous
+    behaviour with a buffer's complexity added. Async is shared memory plus a notification
+    capability, one layer up — the shape `io_uring` converged on, needing the nucleus to provide
+    exactly one thing: a way to wake someone.
+  - **A4 — the native ABI is A2.** There is no separate native ABI to design. Consequence worth
+    stating: **no native `libc`**; the roadmap's Phase 2 libc belongs to the Linux personality.
+- **Capabilities implemented, and all four rules of `docs/security.md` §2 are individually
+  negative-tested** — each one broken on purpose, each breaking its own test and no other.
+  - Derivation monotonicity is tested over **every one of 64×64 rights pairs**, not sampled. §2 asks
+    for exhaustive and a sampled version would pass while missing the combination that matters.
+  - Revocation is transitive *and* inert outside the subtree, which is the half a naive
+    implementation gets wrong, and both directions are gated.
+  - A stale reference never resolves to a reused entry — the use-after-free that hands out authority
+    instead of crashing, which is the worst possible version of it.
+- **The derivation tree is global rather than per-domain**, because revocation must cross domains:
+  the whole point of granting is that the capability ends up somewhere else. A domain's CSpace holds
+  references into that tree, so revoking a node invalidates every slot referring to it without
+  traversing a single domain — the slots were never the authority.
+- **Built before the syscall interface on purpose.** Capabilities sit below the ABI decision, so
+  M5-01 could proceed while RFC 0008 waits for a verdict.
 
 ### 2026-08-04 (M4-12, per-CPU frame reserve — M4 complete)
 

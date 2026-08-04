@@ -28,6 +28,7 @@
 // The kernel heap makes `alloc` usable; see `heap`.
 extern crate alloc;
 
+pub mod cap;
 pub mod console;
 pub mod faultinject;
 pub mod font;
@@ -321,6 +322,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("    tickless       FAILED");
     }
+    if !capability_self_test() {
+        println!("    capabilities   FAILED");
+    }
     frames_report();
     tickless_report();
 
@@ -416,6 +420,98 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
         cpus - 1
     );
     true
+}
+
+/// Exercises capabilities against the real global arena.
+///
+/// The host tests cover the rules exhaustively against a local arena; this
+/// checks the same properties through the lock, on the real one, which is the
+/// only thing that can catch the arena being unreachable or the lock being
+/// mis-ranked. It also proves the arena is left clean, so a later milestone
+/// starting from a non-empty tree is a visible failure rather than a slow leak.
+fn capability_self_test() -> bool {
+    use cap::{ObjectKind, ObjectRef, Rights};
+
+    let before = cap::live();
+
+    let outcome = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(ObjectRef::new(ObjectKind::Frame, 0xbeef), Rights::ALL, 0)
+            .ok()?;
+
+        // A service is handed a narrowed, badged capability -- the shape every
+        // grant in this system will take.
+        // Narrowed, but still able to pass on and to be revoked: holding a
+        // right is not the same as being allowed to delegate it, so those two
+        // have to be granted explicitly.
+        let service_rights = Rights::READ
+            .union(Rights::WRITE)
+            .union(Rights::DERIVE)
+            .union(Rights::REVOKE);
+        let granted = arena.derive(root, service_rights, 0xa11ce).ok()?;
+        let further = arena.derive(granted, Rights::READ, 0xb0b).ok()?;
+
+        let widening_refused = arena
+            .derive(granted, Rights::ALL, 0)
+            .is_err_and(|error| error == cap::CapError::RightsNotMonotone);
+
+        // Two domains, the same index, different authority.
+        let mut alice = cap::CSpace::new();
+        let mut bob = cap::CSpace::new();
+        alice.install(granted).ok()?;
+        bob.install(further).ok()?;
+        let indices_are_not_authority = alice.get(0) != bob.get(0);
+
+        let badge_survived = arena.badge_of(further) == Some(0xb0b);
+
+        // Revoking the middle capability must take the one below it and leave
+        // the one above untouched -- checked before this call returns.
+        let destroyed = arena.revoke(granted).ok()?;
+        let transitive = destroyed == 2 && !arena.is_live(granted) && !arena.is_live(further);
+        let parent_survived = arena.is_live(root);
+
+        arena.revoke_unchecked(root);
+
+        Some((
+            widening_refused,
+            indices_are_not_authority,
+            badge_survived,
+            transitive,
+            parent_survived,
+        ))
+    });
+
+    let after = cap::live();
+
+    let Some((widening_refused, distinct, badge_survived, transitive, parent_survived)) = outcome
+    else {
+        println!("    capabilities   FAILED: the arena refused a capability it should have made");
+        return false;
+    };
+
+    let checks = [
+        ("derivation refused to widen rights", widening_refused),
+        ("an index means nothing outside its cspace", distinct),
+        ("a granter's badge survived derivation", badge_survived),
+        ("revocation was transitive and immediate", transitive),
+        ("revocation spared the parent", parent_survived),
+        ("no capabilities leaked", after == before),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!("    capabilities   FAILED: {name}");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!(
+            "    capabilities   derive is monotone, revoke is transitive and immediate; {after} live"
+        );
+    }
+    ok
 }
 
 /// Reports the state of the per-CPU fault-path frame reserves.
