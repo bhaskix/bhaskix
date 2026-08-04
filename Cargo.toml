@@ -15,6 +15,7 @@
 resolver = "3"
 members = [
     # M1 — docs/roadmap.md
+    "abi",
     "boot/handoff",
     "boot/shim",
     "arch/x86_64",

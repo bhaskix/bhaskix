@@ -43,6 +43,7 @@ pub mod irq;
 pub mod memory;
 pub mod panic;
 pub mod sched;
+pub mod service;
 pub mod shell;
 pub mod smp;
 pub mod stack;
@@ -413,10 +414,24 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
 
     println!();
 
-    // The shell, on the CPU the serial interrupt is routed to. That pairing
-    // is required rather than tidy: `input`'s wake-up argument depends on the
-    // handler and the reader sharing a CPU.
-    if input_ready {
+    // Which shell the machine boots to. The user-mode one by default, because
+    // it is the one that has to ask permission for everything it does;
+    // `shell=kernel` on the command line selects the ring 0 one, which is a
+    // debugging tool and says so when it starts.
+    let kernel_shell = handoff
+        .cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == "shell=kernel");
+
+    if !input_ready {
+        // Say so rather than spawning a shell that would block for ever on a
+        // console nothing can write to.
+        println!("  M6 in progress. Nothing left to do at this milestone.");
+        println!("  no console input on this machine, so no shell.");
+    } else if kernel_shell {
+        // On the CPU the serial interrupt is routed to. That pairing is
+        // required rather than tidy: `input`'s wake-up argument depends on the
+        // handler and the reader sharing a CPU.
         match sched::spawn_on_with(
             0,
             "shell",
@@ -429,10 +444,21 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             Err(error) => println!("  the shell could not be spawned: {error:?}"),
         }
     } else {
-        // Say so rather than spawning a shell that would block for ever on a
-        // console nothing can write to.
-        println!("  M6 in progress. Nothing left to do at this milestone.");
-        println!("  no console input on this machine, so no shell.");
+        match user_shell(handoff) {
+            Ok(()) => println!("  M6 in progress. Nothing left to do at this milestone."),
+            Err(reason) => {
+                println!("  the user-mode shell could not be started: {reason}");
+                println!("  falling back to the kernel shell.");
+                let _ = sched::spawn_on_with(
+                    0,
+                    "shell",
+                    shell::main,
+                    0,
+                    handoff.hhdm_base.as_u64(),
+                    sched::SpawnOptions::new().pinned(),
+                );
+            }
+        }
     }
 
     // Not `halt_forever`: the shell is a thread, and this CPU has to be
@@ -1131,6 +1157,294 @@ fn initrd_self_test(handoff: &Handoff) -> bool {
     ok
 }
 
+/// Where the user-mode shell's stack goes, and how much of it there is.
+///
+/// Four pages, against the probe's one. A shell has a line editor, a path
+/// buffer and a listing buffer, all on the stack because it has no allocator —
+/// and a program that cannot allocate keeps everything somewhere, which here
+/// is here.
+const SHELL_STACK: u64 = 0x0000_0000_1100_0000;
+const SHELL_STACK_PAGES: u64 = 4;
+
+/// Where the user-mode shell is in the filesystem.
+const SHELL_PROGRAM: &[u8] = b"bin/shell";
+
+/// The CPU the user-mode shell prefers.
+///
+/// Not the bootstrap CPU: that one runs the console service, which blocks
+/// waiting for a byte, while the shell blocks waiting for the console's reply.
+/// Both on one CPU works — the scheduler runs whichever is ready — but keeping
+/// them apart makes the reply path a genuine cross-processor wake rather than
+/// a local one, which is the case more likely to be wrong.
+///
+/// Clamped to what the machine has: a single-processor machine still gets a
+/// shell, on the only CPU there is.
+const SHELL_CPU: u32 = 2;
+
+/// Slot base for the privilege stack the shell's CPU needs.
+const SHELL_RSP0_SLOT: u64 = 3072;
+
+/// The badges the shell's two capabilities carry.
+const BADGE_CONSOLE: u64 = 0x0000_0000_00c0_0000;
+const BADGE_FILESYSTEM: u64 = 0x0000_0000_00f5_0000;
+
+/// The shell's domain, for reporting.
+static SHELL_DOMAIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Starts the console and filesystem services, then the shell that uses them.
+///
+/// Everything the shell can do is decided here, once, by what is installed in
+/// its CSpace — two endpoints and nothing else. It cannot open a file the
+/// filesystem service would not open for it, cannot print except through the
+/// console service, and cannot name any other object in the system, because
+/// there is no third slot.
+fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
+    let hhdm = handoff.hhdm_base.as_u64();
+
+    // The console service is pinned to the CPU the serial line is routed to,
+    // because it is the thread that blocks in `input::read`.
+    service::start(0, hhdm)?;
+
+    let console = service::console_endpoint().ok_or("the console service has no endpoint")?;
+    let filesystem = service::filesystem_endpoint().ok_or("the filesystem has no endpoint")?;
+
+    let realm = domain::create("shell", domain::ResourceEnvelope::new())
+        .map_err(|_| "no room for another domain")?;
+    SHELL_DOMAIN.store(realm.as_u32(), core::sync::atomic::Ordering::Release);
+
+    // A badged capability per service, derived from a root the kernel keeps.
+    // Derived rather than installed directly for two reasons: the badge is
+    // what the service uses to tell its callers apart, and revoking the root
+    // takes the shell's authority with it -- so the shell holds its authority
+    // on the same terms as anything else, rather than being trusted.
+    //
+    // Two slots, and there is no third. Everything this program can do is
+    // decided here.
+    for (index, endpoint, badge) in [
+        (0usize, console, BADGE_CONSOLE),
+        (1usize, filesystem, BADGE_FILESYSTEM),
+    ] {
+        let derived = cap::with_arena(|arena| {
+            let root = arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                    cap::Rights::ALL,
+                    0,
+                )
+                .ok()?;
+            arena.derive(root, cap::Rights::ALL, badge).ok()
+        })
+        .ok_or("the capability arena is full")?;
+
+        if domain::with(realm, |owner| {
+            owner.cspace.install_at(index, derived).is_ok()
+        }) != Some(true)
+        {
+            return Err("the capability would not install");
+        }
+    }
+
+    // Clamped to what the machine actually has, so a single-processor machine
+    // gets a shell on the only CPU there is rather than an error.
+    let cpu = SHELL_CPU.min(bhaskix_arch::percpu::online_count().saturating_sub(1));
+
+    // The stack an interrupt from ring 3 lands on, for the shell's CPU.
+    // SAFETY: a slot no thread, syscall stack or other privilege stack uses.
+    let privileged = unsafe { stack::allocate(hhdm, SHELL_RSP0_SLOT + u64::from(cpu)) }
+        .map_err(|_| "no privilege stack for the shell's cpu")?;
+    // SAFETY: set before anything can enter ring 3 on that CPU.
+    unsafe { bhaskix_arch::gdt::set_privilege_stack(cpu as usize, privileged.top) };
+
+    // Before ring 3 gets near them, prove the services answer. A failure here
+    // is a protocol bug reported as one; the same failure discovered through
+    // the shell is a program that prints nothing for a reason nobody can see.
+    if !service_self_test(filesystem) {
+        println!("    services       FAILED");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(cpu, "usershell", user_shell_entry, hhdm, hhdm, options)
+        .map_err(|_| "the shell would not spawn")?;
+    Ok(())
+}
+
+/// Exercises the filesystem service's protocol without a user program.
+///
+/// Calls the endpoint directly, with a badge of this test's choosing, which is
+/// something only in-kernel code can do — a caller in ring 3 gets whatever
+/// badge its capability carries. That is the point: this checks the *service*,
+/// and the shell checks the path a real program takes to it.
+///
+/// `console::READ` is deliberately not exercised. It blocks until somebody
+/// types, and a boot test that waited for that would hang in CI and pass on a
+/// developer's terminal.
+fn service_self_test(filesystem: ipc::EndpointId) -> bool {
+    use bhaskix_abi::{Chunk, fs, outcome, outcome_of};
+
+    const TESTER: u64 = 0x00a1_0000;
+    const SECOND: u64 = 0x00a2_0000;
+    const THIRD: u64 = 0x00a3_0000;
+
+    let send = |badge: u64, method: u64, args: [u64; 4]| {
+        ipc::call(filesystem, badge, method, args).map(|reply| reply.args)
+    };
+
+    // A path in two chunks, because a path longer than sixteen bytes is the
+    // ordinary case and the chunking is where an off-by-one would live.
+    let path = b"etc/hostname";
+    let (first, rest) = Chunk::take(&path[..8]);
+    let (second, _) = Chunk::take(rest);
+    let _ = send(TESTER, fs::PATH, first.pack(0));
+    let _ = send(TESTER, fs::PATH, Chunk::take(&path[8..]).0.pack(0));
+    let _ = second;
+
+    let opened = send(TESTER, fs::OPEN, [0; 4]);
+    let size = opened.map(|args| args[3]).unwrap_or(0);
+    let opened_ok = opened.map(|args| outcome_of(args[0])) == Ok(outcome::OK);
+
+    // Read it back through the chunk protocol.
+    let mut contents = [0u8; 32];
+    let mut length = 0;
+    for _ in 0..8 {
+        let Ok(args) = send(TESTER, fs::READ, [0; 4]) else {
+            break;
+        };
+        let chunk = Chunk::unpack(&args);
+        if chunk.is_empty() {
+            break;
+        }
+        let room = contents.len() - length;
+        let taken = chunk.len().min(room);
+        contents[length..length + taken].copy_from_slice(&chunk.bytes()[..taken]);
+        length += taken;
+    }
+
+    // A listing of the root, one entry per call.
+    let _ = send(TESTER, fs::RESET, [0; 4]);
+    let mut entries = 0;
+    let mut directories = 0;
+    for _ in 0..32 {
+        let Ok(args) = send(TESTER, fs::LIST, [0; 4]) else {
+            break;
+        };
+        let chunk = Chunk::unpack(&args);
+        if chunk.is_empty() {
+            break;
+        }
+        if !chunk.more() {
+            entries += 1;
+            let (_, directory) = bhaskix_abi::entry_of(args[3]);
+            if directory {
+                directories += 1;
+            }
+        }
+    }
+
+    // A path the filesystem refuses, through the service rather than directly.
+    let _ = send(TESTER, fs::RESET, [0; 4]);
+    let (traversal, _) = Chunk::take(b"../etc/hostname");
+    let _ = send(TESTER, fs::PATH, traversal.pack(0));
+    let refused = send(TESTER, fs::OPEN, [0; 4]).map(|args| outcome_of(args[0]));
+
+    // A third caller, with two sessions already taken. Refused rather than
+    // handed somebody else's open file. The second claims its session with a
+    // `PATH`, because `RESET` *releases* one -- which is also why both are
+    // released below, before anything real needs a session.
+    let (probe, _) = Chunk::take(b"x");
+    let _ = send(SECOND, fs::PATH, probe.pack(0));
+    let busy = send(THIRD, fs::PATH, probe.pack(0)).map(|args| outcome_of(args[0]));
+
+    // Hand both back. A test that left the service full would leave the shell
+    // unable to open anything, which is precisely what the first version did.
+    let _ = send(TESTER, fs::RESET, [0; 4]);
+    let _ = send(SECOND, fs::RESET, [0; 4]);
+
+    let checks = [
+        ("a path sent in two chunks opened a file", opened_ok),
+        ("the file's size came back", size == 8),
+        (
+            "its contents came back through the chunk protocol",
+            &contents[..length] == b"bhaskix\n",
+        ),
+        ("a listing named what is in the root", entries >= 5),
+        ("directories are distinguished", directories >= 2),
+        (
+            "a path with a parent component was refused",
+            refused == Ok(outcome::BAD_PATH),
+        ),
+        (
+            "a third caller was refused, not confused",
+            busy == Ok(outcome::BUSY),
+        ),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!("    services       FAILED: {name} ({length} bytes, {entries} entries)");
+            ok = false;
+        }
+    }
+
+    if ok {
+        let (written, read, requests, refused_callers) = service::statistics();
+        println!(
+            "    services       {entries} entries listed, {length} bytes read by message; \
+             {requests} requests, {refused_callers} callers refused, console {written}/{read} b w/r"
+        );
+    }
+    ok
+}
+
+/// Loads `bin/shell` and becomes it.
+///
+/// The same shape as the ring 3 probe: this thread reads a file, maps what its
+/// headers ask for, and enters user mode, which it never leaves except through
+/// a system call. What is different is that this program is given capabilities
+/// first, and everything it does afterwards goes through them.
+extern "C" fn user_shell_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+
+    let Ok(file) = vfs::open(SHELL_PROGRAM) else {
+        println!("  the shell program is not in the filesystem");
+        stop()
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        println!("  the shell program is not an ELF this kernel will load");
+        stop()
+    };
+
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(SHELL_STACK), SHELL_STACK_PAGES) else {
+        stop()
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop()
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop()
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = SHELL_STACK + SHELL_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed -- `elf::parse` refuses an entry point that is not -- `rsp` is
+    // one past user-writable memory in the same space, and `RSP0` was set
+    // before this thread was spawned.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp) }
+}
+
 /// Brings up device interrupts and points the console's input at the UART.
 ///
 /// Returns whether input works. Everything here is allowed to fail: a machine
@@ -1354,8 +1668,12 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
+            // Two programs in /bin since M6-05: the ring 3 probe and the
+            // user-mode shell. Exact rather than "at least", so adding a
+            // third without noticing this line is a failure rather than a
+            // silently weaker test.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 1,
+            entries >= 3 && bin == 2,
         ),
         (
             "the user program is an ELF the loader accepts",

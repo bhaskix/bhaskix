@@ -139,9 +139,12 @@ jobs:
       - name: Build bootable image
         run: make iso
 
-      # The only check here that writes to the kernel rather than only reading
-      # from it. An input path cannot be tested any other way.
-      - name: Type at the machine and assert on its replies
+      # The only checks here that write to the kernel rather than only reading
+      # from it. An input path cannot be tested any other way, and the
+      # user-mode shell's whole claim -- that it can do nothing it was not
+      # given a capability for -- is a claim about what happens when someone
+      # types at it.
+      - name: Type at both shells and assert on their replies
         run: make test-shell
 
   faults:

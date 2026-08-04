@@ -13,6 +13,7 @@ name = "bhaskix_kernel"
 path = "src/lib.rs"
 
 [dependencies]
+bhaskix-abi = { path = "../abi" }
 bhaskix-boot = { path = "../boot/handoff" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-mm = { path = "../mm" }

@@ -44,10 +44,23 @@ bhaskix/
 ├── net/                    network stack (a service)
 ├── drivers/                device drivers (services), one module per device
 │
+├── abi/                    the interface between the kernel and the programs
+│                           it runs: syscall numbers, the message layout, the
+│                           methods services answer. Compiled into BOTH sides,
+│                           so its `unsafe` budget is zero and stays there.
+│
+├── user/                   unprivileged programs. Each is its own workspace:
+│   │                       they need their own code model and linker script,
+│   │                       which a workspace member cannot have.
+│   ├── probe/              the ring 3 probe the kernel proves user mode with
+│   └── shell/              the user-mode shell (M6-05)
+│
 ├── libc/                   userspace C runtime — Phase 2.
 │                           ⚠ NEVER linked into the kernel.
 │
-├── userspace/              init, shell, bhaskixd-* daemons
+├── userspace/              init and bhaskixd-* daemons — Phase 2. Named
+│                           before `user/` existed; when the daemons arrive,
+│                           one of the two names goes.
 ├── tools/                  setup-dev.sh, image builder, CI helpers
 │
 ├── tests/

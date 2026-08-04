@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The user-mode shell.
+#
+# Not a member of the root workspace, for the reasons user/probe/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+#
+# Its one dependency is the ABI, which is what an unprivileged program is
+# allowed to know about the kernel: six system call numbers, a message layout,
+# and the methods two services answer. Nothing else.
+[workspace]
+
+[package]
+name = "bhaskix-user-shell"
+description = "A shell that runs in ring 3 and asks for everything it does."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+
+[package.metadata.bhaskix]
+# Two blocks: the `syscall` instruction, whose register clobbers no safe
+# wrapper can express, and the `ud2` a panic ends at. Everything else is safe
+# code -- a program with no authority has no pointer worth dereferencing, and
+# the one dangerous thing it can do is ask the kernel, which is what the
+# syscall block is for.
+#
+# 20 counts those two blocks and their operand lists. It should not grow: a
+# third `unsafe` in an unprivileged program would need a reason this one does
+# not have.
+unsafe_budget = 20
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"

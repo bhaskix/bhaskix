@@ -32,12 +32,16 @@ LIMINE_DIR   := boot/limine/limine
 # have (see user/probe/Cargo.toml).
 PROBE_DIR    := user/probe
 PROBE        := $(PROBE_DIR)/target/$(TARGET)/release/probe
+SHELL_DIR    := user/shell
+USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
 # kernel's PIC/kernel-code-model settings are wrong for a user program linked
 # at a fixed low address.
 PROBE_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(PROBE_DIR)/link.ld
+SHELL_FLAGS  := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(SHELL_DIR)/link.ld
 
 # 256 MiB is comfortably more than the kernel needs and small enough that the
 # memory-map output stays readable.
@@ -103,11 +107,12 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
 	cp $(PROBE) $(INITRD_ROOT)/bin/probe
+	cp $(USER_SHELL) $(INITRD_ROOT)/bin/shell
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
 	@echo "built $@ ($$(stat -c%s $@) bytes)"
@@ -116,6 +121,15 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE)
 # compiled artefact never lands in a source tree that is under version control.
 $(PROBE): $(PROBE_DIR)/src/main.rs $(PROBE_DIR)/link.ld $(PROBE_DIR)/Cargo.toml
 	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# The user-mode shell. Depends on the ABI crate as well as its own source: the
+# ABI is compiled into both sides of the boundary, so a change there changes
+# the program as surely as a change here.
+$(USER_SHELL): $(SHELL_DIR)/src/main.rs $(SHELL_DIR)/link.ld $(SHELL_DIR)/Cargo.toml \
+               $(wildcard abi/src/*.rs)
+	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
@@ -169,7 +183,7 @@ test: fmt clippy test-host gates test-boot test-boot-uefi test-shell test-faults
 # Host unit tests. The overridden --target is what takes these off the
 # freestanding target and onto something that can run a test harness.
 test-host:
-	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-boot -p bhaskix-kernel -p bhaskix-mm
+	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-mm
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios
@@ -178,10 +192,15 @@ test-boot-uefi: $(ISO)
 	tests/qemu/boot-test.sh uefi
 
 # Types at the machine over the serial line and asserts on the replies. The
-# only test here that writes to the kernel rather than only reading from it,
+# only tests here that write to the kernel rather than only reading from it,
 # which is the only way to test an input path.
+#
+# Both shells, because both are supported: the user-mode one the machine boots
+# to, and the ring 0 one `shell=kernel` selects. The second rebuilds the image
+# with that on the command line and puts the default back afterwards.
 test-shell: $(ISO)
-	tests/qemu/shell-test.sh
+	tests/qemu/shell-test.sh user
+	tests/qemu/shell-test.sh kernel
 
 # Rebuilds the image per fault, so it must not run in parallel with the boot
 # tests -- hence its own target rather than a boot-test flag.
@@ -191,6 +210,7 @@ test-faults:
 fmt:
 	$(CARGO) fmt --all --check
 	cd $(PROBE_DIR) && $(CARGO) fmt --all --check
+	cd $(SHELL_DIR) && $(CARGO) fmt --all --check
 
 # Two passes, because they cover different things. `--all-targets` cannot be
 # used on the freestanding target: it would try to build the test harness,
@@ -198,8 +218,10 @@ fmt:
 clippy:
 	$(CARGO) clippy --profile $(PROFILE) --target $(TARGET) --lib --bins -- -D warnings
 	$(CARGO) clippy --target $(HOST_TARGET) --all-targets \
-	    -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm -- -D warnings
+	    -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm -- -D warnings
 	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 
 # The project-specific invariants from docs/. Each one is cheap and catches a
@@ -214,6 +236,7 @@ gates:
 clean:
 	$(CARGO) clean
 	cd $(PROBE_DIR) && $(CARGO) clean
+	cd $(SHELL_DIR) && $(CARGO) clean
 	rm -rf build
 
 distclean: clean

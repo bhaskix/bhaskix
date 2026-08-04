@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhaskix-abi"
+description = "The interface between Bhaskix and the programs that run on it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_abi"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, and it should stay zero. This crate is constants, arithmetic on
+# message registers, and a state machine over bytes. Nothing in it touches a
+# pointer, and anything that wants to is in the wrong crate: this is the one
+# piece of the system compiled into *both* the kernel and unprivileged
+# programs, so an `unsafe` here would be an obligation owed on both sides of
+# the boundary at once.
+unsafe_budget = 0

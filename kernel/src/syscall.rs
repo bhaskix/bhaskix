@@ -109,6 +109,23 @@ pub enum Kind {
     Exit = 5,
 }
 
+// The six numbers are also written down in `bhaskix_abi`, which unprivileged
+// programs compile against. Two definitions of a system call number is exactly
+// the kind of duplication that drifts, so it does not get to: these assertions
+// fail the build rather than a message.
+const _: () = {
+    assert!(Kind::Invoke as u64 == bhaskix_abi::syscall::INVOKE);
+    assert!(Kind::Call as u64 == bhaskix_abi::syscall::CALL);
+    assert!(Kind::Reply as u64 == bhaskix_abi::syscall::REPLY);
+    assert!(Kind::Recv as u64 == bhaskix_abi::syscall::RECV);
+    assert!(Kind::Yield as u64 == bhaskix_abi::syscall::YIELD);
+    assert!(Kind::Exit as u64 == bhaskix_abi::syscall::EXIT);
+    assert!(Status::Ok as u64 == bhaskix_abi::status::OK);
+    assert!(Status::NoSuchCapability as u64 == bhaskix_abi::status::NO_SUCH_CAPABILITY);
+    assert!(Status::Revoked as u64 == bhaskix_abi::status::REVOKED);
+    assert!(Status::NoSuchMethod as u64 == bhaskix_abi::status::NO_SUCH_METHOD);
+};
+
 impl Kind {
     /// Decodes a raw value.
     ///
@@ -495,7 +512,16 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 [frame.arg0, frame.arg1, frame.arg2, frame.arg3],
             ) {
                 Ok(reply) => {
+                    // The whole message comes back, not just its first word.
+                    // RFC 0008 says a message is four registers; returning one
+                    // of them made every service that needed to answer with
+                    // more than a number invent a way to say it in pieces.
+                    // `arg0` is written again by the dispatcher from
+                    // `Outcome::value`, which is why it is also set there.
                     frame.arg0 = reply.args[0];
+                    frame.arg1 = reply.args[1];
+                    frame.arg2 = reply.args[2];
+                    frame.arg3 = reply.args[3];
                     return Outcome::ok(reply.args[0]);
                 }
                 Err(error) => return Outcome::err(ipc_status(error)),

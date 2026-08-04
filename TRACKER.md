@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-04 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 4/6 — boots to a shell you can type at · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 5/6 — boots to a user-mode shell holding two capabilities · CI green |
 
 ### Division of responsibility between documents
 
@@ -122,7 +122,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-02 | VFS layer over the initrd | ✅ `DONE` | Paths resolve, files open with a cursor, directories list what is directly under them. `..` is **refused rather than resolved** — it cannot escape a flat archive today, and would be a traversal the moment a backend walks a tree. **Negative-tested**: accepting `..` fails the boot gate. |
 | M6-03 | ELF64 loader, with a fuzz target | ✅ `DONE` | Ring 3 now runs `bin/probe`, a separately built ET_EXEC loaded out of the initrd, mapped at the addresses and with the permissions **its own headers** name. **Negative-tested**: dropping one segment fails the gate; a deliberately reintroduced wrap bug is caught by the mutation harness at seed 424. |
 | M6-04 | Kernel shell | ✅ `DONE` | The console reads: ACPI walk → I/O APIC → IRQ 4 → a vector → a lock-free ring → a blocking read. Nine read-only commands, run by the boot self-test through the same function the prompt calls. **Negative-tested**: draining one byte per interrupt fails the boot gate; removing the wake-up passes it and fails `shell-test.sh`, which is why that test exists. |
-| M6-05 | User-mode shell over the syscall interface | ⬜ `TODO` | Needs M6-03 and a way to read input from a domain. |
+| M6-05 | User-mode shell over the syscall interface | ✅ `DONE` | The machine boots to a shell in ring 3 holding two capabilities and nothing else: console and filesystem, both reached by IPC, sixteen bytes per round trip. `shell=kernel` selects the ring 0 one. **Negative-tested**: withholding the filesystem capability makes `caps` report it, both filesystem commands fail, and everything else keeps working. |
 | M6-06 | `virtio-blk` driver | ⬜ `TODO` | Needs PCIe enumeration, which is Phase 2's driver framework. |
 
 ### Honest notes on M6 so far
@@ -161,6 +161,32 @@ fairness within 2% for two equal-weight workloads.
   and every choice is weaker than one segment asked for or stronger than the other did. A file
   produced by a linker Bhaskix does not control could hit this and be rejected for a reason its
   author will find surprising.
+
+- **The user-mode shell moves sixteen bytes per round trip.** A message is four registers
+  ([RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md)); two of them carry bytes. Printing a line of
+  help is therefore a few dozen context switches. The alternative is shared memory, which needs a
+  page granted across a domain boundary and a capability type to describe it — an RFC's worth of
+  decisions this milestone does not need. What the slow version buys is worth keeping in mind when
+  the fast one arrives: **no pointer crosses the boundary**, so the kernel never dereferences an
+  address a caller chose, and the whole class of confused-deputy bugs that `copy_from_user` exists
+  to contain cannot occur.
+
+- **`Recv` still returns a truncated message.** `Call` was fixed at M6-05 to return all four
+  registers; `Recv` still overwrites two of them with the caller identifier and the badge, because
+  nothing in the tree receives from ring 3 yet — the services are kernel threads using `ipc::recv`
+  directly. The first user-mode service will need this fixed, and will find out by receiving
+  nonsense in `args[1]`.
+
+- **A service cannot tell that a caller has died.** The filesystem service releases a session when
+  the caller says `RESET`, and has no other signal. A program that stops without one holds a slot
+  until the machine restarts, and with two slots that matters. The fix needs a mechanism that does
+  not exist: an endpoint that reports when the capability reaching it is revoked. Found the hard
+  way — the boot self-test's two test callers held both slots for the rest of the machine's life,
+  and the shell was refused before it started.
+
+- **Each service is one thread, so it answers one caller at a time.** While the console service is
+  blocked waiting for someone to type, it is not answering writes. That is correct with one shell
+  and would deadlock two.
 
 - **The kernel shell is the kernel.** It runs in ring 0, calls kernel functions directly, and holds
   no capability, so it is an operator's tool and not a security boundary. Every command is read-only
@@ -430,6 +456,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M6-05 — a shell that has to ask)
+
+- **The machine boots to a program in ring 3 that holds two capabilities and nothing else.** It
+  reaches the console through one and the filesystem through the other, sixteen bytes per message,
+  and there is no third slot. `caps` asks the kernel about each: two are reachable and the third is
+  refused before any service is involved — which is the difference between "the service said no"
+  and "you have no authority", printed in different words because they are different facts.
+- **The difference between the two shells is now visible rather than argued.** The kernel shell
+  calls `vfs::open`. This one cannot: it has no filesystem, and withholding its capability turns
+  both of its filesystem commands into refusals while `help` and `echo` carry on. That is the
+  negative test, and it is the milestone in one sentence.
+- **An ABI crate, compiled into the kernel and into unprivileged programs.** Six system call
+  numbers, the message layout, the methods two services answer, and the line editor both shells
+  use. Its `unsafe` budget is zero and should stay there: code here is trusted by the kernel *and*
+  handed to untrusted programs, so an obligation in it would be owed on both sides of the boundary
+  at once. The kernel's own `Kind` and `Status` are checked against it with a compile-time
+  assertion, so two definitions of a syscall number fail the build rather than a message.
+- **`Call` returned one register of a four-register message.** RFC 0008 says a message is four
+  words; the syscall path returned `args[0]` and dropped the rest, which is why nothing had yet
+  needed to answer with more than a number. Fixed, and the chunk protocol is the first thing to
+  depend on it.
+- **The first bug this milestone's own test found was a resource leak in a self-test.** `RESET`
+  cleared a session's state but kept its slot, so the two callers the boot self-test used held both
+  slots permanently and the shell was refused before it ever started. Typing at the machine found
+  it in one run; nothing else would have. `RESET` now releases the session, and the honest note
+  above records what still cannot be detected — a caller that dies.
+- **Both shells are now typed at by CI.** `tests/qemu/shell-test.sh user` and `... kernel`; the
+  second builds an image with `shell=kernel` on the command line and puts the default back.
 
 ### 2026-08-04 (M6-04 — the console reads, and there is a shell)
 

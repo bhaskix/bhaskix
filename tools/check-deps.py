@@ -28,6 +28,11 @@ SKIP = {"target", "build", "limine"}
 
 # Layer index: a crate may depend only on strictly lower layers.
 LAYERS = {
+    # The interface between the kernel and the programs it runs. Below
+    # everything, because it is compiled into both sides: anything it depended
+    # on would become part of the interface too.
+    "bhaskix-abi": -2,
+
     "bhaskix-boot": 0,        # pure types, depends on nothing
     "bhaskix-arch-x86-64": 0,  # arch -> nothing
     "bhaskix-mm": 1,
@@ -38,12 +43,13 @@ LAYERS = {
     "bhaskix-drivers": 4,
     "bhaskix-boot-shim": 5,    # the binary, top of the graph
 
-    # User programs. Layer -1 because they are not in the graph at all: they
-    # run in ring 3 and reach the kernel only through system calls, so a
+    # User programs. Layer -1 because they are not in the kernel's graph at
+    # all: they run in ring 3 and reach it only through system calls, so a
     # dependency on any kernel crate would be a category error rather than a
-    # layering violation. Zero is the correct number of dependencies here, and
-    # a lower layer than everything is how this script says so.
+    # layering violation. The only thing they may depend on is the ABI, which
+    # is why that sits lower still.
     "bhaskix-user-probe": -1,
+    "bhaskix-user-shell": -1,
 }
 
 # Third-party crates permitted in the tree. Empty on purpose: Bhaskix has no

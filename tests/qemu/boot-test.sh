@@ -292,7 +292,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 1 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 2 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -317,6 +317,16 @@ if grep -qE "shell +[0-9]+ commands; [1-9][0-9]* bytes read back through the int
     pass "console input arrives by interrupt, and every shell command works"
 else
     fail "console input or the shell did not pass"
+    status=1
+fi
+
+# The services an unprivileged program is given. Checked here by calling the
+# endpoints directly, so a protocol bug is reported as one rather than as a
+# shell that prints nothing.
+if grep -qE "services +[0-9]+ entries listed, [0-9]+ bytes read by message; [0-9]+ requests, [1-9][0-9]* callers refused" "$LOG"; then
+    pass "the console and filesystem services answer, and refuse a third caller"
+else
+    fail "the services did not pass"
     status=1
 fi
 
