@@ -261,6 +261,11 @@ kernel. This defeats every software isolation guarantee we make. Therefore:
 
 **Every DMA-capable device is behind the IOMMU (VT-d / AMD-Vi), including in-nucleus drivers.**
 
+[RFC 0012](rfc/0012-iommu.md), accepted, revises the sketch below in two ways worth reading before
+implementing it: the capability does not live *inside* the window — the window **is** the object a
+capability names, as every other object in this kernel works — and `DmaBuffer` is
+[RFC 0009](rfc/0009-shared-memory.md)'s `Memory`, not a fourth kind of memory region.
+
 ```rust
 pub struct DmaWindow {
     domain: IommuDomain,      // per-device IOMMU page tables
@@ -284,6 +289,8 @@ impl DmaWindow {
 - Unmapping invalidates the IOMMU TLB before returning. A stale IOMMU entry is a live exploit.
 - If the platform has no IOMMU, Bhaskix boots in a degraded mode that is **reported in the attestation
   log and printed at boot**. We do not silently accept a broken threat model.
+  **Half of that is real:** the boot print exists and a gate asserts it. There is no attestation log —
+  it is Phase 3 — and this sentence will keep naming something that does not exist until there is.
 
 Bounce buffering for devices with addressing limits is handled in the DMA layer, not in each driver.
 

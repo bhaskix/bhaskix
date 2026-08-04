@@ -171,7 +171,11 @@ ACPI / Device Tree / PCI config space
 
 Rules:
 
-- **Default deny.** An unmatched device gets no capabilities and is left in reset. An unknown PCIe
+- **Default deny.** With [RFC 0012](rfc/0012-iommu.md) (accepted) this becomes hardware-enforced
+  rather than a property of this framework's good behaviour: a device's window starts empty, and
+  anything it reaches for that it was not given is a fault the machine reports. Until that code
+  lands, "default deny" is this framework's promise and nothing checks it.
+  An unmatched device gets no capabilities and is left in reset. An unknown PCIe
   device plugged into a running machine is inert, not opportunistically probed.
 - **The enumerator grants; the driver requests.** A driver declares what it needs in its manifest.
   The enumerator grants the intersection of what was requested and what the device actually claims

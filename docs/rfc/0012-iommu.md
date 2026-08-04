@@ -2,11 +2,36 @@
 
 | | |
 |---|---|
-| **Status** | **Draft — for discussion.** |
+| **Status** | ✅ **Accepted 2026-08-04**, including the roadmap change it asks for. Resolves **IO1**. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`iommu`, `cap`), arch (`acpi`, `pci`), mm |
 | **Milestone** | Phase 3 in [roadmap.md](../roadmap.md) — argued below that discovery and per-device domains should move to Phase 2 |
 | **Depends on** | [RFC 0009](0009-shared-memory.md) (the `Memory` object this maps), [RFC 0011](0011-irq-handler.md) (which is blocked on this), [memory.md](../memory.md) §5, [security.md](../security.md) §1 T3 and T4 |
+
+---
+
+> **Accepted 2026-08-04 by the project lead**, *including* the phase change in
+> *Motivation*: **discovery, per-device domains and strict mapping move from
+> Phase 3 to Phase 2.** Interrupt remapping and nested translation stay in
+> Phase 3. `roadmap.md` is updated accordingly.
+>
+> **Acceptance decides a design; it does not deliver a mitigation.** `security.md`
+> §1 T3 and T4 remain unfunded until the code lands, and that section now says
+> so with a pointer here rather than reading as though the work were done. The
+> boot log keeps printing the degraded threat model until step 3.
+>
+> Unresolved questions 1, 2, 5 and 6 are taken as proposed: one window per
+> device; in-nucleus drivers get their own windows and the cost is measured
+> rather than assumed; no ATS or device page faults; and a machine with no
+> IOMMU runs everything except a domain-hosted driver, reported at boot.
+> Questions 3 and 4 stay open, and 3 belongs to whichever RFC defines the
+> device object.
+>
+> **VT-d first is accepted with its cost**: an AMD machine runs degraded until
+> AMD-Vi lands. That is a real gap on hardware many contributors will have.
+>
+> The argument below is now immutable, per the document ownership table in
+> `TRACKER.md`. A change of mind is a new RFC that supersedes this one.
 
 ---
 

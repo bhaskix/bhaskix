@@ -79,7 +79,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **SM1** | Shared memory | ✅ **Accepted** 2026-08-04 | A **`Memory` object**: frames a capability names, mapped into the holder's *own* address space with rights no wider than the capability, unmapped from everywhere before a `revoke` returns. Completes RFC 0008's answer to **A3** — which promised shared memory and did not build it, so bulk data currently moves sixteen bytes per round trip. Its one architectural fork — whether `Untyped` memory exists at all — **was resolved by acceptance**: it does not. | [RFC 0009](docs/rfc/0009-shared-memory.md) |
 | **NF1** | Notifications | ✅ **Accepted** 2026-08-04 | A **`Notification` object**: one word of pending badge bits, at most one waiter, signalled without blocking and safely from an interrupt handler. Completes the other half of RFC 0008's answer to **A3**. Its immediate consequence is that `virtio-blk` can stop polling and `input.rs`'s hand-written reader becomes an instance of a general object. Interrupt *delivery* is ready; who may *claim* a line needs an `IRQHandler` object and its own RFC. | [RFC 0010](docs/rfc/0010-notifications.md) |
 | **IR1** | Interrupt authority | ✅ **Accepted** 2026-08-04 | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU (RFC 0012, draft), and the RFC says so rather than implying otherwise — **steps 1–4 are unblocked and worth doing alone.** | [RFC 0011](docs/rfc/0011-irq-handler.md) |
-| **IO1** | IOMMU | ⬜ Draft | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Asks for a roadmap change**: discovery and per-device domains move from Phase 3 to Phase 2, because they are what make a driver's bugs containable. | [RFC 0012](docs/rfc/0012-iommu.md) |
+| **IO1** | IOMMU | ✅ **Accepted** 2026-08-04 | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Roadmap changed on acceptance**: discovery, per-device domains and strict mapping moved from Phase 3 to Phase 2; interrupt remapping and nested translation stay. | [RFC 0012](docs/rfc/0012-iommu.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | *Blocks M3* |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
@@ -501,6 +501,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (RFC 0012 accepted — and a roadmap phase moved with it)
+
+- **The IOMMU design is decided, and the roadmap changed to match.** Discovery, per-device domains
+  and strict mapping move from Phase 3 to **Phase 2**; interrupt remapping, nested translation and
+  AMD-Vi stay in Phase 3. This is the first RFC in the project to reorder planned work as part of
+  its acceptance, which is why the phase change is recorded in the RFC's own status line as well as
+  here.
+- **Acceptance decides a design; it does not deliver a mitigation, and `security.md` now says so.**
+  §1's threat table has listed "IOMMU-enforced DMA windows" against **T3** and **T4** since Phase 0.
+  There is still no code. The table now carries a note saying the mitigations are *designed and not
+  yet delivered*, quoting the boot line that admits it and pointing at the gate that asserts the
+  line. **The note comes out when the code lands and not before** — a mitigation column is a claim,
+  and a claim with nothing behind it is the most expensive documentation a security project can
+  carry.
+- **Four unresolved questions taken as proposed**: one window per device; in-nucleus drivers get
+  their own windows and the cost is measured rather than assumed; no ATS or device page faults; and
+  a machine with no IOMMU runs everything except a domain-hosted driver. Questions 3 and 4 stay
+  open, and 3 belongs to whichever RFC defines the device object.
+- **VT-d first is accepted with its cost**: an AMD machine runs degraded until AMD-Vi lands, which
+  is hardware many contributors will have. The reason is testability rather than preference — QEMU
+  emulates VT-d, and a design CI cannot exercise is one that will be wrong unnoticed.
+- **RFC 0011's step 6 is no longer blocked on a decision**; it is blocked on this RFC's
+  implementation, which is a different and smaller thing to be waiting for.
+- **Three documents changed.** `memory.md` §5 records the two revisions the RFC makes to its own
+  ten-month-old sketch — the capability does not live inside the window, and `DmaBuffer` is RFC
+  0009's `Memory` — and admits that the "attestation log" half of its degraded-mode sentence names
+  something that does not exist. `driver-model.md` §5's "default deny" gains the distinction between
+  a framework's promise and a hardware guarantee. `roadmap.md` carries the split.
 
 ### 2026-08-04 (RFC 0011 accepted — interrupts get an owner)
 

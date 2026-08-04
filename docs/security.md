@@ -38,6 +38,23 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 | Denial of service by an authorised administrator | Authorisation is the boundary; we do not defend against correctly-authorised destruction | Audit log makes it *attributable*, not impossible |
 | Traffic analysis, timing, and power side channels on network paths | Out of scope for an OS kernel | — |
 
+> **T3 and T4 are designed and not yet delivered, as of Phase 1.**
+> [RFC 0012](rfc/0012-iommu.md) was accepted on 2026-08-04 and specifies both mitigations; no code
+> implements them. Until it does, **any DMA-capable device can read and write all of physical
+> memory**, and the kernel prints exactly that at boot rather than leaving this table to be believed:
+>
+> ```
+>     dma            NO IOMMU: this device can reach all of physical memory (docs/memory.md §5)
+> ```
+>
+> A boot gate asserts that line, so the day a device is brought up without the warning is a red build
+> rather than a table that quietly became true-looking. The corresponding roadmap item moved to Phase
+> 2 with the RFC's acceptance.
+>
+> This note comes out when the code lands, and not before. **A mitigation column is a claim, and a
+> claim with no implementation behind it is the most expensive kind of documentation a security
+> project can carry.**
+
 **If you find that a mitigation listed as "in scope" does not actually work, that is a security bug
 and we want the report.** See §9.
 

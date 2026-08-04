@@ -139,6 +139,10 @@ Order within the phase is flexible; dependencies are noted.
   measure twice
 - **Service framework** — the `Service` trait, both placements, and the CI job that builds both
   (this is the milestone that makes [architecture.md](architecture.md) §2 true rather than aspirational)
+- **IOMMU: discovery, per-device domains, strict mapping** — [RFC 0012](rfc/0012-iommu.md)
+  (accepted). VT-d first, because QEMU emulates it and a design CI cannot test will be wrong
+  unnoticed; an AMD machine runs degraded and says so. This is what funds `security.md` §1 T3
+  and T4, and what unblocks a driver running outside the kernel
 - **Driver framework** — PCIe/ECAM enumeration, `register_block!`, `Mmio<T>`, mock-MMIO test harness
 - **Networking** — virtio-net, Ethernet, ARP, IPv4/IPv6, UDP, TCP, sockets
 - **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing tool
@@ -166,7 +170,11 @@ own bootloader.
 - **Secure update** — immutable root, A/B slots, rollback protection
 - **RBAC** — `bhaskixd-authz` over capabilities
 - **Audit framework** — hash-chained log over the telemetry plane, remote attestation
-- **IOMMU** — full VT-d/AMD-Vi, per-device domains
+- **IOMMU, the rest of it** — interrupt remapping, nested translation for VMs, and AMD-Vi.
+  Discovery, per-device domains and strict mapping moved to Phase 2 when
+  [RFC 0012](rfc/0012-iommu.md) was accepted: they are what make a driver's mistakes
+  containable, and leaving them here left `security.md` §1 T3 and T4 unfunded for the
+  length of Phase 2
 - **Side-channel mitigations** — the documented Phase-1/2 gap in [security.md](security.md) §1
 
 **Exit:** a signed, attestable Bhaskix boots, runs containers and VMs side by side under one
