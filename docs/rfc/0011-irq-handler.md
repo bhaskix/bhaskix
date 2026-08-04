@@ -7,7 +7,7 @@
 | **Subsystem** | kernel (`cap`, `irq`, `trap`), arch (`ioapic`, `pci`) |
 | **Milestone** | Phase 2 — with the driver framework |
 | **Depends on** | [RFC 0010](0010-notifications.md) (the delivery mechanism), [driver-model.md](../driver-model.md) §2, [security.md](../security.md) §2 |
-| **Blocked by** | An IOMMU. See *The prerequisite this RFC does not remove* |
+| **Blocked by** | An IOMMU — [RFC 0012](0012-iommu.md). See *The prerequisite this RFC does not remove* |
 
 ---
 
@@ -73,6 +73,8 @@ So the honest statement of what this RFC delivers:
 That is not a reason to defer this work. The interrupt half is useful on its
 own — it is what lets `virtio-blk` stop burning a CPU — and building it now
 means the IOMMU RFC is about memory rather than about memory *and* interrupts.
+[RFC 0012](0012-iommu.md) is that RFC, and its step 7 is the moment a driver
+can first run outside the kernel.
 
 ---
 
