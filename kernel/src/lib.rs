@@ -1664,6 +1664,89 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
         domain::destroy(realm2);
     }
 
+    // Step 4: two domains, one object, and a capability crossing between them.
+    // This is the step where the feature becomes usable, so the assertions are
+    // about *sharing* rather than about mechanism: both address spaces must
+    // resolve their own virtual address to the same physical frame, and the
+    // recipient must hold rights no wider than it was given.
+    let mut shared_by_two = false;
+    let mut narrower_rights = false;
+    let mut both_unmapped = false;
+
+    if let (Ok(giver), Ok(taker)) = (
+        domain::create("giver", domain::ResourceEnvelope::new()),
+        domain::create("taker", domain::ResourceEnvelope::new()),
+    ) {
+        if let Ok(id) = shared::create(giver, 2 * FRAME_SIZE)
+            && let Ok(root) = shared::name(id)
+            && let Ok(mut mine) = vm::AddressSpace::new(hhdm)
+            && let Ok(mut theirs) = vm::AddressSpace::new(hhdm)
+        {
+            const MINE: u64 = 0x0000_0000_4000_0000;
+            const THEIRS: u64 = 0x0000_0000_5000_0000;
+
+            // The giver hands over a *read-only* capability. Derivation is
+            // monotone, so this is the ceiling on everything the taker can do
+            // with it -- there is no path from here back to write access.
+            let granted = cap::with_arena(|arena| {
+                arena
+                    .derive(root, cap::Rights::READ, 0x0000_0000_5ade_0000)
+                    .ok()
+            });
+            narrower_rights = granted.is_some_and(|slot| {
+                cap::with_arena(|arena| {
+                    arena
+                        .lookup(slot)
+                        .is_some_and(|(_, rights)| rights == cap::Rights::READ)
+                })
+            }) && domain::with(taker, |owner| {
+                granted.is_some_and(|slot| owner.cspace.install_at(0, slot).is_ok())
+            }) == Some(true);
+
+            let a = shared::map_into(
+                id,
+                &mut mine,
+                bhaskix_boot::VirtAddr(MINE),
+                bhaskix_mm::Protection::ReadWrite,
+            );
+            let b = shared::map_into(
+                id,
+                &mut theirs,
+                bhaskix_boot::VirtAddr(THEIRS),
+                bhaskix_mm::Protection::ReadOnly,
+            );
+
+            // The same frames, reached from two address spaces at two
+            // different addresses. This is what "shared" means, and it is
+            // checked through the page tables rather than inferred from the
+            // calls having returned.
+            shared_by_two = a.is_ok()
+                && b.is_ok()
+                && (0..2).all(|page| {
+                    let one = mine
+                        .translate(bhaskix_boot::VirtAddr(MINE + page * FRAME_SIZE))
+                        .map(|physical| physical & !(FRAME_SIZE - 1));
+                    let two = theirs
+                        .translate(bhaskix_boot::VirtAddr(THEIRS + page * FRAME_SIZE))
+                        .map(|physical| physical & !(FRAME_SIZE - 1));
+                    one.is_some() && one == two
+                });
+
+            // Revoking the capability takes the memory from *both*, and the
+            // derived capability with it. Mappings first, then the subtree.
+            let (removed, capabilities) = shared::revoke_capability(root);
+            both_unmapped = removed == 2
+                && capabilities >= 2
+                && mine.translate(bhaskix_boot::VirtAddr(MINE)).is_none()
+                && theirs.translate(bhaskix_boot::VirtAddr(THEIRS)).is_none();
+
+            mine.destroy();
+            theirs.destroy();
+        }
+        domain::destroy(taker);
+        domain::destroy(giver);
+    }
+
     // Destroying the domain destroys its objects: a shared region does not
     // outlive the domain that made it.
     if let Some(small) = pinched {
@@ -1701,6 +1784,15 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
             "revocation removed the pages from the page tables",
             revoked_ok,
         ),
+        ("two address spaces reach the same frames", shared_by_two),
+        (
+            "the recipient's capability is narrower than the giver's",
+            narrower_rights,
+        ),
+        (
+            "revoking the capability unmapped both, and killed the derived one",
+            both_unmapped,
+        ),
         ("a length of zero is refused", zero),
         ("a length past the bound is refused", huge),
         (
@@ -1724,8 +1816,9 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
 
     if ok {
         println!(
-            "    memory objects {created} created, {destroyed} destroyed, none live; {} mappings \
-             revoked out of their page tables; no frame lost ({before})",
+            "    memory objects {created} created, {destroyed} destroyed, none live; two domains \
+             shared one object; {} mappings revoked out of their page tables; no frame lost \
+             ({before})",
             shared::revocations()
         );
     }

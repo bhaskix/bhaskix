@@ -436,6 +436,68 @@ pub fn revoke(id: MemoryId) -> usize {
     removed
 }
 
+/// Names a `Memory` object with a capability, so it can be granted.
+///
+/// Returns a root capability with every right, from which the owner derives
+/// what it hands out. Sharing happens by **handing over a capability**, which
+/// is what makes it capability-shaped rather than an address someone was told:
+/// the recipient maps it into its own address space, with rights no wider than
+/// it was given, because derivation is monotone (`security.md` §2 rule 2).
+///
+/// # Errors
+///
+/// [`MemoryError::Gone`] if the object has been destroyed, or
+/// [`MemoryError::Exhausted`] if the capability arena is full.
+pub fn name(id: MemoryId) -> Result<crate::cap::SlotRef, MemoryError> {
+    if !live(id) {
+        return Err(MemoryError::Gone);
+    }
+    // The identity carries the generation, so a capability outliving its
+    // object names nothing rather than naming whatever took the slot.
+    let identity = u64::from(id.index) | (u64::from(id.generation) << 32);
+    crate::cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                crate::cap::ObjectRef::new(crate::cap::ObjectKind::Memory, identity),
+                crate::cap::Rights::ALL,
+                0,
+            )
+            .map_err(|_| MemoryError::Exhausted)
+    })
+}
+
+/// The object a `Memory` capability names, if it is still there.
+#[must_use]
+pub fn from_identity(identity: u64) -> Option<MemoryId> {
+    let id = MemoryId {
+        index: identity as u32,
+        generation: (identity >> 32) as u32,
+    };
+    live(id).then_some(id)
+}
+
+/// Revokes a `Memory` capability: its mappings first, then its subtree.
+///
+/// **The order is the design.** Doing the capabilities first would leave a
+/// window in which the capability is dead and the memory is still mapped —
+/// which is precisely the delay fuse `security.md` §2 rule 3 exists to forbid.
+/// So the pages come out of every address space that had them, and only then
+/// does the derivation tree go.
+///
+/// Returns the mappings removed and the capabilities destroyed.
+pub fn revoke_capability(slot: crate::cap::SlotRef) -> (usize, usize) {
+    let object = crate::cap::with_arena(|arena| {
+        arena.lookup(slot).and_then(|(object, _)| {
+            (object.kind == crate::cap::ObjectKind::Memory).then_some(object.id)
+        })
+    });
+
+    let mappings = object.and_then(from_identity).map_or(0, revoke);
+
+    let capabilities = crate::cap::with_arena(|arena| arena.revoke_unchecked(slot));
+    (mappings, capabilities)
+}
+
 /// How many address spaces have this object mapped.
 #[must_use]
 pub fn mapping_count(id: MemoryId) -> usize {
