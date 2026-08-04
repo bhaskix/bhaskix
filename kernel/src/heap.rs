@@ -119,5 +119,10 @@ pub fn free_frames() -> u64 {
 /// that test is the project's most trusted gate.
 #[must_use]
 pub fn available_frames() -> u64 {
-    free_frames() + crate::frames::held()
+    // Both halves under one hold of the lock, so a refill moving frames from
+    // the allocator into a reserve cannot land between them. `refill` does its
+    // whole move under this same lock for exactly that reason; reading the two
+    // numbers separately made the frame-leak gate report a sixteen-frame gain
+    // that had not happened.
+    with(|heap| heap.pmm().free_frames() + crate::frames::held()).unwrap_or(0)
 }

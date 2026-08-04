@@ -43,9 +43,24 @@ pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 # the image, so testing it means building one. The default image is put back
 # afterwards -- a test that left a non-default image behind would make every
 # later test in the run answer a question nobody asked.
-if [[ "$MODE" == "kernel" ]]; then
-    make -C "$REPO_ROOT" iso CMDLINE="shell=kernel" >/dev/null 2>&1 || {
-        fail "could not build an image with shell=kernel"
+case "$MODE" in
+kernel)
+    cmdline="shell=kernel"
+    ;;
+disk)
+    # The whole point of this mode: the filesystem is read off the block
+    # device, so every file the shell touches -- including the shell itself,
+    # which the kernel loaded before ring 3 existed -- came through the driver.
+    cmdline="root=disk"
+    ;;
+*)
+    cmdline=""
+    ;;
+esac
+
+if [[ -n "$cmdline" ]]; then
+    make -C "$REPO_ROOT" iso CMDLINE="$cmdline" >/dev/null 2>&1 || {
+        fail "could not build an image with $cmdline"
         exit 1
     }
     restore_image() { make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true; }
@@ -61,7 +76,7 @@ fi
 # all would pass a test that only looked for command output it recognised.
 if [[ "$MODE" == "kernel" ]]; then
     started="a shell. 'help' lists"
-    commands=$'help\r'$'ls /\r'$'cat etc/hostname\r'$'elf bin/probe\r'$'nosuchcommand\r'
+    commands=$'help\r'$'ls /\r'$'cat etc/hostname\r'$'elf bin/probe\r'$'disk\r'$'nosuchcommand\r'
 else
     started="a user-mode shell. 'help' lists"
     # `caps` is the one that matters: it asks the kernel about a slot this
@@ -83,6 +98,8 @@ echo "booting and typing at it, up to ${TIMEOUT}s..."
 
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -M q35 -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
+    -drive "file=$REPO_ROOT/build/initrd.tar,format=raw,if=none,id=disk0" \
+    -device virtio-blk-pci,drive=disk0 \
     -no-reboot -cdrom "$ISO" -boot d -serial stdio -display none \
     < "$FIFO" > "$LOG" 2>&1 &
 qemu=$!
@@ -164,6 +181,17 @@ else
         "cat read a file through IPC:^bhaskix.?$"
         "an unknown command was refused:nosuchcommand: not a command"
     )
+    if [[ "$MODE" == "disk" ]]; then
+        # Asserted against the whole log, not the session: this one is a line
+        # the kernel printed before the shell existed, and it is what makes
+        # every check above a statement about the disk.
+        if grep -qE "root +[0-9]+ KiB read from the block device" "$LOG"; then
+            pass "the filesystem was read off the block device"
+        else
+            fail "the root filesystem did not come from the disk"
+            status=1
+        fi
+    fi
 fi
 
 

@@ -62,4 +62,11 @@ workspace = true
 # next read is addressed". The ACPI walk adds the rest: each table is borrowed
 # from a physical address the firmware named, and each borrow is a separate
 # obligation stated where the length it depends on was checked.
-unsafe_budget = 900
+# 980 at M6-06, PCI. Configuration space is reached by writing an address
+# port and then reading a data port, so every register access is a pair of
+# port operations that must happen in that order and must not be elided --
+# the same shape as the I/O APIC's window, and just as impossible to express
+# safely. The count is dominated by one `unsafe` block per accessor, which is
+# deliberate: each states which port pair it drives and why nothing else is
+# driving it concurrently.
+unsafe_budget = 980

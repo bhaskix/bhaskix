@@ -42,7 +42,10 @@ bhaskix/
 ├── sched/                  runqueues, scheduling classes, balancing, policy hook
 ├── fs/                     VFS and filesystems (a service)
 ├── net/                    network stack (a service)
-├── drivers/                device drivers (services), one module per device
+├── drivers/                device drivers (services), one module per device.
+│                           virtio-blk is in kernel/ rather than here, which is
+│                           the placement driver-model.md §6 gives it: small,
+│                           performance-critical drivers default to `nucleus`.
 │
 ├── abi/                    the interface between the kernel and the programs
 │                           it runs: syscall numbers, the message layout, the

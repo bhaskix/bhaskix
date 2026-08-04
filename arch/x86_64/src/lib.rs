@@ -37,6 +37,7 @@ pub mod idt;
 pub mod ioapic;
 pub mod msr;
 pub mod paging;
+pub mod pci;
 pub mod percpu;
 pub mod pic;
 pub mod port;

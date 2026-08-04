@@ -102,6 +102,7 @@ pub fn run(line: &[u8]) -> Outcome {
         b"ps" => threads(),
         b"uptime" => uptime(),
         b"input" => input_statistics(),
+        b"disk" => disk(),
         unknown => {
             println!("{}: not a command. Try 'help'.", Text(unknown));
             Outcome::Unknown
@@ -165,6 +166,7 @@ fn help() -> Outcome {
     println!("    ps                threads, by cpu");
     println!("    uptime            time since the kernel started");
     println!("    input             console input statistics");
+    println!("    disk              the block device, if there is one");
     println!();
     println!("  this shell is the kernel: it holds no capability and asks");
     println!("  permission for nothing. m6-05's user-mode shell will.");
@@ -329,6 +331,45 @@ fn uptime() -> Outcome {
         ),
     }
     Outcome::Ran
+}
+
+fn disk() -> Outcome {
+    let Some((bus, device, function)) = crate::virtio::location() else {
+        println!("  no block device");
+        return Outcome::Ran;
+    };
+    let capacity = crate::virtio::capacity();
+    let (completed, timeouts) = crate::virtio::statistics();
+    println!(
+        "  virtio-blk at {bus:02x}:{device:02x}.{function}, {capacity} sectors ({} KiB)",
+        capacity * crate::virtio::SECTOR / 1024
+    );
+    println!(
+        "  status {:#04x}, {completed} requests completed, {timeouts} timed out",
+        crate::virtio::status()
+    );
+
+    // Read the first sector and say what it holds. A driver that is only ever
+    // exercised at boot is one whose failures are only ever seen at boot.
+    let mut sector = [0u8; 512];
+    match crate::virtio::read(0, &mut sector) {
+        Ok(()) => {
+            let name = ustar::Archive::new(&sector)
+                .next()
+                .map(|entry| entry.name().len())
+                .unwrap_or(0);
+            if name > 0 {
+                println!("  sector 0 is a ustar header");
+            } else {
+                println!("  sector 0 read, and is not a ustar header");
+            }
+            Outcome::Ran
+        }
+        Err(error) => {
+            println!("  reading sector 0 failed: {error:?}");
+            Outcome::Failed
+        }
+    }
 }
 
 fn input_statistics() -> Outcome {

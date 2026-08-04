@@ -68,7 +68,12 @@ pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 
 [[ -f "$ISO" ]] || { fail "$ISO not found -- run 'make iso' first"; exit 1; }
 
+# The ramdisk image is attached as a disk as well as loaded as a module, so
+# the block driver's test knows what must come back.
+DISK="$REPO_ROOT/build/initrd.tar"
+
 QEMU_ARGS=(-M q35 -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
+           -drive "file=$DISK,format=raw,if=none,id=disk0" -device virtio-blk-pci,drive=disk0
            -serial "file:$LOG" -display none)
 
 if [[ "$MODE" == "uefi" ]]; then
@@ -327,6 +332,17 @@ if grep -qE "services +[0-9]+ entries listed, [0-9]+ bytes read by message; [0-9
     pass "the console and filesystem services answer, and refuse a third caller"
 else
     fail "the services did not pass"
+    status=1
+fi
+
+# The first device Bhaskix finds rather than assumes: enumerated on the PCI
+# bus, configured through its own capability list, driven by DMA. The sector
+# count is the ramdisk image's, which is what makes "it read something" and
+# "it read the right thing" different assertions.
+if grep -qE "virtio-blk +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [1-9][0-9]* sectors .*status 0x0f" "$LOG"; then
+    pass "virtio-blk found on the bus, read by DMA, refuses what it should"
+else
+    fail "the block device did not pass"
     status=1
 fi
 

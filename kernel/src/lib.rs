@@ -41,6 +41,7 @@ pub mod input;
 pub mod ipc;
 pub mod irq;
 pub mod memory;
+pub mod mmio;
 pub mod panic;
 pub mod sched;
 pub mod service;
@@ -54,6 +55,7 @@ pub mod tlb;
 pub mod trap;
 pub mod ustar;
 pub mod vfs;
+pub mod virtio;
 pub mod vm;
 pub mod wait;
 
@@ -357,16 +359,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !initrd_self_test(handoff) {
         println!("    initrd         FAILED");
     }
-    // The ramdisk becomes the root filesystem. Done here, on the bootstrap
-    // CPU, while the only other CPUs are idling in the scheduler and nothing
-    // has been spawned that could look at a filesystem -- which is what the
-    // `unsafe` on `mount` asks for.
-    if let Some(bytes) = handoff.initrd {
-        // SAFETY: called once, on the bootstrap CPU, before any thread that
-        // could reach the VFS exists, with a slice that borrows the module the
-        // bootloader loaded and never reclaims.
-        unsafe { vfs::mount(bytes) };
+    if !block_self_test(handoff) {
+        println!("    virtio-blk     FAILED");
     }
+    mount_root(handoff);
     if !vfs_self_test(handoff) {
         println!("    vfs            FAILED");
     }
@@ -1445,6 +1441,167 @@ extern "C" fn user_shell_entry(hhdm_base: u64) -> ! {
     unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp) }
 }
 
+/// Largest filesystem image this will read off a disk.
+///
+/// Four megabytes. The image is read into the heap in one piece, so the bound
+/// is what stops a device reporting an implausible capacity from turning into
+/// an allocation the size of whatever it claimed. A real filesystem reads
+/// blocks as it needs them and has no such number; this one is a whole image
+/// held in memory, and says so.
+const MAX_ROOT_IMAGE: u64 = 4 * 1024 * 1024;
+
+/// Chooses where the root filesystem comes from, and mounts it.
+///
+/// The ramdisk by default. `root=disk` takes it from the block device instead,
+/// which is the same bytes by a completely different route: enumerated on the
+/// PCI bus, read by DMA, assembled in the heap. Everything above the VFS —
+/// including the user-mode shell, which is a file — then comes from the disk
+/// without knowing it.
+///
+/// Falls back to the ramdisk if the disk cannot be read, and says so. A
+/// machine that booted with an empty filesystem because a drive was missing
+/// would be a machine with no shell and no explanation.
+fn mount_root(handoff: &Handoff) {
+    let wants_disk = handoff
+        .cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == "root=disk");
+
+    if wants_disk {
+        match virtio::read_all(MAX_ROOT_IMAGE) {
+            Ok(image) => {
+                let bytes = alloc::vec::Vec::leak(image);
+                println!(
+                    "    root           {} KiB read from the block device",
+                    bytes.len() / 1024
+                );
+                // SAFETY: called once, on the bootstrap CPU, before any thread
+                // that could reach the VFS exists. The slice is leaked, so it
+                // outlives everything that will borrow it.
+                unsafe { vfs::mount(bytes) };
+                return;
+            }
+            Err(error) => {
+                println!(
+                    "    root           the disk could not be read ({error:?}); using the ramdisk"
+                );
+            }
+        }
+    }
+
+    // The ramdisk. Mounted on the bootstrap CPU while the only other CPUs are
+    // idling in the scheduler and nothing has been spawned that could look at
+    // a filesystem -- which is what the `unsafe` on `mount` asks for.
+    if let Some(bytes) = handoff.initrd {
+        // SAFETY: as above, with a slice that borrows the module the
+        // bootloader loaded and never reclaims.
+        unsafe { vfs::mount(bytes) };
+    }
+}
+
+/// Brings up the block device and reads from it.
+///
+/// The disk is the initial ramdisk's own image, attached as a drive. That is
+/// not a convenience: it means the test knows exactly what the first sectors
+/// must contain, and can say so — a driver that read *something* and reported
+/// success would pass a test that only checked for an error code.
+///
+/// A machine with no disk is not a failure. The kernel boots without one and
+/// says there was none.
+fn block_self_test(handoff: &Handoff) -> bool {
+    let capacity = match virtio::init(handoff.hhdm_base.as_u64()) {
+        Ok(capacity) => capacity,
+        Err(virtio::BlockError::NotFound) => {
+            println!("    virtio-blk     no block device on the bus");
+            return true;
+        }
+        Err(error) => {
+            println!("    virtio-blk     FAILED to bring up: {error:?}");
+            return false;
+        }
+    };
+
+    // The disk is the ramdisk's own image, and the kernel already has that
+    // image as a module. So every sector read here has a known answer, and the
+    // test is not "did a read succeed" but "is this the same data by a
+    // completely different route" -- bootloader module against PCI, DMA and a
+    // virtqueue.
+    let expected = handoff.initrd.unwrap_or(&[]);
+
+    let mut first = [0u8; 512];
+    let read_first = virtio::read(0, &mut first);
+    let first_matches = expected.len() >= 512 && first == expected[..512];
+
+    // From further in, and this is the check that matters: a driver that
+    // ignored the sector number entirely would pass every test that only ever
+    // read sector zero, and this kernel would then read one sector of a
+    // filesystem over and over without noticing.
+    const AT: usize = 4;
+    let mut later = [0u8; 2048];
+    let read_later = virtio::read(AT as u64, &mut later);
+    let later_matches =
+        expected.len() >= AT * 512 + 2048 && later == expected[AT * 512..AT * 512 + 2048];
+
+    // Reading past the end must be refused rather than clamped: a filesystem
+    // that asked for a sector beyond the device and got zeros would read a
+    // hole where the error should have been.
+    let past_end = virtio::read(capacity, &mut first[..512]);
+    // And a length that is not a whole number of sectors.
+    let ragged = virtio::read(0, &mut later[..100]);
+
+    let (completed, timeouts) = virtio::statistics();
+    let checks = [
+        ("the first sector read", read_first.is_ok()),
+        (
+            "and is byte for byte what the bootloader loaded",
+            first_matches,
+        ),
+        ("four sectors read from further in", read_later.is_ok()),
+        (
+            "and those are the right four, not sector zero again",
+            later_matches,
+        ),
+        (
+            "a read past the end is refused",
+            past_end == Err(virtio::BlockError::OutOfRange),
+        ),
+        (
+            "a read that is not a whole number of sectors is refused",
+            ragged == Err(virtio::BlockError::TooLarge),
+        ),
+        ("the device says it is running", virtio::status() == 0x0f),
+        (
+            // Both bits are what makes DMA possible at all. Asserted as state
+            // rather than as an action: firmware sets them too, so this cannot
+            // tell whose write it was -- only that the requirement holds.
+            "it may reach memory and act as a bus master",
+            virtio::command() & 0b110 == 0b110,
+        ),
+        ("nothing timed out", timeouts == 0),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!(
+                "    virtio-blk     FAILED: {name} ({completed} completed, {timeouts} timed out)"
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        let (bus, device, function) = virtio::location().unwrap_or((0, 0, 0));
+        println!(
+            "    virtio-blk     {bus:02x}:{device:02x}.{function} {capacity} sectors \
+             ({} KiB), {completed} requests, status {:#04x}",
+            capacity * virtio::SECTOR / 1024,
+            virtio::status()
+        );
+    }
+    ok
+}
+
 /// Brings up device interrupts and points the console's input at the UART.
 ///
 /// Returns whether input works. Everything here is allowed to fail: a machine
@@ -1577,6 +1734,7 @@ fn shell_self_test() -> bool {
         (shell::run(b"ps"), shell::Outcome::Ran),
         (shell::run(b"uptime"), shell::Outcome::Ran),
         (shell::run(b"input"), shell::Outcome::Ran),
+        (shell::run(b"disk"), shell::Outcome::Ran),
         (shell::run(b"nosuchcommand"), shell::Outcome::Unknown),
     ];
     let commands = outcomes.len();

@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-04 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 5/6 — boots to a user-mode shell holding two capabilities · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built — one exit criterion met by substitute · CI green |
 
 ### Division of responsibility between documents
 
@@ -123,7 +123,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-03 | ELF64 loader, with a fuzz target | ✅ `DONE` | Ring 3 now runs `bin/probe`, a separately built ET_EXEC loaded out of the initrd, mapped at the addresses and with the permissions **its own headers** name. **Negative-tested**: dropping one segment fails the gate; a deliberately reintroduced wrap bug is caught by the mutation harness at seed 424. |
 | M6-04 | Kernel shell | ✅ `DONE` | The console reads: ACPI walk → I/O APIC → IRQ 4 → a vector → a lock-free ring → a blocking read. Nine read-only commands, run by the boot self-test through the same function the prompt calls. **Negative-tested**: draining one byte per interrupt fails the boot gate; removing the wake-up passes it and fails `shell-test.sh`, which is why that test exists. |
 | M6-05 | User-mode shell over the syscall interface | ✅ `DONE` | The machine boots to a shell in ring 3 holding two capabilities and nothing else: console and filesystem, both reached by IPC, sixteen bytes per round trip. `shell=kernel` selects the ring 0 one. **Negative-tested**: withholding the filesystem capability makes `caps` report it, both filesystem commands fail, and everything else keeps working. |
-| M6-06 | `virtio-blk` driver | ⬜ `TODO` | Needs PCIe enumeration, which is Phase 2's driver framework. |
+| M6-06 | `virtio-blk` driver | ✅ `DONE` | PCI enumeration, modern virtio 1.0 discovered through the device's own capability list, a split virtqueue driven by DMA. `root=disk` mounts the filesystem off the device, so the user-mode shell is a file the driver read. **Negative-tested**: a driver that ignored the sector number reads sector zero four times and fails the gate, because the disk is the ramdisk image and the kernel has the same bytes from the bootloader to compare against. |
 
 ### Honest notes on M6 so far
 
@@ -161,6 +161,42 @@ fairness within 2% for two equal-weight workloads.
   and every choice is weaker than one segment asked for or stronger than the other did. A file
   produced by a linker Bhaskix does not control could hit this and be rejected for a reason its
   author will find surprising.
+
+- **The frame-leak gate could report a leak that had not happened, and did.** `available_frames()`
+  read the allocator's free count and the per-CPU reserves as two separate operations, while
+  `frames::refill` moved frames between exactly those two places in two separate steps. A frame in
+  between belonged to neither, and sixteen move per refill — so the composite read could be wrong by
+  a whole reserve in either direction. It showed up once in about eight boots as a phantom
+  sixteen-frame *gain*. Both sides are now single operations under one hold of the allocator lock.
+  This mattered more than its size: the frame-leak check is the gate this project trusts most, and a
+  gate that is occasionally wrong is worse than one that is absent, because it is believed.
+
+- **The block driver waits by spinning.** A request is submitted and the used ring polled until it
+  moves or two seconds pass. Interrupt-driven completion needs MSI-X — which is the right answer and
+  avoids the other problem entirely: routing a device's legacy interrupt needs the ACPI `_PRT`,
+  which is AML, which needs an interpreter this kernel does not have and should think hard about
+  before acquiring. Under an emulator a read completes in tens of microseconds, so the spin is
+  short; on real hardware with a real disk it would be a CPU held for milliseconds.
+
+- **One request at a time, and reads only.** The ring holds eight descriptors and the driver uses
+  three of them, once. Writes are the same descriptor chain with a different request type and no
+  filesystem that would use them. Both are shapes to grow into rather than limitations that were
+  discovered.
+
+- **The whole filesystem image is read into memory at boot.** `root=disk` reads up to four megabytes
+  into the heap and mounts that. A real filesystem reads blocks as it needs them; this one is an
+  image held in memory, and the bound exists so that a device reporting an implausible capacity is a
+  refusal rather than an allocation of whatever it claimed.
+
+- **`pci::enable` cannot be shown to matter on the machines this is tested on.** Firmware has
+  already set memory access and bus mastering, so removing the call changes nothing — the negative
+  test for it passes, which is the honest result rather than a green tick. The self-test asserts the
+  *state* instead, which is the actual requirement; it just cannot say whose write produced it.
+
+- **There is no IOMMU, so a wrong descriptor address is a device writing anywhere.** Every address
+  in a virtqueue is physical and the device dereferences it without asking. That is the one
+  operation in this kernel no page table can contain, and the reason every buffer here comes from
+  the frame allocator rather than from a pointer that happened to be at hand.
 
 - **The user-mode shell moves sixteen bytes per round trip.** A message is four registers
   ([RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md)); two of them carry bytes. Printing a line of
@@ -456,6 +492,64 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M6 — every task built, and one exit criterion that is not met)
+
+**M6's tasks are all done. Its exit criteria are not all met, and the gap is worth stating in one
+place rather than leaving to be discovered.**
+
+| Criterion | Status |
+|---|---|
+| Boot to a shell | ✅ A user-mode shell in ring 3, holding two capabilities |
+| `ls` a real filesystem | ✅ Through IPC, from the ramdisk or from the block device |
+| Load and run an ELF binary from disk | ✅ `root=disk` makes "from disk" literal |
+| **The ELF loader survives 24 hours of fuzzing** | ❌ **Not met.** 20 million mutated inputs per parser, clean. See below |
+
+The fuzzing criterion is met by a substitute, not by the thing it asks for.
+[docs/coding-style.md](docs/coding-style.md) §8 records why coverage-guided fuzzing is not in this
+tree — it needs a nightly toolchain for sanitizer support — and what runs instead: a seeded mutation
+harness, on stable, in CI, on every build. M6-03 also measured how much weaker that is, and the
+answer was worse than expected: a deliberately reintroduced wrap bug survived half a million uniform
+mutations because it needed an offset within sixteen of `u64::MAX`.
+
+The harness now seeds those edges deliberately and finds that bug in the first few hundred cases.
+A soak at M6-06 put **20 million mutated inputs through each of the three parsers** — `ustar`,
+`elf`, and the ACPI table walker — with no panic, no hang, and no accepted image that violated an
+invariant the mapper relies on. That is a real number and it is still not twenty-four hours of
+coverage-guided fuzzing. **Phase
+1 is therefore reported as "every task built" rather than "complete".** Closing this needs either a
+nightly toolchain entry in `docs/nightly-features.md` with a justification, or an external fuzzing
+harness run outside CI — a decision, not a task.
+
+### 2026-08-04 (M6-06 — the first device Bhaskix finds rather than assumes)
+
+- **A `virtio-blk` driver, and with it PCI.** Everything driven before this was the machine itself:
+  timers, interrupt controllers, a UART that has been at port 0x3f8 since 1981. This device is
+  *found* — enumerated on a bus, identified by what it says it is, configured through registers
+  whose addresses come out of its own capability list, and driven through rings it reads by DMA.
+- **`root=disk` mounts the filesystem off the device.** The same bytes by a completely different
+  route: bootloader module in one case, PCI and a virtqueue in the other. Everything above the VFS
+  — including the user-mode shell, which is a file — then comes from the disk without knowing it.
+  M6's exit criterion asked to "load and run an ELF binary from disk"; this is the version where
+  "from disk" is literal.
+- **The disk is the ramdisk's own image, and that is what makes the test a test.** The kernel
+  already has those bytes from the bootloader, so every sector read has a known answer. A driver
+  that ignored the sector number was written on purpose: it reads sector zero four times, and fails
+  on the second comparison rather than on a missing error code.
+- **Modern virtio rather than legacy.** Legacy is a handful of I/O ports at a fixed layout and about
+  a hundred lines less work; it is also a device model that new hardware does not implement and that
+  QEMU disables by default on a PCI Express bus. Both device identities are accepted — a modern one
+  says what it is in its device id, a transitional one in its subsystem id — because the two
+  defaults are one QEMU flag apart.
+- **Configuration mechanism 1, not ECAM.** Two I/O ports every PC has had since 1993, needing no
+  ACPI table and no fallback for firmware that omits one. What it cannot reach is extended
+  configuration space, which nothing needs yet; when something does, the address is built in one
+  function and every caller keeps working.
+- **A capability list is a linked list inside a device's configuration space**, and this one is
+  walked with a bound. A device with a cycle in it — broken, or hostile — would otherwise be walked
+  for ever during boot with interrupts disabled.
+- **`make test-shell` now runs three configurations**: the user-mode shell, the ring 0 shell, and
+  the user-mode shell with its filesystem read off the disk.
 
 ### 2026-08-04 (M6-05 — a shell that has to ask)
 

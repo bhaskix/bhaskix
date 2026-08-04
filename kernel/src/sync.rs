@@ -109,8 +109,15 @@ pub enum Rank {
     WaitQueue = 8,
     /// `sched::QUEUES` — one runqueue per CPU.
     SchedRunqueue = 9,
+    /// `virtio::DEVICE` — the one block device.
+    ///
+    /// Inside the scheduler's queues because nothing here wakes a thread: the
+    /// driver waits for its device by spinning on a ring the device writes,
+    /// not by blocking. Outside the console, because a driver reports what it
+    /// found while holding itself.
+    Block = 10,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
-    Console = 10,
+    Console = 11,
 }
 
 impl Rank {
@@ -145,6 +152,7 @@ impl Rank {
             Self::Endpoints => "ipc::TABLE",
             Self::WaitQueue => "wait::WaitQueue",
             Self::SchedRunqueue => "sched::QUEUES",
+            Self::Block => "virtio::DEVICE",
             Self::Console => "console::CONSOLE",
         }
     }

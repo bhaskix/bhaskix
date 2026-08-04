@@ -244,37 +244,53 @@ pub fn refill() {
         return;
     }
 
-    // Allocated outside the reserve's masked section: taking frames from the
-    // buddy allocator is not something to do with interrupts off for longer
-    // than necessary, and each frame is handed over individually.
+    // Allocation and hand-over happen under *one* hold of the allocator lock,
+    // and that is the whole design of this loop rather than a detail of it.
+    //
+    // A frame between the allocator and a reserve belongs to neither: the
+    // allocator's free count has already dropped and the reserve's count has
+    // not yet risen. Anything counting free frames in that window sees one
+    // fewer than exist, and anything counting them in the other order sees one
+    // more. Sixteen frames move per refill, so the error is up to a whole
+    // reserve -- and the frame-leak gate, which is this project's most trusted
+    // check, reported exactly that: a phantom sixteen-frame gain, once in
+    // about eight boots.
+    //
+    // Holding the lock across both steps makes the move invisible to anyone
+    // who reads both numbers under the same lock. It costs the lock being held
+    // for one reserve store, with interrupts already off in that section.
     for _ in 0..wanted {
-        let frame = heap::try_with(|heap| {
-            heap.pmm_mut()
-                .allocate(0, Zone::Normal)
-                .ok()
-                .map(|pfn| u64::from(pfn) * FRAME_SIZE)
-        });
-        match frame {
-            Some(Some(frame)) => {
-                REFILLED.fetch_add(1, Ordering::Relaxed);
-                let stored = with_reserve(|reserve| {
-                    if reserve.count < RESERVE_FRAMES {
-                        reserve.frames[reserve.count] = frame;
-                        reserve.count += 1;
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false);
-                if !stored {
-                    let _ = heap::try_with(|heap| {
-                        let _ = heap.pmm_mut().free((frame / FRAME_SIZE) as u32, 0);
-                    });
-                    return;
+        let stored = heap::try_with(|heap| {
+            let Ok(pfn) = heap.pmm_mut().allocate(0, Zone::Normal) else {
+                return false;
+            };
+            let frame = u64::from(pfn) * FRAME_SIZE;
+
+            let stored = with_reserve(|reserve| {
+                if reserve.count < RESERVE_FRAMES {
+                    reserve.frames[reserve.count] = frame;
+                    reserve.count += 1;
+                    true
+                } else {
+                    false
                 }
+            })
+            .unwrap_or(false);
+
+            if !stored {
+                // Straight back, under the same hold, so the frame is never
+                // unaccounted for.
+                let _ = heap.pmm_mut().free(pfn, 0);
             }
-            // Allocator held, or out of memory. Either way, later.
+            stored
+        });
+
+        match stored {
+            Some(true) => {
+                REFILLED.fetch_add(1, Ordering::Relaxed);
+            }
+            // Allocator held, out of memory, or the reserve filled up. Either
+            // way, later.
             _ => return,
         }
     }

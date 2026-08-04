@@ -115,6 +115,8 @@ for fault in "${FAULTS[@]}"; do
   qemu_log="$(mktemp)"
   run_until "$log" "${EXPECT[$fault]}" "$TIMEOUT" \
       -M q35 -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom build/bhaskix.iso -boot d \
+      -drive file=build/initrd.tar,format=raw,if=none,id=disk0 \
+      -device virtio-blk-pci,drive=disk0 \
       -serial "file:$log" -display none \
       -d cpu_reset -D "$qemu_log"
 

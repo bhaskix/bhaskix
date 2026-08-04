@@ -66,7 +66,14 @@ CMDLINE      ?=
 # The stamp is rewritten only when the value actually changes, so this forces a
 # rebuild exactly when it should and never otherwise.
 CMDLINE_STAMP := build/.cmdline
-QEMU_COMMON  := -M q35 -cpu $(QEMU_CPU) -m $(QEMU_MEM) -no-reboot -no-shutdown
+# The initial ramdisk, attached as a disk as well as loaded as a module. The
+# same bytes in both places is deliberate: a test that reads the disk knows
+# exactly what must come back, because the kernel already parsed it from
+# somewhere else.
+QEMU_DISK    := -drive file=$(INITRD),format=raw,if=none,id=disk0 \
+                -device virtio-blk-pci,drive=disk0
+
+QEMU_COMMON  := -M q35 -cpu $(QEMU_CPU) -m $(QEMU_MEM) -no-reboot -no-shutdown $(QEMU_DISK)
 
 # OVMF ships as a CODE/VARS pair that must be size-matched -- a 4 MB CODE with
 # a 2 MB VARS is rejected by the firmware, not by QEMU. Selected as a pair for
@@ -201,6 +208,7 @@ test-boot-uefi: $(ISO)
 test-shell: $(ISO)
 	tests/qemu/shell-test.sh user
 	tests/qemu/shell-test.sh kernel
+	tests/qemu/shell-test.sh disk
 
 # Rebuilds the image per fault, so it must not run in parallel with the boot
 # tests -- hence its own target rather than a boot-test flag.

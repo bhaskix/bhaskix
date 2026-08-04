@@ -25,11 +25,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bhaskix_arch::acpi;
 use bhaskix_arch::ioapic::IoApic;
-use bhaskix_arch::paging;
-use bhaskix_boot::{PhysAddr, VirtAddr};
+use bhaskix_boot::PhysAddr;
 use bhaskix_mm::FRAME_SIZE;
-
-use crate::heap;
 
 /// Makes `length` bytes at `physical` readable through the direct map.
 ///
@@ -37,52 +34,8 @@ use crate::heap;
 /// BIOS machine sits in the legacy area below one megabyte, which the memory
 /// map calls reserved — so the first version of this code faulted on it during
 /// boot, at an address that looked entirely plausible.
-///
-/// Pages already present are left alone; the rest are mapped uncached and
-/// non-executable. Uncached is not a performance decision: firmware tables are
-/// read once, and a mapping that matches how the firmware itself describes the
-/// region is one less thing that can differ between machines.
 fn ensure_mapped(physical: u64, length: usize, hhdm: u64) -> bool {
-    if length == 0 {
-        return true;
-    }
-    let Some(last) = physical.checked_add(length as u64 - 1) else {
-        return false;
-    };
-    let first_page = physical & !(FRAME_SIZE - 1);
-    let last_page = last & !(FRAME_SIZE - 1);
-
-    let mut page = first_page;
-    loop {
-        let virtual_address = hhdm + page;
-        // SAFETY: reading the active page table's entries has no side effects.
-        let present = unsafe {
-            paging::translate(paging::active_page_table(), virtual_address, hhdm).is_some()
-        };
-        if !present {
-            let mapped = heap::with(|heap| {
-                let pmm = heap.pmm_mut();
-                // SAFETY: bootstrap CPU during boot, mapping firmware memory
-                // read-only into the direct map at its usual address.
-                unsafe {
-                    paging::map_device_page(virtual_address, page, hhdm, &mut || {
-                        pmm.allocate(0, bhaskix_mm::Zone::Normal)
-                            .ok()
-                            .map(|pfn| u64::from(pfn) * FRAME_SIZE)
-                    })
-                }
-            });
-            match mapped {
-                Some(Ok(())) => {}
-                _ => return false,
-            }
-        }
-
-        if page == last_page {
-            return true;
-        }
-        page += FRAME_SIZE;
-    }
+    crate::mmio::map(physical, length as u64, hhdm).is_some()
 }
 
 /// Virtual address of the chip's register window, or zero.
@@ -151,27 +104,10 @@ pub unsafe fn init(rsdp: Option<PhysAddr>, hhdm: u64) -> Result<Report, IrqError
     let entry = madt.io_apic().ok_or(IrqError::NoIoApic)?;
 
     let physical = u64::from(entry.address);
-    let window = PhysAddr(physical).to_hhdm(VirtAddr(hhdm)).as_u64();
 
-    // The direct map already covers this address as ordinary memory. Mapping
-    // it again with device attributes is not redundant: a cached mapping of a
-    // register window means a write can sit in a cache line and a read can be
-    // answered from one, so a redirection entry would be programmed into the
-    // cache and the chip would never see it.
-    let mapped = heap::with(|heap| {
-        let pmm = heap.pmm_mut();
-        // SAFETY: bootstrap CPU during boot, mapping a firmware-reported
-        // register page into the active address space.
-        unsafe {
-            paging::map_device_page(window, physical, hhdm, &mut || {
-                pmm.allocate(0, bhaskix_mm::Zone::Normal)
-                    .ok()
-                    .map(|pfn| u64::from(pfn) * bhaskix_mm::FRAME_SIZE)
-            })
-        }
-    })
-    .ok_or(IrqError::NoHeap)?;
-    mapped.map_err(|_| IrqError::MapFailed)?;
+    // Mapped rather than assumed present: the window is a register page, and
+    // the direct map covers memory.
+    let window = crate::mmio::map(physical, FRAME_SIZE, hhdm).ok_or(IrqError::MapFailed)?;
 
     // SAFETY: `window` is the mapping just made of this chip's registers, and
     // this is the only code that touches it.

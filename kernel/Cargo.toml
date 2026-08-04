@@ -68,4 +68,13 @@ workspace = true
 # its loopback mode from the self-test. And rebuilding the `IoApic` and
 # `SerialPort` wrappers around an address held in an atomic, which is what
 # keeps the interrupt handler free of locks.
-unsafe_budget = 580
+# 800 at M6-06, the block driver. Almost all of the increase is one module:
+# a device driver is unsafe by nature, and virtio concentrates it. Registers
+# are volatile accesses to a mapped window; the virtqueue is a structure the
+# *device* reads and writes by DMA, so every descriptor is written volatile at
+# a physical address the driver allocated, and every completion is read the
+# same way. None of it can be expressed safely, because the other party to
+# every one of these accesses is not a thread and holds no lock -- which is
+# exactly why each block says which frame it is touching and who else may be
+# looking at it.
+unsafe_budget = 800
