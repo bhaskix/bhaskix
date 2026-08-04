@@ -21,14 +21,19 @@ compiled into the nucleus for speed.
 |---|---|
 | Access MMIO ranges named by its `MmioCapability` | Access any other physical or virtual address |
 | Map DMA buffers named by its `DmaCapability` | Perform DMA to arbitrary memory |
-| Receive the IRQs named by its `IrqCapability` | Install an interrupt handler directly |
+| Receive the IRQs named by its `IrqHandler` | Install an interrupt handler directly |
 | Allocate from its own domain's memory envelope | Allocate without accounting |
 | Call other services by message | Call kernel internals directly |
 | Contain `unsafe` in its `hal` submodule | Contain `unsafe` anywhere else |
 
-These are not conventions. `MmioCapability`, `DmaCapability`, and `IrqCapability` are the only types
+These are not conventions. `MmioCapability`, `DmaCapability`, and `IrqHandler` are the only types
 that unlock the corresponding operations, and a driver receives only the ones its manifest requested
 and the enumerator granted.
+
+`IrqHandler` is made concrete by [RFC 0011](rfc/0011-irq-handler.md) (accepted), which also settles
+who may hand one out and what may be claimed: **a domain may claim only MSI-X sources.** A legacy
+`INTx` line is shared between devices, and a holder that never acknowledges masks a line the others
+need — so those stay in the nucleus.
 
 ---
 
@@ -79,8 +84,18 @@ waiting driver task. It runs with interrupts disabled for a bounded, tiny number
 
 "Signal the waiting driver task" is a **notification** ([RFC 0010](rfc/0010-notifications.md),
 accepted): two atomics and a wake, with no lock and no allocation, which is what makes it callable
-from a handler at all. *Who* may receive one — an interrupt line is a hardware resource, and
-claiming it excludes everyone else — is [RFC 0011](rfc/0011-irq-handler.md), still a draft.
+from a handler at all. *Who* may receive one is [RFC 0011](rfc/0011-irq-handler.md), also accepted.
+
+That RFC adds one step this section did not mention and cannot do without: **the source is masked
+before it is signalled.** A level-triggered line that is not masked re-asserts the instant the
+handler returns, and the CPU spends its life in the handler. Masking is also flow control — a slow
+driver gets fewer interrupts rather than a storm.
+
+**The rule that follows, for driver authors: drain the device before acknowledging.** Between
+delivery and `ACK` the source is masked, and an *edge* raised in that window — which is every MSI —
+is lost. Read the device's completion state until it is empty, then acknowledge. A driver that
+acknowledges first and reads second will one day sleep with a completion in its queue and no
+interrupt coming, and that bug presents as a hang under load and nothing at all in testing.
 
 This is the top-half/bottom-half split made mandatory instead of optional. It means:
 
@@ -95,6 +110,12 @@ This is the top-half/bottom-half split made mandatory instead of optional. It me
 
 No raw pointers. MMIO is reached through a typed wrapper that is the *only* thing an
 `MmioCapability` unlocks:
+
+**A device's MSI-X table pages must never be inside an `MmioCapability` given to a domain.**
+Programming an MSI is a device write of an arbitrary vector to an arbitrary CPU — a general
+interrupt-injection primitive obtained by writing two words — which is why
+[RFC 0011](rfc/0011-irq-handler.md) keeps that programming in the kernel. Whatever hands out MMIO
+capabilities must exclude those pages, and this is the sentence it will be measured against.
 
 ```rust
 pub struct Mmio<T: MmioSafe> { /* addr + capability, private */ }

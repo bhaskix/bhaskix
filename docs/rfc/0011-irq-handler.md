@@ -2,12 +2,40 @@
 
 | | |
 |---|---|
-| **Status** | **Draft — for discussion.** |
+| **Status** | ✅ **Accepted 2026-08-04.** Resolves **IR1**. Step 6 remains blocked on RFC 0012. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`cap`, `irq`, `trap`), arch (`ioapic`, `pci`) |
 | **Milestone** | Phase 2 — with the driver framework |
 | **Depends on** | [RFC 0010](0010-notifications.md) (the delivery mechanism), [driver-model.md](../driver-model.md) §2, [security.md](../security.md) §2 |
 | **Blocked by** | An IOMMU — [RFC 0012](0012-iommu.md). See *The prerequisite this RFC does not remove* |
+
+---
+
+> **Accepted 2026-08-04 by the project lead.**
+>
+> **Three things acceptance locks in**, each of which narrows what a future
+> contributor may do:
+>
+> 1. **A domain may claim only MSI-X sources.** Legacy shared `INTx` stays
+>    kernel-only, because a holder that never acknowledges masks a line other
+>    devices need and the kernel cannot poll those devices for it.
+> 2. **MSI-X programming is never delegated**, and its consequence binds a
+>    component that does not exist yet: **a device's MSI-X table pages must
+>    never be inside an `MmioCapability` given to a domain.** That constraint
+>    is now written into `driver-model.md` §3, where it will be needed, rather
+>    than only here.
+> 3. **Unresolved questions 3 and 4 are taken as proposed**: a source whose
+>    holder died is masked permanently and reported, and MSI-X is the only
+>    message-signalled form supported. Questions 1, 2 and 5 stay open.
+>
+> **Steps 1–4 of the implementation plan are unblocked and worth doing on
+> their own** — they retire five hand-routed vector constants and let
+> `virtio-blk` stop burning a CPU. **Step 6, delegation to a domain, remains
+> blocked on [RFC 0012](0012-iommu.md)**, which is a draft. Accepting this RFC
+> does not make a user-mode driver safe, and the table below says so.
+>
+> The argument below is now immutable, per the document ownership table in
+> `TRACKER.md`. A change of mind is a new RFC that supersedes this one.
 
 ---
 

@@ -146,6 +146,11 @@ highest-priority RT thread on an otherwise busy machine, target < 50 µs at the 
 The QEMU test suite measures this on every PR and fails on regression. A number nobody measures is
 a number nobody meets.
 
+[RFC 0011](rfc/0011-irq-handler.md) (accepted) adds the case this budget was really written for: a
+driver woken by its device is an ordinary RT wake-up, measured from the signal inside the interrupt
+handler to the waiter running. The target is unchanged; what changes is that it now has a
+hardware-triggered source, which is the one that matters and the one that was missing.
+
 > **Implemented, and over budget, as of M4-07.** Fixed priorities, `FIFO` and `RR`, and admission
 > control at 95% are all in and unit-tested; a request that would exceed the cap is refused rather
 > than accepted and then missed. Real-time threads are also excluded from work stealing, because

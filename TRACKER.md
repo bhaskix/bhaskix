@@ -78,7 +78,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **A4** | Userspace ABI | ✅ **Accepted** 2026-08-04 | **Capability-shaped**, and the native ABI *is* A2's syscall interface — there is no separate document to write. Consequence: no native `libc`; the roadmap's Phase 2 libc belongs to the Linux personality. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 | **SM1** | Shared memory | ✅ **Accepted** 2026-08-04 | A **`Memory` object**: frames a capability names, mapped into the holder's *own* address space with rights no wider than the capability, unmapped from everywhere before a `revoke` returns. Completes RFC 0008's answer to **A3** — which promised shared memory and did not build it, so bulk data currently moves sixteen bytes per round trip. Its one architectural fork — whether `Untyped` memory exists at all — **was resolved by acceptance**: it does not. | [RFC 0009](docs/rfc/0009-shared-memory.md) |
 | **NF1** | Notifications | ✅ **Accepted** 2026-08-04 | A **`Notification` object**: one word of pending badge bits, at most one waiter, signalled without blocking and safely from an interrupt handler. Completes the other half of RFC 0008's answer to **A3**. Its immediate consequence is that `virtio-blk` can stop polling and `input.rs`'s hand-written reader becomes an instance of a general object. Interrupt *delivery* is ready; who may *claim* a line needs an `IRQHandler` object and its own RFC. | [RFC 0010](docs/rfc/0010-notifications.md) |
-| **IR1** | Interrupt authority | ⬜ Draft | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU, and the RFC says so rather than implying otherwise. | [RFC 0011](docs/rfc/0011-irq-handler.md) |
+| **IR1** | Interrupt authority | ✅ **Accepted** 2026-08-04 | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU (RFC 0012, draft), and the RFC says so rather than implying otherwise — **steps 1–4 are unblocked and worth doing alone.** | [RFC 0011](docs/rfc/0011-irq-handler.md) |
 | **IO1** | IOMMU | ⬜ Draft | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Asks for a roadmap change**: discovery and per-device domains move from Phase 3 to Phase 2, because they are what make a driver's bugs containable. | [RFC 0012](docs/rfc/0012-iommu.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | *Blocks M3* |
 
@@ -501,6 +501,34 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (RFC 0011 accepted — interrupts get an owner)
+
+- **Interrupt authority is decided.** `IrqControl` hands out `IrqHandler` capabilities, one per
+  source, exclusively; the kernel's path becomes mask → signal a notification → acknowledge.
+- **Acceptance narrows what a future contributor may do, in three ways worth naming.** A domain may
+  claim only MSI-X sources — legacy shared `INTx` stays in the nucleus, because a holder that never
+  acknowledges masks a line other devices need. MSI-X programming is never delegated. And unresolved
+  questions 3 and 4 are taken as proposed: a source whose holder died is masked permanently and
+  reported, and MSI-X is the only message-signalled form supported.
+- **One constraint now binds a component that does not exist yet**, which is why it was worth
+  writing down at acceptance rather than at implementation: **a device's MSI-X table pages must
+  never be inside an `MmioCapability` given to a domain.** Programming an MSI is a device write of
+  an arbitrary vector to an arbitrary CPU. That sentence is now in `driver-model.md` §3, where
+  whatever hands out MMIO capabilities will be read.
+- **Steps 1–4 are unblocked and pay for themselves.** They retire five hand-routed vector constants
+  in four files — the timer, both IPIs and the serial line — for a real allocator, turning a
+  collision from a machine behaving strangely into a boot failure, and they let `virtio-blk` stop
+  burning a CPU per request. **Step 6, delegation to a domain, stays blocked on RFC 0012.**
+  Accepting this does not make a user-mode driver safe, and the RFC's own table says so.
+- **Three documents changed.** `driver-model.md` §1 renames `IrqCapability` to `IrqHandler` and
+  records the MSI-X-only rule; §2 gains the step it was missing — *the source is masked before it is
+  signalled* — and the driver-author rule that follows from it, **drain the device before
+  acknowledging**, because an edge raised while masked is lost and that bug presents as a hang under
+  load and nothing in testing. `scheduler.md` §4 gains the RT wake-up source its 50 µs budget was
+  really written for: a driver woken by its device, measured from inside the handler.
+- **No testing debt.** Everything in the plan concerns code that does not exist; the one item
+  touching existing machinery is the vector allocator, which is step 1 rather than an obligation.
 
 ### 2026-08-04 (RFC 0010 accepted — A3 is now answered in full)
 
