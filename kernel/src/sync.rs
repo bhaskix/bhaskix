@@ -76,17 +76,22 @@ pub enum Rank {
     Heap = 2,
     /// `tlb::SENDER` — serialises shootdowns over the one shared address slot.
     TlbSender = 3,
+    /// `time::TIMERS` — one CPU's pending timer deadlines.
+    ///
+    /// Outside the runqueues for the same reason the wait queues are: expiring
+    /// a timer wakes a thread, which takes a runqueue lock while this is held.
+    Timers = 4,
     /// `wait::WaitQueue` — the waiter list of a blocking primitive.
     ///
     /// Outside the runqueues, because both halves of a sleep take them in that
     /// order: a sleeper holds this while marking itself blocked, and a waker
     /// holds it while marking a sleeper ready. Either one taking them the
     /// other way round is the deadlock this ordering exists to make visible.
-    WaitQueue = 4,
+    WaitQueue = 5,
     /// `sched::QUEUES` — one runqueue per CPU.
-    SchedRunqueue = 5,
+    SchedRunqueue = 6,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
-    Console = 6,
+    Console = 7,
 }
 
 impl Rank {
@@ -115,6 +120,7 @@ impl Rank {
             Self::AddressSpacePrevious => "vm::PREVIOUS_ROOT",
             Self::Heap => "heap::HEAP",
             Self::TlbSender => "tlb::SENDER",
+            Self::Timers => "time::TIMERS",
             Self::WaitQueue => "wait::WaitQueue",
             Self::SchedRunqueue => "sched::QUEUES",
             Self::Console => "console::CONSOLE",
@@ -403,6 +409,7 @@ mod tests {
             Rank::AddressSpacePrevious,
             Rank::Heap,
             Rank::TlbSender,
+            Rank::Timers,
             Rank::WaitQueue,
             Rank::SchedRunqueue,
             Rank::Console,

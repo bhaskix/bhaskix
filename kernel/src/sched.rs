@@ -278,6 +278,16 @@ struct RunQueue {
     /// comes from asking for a short slice, which earns an earlier deadline.
     /// That separation is the point of a virtual *deadline*.
     min_vruntime: u64,
+    /// TSC value at which the running thread's slice expires.
+    ///
+    /// Absolute rather than a duration, because the timer is re-armed by every
+    /// interrupt that reaches the scheduler and not only by the one that ends
+    /// a slice. Arming for a *fresh* slice each time silently extends whoever
+    /// happens to be running when an unrelated interrupt lands — a reschedule
+    /// IPI, a shootdown — and the thread that runs most often benefits most.
+    /// It measured as a 3:1 weight ratio delivering 3.7:1, while the policy
+    /// itself is exactly 3:1 in simulation.
+    slice_deadline: u64,
     /// Whether this CPU is between choosing a switch and completing it.
     ///
     /// Set under the lock before the lock is released for the switch, and
@@ -294,6 +304,7 @@ impl RunQueue {
             current: 0,
             started: false,
             min_vruntime: 0,
+            slice_deadline: 0,
             switching: false,
         }
     }
@@ -353,6 +364,30 @@ impl RunQueue {
     /// First unused slot.
     fn free_slot(&self) -> Option<usize> {
         self.threads.iter().position(Option::is_none)
+    }
+
+    /// Drops finished threads, freeing their slots.
+    ///
+    /// Never the thread the CPU is currently on, even if it has finished: it
+    /// is still executing on its own stack inside `exit`, and the switch away
+    /// from it will read its context. Everything else that has finished is
+    /// quiescent by definition — nothing will schedule it again — so its slot
+    /// is reusable.
+    ///
+    /// Reaped lazily, when a slot is wanted, rather than eagerly on exit:
+    /// exit runs with the CPU's queue in a state the exiting thread is still
+    /// part of, and unpicking that at the moment of departure is how a
+    /// use-after-free gets written.
+    ///
+    /// The *stack* is not reclaimed; that needs an allocator for stack slots
+    /// and is recorded in TRACKER.md as outstanding.
+    fn reap_finished(&mut self) {
+        let current = self.current;
+        for (slot, entry) in self.threads.iter_mut().enumerate() {
+            if slot != current && entry.as_ref().is_some_and(|t| t.state == State::Finished) {
+                *entry = None;
+            }
+        }
     }
 
     /// Slot indices in round-robin order, starting *after* `from`.
@@ -504,6 +539,17 @@ static NEXT_THREAD: AtomicU64 = AtomicU64::new(0);
 
 /// Context switches performed, across every CPU.
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Vector used to tell another CPU that its runqueue changed.
+///
+/// One above the shootdown vector, and for the same reason that one exists:
+/// marking a thread `Ready` in another CPU's queue changes nothing that CPU
+/// can observe until it next looks — and if it is idle, or has stopped its
+/// timer, it may not look again for a very long time.
+pub const RESCHEDULE_VECTOR: u8 = 0x41;
+
+/// Reschedule interrupts sent to other CPUs.
+static RESCHEDULE_IPIS: AtomicU64 = AtomicU64::new(0);
 
 /// Threads that actually went to sleep.
 static BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -704,7 +750,7 @@ pub fn spawn_on_with(
     // it. Allocation needs the heap, and holding a runqueue lock across it
     // would order the two locks the opposite way round from every other path.
     let (slot, floor) = {
-        let queue = QUEUES[cpu as usize].lock();
+        let mut queue = QUEUES[cpu as usize].lock();
 
         // Admission control, before anything is allocated. `docs/scheduler.md`
         // §4: exceeding the cap must fail the request rather than hang the
@@ -721,7 +767,8 @@ pub fn spawn_on_with(
             }
         }
 
-        let Some(slot) = (0..MAX_THREADS_PER_CPU).find(|&i| queue.threads[i].is_none()) else {
+        queue.reap_finished();
+        let Some(slot) = queue.free_slot() else {
             return Err(SpawnError::QueueFull(cpu));
         };
         (slot, queue.min_vruntime)
@@ -766,6 +813,17 @@ pub fn spawn_on_with(
     if let Some(thread) = queue.threads[slot].as_mut() {
         thread.charge(0);
     }
+    drop(queue);
+
+    // Tell the target CPU, for the same reason `wake` does. Once a CPU can
+    // stop its timer, *every* operation that makes a thread runnable on
+    // another processor has to say so — otherwise the thread waits for the
+    // idle backstop, which is a second. This one was missed at first and
+    // presented as three worker threads that never ran.
+    if cpu != percpu::cpu_id() {
+        notify(cpu);
+    }
+
     Ok(id)
 }
 
@@ -996,6 +1054,15 @@ pub fn preempt() {
         }
         queue.advance_min_vruntime();
 
+        // Renew the quantum only when it has run out. An interrupt arriving
+        // mid-slice leaves it alone, so the running thread keeps the remainder
+        // it was owed rather than being handed a fresh one.
+        if now >= queue.slice_deadline
+            && let Some(thread) = queue.threads[current].as_ref()
+        {
+            queue.slice_deadline = now.saturating_add(thread.slice_ticks);
+        }
+
         let mut next = queue.pick_next(current);
         if next == current {
             // Nothing else here to run. This is the cheapest moment to
@@ -1020,6 +1087,10 @@ pub fn preempt() {
             thread.state = State::Running;
             thread.runs += 1;
             thread.last_start = now;
+        }
+        // A new thread starts a new quantum.
+        if let Some(thread) = queue.threads[next].as_ref() {
+            queue.slice_deadline = now.saturating_add(thread.slice_ticks);
         }
         queue.current = next;
 
@@ -1300,6 +1371,9 @@ pub fn block_self() {
                     thread.runs += 1;
                     thread.last_start = now;
                 }
+                if let Some(thread) = queue.threads[next].as_ref() {
+                    queue.slice_deadline = now.saturating_add(thread.slice_ticks);
+                }
                 queue.current = next;
 
                 let incoming_locks = queue.threads[next].as_ref().map_or(0, |t| t.held_locks);
@@ -1381,29 +1455,116 @@ pub fn block_self() {
 /// thread is scheduled by its own CPU, on its own stack, as it always was.
 pub fn wake(id: u32) -> bool {
     let online = percpu::online_count() as usize;
-    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+    let here = percpu::cpu_id();
+
+    for (cpu, queue) in QUEUES.iter().enumerate().take(online.min(MAX_CPUS)) {
         // One queue lock at a time. Two would be two locks of the same rank,
         // which have no order relative to each other and could close a cycle.
-        let mut queue = queue.lock();
-        let floor = queue.min_vruntime;
-        for thread in queue.threads.iter_mut().flatten() {
-            if thread.id == id && thread.state == State::Blocked {
-                thread.state = State::Ready;
-                // A thread that has slept has a `vruntime` frozen far behind
-                // the ones that stayed awake, and would monopolise the CPU
-                // until it caught up. Advance it to the floor -- it keeps its
-                // deadline advantage, which is what makes a woken interactive
-                // thread run *soon*, without also being owed a backlog.
-                if matches!(thread.policy, Policy::Fair { .. }) {
-                    thread.vruntime = thread.vruntime.max(floor);
-                    thread.charge(0);
+        let woken = {
+            let mut queue = queue.lock();
+            let floor = queue.min_vruntime;
+            let mut woken = false;
+            for thread in queue.threads.iter_mut().flatten() {
+                if thread.id == id && thread.state == State::Blocked {
+                    thread.state = State::Ready;
+                    if matches!(thread.policy, Policy::Fair { .. }) {
+                        thread.vruntime = thread.vruntime.max(floor);
+                        thread.charge(0);
+                    }
+                    WAKEUPS.fetch_add(1, Ordering::Relaxed);
+                    woken = true;
+                    break;
                 }
-                WAKEUPS.fetch_add(1, Ordering::Relaxed);
-                return true;
             }
+            woken
+        };
+
+        if woken {
+            // Poke the other CPU. Sent after the lock is released -- an IPI is
+            // not instantaneous, and holding a runqueue lock across it would
+            // block the very CPU being woken from acting on the news.
+            if cpu as u32 != here {
+                notify(cpu as u32);
+            }
+            return true;
         }
     }
     false
+}
+
+/// Tells `cpu` that its runqueue changed.
+///
+/// The counterpart to the local `resched`. Marking a thread ready in another
+/// CPU's queue is invisible to that CPU until it next runs the scheduler, and
+/// an idle CPU with its timer stopped has no reason to. Without this, tickless
+/// idle is not a power optimisation, it is a way to lose threads.
+fn notify(cpu: u32) {
+    let Some(lapic) = percpu::lapic_id_of(cpu) else {
+        return;
+    };
+    RESCHEDULE_IPIS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the APIC is initialised long before any thread can block, and
+    // every CPU has an IDT gate for all 256 vectors.
+    unsafe {
+        bhaskix_arch::apic::send_ipi(lapic, RESCHEDULE_VECTOR);
+    }
+}
+
+/// Whether `cpu` still needs a periodic interrupt to preempt with.
+///
+/// A tick exists to take the CPU *away* from a thread, which means nothing
+/// when there is nothing to give it to. This is the whole tickless rule, and
+/// it is deliberately a property of the runqueue rather than of the timer.
+///
+/// Answers `true` before the scheduler has started on that CPU: early boot
+/// counts ticks to prove the timer works at all, and a CPU that stopped
+/// ticking before it had a runqueue would look identical to a broken timer.
+#[must_use]
+pub fn needs_preemption_tick(cpu: usize) -> bool {
+    if cpu >= MAX_CPUS {
+        return true;
+    }
+    let Some(queue) = QUEUES[cpu].try_lock() else {
+        // Contended: assume a tick is needed. Being wrong costs one interrupt;
+        // being wrong the other way costs a CPU that stops scheduling.
+        return true;
+    };
+    if !queue.started {
+        return true;
+    }
+    queue.runnable() > 1
+}
+
+/// When the running thread's slice next expires on `cpu`, in TSC units.
+///
+/// A deadline already in the past is replaced with a fresh slice rather than
+/// returned as-is. The timer is armed from inside the interrupt handler,
+/// *before* the scheduler has renewed the quantum — so at every slice
+/// boundary the stored deadline is momentarily stale, and arming for the
+/// remaining zero nanoseconds asks the hardware to interrupt immediately.
+///
+/// That is not a rounding error, it is an interrupt storm: the measured tick
+/// rate went from 400 a second to over thirty thousand, which is a machine
+/// spending all its time in the timer handler.
+#[must_use]
+pub fn next_slice_deadline(cpu: usize, now: u64) -> Option<u64> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    let queue = QUEUES[cpu].try_lock()?;
+    if queue.slice_deadline > now {
+        return Some(queue.slice_deadline);
+    }
+    let current = queue.current;
+    queue.threads[current]
+        .as_ref()
+        .map(|thread| now.saturating_add(thread.slice_ticks))
+}
+
+/// Reschedule interrupts sent to other CPUs.
+#[must_use]
+pub fn reschedule_ipis() -> u64 {
+    RESCHEDULE_IPIS.load(Ordering::Relaxed)
 }
 
 /// Threads that went to sleep.
@@ -1529,6 +1690,76 @@ mod tests {
     fn an_idle_cpu_takes_from_a_queue_of_three() {
         let queue = with(&[State::Running, State::Ready, State::Ready]);
         assert_eq!(queue.steal_candidate(0), Some(1));
+    }
+
+    /// Runs the real pick-and-charge loop and reports the service split.
+    ///
+    /// The boot test measures this on hardware, where the answer is entangled
+    /// with interrupt timing and emulator jitter. This runs the same algorithm
+    /// with time as an exact input, so a deviation is the algorithm's and
+    /// nothing else's.
+    fn simulate(weights: &[u32], slice: u64, rounds: usize) -> Vec<u64> {
+        let mut queue = RunQueue::new();
+        for (slot, weight) in weights.iter().enumerate() {
+            let mut thread = thread(slot, State::Ready, Policy::Fair { weight: *weight });
+            thread.slice_ticks = slice;
+            thread.charge(0);
+            queue.threads[slot] = Some(thread);
+        }
+        queue.current = 0;
+
+        for _ in 0..rounds {
+            let next = queue.pick_next(queue.current);
+            queue.current = next;
+            if let Some(thread) = queue.threads[next].as_mut() {
+                thread.charge(slice);
+            }
+            queue.advance_min_vruntime();
+        }
+
+        weights
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| queue.threads[slot].as_ref().map_or(0, |t| t.cycles))
+            .collect()
+    }
+
+    #[test]
+    fn equal_weights_share_the_cpu_equally() {
+        let service = simulate(&[1024, 1024], 1_000, 1_000);
+        assert_eq!(service[0], service[1]);
+    }
+
+    #[test]
+    fn three_to_one_weights_give_three_to_one_service() {
+        // The headline claim of the fair class. Ten thousand rounds, so a
+        // startup transient cannot account for a deviation.
+        let service = simulate(&[3 * 1024, 1024], 1_000, 10_000);
+        let ratio_tenths = service[0] * 10 / service[1].max(1);
+        assert!(
+            (29..=31).contains(&ratio_tenths),
+            "expected 3.0x, got {}.{}x ({} vs {})",
+            ratio_tenths / 10,
+            ratio_tenths % 10,
+            service[0],
+            service[1]
+        );
+    }
+
+    #[test]
+    fn reaping_frees_finished_slots_but_never_the_running_one() {
+        // A finished thread that is still `current` is executing inside
+        // `exit` on its own stack, and the switch away from it will read its
+        // context. Reaping it would be a use-after-free.
+        let mut queue = with(&[State::Finished, State::Finished, State::Ready]);
+        queue.current = 0;
+        queue.reap_finished();
+        assert!(queue.threads[0].is_some(), "the running thread stays");
+        assert!(
+            queue.threads[1].is_none(),
+            "a quiescent finished thread goes"
+        );
+        assert!(queue.threads[2].is_some(), "a ready thread stays");
     }
 
     #[test]

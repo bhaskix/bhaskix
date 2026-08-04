@@ -196,6 +196,16 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             // interrupt currently in service.
             unsafe { apic::end_of_interrupt() };
 
+            // Expire timers and choose when to fire next, before scheduling.
+            // The order matters: a thread whose sleep has just elapsed must be
+            // runnable before the arming decision asks whether this CPU has
+            // anything to run, or the CPU decides it is idle and stops the
+            // very timer that would have corrected it.
+            //
+            // SAFETY: this is the timer interrupt handler, after
+            // acknowledgement, and the APIC is initialised.
+            unsafe { crate::time::on_tick() };
+
             // Preemption, after the acknowledgement. The order matters: the
             // switch does not return until this thread is scheduled again, and
             // an unacknowledged interrupt would block every later one in the
@@ -206,6 +216,18 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             // stack still holds this interrupt's frame. When the thread is
             // resumed the switch returns here, the handler unwinds normally,
             // and `iretq` returns to wherever that thread was interrupted.
+            crate::sched::preempt();
+        }
+
+        // Another CPU made something runnable here. There is nothing to do
+        // beyond acknowledging and letting the scheduler look: the sender has
+        // already marked the thread ready under this CPU's queue lock, and the
+        // whole purpose of the interrupt is to make this CPU *look*, which an
+        // idle CPU with its timer stopped would otherwise not do.
+        crate::sched::RESCHEDULE_VECTOR => {
+            // SAFETY: the APIC is initialised -- interrupts cannot be enabled
+            // before `enable` succeeds.
+            unsafe { apic::end_of_interrupt() };
             crate::sched::preempt();
         }
 

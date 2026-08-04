@@ -57,6 +57,8 @@ const REG_ICR_HIGH: usize = 0x310;
 /// knowing every APIC id, and a mask that is stale by one CPU produces a
 /// shootdown that silently misses a processor.
 const ICR_ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
+/// Fixed delivery to the destination in the ICR's high half, level assert.
+const ICR_FIXED_ASSERT: u32 = 1 << 14;
 
 /// Set while an IPI is still being delivered. xAPIC only; in x2APIC the write
 /// is serialising and the bit does not exist.
@@ -362,6 +364,51 @@ unsafe fn calibrate() -> Result<u32, ApicError> {
     Ok((ticks_per_second / 16) as u32)
 }
 
+/// Arms the timer to fire once, after `count` timer ticks.
+///
+/// One-shot rather than periodic is what makes ticklessness possible at all: a
+/// periodic timer interrupts on a schedule the kernel chose once at boot,
+/// whereas a one-shot timer is re-armed after every interrupt for exactly as
+/// long as the next thing that needs attention. A CPU with nothing to do
+/// simply is not armed.
+///
+/// # Safety
+///
+/// [`init`] must have run and there must be an IDT gate for [`TIMER_VECTOR`].
+pub unsafe fn arm_oneshot(count: u32) {
+    // SAFETY: the APIC is initialised per the caller's obligation.
+    unsafe {
+        write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
+        // Mode bits clear: one-shot. Writing the initial count starts it.
+        write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
+        write(REG_TIMER_INITIAL, count.max(1));
+    }
+}
+
+/// Stops the timer entirely. Nothing will fire until it is armed again.
+///
+/// # Safety
+///
+/// [`init`] must have run. The caller is responsible for arranging some other
+/// way to be woken — on an otherwise idle CPU that means an inter-processor
+/// interrupt, and without one the CPU sleeps until the machine is reset.
+pub unsafe fn disarm_timer() {
+    // SAFETY: the APIC is initialised per the caller's obligation.
+    unsafe {
+        write(REG_TIMER_INITIAL, 0);
+        write(REG_LVT_TIMER, LVT_MASKED);
+    }
+}
+
+/// Timer ticks per second, as measured at boot, or `None` before calibration.
+#[must_use]
+pub fn timer_hertz() -> Option<u32> {
+    match TICKS_PER_SECOND.load(Ordering::Acquire) {
+        0 => None,
+        hertz => Some(hertz),
+    }
+}
+
 /// Starts the timer at `hertz`, delivering on [`TIMER_VECTOR`].
 ///
 /// # Safety
@@ -464,6 +511,57 @@ pub unsafe fn enable_this_cpu() {
         write(REG_LVT_LINT1, LVT_MASKED);
         write(REG_LVT_ERROR, u32::from(ERROR_VECTOR));
     }
+}
+
+/// Writes the whole 64-bit x2APIC interrupt command register.
+///
+/// The generic register write is 32 bits, which is right for every other
+/// register but cannot express a targeted send: in x2APIC the destination and
+/// the command are one MSR, written together, and that write is what sends.
+///
+/// # Safety
+///
+/// The CPU must be in x2APIC mode.
+unsafe fn write_icr64(value: u64) {
+    // SAFETY: the caller guarantees x2APIC mode, where the ICR is a single
+    // writable MSR at the base plus the register's index.
+    unsafe { msr::write(X2APIC_MSR_BASE + (REG_ICR_LOW >> 4) as u32, value) };
+}
+
+/// Sends `vector` to the CPU with local APIC id `target`.
+///
+/// The x2APIC path takes a 32-bit destination; the xAPIC path only has eight
+/// bits, so an id above 255 cannot be addressed and is refused rather than
+/// silently truncated into somebody else's.
+///
+/// # Safety
+///
+/// As [`send_ipi_all_but_self`]: the APIC must be initialised and the target
+/// must have an IDT gate for `vector`.
+pub unsafe fn send_ipi(target: u32, vector: u8) -> bool {
+    let command = ICR_FIXED_ASSERT | u32::from(vector);
+
+    // SAFETY: the APIC is initialised per the caller's obligation.
+    unsafe {
+        if in_x2apic_mode() {
+            write_icr64((u64::from(target) << 32) | u64::from(command));
+        } else {
+            if target > 0xff {
+                return false;
+            }
+            // High half first: writing the low half is what sends, so the
+            // other order sends with a stale destination.
+            write(REG_ICR_HIGH, target << 24);
+            write(REG_ICR_LOW, command);
+
+            let mut spins = 0u32;
+            while read(REG_ICR_LOW) & ICR_DELIVERY_PENDING != 0 && spins < 1_000_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+        }
+    }
+    true
 }
 
 /// Sends `vector` to every CPU except this one.

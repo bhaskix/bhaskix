@@ -48,4 +48,10 @@ workspace = true
 # ordering constraint documentable where it applies. The rest is the switch
 # path: raw context pointers taken out of a runqueue and handed to assembly
 # that changes RSP, which no safe signature can describe.
-unsafe_budget = 430
+# 460 at M4-10, tickless timers. The timer path is unsafe by nature: arming and
+# disarming a device register, called from an interrupt handler, on a CPU whose
+# APIC state the type system cannot describe. Each step is a separate block so
+# that its own precondition -- "the APIC is initialised", "this is the timer
+# handler, after acknowledgement" -- is stated where it applies rather than
+# once for a whole function.
+unsafe_budget = 460

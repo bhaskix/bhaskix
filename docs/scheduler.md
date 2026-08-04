@@ -237,6 +237,31 @@ Deliberate design points:
   synchronisation across sockets is verified at boot and the fallback is taken if it fails, rather
   than assumed.
 
+> **Implemented, in part, as of M4-10.** The APIC timer is **one-shot**, re-armed after every
+> interrupt for exactly as long as the next thing that needs attention — the slice of the running
+> thread, or the soonest pending timer, whichever is sooner. Ticklessness is not layered on top of
+> that; it is what a one-shot timer does when asked for nothing. Measured: **0 timer interrupts over
+> 400 ms** with the machine idle, against 320–483 with every CPU busy.
+>
+> **A tickless CPU can only be woken by an interrupt**, so this required the reschedule IPI first —
+> and then a second fix, because *spawning* a thread on an idle CPU also has to poke it. Missing
+> that presented as three worker threads that never ran. The rule is now explicit: every operation
+> that makes a thread runnable on another processor must say so.
+>
+> **An idle CPU is still armed once a second.** Strictly it needs no interrupt at all, but that
+> assumes every present and future path that makes a thread runnable remembers the IPI. The backstop
+> costs nothing and turns the worst failure this design has — a silently lost thread — into "that
+> thread ran late".
+>
+> **No hierarchical timer wheel**, because there is no network stack to give it a shape. What exists
+> is §7's few-precise-timers case: a small per-CPU array, scanned linearly, allocating nothing. **No
+> TSC-deadline mode**, **no HPET fallback**, and **no cross-socket TSC verification** — every reading
+> is compared only against another from the same CPU, and that assumption must be revisited before
+> any timestamp crosses a CPU boundary.
+>
+> **The tick is no longer a clock.** It counts timer interrupts delivered, which stopped being
+> proportional to elapsed time. Anything measuring duration now reads the TSC.
+
 ---
 
 ## 8. The policy hook

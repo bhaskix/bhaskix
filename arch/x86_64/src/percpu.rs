@@ -189,6 +189,25 @@ pub fn online_count() -> u32 {
     ONLINE.load(Ordering::Acquire).min(MAX_CPUS as u32)
 }
 
+/// The local APIC identifier of `cpu_id`, if that CPU is online.
+///
+/// Needed to send a CPU an interrupt: the dense index is a kernel convenience
+/// and means nothing to the hardware, which addresses processors by APIC id —
+/// and the two are not interchangeable, because APIC ids are not dense and
+/// routinely skip values.
+#[must_use]
+pub fn lapic_id_of(cpu_id: u32) -> Option<u32> {
+    let count = online_count() as usize;
+    // SAFETY: elements below `count` were fully written by `install` before
+    // the counter that publishes them was incremented, and never change again.
+    let areas = unsafe { AREAS.get() };
+    areas
+        .iter()
+        .take(count)
+        .find(|area| area.online && area.cpu_id == cpu_id)
+        .map(|area| area.lapic_id)
+}
+
 /// Runs `f` for each online CPU: `(cpu_id, lapic_id)`.
 pub fn for_each_online(mut f: impl FnMut(u32, u32)) {
     let count = online_count() as usize;
