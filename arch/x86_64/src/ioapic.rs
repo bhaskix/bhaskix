@@ -220,6 +220,35 @@ impl IoApic {
         Ok(())
     }
 
+    /// Unmasks `gsi`, so it may be delivered again.
+    ///
+    /// The counterpart to [`IoApic::mask`], and the reason masking is safe to
+    /// do inside an interrupt handler: the handler masks, the driver's thread
+    /// does the work, and this is how it says it is finished. A source that is
+    /// masked and never unmasked is a device that raises one interrupt and
+    /// then goes quiet for ever, which is a failure mode worth being able to
+    /// recognise.
+    ///
+    /// # Errors
+    ///
+    /// [`IoApicError::NoSuchInput`] if this chip has no such input.
+    ///
+    /// # Safety
+    ///
+    /// As [`IoApic::route`].
+    pub unsafe fn unmask(&mut self, gsi: u32) -> Result<(), IoApicError> {
+        if !self.owns(gsi) {
+            return Err(IoApicError::NoSuchInput);
+        }
+        let index = REDIRECTION + 2 * (gsi - self.gsi_base);
+        // SAFETY: the caller's obligations; `index` is a valid entry.
+        unsafe {
+            let low = self.read(index);
+            self.write(index, low & !MASKED);
+        }
+        Ok(())
+    }
+
     /// Reads back the low half of `gsi`'s redirection entry.
     ///
     /// For self-tests: the point of reading a register back is to check the

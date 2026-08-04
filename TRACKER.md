@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-04 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built — one exit criterion met by substitute · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 (RFC 0011 steps 1–4) · CI green |
 
 ### Division of responsibility between documents
 
@@ -127,6 +127,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-03 | ELF64 loader, with a fuzz target | ✅ `DONE` | Ring 3 now runs `bin/probe`, a separately built ET_EXEC loaded out of the initrd, mapped at the addresses and with the permissions **its own headers** name. **Negative-tested**: dropping one segment fails the gate; a deliberately reintroduced wrap bug is caught by the mutation harness at seed 424. |
 | M6-04 | Kernel shell | ✅ `DONE` | The console reads: ACPI walk → I/O APIC → IRQ 4 → a vector → a lock-free ring → a blocking read. Nine read-only commands, run by the boot self-test through the same function the prompt calls. **Negative-tested**: draining one byte per interrupt fails the boot gate; removing the wake-up passes it and fails `shell-test.sh`, which is why that test exists. |
 | M6-05 | User-mode shell over the syscall interface | ✅ `DONE` | The machine boots to a shell in ring 3 holding two capabilities and nothing else: console and filesystem, both reached by IPC, sixteen bytes per round trip. `shell=kernel` selects the ring 0 one. **Negative-tested**: withholding the filesystem capability makes `caps` report it, both filesystem commands fail, and everything else keeps working. |
+| M6-07 | RFC 0011 steps 1–4: a vector allocator, `IrqHandler`, and a driver that stops polling | ✅ `DONE` | One registry for all 256 vectors; `IrqControl`/`IrqHandler` with exclusive claims and reserved sources; the delivery path is mask → signal a notification → acknowledge. RFC 0010's `Notification` landed with it, because step 3 binds one. `input.rs` and `virtio-blk` are both clients now rather than special cases. **Negative-tested**: leaving the notification unbound fails the gate. |
 | M6-06 | `virtio-blk` driver | ✅ `DONE` | PCI enumeration, modern virtio 1.0 discovered through the device's own capability list, a split virtqueue driven by DMA. `root=disk` mounts the filesystem off the device, so the user-mode shell is a file the driver read. **Negative-tested**: a driver that ignored the sector number reads sector zero four times and fails the gate, because the disk is the ramdisk image and the kernel has the same bytes from the bootloader to compare against. |
 
 ### Honest notes on M6 so far
@@ -501,6 +502,37 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M6-07 — RFC 0011 steps 1–4, and a driver that stopped polling)
+
+- **`virtio-blk` waits on an interrupt: 1 wait, 0 spins, 1 interrupt per request.** Before this it
+  spun on the used ring for the duration of every request. The gate asserts the *pair* of counters
+  rather than a duration, because "0 spins" is a claim a timing measurement on an emulator could
+  not make.
+- **There is one registry for all 256 vectors**, and the serial line's is now *allocated* rather
+  than named: `input::SERIAL_VECTOR` is gone, and its absence is the point. Five constants across
+  four files became one table that the boot log prints, so a collision is a boot failure rather
+  than a machine behaving strangely.
+- **The delivery path is three steps and nothing else**: mask the source, signal a notification,
+  acknowledge the controller. `input.rs` drains the UART and *then* acknowledges — the rule
+  `driver-model.md` §2 gained at RFC 0011's acceptance, demonstrated by the kernel's own first
+  client rather than left for the first driver author to get wrong.
+- **RFC 0010's `Notification` landed with it**, because step 3 binds one. One waiter, refused rather
+  than queued; signal takes no lock, which is what lets an interrupt handler call it.
+  `notify::wait_once` was added for the block driver: it blocks *once*, so a caller can arm its own
+  deadline and still find out whether it was the device or the clock that woke it. That is not the
+  timeout RFC 0008 leaves unresolved — it is the smaller thing that lets a caller build one.
+- **The lock-rank checker earned its keep on the first boot.** `irq::HANDLERS` and `vectors::TABLE`
+  were given the same rank, and claiming a source takes one then the other. Two locks of one rank
+  have no declared order and can close a cycle exactly as an inversion can; the detector said so
+  before anything deadlocked.
+- **Two things this cannot yet catch, recorded rather than implied.** Acknowledging *before*
+  draining is a rule with no gate behind it: both of this kernel's sources are edge-triggered, so
+  the loss window needs a second interrupt inside it to be observable. And not masking at all is
+  invisible for the same reason — a level-triggered source would storm, and neither of ours is one.
+  The first level-triggered device will make both testable.
+- **Step 5 (domain teardown) and step 6 (delegation) are not done.** Six is blocked on RFC 0012's
+  implementation, as its acceptance note says.
 
 ### 2026-08-04 (RFC 0012 accepted — and a roadmap phase moved with it)
 

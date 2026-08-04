@@ -14,48 +14,34 @@
 //! then wait for a lock held by a thread that cannot run until the handler
 //! returns. Disjoint indices make that impossible rather than unlikely.
 //!
+//! # The first client of RFC 0011, and it drains before it acknowledges
+//!
+//! Since M6-07 this module owns nothing of the interrupt path. It claims the
+//! serial line through `irq::claim`, binds a notification to it, and waits.
+//! The handler masks the source and signals; **this module drains the UART and
+//! then acknowledges**, which is the rule `docs/driver-model.md` §2 states for
+//! every driver: an edge raised while the source is masked is lost, so read
+//! the device empty *before* saying you are finished with it.
+//!
+//! What that replaced was a hand-written version of the same thing — a reader
+//! recorded in an atomic, woken from a handler that also drained the FIFO.
+//! It worked, and it was a special case of a general object that did not exist
+//! yet. It does now.
+//!
 //! # One reader
 //!
-//! [`read`] records the calling thread as *the* reader, so a second caller
-//! would displace the first and leave it asleep with nobody to wake it. There
-//! is one console and one shell, so that is a description rather than a
-//! limitation — but it is a real one, and a second reader needs a list here
-//! before it needs anything else.
-//!
-//! # Why the reader and the interrupt share a CPU
-//!
-//! The serial interrupt is routed to the bootstrap CPU and the shell is pinned
-//! there. That pairing is what makes the wake-up argument below hold, and it
-//! is a requirement rather than a convenience — [`install`] says so, and
-//! `shell::start` is the only caller.
-//!
-//! # Why no wakeup can be lost
-//!
-//! The reader marks itself blocked *before* it looks at the ring, which is the
-//! rule M4-09 established and M5-05 had to relearn. Then:
-//!
-//! - A byte pushed before the reader looks is found by the look, and the
-//!   reader cancels its own block.
-//! - A byte pushed after the look arrives when the reader holds no runqueue
-//!   lock, so the handler's `try_lock` wake succeeds.
-//! - A byte pushed while the reader is inside `block_self` cannot happen on
-//!   this CPU: `block_self` masks interrupts for exactly that reason.
-//!
-//! The remaining case — the handler interrupting the reader *inside*
-//! `mark_blocked`, where the runqueue lock is held — loses the wake and is
-//! caught by the recheck: the reader's look happens after `mark_blocked`
-//! returns, so it sees the byte.
+//! A notification takes one waiter and refuses a second, so this inherits that
+//! bound rather than restating it. There is one console and one shell.
 
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use bhaskix_arch::SerialPort;
 
-/// Vector the serial interrupt is delivered on.
-///
-/// Above the exceptions, clear of the timer (`0x20`), the reschedule IPI
-/// (`0x41`) and the shootdown IPI. The number itself does not matter; that it
-/// is written down in one place does.
-pub const SERIAL_VECTOR: u8 = 0x42;
+// There is no `SERIAL_VECTOR` any more, and its absence is the point of
+// RFC 0011 step 1: the vector is allocated at claim time and this module never
+// learns a number it did not ask for. What it keeps is the *source* -- which
+// line the console is on -- because that is a fact about the machine rather
+// than a fact about this kernel's bookkeeping.
 
 /// The legacy ISA interrupt a PC's first serial port raises.
 pub const SERIAL_IRQ: u8 = 4;
@@ -81,9 +67,6 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Times the handler ran.
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 
-/// The thread to wake when a byte arrives, or zero.
-static READER: AtomicU32 = AtomicU32::new(0);
-
 /// I/O port of the UART the handler drains, or zero if there is none.
 ///
 /// A port number rather than a `SerialPort`, so the handler can read it with
@@ -91,48 +74,114 @@ static READER: AtomicU32 = AtomicU32::new(0);
 /// number, so nothing is lost by rebuilding it per interrupt.
 static PORT_BASE: AtomicU16 = AtomicU16::new(0);
 
-/// Names the port console input arrives on, and asks it to interrupt.
+/// Names the port console input arrives on, claims its interrupt, and binds a
+/// notification to it.
+///
+/// # Errors
+///
+/// Returns `Err` if the line could not be claimed or a notification created.
+/// Either is survivable — the kernel boots without console input and says so.
 ///
 /// # Safety
 ///
 /// Must be called once, during boot, with the base of a UART whose `init`
-/// succeeded. The caller must also route [`SERIAL_IRQ`] to [`SERIAL_VECTOR`]
-/// on the bootstrap CPU and pin every reader there — see the module header.
-pub unsafe fn install(base: u16) {
+/// succeeded.
+pub unsafe fn install(
+    base: u16,
+    apic_id: u32,
+    rsdp: Option<bhaskix_boot::PhysAddr>,
+    hhdm: u64,
+) -> Result<u8, &'static str> {
+    let notification = crate::notify::create().map_err(|_| "no notification for the console")?;
+
+    // SAFETY: `trap` dispatches claimed vectors to `irq::on_interrupt`, which
+    // acknowledges the local APIC.
+    let handler = unsafe {
+        crate::irq::claim(
+            crate::irq::Source::Line {
+                gsi: gsi_for_serial(rsdp, hhdm),
+            },
+            "serial",
+            apic_id,
+            rsdp,
+            hhdm,
+        )
+    }
+    .map_err(|_| "the serial line could not be claimed")?;
+
+    crate::irq::bind(handler, notification, BADGE)
+        .map_err(|_| "the notification would not bind")?;
+
+    let vector = crate::irq::vector_of(handler).unwrap_or(0);
+    NOTIFICATION.store(notification.index() + 1, Ordering::Release);
+    NOTIFICATION_GENERATION.store(notification.generation(), Ordering::Relaxed);
+    HANDLER.store(handler_to_raw(handler), Ordering::Release);
     PORT_BASE.store(base, Ordering::Release);
-    // SAFETY: the caller guarantees the port is initialised. From here the
-    // UART raises its line, which is why routing is the caller's job and is
-    // done before this.
+
+    // Last: from here the UART raises its line, so everything that services it
+    // must already be in place.
+    // SAFETY: the caller guarantees the port is initialised.
     unsafe { SerialPort::new(base).enable_receive_interrupt() };
+    Ok(vector)
 }
 
-/// Services the serial interrupt.
+/// The global interrupt the serial line arrives on.
 ///
-/// Drains the whole FIFO. Stopping after one byte would leave the rest behind
-/// an interrupt that has already been acknowledged and will not be raised
-/// again for bytes already in the buffer — a console that loses everything a
-/// person types faster than one character per interrupt.
-pub fn on_interrupt() {
-    INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+/// Translated through the firmware's overrides once, here, so that the claim
+/// records the number the chip actually uses. Everything downstream — masking,
+/// acknowledging — works in that number and must not translate again.
+fn gsi_for_serial(rsdp: Option<bhaskix_boot::PhysAddr>, hhdm: u64) -> u32 {
+    crate::irq::isa_to_gsi(rsdp, hhdm, SERIAL_IRQ)
+}
 
+/// The badge the serial line signals with. One bit, because there is one
+/// source; a second device on the same notification would take another.
+const BADGE: u64 = 1 << 0;
+
+/// The bound notification, as index-plus-one and generation.
+static NOTIFICATION: AtomicU32 = AtomicU32::new(0);
+static NOTIFICATION_GENERATION: AtomicU32 = AtomicU32::new(0);
+/// The claimed handler, packed so it can live in an atomic.
+static HANDLER: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn handler_to_raw(handler: crate::irq::HandlerId) -> u64 {
+    crate::irq::handler_raw(handler)
+}
+
+/// Drains the UART into the ring. Returns how many bytes it took.
+///
+/// Called by the reader after a wake, never from the interrupt handler — the
+/// handler does one thing, and this is the other thing.
+fn drain() -> usize {
     let base = PORT_BASE.load(Ordering::Acquire);
     if base == 0 {
-        return;
+        return 0;
     }
     let port = SerialPort::new(base);
-
+    let mut taken = 0;
     // SAFETY: `install` stored a port whose `init` succeeded, and reading is
-    // the documented way to clear the condition that raised this interrupt.
+    // the documented way to clear the condition that raised the interrupt.
     while let Some(byte) = unsafe { port.read_byte() } {
         push(byte);
+        taken += 1;
     }
+    taken
+}
 
-    // The wake is last, after every byte is visible. A reader woken before the
-    // bytes were published would look, find nothing, and sleep again.
-    let reader = READER.load(Ordering::Acquire);
-    if reader != 0 {
-        crate::sched::wake_from_interrupt(reader);
+/// Drains and acknowledges, in that order.
+///
+/// The order is the rule: an edge raised while the source is masked is lost,
+/// so the device must be empty before it is unmasked. Reversing these two
+/// lines is the bug `docs/driver-model.md` §2 warns about, and it presents as
+/// a console that stops responding under fast typing and nothing at all in
+/// testing.
+pub fn service() -> usize {
+    let taken = drain();
+    let raw = HANDLER.load(Ordering::Acquire);
+    if raw != u64::MAX {
+        let _ = crate::irq::acknowledge(crate::irq::handler_from_raw(raw));
     }
+    taken
 }
 
 /// Adds a byte, dropping it if there is no room.
@@ -173,24 +222,32 @@ pub fn pending() -> bool {
 
 /// Waits for a byte.
 ///
-/// Blocks rather than polls: a shell spinning on an empty ring would keep a
-/// CPU out of idle for as long as nobody typed, which is most of the time, and
-/// would undo M4-10's tickless idle single-handedly.
+/// Blocks on the notification the serial line is bound to. On waking it drains
+/// the UART and acknowledges the source, then takes a byte from the ring.
 pub fn read() -> u8 {
-    // Claim the wake before the first look, not after: a byte arriving in
-    // between would otherwise find no reader recorded and wake nobody.
-    if let Some(id) = crate::sched::current_thread_id() {
-        READER.store(id, Ordering::Release);
-    }
-
     loop {
-        // Mark blocked first, look second. See the module header.
-        crate::sched::mark_blocked();
         if let Some(byte) = try_read() {
-            crate::sched::cancel_block();
             return byte;
         }
-        crate::sched::block_self();
+
+        let index = NOTIFICATION.load(Ordering::Acquire);
+        if index == 0 {
+            // No interrupt path. Nothing will ever arrive, and spinning would
+            // hold a CPU for ever -- so drain by hand and yield, which is what
+            // a machine with no I/O APIC gets.
+            if service() == 0 {
+                crate::sched::yield_now();
+            }
+            continue;
+        }
+
+        let id = crate::notify::NotificationId::from_parts(
+            index - 1,
+            NOTIFICATION_GENERATION.load(Ordering::Relaxed),
+        );
+        let _ = crate::notify::wait(id);
+        INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+        service();
     }
 }
 

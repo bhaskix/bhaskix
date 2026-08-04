@@ -109,15 +109,35 @@ pub enum Rank {
     WaitQueue = 8,
     /// `sched::QUEUES` — one runqueue per CPU.
     SchedRunqueue = 9,
+    /// `notify::ALLOCATION` — creation and destruction of notifications.
+    ///
+    /// Outside the runqueues, because destroying one wakes whoever was
+    /// waiting. The *signal* path takes no lock at all, which is what lets an
+    /// interrupt handler call it.
+    Notifications = 10,
+    /// `irq::HANDLERS` — claimed interrupt sources.
+    ///
+    /// Outside `vectors::TABLE`, because claiming a source takes this and then
+    /// allocates a vector. Nothing goes the other way. They were briefly the
+    /// same rank, which the checker reported on the first boot: two locks of
+    /// one rank have no declared order and can close a cycle just as easily as
+    /// an inversion.
+    IrqHandlers = 11,
+    /// `vectors::TABLE` — who owns which interrupt vector.
+    ///
+    /// A leaf: taken at boot and when a driver claims a source, with nothing
+    /// acquired while it is held. Inside the scheduler's queues because a
+    /// claim never wakes anything.
+    Vectors = 12,
     /// `virtio::DEVICE` — the one block device.
     ///
     /// Inside the scheduler's queues because nothing here wakes a thread: the
     /// driver waits for its device by spinning on a ring the device writes,
     /// not by blocking. Outside the console, because a driver reports what it
     /// found while holding itself.
-    Block = 10,
+    Block = 13,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
-    Console = 11,
+    Console = 14,
 }
 
 impl Rank {
@@ -152,6 +172,9 @@ impl Rank {
             Self::Endpoints => "ipc::TABLE",
             Self::WaitQueue => "wait::WaitQueue",
             Self::SchedRunqueue => "sched::QUEUES",
+            Self::Notifications => "notify::ALLOCATION",
+            Self::IrqHandlers => "irq::HANDLERS",
+            Self::Vectors => "vectors::TABLE",
             Self::Block => "virtio::DEVICE",
             Self::Console => "console::CONSOLE",
         }

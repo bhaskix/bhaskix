@@ -308,10 +308,32 @@ fi
 # programs that the firmware describes rather than the architecture fixes, so
 # the numbers come out of the machine's own tables. The vector is matched
 # exactly because it is a constant this kernel chose.
-if grep -qE "io apic +at 0x[0-9a-f]+, [0-9]+ inputs, [0-9]+ overrides.*irq 4 -> gsi [0-9]+, vector 0x42" "$LOG"; then
+if grep -qE "io apic +at 0x[0-9a-f]+, [0-9]+ inputs, [0-9]+ overrides.*irq 4 -> gsi [0-9]+, vector 0x[0-9a-f]+" "$LOG"; then
     pass "I/O APIC found through ACPI and a device interrupt routed"
 else
     fail "the I/O APIC was not found or the serial line was not routed"
+    status=1
+fi
+
+# The vector allocator (RFC 0011 step 1). The vector is deliberately *not*
+# matched against a constant above: it is allocated at claim time, and a test
+# that pinned it would be asserting the thing the allocator exists to stop
+# anyone depending on. What is asserted instead is that every vector in use has
+# exactly one named owner -- because a collision is now a boot failure, and the
+# table is how a person reading a log after one finds out what happened.
+if grep -qE "vectors +[0-9]+ of 224 allocatable in use" "$LOG"; then
+    missing=""
+    for owner in "apic timer" "tlb shootdown ipi" "reschedule ipi" "serial" "apic error" "apic spurious"; do
+        grep -qE "^ +0x[0-9a-f]{2}  $owner.?\$" "$LOG" || missing="$missing '$owner'"
+    done
+    if [[ -z "$missing" ]]; then
+        pass "every interrupt vector in use has one named owner"
+    else
+        fail "the vector table is missing:$missing"
+        status=1
+    fi
+else
+    fail "no vector table was reported"
     status=1
 fi
 
@@ -355,6 +377,18 @@ if grep -qF "NO IOMMU: this device can reach all of physical memory" "$LOG"; the
     pass "the absent IOMMU is reported rather than silently accepted"
 else
     fail "a DMA-capable device was brought up without saying there is no IOMMU"
+    status=1
+fi
+
+# RFC 0011 step 4: the block driver stops polling. The assertion is a pair of
+# counters rather than a duration -- a request on MSI-X blocks once and spins
+# *never*, and the reverse before the interrupt was claimed. "0 spins" is the
+# number the RFC asks for, and a timing measurement on an emulator could not
+# tell the two apart.
+if grep -qE "virtio-blk irq +msi-x vector 0x[0-9a-f]+; [1-9][0-9]* waits, 0 spins, [1-9][0-9]* interrupts per request" "$LOG"; then
+    pass "the block driver waits on an interrupt and never spins"
+else
+    fail "the block device is still polling, or its interrupt did not arrive"
     status=1
 fi
 

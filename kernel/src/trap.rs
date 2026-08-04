@@ -241,21 +241,23 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             crate::sched::preempt();
         }
 
-        // A byte arrived on the console. The handler drains the UART's FIFO
-        // and wakes whoever is reading; both are lock-free or `try_lock`,
-        // because this may have interrupted the reader itself.
-        crate::input::SERIAL_VECTOR => {
-            crate::input::on_interrupt();
-            // SAFETY: the APIC is initialised -- interrupts cannot be enabled
-            // before it is -- and this acknowledges the interrupt in service.
-            unsafe { apic::end_of_interrupt() };
-        }
-
         // TLB shootdown from another CPU. Acknowledged like any delivered
         // interrupt; the invalidation itself takes no locks, because this CPU
         // may have been interrupted anywhere.
         crate::tlb::SHOOTDOWN_VECTOR => {
             crate::tlb::handle_ipi();
+            // SAFETY: the APIC is initialised -- interrupts cannot be enabled
+            // before it is -- and this acknowledges the interrupt in service.
+            unsafe { apic::end_of_interrupt() };
+        }
+
+        // A device interrupt on a vector something claimed (RFC 0011). The
+        // vector is not a constant here and cannot be: it was allocated at
+        // claim time, which is the whole point of having an allocator. The
+        // handler masks the source and signals a notification -- nothing
+        // else, ever, in interrupt context.
+        vector if crate::irq::is_claimed(vector) => {
+            crate::irq::on_interrupt(vector);
             // SAFETY: the APIC is initialised -- interrupts cannot be enabled
             // before it is -- and this acknowledges the interrupt in service.
             unsafe { apic::end_of_interrupt() };

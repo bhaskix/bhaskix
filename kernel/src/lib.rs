@@ -42,6 +42,7 @@ pub mod ipc;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
+pub mod notify;
 pub mod panic;
 pub mod sched;
 pub mod service;
@@ -54,6 +55,7 @@ pub mod time;
 pub mod tlb;
 pub mod trap;
 pub mod ustar;
+pub mod vectors;
 pub mod vfs;
 pub mod virtio;
 pub mod vm;
@@ -399,6 +401,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     let input_ready = console_input(handoff);
     if input_ready && !shell_self_test() {
         println!("    shell          FAILED");
+    }
+    if input_ready && !block_interrupt_self_test(handoff) {
+        println!("    virtio-blk irq FAILED");
     }
 
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
@@ -1499,6 +1504,85 @@ fn mount_root(handoff: &Handoff) {
     }
 }
 
+/// Moves the block device off polling and onto an interrupt.
+///
+/// Runs after `console_input`, because claiming a source needs the vector
+/// allocator and the I/O APIC that brings up. The assertion is a pair of
+/// counters rather than a duration: **a request on MSI-X blocks once and spins
+/// never**, and the reverse before this ran. A timing measurement could not
+/// tell those apart on an emulator.
+fn block_interrupt_self_test(handoff: &Handoff) -> bool {
+    if !virtio::present() {
+        return true;
+    }
+
+    let vector = match virtio::enable_interrupts(
+        handoff.bsp_lapic_id,
+        handoff.rsdp,
+        handoff.hhdm_base.as_u64(),
+    ) {
+        Ok(vector) => vector,
+        Err(error) => {
+            // Survivable: the driver polls, which is what it did until now.
+            println!("    virtio-blk irq not enabled ({error:?}); the driver polls");
+            return true;
+        }
+    };
+
+    let (_, spins_before) = virtio::waiting();
+    let (delivered_before, _, _) = irq::statistics();
+
+    // One read, with the whole path live.
+    let mut sector = [0u8; 512];
+    let read = virtio::read(8, &mut sector);
+
+    let (waits, spins) = virtio::waiting();
+    let (delivered, strays, unbound) = irq::statistics();
+    let expected = handoff.initrd.unwrap_or(&[]);
+    let matches = expected.len() >= 8 * 512 + 512 && sector == expected[8 * 512..8 * 512 + 512];
+
+    let checks = [
+        ("the read completed", read.is_ok()),
+        ("and returned the right sector", matches),
+        ("the driver waited on an interrupt", waits > 0),
+        (
+            // The number RFC 0011 asks for. Not "fewer spins" -- none.
+            "and did not spin once",
+            spins == spins_before,
+        ),
+        (
+            "the device delivered an interrupt",
+            delivered > delivered_before,
+        ),
+        (
+            "nothing arrived unclaimed or unbound",
+            strays == 0 && unbound == 0,
+        ),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!(
+                "    virtio-blk irq FAILED: {name} ({waits} waits, {} spins, {} deliveries)",
+                spins - spins_before,
+                delivered - delivered_before
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!(
+            "    virtio-blk irq msi-x vector {vector:#04x}; {waits} waits, {} spins, \
+             {} interrupts per request",
+            spins - spins_before,
+            delivered - delivered_before
+        );
+    }
+    ok
+}
+
 /// Brings up the block device and reads from it.
 ///
 /// The disk is the initial ramdisk's own image, attached as a drive. That is
@@ -1632,20 +1716,34 @@ fn console_input(handoff: &Handoff) -> bool {
         }
     };
 
-    // SAFETY: `SERIAL_VECTOR` has a gate -- every vector does -- and its
-    // handler acknowledges the local APIC. From here the line is live.
-    let gsi = match unsafe {
-        irq::route_isa(
-            handoff.rsdp,
-            hhdm,
-            input::SERIAL_IRQ,
-            input::SERIAL_VECTOR,
-            handoff.bsp_lapic_id,
-        )
-    } {
-        Ok(gsi) => gsi,
-        Err(error) => {
-            println!("    io apic        found but not routed: {error:?}");
+    // The vectors the architecture and this kernel fix, registered before
+    // anything can allocate one. A collision here is a boot failure rather
+    // than a machine that behaves strangely -- which is what five constants in
+    // four files could not give (RFC 0011).
+    for (vector, owner) in [
+        (bhaskix_arch::apic::TIMER_VECTOR, "apic timer"),
+        (tlb::SHOOTDOWN_VECTOR, "tlb shootdown ipi"),
+        (sched::RESCHEDULE_VECTOR, "reschedule ipi"),
+        (bhaskix_arch::apic::ERROR_VECTOR, "apic error"),
+        (bhaskix_arch::apic::SPURIOUS_VECTOR, "apic spurious"),
+    ] {
+        if let Err(error) = vectors::reserve(vector, owner) {
+            println!("    vectors        FAILED: {owner} wants {vector:#04x}: {error:?}");
+            return false;
+        }
+    }
+
+    // The console claims its own line through `irq::claim`, which allocates a
+    // vector rather than being told one. Nothing outside `vectors` chooses a
+    // number any more.
+    //
+    // SAFETY: COM1 was initialised by `init_serial` at the top of boot. From
+    // here the line is claimed, a notification is bound to it, and the UART
+    // may raise its interrupt.
+    let vector = match unsafe { input::install(COM1, handoff.bsp_lapic_id, handoff.rsdp, hhdm) } {
+        Ok(vector) => vector,
+        Err(reason) => {
+            println!("    console        FAILED to claim the serial line: {reason}");
             return false;
         }
     };
@@ -1654,21 +1752,18 @@ fn console_input(handoff: &Handoff) -> bool {
     // read is a write that may have gone into a cache line, into the wrong
     // register, or nowhere -- and the symptom is a device that raises no
     // interrupts, which looks like a hardware problem for a long time.
+    let gsi = irq::isa_to_gsi(handoff.rsdp, hhdm, input::SERIAL_IRQ);
     let entry = irq::redirection(gsi).unwrap_or(0);
-    let vector_ok = entry & 0xff == u32::from(input::SERIAL_VECTOR);
+    let vector_ok = entry & 0xff == u32::from(vector);
     let unmasked = entry & (1 << 16) == 0;
     if !vector_ok || !unmasked {
         println!("    io apic        FAILED: entry for gsi {gsi} reads back {entry:#x}");
         return false;
     }
 
-    // SAFETY: COM1 was initialised by `init_serial` at the top of boot, the
-    // line is routed to this CPU above, and the shell -- the only reader -- is
-    // pinned to it.
-    unsafe { input::install(COM1) };
-
+    let (taken, total) = vectors::usage();
     println!(
-        "    io apic        at {:#x}, {} inputs, {} overrides{}; irq {} -> gsi {gsi}, vector {:#04x}",
+        "    io apic        at {:#x}, {} inputs, {} overrides{}; irq {} -> gsi {gsi}, vector {vector:#04x}",
         report.address,
         report.inputs,
         report.overrides,
@@ -1678,8 +1773,9 @@ fn console_input(handoff: &Handoff) -> bool {
             ""
         },
         input::SERIAL_IRQ,
-        input::SERIAL_VECTOR,
     );
+    println!("    vectors        {taken} of {total} allocatable in use:");
+    vectors::for_each(|vector, owner| println!("      {vector:#04x}  {owner}"));
     true
 }
 
@@ -1699,7 +1795,8 @@ fn shell_self_test() -> bool {
     const TYPED: &[u8] = b"ls /\r";
 
     let port = SerialPort::new(COM1);
-    let (_, _, interrupts_before) = input::statistics();
+    let (delivered_before, _, _) = irq::statistics();
+    let (signals_before, _, _) = notify::statistics();
 
     // Drain anything already waiting, so what is counted below is what this
     // test produced.
@@ -1712,9 +1809,19 @@ fn shell_self_test() -> bool {
         // SAFETY: as above.
         unsafe { port.write_byte(*byte) };
     }
-    let arrived = wait_until(input::pending, 500);
+
+    // Wait for the *interrupt*, not for the bytes. Since RFC 0011 the handler
+    // does one thing -- mask the source and signal a notification -- so
+    // nothing reaches the ring until a reader drains the UART. Waiting on the
+    // ring here would be waiting for work this test has not done yet.
+    let arrived = wait_until(|| irq::statistics().0 > delivered_before, 500);
     // SAFETY: as above -- and this must happen before anything is printed.
     unsafe { port.set_loopback(false) };
+
+    // Now do what a reader does: drain the device, *then* acknowledge it. That
+    // order is the rule an edge-triggered source makes load-bearing
+    // (`docs/driver-model.md` §2).
+    let drained = input::service();
 
     let mut received = [0u8; 8];
     let mut count = 0;
@@ -1725,8 +1832,11 @@ fn shell_self_test() -> bool {
         count += 1;
     }
 
-    let (_, dropped, interrupts) = input::statistics();
-    let by_interrupt = interrupts > interrupts_before;
+    let (_, dropped, _) = input::statistics();
+    let (delivered, strays, unbound) = irq::statistics();
+    let (signals, _, _) = notify::statistics();
+    let by_interrupt = delivered > delivered_before;
+    let signalled = signals > signals_before;
 
     // The command half. Run through `shell::run`, which is the same function
     // the interactive loop calls -- so this tests the commands rather than a
@@ -1758,6 +1868,22 @@ fn shell_self_test() -> bool {
         ("a byte typed at the console arrived", arrived),
         ("it arrived by interrupt rather than by luck", by_interrupt),
         (
+            // The delivery path is RFC 0011's, end to end: the handler masked
+            // the source and signalled a notification, and RFC 0010's object
+            // counted it. A handler that quietly did the work itself would
+            // pass every check but this one.
+            "the interrupt signalled a notification",
+            signalled,
+        ),
+        (
+            "nothing arrived on a vector nobody claimed",
+            strays == 0 && unbound == 0,
+        ),
+        (
+            "draining after the wake found the bytes",
+            drained == TYPED.len(),
+        ),
+        (
             "every byte arrived, in order",
             count == TYPED.len() && &received[..count.min(received.len())] == TYPED,
         ),
@@ -1771,7 +1897,7 @@ fn shell_self_test() -> bool {
             println!(
                 "    shell          FAILED: {name} ({count} of {} bytes, {} interrupts, {wrong} of {commands} commands wrong)",
                 TYPED.len(),
-                interrupts - interrupts_before
+                delivered - delivered_before
             );
             ok = false;
         }
@@ -1779,7 +1905,9 @@ fn shell_self_test() -> bool {
 
     if ok {
         println!(
-            "    shell          {commands} commands; {count} bytes read back through the interrupt path"
+            "    shell          {commands} commands; {count} bytes read back through the interrupt path, \
+             {} deliveries signalled a notification",
+            delivered - delivered_before
         );
     }
     ok

@@ -192,6 +192,34 @@ pub unsafe fn route_isa(
     Ok(routing.gsi)
 }
 
+/// Routes an already-translated global interrupt to `vector`.
+///
+/// The counterpart to [`route_isa`], which translates an ISA number through
+/// the firmware's overrides first. A caller that already has a GSI — because
+/// it took one from a claim — must not translate it again: an override applied
+/// twice programs an input nothing is wired to.
+///
+/// # Errors
+///
+/// [`IrqError`] if there is no chip, or it refused the input.
+///
+/// # Safety
+///
+/// As [`route_isa`].
+pub unsafe fn route_gsi(
+    _rsdp: Option<PhysAddr>,
+    _hhdm: u64,
+    gsi: u32,
+    vector: u8,
+    apic_id: u32,
+) -> Result<(), IrqError> {
+    let mut chip = chip().ok_or(IrqError::NotPresent)?;
+    let destination = u8::try_from(apic_id).map_err(|_| IrqError::UnreachableCpu)?;
+    // SAFETY: the caller guarantees a handler for `vector`; the chip is the
+    // one `init` mapped, and this runs on the bootstrap CPU only.
+    unsafe { chip.route(gsi, vector, destination, false, false) }.map_err(|_| IrqError::NotRouted)
+}
+
 /// Reads back the redirection entry for `gsi`.
 ///
 /// For the self-test: a write to a memory-mapped register that is never read
@@ -214,4 +242,523 @@ pub fn present() -> bool {
 #[must_use]
 pub fn inputs() -> u32 {
     INPUTS.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0011: who may receive an interrupt
+// ---------------------------------------------------------------------------
+
+/// Interrupt sources the kernel will track at once.
+pub const MAX_HANDLERS: usize = 16;
+
+/// What an [`IrqHandler`] names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// A legacy line, routed through the I/O APIC.
+    Line {
+        /// The global interrupt number.
+        gsi: u32,
+    },
+    /// One entry of a PCI function's MSI-X table.
+    MessageSignalled {
+        /// Where the device is on the bus.
+        device: bhaskix_arch::pci::Address,
+        /// Which table entry.
+        entry: u16,
+    },
+}
+
+impl Source {
+    /// Whether the kernel keeps this source for itself.
+    ///
+    /// Refused **by name**, not by vector, so the refusal survives the
+    /// allocator moving anything. The timer and the two inter-processor
+    /// interrupts are not lines at all — they are the local APIC's — so the
+    /// list here is the legacy lines a domain must never be able to wedge.
+    #[must_use]
+    pub const fn reserved(&self) -> bool {
+        match self {
+            // The 8254 timer and the cascade line. Neither is used by this
+            // kernel, and both are the kind of thing firmware leaves live.
+            Self::Line { gsi } => *gsi == 0 || *gsi == 2,
+            Self::MessageSignalled { .. } => false,
+        }
+    }
+
+    /// Whether a *domain* may claim this, as opposed to in-nucleus code.
+    ///
+    /// Only message-signalled sources. A legacy line is shared between
+    /// devices, and a holder that never acknowledges masks a line the others
+    /// need — which the kernel cannot fix without a driver for each of them.
+    #[must_use]
+    pub const fn delegable(&self) -> bool {
+        matches!(self, Self::MessageSignalled { .. })
+    }
+}
+
+/// Names a claimed interrupt source.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HandlerId {
+    index: u32,
+    generation: u32,
+}
+
+/// Why a claim, bind or acknowledge failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClaimError {
+    /// Something already holds this source.
+    AlreadyClaimed,
+    /// The kernel keeps this source for itself.
+    Reserved,
+    /// No free handler slot.
+    Exhausted,
+    /// No vector could be allocated.
+    NoVector,
+    /// There is no I/O APIC, or it refused the routing.
+    NotRouted,
+    /// The handler has been released, or the name is stale.
+    Gone,
+}
+
+/// One claimed source. Behind a lock; the interrupt path does not read this.
+#[derive(Clone, Copy)]
+struct Handler {
+    source: Source,
+    vector: u8,
+    generation: u32,
+    live: bool,
+}
+
+/// What the interrupt path needs, per vector, without taking a lock.
+///
+/// The handler table above is behind a `SpinLock` and an interrupt handler
+/// must not take one — so everything the delivery path reads lives here, in
+/// atomics, written at claim time and read in the handler.
+struct Delivery {
+    /// Handler index plus one; zero means the vector is unclaimed.
+    handler: AtomicU32,
+    /// Notification index plus one; zero means nothing is bound.
+    notification: AtomicU32,
+    /// The bound notification's generation.
+    generation: AtomicU32,
+    /// The badge to signal with.
+    badge: AtomicU64,
+    /// The global interrupt to mask, or `u32::MAX` for a message-signalled
+    /// source, which masks differently.
+    gsi: AtomicU32,
+}
+
+impl Delivery {
+    const fn new() -> Self {
+        Self {
+            handler: AtomicU32::new(0),
+            notification: AtomicU32::new(0),
+            generation: AtomicU32::new(0),
+            badge: AtomicU64::new(0),
+            gsi: AtomicU32::new(u32::MAX),
+        }
+    }
+}
+
+static DELIVERY: [Delivery; 256] = [const { Delivery::new() }; 256];
+
+static HANDLERS: crate::sync::SpinLock<[Option<Handler>; MAX_HANDLERS]> =
+    crate::sync::SpinLock::new(crate::sync::Rank::IrqHandlers, [None; MAX_HANDLERS]);
+
+/// Interrupts delivered through a handler, and ones that found no claim.
+static DELIVERED: AtomicU64 = AtomicU64::new(0);
+static STRAYS: AtomicU64 = AtomicU64::new(0);
+/// Deliveries that found a claim with nothing bound to it.
+static UNBOUND: AtomicU64 = AtomicU64::new(0);
+
+/// Claims `source`, allocating a vector and routing it to `apic_id`.
+///
+/// This is `IrqControl::CLAIM`. It is a plain function rather than a
+/// capability method because nothing outside the kernel can reach it yet —
+/// delegation is RFC 0011 step 6 and is blocked on an IOMMU. What it already
+/// enforces is what makes delegation possible later: **a source may be claimed
+/// once**, and reserved sources are refused by name.
+///
+/// # Errors
+///
+/// [`ClaimError`] naming what was refused.
+///
+/// # Safety
+///
+/// The caller must ensure the delivery path is ready to receive on the
+/// allocated vector — which for this kernel means `trap` dispatches unclaimed
+/// vectors to [`on_interrupt`], as it does.
+pub unsafe fn claim(
+    source: Source,
+    owner: &'static str,
+    apic_id: u32,
+    rsdp: Option<PhysAddr>,
+    hhdm: u64,
+) -> Result<HandlerId, ClaimError> {
+    if source.reserved() {
+        return Err(ClaimError::Reserved);
+    }
+
+    let mut handlers = HANDLERS.lock();
+    if handlers
+        .iter()
+        .flatten()
+        .any(|handler| handler.live && handler.source == source)
+    {
+        return Err(ClaimError::AlreadyClaimed);
+    }
+    let index = handlers
+        .iter()
+        .position(Option::is_none)
+        .or_else(|| handlers.iter().position(|h| h.is_none_or(|h| !h.live)))
+        .ok_or(ClaimError::Exhausted)?;
+
+    let vector = crate::vectors::allocate(owner).map_err(|_| ClaimError::NoVector)?;
+
+    // Route it. A line goes through the I/O APIC; a message-signalled source
+    // is programmed into the device, which is step 4 and not yet here.
+    match source {
+        Source::Line { gsi } => {
+            // SAFETY: the caller's obligation -- the vector's handler is
+            // `on_interrupt`, which acknowledges the local APIC.
+            let routed = unsafe { route_gsi(rsdp, hhdm, gsi, vector, apic_id) };
+            if routed.is_err() {
+                let _ = crate::vectors::release(vector);
+                return Err(ClaimError::NotRouted);
+            }
+            DELIVERY[vector as usize]
+                .gsi
+                .store(gsi, core::sync::atomic::Ordering::Relaxed);
+        }
+        Source::MessageSignalled { device, entry } => {
+            // SAFETY: this device is the kernel's, and the caller guarantees a
+            // handler for `vector`.
+            if unsafe { program_msix(device, entry, vector, apic_id, hhdm) }.is_err() {
+                let _ = crate::vectors::release(vector);
+                return Err(ClaimError::NotRouted);
+            }
+        }
+    }
+
+    let generation = handlers[index].map_or(0, |handler| handler.generation.wrapping_add(1));
+    handlers[index] = Some(Handler {
+        source,
+        vector,
+        generation,
+        live: true,
+    });
+
+    // Published last: a non-zero handler is what the delivery path takes as
+    // "this vector is claimed", so it must not be visible before the values
+    // describing it are.
+    DELIVERY[vector as usize]
+        .handler
+        .store(index as u32 + 1, core::sync::atomic::Ordering::Release);
+
+    Ok(HandlerId {
+        index: index as u32,
+        generation,
+    })
+}
+
+/// Binds a notification to a claimed source.
+///
+/// From here, an interrupt on that source signals `notification` with `badge`.
+///
+/// # Errors
+///
+/// [`ClaimError::Gone`] if the handler has been released.
+pub fn bind(
+    id: HandlerId,
+    notification: crate::notify::NotificationId,
+    badge: u64,
+) -> Result<(), ClaimError> {
+    use core::sync::atomic::Ordering;
+    let handlers = HANDLERS.lock();
+    let handler = resolve(&handlers, id).ok_or(ClaimError::Gone)?;
+    let entry = &DELIVERY[handler.vector as usize];
+
+    entry.badge.store(badge, Ordering::Relaxed);
+    entry
+        .generation
+        .store(notification.generation(), Ordering::Relaxed);
+    // Last, for the same reason as above.
+    entry
+        .notification
+        .store(notification.index() + 1, Ordering::Release);
+    Ok(())
+}
+
+/// Unmasks a source after its driver has finished with it.
+///
+/// This is `IrqHandler::ACK`. **Drain the device before calling it:** between
+/// delivery and this the source is masked, and an edge raised while masked is
+/// lost. See `docs/driver-model.md` §2.
+///
+/// # Errors
+///
+/// [`ClaimError::Gone`] if the handler has been released.
+pub fn acknowledge(id: HandlerId) -> Result<(), ClaimError> {
+    let handlers = HANDLERS.lock();
+    let handler = resolve(&handlers, id).ok_or(ClaimError::Gone)?;
+    let Source::Line { gsi } = handler.source else {
+        return Ok(());
+    };
+    drop(handlers);
+
+    let Some(mut chip) = chip() else {
+        return Err(ClaimError::NotRouted);
+    };
+    // Interrupts off across the index/data pair: the same window an interrupt
+    // handler uses to mask, and the chip has one of each.
+    let enabled = bhaskix_arch::cpu::interrupts_enabled();
+    if enabled {
+        // SAFETY: restored below on every path.
+        unsafe { bhaskix_arch::cpu::disable_interrupts() };
+    }
+    // SAFETY: the chip `init` mapped; this CPU is the only one touching the
+    // index/data pair while interrupts are off here.
+    let outcome = unsafe { chip.unmask(gsi) };
+    if enabled {
+        // SAFETY: they were enabled on entry.
+        unsafe { bhaskix_arch::cpu::enable_interrupts() };
+    }
+    outcome.map_err(|_| ClaimError::NotRouted)
+}
+
+/// Releases a claim: masks the source permanently and frees the vector.
+pub fn release(id: HandlerId) -> bool {
+    use core::sync::atomic::Ordering;
+    let mut handlers = HANDLERS.lock();
+    let Some(handler) = resolve(&handlers, id) else {
+        return false;
+    };
+    let vector = handler.vector;
+
+    // The delivery path stops seeing it before anything else changes.
+    DELIVERY[vector as usize]
+        .handler
+        .store(0, Ordering::Release);
+    DELIVERY[vector as usize]
+        .notification
+        .store(0, Ordering::Release);
+
+    if let Source::Line { gsi } = handler.source
+        && let Some(mut chip) = chip()
+    {
+        // SAFETY: the chip `init` mapped. Masked rather than left live: a
+        // device still raising an interrupt nobody owns would be a stray on
+        // every assertion, for ever.
+        let _ = unsafe { chip.mask(gsi) };
+    }
+    let _ = crate::vectors::release(vector);
+
+    if let Some(slot) = handlers.get_mut(id.index as usize)
+        && let Some(entry) = slot.as_mut()
+    {
+        entry.live = false;
+    }
+    true
+}
+
+fn resolve(handlers: &[Option<Handler>; MAX_HANDLERS], id: HandlerId) -> Option<Handler> {
+    let handler = (*handlers.get(id.index as usize)?)?;
+    (handler.live && handler.generation == id.generation).then_some(handler)
+}
+
+/// Whether `vector` has been claimed.
+#[must_use]
+pub fn is_claimed(vector: u8) -> bool {
+    DELIVERY[vector as usize]
+        .handler
+        .load(core::sync::atomic::Ordering::Acquire)
+        != 0
+}
+
+/// Services an interrupt on a claimed vector.
+///
+/// **Mask, signal, and nothing else.** The mask is what stops a
+/// level-triggered line re-asserting the instant this returns — and it is also
+/// flow control, so a slow driver gets fewer interrupts rather than a storm.
+/// The signal is lock-free by RFC 0010's design, which was chosen for exactly
+/// this caller.
+///
+/// The local APIC is acknowledged by the dispatcher, after this returns.
+pub fn on_interrupt(vector: u8) {
+    use core::sync::atomic::Ordering;
+    let entry = &DELIVERY[vector as usize];
+
+    if entry.handler.load(Ordering::Acquire) == 0 {
+        STRAYS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    DELIVERED.fetch_add(1, Ordering::Relaxed);
+
+    let gsi = entry.gsi.load(Ordering::Relaxed);
+    if gsi != u32::MAX
+        && let Some(mut chip) = chip()
+    {
+        // SAFETY: the chip `init` mapped, and this runs with interrupts
+        // already disabled, so nothing else on this CPU is between the index
+        // and the data write.
+        let _ = unsafe { chip.mask(gsi) };
+    }
+
+    let notification = entry.notification.load(Ordering::Acquire);
+    if notification == 0 {
+        UNBOUND.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let id = crate::notify::NotificationId::from_parts(
+        notification - 1,
+        entry.generation.load(Ordering::Relaxed),
+    );
+    let _ = crate::notify::signal(id, entry.badge.load(Ordering::Relaxed));
+}
+
+/// Interrupts delivered, strays, and deliveries with nothing bound.
+#[must_use]
+pub fn statistics() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        DELIVERED.load(Relaxed),
+        STRAYS.load(Relaxed),
+        UNBOUND.load(Relaxed),
+    )
+}
+
+/// The vector a handler was given, for reporting.
+#[must_use]
+pub fn vector_of(id: HandlerId) -> Option<u8> {
+    let handlers = HANDLERS.lock();
+    resolve(&handlers, id).map(|handler| handler.vector)
+}
+
+/// Translates an ISA interrupt number to the global interrupt it arrives on.
+///
+/// Once, at claim time. Everything downstream works in the translated number,
+/// because an override applied twice programs an input nothing is wired to.
+#[must_use]
+pub fn isa_to_gsi(rsdp: Option<PhysAddr>, hhdm: u64, irq: u8) -> u32 {
+    let Some(rsdp) = rsdp else {
+        return u32::from(irq);
+    };
+    // SAFETY: the tables were mapped by `init` and are not unmapped.
+    let madt = unsafe {
+        acpi::madt(rsdp.as_u64(), hhdm, &mut |physical, length| {
+            ensure_mapped(physical, length, hhdm)
+        })
+    };
+    madt.map_or(u32::from(irq), |madt| madt.route(irq).gsi)
+}
+
+/// Packs a handler name into one word, so a caller can keep it in an atomic.
+///
+/// The delivery path is lock-free and its clients are too; a two-field name
+/// that cannot be stored atomically would push them all back to a lock.
+#[must_use]
+pub const fn handler_raw(id: HandlerId) -> u64 {
+    ((id.index as u64) << 32) | id.generation as u64
+}
+
+/// Unpacks [`handler_raw`].
+#[must_use]
+pub const fn handler_from_raw(raw: u64) -> HandlerId {
+    HandlerId {
+        index: (raw >> 32) as u32,
+        generation: raw as u32,
+    }
+}
+
+/// The PCI capability identifier for MSI-X.
+const CAP_MSIX: u8 = 0x11;
+
+/// Programs one MSI-X table entry to deliver `vector` to `apic_id`.
+///
+/// **Kernel-side, and never delegated** (RFC 0011). An MSI is a memory write
+/// the device performs: an address in the local APIC's window and a data word
+/// that *is* the vector. A holder that could program it could point any
+/// device's interrupt at any vector on any CPU, which is an
+/// interrupt-injection primitive obtained by writing two words.
+///
+/// The consequence for whoever hands out MMIO capabilities is in
+/// `docs/driver-model.md` §3: **a device's MSI-X table pages must never be
+/// inside one.**
+///
+/// # Errors
+///
+/// [`ClaimError::NotRouted`] if the device has no MSI-X capability, too few
+/// entries, or its table cannot be mapped.
+///
+/// # Safety
+///
+/// The device must be the kernel's, and `vector` must have a handler that
+/// acknowledges the local APIC.
+unsafe fn program_msix(
+    device: bhaskix_arch::pci::Address,
+    entry: u16,
+    vector: u8,
+    apic_id: u32,
+    hhdm: u64,
+) -> Result<(), ClaimError> {
+    use bhaskix_arch::pci;
+
+    let mut capability = None;
+    // SAFETY: configuration reads on the bootstrap CPU during boot.
+    unsafe {
+        pci::for_each_capability(device, |found| {
+            if found.id == CAP_MSIX {
+                capability = Some(found.offset);
+                return false;
+            }
+            true
+        });
+    }
+    let offset = capability.ok_or(ClaimError::NotRouted)?;
+
+    // SAFETY: the capability the walk just found, on a device the kernel owns.
+    let (table_base, entries) = unsafe {
+        let control = pci::read16(device, offset + 2);
+        let entries = (control & 0x7ff) + 1;
+        let table = pci::read32(device, offset + 4);
+        let bir = (table & 0b111) as u8;
+        let within = u64::from(table & !0b111);
+
+        let pci::Bar::Memory { address, .. } = pci::bar(device, bir) else {
+            return Err(ClaimError::NotRouted);
+        };
+        (address + within, entries)
+    };
+
+    if entry >= entries {
+        return Err(ClaimError::NotRouted);
+    }
+
+    // One entry is four 32-bit words: address low, address high, data, and a
+    // vector control word whose bit 0 is the per-entry mask.
+    const ENTRY_BYTES: u64 = 16;
+    let table = crate::mmio::map(table_base, ENTRY_BYTES * u64::from(entries), hhdm)
+        .ok_or(ClaimError::NotRouted)?;
+    let slot = table + ENTRY_BYTES * u64::from(entry);
+
+    // SAFETY: `slot` is inside the mapped MSI-X table of this device, and the
+    // layout is the four words the specification fixes.
+    unsafe {
+        // Masked while it is programmed, so a device that fires mid-write does
+        // not deliver a half-written vector.
+        core::ptr::write_volatile((slot + 12) as *mut u32, 1);
+        core::ptr::write_volatile(slot as *mut u32, 0xfee0_0000 | (apic_id << 12));
+        core::ptr::write_volatile((slot + 4) as *mut u32, 0);
+        core::ptr::write_volatile((slot + 8) as *mut u32, u32::from(vector));
+        // Unmasked last.
+        core::ptr::write_volatile((slot + 12) as *mut u32, 0);
+    }
+
+    // Enable MSI-X, and clear the function mask that would hold every entry.
+    // SAFETY: the message control word of the capability just walked to.
+    unsafe {
+        let control = pci::read16(device, offset + 2);
+        pci::write16(device, offset + 2, (control | (1 << 15)) & !(1 << 14));
+    }
+    Ok(())
 }

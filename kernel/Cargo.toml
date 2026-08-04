@@ -77,4 +77,10 @@ workspace = true
 # every one of these accesses is not a thread and holds no lock -- which is
 # exactly why each block says which frame it is touching and who else may be
 # looking at it.
-unsafe_budget = 800
+# 860 at M6-07, RFC 0011 steps 1-4. The increase is one function: programming
+# an MSI-X table entry, which is four volatile writes to a mapped device table
+# plus the configuration accesses that find it. It is deliberately the only
+# place that does so -- an MSI is a device write of an arbitrary vector to an
+# arbitrary CPU, so this is the code the RFC says must never be delegated, and
+# keeping it in one function is what makes "never delegated" checkable.
+unsafe_budget = 860
