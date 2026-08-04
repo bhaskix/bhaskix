@@ -136,6 +136,11 @@ For this to work, a service must obey four rules, enforced by the crate's lint c
    provides.
 4. No panics on input. Malformed messages return errors; they do not unwind.
 
+A note that arrives with [RFC 0009](rfc/0009-shared-memory.md): today's services move bytes in
+message registers, which is placement-independent *by accident* — there is nothing to map either
+way. Once a bulk path uses shared memory, the two placements genuinely differ in what they map, and
+the both-placements CI job below stops being a formality.
+
 **The caveat, stated plainly:** "write once, place anywhere" is a claim many systems have made and
 few have delivered. The usual failure is that in-nucleus services quietly acquire direct calls,
 shared statics, and pointer-passing, and the userspace placement rots. Our mitigations are (a) CI

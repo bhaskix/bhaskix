@@ -132,6 +132,11 @@ Order within the phase is flexible; dependencies are noted.
 - **Process management** — fork/exec-equivalent (capability-shaped, not POSIX-shaped), process trees,
   reaping, signals-equivalent
 - **Full VFS** — mount points, a writable filesystem with a journal, page cache
+- **Shared memory and notifications** — [RFC 0009](rfc/0009-shared-memory.md) (accepted) and
+  [RFC 0010](rfc/0010-notifications.md): a `Memory` object a capability names, and a doorbell to go
+  with it. Between them they complete RFC 0008's answer to A3, and they precede everything below:
+  a service framework whose bulk paths move sixteen bytes per round trip is a framework nobody will
+  measure twice
 - **Service framework** — the `Service` trait, both placements, and the CI job that builds both
   (this is the milestone that makes [architecture.md](architecture.md) §2 true rather than aspirational)
 - **Driver framework** — PCIe/ECAM enumeration, `register_block!`, `Mmio<T>`, mock-MMIO test harness

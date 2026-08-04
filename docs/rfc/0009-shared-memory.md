@@ -2,11 +2,29 @@
 
 | | |
 |---|---|
-| **Status** | **Draft — for discussion.** |
+| **Status** | ✅ **Accepted 2026-08-04.** Resolves **SM1**, and its own unresolved question 1. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`cap`, `vm`, `syscall`), mm |
 | **Milestone** | Phase 2 — required before user-mode drivers or any bulk data path |
 | **Depends on** | [RFC 0008](0008-syscall-and-ipc-shape.md) (which promises this), [security.md](../security.md) §2, [memory.md](../memory.md) §3 and §5 |
+
+---
+
+> **Accepted 2026-08-04 by the project lead.**
+>
+> **This acceptance answers unresolved question 1**, which the RFC marked as
+> "decided by the project owner, before implementation starts": the simpler
+> model is taken, and **`ObjectKind::Untyped` is deleted**. Kernel memory is
+> not retyped from untyped capabilities by userspace; a `Memory` object is
+> allocated from a domain's `ResourceEnvelope`. That is a real divergence from
+> the seL4 lineage this design otherwise follows, and the cost — accounting
+> that is a quota rather than an exact partition of physical memory — is
+> accepted with it.
+>
+> Questions 2 through 5 remain open and are the implementation's to answer.
+>
+> The argument below is now immutable, per the document ownership table in
+> `TRACKER.md`. A change of mind is a new RFC that supersedes this one.
 
 ---
 

@@ -163,6 +163,17 @@ The `RangeMap` is the source of truth; the page table is a *cache* of it. On a p
 the `RangeMap` to decide whether the fault is legal, then populate the page table. This is what makes
 demand paging, COW, and file-backed mappings uniform instead of three special cases.
 
+`Shared{..}` is made concrete by [RFC 0009](rfc/0009-shared-memory.md) (accepted): the region names a
+kernel-owned `Memory` object rather than frames of its own. Two invariants come with it, and the
+second is the one that will be got wrong:
+
+- **The frames belong to the object, not to the address space.** Tearing down an address space must
+  not free them. The frame-leak gate is what catches this, and it should be pointed at exactly this
+  case when the code lands.
+- **Revoking the capability unmaps the region**, from every address space that mapped it, before the
+  revoke returns — because a revoked capability whose pages are still mapped is not revoked, it is
+  renamed. See `security.md` §2 rule 3.
+
 ### W^X is absolute
 
 `Protection` cannot represent write+execute. There is no flag to override it, no boot parameter, and
@@ -262,7 +273,12 @@ impl DmaWindow {
 }
 ```
 
-- A driver receives a `DmaCapability` naming exactly the frames it may map. It cannot widen it.
+- A driver receives a `DmaCapability` naming exactly the frames it may map. It cannot widen it. The
+  object it names is [RFC 0009](rfc/0009-shared-memory.md)'s `Memory`, and the window it maps into is
+  [RFC 0012](rfc/0012-iommu.md)'s `DmaWindow` — one object, mapped into a domain's address space and
+  into a device's, rather than two kinds of memory region. **Until an IOMMU exists, a device-visible
+  `Memory` object may be held only by in-nucleus code**: handing one to a domain would be handing it
+  the machine while telling it otherwise.
 - Device addresses (`DevAddr`) are a distinct type from `PhysAddr`. They are not interchangeable and
   the compiler will say so.
 - Unmapping invalidates the IOMMU TLB before returning. A stale IOMMU entry is a live exploit.

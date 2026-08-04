@@ -76,7 +76,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **A2** | Syscall ABI shape | ✅ **Accepted** 2026-08-04 | **Capability invocation**, six syscall kinds, all authority arriving as a capability argument. A numbered table is ambient authority and discards the project's central claim on the first syscall. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
 | **A3** | IPC style | ✅ **Accepted** 2026-08-04 | **Synchronous rendezvous** is primitive; async is shared memory plus a notification capability, one layer up. Buffering forces the nucleus to answer "whose memory is it", and every answer is a denial of service or the synchronous behaviour with extra steps. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
 | **A4** | Userspace ABI | ✅ **Accepted** 2026-08-04 | **Capability-shaped**, and the native ABI *is* A2's syscall interface — there is no separate document to write. Consequence: no native `libc`; the roadmap's Phase 2 libc belongs to the Linux personality. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
-| **SM1** | Shared memory | ⬜ Draft | A **`Memory` object**: frames a capability names, mapped into the holder's *own* address space with rights no wider than the capability, unmapped from everywhere before a `revoke` returns. Completes RFC 0008's answer to **A3** — which promised shared memory and did not build it, so bulk data currently moves sixteen bytes per round trip. Its one architectural fork is whether `Untyped` memory exists at all. | [RFC 0009](docs/rfc/0009-shared-memory.md) |
+| **SM1** | Shared memory | ✅ **Accepted** 2026-08-04 | A **`Memory` object**: frames a capability names, mapped into the holder's *own* address space with rights no wider than the capability, unmapped from everywhere before a `revoke` returns. Completes RFC 0008's answer to **A3** — which promised shared memory and did not build it, so bulk data currently moves sixteen bytes per round trip. Its one architectural fork — whether `Untyped` memory exists at all — **was resolved by acceptance**: it does not. | [RFC 0009](docs/rfc/0009-shared-memory.md) |
 | **NF1** | Notifications | ⬜ Draft | A **`Notification` object**: one word of pending badge bits, at most one waiter, signalled without blocking and safely from an interrupt handler. Completes the other half of RFC 0008's answer to **A3**. Its immediate consequence is that `virtio-blk` can stop polling and `input.rs`'s hand-written reader becomes an instance of a general object. Interrupt *delivery* is ready; who may *claim* a line needs an `IRQHandler` object and its own RFC. | [RFC 0010](docs/rfc/0010-notifications.md) |
 | **IR1** | Interrupt authority | ⬜ Draft | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU, and the RFC says so rather than implying otherwise. | [RFC 0011](docs/rfc/0011-irq-handler.md) |
 | **IO1** | IOMMU | ⬜ Draft | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Asks for a roadmap change**: discovery and per-device domains move from Phase 3 to Phase 2, because they are what make a driver's bugs containable. | [RFC 0012](docs/rfc/0012-iommu.md) |
@@ -501,6 +501,34 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (RFC 0009 accepted — and a fork closed with it)
+
+- **Shared memory is decided.** A `Memory` object a capability names, mapped into the holder's *own*
+  address space, unmapped from everywhere before a `revoke` returns.
+- **The fork is closed in the direction the RFC proposed: `Untyped` memory does not exist.** The RFC
+  marked that question "decided by the project owner, before implementation starts", and acceptance
+  is that decision. Kernel memory is not retyped from untyped capabilities by userspace; a `Memory`
+  object comes out of a domain's `ResourceEnvelope`. **This is a deliberate divergence from the seL4
+  lineage the rest of the design follows**, and the cost is accepted with it: accounting becomes a
+  quota rather than an exact partition of physical memory. `ObjectKind::Untyped` is deleted when the
+  code lands.
+- **No testing debt on acceptance**, unlike RFC 0008. Everything in RFC 0009's plan is about code
+  that does not exist yet, and its fuzz-target answer is an explicit "none, and here is why" — the
+  offsets arrive in registers and are range-checked, so there is no structure being parsed. The one
+  item that touches existing machinery is a note to point the frame-leak gate at shared regions when
+  they land, which is now written into `memory.md` §3 rather than left in an RFC nobody rereads.
+- **Four documents changed.** `memory.md` §3 gains the two invariants that come with `Shared` backing
+  — the frames belong to the object, and revocation unmaps before it returns. `memory.md` §5 records
+  that a `DmaCapability` names a `Memory` object, and that a device-visible one is kernel-only until
+  there is an IOMMU. `architecture.md` §2 notes that today's services are placement-independent *by
+  accident*, because there is nothing to map either way, and that shared memory is what makes the
+  both-placements CI job stop being a formality. `roadmap.md` Phase 2 gains the item, placed before
+  the service framework — a framework whose bulk paths move sixteen bytes per round trip is one
+  nobody will measure twice.
+- **Questions 2–5 stay open** and belong to the implementation: whether an object must be physically
+  contiguous, `MAX_MAPPINGS`, and whether a mapping may be resized. Question 3 was already answered
+  by RFC 0010 existing.
 
 ### 2026-08-04 (RFC 0008 accepted — and the commitment that came with it)
 
