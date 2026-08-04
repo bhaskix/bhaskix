@@ -2,11 +2,32 @@
 
 | | |
 |---|---|
-| **Status** | **Draft — for discussion.** Resolves open decisions **A2**, **A3** and **A4**. |
+| **Status** | ✅ **Accepted 2026-08-04.** Resolves open decisions **A2**, **A3** and **A4**. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel; new subsystems `cap`, `ipc`, `syscall` |
 | **Milestone** | M5 — decision required before M5-03 |
 | **Depends on** | [architecture.md](../architecture.md) §3–4, [security.md](../security.md) §2, [RFC 0005](0005-linux-abi-compatibility.md) |
+
+---
+
+> **Accepted 2026-08-04 by the project lead**, per
+> [GOVERNANCE.md](../../GOVERNANCE.md) — architecture direction and open
+> decisions A1–A5 are the lead's call, after an RFC with a public rationale.
+>
+> What acceptance covers: the six syscall kinds and their register convention,
+> capability invocation as the only route to authority, synchronous rendezvous
+> as the IPC primitive, and a capability-shaped native ABI. Thirteen milestones
+> were built against this document before it was accepted; that was recorded in
+> `TRACKER.md` at the time as building on a recommendation rather than a
+> decision, and the note now comes off.
+>
+> The **unresolved questions below remain open.** Two have since been answered
+> by implementation rather than by argument, and `TRACKER.md` records which —
+> this document is not edited to claim it foresaw them.
+>
+> The argument above and below this note is unchanged and, per the document
+> ownership table in `TRACKER.md`, is now immutable. A change of mind is a new
+> RFC that supersedes this one.
 
 ---
 

@@ -73,9 +73,9 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **K1** | Storage implementation | ⬜ Draft | **Kosh** — RFC 0003's layers made concrete, plus distribution. Elastic from one node, RF=1…n, block/file/object/key-value, asynchronous geo. Commits to the row RFC 0003 marked *not committed*, and is explicit that the first years are single-node. | [RFC 0006](docs/rfc/0006-kosh-distributed-storage.md) |
 | **U1** | Live patching | ⬜ Draft | Nucleus-only, stop-the-world quiescence, declared-patchable functions. Narrows rather than expands: service domains restart instead, and A/B reboot stays the default. Its **P0 prerequisites** — a build identifier and an attestation format that can express "image plus patches" — are cheap now and painful to retrofit. | [RFC 0007](docs/rfc/0007-livepatch.md) |
 | **C1** | Binary compatibility | ⬜ Draft | Linux `x86_64` ABI as a **domain personality**, not the native interface. First target deliberately narrow: statically linked Go binaries. Answers **A4** by refusing its premise — own ABI natively *and* Linux compatibility as something offered. | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
-| **A2** | Syscall ABI shape | ⬜ Draft | **Capability invocation**, six syscall kinds, all authority arriving as a capability argument. A numbered table is ambient authority and discards the project's central claim on the first syscall. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
-| **A3** | IPC style | ⬜ Draft | **Synchronous rendezvous** is primitive; async is shared memory plus a notification capability, one layer up. Buffering forces the nucleus to answer "whose memory is it", and every answer is a denial of service or the synchronous behaviour with extra steps. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
-| **A4** | Userspace ABI | ⬜ Draft | **Capability-shaped**, and the native ABI *is* A2's syscall interface — there is no separate document to write. Consequence: no native `libc`; the roadmap's Phase 2 libc belongs to the Linux personality. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
+| **A2** | Syscall ABI shape | ✅ **Accepted** 2026-08-04 | **Capability invocation**, six syscall kinds, all authority arriving as a capability argument. A numbered table is ambient authority and discards the project's central claim on the first syscall. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
+| **A3** | IPC style | ✅ **Accepted** 2026-08-04 | **Synchronous rendezvous** is primitive; async is shared memory plus a notification capability, one layer up. Buffering forces the nucleus to answer "whose memory is it", and every answer is a denial of service or the synchronous behaviour with extra steps. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
+| **A4** | Userspace ABI | ✅ **Accepted** 2026-08-04 | **Capability-shaped**, and the native ABI *is* A2's syscall interface — there is no separate document to write. Consequence: no native `libc`; the roadmap's Phase 2 libc belongs to the Linux personality. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 | **SM1** | Shared memory | ⬜ Draft | A **`Memory` object**: frames a capability names, mapped into the holder's *own* address space with rights no wider than the capability, unmapped from everywhere before a `revoke` returns. Completes RFC 0008's answer to **A3** — which promised shared memory and did not build it, so bulk data currently moves sixteen bytes per round trip. Its one architectural fork is whether `Untyped` memory exists at all. | [RFC 0009](docs/rfc/0009-shared-memory.md) |
 | **NF1** | Notifications | ⬜ Draft | A **`Notification` object**: one word of pending badge bits, at most one waiter, signalled without blocking and safely from an interrupt handler. Completes the other half of RFC 0008's answer to **A3**. Its immediate consequence is that `virtio-blk` can stop polling and `input.rs`'s hand-written reader becomes an instance of a general object. Interrupt *delivery* is ready; who may *claim* a line needs an `IRQHandler` object and its own RFC. | [RFC 0010](docs/rfc/0010-notifications.md) |
 | **IR1** | Interrupt authority | ⬜ Draft | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU, and the RFC says so rather than implying otherwise. | [RFC 0011](docs/rfc/0011-irq-handler.md) |
@@ -264,10 +264,10 @@ fairness within 2% for two equal-weight workloads.
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
-| M5-00 | Decide the syscall and IPC shape | ⬜ `DRAFT` | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) answers **A2**, **A3** and **A4**. Blocks M5-03 onwards; does *not* block M5-01. |
+| M5-00 | Decide the syscall and IPC shape | ✅ `DONE` | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) **accepted 2026-08-04**, answering **A2**, **A3** and **A4**. Thirteen milestones were built against it first; the code needed no change on acceptance, which is the outcome the alternative — waiting — would also have produced, more slowly and with less evidence. |
 | M5-01 | Capability objects, CSpace, derive/revoke | ✅ `DONE` | All four rules of `docs/security.md` §2 enforced and **each negative-tested**. Derivation monotonicity tested over every one of 64×64 rights pairs, not sampled. |
 | M5-02 | `Domain` with `ResourceEnvelope` | ✅ `DONE` | Envelope refuses at allocation time (T10); CPU share **divided** among a domain's threads so it does not grow with thread count; destruction revokes the domain's whole derived subtree. **Negative-tested** in both directions. |
-| M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | ✅ `DONE` | Exercised for real as of M5-04: ten system calls from ring 3 per boot. Built on RFC 0008's recommendation rather than its acceptance. |
+| M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | ✅ `DONE` | Exercised for real as of M5-04: ten system calls from ring 3 per boot. Built on RFC 0008's recommendation; **accepted 2026-08-04** with no change to this code. |
 | M5-04 | Ring 3 execution | ✅ `DONE` | A program runs in ring 3, enters the kernel through `SYSCALL`, and is interrupted there. **Negative-tested**: removing the interrupt-entry `swapgs` or leaving `RSP0` zero both fail the gate. |
 | M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`/`Recv`, badges | ✅ `DONE` | Rendezvous, no buffering. Exercised through the whole syscall path — domain, CSpace, capability, type check, badge. **Negative-tested**: taking the badge from the caller's frame makes the service unable to tell its clients apart. |
 | M5-05b | IPC from ring 3 | ✅ `DONE` | A user program calls a service by capability, blocks, is woken across CPUs, and receives the reply — proved by sending the value back. **Negative-tested**: with no capability, or no domain, the syscalls still happen and reach nothing. |
@@ -501,6 +501,41 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (RFC 0008 accepted — and the commitment that came with it)
+
+- **A2, A3 and A4 are decided.** Capability invocation with six syscall kinds; synchronous
+  rendezvous as the IPC primitive; a capability-shaped native ABI. Thirteen milestones were built
+  against the recommendation before the verdict, and **no code changed on acceptance** — which is
+  the outcome waiting would also have produced, more slowly and with less evidence. The note in
+  M5-03's entry saying this was a risk stays, struck through, because a risk that is only recorded
+  when it turns out badly is a record that flatters the project.
+- **Accepting an RFC accepts its testing plan.** RFC 0008's said: *"a fuzz target on syscall
+  argument decoding, before user mode can be reached by anything untrusted."* Untrusted code has
+  been reaching it since M6-05 and no such target existed. It does now, and it asserts something
+  stronger than "no panic": that **no frame a caller can write produces authority** — every
+  capability in the CSpace after an arbitrary system call still names the object it named before,
+  with rights within what was granted.
+- **The first version of that harness could not fail.** It seeded the domain with `Rights::ALL`, so
+  "nothing can widen its rights" was a statement about a set with nothing above it. Seeded with
+  three rights instead, and negative-tested by removing the monotonicity check in `cap::derive_owned`
+  — caught at seed 932, slot 6, `Rights(43)` outside `Rights(49)`.
+- **Two of the RFC's five unresolved questions were answered by implementation, not by argument**,
+  and the RFC is not edited to claim it foresaw them:
+
+  | Question | Answer, and where it came from |
+  |---|---|
+  | Q2 — how large is a register-carried message? | **Four registers.** RFC 0009 explains what happens to anything larger; M6-05 measured the cost at sixteen bytes per round trip |
+  | Q5 — how many capability slots per CSpace, and is it fixed? | **64, fixed.** `cap::CSPACE_SLOTS`; fixed keeps allocation off the invocation path, as the RFC hoped |
+  | Q1 — does `Recv` need a timeout? | Still open. Nothing has hung yet, which is not evidence |
+  | Q3 — does `Call` donate the sender's slice? | Still open. Not implemented |
+  | Q4 — how does telemetry name a capability? | Still open. There is no telemetry plane |
+
+- **Three design documents changed, as the RFC's impact table said they would.**
+  `architecture.md` §3 gains the six kinds and why there is no numbered table; `security.md` §2's
+  four rules become a table of named functions and the tests that check them — each of which has
+  been shown to fail; `roadmap.md` records that a native program links no libc, with M6-05's shell
+  as the demonstration.
 
 ### 2026-08-04 (M6 — every task built, and one exit criterion that is not met)
 
@@ -843,8 +878,11 @@ harness run outside CI — a decision, not a task.
 - **"Never had one" and "had one, revoked" stay distinct status codes.** Collapsing them would make
   a revocation bug indistinguishable from a caller bug, which is the confusion a security review
   can least afford.
-- **Built on RFC 0008's recommendation, not its acceptance.** The decision is still a draft awaiting
-  a verdict; if A2 or A3 is answered differently, this is the code that changes.
+- **Built on RFC 0008's recommendation, not its acceptance.** ~~The decision is still a draft
+  awaiting a verdict; if A2 or A3 is answered differently, this is the code that changes.~~
+  **Resolved: RFC 0008 was accepted on 2026-08-04 and this code did not change.** The risk was real
+  when it was written and it did not materialise, which is worth recording either way — a note that
+  is only kept when it turns out badly is a note that flatters the project.
 
 ### 2026-08-04 (M5-02, domains and the resource envelope)
 

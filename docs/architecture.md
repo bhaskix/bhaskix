@@ -171,6 +171,31 @@ Properties we commit to:
 - **Badges are set by the granter.** A service can therefore identify its callers without trusting
   them, which is what makes RBAC implementable in userspace.
 
+### The interface a domain sees
+
+[RFC 0008](rfc/0008-syscall-and-ipc-shape.md), accepted 2026-08-04, fixes it at
+**six system-call kinds and no seventh without an RFC**:
+
+| Kind | Meaning |
+|---|---|
+| `Invoke` | Perform a method on the object a capability names |
+| `Call` | `Invoke`, then block for a reply; creates a one-shot reply capability |
+| `Reply` | Answer a `Call`, consuming the reply capability |
+| `Recv` | Block until a message arrives on an endpoint |
+| `Yield` | Give up the rest of this thread's slice |
+| `Exit` | Terminate this thread |
+
+There is no numbered syscall table, because a numbered table is ambient
+authority: a call that names *what to do* without naming *what to do it to*
+discards the claim above on the first syscall. Everything a domain can reach,
+it reaches by naming a capability it holds — which is why the shell at M6-05
+can be given a console and a filesystem and nothing else, and why a slot it was
+not given is refused by the kernel before any service is involved.
+
+A message is four registers. Anything larger travels as a capability to shared
+memory ([RFC 0009](rfc/0009-shared-memory.md)), and anything asynchronous is
+that plus a notification ([RFC 0010](rfc/0010-notifications.md)).
+
 Role-based access control (Phase 3) is a userspace policy service that hands out capabilities. It is
 built *on* this mechanism, not *instead of* it. Details: [security.md](security.md).
 

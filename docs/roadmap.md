@@ -99,7 +99,9 @@ lock-rank assertions clean. Fairness test: two equal-weight workloads get 50/50 
 
 - Capability objects, CSpace, derive/revoke with transitive revocation
 - `Domain` with `ResourceEnvelope`
-- `SYSCALL`/`SYSRET` entry, syscall dispatch, SMAP bracketing
+- `SYSCALL`/`SYSRET` entry, syscall dispatch, SMAP bracketing — the interface is
+  specified by [RFC 0008](rfc/0008-syscall-and-ipc-shape.md) (accepted): six syscall
+  kinds, all authority arriving as a capability argument
 - Ring 3 execution
 - Synchronous IPC (call/reply) with badges
 
@@ -138,7 +140,11 @@ Order within the phase is flexible; dependencies are noted.
 - **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
   sovereignty milestone the boot shim was designed to enable)
 - **Package management** and image building
-- **libc** — enough for real userspace software
+- **libc** — enough for real userspace software. Belongs to the **Linux personality**
+  ([RFC 0005](rfc/0005-linux-abi-compatibility.md)), not to native userspace: RFC 0008
+  is accepted, and the native ABI *is* the capability interface, so a native program
+  links no libc at all. The user-mode shell at M6-05 is the demonstration — it has no
+  runtime and could not have one
 
 **Exit:** Bhaskix self-hosts its own userspace utilities, does useful network I/O, and boots on its
 own bootloader.

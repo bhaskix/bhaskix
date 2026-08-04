@@ -899,4 +899,158 @@ mod tests {
         assert_eq!(Status::SlotUnavailable.as_u64(), 11);
         assert_eq!(Status::QuotaExceeded.as_u64(), 12);
     }
+
+    /// The same deterministic generator the other harnesses use.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            if bound == 0 {
+                0
+            } else {
+                (self.next() % bound as u64) as usize
+            }
+        }
+
+        /// A value drawn from the numbers that break arithmetic, or a random
+        /// one. Uniform draws never land on a boundary; `elf`'s harness
+        /// measured how badly, and this one is written knowing it.
+        fn interesting(&mut self) -> u64 {
+            const EDGES: [u64; 10] = [
+                0,
+                1,
+                6,
+                63,
+                64,
+                u64::MAX,
+                u64::MAX - 1,
+                1 << 63,
+                0x7fff_ffff_ffff_ffff,
+                0xffff_ffff,
+            ];
+            if self.below(2) == 0 {
+                EDGES[self.below(EDGES.len())]
+            } else {
+                self.next()
+            }
+        }
+    }
+
+    /// The fuzz target [RFC 0008](../../docs/rfc/0008-syscall-and-ipc-shape.md)'s
+    /// testing plan commits to: *"a fuzz target on syscall argument decoding,
+    /// before user mode can be reached by anything untrusted"*.
+    ///
+    /// Every field of a system-call frame is chosen by ring 3. `dispatch_with`
+    /// and `invoke_capability` are the two functions that read them, and both
+    /// are pure by construction — they resolve, rearrange authority, and
+    /// return, without blocking — which is what makes this testable on the
+    /// host at all rather than only by booting.
+    ///
+    /// What is asserted is not "no panic". It is that **nothing a caller can
+    /// write in a register produces authority**: every frame either fails, or
+    /// succeeds against a capability that was already in the CSpace before the
+    /// call. A fuzzer that only checked for panics would pass a kernel that
+    /// handed out capabilities to anyone who asked in the right order.
+    #[test]
+    fn a_mutation_harness_never_lets_a_frame_invent_authority() {
+        let iterations: usize = std::env::var("BHASKIX_FUZZ_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20_000);
+
+        for seed in 0..iterations as u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d).wrapping_add(13));
+
+            // A domain holding exactly one capability, to an endpoint, with
+            // *some* of the rights. Deliberately not `Rights::ALL`: a seed
+            // capability that already held everything would make "no frame can
+            // widen its rights" a statement with nothing to widen, and the
+            // check below would pass against a kernel that ignored
+            // monotonicity entirely. It did, when this was first written.
+            const GRANTED: Rights = Rights::from_bits(
+                Rights::READ.bits() | Rights::DERIVE.bits() | Rights::REVOKE.bits(),
+            );
+
+            let mut arena = Arena::new();
+            let mut cspace = CSpace::new();
+            let root = arena
+                .insert_root(ObjectRef::new(ObjectKind::Endpoint, 7), GRANTED, 0)
+                .expect("a fresh arena has room");
+            cspace.install_at(0, root).expect("slot 0 is free");
+            let before = arena.live();
+
+            let mut f = SyscallFrame {
+                kind: rng.interesting(),
+                capability: rng.interesting(),
+                method: rng.interesting(),
+                arg0: rng.interesting(),
+                arg1: rng.interesting(),
+                arg2: rng.interesting(),
+                arg3: rng.interesting(),
+                ..SyscallFrame::default()
+            };
+
+            // Both readers of the frame, because they decode different fields:
+            // `dispatch_with` reads the kind and the capability index, and
+            // `invoke_capability` reads the method and all four arguments.
+            let outcome = dispatch_with(&mut f, &cspace, &arena);
+            assert!(
+                outcome.status == Status::Ok || outcome.value == 0,
+                "seed {seed}: a failed call returned a value"
+            );
+
+            let f = SyscallFrame {
+                kind: Kind::Invoke as u64,
+                capability: rng.interesting(),
+                method: rng.interesting(),
+                arg0: rng.interesting(),
+                arg1: rng.interesting(),
+                arg2: rng.interesting(),
+                arg3: rng.interesting(),
+                ..SyscallFrame::default()
+            };
+            let _ = invoke_capability(&f, 0, &mut cspace, &mut arena);
+
+            // The invariant that matters. A frame may legitimately *derive* a
+            // capability -- that is what `Invoke` is for -- but every one it
+            // produces must descend from the one this domain already held, and
+            // the arena must never lose track of how many exist.
+            let after = arena.live();
+            assert!(
+                after >= before.saturating_sub(1),
+                "seed {seed}: capabilities vanished without a revoke"
+            );
+
+            for index in 0..crate::cap::CSPACE_SLOTS {
+                let Some(slot) = cspace.get(index) else {
+                    continue;
+                };
+                let Some((object, rights)) = arena.lookup(slot) else {
+                    continue;
+                };
+                assert_eq!(
+                    object.kind,
+                    ObjectKind::Endpoint,
+                    "seed {seed}: slot {index} names an object kind nothing granted"
+                );
+                assert_eq!(
+                    object.id, 7,
+                    "seed {seed}: slot {index} names another object"
+                );
+                assert!(
+                    GRANTED.contains(rights),
+                    "seed {seed}: slot {index} holds rights nobody had to give -- \
+                     {rights:?} is not within {GRANTED:?}"
+                );
+            }
+        }
+    }
 }

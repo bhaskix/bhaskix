@@ -92,6 +92,19 @@ you do not.
    service authenticate its callers without trusting them — and therefore what lets RBAC live in
    userspace.
 
+Since [RFC 0008](rfc/0008-syscall-and-ipc-shape.md) was accepted and M5 implemented it, these are
+statements about named functions with named tests rather than aspirations:
+
+| Rule | Enforced by | Checked by |
+|---|---|---|
+| 1 — unforgeable | `cap::CSpace`; a domain holds a slot index, never a pointer | A ring 3 program is refused a slot it was not given, before any service is reached (M6-05) |
+| 2 — monotone derivation | `cap::Arena::derive`, one function | Exhaustive over all 64×64 rights pairs, on the host |
+| 3 — immediate transitive revocation | `cap::Arena::destroy_subtree`, a fixed-point sweep | A derivation tree is revoked at an interior node and every descendant is dead *before the call returns* — and ring 3 revokes its own derived capability and finds the next call refused (M5-07) |
+| 4 — granter-set badges | The badge is copied from the capability by the kernel and is never read from the caller's frame | Taking the badge from the frame instead makes a service unable to tell its callers apart, which fails the gate (M5-05) |
+
+**Each of those checks has been shown to fail** when the rule it guards is deliberately broken. A
+gate that has never failed is a gate nobody has tested.
+
 ### RBAC is policy, built on this mechanism
 
 Phase 3's role-based security is a userspace service (`bhaskixd-authz`) that holds capabilities and
