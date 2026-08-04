@@ -534,58 +534,6 @@ pub fn interrupt_driven() -> bool {
 /// # Errors
 ///
 /// [`BlockError`] if the source could not be claimed or bound.
-pub fn enable_interrupts(
-    apic_id: u32,
-    rsdp: Option<bhaskix_boot::PhysAddr>,
-    hhdm: u64,
-) -> Result<u8, BlockError> {
-    /// The badge the device signals with.
-    const BADGE: u64 = 1 << 0;
-
-    let mut guard = DEVICE.lock();
-    let device = guard.as_mut().ok_or(BlockError::NotPresent)?;
-
-    let notification = crate::notify::create().map_err(|_| BlockError::OutOfMemory)?;
-    // SAFETY: `trap` dispatches claimed vectors to `irq::on_interrupt`, which
-    // acknowledges the local APIC.
-    let handler = unsafe {
-        crate::irq::claim(
-            crate::irq::Source::MessageSignalled {
-                device: device.address,
-                entry: 0,
-            },
-            "virtio-blk",
-            apic_id,
-            rsdp,
-            hhdm,
-        )
-    }
-    .map_err(|_| BlockError::NotModern)?;
-
-    crate::irq::bind(handler, notification, BADGE).map_err(|_| BlockError::NotModern)?;
-
-    // Tell the device which MSI-X entry its queue and its configuration
-    // changes use. Read back: the device reports `0xffff` if it could not take
-    // the vector, and a driver that did not check would then wait for an
-    // interrupt that was never going to arrive.
-    // SAFETY: the mapped common configuration of the device this driver owns.
-    let accepted = unsafe {
-        write16(device.common + common::QUEUE_SELECT, 0);
-        write16(device.common + common::QUEUE_MSIX_VECTOR, 0);
-        write16(device.common + common::CONFIG_MSIX_VECTOR, 0);
-        read16(device.common + common::QUEUE_MSIX_VECTOR) == 0
-    };
-    if !accepted {
-        crate::irq::release(handler);
-        crate::notify::destroy(notification);
-        return Err(BlockError::NotModern);
-    }
-
-    device.notification = Some(notification);
-    device.handler = Some(handler);
-    Ok(crate::irq::vector_of(handler).unwrap_or(0))
-}
-
 /// The status byte the device reports, read back from its registers.
 ///
 /// `0x0f` is a device that has acknowledged, accepted the feature set, and
@@ -627,6 +575,92 @@ pub fn location() -> Option<(u8, u8, u8)> {
     })
 }
 
+/// Claims the device's first MSI-X entry and binds a notification to it.
+///
+/// Called after bring-up, because it needs the vector allocator and the I/O
+/// APIC — and because a device that is not yet configured has nothing to
+/// interrupt about. Failure is survivable: the driver polls, and says so.
+///
+/// # Errors
+///
+/// [`BlockError`] if the source could not be claimed or bound.
+pub fn enable_interrupts(
+    apic_id: u32,
+    rsdp: Option<bhaskix_boot::PhysAddr>,
+    hhdm: u64,
+) -> Result<u8, BlockError> {
+    /// The badge the device signals with.
+    const BADGE: u64 = 1 << 0;
+
+    // Where the device is, and nothing else, under the lock. Everything that
+    // follows takes locks ranking *below* this driver's -- the notification
+    // arena, the interrupt handlers, the vector allocator, the heap for the
+    // MSI-X mapping -- and holding this one across them is the inversion the
+    // lock-order checker reported six times over. It is the same mistake
+    // `read` made, in the same module, on the same lock.
+    let address = {
+        let guard = DEVICE.lock();
+        guard.as_ref().ok_or(BlockError::NotPresent)?.address
+    };
+
+    let notification = crate::notify::create().map_err(|_| BlockError::OutOfMemory)?;
+    // SAFETY: `trap` dispatches claimed vectors to `irq::on_interrupt`, which
+    // acknowledges the local APIC.
+    let handler = unsafe {
+        crate::irq::claim(
+            crate::irq::Source::MessageSignalled {
+                device: address,
+                entry: 0,
+            },
+            "virtio-blk",
+            apic_id,
+            rsdp,
+            hhdm,
+        )
+    }
+    .map_err(|_| BlockError::NotModern)?;
+
+    if crate::irq::bind(handler, notification, BADGE).is_err() {
+        crate::irq::release(handler);
+        crate::notify::destroy(notification);
+        return Err(BlockError::NotModern);
+    }
+    let vector = crate::irq::vector_of(handler).unwrap_or(0);
+
+    // Now the device's own registers, with nothing else acquired while the
+    // lock is held.
+    let accepted = {
+        let mut guard = DEVICE.lock();
+        let device = guard.as_mut().ok_or(BlockError::NotPresent)?;
+
+        // Tell the device which MSI-X entry its queue and its configuration
+        // changes use. Read back: the device reports `0xffff` if it could not
+        // take the vector, and a driver that did not check would wait for an
+        // interrupt that was never going to arrive.
+        // SAFETY: the mapped common configuration of the device this driver
+        // owns.
+        let accepted = unsafe {
+            write16(device.common + common::QUEUE_SELECT, 0);
+            write16(device.common + common::QUEUE_MSIX_VECTOR, 0);
+            write16(device.common + common::CONFIG_MSIX_VECTOR, 0);
+            read16(device.common + common::QUEUE_MSIX_VECTOR) == 0
+        };
+        if accepted {
+            device.notification = Some(notification);
+            device.handler = Some(handler);
+        }
+        accepted
+    };
+
+    if !accepted {
+        // Outside the lock, for the reason above.
+        crate::irq::release(handler);
+        crate::notify::destroy(notification);
+        return Err(BlockError::NotModern);
+    }
+    Ok(vector)
+}
+
 /// Reads `buffer.len()` bytes starting at `sector`.
 ///
 /// The length must be a whole number of sectors and must fit in the driver's
@@ -644,18 +678,39 @@ pub fn read(sector: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
         return Err(BlockError::TooLarge);
     }
 
+    // One request at a time, enforced by a flag rather than by holding the
+    // device lock across the wait.
+    //
+    // Holding it was the first version, and it was wrong in a way the
+    // lock-order checker named: waiting means blocking, blocking takes a
+    // runqueue lock and an interrupt-handler lock, and both rank *below* this
+    // driver's. A spinlock held across a block is also what M4-08 exists to
+    // refuse -- `block_self` will not switch away from a thread holding one,
+    // so the "sleep" was a spin with a lock held, the worst of both.
+    let _request = Request::acquire()?;
+
+    let (notification, handler) = {
+        let mut guard = DEVICE.lock();
+        let device = guard.as_mut().ok_or(BlockError::NotPresent)?;
+
+        let sectors = buffer.len() as u64 / SECTOR;
+        if sector
+            .checked_add(sectors)
+            .is_none_or(|end| end > device.capacity)
+        {
+            return Err(BlockError::OutOfRange);
+        }
+
+        device.submit(sector, buffer.len() as u32)?;
+        (device.notification, device.handler)
+    };
+
+    // Outside every lock. This is the part that may take milliseconds.
+    let outcome = await_completion(notification, handler);
+
     let mut guard = DEVICE.lock();
     let device = guard.as_mut().ok_or(BlockError::NotPresent)?;
-
-    let sectors = buffer.len() as u64 / SECTOR;
-    if sector
-        .checked_add(sectors)
-        .is_none_or(|end| end > device.capacity)
-    {
-        return Err(BlockError::OutOfRange);
-    }
-
-    device.submit(sector, buffer.len() as u32)?;
+    outcome?;
 
     // SAFETY: `buffer` names the frame the device just wrote into, through the
     // direct map, and the length was bounded to that frame above.
@@ -669,8 +724,104 @@ pub fn read(sector: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
     Ok(())
 }
 
+/// Serialises requests without a spinlock, so the waiting happens with no lock
+/// held at all.
+///
+/// A spinlock cannot be held across a block; this can, because the scheduler
+/// does not know about it — a contending thread yields rather than spinning,
+/// so the CPU goes to whoever is doing useful work.
+struct Request;
+
+static IN_FLIGHT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+impl Request {
+    fn acquire() -> Result<Self, BlockError> {
+        let deadline = crate::time::now()
+            + crate::time::micros(REQUEST_TIMEOUT_MICROS).unwrap_or(u64::MAX / 2);
+        loop {
+            if IN_FLIGHT
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(Self);
+            }
+            if crate::time::now() >= deadline {
+                return Err(BlockError::TimedOut);
+            }
+            crate::sched::yield_now();
+        }
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Waits for the outstanding request, holding nothing.
+///
+/// Blocks on the notification when one is bound and spins when one is not. The
+/// bound is kept either way: a device that has stopped answering must not stop
+/// the kernel, so the interrupt-driven path arms its own deadline and blocks
+/// *once* per pass, which is what `notify::wait_once` exists for.
+fn await_completion(
+    notification: Option<crate::notify::NotificationId>,
+    handler: Option<crate::irq::HandlerId>,
+) -> Result<(), BlockError> {
+    let deadline =
+        crate::time::now() + crate::time::micros(REQUEST_TIMEOUT_MICROS).unwrap_or(u64::MAX / 2);
+
+    loop {
+        // The completion check needs the device, so it takes the lock -- and
+        // gives it straight back, without blocking while it is held.
+        let finished = {
+            let mut guard = DEVICE.lock();
+            let device = guard.as_mut().ok_or(BlockError::NotPresent)?;
+            device.completed()
+        };
+
+        if let Some(status) = finished {
+            // Acknowledge *after* reading the completion and outside the
+            // device lock: an edge raised while the source is masked is lost,
+            // so the device must be read empty first, and `acknowledge` takes
+            // a lock ranking below this driver's.
+            if let Some(handler) = handler {
+                let _ = crate::irq::acknowledge(handler);
+            }
+            COMPLETED.fetch_add(1, Ordering::Relaxed);
+            return if status == 0 {
+                Ok(())
+            } else {
+                Err(BlockError::Failed)
+            };
+        }
+
+        if crate::time::now() >= deadline {
+            TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            if let Some(handler) = handler {
+                let _ = crate::irq::acknowledge(handler);
+            }
+            return Err(BlockError::TimedOut);
+        }
+
+        match notification {
+            Some(id) => {
+                WAITS.fetch_add(1, Ordering::Relaxed);
+                if crate::notify::wait_once(id).is_err() {
+                    return Err(BlockError::TimedOut);
+                }
+            }
+            None => {
+                SPINS.fetch_add(1, Ordering::Relaxed);
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
 impl Device {
-    /// Puts one read on the ring, rings the bell, and waits for the answer.
+    /// Puts one read on the ring and rings the bell. Does not wait.
     fn submit(&mut self, sector: u64, length: u32) -> Result<(), BlockError> {
         let header = RequestHeader {
             kind: BLK_IN,
@@ -737,72 +888,27 @@ impl Device {
             // Ring the bell.
             write16(self.notify, 0);
         }
-
-        self.wait()
+        Ok(())
     }
 
-    /// Waits for the used ring to advance, bounded.
+    /// Whether the outstanding request has finished, and its status byte.
     ///
-    /// Blocks on a notification when one is bound, and spins when one is not.
-    /// The bound is kept either way: a device that has stopped answering must
-    /// not stop the kernel, so the interrupt-driven path arms a timer and
-    /// blocks *once*, which is what `notify::wait_once` exists for.
-    fn wait(&mut self) -> Result<(), BlockError> {
-        let deadline = crate::time::now()
-            + crate::time::micros(REQUEST_TIMEOUT_MICROS).unwrap_or(u64::MAX / 2);
-
-        loop {
-            // SAFETY: the used ring's index, in a frame this driver allocated
-            // and the device writes to. Volatile because it changes without
-            // this code writing it, which is the entire question being asked.
-            let published = unsafe { core::ptr::read_volatile((self.used.1 + 2) as *const u16) };
-            if published != self.used_index {
-                fence(Ordering::SeqCst);
-                self.used_index = published;
-                COMPLETED.fetch_add(1, Ordering::Relaxed);
-
-                // SAFETY: the status byte the device was told to write, in the
-                // driver's own frame.
-                let status = unsafe { read8(self.request.1 + 16) };
-
-                // Acknowledge *after* reading the completion, never before.
-                // Between delivery and this the source is masked, and an edge
-                // raised while masked is lost -- so the device must be read
-                // empty first (`docs/driver-model.md` §2).
-                if let Some(handler) = self.handler {
-                    let _ = crate::irq::acknowledge(handler);
-                }
-
-                return if status == 0 {
-                    Ok(())
-                } else {
-                    Err(BlockError::Failed)
-                };
-            }
-
-            if crate::time::now() >= deadline {
-                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                if let Some(handler) = self.handler {
-                    let _ = crate::irq::acknowledge(handler);
-                }
-                return Err(BlockError::TimedOut);
-            }
-
-            match self.notification {
-                Some(id) => {
-                    WAITS.fetch_add(1, Ordering::Relaxed);
-                    // One block. Whether it was the device or the deadline
-                    // that ended it is decided by the loop, not here.
-                    if crate::notify::wait_once(id).is_err() {
-                        return Err(BlockError::TimedOut);
-                    }
-                }
-                None => {
-                    SPINS.fetch_add(1, Ordering::Relaxed);
-                    core::hint::spin_loop();
-                }
-            }
+    /// Takes no lock and never blocks: the caller holds the device lock for
+    /// exactly this call and waits outside it.
+    fn completed(&mut self) -> Option<u8> {
+        // SAFETY: the used ring's index, in a frame this driver allocated and
+        // the device writes to. Volatile because it changes without this code
+        // writing it, which is the entire question being asked.
+        let published = unsafe { core::ptr::read_volatile((self.used.1 + 2) as *const u16) };
+        if published == self.used_index {
+            return None;
         }
+        fence(Ordering::SeqCst);
+        self.used_index = published;
+
+        // SAFETY: the status byte the device was told to write, in the
+        // driver's own frame.
+        Some(unsafe { read8(self.request.1 + 16) })
     }
 }
 

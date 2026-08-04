@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-04 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07, M6-08 (RFC 0011 steps 1–4, RFC 0009 steps 1–4) · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07, M6-08 (RFC 0011 steps 1–4, RFC 0009 steps 1–5) · CI green |
 
 ### Division of responsibility between documents
 
@@ -127,7 +127,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-03 | ELF64 loader, with a fuzz target | ✅ `DONE` | Ring 3 now runs `bin/probe`, a separately built ET_EXEC loaded out of the initrd, mapped at the addresses and with the permissions **its own headers** name. **Negative-tested**: dropping one segment fails the gate; a deliberately reintroduced wrap bug is caught by the mutation harness at seed 424. |
 | M6-04 | Kernel shell | ✅ `DONE` | The console reads: ACPI walk → I/O APIC → IRQ 4 → a vector → a lock-free ring → a blocking read. Nine read-only commands, run by the boot self-test through the same function the prompt calls. **Negative-tested**: draining one byte per interrupt fails the boot gate; removing the wake-up passes it and fails `shell-test.sh`, which is why that test exists. |
 | M6-05 | User-mode shell over the syscall interface | ✅ `DONE` | The machine boots to a shell in ring 3 holding two capabilities and nothing else: console and filesystem, both reached by IPC, sixteen bytes per round trip. `shell=kernel` selects the ring 0 one. **Negative-tested**: withholding the filesystem capability makes `caps` report it, both filesystem commands fail, and everything else keeps working. |
-| M6-08 | RFC 0009 steps 1–4: `Memory` objects, mapping, revocation, transfer | ✅ `DONE` | An object is frames, a length and an owner, charged to a `ResourceEnvelope` and released when it goes; `Backing::Shared` lets an address space borrow frames it does not own. `ObjectKind::Untyped` deleted, per the RFC's acceptance. **Negative-tested**: a `destroy` that leaks four frames fails the gate. The teardown invariant — a destroyed address space must not free a shared region's frames — is asserted directly rather than inferred. Step 3 adds the reverse map, the revocation walk and the shootdown: after `revoke` returns the pages are gone from the *page tables*, which is what grants access. **Negative-tested** twice: a `destroy` that leaks four frames, and a `revoke` that removes the bookkeeping but leaves the page-table entry. Step 4 gives an object a capability that can be granted: two domains reach the same frames at different addresses, the recipient's rights are narrower, and one revoke takes it from both. |
+| M6-08 | RFC 0009 steps 1–5: `Memory` objects, mapping, revocation, transfer, the channel | ✅ `DONE` | An object is frames, a length and an owner, charged to a `ResourceEnvelope` and released when it goes; `Backing::Shared` lets an address space borrow frames it does not own. `ObjectKind::Untyped` deleted, per the RFC's acceptance. **Negative-tested**: a `destroy` that leaks four frames fails the gate. The teardown invariant — a destroyed address space must not free a shared region's frames — is asserted directly rather than inferred. Step 3 adds the reverse map, the revocation walk and the shootdown: after `revoke` returns the pages are gone from the *page tables*, which is what grants access. **Negative-tested** twice: a `destroy` that leaks four frames, and a `revoke` that removes the bookkeeping but leaves the page-table entry. Step 4 gives an object a capability that can be granted: two domains reach the same frames at different addresses, the recipient's rights are narrower, and one revoke takes it from both. Step 5 adds the ring layout in `abi`, which touches no memory and keeps that crate's `unsafe` budget at zero. |
 | M6-07 | RFC 0011 steps 1–4: a vector allocator, `IrqHandler`, and a driver that stops polling | ✅ `DONE` | One registry for all 256 vectors; `IrqControl`/`IrqHandler` with exclusive claims and reserved sources; the delivery path is mask → signal a notification → acknowledge. RFC 0010's `Notification` landed with it, because step 3 binds one. `input.rs` and `virtio-blk` are both clients now rather than special cases. **Negative-tested**: leaving the notification unbound fails the gate. |
 | M6-06 | `virtio-blk` driver | ✅ `DONE` | PCI enumeration, modern virtio 1.0 discovered through the device's own capability list, a split virtqueue driven by DMA. `root=disk` mounts the filesystem off the device, so the user-mode shell is a file the driver read. **Negative-tested**: a driver that ignored the sector number reads sector zero four times and fails the gate, because the disk is the ramdisk image and the kernel has the same bytes from the bootloader to compare against. |
 
@@ -503,6 +503,85 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (the rendezvous that stalled, and the machine that could see it)
+
+- **A second machine changed the answer.** The same ISO that passes here failed the IPC self-test
+  **fourteen times in forty** on a two-socket Xeon with real parallelism. Not a new bug: `7925e38`
+  fails it 4 in 8. It has been in `main` for weeks, under a suite that runs every boot once, on a
+  host whose QEMU is old enough that its four vCPUs rarely execute at the same instant.
+- **What it was.** A receiver marks itself `Blocked` *before* checking its mailbox, so a wake
+  arriving in the gap is not lost -- the rule M4-09 arrived at. That leaves a window where the
+  thread is marked blocked **and still running**. Once it has taken the message out of its mailbox,
+  the wake that would have rescued it is already spent, and `preempt` returns a thread to `Ready`
+  only if it was `Running`. A tick landing between "take the message" and "clear the mark" switches
+  the thread out blocked, holding the message, unwakeable: no future sender wakes a receiver it has
+  already matched. `take_message_awake` now does both halves under one hold of the runqueue lock,
+  which `preempt` reaches with `try_lock` and therefore declines to interrupt.
+- **Four wrong theories, each killed by a counter.** Dropped handover: `dropped 0`. Lost wakeup:
+  `wake missed 0`. Message stranded in a mailbox: `mailboxes 0` -- and *that* reading was itself
+  wrong, sampled after teardown had freed the mailboxes, so it reported "no message anywhere" for a
+  message that was in one at the time the test gave up. The trace ring settled it: `recv got` was
+  the last thing that ever happened.
+- **The lesson is about the harness, not the kernel.** Every gate here boots once. That is enough
+  for a fault that is always there and worthless for one that depends on where a tick lands, and a
+  one-in-three failure looks like a pass often enough to be believed. `tests/qemu/soak-test.sh`
+  repeats a boot and reports how many passed -- deliberately at low concurrency, because
+  oversubscribing the host serialises the guest's CPUs and hid this bug completely at 24 boots at
+  once.
+- **Fourth tooling blind spot this milestone**, after the frame-leak gate's phantom sixteen frames,
+  the harness that blamed the kernel for QEMU's disk lock, and the lock check that ran before the
+  code it was checking. The shape does not change: **the check was fine, and it was not looking at
+  the thing.**
+
+### 2026-08-04 (three lock inversions, and the check that was looking the wrong way)
+
+- **`make test` failed after RFC 0009 step 5, on code that had nothing to do with it.** The
+  lock-order detector reported `blocking on sched::QUEUES while holding virtio::DEVICE` — the block
+  driver waiting for its interrupt **while holding the device lock**, which M6-07 shipped and every
+  gate passed.
+- **Worse than a rank inversion.** M4-08 established that `block_self` will not switch away from a
+  thread holding a spinlock. So that "sleep" was a *spin with a lock held* — the worst of both, and
+  invisible because the reply came back fast enough in an emulator.
+- **The same mistake three times, in one milestone.** `virtio::read` waiting; `virtio::enable_interrupts`
+  claiming an IRQ, creating a notification and mapping MSI-X; `irq::claim` mapping a register window.
+  The pattern each time: **take the lock on the thing you own, then go and do everything else while
+  still holding it.** It reads naturally and it is wrong every time, because everything else ranks
+  lower. All three now hold the lock for exactly the state that needs protecting and do the work
+  outside it — `claim` reserves its slot first, so exclusivity survives the gap.
+- **The reason it shipped: `lock_ordering_self_test` ran at line 395**, before the I/O APIC, the
+  block driver's interrupt path, the memory objects and the services. It verified the code that runs
+  *before it*, which is not what anyone reading "0 violations" would take it to mean. There is now a
+  second check at the end of bring-up, against a baseline, with its own boot gate.
+- **This is the third tooling blind spot this milestone**, after the frame-leak gate's phantom
+  sixteen frames and the harness that blamed the kernel for QEMU's disk lock. The shape is the same
+  each time: **the check was fine, and it was not looking at the thing.**
+
+### 2026-08-04 (RFC 0009 step 5 — a channel that cannot be double-fetched)
+
+- **The ring lives in `abi` and touches no memory.** It computes where bytes go and whether a pair
+  of indices can be believed; the loads and stores belong to whichever side owns the mapping, which
+  is the side that can state the safety obligation. `abi`'s `unsafe` budget stays at zero, and the
+  crate now says why it does *not* exempt `undocumented_unsafe_blocks` in tests the way the others
+  do: an exemption there would be permission for something that must not appear.
+- **The double-fetch rule is structural rather than documentary.** `Cursor` is constructed from
+  *numbers*, never from a reference to the region, so by the time a caller holds one there is
+  nothing left to re-read. RFC 0009's security section asked for "copy out before validating"; this
+  makes writing it the other way impossible rather than discouraged.
+- **Untrusted indices are refused, not clamped.** A clamped index is a number that looks usable and
+  describes memory nobody wrote. What to do about a peer whose indices cannot both be true — drop
+  it, log it, restart the channel — is the caller's policy, and this layer says only that the
+  numbers are not believable.
+- **Two test failures, and one of them was the test.** An empty `Run` named offset zero, which is
+  inside the header where the *other side's index* lives; nothing copies zero bytes there today, and
+  that is not a property of the type. And I asserted that a wrapped pair (`head = 0`,
+  `tail = u64::MAX`) should be refused — **a misreading of my own design**: free-running indices
+  wrap, the subtraction wraps with them, and that pair is one outstanding byte. The test now asserts
+  it is accepted, which documents the seam.
+- **The test worth keeping** is the exhaustive one: every index and length a ring of that size can
+  produce, asserting no run ever names a byte outside the data area. An off-by-one there writes into
+  the peer's index, which is the one bug in this module that would be a security problem rather than
+  a corruption.
 
 ### 2026-08-04 (RFC 0009 step 4 — two domains, one object)
 

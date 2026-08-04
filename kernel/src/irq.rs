@@ -395,65 +395,95 @@ pub unsafe fn claim(
     rsdp: Option<PhysAddr>,
     hhdm: u64,
 ) -> Result<HandlerId, ClaimError> {
+    use core::sync::atomic::Ordering;
+
     if source.reserved() {
         return Err(ClaimError::Reserved);
     }
 
-    let mut handlers = HANDLERS.lock();
-    if handlers
-        .iter()
-        .flatten()
-        .any(|handler| handler.live && handler.source == source)
-    {
-        return Err(ClaimError::AlreadyClaimed);
-    }
-    let index = handlers
-        .iter()
-        .position(Option::is_none)
-        .or_else(|| handlers.iter().position(|h| h.is_none_or(|h| !h.live)))
-        .ok_or(ClaimError::Exhausted)?;
+    // Reserve a slot under the lock, and do nothing else under it.
+    //
+    // Routing a source maps a register window, which takes the heap -- a lock
+    // ranking *below* this one. Holding this across that is an inversion, and
+    // it is the third time this pattern has appeared in this milestone: take
+    // the thing you own, then go and do everything else while still holding
+    // it. It reads naturally and it is wrong every time, because everything
+    // else ranks lower.
+    let (index, generation) = {
+        let mut handlers = HANDLERS.lock();
+        if handlers
+            .iter()
+            .flatten()
+            .any(|handler| handler.live && handler.source == source)
+        {
+            return Err(ClaimError::AlreadyClaimed);
+        }
+        let index = handlers
+            .iter()
+            .position(|slot| slot.is_none_or(|handler| !handler.live))
+            .ok_or(ClaimError::Exhausted)?;
 
-    let vector = crate::vectors::allocate(owner).map_err(|_| ClaimError::NoVector)?;
+        let generation = handlers[index].map_or(0, |handler| handler.generation.wrapping_add(1));
+        // Claimed immediately, so a second caller cannot take the same source
+        // or the same slot while this one is out of the lock doing the work.
+        handlers[index] = Some(Handler {
+            source,
+            vector: 0,
+            generation,
+            live: true,
+        });
+        (index, generation)
+    };
 
-    // Route it. A line goes through the I/O APIC; a message-signalled source
-    // is programmed into the device, which is step 4 and not yet here.
-    match source {
+    let undo = |index: usize| {
+        let mut handlers = HANDLERS.lock();
+        if let Some(Some(handler)) = handlers.get_mut(index) {
+            handler.live = false;
+        }
+    };
+
+    let Ok(vector) = crate::vectors::allocate(owner) else {
+        undo(index);
+        return Err(ClaimError::NoVector);
+    };
+
+    // Route it, holding nothing.
+    let routed = match source {
         Source::Line { gsi } => {
             // SAFETY: the caller's obligation -- the vector's handler is
             // `on_interrupt`, which acknowledges the local APIC.
-            let routed = unsafe { route_gsi(rsdp, hhdm, gsi, vector, apic_id) };
-            if routed.is_err() {
-                let _ = crate::vectors::release(vector);
-                return Err(ClaimError::NotRouted);
+            let outcome = unsafe { route_gsi(rsdp, hhdm, gsi, vector, apic_id) };
+            if outcome.is_ok() {
+                DELIVERY[vector as usize].gsi.store(gsi, Ordering::Relaxed);
             }
-            DELIVERY[vector as usize]
-                .gsi
-                .store(gsi, core::sync::atomic::Ordering::Relaxed);
+            outcome.is_ok()
         }
         Source::MessageSignalled { device, entry } => {
             // SAFETY: this device is the kernel's, and the caller guarantees a
             // handler for `vector`.
-            if unsafe { program_msix(device, entry, vector, apic_id, hhdm) }.is_err() {
-                let _ = crate::vectors::release(vector);
-                return Err(ClaimError::NotRouted);
-            }
+            unsafe { program_msix(device, entry, vector, apic_id, hhdm) }.is_ok()
         }
+    };
+
+    if !routed {
+        let _ = crate::vectors::release(vector);
+        undo(index);
+        return Err(ClaimError::NotRouted);
     }
 
-    let generation = handlers[index].map_or(0, |handler| handler.generation.wrapping_add(1));
-    handlers[index] = Some(Handler {
-        source,
-        vector,
-        generation,
-        live: true,
-    });
+    {
+        let mut handlers = HANDLERS.lock();
+        if let Some(Some(handler)) = handlers.get_mut(index) {
+            handler.vector = vector;
+        }
+    }
 
     // Published last: a non-zero handler is what the delivery path takes as
     // "this vector is claimed", so it must not be visible before the values
     // describing it are.
     DELIVERY[vector as usize]
         .handler
-        .store(index as u32 + 1, core::sync::atomic::Ordering::Release);
+        .store(index as u32 + 1, Ordering::Release);
 
     Ok(HandlerId {
         index: index as u32,

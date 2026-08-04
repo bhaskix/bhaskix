@@ -400,12 +400,17 @@ else
 fi
 
 # RFC 0011 step 4: the block driver stops polling. The assertion is a pair of
-# counters rather than a duration -- a request on MSI-X blocks once and spins
-# *never*, and the reverse before the interrupt was claimed. "0 spins" is the
-# number the RFC asks for, and a timing measurement on an emulator could not
-# tell the two apart.
-if grep -qE "virtio-blk irq +msi-x vector 0x[0-9a-f]+; [1-9][0-9]* waits, 0 spins, [1-9][0-9]* interrupts per request" "$LOG"; then
-    pass "the block driver waits on an interrupt and never spins"
+# counters rather than a duration -- a request on MSI-X spins *never*, and did
+# so before the interrupt was claimed. "0 spins" is the number the RFC asks
+# for, and a timing measurement on an emulator could not tell the two apart.
+#
+# The wait count is printed but not asserted. A driver whose device finishes
+# before its first completion check waits zero times and is working perfectly;
+# requiring at least one wait asserts that the host was slow, which on a loaded
+# machine it is not. That version failed a suite run having passed 24 of 24 on
+# an idle one.
+if grep -qE "virtio-blk irq +msi-x vector 0x[0-9a-f]+; [0-9]+ waits, 0 spins, [1-9][0-9]* interrupts per request" "$LOG"; then
+    pass "the block driver never spins, and its interrupt arrives"
 else
     fail "the block device is still polling, or its interrupt did not arrive"
     status=1
@@ -420,6 +425,19 @@ if grep -qE "memory objects +[1-9][0-9]* created, [1-9][0-9]* destroyed, none li
     pass "two domains share an object, revocation takes it from both, nothing leaks"
 else
     fail "the memory-object self test did not pass"
+    status=1
+fi
+
+# The lock-order detector, checked *again* at the end of bring-up. The first
+# check runs before the I/O APIC, the block driver's interrupt path, the memory
+# objects and the services -- so on its own it verifies only the code that runs
+# before it, and M6-07 shipped an inversion it could not have seen. A detector
+# that looks once, early, is a detector with a blind spot the size of the rest
+# of the boot.
+if grep -qE "lock order +clean through bring-up too" "$LOG"; then
+    pass "no lock-order violation anywhere in bring-up, not just before the check"
+else
+    fail "a lock-order violation appeared after the early check"
     status=1
 fi
 

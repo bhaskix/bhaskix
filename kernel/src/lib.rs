@@ -395,6 +395,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !lock_ordering_self_test() {
         println!("    lock order     FAILED");
     }
+    // Everything from here to the end of bring-up is code the check above ran
+    // too early to see. The count is taken now and compared at the end.
+    let lock_violations_at_start = sync::violations();
 
     // Device interrupts, and with them a console that can be typed at. Last of
     // the bring-up, because everything above it works on a machine with no I/O
@@ -412,6 +415,26 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!();
         println!("  FAULT INJECTION RETURNED: the exception was not delivered.");
         cpu::halt_forever();
+    }
+
+    // The lock-order check again, at the end.
+    //
+    // The first one runs before the I/O APIC, the block driver's interrupt
+    // path, memory objects and the services -- so it could not see a violation
+    // any of them caused, and did not: M6-07 shipped an inversion in the block
+    // driver that this second check is what found. A detector that only looks
+    // once, early, verifies the code that runs before it.
+    let late = sync::violations();
+    if late > lock_violations_at_start {
+        println!(
+            "    lock order     FAILED: {} violations after bring-up",
+            late - lock_violations_at_start
+        );
+    } else {
+        println!(
+            "    lock order     clean through bring-up too ({} acquisitions checked)",
+            sync::acquisitions()
+        );
     }
 
     println!();
@@ -727,6 +750,28 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let delivered = delivered - delivered_before;
     let replied = replied - replied_before;
 
+    // Sampled *before* the teardown below. Afterwards every participant has
+    // been retired and its mailbox freed, so a reading taken then says only
+    // that cleanup ran -- which is what the first version of this measured,
+    // and it reported "no message anywhere" for a message that was sitting in
+    // a mailbox at the moment the test gave up.
+    let pending = sched::pending_mailboxes();
+    //
+    // Two passes, and it has to be two: `for_each` runs its callback holding a
+    // runqueue lock, and `has_message` takes the same one. Asking inside the
+    // walk deadlocks the CPU doing the asking.
+    let mut resting = [(0u32, sched::State::Ready, false); 4];
+    let mut resting_len = 0;
+    sched::for_each(|_cpu, id, name, state, _runs, _migrations, _class| {
+        if name.starts_with("ipc-") && resting_len < resting.len() {
+            resting[resting_len] = (id, state, false);
+            resting_len += 1;
+        }
+    });
+    for entry in resting.iter_mut().take(resting_len) {
+        entry.2 = sched::has_message(entry.0);
+    }
+
     // Retire the service, then tear the endpoint down and confirm nothing is
     // left queued on it.
     PHASE.store(PHASE_IPC + 1, Ordering::Release);
@@ -753,13 +798,31 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
         ("the endpoint counted the replies", replied >= 8),
     ];
 
+    let (dropped, wake_missed, received, replies_tried, no_caller, empty) = ipc::diagnostics();
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    ipc            FAILED: {name} (replies {replies}, correct {correct}, badges {badges:#x}, delivered {delivered}, replied {replied})"
+                "    ipc            FAILED: {name} (replies {replies}, correct {correct}, badges {badges:#x}, delivered {delivered}, replied {replied}, dropped {dropped}, wake missed {wake_missed}, mailboxes {pending}, recv returned {received}, reply tried {replies_tried}, no caller {no_caller}, empty checks {empty})"
             );
             ok = false;
         }
+    }
+
+    if !ok {
+        // The counters disagreed with each other, so print the order things
+        // happened in. Thread names first: every trace line below is a pair of
+        // thread ids, which mean nothing on their own.
+        for (id, state, mail) in resting.iter().take(resting_len) {
+            let mail = if *mail {
+                "holding a message"
+            } else {
+                "no message"
+            };
+            println!("    ipc            thread {id} was {state}, {mail}, when the test gave up");
+        }
+        ipc::replay(|event, who, with| {
+            println!("    ipc            trace: {event} {who} -> {with}");
+        });
     }
 
     if ok {
@@ -1858,6 +1921,7 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
     let read = virtio::read(8, &mut sector);
 
     let (waits, spins) = virtio::waiting();
+    let interrupt_driven = virtio::interrupt_driven();
     let (delivered, strays, unbound) = irq::statistics();
     let expected = handoff.initrd.unwrap_or(&[]);
     let matches = expected.len() >= 8 * 512 + 512 && sector == expected[8 * 512..8 * 512 + 512];
@@ -1865,7 +1929,19 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
     let checks = [
         ("the read completed", read.is_ok()),
         ("and returned the right sector", matches),
-        ("the driver waited on an interrupt", waits > 0),
+        // Deliberately *not* `waits > 0`. Whether the driver had to sleep
+        // depends on whether the device finished before the first completion
+        // check, which is a fact about the host: a read that completes that
+        // fast is the driver working, not failing. That assertion cost a suite
+        // run on a loaded machine, having passed 24 of 24 on an idle one.
+        //
+        // What is asserted instead cannot be satisfied by a polling driver:
+        // the interrupt is bound (so completion has something to arrive on),
+        // and `spins` below stays at zero (so nothing looked twice).
+        (
+            "the driver is interrupt-driven, not polling",
+            interrupt_driven,
+        ),
         (
             // The number RFC 0011 asks for. Not "fewer spins" -- none.
             "and did not spin once",

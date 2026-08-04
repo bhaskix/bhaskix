@@ -32,6 +32,15 @@
 //! `copy_from_user` exists to contain cannot occur here.
 
 #![no_std]
+// Tests are exempt from the `unwrap`/`expect`/`panic` bans, as
+// docs/coding-style.md §4 specifies: those bans exist to stop a fallible
+// operation taking down the nucleus, and a test that cannot panic cannot
+// fail. Deliberately *not* exempting `undocumented_unsafe_blocks`, which the
+// other crates do — there is no `unsafe` in this crate and its budget is zero,
+// so an exemption here would be permission for something that must not appear.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+pub mod ring;
 
 /// The six system calls. See `docs/rfc/0008-syscall-and-ipc-shape.md`.
 ///

@@ -945,6 +945,73 @@ pub fn deliver(thread: u32, message: crate::ipc::Message, from: u32) -> bool {
     false
 }
 
+/// How many threads are holding a message nobody has collected.
+///
+/// A handover writes the mailbox and then wakes; a woken thread rechecks and
+/// takes it. So a mailbox that is still full once everything has stopped means
+/// the message arrived and its owner never ran again — which distinguishes a
+/// lost message from a lost wakeup, two failures that look identical from the
+/// outside.
+#[must_use]
+pub fn pending_mailboxes() -> u32 {
+    let mut pending = 0;
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        for thread in queue.threads.iter().flatten() {
+            if thread.mailbox.is_some() {
+                pending += 1;
+            }
+        }
+    }
+    pending
+}
+
+/// Whether `thread` is holding a message it has not collected.
+#[must_use]
+pub fn has_message(thread: u32) -> bool {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        if let Some(target) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return target.mailbox.is_some();
+        }
+    }
+    false
+}
+
+/// Takes the message waiting for `thread` and, if there was one, makes it
+/// runnable again — both under one hold of its runqueue lock.
+///
+/// The two halves must not come apart, and this is why. A waiter marks itself
+/// `Blocked` *before* checking its mailbox, so that a wake arriving in the gap
+/// is not lost. That leaves a window where the thread is marked blocked and is
+/// still running. If it takes the message and is preempted before clearing the
+/// mark, it is switched out `Blocked` — and the wake that would have rescued it
+/// has already been spent on delivering the message it is now holding. Nothing
+/// will ever select it again: [`preempt`] only returns a thread to `Ready` if
+/// it was `Running`, and no future sender will wake a receiver it has already
+/// matched.
+///
+/// Holding the lock across both halves closes it, because `preempt` reaches
+/// this runqueue with `try_lock` and gives up rather than switching a thread
+/// out from under this.
+///
+/// Measured as an IPC rendezvous that stalled after exactly one delivery, on a
+/// host fast enough to land a timer tick in a two-instruction window.
+#[must_use]
+pub fn take_message_awake(thread: u32) -> Option<(crate::ipc::Message, u32)> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            let message = target.mailbox.take();
+            if message.is_some() && target.state == State::Blocked {
+                target.state = State::Running;
+            }
+            return message;
+        }
+    }
+    None
+}
+
 /// Takes the message waiting for `thread`, if there is one.
 #[must_use]
 pub fn take_message(thread: u32) -> Option<(crate::ipc::Message, u32)> {

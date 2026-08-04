@@ -52,8 +52,98 @@
 //!   own CPU and takes an IPI otherwise; either way the woken thread runs when
 //!   its CPU next schedules.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::sched;
 use crate::sync::{Rank, SpinLock};
+
+/// Rendezvous matched, message never handed over.
+///
+/// A match takes the partner out of the endpoint's queue and counts a delivery
+/// while holding the table lock, but the handover happens after that lock is
+/// released. If the handover fails there is no longer a queue entry to put
+/// back, so the message is gone and both threads wait for each other. Counted
+/// rather than ignored: `delivered` would otherwise report a rendezvous that
+/// did not happen.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Handovers whose wake found the partner not blocked.
+///
+/// Not an error on its own — the partner may not have marked itself blocked
+/// yet, and will find the message when it checks. Counted to tell that case
+/// apart from a genuinely lost wakeup.
+static WAKE_MISSED: AtomicU64 = AtomicU64::new(0);
+
+/// Calls to [`recv`] that returned a message to their caller.
+static RECV_RETURNED: AtomicU64 = AtomicU64::new(0);
+
+/// Times a queued receiver checked its mailbox and found it empty.
+///
+/// One such check per `recv` is expected — the receiver marks itself blocked
+/// and looks before sleeping. Many more mean it is being woken and finding
+/// nothing, which is a different failure from never being woken at all.
+static RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
+
+/// Calls to [`reply`] that were attempted, whatever came of them.
+static REPLY_TRIED: AtomicU64 = AtomicU64::new(0);
+
+/// Replies whose caller was no longer waiting to receive one.
+static REPLY_NO_CALLER: AtomicU64 = AtomicU64::new(0);
+
+/// A ring of the last few rendezvous events, for when the counters agree on
+/// something impossible.
+///
+/// Counters say how often; they cannot say in what order, or between whom. A
+/// stalled rendezvous is a question about ordering between three threads, so
+/// the ring records `(what, who, with-whom)` and the self-test prints it when
+/// it fails.
+static TRACE: [AtomicU64; TRACE_LEN] = [const { AtomicU64::new(0) }; TRACE_LEN];
+static TRACE_AT: AtomicU64 = AtomicU64::new(0);
+
+const TRACE_LEN: usize = 48;
+
+/// What a [`TRACE`] entry records.
+#[derive(Clone, Copy)]
+#[repr(u64)]
+enum Event {
+    SendMatched = 1,
+    SendQueued = 2,
+    RecvMatched = 3,
+    RecvQueued = 4,
+    RecvTook = 5,
+    Replied = 6,
+    ReplyRefused = 7,
+}
+
+fn trace(event: Event, who: u32, with: u32) {
+    let slot = TRACE_AT.fetch_add(1, Ordering::Relaxed) as usize % TRACE_LEN;
+    let packed = (event as u64) << 56 | u64::from(who) << 28 | u64::from(with);
+    TRACE[slot].store(packed, Ordering::Relaxed);
+}
+
+/// Replays the trace ring, oldest first, as `(event name, who, with)`.
+pub fn replay(mut visit: impl FnMut(&'static str, u32, u32)) {
+    let at = TRACE_AT.load(Ordering::Relaxed) as usize;
+    let first = at.saturating_sub(TRACE_LEN);
+    for index in first..at {
+        let packed = TRACE[index % TRACE_LEN].load(Ordering::Relaxed);
+        let name = match packed >> 56 {
+            1 => "send matched",
+            2 => "send queued",
+            3 => "recv matched",
+            4 => "recv queued",
+            5 => "recv took",
+            6 => "replied",
+            7 => "reply refused",
+            _ => continue,
+        };
+        visit(
+            name,
+            ((packed >> 28) & 0xfff_ffff) as u32,
+            (packed & 0xfff_ffff) as u32,
+        );
+    }
+}
 
 /// Endpoints that can exist at once.
 pub const MAX_ENDPOINTS: usize = 32;
@@ -335,8 +425,12 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
             // A receiver was already waiting. Hand it the message and wake it,
             // then block for the reply -- the mailbox is written before the
             // wake, or the receiver could run and find nothing.
-            sched::deliver(partner, message, me);
-            sched::wake(partner);
+            if !sched::deliver(partner, message, me) {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+            if !sched::wake(partner) {
+                WAKE_MISSED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Rendezvous::Queued => {}
     }
@@ -357,8 +451,9 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
     // thread ready, and `block_self` returns without sleeping.
     loop {
         sched::mark_blocked();
-        if let Some((reply, _)) = sched::take_message(me) {
-            sched::cancel_block();
+        // Takes the reply and clears the blocked mark together: separating them
+        // loses this thread if a tick lands between the two.
+        if let Some((reply, _)) = sched::take_message_awake(me) {
             return Ok(reply);
         }
         if !live(id) {
@@ -383,7 +478,10 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
 
     match rendezvous_recv(id, me)? {
         // A sender was already waiting; its message is in hand.
-        Rendezvous::Matched { partner, message } => Ok((message, partner)),
+        Rendezvous::Matched { partner, message } => {
+            RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
+            Ok((message, partner))
+        }
 
         // Queued as a receiver. A sender that arrives writes the message into
         // this thread's mailbox *before* waking it, so a wake with an empty
@@ -393,10 +491,12 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
         // messages.
         Rendezvous::Queued => loop {
             sched::mark_blocked();
-            if let Some((message, from)) = sched::take_message(me) {
-                sched::cancel_block();
+            if let Some((message, from)) = sched::take_message_awake(me) {
+                RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
+                trace(Event::RecvTook, me, from);
                 return Ok((message, from));
             }
+            RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
             if !live(id) {
                 // The endpoint was destroyed under us. Leaving the queue entry
                 // behind would have a later rendezvous deliver to a thread
@@ -419,9 +519,13 @@ pub fn reply(caller: u32, message: Message) -> Result<(), IpcError> {
     let Some(me) = sched::current_thread_id() else {
         return Err(IpcError::NoSuchCaller);
     };
+    REPLY_TRIED.fetch_add(1, Ordering::Relaxed);
     if !sched::deliver(caller, message, me) {
+        REPLY_NO_CALLER.fetch_add(1, Ordering::Relaxed);
+        trace(Event::ReplyRefused, me, caller);
         return Err(IpcError::NoSuchCaller);
     }
+    trace(Event::Replied, me, caller);
     TABLE.lock().replied += 1;
     sched::wake(caller);
     Ok(())
@@ -435,6 +539,23 @@ pub fn live(id: EndpointId) -> bool {
         .endpoints
         .get(id.0 as usize)
         .is_some_and(|endpoint| endpoint.live)
+}
+
+/// `(dropped, wake_missed, recv_returned, reply_tried, reply_no_caller, recv_empty)`.
+///
+/// Enough to tell apart the ways a rendezvous can stall: a message that was
+/// never handed over, a wakeup that found nobody, a receiver that never came
+/// back from `recv`, and a reply with no one left to take it.
+#[must_use]
+pub fn diagnostics() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        DROPPED.load(Ordering::Relaxed),
+        WAKE_MISSED.load(Ordering::Relaxed),
+        RECV_RETURNED.load(Ordering::Relaxed),
+        REPLY_TRIED.load(Ordering::Relaxed),
+        REPLY_NO_CALLER.load(Ordering::Relaxed),
+        RECV_EMPTY.load(Ordering::Relaxed),
+    )
 }
 
 /// `(delivered, replied)` since boot.
@@ -473,13 +594,16 @@ fn rendezvous_send(id: EndpointId, pending: PendingSend) -> Result<Rendezvous, I
 
     if let Some(receiver) = endpoint.take_receiver() {
         table.delivered += 1;
+        trace(Event::SendMatched, pending.thread, receiver);
         return Ok(Rendezvous::Matched {
             partner: receiver,
             message: pending.message,
         });
     }
 
+    let me = pending.thread;
     endpoint.queue_sender(pending)?;
+    trace(Event::SendQueued, me, 0);
     Ok(Rendezvous::Queued)
 }
 
@@ -494,6 +618,7 @@ fn rendezvous_recv(id: EndpointId, me: u32) -> Result<Rendezvous, IpcError> {
 
     if let Some(sender) = endpoint.take_sender() {
         table.delivered += 1;
+        trace(Event::RecvMatched, me, sender.thread);
         return Ok(Rendezvous::Matched {
             partner: sender.thread,
             message: sender.message,
@@ -501,6 +626,7 @@ fn rendezvous_recv(id: EndpointId, me: u32) -> Result<Rendezvous, IpcError> {
     }
 
     endpoint.queue_receiver(me)?;
+    trace(Event::RecvQueued, me, 0);
     Ok(Rendezvous::Queued)
 }
 
