@@ -32,6 +32,7 @@ pub mod console;
 pub mod faultinject;
 pub mod font;
 pub mod framebuffer;
+pub mod frames;
 pub mod heap;
 pub mod memory;
 pub mod panic;
@@ -186,6 +187,12 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
             heap::init(pmm, handoff.hhdm_base.as_u64());
             memory::heap_self_test();
 
+            // Fill this CPU's fault-path reserve now rather than waiting for
+            // the first timer tick to do it. A fault before the reserve has
+            // anything in it is refused, and early boot is exactly when the
+            // first demand-paged access happens.
+            frames::refill();
+
             // No-execute must be on before any mapping carrying the NX bit is
             // created, or the CPU treats bit 63 as reserved and the mapping
             // faults instead of being non-executable.
@@ -314,6 +321,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("    tickless       FAILED");
     }
+    frames_report();
     tickless_report();
 
     if !lock_ordering_self_test() {
@@ -408,6 +416,24 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
         cpus - 1
     );
     true
+}
+
+/// Reports the state of the per-CPU fault-path frame reserves.
+///
+/// Misses are the number worth watching: each one is a fault that had to be
+/// refused because its CPU had run dry, which is the failure the reserve
+/// exists to make rare. Reporting hits alone would look identical whether the
+/// reserve was sized well or barely used.
+fn frames_report() {
+    let held = frames::held();
+    let hits = frames::hits();
+    let misses = frames::misses();
+    let refilled = frames::refilled();
+
+    println!(
+        "    frame reserve  {held} frames held across {} cpus; {hits} faults served, {misses} missed, {refilled} refilled",
+        bhaskix_arch::percpu::online_count()
+    );
 }
 
 /// Reports what the tickless timer avoided, and that it is still arming.

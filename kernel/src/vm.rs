@@ -27,6 +27,7 @@ use bhaskix_mm::vm::{
 };
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
+use crate::frames;
 use crate::heap;
 use crate::sync::{Rank, SpinLock};
 
@@ -329,7 +330,7 @@ impl AddressSpace {
 ///
 /// Returns whether the free-frame count returned to exactly its baseline.
 pub fn self_test(hhdm_base: u64, iterations: u32) -> bool {
-    let baseline = heap::free_frames();
+    let baseline = heap::available_frames();
 
     for index in 0..iterations {
         let Ok(mut space) = AddressSpace::new(hhdm_base) else {
@@ -367,7 +368,7 @@ pub fn self_test(hhdm_base: u64, iterations: u32) -> bool {
         space.destroy();
     }
 
-    let after = heap::free_frames();
+    let after = heap::available_frames();
     if after != baseline {
         crate::println!(
             "    address space  LEAK: {baseline} frames before, {after} after {iterations} cycles"
@@ -531,96 +532,93 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
     // SAFETY: reads page table entries only.
     let existing = unsafe { paging::translate(root, page.as_u64(), hhdm) };
 
-    let Some(outcome) = heap::try_with(|heap| {
-        let pmm = heap.pmm_mut();
-
-        let Ok(pfn) = pmm.allocate(0, Zone::Normal) else {
-            return FaultOutcome::Unserviceable("out of physical memory");
-        };
-        let fresh = u64::from(pfn) * FRAME_SIZE;
-
-        match existing {
-            // Copy-on-write: the page is present but write-protected, and the
-            // region says a write should copy rather than fail.
-            Some(old) if write && region.flags.copy_on_write => {
-                // SAFETY: both frames are reachable through the direct map;
-                // `fresh` was just allocated so nothing else refers to it, and
-                // the ranges cannot overlap because they are distinct frames.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        (hhdm + (old & !(PAGE_SIZE - 1))) as *const u8,
-                        (hhdm + fresh) as *mut u8,
-                        PAGE_SIZE as usize,
-                    );
-                }
-
-                let entry = AddressSpace::entry_flags(Protection::ReadWrite, page.as_u64());
-                // SAFETY: single CPU; `root` is the installed space's PML4.
-                let replaced = unsafe {
-                    paging::unmap_page(root, page.as_u64(), hhdm).and_then(|_| {
-                        paging::map_page(root, page.as_u64(), fresh, entry, hhdm, &mut || {
-                            pmm.allocate(0, Zone::Normal)
-                                .ok()
-                                .map(|pfn| u64::from(pfn) * FRAME_SIZE)
-                        })
-                    })
-                };
-                if replaced.is_err() {
-                    let _ = pmm.free(pfn, 0);
-                    return FaultOutcome::Unserviceable("could not remap the copied page");
-                }
-
-                // The frame that was shared is released only when nothing else
-                // holds it. Refcounting arrives with fork in M5; until then a
-                // COW region's original frame belongs to whoever mapped it, so
-                // it is deliberately *not* freed here.
-                FaultOutcome::Handled
-            }
-
-            // Present, and not a copy-on-write write. There is nothing to
-            // create, so this handler cannot help -- and saying `Handled`
-            // would retry the same faulting instruction forever.
-            //
-            // That loop is reachable: with SMAP on, a kernel access to a
-            // *mapped* user page faults, and the mapping already being there
-            // is exactly what makes it look serviceable.
-            Some(_) => {
-                let _ = pmm.free(pfn, 0);
-                FaultOutcome::NotOurs
-            }
-
-            // Demand paging: the region says this address is valid and the
-            // page table says nothing is there. Make it so.
-            None => {
-                // SAFETY: freshly allocated and unaliased, reachable through
-                // the direct map. Zeroing on allocation is required by
-                // `docs/memory.md` §6 -- a frame must never reach a consumer
-                // carrying another domain's data.
-                unsafe {
-                    core::ptr::write_bytes((hhdm + fresh) as *mut u8, 0, PAGE_SIZE as usize);
-                }
-
-                let entry = AddressSpace::entry_flags(region.protection, page.as_u64());
-                // SAFETY: single CPU; `root` is the installed space's PML4.
-                let mapped = unsafe {
-                    paging::map_page(root, page.as_u64(), fresh, entry, hhdm, &mut || {
-                        pmm.allocate(0, Zone::Normal)
-                            .ok()
-                            .map(|pfn| u64::from(pfn) * FRAME_SIZE)
-                    })
-                };
-                if mapped.is_err() {
-                    let _ = pmm.free(pfn, 0);
-                    return FaultOutcome::Unserviceable("could not map the demanded page");
-                }
-                FaultOutcome::Handled
-            }
-        }
-    }) else {
-        return FaultOutcome::Unserviceable("allocator lock held");
+    // Frames come from this CPU's reserve, not from the allocator.
+    //
+    // The allocator's lock is the one thing a fault handler must never wait
+    // for: a fault can interrupt code on this very CPU that already holds it,
+    // and then neither can proceed. Taking the frame from a reserve that no
+    // lock protects removes the question. `frames::take` falls back to nothing
+    // -- if the reserve is dry the fault is refused, which is the same
+    // outcome as before but now the rare case rather than the common one.
+    let Some(fresh) = frames::take() else {
+        return FaultOutcome::Unserviceable("no frame in this cpu's reserve");
     };
 
-    outcome
+    // Page-table levels come from the same place, for the same reason.
+    let mut reserve_frame = || frames::take();
+
+    match existing {
+        // Copy-on-write: the page is present but write-protected, and the
+        // region says a write should copy rather than fail.
+        Some(old) if write && region.flags.copy_on_write => {
+            // SAFETY: both frames are reachable through the direct map;
+            // `fresh` came from this CPU's reserve so nothing else refers to
+            // it, and the ranges cannot overlap because they are distinct
+            // frames. No zeroing first: every byte is about to be written.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (hhdm + (old & !(PAGE_SIZE - 1))) as *const u8,
+                    (hhdm + fresh) as *mut u8,
+                    PAGE_SIZE as usize,
+                );
+            }
+
+            let entry = AddressSpace::entry_flags(Protection::ReadWrite, page.as_u64());
+            // SAFETY: `root` is the installed space's PML4, and this CPU is
+            // the one faulting on it.
+            let replaced = unsafe {
+                paging::unmap_page(root, page.as_u64(), hhdm).and_then(|_| {
+                    paging::map_page(root, page.as_u64(), fresh, entry, hhdm, &mut reserve_frame)
+                })
+            };
+            if replaced.is_err() {
+                frames::give(fresh);
+                return FaultOutcome::Unserviceable("could not remap the copied page");
+            }
+
+            // The frame that was shared is released only when nothing else
+            // holds it. Refcounting arrives with fork in M5; until then a
+            // COW region's original frame belongs to whoever mapped it, so
+            // it is deliberately *not* freed here.
+            FaultOutcome::Handled
+        }
+
+        // Present, and not a copy-on-write write. There is nothing to
+        // create, so this handler cannot help -- and saying `Handled`
+        // would retry the same faulting instruction forever.
+        //
+        // That loop is reachable: with SMAP on, a kernel access to a
+        // *mapped* user page faults, and the mapping already being there
+        // is exactly what makes it look serviceable.
+        Some(_) => {
+            frames::give(fresh);
+            FaultOutcome::NotOurs
+        }
+
+        // Demand paging: the region says this address is valid and the
+        // page table says nothing is there. Make it so.
+        None => {
+            // SAFETY: taken from this CPU's reserve and unaliased, reachable
+            // through the direct map. Zeroing is required by
+            // `docs/memory.md` §6 -- a frame must never reach a consumer
+            // carrying another domain's data -- and unlike the copy above,
+            // nothing here is about to overwrite it.
+            unsafe {
+                core::ptr::write_bytes((hhdm + fresh) as *mut u8, 0, PAGE_SIZE as usize);
+            }
+
+            let entry = AddressSpace::entry_flags(region.protection, page.as_u64());
+            // SAFETY: as above.
+            let mapped = unsafe {
+                paging::map_page(root, page.as_u64(), fresh, entry, hhdm, &mut reserve_frame)
+            };
+            if mapped.is_err() {
+                frames::give(fresh);
+                return FaultOutcome::Unserviceable("could not map the demanded page");
+            }
+            FaultOutcome::Handled
+        }
+    }
 }
 
 /// Exercises demand paging and copy-on-write against a live address space.
@@ -634,18 +632,20 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
 pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
     const LAZY: u64 = 0x0000_0000_2000_0000;
     const EAGER: u64 = 0x0000_0000_3000_0000;
+    const UNDER_LOCK: u64 = 0x0000_0000_4000_0000;
     const PATTERN: u64 = 0xfeed_face_0bad_c0de;
 
-    let baseline = heap::free_frames();
+    let baseline = heap::available_frames();
 
     let Ok(mut space) = AddressSpace::new(hhdm_base) else {
         crate::println!("    demand paging  FAILED to create an address space");
         return false;
     };
 
-    let (Some(lazy), Some(eager)) = (
+    let (Some(lazy), Some(eager), Some(under_lock)) = (
         VirtRange::from_pages(VirtAddr(LAZY), 2),
         VirtRange::from_pages(VirtAddr(EAGER), 1),
+        VirtRange::from_pages(VirtAddr(UNDER_LOCK), 1),
     ) else {
         return false;
     };
@@ -656,6 +656,9 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
         .map_anonymous_lazy(lazy, Protection::ReadWrite)
         .is_err()
         || space.map_anonymous(eager, Protection::ReadWrite).is_err()
+        || space
+            .map_anonymous_lazy(under_lock, Protection::ReadWrite)
+            .is_err()
     {
         crate::println!("    demand paging  FAILED to register regions");
         space.destroy();
@@ -776,6 +779,47 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
         None => false,
     };
 
+    // --- a fault serviced while the allocator lock is held -----------------
+    //
+    // The property M4-12 exists for, and the one the old fault path could not
+    // provide. The closure below runs with the physical allocator's lock held
+    // by *this* CPU; the write inside it touches a page that has never been
+    // mapped, so it faults, and the handler must complete without going
+    // anywhere near that lock. Before the per-CPU reserve this returned
+    // "allocator lock held" and the write failed.
+    //
+    // Deliberately the real lock rather than a simulation: a mock would prove
+    // the handler avoids a lock nobody was holding.
+    let mut under_lock_value = PATTERN ^ 0x5555;
+    let serviced_under_lock = heap::with(|_allocator| {
+        // SAFETY: `under_lock_value` is a live local of the right size, and
+        // the destination is untrusted by contract.
+        unsafe {
+            uaccess::copy_to_user(
+                UNDER_LOCK,
+                (&raw const under_lock_value).cast::<u8>(),
+                size_of::<u64>(),
+            )
+        }
+        .is_ok()
+    })
+    .unwrap_or(false);
+
+    under_lock_value = 0;
+    // SAFETY: as above, in the other direction, with the lock released.
+    let read_under_lock = unsafe {
+        uaccess::copy_from_user(
+            (&raw mut under_lock_value).cast::<u8>(),
+            UNDER_LOCK,
+            size_of::<u64>(),
+        )
+    };
+    let under_lock_read_back = if serviced_under_lock && read_under_lock.is_ok() {
+        under_lock_value
+    } else {
+        0
+    };
+
     // While a space is still installed, so the fault paths have somewhere real
     // to land.
     let user_access_ok = user_access_self_test();
@@ -789,7 +833,7 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
     };
     space.destroy();
 
-    let after = heap::free_frames();
+    let after = heap::available_frames();
 
     let checks = [
         ("no mapping existed beforehand", unmapped_before),
@@ -797,6 +841,10 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
         (
             "second page faulted separately",
             read_back_second == PATTERN ^ 1,
+        ),
+        (
+            "fault serviced while the allocator lock was held",
+            under_lock_read_back == PATTERN ^ 0x5555,
         ),
         ("region became copy-on-write", cow_ready),
         ("copy-on-write write took effect", after_cow == !PATTERN),

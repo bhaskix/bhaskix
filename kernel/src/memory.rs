@@ -227,7 +227,7 @@ pub fn heap_self_test() {
     use alloc::boxed::Box;
     use alloc::vec::Vec;
 
-    let before = crate::heap::free_frames();
+    let before = crate::heap::available_frames();
 
     // A boxed value, read back to prove the memory is genuinely writable.
     let boxed = Box::new(0xB4A5_C123_u64);
@@ -249,7 +249,7 @@ pub fn heap_self_test() {
             .all(|(i, v)| *v == (i as u64) * (i as u64));
     drop(values);
 
-    let after = crate::heap::free_frames();
+    let after = crate::heap::available_frames();
 
     if boxed_ok && vector_ok && before == after {
         println!("    heap           alloc works, no frames leaked");

@@ -112,7 +112,7 @@ fairness within 2% for two equal-weight workloads.
 | M4-10 | Tickless idle, one-shot timers | ✅ `DONE` | One-shot APIC timer, per-CPU deadlines, `sleep_micros`, reschedule IPI. **0 ticks over 400 ms idle vs 320–483 busy**; negative-testable as a ratio. |
 | M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape; there is no network stack. |
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
-| M4-12 | Per-CPU frame reserve for the fault path | ⬜ `TODO` | Would let a fault be serviced while the allocator lock is held |
+| M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
 
 ### Bugs found and fixed during M4
 
@@ -180,6 +180,13 @@ fairness within 2% for two equal-weight workloads.
   under contention. It needs a lock with an owner that can sleep; the spinlocks here have neither.
 - **Fairness is between threads, not domains.** A domain that spawns more threads gets more CPU,
   which is exactly what §3's two-level runqueue exists to prevent. It needs domains, so M5.
+- **The frame reserve is not a memory guarantee.** A CPU that exhausts its reserve between refills
+  refuses the fault exactly as before; the reserve makes that rare, not impossible. Sizing it
+  against a real fault rate needs a workload that produces one, and there is none yet — the boot
+  report counts misses so the gap is visible rather than assumed.
+- **A frame dropped by `give` when both the reserve and the allocator are unavailable is leaked.**
+  Deliberate: the alternative is a fault handler that waits for a lock. It has not been observed,
+  and nothing counts it.
 - **Tick counting is no longer a measure of time**, and anything written against it is wrong. The
   self-tests were converted to a wall clock; nothing else in the kernel measured duration in ticks,
   but the next thing that wants to must not.
@@ -268,6 +275,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M4-12, per-CPU frame reserve — M4 complete)
+
+- **The page-fault path no longer touches the physical allocator.** Each CPU keeps a small reserve of
+  frames it has already taken, and faults spend those. Refilling happens from the timer interrupt, a
+  context that can afford to fail and retry.
+- **The reserve needs no lock, and that is the design rather than an optimisation.** A CPU's reserve
+  is touched only by that CPU, so the only concurrency is an interrupt arriving mid-update, and
+  interrupts are masked for the few instructions involved. Every alternative ends in a lock the
+  fault handler must not wait for — which was the old behaviour: try the lock, and when it was held
+  report the fault unserviceable. Honest, and a kernel that failed at exactly the moments it was
+  busiest for no reason the workload could see or avoid.
+- **The gate holds the real lock and then faults inside it.** A closure runs with the allocator's
+  lock held by this CPU and writes to a page that has never been mapped; the handler must complete
+  without going near that lock. A mock lock would have proved the handler avoids a lock nobody was
+  holding. Negative-tested: emptying the reserve makes it report `no frame in this cpu's reserve`.
+- **Every frame-leak check had to learn about reserves.** A frame in a reserve has left the
+  allocator's free count without being lost, so `available_frames` counts both. Without that, the
+  project's most trusted gate would have reported a refill as a leak — and been believed.
+- **`unsafe` budget for `bhaskix-kernel` raised 460 → 460** (unchanged; the reserve costs 12 lines
+  and fitted inside M4-10's raise).
+- **M4 is complete.** Threads, SMP, per-CPU runqueues, work stealing, lock ranking, sleeping and
+  wait queues, scheduling classes, tickless timers, TLB shootdown and now the fault-path reserve.
+  What M4 does *not* have is recorded in the honest-notes section above and is longer than the list
+  of what it does: no priority inheritance, no domain-level fairness, no timer wheel, no reclaimed
+  stacks, and a real-time wakeup latency that is measured and over budget.
 
 ### 2026-08-04 (M4-10, tickless idle and one-shot timers)
 

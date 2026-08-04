@@ -288,6 +288,12 @@ pub unsafe fn on_tick() {
         crate::sched::wake(*thread);
     }
 
+    // Top up this CPU's fault-path frame reserve. Here rather than in the
+    // fault handler because this context can afford to fail: if the allocator
+    // is busy the next tick tries again, whereas a fault that needs a frame
+    // needs it now.
+    crate::frames::refill();
+
     // SAFETY: the caller guarantees an initialised APIC.
     unsafe { rearm(cpu, now) };
 }

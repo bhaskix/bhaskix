@@ -276,6 +276,17 @@ else
     status=1
 fi
 
+# The fault path's per-CPU frame reserve. Held frames prove it is populated;
+# the "fault serviced while the allocator lock was held" property is gated by
+# the demand-paging assertion above, which only prints its success line when
+# every one of its checks passed.
+if grep -qE "frame reserve +[1-9][0-9]* frames held across [0-9]+ cpus" "$LOG"; then
+    pass "per-CPU frame reserve populated for the fault path"
+else
+    fail "frame reserve is empty or absent"
+    status=1
+fi
+
 # Lock ordering. Three claims in one line, and only the last is the one people
 # quote: that acquisitions were actually *checked* (zero violations is what a
 # checker that never ran also reports), that the detector fires when given a

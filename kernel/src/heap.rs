@@ -108,3 +108,16 @@ pub fn try_with<R>(f: impl FnOnce(&mut Heap) -> R) -> Option<R> {
 pub fn free_frames() -> u64 {
     with(|heap| heap.pmm().free_frames()).unwrap_or(0)
 }
+
+/// Frames that are not in use: free in the allocator, or held in a per-CPU
+/// reserve.
+///
+/// The distinction matters to every leak check. A frame sitting in a reserve
+/// has left the allocator's free count without being lost, so a test that
+/// compared only `free_frames` across an operation that happened to trigger a
+/// refill would report the difference as a leak — and be believed, because
+/// that test is the project's most trusted gate.
+#[must_use]
+pub fn available_frames() -> u64 {
+    free_frames() + crate::frames::held()
+}

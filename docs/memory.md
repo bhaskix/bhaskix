@@ -108,6 +108,37 @@ Every allocated frame records its owning `DomainId`. This gives us, for free:
 
 ---
 
+### Per-CPU frame reserves for the fault path
+
+**Implemented at M4-12.** Servicing a page fault means allocating — a frame for the page, sometimes
+more for the page-table levels above it — and allocating means taking the physical allocator's lock.
+A page fault can interrupt *anything*, including code on the same CPU that already holds that lock,
+so the fault handler must never wait for it.
+
+Each CPU therefore keeps a small reserve of frames it has already taken, and the fault path spends
+those. Refilling happens from the timer interrupt, a context that can afford to fail and try again.
+
+The reserve needs **no lock at all**, and that is the point rather than an optimisation: a CPU's
+reserve is touched only by that CPU, so the only concurrency is an interrupt arriving mid-update,
+and interrupts are masked for the few instructions involved. This is
+[architecture.md](architecture.md) §6's "prefer per-CPU over shared" applied where every alternative
+design ends in a lock the fault handler must not wait for.
+
+What it does not do:
+
+- **It is not a memory guarantee.** A reserve that runs dry means the fault is refused, exactly as
+  before. It converts a likely failure into a rare one, and the boot report counts the misses so the
+  difference is visible rather than assumed.
+- **It does not survive a burst** beyond its size between refills. Sizing it against a real fault
+  rate needs a workload that generates one.
+- **Reserved frames are not free memory**, and every leak check accounts for them separately —
+  otherwise the project's most trusted gate would report a refill as a leak, and be believed.
+
+Gated by a test that holds the allocator's real lock and then faults inside it. Negative-tested:
+emptying the reserve makes that fault report `no frame in this cpu's reserve` and the gate goes red.
+
+---
+
 ## 3. Virtual memory
 
 ### `AddressSpace`
