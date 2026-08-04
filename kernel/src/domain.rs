@@ -418,6 +418,14 @@ pub fn create(name: &'static str, envelope: ResourceEnvelope) -> Result<DomainId
 /// `docs/security.md` §2 rule 3 — so a destroyed domain's grants are dead
 /// everywhere, not scheduled for cleanup.
 pub fn destroy(id: DomainId) -> bool {
+    // Memory objects first, and outside the table lock. A shared region does
+    // not outlive the domain that made it (RFC 0009): the frames are charged
+    // to this envelope, and leaving them would be a leak the frame gate would
+    // find and nobody could explain. Done before the domain is marked dead, so
+    // the release finds an envelope to release into.
+    let objects = crate::shared::destroy_owned_by(id);
+    let _ = objects;
+
     let root = {
         let mut table = TABLE.lock();
         let Some(domain) = table.domains.get_mut(id.0 as usize) else {

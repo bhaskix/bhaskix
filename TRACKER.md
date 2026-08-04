@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-04 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 (RFC 0011 steps 1–4) · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07, M6-08 (RFC 0011 steps 1–4, RFC 0009 steps 1–2) · CI green |
 
 ### Division of responsibility between documents
 
@@ -127,6 +127,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-03 | ELF64 loader, with a fuzz target | ✅ `DONE` | Ring 3 now runs `bin/probe`, a separately built ET_EXEC loaded out of the initrd, mapped at the addresses and with the permissions **its own headers** name. **Negative-tested**: dropping one segment fails the gate; a deliberately reintroduced wrap bug is caught by the mutation harness at seed 424. |
 | M6-04 | Kernel shell | ✅ `DONE` | The console reads: ACPI walk → I/O APIC → IRQ 4 → a vector → a lock-free ring → a blocking read. Nine read-only commands, run by the boot self-test through the same function the prompt calls. **Negative-tested**: draining one byte per interrupt fails the boot gate; removing the wake-up passes it and fails `shell-test.sh`, which is why that test exists. |
 | M6-05 | User-mode shell over the syscall interface | ✅ `DONE` | The machine boots to a shell in ring 3 holding two capabilities and nothing else: console and filesystem, both reached by IPC, sixteen bytes per round trip. `shell=kernel` selects the ring 0 one. **Negative-tested**: withholding the filesystem capability makes `caps` report it, both filesystem commands fail, and everything else keeps working. |
+| M6-08 | RFC 0009 steps 1–2: `Memory` objects, and mapping them | ✅ `DONE` | An object is frames, a length and an owner, charged to a `ResourceEnvelope` and released when it goes; `Backing::Shared` lets an address space borrow frames it does not own. `ObjectKind::Untyped` deleted, per the RFC's acceptance. **Negative-tested**: a `destroy` that leaks four frames fails the gate. The teardown invariant — a destroyed address space must not free a shared region's frames — is asserted directly rather than inferred. |
 | M6-07 | RFC 0011 steps 1–4: a vector allocator, `IrqHandler`, and a driver that stops polling | ✅ `DONE` | One registry for all 256 vectors; `IrqControl`/`IrqHandler` with exclusive claims and reserved sources; the delivery path is mask → signal a notification → acknowledge. RFC 0010's `Notification` landed with it, because step 3 binds one. `input.rs` and `virtio-blk` are both clients now rather than special cases. **Negative-tested**: leaving the notification unbound fails the gate. |
 | M6-06 | `virtio-blk` driver | ✅ `DONE` | PCI enumeration, modern virtio 1.0 discovered through the device's own capability list, a split virtqueue driven by DMA. `root=disk` mounts the filesystem off the device, so the user-mode shell is a file the driver read. **Negative-tested**: a driver that ignored the sector number reads sector zero four times and fails the gate, because the disk is the ramdisk image and the kernel has the same bytes from the bootloader to compare against. |
 
@@ -502,6 +503,54 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (a harness that blamed the kernel for its own contention)
+
+- **`make test` failed at fault injection, and the kernel was not at fault.** The message was
+  `missing: 'EXCEPTION: divide error (#DE)'`, which reads as an exception handler that did not
+  report — and sent one investigation straight at the exception path. The actual cause: **QEMU takes
+  an exclusive write lock on a disk image by default**, and M6-06 attached `build/initrd.tar` to
+  every harness. Two runs overlapping by a second — which is every `make test` on a loaded host —
+  and the second starts with no disk.
+- **Demonstrated rather than assumed.** A second QEMU on the same writable image prints
+  `Failed to get "write" lock`; the same with `readonly=on` runs. The image is now attached read-only
+  everywhere, which is also more honest: the kernel only ever reads it.
+- **The harness now says why a run ended.** `fault-test.sh`'s waiter returns whether it found what it
+  was looking for, timed out, or outlived the machine, and reports that *before* listing what the log
+  did not contain. A timeout on a loaded host and a broken exception handler are not the same failure
+  and must not print the same way.
+- **`boot-test.sh` stops after one accurate line instead of thirty misleading ones.** If the machine
+  never finished booting, every assertion below fails for the same reason; that wall of red has twice
+  been mistaken for a catastrophic regression. It now reports the boot failure, shows how far it got,
+  and exits.
+- **The lesson, since this is the second time this project has been misled by its own tooling:** a
+  test that cannot distinguish "the thing under test is broken" from "the test could not run" will
+  eventually be believed about the wrong one.
+
+### 2026-08-04 (M6-08 — RFC 0009 steps 1 and 2)
+
+- **A `Memory` object exists**: frames, a length, an owner. Charged to the owner's envelope when it
+  is made and released when it goes, all-or-nothing on every failing path — a half-made object is
+  one somebody has to find and clean up, and that somebody is nobody.
+- **`ObjectKind::Untyped` is deleted**, which is what accepting RFC 0009 decided. The reasoning sits
+  where the type is defined rather than only in this file: accounting here is a quota, not an exact
+  partition of physical memory, and that was chosen rather than discovered.
+- **`Backing::Shared` lets an address space borrow frames it does not own.** Every release path
+  already checks for `Backing::Anonymous` rather than "not reserved", so a shared region is skipped
+  **by construction** rather than by a branch someone has to remember. `EXECUTE` is refused
+  outright — revocation unmaps while the other side is running, and a receiver whose *code* vanishes
+  faults at an instruction that no longer exists.
+- **The lock-rank checker caught a real inversion on the first boot.** `create` and `destroy` called
+  the frame allocator and the domain table *while holding their own arena*, both lower-ranked. The
+  fix was not to renumber the ranks but to stop holding the arena across those calls, so it is now a
+  genuine leaf — and the declaration says so, and says the checker found it.
+- **A test that could not fail, for the third time in this project.** The teardown invariant was
+  first asserted as "fewer than four extra frames after destroying the address space", which passes
+  whether or not the shared frames were wrongly freed, because teardown also returns the page tables
+  it built. It is now exact: the frame count *before the address space exists* must equal the count
+  after it is destroyed — "it returned exactly what it took, and nothing that was not its". The
+  pattern each time has been the same: an assertion satisfied by both the correct and the broken
+  world.
 
 ### 2026-08-04 (M6-07 — RFC 0011 steps 1–4, and a driver that stopped polling)
 

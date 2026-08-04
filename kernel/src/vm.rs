@@ -45,6 +45,13 @@ pub enum VmError {
     Region(RangeMapError),
     /// The page tables rejected the change.
     Paging(MapError),
+    /// The request describes something this kernel refuses to map.
+    ///
+    /// A shared region asking to be executable, or a frame list whose length
+    /// does not match the range. Both are refusals rather than clamps: a
+    /// mapping that is *nearly* what was asked for is one the caller will use
+    /// as though it were exactly that.
+    Refused,
 }
 
 impl From<RangeMapError> for VmError {
@@ -258,6 +265,89 @@ impl AddressSpace {
     ///
     /// # Errors
     ///
+    /// Maps frames this address space does not own.
+    ///
+    /// The frames belong to a `Memory` object ([RFC 0009](../../../docs/rfc/0009-shared-memory.md));
+    /// this address space borrows them. Two consequences, and both are the
+    /// point rather than side effects:
+    ///
+    /// - **Teardown does not free them.** `unmap` and `destroy` release frames
+    ///   only for [`Backing::Anonymous`], so a shared region is skipped
+    ///   without a branch anyone has to remember.
+    /// - **They are not zeroed.** An anonymous mapping is zeroed on allocation
+    ///   because the receiving domain's correctness depends on it; these
+    ///   already hold whatever the object's owner put there, which is the
+    ///   entire reason for mapping them.
+    ///
+    /// `frames` gives the physical address of each page in order, and must
+    /// yield exactly `range.pages()` of them.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Refused`] if `protection` is executable — RFC 0009
+    /// refuses that outright, because revocation unmaps while the other side
+    /// is running, and a receiver whose *code* vanishes faults at an
+    /// instruction that no longer exists. See [`VmError`] otherwise; on
+    /// failure the address space is left unchanged.
+    pub fn map_shared(
+        &mut self,
+        range: VirtRange,
+        object: u32,
+        frames: &[u64],
+        protection: Protection,
+    ) -> Result<(), VmError> {
+        if protection.executable() {
+            return Err(VmError::Refused);
+        }
+        if frames.len() as u64 != range.pages() {
+            return Err(VmError::Refused);
+        }
+
+        let region = VmRegion::new(range, protection, Backing::Shared { object });
+        self.regions.insert(region)?;
+
+        let root = self.root;
+        let hhdm = self.hhdm_base;
+
+        let result = heap::with(|heap| {
+            let pmm = heap.pmm_mut();
+            for (index, page) in range.pages_iter().enumerate() {
+                let physical = frames[index];
+                let entry = Self::entry_flags(protection, page.as_u64());
+                // SAFETY: `root` is this space's PML4, `hhdm` the direct map
+                // base, and `physical` is a frame the object owns and keeps
+                // owning -- this only builds a second name for it.
+                let outcome = unsafe {
+                    paging::map_page(root, page.as_u64(), physical, entry, hhdm, &mut || {
+                        pmm.allocate(0, Zone::Normal)
+                            .ok()
+                            .map(|pfn| u64::from(pfn) * FRAME_SIZE)
+                    })
+                };
+                if let Err(error) = outcome {
+                    return Err((VmError::Paging(error), index as u64));
+                }
+            }
+            Ok(())
+        });
+
+        match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err((error, mapped))) => {
+                // Undo the pages that were mapped, and the region, so a failed
+                // map leaves nothing behind. The frames themselves are not
+                // freed -- they were never this address space's.
+                self.unmap_pages(range, mapped);
+                let _ = self.regions.remove(range.start);
+                Err(error)
+            }
+            None => {
+                let _ = self.regions.remove(range.start);
+                Err(VmError::OutOfMemory)
+            }
+        }
+    }
+
     /// [`VmError::Region`] if no region starts there.
     pub fn unmap(&mut self, start: VirtAddr) -> Result<(), VmError> {
         let region = self.regions.remove(start)?;

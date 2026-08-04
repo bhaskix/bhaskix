@@ -98,7 +98,7 @@ echo "booting and typing at it, up to ${TIMEOUT}s..."
 
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -M q35 -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
-    -drive "file=$REPO_ROOT/build/initrd.tar,format=raw,if=none,id=disk0" \
+    -drive "file=$REPO_ROOT/build/initrd.tar,format=raw,if=none,id=disk0,readonly=on" \
     -device virtio-blk-pci,drive=disk0 \
     -no-reboot -cdrom "$ISO" -boot d -serial stdio -display none \
     < "$FIFO" > "$LOG" 2>&1 &

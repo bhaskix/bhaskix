@@ -70,11 +70,23 @@ status=0
 # build machine also meant minutes of dead waiting per case. Polling separates
 # the two -- a healthy boot finishes in seconds and the timeout goes back to
 # being an upper bound rather than the running cost.
+# Returns *why* it stopped, which the caller reports:
+#
+#   0  every expected line appeared
+#   1  the deadline passed and they had not
+#   2  qemu exited before they did
+#
+# The distinction is the whole reason this returns anything. Before it did, a
+# machine that was still booting when the clock ran out was reported as
+# "missing: 'EXCEPTION: divide error'" -- which reads as a kernel that
+# mishandled a fault, and sent one investigation down entirely the wrong path.
+# A timeout on a loaded host and a broken exception handler are not the same
+# failure and must not print the same way.
 run_until() {
     local logfile="$1" expected="$2" limit="$3"; shift 3
     : > "$logfile"
     timeout "$limit" qemu-system-x86_64 "$@" >/dev/null 2>&1 &
-    local pid=$! waited=0
+    local pid=$! waited=0 outcome=1
     while kill -0 "$pid" 2>/dev/null; do
         # Every expected line, not just the first. The exception report is
         # written a line at a time, so stopping the machine once the header
@@ -85,15 +97,29 @@ run_until() {
             [[ -z "$line" ]] && continue
             grep -qF -- "$line" "$logfile" 2>/dev/null || { complete=0; break; }
         done <<< "$expected"
-        [[ $complete -eq 1 ]] && break
+        [[ $complete -eq 1 ]] && { outcome=0; break; }
 
         sleep 0.25
         waited=$((waited + 1))
         [[ $waited -gt $((limit * 4)) ]] && break
     done
+
+    # The machine may have printed everything and exited between two polls, so
+    # the log is checked once more before the process's death is called a
+    # failure.
+    if [[ $outcome -ne 0 ]] && ! kill -0 "$pid" 2>/dev/null; then
+        outcome=2
+        local line complete=1
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            grep -qF -- "$line" "$logfile" 2>/dev/null || { complete=0; break; }
+        done <<< "$expected"
+        [[ $complete -eq 1 ]] && outcome=0
+    fi
+
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
-    return 0
+    return $outcome
 }
 
 for fault in "${FAULTS[@]}"; do
@@ -115,12 +141,21 @@ for fault in "${FAULTS[@]}"; do
   qemu_log="$(mktemp)"
   run_until "$log" "${EXPECT[$fault]}" "$TIMEOUT" \
       -M q35 -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom build/bhaskix.iso -boot d \
-      -drive file=build/initrd.tar,format=raw,if=none,id=disk0 \
+      -drive file=build/initrd.tar,format=raw,if=none,id=disk0,readonly=on \
       -device virtio-blk-pci,drive=disk0 \
       -serial "file:$log" -display none \
       -d cpu_reset -D "$qemu_log"
+  verdict=$?
 
   failures=()
+
+  # Lead with why the run ended, when it did not end well. Everything below
+  # this describes *what was in the log*, which is only meaningful once the
+  # machine got far enough to write it.
+  case $verdict in
+    1) failures+=("timed out after ${TIMEOUT}s -- the machine had not reached the fault yet, which on a loaded host is a slow boot rather than a mishandled exception") ;;
+    2) failures+=("qemu exited before the fault was reported -- check that the image and the disk were both available") ;;
+  esac
 
   # The decisive check: a triple fault resets the CPU, and QEMU logs it.
   # This is the difference between "reported the fault" and "died".
@@ -128,10 +163,12 @@ for fault in "${FAULTS[@]}"; do
     failures+=("machine TRIPLE FAULTED instead of reporting")
   fi
 
-  while IFS= read -r expected; do
-    [[ -z "$expected" ]] && continue
-    grep -qF -- "$expected" "$log" || failures+=("missing: '$expected'")
-  done <<< "${EXPECT[$fault]}"
+  if [[ $verdict -eq 0 ]]; then
+    while IFS= read -r expected; do
+      [[ -z "$expected" ]] && continue
+      grep -qF -- "$expected" "$log" || failures+=("missing: '$expected'")
+    done <<< "${EXPECT[$fault]}"
+  fi
 
   for marker in "${FATAL_MARKERS[@]}"; do
     grep -qF -- "$marker" "$log" && failures+=("$marker")

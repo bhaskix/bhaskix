@@ -150,10 +150,20 @@ impl Rights {
 /// so an invocation can be type-checked before anything dereferences it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObjectKind {
-    /// A region of physical memory not yet given a purpose.
-    Untyped,
     /// A physical frame.
+    ///
+    /// Kept for the one case that wants a single page — a device register
+    /// window. Bulk memory is a [`ObjectKind::Memory`] object instead.
     Frame,
+    /// A set of frames a capability names: [RFC 0009](../../docs/rfc/0009-shared-memory.md).
+    ///
+    /// There is deliberately no `Untyped`. seL4 makes all kernel memory come
+    /// from untyped capabilities that userspace retypes; RFC 0009's acceptance
+    /// took the simpler model, where an object is allocated from a domain's
+    /// `ResourceEnvelope`. The cost is that accounting is a quota rather than
+    /// an exact partition of physical memory, and it was accepted with the
+    /// decision.
+    Memory,
     /// An address space.
     AddressSpace,
     /// A thread.
@@ -262,7 +272,7 @@ impl Arena {
     pub const fn new() -> Self {
         Self {
             nodes: [CapNode {
-                object: ObjectRef::new(ObjectKind::Untyped, 0),
+                object: ObjectRef::new(ObjectKind::Frame, 0),
                 rights: Rights::NONE,
                 badge: 0,
                 parent: None,

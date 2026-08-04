@@ -46,6 +46,7 @@ pub mod notify;
 pub mod panic;
 pub mod sched;
 pub mod service;
+pub mod shared;
 pub mod shell;
 pub mod smp;
 pub mod stack;
@@ -1502,6 +1503,166 @@ fn mount_root(handoff: &Handoff) {
         // bootloader loaded and never reclaims.
         unsafe { vfs::mount(bytes) };
     }
+}
+
+/// Checks RFC 0009 step 1: objects are made, charged, and given back whole.
+///
+/// The assertion that matters is the frame count across the whole thing. An
+/// object holds frames the allocator no longer has, charged to a domain that
+/// no longer wants them the moment either bookkeeping half is wrong — and the
+/// frame-leak gate is the check this project trusts most, so this points it at
+/// exactly the new case rather than hoping the existing one covers it.
+fn shared_memory_self_test(hhdm: u64) -> bool {
+    use bhaskix_mm::FRAME_SIZE;
+
+    let before = heap::available_frames();
+
+    let Ok(realm) = domain::create("memtest", domain::ResourceEnvelope::new()) else {
+        println!("    memory objects FAILED: no domain to charge");
+        return false;
+    };
+
+    // A four-page object. Its frames must be real, distinct and page-aligned:
+    // a device or a page table will use them directly, and two entries naming
+    // one frame is a buffer that aliases itself.
+    let object = shared::create(realm, 4 * FRAME_SIZE);
+    let mut distinct = true;
+    let mut aligned = true;
+    if let Ok(id) = object {
+        let mut seen = [0u64; 4];
+        for page in 0..4 {
+            let frame = shared::frame_at(id, page).unwrap_or(0);
+            aligned &= frame != 0 && frame.is_multiple_of(FRAME_SIZE);
+            distinct &= !seen[..page].contains(&frame);
+            seen[page] = frame;
+        }
+        // One past the end names nothing, rather than the next object's first
+        // page -- which is what an unchecked index would have returned.
+        distinct &= shared::frame_at(id, 4).is_none();
+    }
+
+    let charged = domain::with(realm, |owner| owner.charged_frames()) == Some(4);
+    let after_create = heap::available_frames();
+    let took_frames = after_create + 4 == before;
+
+    // Lengths: zero and one page past the bound are refusals, not clamps.
+    let zero = shared::create(realm, 0) == Err(shared::MemoryError::BadLength);
+    let huge = shared::create(realm, FRAME_SIZE * shared::MAX_FRAMES as u64 + 1)
+        == Err(shared::MemoryError::BadLength);
+
+    // A domain whose envelope will not cover it is refused, and nothing is
+    // taken on the way out.
+    let mut tiny = domain::ResourceEnvelope::new();
+    tiny.memory_frames = 2;
+    let pinched = domain::create("pinched", tiny).ok();
+    let refused = pinched.is_some_and(|small| {
+        let before_refusal = heap::available_frames();
+        let outcome = shared::create(small, 4 * FRAME_SIZE);
+        let unchanged = heap::available_frames() == before_refusal;
+        outcome == Err(shared::MemoryError::QuotaExceeded) && unchanged
+    });
+
+    // The mapping half (step 2). Mapped into a fresh address space, checked
+    // through the page tables, then the *space* is destroyed -- which must not
+    // free frames that belong to the object. That invariant is the one RFC
+    // 0009 singles out as the one that will be got wrong, so it is asserted
+    // directly rather than inferred from a later leak check.
+    let mut mapped_ok = false;
+    let mut translated_ok = false;
+    let mut execute_refused = false;
+    let mut frames_kept = false;
+
+    // The baseline is taken *before* the address space exists, so that after
+    // it is destroyed the only correct answer is "exactly what it started
+    // with". A threshold would not do: teardown also returns the page tables
+    // it built, so "fewer than four extra frames" is a number that passes
+    // whether or not the object's frames were wrongly freed. That version was
+    // written first and failed for the right reason.
+    let baseline = heap::available_frames();
+
+    if let Ok(id) = object
+        && let Ok(mut space) = vm::AddressSpace::new(hhdm)
+    {
+        const AT: u64 = 0x0000_0000_2000_0000;
+        let at = bhaskix_boot::VirtAddr(AT);
+
+        // Executable shared memory is refused outright: revocation unmaps
+        // while the other side is running, and a receiver whose code vanishes
+        // faults at an instruction that no longer exists.
+        execute_refused =
+            shared::map_into(id, &mut space, at, bhaskix_mm::Protection::ReadExecute).is_err();
+
+        mapped_ok = shared::map_into(id, &mut space, at, bhaskix_mm::Protection::ReadWrite).is_ok();
+
+        // The mapping points at the object's own frames, not at copies.
+        translated_ok = (0..4).all(|page| {
+            let virtual_address = bhaskix_boot::VirtAddr(AT + page * FRAME_SIZE);
+            space
+                .translate(virtual_address)
+                .map(|physical| physical & !(FRAME_SIZE - 1))
+                == shared::frame_at(id, page as usize)
+        });
+
+        space.destroy();
+        // Exactly what it took, and nothing that was not its. If teardown
+        // freed the object's four frames as well, this is four too many.
+        frames_kept = heap::available_frames() == baseline;
+    }
+
+    // Destroying the domain destroys its objects: a shared region does not
+    // outlive the domain that made it.
+    if let Some(small) = pinched {
+        domain::destroy(small);
+    }
+    domain::destroy(realm);
+
+    let after = heap::available_frames();
+    let (live, created, destroyed) = shared::statistics();
+
+    let checks = [
+        ("an object was created", object.is_ok()),
+        (
+            "its frames are distinct and page-aligned",
+            distinct && aligned,
+        ),
+        ("the frames left the allocator", took_frames),
+        ("and were charged to the domain's envelope", charged),
+        ("it maps into an address space", mapped_ok),
+        ("an executable shared mapping is refused", execute_refused),
+        ("the mapping names the object's own frames", translated_ok),
+        (
+            // The invariant RFC 0009 says will be got wrong.
+            "destroying the address space did not free the object's frames",
+            frames_kept,
+        ),
+        ("a length of zero is refused", zero),
+        ("a length past the bound is refused", huge),
+        (
+            "an envelope that will not cover it refuses, taking nothing",
+            refused,
+        ),
+        (
+            "destroying the domain destroyed its objects",
+            live == 0 && destroyed >= created,
+        ),
+        ("and every frame came back", after == before),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!("    memory objects FAILED: {name} (frames {before} -> {after}, {live} live)");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!(
+            "    memory objects {created} created, {destroyed} destroyed, none live; mapped and \
+             unmapped without losing a frame ({before})"
+        );
+    }
+    ok
 }
 
 /// Moves the block device off polling and onto an interrupt.
@@ -3513,6 +3674,7 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
     PHASE.store(PHASE_DOMAIN, Ordering::Release);
     wait_millis(200);
     ok &= domain_self_test(hhdm_base, cpus);
+    ok &= shared_memory_self_test(hhdm_base);
 
     // Retire the class threads: publish, then wake, then let them exit.
     PHASE.store(PHASE_CLASS + 1, Ordering::Release);

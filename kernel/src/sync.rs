@@ -115,6 +115,12 @@ pub enum Rank {
     /// waiting. The *signal* path takes no lock at all, which is what lets an
     /// interrupt handler call it.
     Notifications = 10,
+    /// `shared::ARENA` — memory objects (RFC 0009).
+    ///
+    /// Outside the heap, because creating one allocates frames while it is
+    /// held; inside the domain table, because charging an envelope happens
+    /// before the arena is taken. Nothing goes the other way.
+    SharedMemory = 11,
     /// `irq::HANDLERS` — claimed interrupt sources.
     ///
     /// Outside `vectors::TABLE`, because claiming a source takes this and then
@@ -122,22 +128,22 @@ pub enum Rank {
     /// same rank, which the checker reported on the first boot: two locks of
     /// one rank have no declared order and can close a cycle just as easily as
     /// an inversion.
-    IrqHandlers = 11,
+    IrqHandlers = 12,
     /// `vectors::TABLE` — who owns which interrupt vector.
     ///
     /// A leaf: taken at boot and when a driver claims a source, with nothing
     /// acquired while it is held. Inside the scheduler's queues because a
     /// claim never wakes anything.
-    Vectors = 12,
+    Vectors = 13,
     /// `virtio::DEVICE` — the one block device.
     ///
     /// Inside the scheduler's queues because nothing here wakes a thread: the
     /// driver waits for its device by spinning on a ring the device writes,
     /// not by blocking. Outside the console, because a driver reports what it
     /// found while holding itself.
-    Block = 13,
+    Block = 14,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
-    Console = 14,
+    Console = 15,
 }
 
 impl Rank {
@@ -173,6 +179,7 @@ impl Rank {
             Self::WaitQueue => "wait::WaitQueue",
             Self::SchedRunqueue => "sched::QUEUES",
             Self::Notifications => "notify::ALLOCATION",
+            Self::SharedMemory => "shared::ARENA",
             Self::IrqHandlers => "irq::HANDLERS",
             Self::Vectors => "vectors::TABLE",
             Self::Block => "virtio::DEVICE",

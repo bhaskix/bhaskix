@@ -70,7 +70,12 @@ CMDLINE_STAMP := build/.cmdline
 # same bytes in both places is deliberate: a test that reads the disk knows
 # exactly what must come back, because the kernel already parsed it from
 # somewhere else.
-QEMU_DISK    := -drive file=$(INITRD),format=raw,if=none,id=disk0 \
+#
+# `readonly=on` is not decoration. The kernel only reads this image, and QEMU's
+# default is an *exclusive write lock* on the file — so two runs that overlap
+# by a second, which is every `make test` on a loaded machine, fight over it
+# and the loser starts with no disk. Read-only takes a shared lock instead.
+QEMU_DISK    := -drive file=$(INITRD),format=raw,if=none,id=disk0,readonly=on \
                 -device virtio-blk-pci,drive=disk0
 
 QEMU_COMMON  := -M q35 -cpu $(QEMU_CPU) -m $(QEMU_MEM) -no-reboot -no-shutdown $(QEMU_DISK)

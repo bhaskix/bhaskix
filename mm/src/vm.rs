@@ -170,6 +170,21 @@ pub enum Backing {
     },
     /// Reserved address space with nothing behind it. Guard pages.
     Reserved,
+    /// Frames owned by a `Memory` object, not by this address space.
+    ///
+    /// [RFC 0009](../../docs/rfc/0009-shared-memory.md). The distinction is
+    /// the whole point of the variant: **tearing down an address space must
+    /// not free these frames**, because they belong to the object and may be
+    /// mapped somewhere else as well. Every path that releases memory checks
+    /// for [`Backing::Anonymous`] rather than for "not reserved", so a shared
+    /// region is skipped by construction rather than by a branch somebody has
+    /// to remember to add.
+    Shared {
+        /// Which object, as its arena index. An opaque number here: `mm` does
+        /// not know what a `Memory` object is, and should not — it needs only
+        /// to know that these frames are not its to free.
+        object: u32,
+    },
 }
 
 /// Additional properties of a region.

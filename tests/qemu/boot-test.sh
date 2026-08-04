@@ -73,7 +73,7 @@ pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 DISK="$REPO_ROOT/build/initrd.tar"
 
 QEMU_ARGS=(-M q35 -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
-           -drive "file=$DISK,format=raw,if=none,id=disk0" -device virtio-blk-pci,drive=disk0
+           -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on" -device virtio-blk-pci,drive=disk0
            -serial "file:$LOG" -display none)
 
 if [[ "$MODE" == "uefi" ]]; then
@@ -136,6 +136,25 @@ echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
 
 status=0
+
+# If the machine never finished booting, every assertion below fails for one
+# reason and prints thirty of them. That wall of red says nothing about which
+# thing broke, and it has twice been mistaken for a catastrophic regression
+# when the actual cause was a second QEMU holding the disk image or a loaded
+# host. One accurate line is worth more than thirty misleading ones.
+if ! grep -qF "Nothing left to do at this milestone" "$LOG"; then
+    fail "the machine did not finish booting within ${TIMEOUT}s"
+    if [[ ! -s "$LOG" ]]; then
+        echo "        the serial log is empty -- qemu may not have started at all" >&2
+        echo "        (a second run holding build/initrd.tar is the usual cause)" >&2
+    else
+        echo "        it got as far as:" >&2
+        tail -5 "$LOG" | sed 's/^/          /' >&2
+    fi
+    echo "--- serial log ---" >&2
+    cat "$LOG" >&2
+    exit 1
+fi
 
 if grep -qF "$EXPECT_GREETING" "$LOG"; then
     pass "greeting present"
@@ -389,6 +408,18 @@ if grep -qE "virtio-blk irq +msi-x vector 0x[0-9a-f]+; [1-9][0-9]* waits, 0 spin
     pass "the block driver waits on an interrupt and never spins"
 else
     fail "the block device is still polling, or its interrupt did not arrive"
+    status=1
+fi
+
+# RFC 0009 step 1: memory objects. The number in parentheses is the frame count
+# before and after -- asserted as *equal* by the kernel, and printed so that a
+# regression says by how much rather than only that there was one. This is the
+# frame-leak gate pointed at the newest thing that can leak, which is the whole
+# reason the object's frames are charged to an envelope at all.
+if grep -qE "memory objects +[1-9][0-9]* created, [1-9][0-9]* destroyed, none live; mapped and unmapped without losing a frame" "$LOG"; then
+    pass "memory objects map, charge, free, and leak nothing"
+else
+    fail "the memory-object self test did not pass"
     status=1
 fi
 
