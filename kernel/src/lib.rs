@@ -693,6 +693,8 @@ static RING3_ECHOED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 
 /// The badge on the capability the ring 3 probe holds.
 const BADGE_RING3: u64 = 0x0000_0000_1234_0000;
+/// The badge ring 3 puts on the capability it derives for itself.
+const BADGE_DERIVED: u64 = 0x0000_0000_5678_0000;
 /// What the probe asks for, and what it must be told.
 const RING3_REQUEST: u64 = 6;
 
@@ -876,7 +878,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
-    let (calls_before, refused_before) = syscall::statistics();
+    let (calls_before, refused_before, revoked_before) = syscall::statistics();
     let interrupts_before = bhaskix_arch::trap::interrupts_from_user();
 
     // The service on a different CPU, so the probe's call genuinely blocks and
@@ -907,9 +909,10 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     ipc::destroy(endpoint);
     domain::destroy(realm);
 
-    let (calls, refused) = syscall::statistics();
+    let (calls, refused, revoked) = syscall::statistics();
     let calls = calls - calls_before;
     let refused = refused - refused_before;
+    let revoked = revoked - revoked_before;
     let (rip, rsp) = syscall::last_user_context();
     let interrupts = bhaskix_arch::trap::interrupts_from_user() - interrupts_before;
 
@@ -932,10 +935,10 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // is never reached. Removing that `swapgs` passed a version of this
         // test that lacked this line.
         ("the probe was interrupted while in ring 3", interrupts > 0),
-        // The IPC half. Two calls, both from user mode, both carrying the
-        // badge from the capability the probe holds -- which the probe cannot
-        // read or set.
-        ("ring 3 reached a service through IPC", ring3_calls >= 2),
+        // The IPC half. Three calls reach the service: two through the
+        // capability the kernel installed, one through the capability ring 3
+        // derived for itself. The fourth, after revocation, must not.
+        ("ring 3 reached a service through IPC", ring3_calls == 3),
         (
             "the service saw the badge from the probe's capability",
             ring3_badge & BADGE_RING3 != 0,
@@ -943,6 +946,17 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // The decisive one: user mode sent back the value it was told, so the
         // reply reached ring 3 rather than merely being delivered.
         ("the reply reached user mode", echoed),
+        // Delegation, asked for by ring 3 rather than arranged for it. The
+        // derived capability carries a badge the program chose, which the
+        // service sees and the parent's badge does not explain.
+        (
+            "ring 3 derived a capability and used it",
+            ring3_badge & BADGE_DERIVED != 0,
+        ),
+        // And revocation, also asked for by ring 3. The slot is still in the
+        // CSpace; the authority behind it is gone, so the call fails rather
+        // than reaching a service that is still perfectly willing to answer.
+        ("revoking from ring 3 stopped the next call", revoked >= 1),
     ];
 
     let mut ok = true;
@@ -957,7 +971,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     if ok {
         println!(
-            "    ring 3         {calls} syscalls and {interrupts} interrupts from user mode, {refused} refused; {ring3_calls} ipc calls badged {ring3_badge:#x}, reply reached ring 3"
+            "    ring 3         {calls} syscalls, {interrupts} interrupts from user mode; {ring3_calls} ipc calls badged {ring3_badge:#x}; ring 3 derived, used and revoked its own capability ({revoked} refused after)"
         );
     }
     ok

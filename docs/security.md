@@ -72,8 +72,13 @@ you do not.
 > same system calls and reaching nothing — which is the claim above stated as a test rather than as
 > a design intention.
 >
-> Still missing: there is no syscall to **grant, derive or revoke**, so a domain's authority is
-> fixed when it is created. The mechanism exists in the arena and is unreachable from user mode.
+> **Delegation demonstrated from user mode as of M5-07.** The same program derives a second,
+> differently badged capability to the endpoint, calls through it, revokes the parent, and finds the
+> derived copy dead — all by `Invoke` methods on capabilities it holds, with no new system call. A
+> domain can therefore only ever delegate what it was itself given.
+>
+> Still missing: `GRANT` *between* domains is implemented and has no test, so the cross-domain half
+> of delegation is written rather than shown.
 
 ### Rules the implementation must uphold
 

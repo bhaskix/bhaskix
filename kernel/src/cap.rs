@@ -65,6 +65,16 @@ pub const MAX_CAPABILITIES: usize = 1024;
 /// Capability slots one domain can hold.
 pub const CSPACE_SLOTS: usize = 64;
 
+/// Distinct owners the arena can attribute capabilities to.
+///
+/// Matches `domain::MAX_DOMAINS`, and is declared here rather than imported so
+/// that the arena does not depend on the domain table — the dependency runs
+/// the other way, and a cycle would make either one impossible to test alone.
+pub const MAX_OWNERS: usize = 32;
+
+/// The owner of a capability the kernel created for itself.
+pub const OWNER_KERNEL: u32 = u32::MAX;
+
 /// What a capability permits.
 ///
 /// A bitmask rather than an enum: rights compose, and derivation is defined by
@@ -196,6 +206,13 @@ struct CapNode {
     parent: Option<NodeId>,
     /// Incremented every time this entry is reused.
     generation: u32,
+    /// Which domain is charged for this capability's existence.
+    ///
+    /// The arena is a fixed global resource, so "who created this" is the
+    /// question a quota has to answer — and it cannot be answered from the
+    /// CSpaces a capability happens to sit in, because revocation destroys
+    /// nodes without touching any CSpace.
+    owner: u32,
     live: bool,
 }
 
@@ -225,6 +242,12 @@ pub struct Arena {
     nodes: [CapNode; MAX_CAPABILITIES],
     /// Nodes currently live, for reporting.
     live: usize,
+    /// Where `kill` records owners during a tallied revocation.
+    ///
+    /// Threaded through the structure rather than passed down, because the
+    /// sweep that finds descendants is several calls deep and giving every
+    /// one of them an optional out-parameter would obscure what they do.
+    tally: Option<[u32; MAX_OWNERS]>,
 }
 
 impl Default for Arena {
@@ -244,9 +267,11 @@ impl Arena {
                 badge: 0,
                 parent: None,
                 generation: 0,
+                owner: OWNER_KERNEL,
                 live: false,
             }; MAX_CAPABILITIES],
             live: 0,
+            tally: None,
         }
     }
 
@@ -269,6 +294,21 @@ impl Arena {
         rights: Rights,
         badge: u64,
     ) -> Result<SlotRef, CapError> {
+        self.insert_root_owned(object, rights, badge, OWNER_KERNEL)
+    }
+
+    /// Creates a capability with no parent, charged to `owner`.
+    ///
+    /// # Errors
+    ///
+    /// [`CapError::Exhausted`] if the arena is full.
+    pub fn insert_root_owned(
+        &mut self,
+        object: ObjectRef,
+        rights: Rights,
+        badge: u64,
+        owner: u32,
+    ) -> Result<SlotRef, CapError> {
         let index = self.free_index().ok_or(CapError::Exhausted)?;
         let generation = self.nodes[index].generation;
         self.nodes[index] = CapNode {
@@ -277,6 +317,7 @@ impl Arena {
             badge,
             parent: None,
             generation,
+            owner,
             live: true,
         };
         self.live += 1;
@@ -347,6 +388,21 @@ impl Arena {
         rights: Rights,
         badge: u64,
     ) -> Result<SlotRef, CapError> {
+        self.derive_owned(parent, rights, badge, OWNER_KERNEL)
+    }
+
+    /// Derives a capability charged to `owner`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Arena::derive`].
+    pub fn derive_owned(
+        &mut self,
+        parent: SlotRef,
+        rights: Rights,
+        badge: u64,
+        owner: u32,
+    ) -> Result<SlotRef, CapError> {
         let index = self.resolve(parent).ok_or(CapError::NotFound)?;
         let parent_node = self.nodes[index];
 
@@ -365,6 +421,7 @@ impl Arena {
             badge,
             parent: Some(parent.node),
             generation,
+            owner,
             live: true,
         };
         self.live += 1;
@@ -414,6 +471,33 @@ impl Arena {
         }
     }
 
+    /// Revokes, and records how many capabilities each owner got back.
+    ///
+    /// The subtree can span domains — that is the point of granting — so
+    /// releasing quota accurately means attributing every destroyed node to
+    /// whoever was charged for it. Counting only the revoker's own would leak
+    /// quota from every domain it had ever granted to.
+    ///
+    /// # Errors
+    ///
+    /// As [`Arena::revoke`].
+    pub fn revoke_tallied(
+        &mut self,
+        slot: SlotRef,
+        tally: &mut [u32; MAX_OWNERS],
+    ) -> Result<usize, CapError> {
+        let index = self.resolve(slot).ok_or(CapError::NotFound)?;
+        if !self.nodes[index].rights.contains(Rights::REVOKE) {
+            return Err(CapError::RevokeNotPermitted);
+        }
+        self.tally = Some(*tally);
+        let destroyed = self.destroy_subtree(index);
+        if let Some(collected) = self.tally.take() {
+            *tally = collected;
+        }
+        Ok(destroyed)
+    }
+
     fn destroy_subtree(&mut self, root: usize) -> usize {
         let mut destroyed = 0;
 
@@ -448,6 +532,12 @@ impl Arena {
         if !self.nodes[index].live {
             return;
         }
+        if let Some(tally) = self.tally.as_mut() {
+            let owner = self.nodes[index].owner as usize;
+            if owner < MAX_OWNERS {
+                tally[owner] = tally[owner].saturating_add(1);
+            }
+        }
         self.nodes[index].live = false;
         // Bumped on death rather than on reuse, so a slot referring to this
         // node stops resolving the moment it dies, even before the entry is
@@ -460,6 +550,13 @@ impl Arena {
     #[must_use]
     pub const fn live(&self) -> usize {
         self.live
+    }
+
+    /// The domain charged for a capability, if it is still live.
+    #[must_use]
+    pub fn owner_of(&self, slot: SlotRef) -> Option<u32> {
+        let index = self.resolve(slot)?;
+        Some(self.nodes[index].owner)
     }
 }
 

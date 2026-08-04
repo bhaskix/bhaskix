@@ -125,7 +125,8 @@ fairness within 2% for two equal-weight workloads.
 | M5-04 | Ring 3 execution | ✅ `DONE` | A program runs in ring 3, enters the kernel through `SYSCALL`, and is interrupted there. **Negative-tested**: removing the interrupt-entry `swapgs` or leaving `RSP0` zero both fail the gate. |
 | M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`/`Recv`, badges | ✅ `DONE` | Rendezvous, no buffering. Exercised through the whole syscall path — domain, CSpace, capability, type check, badge. **Negative-tested**: taking the badge from the caller's frame makes the service unable to tell its clients apart. |
 | M5-05b | IPC from ring 3 | ✅ `DONE` | A user program calls a service by capability, blocks, is woken across CPUs, and receives the reply — proved by sending the value back. **Negative-tested**: with no capability, or no domain, the syscalls still happen and reach nothing. |
-| M5-06 | Per-domain capability quotas | 🟡 `PARTIAL` | `ResourceEnvelope::max_capabilities` exists and is unit-tested, but nothing charges it yet — there is no syscall through which a domain derives. Wired up in M5-03. |
+| M5-06 | Per-domain capability quotas | ✅ `DONE` | Charged on every capability a domain gains and released on every one it loses, attributed by owner so a revocation spanning domains returns quota to each. **Negative-tested**: a quota of zero stops ring 3 deriving. |
+| M5-07 | Grant, derive and revoke from user mode | ✅ `DONE` | `Invoke` methods, not new syscall kinds — RFC 0008 fixes the set at six. Ring 3 derives a badged capability, calls through it, revokes the parent, and the next call fails. |
 
 ### Honest notes on M5 so far
 
@@ -134,10 +135,14 @@ fairness within 2% for two equal-weight workloads.
   exist. It has caused an intermittent failure in `set_domain_weight`, in `start_all` and in
   `weight_of`/`cycles_of`. `try_lock` belongs where *failing* is a valid outcome — interrupt context,
   and the switch path — and nowhere else.
-- **A user thread can call, but cannot yet be *given* a capability at runtime.** The probe's
-  endpoint capability is installed by the kernel before it starts. There is no syscall to grant,
-  derive or revoke, so a domain's authority is fixed at creation — which makes `Rights::GRANT` and
-  the whole delegation story real in the arena and unreachable from user mode.
+- **`GRANT` between domains is implemented and unexercised.** Ring 3 derives and revokes for
+  itself, which the gate proves. Handing a capability to *another* domain needs a second domain and
+  a capability naming it, and no test builds that arrangement — so the cross-domain half of
+  delegation is code written and reviewed rather than demonstrated. It is the same status M5-03 had
+  before ring 3 existed, and deserves the same treatment.
+- **The quota counts arena nodes, not CSpace slots.** A capability that has been revoked but whose
+  slot is still installed is not charged, because the node is gone; the dead slot still occupies one
+  of the domain's 64. Both are bounded, and they are bounded separately.
 - **IPC has no timeout on `Recv`**, so a service bug hangs its callers indefinitely. RFC 0008
   records it as unresolved because it needs a policy decision rather than code.
 - **"No message is ever lost" is not gated.** The IPC test asserts that every reply that arrived was
@@ -344,6 +349,30 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M5-06 and M5-07: quotas, and delegation from user mode)
+
+- **Ring 3 derives a capability, uses it, and revokes it.** The probe asks the kernel to derive a
+  second capability to the same endpoint with a badge *it* chooses, calls the service through it —
+  which the service sees under the new badge — then revokes the parent, and the next call fails.
+  Nothing about that was arranged by the kernel: it is a user program managing its own authority.
+- **These are `Invoke` methods, not new system calls.** RFC 0008 fixes the set at six and says a
+  seventh should feel like an architectural change. Granting authority is not one; it is an
+  operation *on a capability*, which is what `Invoke` is for. Routing it that way also means a
+  domain can only ever delegate something it was itself given, with no check to write.
+- **Transitive revocation is now observable from user mode**, which is a different claim from the
+  unit test that has covered it since M5-01. Negative-tested: making revocation stop at the root
+  lets the derived copy survive, the fourth call reaches the service, and the gate goes red.
+- **The quota is charged by owner, not by who revoked.** A capability records the domain that
+  created it, and revocation tallies destroyed nodes per owner — because the subtree can span
+  domains, which is the entire point of granting. Counting only the revoker's own would leak quota
+  from every domain it had ever granted to.
+- **A derive that cannot be installed destroys what it made.** Deriving into an occupied slot would
+  otherwise leave a capability charged to the domain and reachable by nobody — a leak only a reboot
+  clears. The same applies to the two-stage cross-domain grant, which unwinds if the recipient
+  refuses it.
+- **`GRANT` between domains is implemented and unexercised**, and recorded as such rather than
+  counted as done.
 
 ### 2026-08-04 (M5-05b, IPC from ring 3 — the loop closes)
 

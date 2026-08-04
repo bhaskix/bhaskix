@@ -436,6 +436,39 @@ bhaskix_user_probe_start:
     mov rdx, r13
     syscall
 
+    // Delegation, from user mode. Derive a second capability to the same
+    // endpoint, with a different badge, into slot 1 of this domain's own
+    // CSpace. Nothing in the kernel arranged this -- ring 3 asked for it.
+    mov rax, 0                  // Kind::Invoke
+    xor rdi, rdi                // on capability 0
+    xor rsi, rsi                // method::DERIVE
+    mov rdx, 0x3f               // rights: everything the parent had
+    mov r10, 0x56780000         // the badge this copy will carry
+    mov r8, 1                   // into slot 1
+    syscall
+
+    // Call through the derived capability. The service sees the *new* badge,
+    // which is how a derived capability is distinguishable from its parent.
+    mov rax, 1                  // Kind::Call
+    mov rdi, 1                  // capability 1
+    mov rsi, 9
+    mov rdx, 5
+    syscall
+
+    // Revoke the parent. Transitively, that must take the derived copy too.
+    mov rax, 0                  // Kind::Invoke
+    xor rdi, rdi
+    mov rsi, 1                  // method::REVOKE
+    syscall
+
+    // The same call again. It must fail: the capability slot is still there,
+    // and the authority behind it is not.
+    mov rax, 1                  // Kind::Call
+    mov rdi, 1
+    mov rsi, 10
+    mov rdx, 5
+    syscall
+
     mov rax, 5                  // Kind::Exit
     syscall
 

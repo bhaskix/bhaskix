@@ -55,12 +55,20 @@ static LAST_RIP: AtomicU64 = AtomicU64::new(0);
 /// The user `RSP` of the most recent call.
 static LAST_RSP: AtomicU64 = AtomicU64::new(0);
 
-/// `(calls, refused)` since boot.
+/// Calls refused because the capability they named had been revoked.
+///
+/// Counted separately from every other failure because it is the observable
+/// consequence of revocation, and a test needs to see authority *stop*
+/// working rather than merely never having worked.
+static REVOKED_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// `(calls, refused, revoked)` since boot.
 #[must_use]
-pub fn statistics() -> (u64, u64) {
+pub fn statistics() -> (u64, u64, u64) {
     (
         CALLS.load(Ordering::Relaxed),
         REFUSED.load(Ordering::Relaxed),
+        REVOKED_CALLS.load(Ordering::Relaxed),
     )
 }
 
@@ -121,6 +129,34 @@ impl Kind {
     }
 }
 
+/// Methods every capability answers, whatever it names.
+///
+/// These are the delegation primitives, and they are `Invoke` methods rather
+/// than syscall kinds on purpose. [RFC 0008] fixes the syscall set at six and
+/// says adding a seventh should feel like an architectural change; granting
+/// authority is not one. It is an operation *on a capability*, which is
+/// exactly what `Invoke` is for — and routing it through a capability means a
+/// domain can only delegate what it was itself given.
+pub mod method {
+    /// Create a weaker capability from this one, in the caller's own CSpace.
+    ///
+    /// `arg0` = rights mask, `arg1` = badge, `arg2` = destination slot.
+    pub const DERIVE: u64 = 0;
+    /// Revoke this capability and everything derived from it.
+    pub const REVOKE: u64 = 1;
+    /// Drop this capability from the caller's CSpace without revoking it.
+    ///
+    /// Distinct from revoking, and the difference matters: other domains may
+    /// legitimately hold the same capability, and dropping your copy must not
+    /// take theirs.
+    pub const DELETE: u64 = 2;
+    /// Give a derived capability to the domain this capability names.
+    ///
+    /// Only on a `Domain` capability. `arg0` = the caller's slot to derive
+    /// from, `arg1` = rights, `arg2` = badge, `arg3` = slot in the recipient.
+    pub const GRANT: u64 = 16;
+}
+
 /// What a system call returns in `rax`.
 ///
 /// Zero is success, so a caller can branch on the sign or on zero without a
@@ -149,6 +185,12 @@ pub enum Status {
     Congested = 8,
     /// The reply names a caller that is no longer waiting.
     NoSuchCaller = 9,
+    /// The object does not answer that method.
+    NoSuchMethod = 10,
+    /// The destination slot is occupied or out of range.
+    SlotUnavailable = 11,
+    /// The domain's capability quota is full.
+    QuotaExceeded = 12,
 }
 
 impl Status {
@@ -218,11 +260,10 @@ pub fn dispatch_with(frame: &mut SyscallFrame, cspace: &CSpace, arena: &Arena) -
         // second implementation that could drift from the first.
         Kind::Yield | Kind::Exit => Outcome::err(Status::BadSyscall),
 
+        // `Invoke` is handled in `dispatch`, which has the mutable CSpace and
+        // arena these methods rearrange. Reaching here means a caller went
+        // round that, so it is an error rather than a second implementation.
         Kind::Invoke => match resolve(cspace, arena, frame.capability) {
-            // The type check that replaces a permission check. A capability
-            // naming a thread is not usable where an endpoint is expected,
-            // and the kind travels *in* the capability so this can be decided
-            // before anything is dereferenced.
             Ok((_, ObjectKind::Reply)) => Outcome::err(Status::WrongObject),
             Ok((_, _)) => Outcome::err(Status::NotImplemented),
             Err(status) => Outcome::err(status),
@@ -242,6 +283,99 @@ pub fn dispatch_with(frame: &mut SyscallFrame, cspace: &CSpace, arena: &Arena) -
                 Err(status) => Outcome::err(status),
             }
         }
+    }
+}
+
+/// Performs an `Invoke` on the caller's own CSpace.
+///
+/// Runs with the domain table and the capability arena both held, which is
+/// safe only because none of these methods block: they rearrange authority
+/// and return. The moment one of them needs to wait, it must move out here
+/// the way the IPC calls did.
+fn invoke_capability(
+    frame: &SyscallFrame,
+    owner: u32,
+    cspace: &mut CSpace,
+    arena: &mut Arena,
+) -> Outcome {
+    let index = match usize::try_from(frame.capability) {
+        Ok(index) => index,
+        Err(_) => return Outcome::err(Status::NoSuchCapability),
+    };
+    let Some(slot) = cspace.get(index) else {
+        return Outcome::err(Status::NoSuchCapability);
+    };
+    let Some((object, _)) = arena.lookup(slot) else {
+        return Outcome::err(Status::Revoked);
+    };
+
+    match frame.method {
+        method::DERIVE => {
+            let rights = crate::cap::Rights::from_bits(frame.arg0 as u8);
+            let destination = match usize::try_from(frame.arg2) {
+                Ok(destination) => destination,
+                Err(_) => return Outcome::err(Status::SlotUnavailable),
+            };
+
+            // Derive first, install second. If the slot is unavailable the
+            // capability would otherwise exist with nothing referring to it —
+            // charged to the domain and unreachable by it, which is a leak
+            // that only a reboot clears.
+            if cspace.get(destination).is_some() {
+                return Outcome::err(Status::SlotUnavailable);
+            }
+
+            match arena.derive_owned(slot, rights, frame.arg1, owner) {
+                Ok(derived) => match cspace.install_at(destination, derived) {
+                    Ok(()) => Outcome::ok(frame.arg2),
+                    Err(_) => {
+                        arena.revoke_unchecked(derived);
+                        Outcome::err(Status::SlotUnavailable)
+                    }
+                },
+                Err(crate::cap::CapError::RightsNotMonotone) => {
+                    Outcome::err(Status::InsufficientRights)
+                }
+                Err(crate::cap::CapError::DeriveNotPermitted) => {
+                    Outcome::err(Status::InsufficientRights)
+                }
+                Err(_) => Outcome::err(Status::QuotaExceeded),
+            }
+        }
+
+        method::REVOKE => {
+            let mut tally = [0u32; crate::cap::MAX_OWNERS];
+            match arena.revoke_tallied(slot, &mut tally) {
+                Ok(destroyed) => {
+                    // The revoked capability's own slot is now a dead
+                    // reference. Clearing it is not required for safety --
+                    // resolving it fails -- but leaving it occupies a slot the
+                    // domain can never use again.
+                    cspace.remove(index);
+                    Outcome {
+                        status: Status::Ok,
+                        value: destroyed as u64,
+                    }
+                }
+                Err(crate::cap::CapError::RevokeNotPermitted) => {
+                    Outcome::err(Status::InsufficientRights)
+                }
+                Err(_) => Outcome::err(Status::NoSuchCapability),
+            }
+        }
+
+        method::DELETE => {
+            cspace.remove(index);
+            Outcome::ok(0)
+        }
+
+        method::GRANT if object.kind == crate::cap::ObjectKind::Domain => {
+            // Handled by the caller: it needs the *recipient's* CSpace, and
+            // two domains' tables cannot be held at once.
+            Outcome::err(Status::NotImplemented)
+        }
+
+        _ => Outcome::err(Status::NoSuchMethod),
     }
 }
 
@@ -300,6 +434,14 @@ const fn ipc_status(error: crate::ipc::IpcError) -> Status {
 /// the correct answer rather than an oversight — kernel threads created before
 /// domains existed must not inherit the ability to name objects.
 pub fn dispatch(frame: &mut SyscallFrame) -> Outcome {
+    let outcome = dispatch_inner(frame);
+    if outcome.status == Status::Revoked {
+        REVOKED_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    outcome
+}
+
+fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // Counted before anything can divert: `Exit` never returns, so a counter
     // incremented afterwards would miss exactly the call that ends the thread.
     CALLS.fetch_add(1, Ordering::Relaxed);
@@ -398,6 +540,10 @@ pub fn dispatch(frame: &mut SyscallFrame) -> Outcome {
         return Outcome::err(Status::NoDomain);
     };
 
+    if kind == Some(Kind::Invoke) {
+        return invoke(id, frame);
+    }
+
     // The domain table, then the arena: the order `sync::Rank` declares, and
     // the same order `domain::destroy` uses.
     let Some(outcome) = domain::with(id, |owner| {
@@ -433,6 +579,131 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     // the stub pops into `rax` and `rdx`.
     frame.kind = outcome.status.as_u64();
     frame.arg0 = outcome.value;
+}
+
+/// Performs an `Invoke`, including the cross-domain grant.
+fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
+    // A grant needs two domains' CSpaces and cannot hold both tables at once,
+    // so it is resolved in stages rather than done in place.
+    if frame.method == method::GRANT {
+        return grant(id, frame);
+    }
+
+    let owner = id.as_u32();
+    domain::with(id, |domain| {
+        let mut cspace = core::mem::take(&mut domain.cspace);
+        let before = cspace.occupied();
+        let outcome = cap::with_arena(|arena| invoke_capability(frame, owner, &mut cspace, arena));
+        let after = cspace.occupied();
+
+        // Charge or release the quota by what the operation actually did,
+        // rather than by what it was asked to do. A derive that failed on the
+        // destination slot must not leave the domain charged for it.
+        if after > before {
+            if domain.charge_capability().is_err() {
+                return Outcome::err(Status::QuotaExceeded);
+            }
+        } else {
+            for _ in after..before {
+                domain.release_capability();
+            }
+        }
+
+        domain.cspace = cspace;
+        outcome
+    })
+    .unwrap_or(Outcome::err(Status::NoDomain))
+}
+
+/// Gives a derived capability to another domain.
+///
+/// Requires two things the caller must already hold: a capability naming the
+/// *recipient* domain, with `WRITE`, and the source capability it is
+/// delegating, with `DERIVE`. Neither is a check bolted on — a domain that
+/// holds no capability to another cannot name it, so there is no way to
+/// express a grant to a stranger.
+fn grant(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
+    // Stage one: resolve both capabilities in the caller's own space, and
+    // derive the copy that will be handed over. The derived capability is
+    // charged to the *recipient*, because it is the recipient's to keep.
+    let resolved = domain::with(id, |domain| {
+        let cspace = core::mem::take(&mut domain.cspace);
+        let result = cap::with_arena(|arena| {
+            let target_index =
+                usize::try_from(frame.capability).map_err(|_| Status::NoSuchCapability)?;
+            let target_slot = cspace.get(target_index).ok_or(Status::NoSuchCapability)?;
+            let (target, target_rights) = arena.lookup(target_slot).ok_or(Status::Revoked)?;
+            if target.kind != crate::cap::ObjectKind::Domain {
+                return Err(Status::WrongObject);
+            }
+            if !target_rights.contains(crate::cap::Rights::WRITE) {
+                return Err(Status::InsufficientRights);
+            }
+
+            let source_index = usize::try_from(frame.arg0).map_err(|_| Status::NoSuchCapability)?;
+            let source_slot = cspace.get(source_index).ok_or(Status::NoSuchCapability)?;
+            let (_, source_rights) = arena.lookup(source_slot).ok_or(Status::Revoked)?;
+            if !source_rights.contains(crate::cap::Rights::GRANT) {
+                return Err(Status::InsufficientRights);
+            }
+
+            let recipient = u32::try_from(target.id).map_err(|_| Status::WrongObject)?;
+            let rights = crate::cap::Rights::from_bits(frame.arg1 as u8);
+            let derived = arena
+                .derive_owned(source_slot, rights, frame.arg2, recipient)
+                .map_err(|error| match error {
+                    crate::cap::CapError::RightsNotMonotone
+                    | crate::cap::CapError::DeriveNotPermitted => Status::InsufficientRights,
+                    _ => Status::QuotaExceeded,
+                })?;
+            Ok((recipient, derived))
+        });
+        domain.cspace = cspace;
+        result
+    });
+
+    let Some(Ok((recipient, derived))) = resolved else {
+        return match resolved {
+            Some(Err(status)) => Outcome::err(status),
+            _ => Outcome::err(Status::NoDomain),
+        };
+    };
+
+    // Stage two: install it in the recipient, and charge the recipient. If
+    // either fails the derived capability is destroyed rather than left
+    // orphaned in the arena.
+    let destination = match usize::try_from(frame.arg3) {
+        Ok(destination) => destination,
+        Err(_) => {
+            cap::with_arena(|arena| arena.revoke_unchecked(derived));
+            return Outcome::err(Status::SlotUnavailable);
+        }
+    };
+
+    let placed = domain::with(domain::DomainId::from_u32(recipient), |target| {
+        if target.charge_capability().is_err() {
+            return Err(Status::QuotaExceeded);
+        }
+        match target.cspace.install_at(destination, derived) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                target.release_capability();
+                Err(Status::SlotUnavailable)
+            }
+        }
+    });
+
+    match placed {
+        Some(Ok(())) => Outcome::ok(frame.arg3),
+        Some(Err(status)) => {
+            cap::with_arena(|arena| arena.revoke_unchecked(derived));
+            Outcome::err(status)
+        }
+        None => {
+            cap::with_arena(|arena| arena.revoke_unchecked(derived));
+            Outcome::err(Status::NoSuchCapability)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -598,5 +869,8 @@ mod tests {
         assert_eq!(Status::NoDomain.as_u64(), 7);
         assert_eq!(Status::Congested.as_u64(), 8);
         assert_eq!(Status::NoSuchCaller.as_u64(), 9);
+        assert_eq!(Status::NoSuchMethod.as_u64(), 10);
+        assert_eq!(Status::SlotUnavailable.as_u64(), 11);
+        assert_eq!(Status::QuotaExceeded.as_u64(), 12);
     }
 }

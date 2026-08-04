@@ -315,8 +315,8 @@ fi
 # page and a stack pointer inside the user stack, neither of which the kernel
 # ever executes at or uses as a stack. Counting system calls alone would look
 # identical to calling the dispatcher directly.
-if grep -qE "ring 3 +[0-9]+ syscalls and [1-9][0-9]* interrupts from user mode, [1-9][0-9]* refused; [1-9][0-9]* ipc calls badged 0x[0-9a-f]+, reply reached ring 3" "$LOG"; then
-    pass "ring 3 runs, calls a service by capability, and receives the reply"
+if grep -qE "ring 3 +[0-9]+ syscalls, [1-9][0-9]* interrupts from user mode; [1-9] ipc calls badged 0x[0-9a-f]+; ring 3 derived, used and revoked its own capability \([1-9][0-9]* refused after\)" "$LOG"; then
+    pass "ring 3 calls by capability, delegates, and revokes its own authority"
 else
     fail "ring 3 execution did not pass"
     status=1
