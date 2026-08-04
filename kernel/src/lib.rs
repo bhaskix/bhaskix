@@ -1515,6 +1515,8 @@ fn mount_root(handoff: &Handoff) {
 fn shared_memory_self_test(hhdm: u64) -> bool {
     use bhaskix_mm::FRAME_SIZE;
 
+    shared::set_hhdm(hhdm);
+
     let before = heap::available_frames();
 
     let Ok(realm) = domain::create("memtest", domain::ResourceEnvelope::new()) else {
@@ -1609,6 +1611,59 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
         frames_kept = heap::available_frames() == baseline;
     }
 
+    // Step 3: revocation takes the pages out of every address space that
+    // mapped them, before the object goes. The assertion is made through the
+    // page tables, because page tables are what grant access -- a region map
+    // that still lists the region is bookkeeping, and `vm::handle_fault`
+    // refuses a fault on a shared region so a stale entry cannot become an
+    // accidental grant.
+    let mut revoked_ok = false;
+    let mut ninth_refused = false;
+    let mut mapped_before_revoke = false;
+
+    if let Ok(realm2) = domain::create("revoketest", domain::ResourceEnvelope::new()) {
+        if let Ok(id) = shared::create(realm2, 2 * FRAME_SIZE)
+            && let Ok(mut space) = vm::AddressSpace::new(hhdm)
+        {
+            const AT: u64 = 0x0000_0000_3000_0000;
+            let at = bhaskix_boot::VirtAddr(AT);
+            let mapped = shared::map_into(id, &mut space, at, bhaskix_mm::Protection::ReadWrite);
+            mapped_before_revoke =
+                mapped.is_ok() && space.translate(at).is_some() && shared::mapping_count(id) == 1;
+
+            // A ninth mapping is refused. Eight is the bound revocation can
+            // walk without allocating, and a mapping revocation cannot find is
+            // the one failure this design exists to prevent.
+            let mut spaces = alloc::vec::Vec::new();
+            for slot in 1..=8u64 {
+                let Ok(mut extra) = vm::AddressSpace::new(hhdm) else {
+                    break;
+                };
+                let outcome = shared::map_into(
+                    id,
+                    &mut extra,
+                    bhaskix_boot::VirtAddr(AT + slot * 0x0010_0000),
+                    bhaskix_mm::Protection::ReadOnly,
+                );
+                if slot == 8 {
+                    ninth_refused = outcome == Err(shared::MemoryError::TooManyMappings);
+                }
+                spaces.push(extra);
+            }
+
+            let removed = shared::revoke(id);
+            // The page is gone from the table it was mapped in. Not "the
+            // region was removed" -- the region map is not what grants access.
+            revoked_ok = removed >= 1 && space.translate(at).is_none() && !shared::live(id);
+
+            space.destroy();
+            for extra in spaces {
+                extra.destroy();
+            }
+        }
+        domain::destroy(realm2);
+    }
+
     // Destroying the domain destroys its objects: a shared region does not
     // outlive the domain that made it.
     if let Some(small) = pinched {
@@ -1635,6 +1690,17 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
             "destroying the address space did not free the object's frames",
             frames_kept,
         ),
+        ("a mapped object reports its mapping", mapped_before_revoke),
+        (
+            "a ninth mapping is refused rather than untracked",
+            ninth_refused,
+        ),
+        (
+            // The property RFC 0009 exists for: after revoke returns, the
+            // pages are gone from the page tables, not merely renamed.
+            "revocation removed the pages from the page tables",
+            revoked_ok,
+        ),
         ("a length of zero is refused", zero),
         ("a length past the bound is refused", huge),
         (
@@ -1658,8 +1724,9 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
 
     if ok {
         println!(
-            "    memory objects {created} created, {destroyed} destroyed, none live; mapped and \
-             unmapped without losing a frame ({before})"
+            "    memory objects {created} created, {destroyed} destroyed, none live; {} mappings \
+             revoked out of their page tables; no frame lost ({before})",
+            shared::revocations()
         );
     }
     ok

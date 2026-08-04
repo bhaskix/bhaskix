@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-04 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07, M6-08 (RFC 0011 steps 1–4, RFC 0009 steps 1–2) · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07, M6-08 (RFC 0011 steps 1–4, RFC 0009 steps 1–3) · CI green |
 
 ### Division of responsibility between documents
 
@@ -127,7 +127,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-03 | ELF64 loader, with a fuzz target | ✅ `DONE` | Ring 3 now runs `bin/probe`, a separately built ET_EXEC loaded out of the initrd, mapped at the addresses and with the permissions **its own headers** name. **Negative-tested**: dropping one segment fails the gate; a deliberately reintroduced wrap bug is caught by the mutation harness at seed 424. |
 | M6-04 | Kernel shell | ✅ `DONE` | The console reads: ACPI walk → I/O APIC → IRQ 4 → a vector → a lock-free ring → a blocking read. Nine read-only commands, run by the boot self-test through the same function the prompt calls. **Negative-tested**: draining one byte per interrupt fails the boot gate; removing the wake-up passes it and fails `shell-test.sh`, which is why that test exists. |
 | M6-05 | User-mode shell over the syscall interface | ✅ `DONE` | The machine boots to a shell in ring 3 holding two capabilities and nothing else: console and filesystem, both reached by IPC, sixteen bytes per round trip. `shell=kernel` selects the ring 0 one. **Negative-tested**: withholding the filesystem capability makes `caps` report it, both filesystem commands fail, and everything else keeps working. |
-| M6-08 | RFC 0009 steps 1–2: `Memory` objects, and mapping them | ✅ `DONE` | An object is frames, a length and an owner, charged to a `ResourceEnvelope` and released when it goes; `Backing::Shared` lets an address space borrow frames it does not own. `ObjectKind::Untyped` deleted, per the RFC's acceptance. **Negative-tested**: a `destroy` that leaks four frames fails the gate. The teardown invariant — a destroyed address space must not free a shared region's frames — is asserted directly rather than inferred. |
+| M6-08 | RFC 0009 steps 1–3: `Memory` objects, mapping, and revocation | ✅ `DONE` | An object is frames, a length and an owner, charged to a `ResourceEnvelope` and released when it goes; `Backing::Shared` lets an address space borrow frames it does not own. `ObjectKind::Untyped` deleted, per the RFC's acceptance. **Negative-tested**: a `destroy` that leaks four frames fails the gate. The teardown invariant — a destroyed address space must not free a shared region's frames — is asserted directly rather than inferred. Step 3 adds the reverse map, the revocation walk and the shootdown: after `revoke` returns the pages are gone from the *page tables*, which is what grants access. **Negative-tested** twice: a `destroy` that leaks four frames, and a `revoke` that removes the bookkeeping but leaves the page-table entry. |
 | M6-07 | RFC 0011 steps 1–4: a vector allocator, `IrqHandler`, and a driver that stops polling | ✅ `DONE` | One registry for all 256 vectors; `IrqControl`/`IrqHandler` with exclusive claims and reserved sources; the delivery path is mask → signal a notification → acknowledge. RFC 0010's `Notification` landed with it, because step 3 binds one. `input.rs` and `virtio-blk` are both clients now rather than special cases. **Negative-tested**: leaving the notification unbound fails the gate. |
 | M6-06 | `virtio-blk` driver | ✅ `DONE` | PCI enumeration, modern virtio 1.0 discovered through the device's own capability list, a split virtqueue driven by DMA. `root=disk` mounts the filesystem off the device, so the user-mode shell is a file the driver read. **Negative-tested**: a driver that ignored the sector number reads sector zero four times and fails the gate, because the disk is the ramdisk image and the kernel has the same bytes from the bootloader to compare against. |
 
@@ -503,6 +503,31 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (RFC 0009 step 3 — revocation that means something)
+
+- **After `revoke` returns, the pages are gone from the page tables.** Not from the region map — from
+  the tables, because tables are what grant access. `security.md` §2 rule 3 says revocation is
+  transitive and immediate; for memory that has to include the mappings, since **a revoked capability
+  whose pages are still mapped is not revoked, it is renamed.**
+- **A mapping records a page-table root, not a reference to an `AddressSpace`.** A reference would be
+  a pointer this arena cannot keep valid. The consequence is that the region map outlives the
+  mapping, which is harmless bookkeeping — and would not have been, but for the next item.
+- **A hole found by reading, not by a test.** `vm::handle_fault` would have serviced a fault on a
+  `Backing::Shared` region by allocating a *fresh* frame — so a revoked mapping would silently
+  reappear as blank memory at the same address. Worse than either keeping it or refusing it. Shared
+  regions are mapped eagerly and never demand-paged, so a fault on one means the pages were taken
+  away; it is refused now, with the reasoning at the arm.
+- **The ninth mapping is refused before anything is mapped.** A mapping that succeeded and could not
+  then be recorded would be one revocation cannot find, which is the single failure this design
+  exists to prevent. `MAX_MAPPINGS` is eight because the walk must complete without allocating.
+- **A TLB shootdown per page, before returning.** An entry surviving in one CPU's TLB is a mapping
+  that is gone from the tables and still works — a revocation with a delay fuse, which is the thing
+  rule 3 forbids.
+- **What step 3 does not yet demonstrate:** the RFC's "B faults after A revokes" needs a second
+  domain with the region mapped and running, which is step 4. What is asserted instead is the
+  mechanism underneath it — `translate()` returns nothing after revocation — which is the property
+  the fault would be evidence *of*.
 
 ### 2026-08-04 (a harness that blamed the kernel for its own contention)
 

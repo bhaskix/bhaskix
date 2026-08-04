@@ -38,6 +38,14 @@ use bhaskix_mm::{FRAME_SIZE, Zone};
 /// Memory objects that can exist at once.
 pub const MAX_OBJECTS: usize = 16;
 
+/// Address spaces one object may be mapped into at once.
+///
+/// RFC 0009 proposes eight, and the bound is not an apology: revocation must
+/// **complete**, and a list it had to allocate to walk is a revocation that
+/// can fail. A ninth `MAP` is refused, which is a caller finding out at map
+/// time rather than a revocation finding out at the worst time.
+pub const MAX_MAPPINGS: usize = 8;
+
 /// Frames one object may hold — 64 KiB.
 ///
 /// Fixed, because the object must not chase an allocation while it is being
@@ -61,6 +69,8 @@ pub enum MemoryError {
     Gone,
     /// The domain does not exist.
     NoSuchDomain,
+    /// The object is already mapped in [`MAX_MAPPINGS`] address spaces.
+    TooManyMappings,
 }
 
 /// Names a memory object, with the generation current when it was named.
@@ -78,6 +88,21 @@ impl MemoryId {
     }
 }
 
+/// Where an object is mapped: a page table, and where in it.
+///
+/// The *page-table root*, not a reference to an `AddressSpace`. Revocation has
+/// to work on the thing that actually grants access, and that is the page
+/// table — a reference to the owning struct would be a pointer this arena
+/// cannot keep valid, and the region map it contains is bookkeeping that
+/// outliving the mapping does no harm (`vm::handle_fault` refuses a fault on a
+/// shared region for exactly that reason).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Mapping {
+    root: u64,
+    address: u64,
+    pages: u64,
+}
+
 /// One object.
 #[derive(Clone, Copy)]
 struct Object {
@@ -90,6 +115,8 @@ struct Object {
     length: u64,
     /// Whose envelope paid, and keeps paying for as long as this exists.
     owner: DomainId,
+    /// Every address space this is mapped into. Walked by [`revoke`].
+    mappings: [Option<Mapping>; MAX_MAPPINGS],
     generation: u32,
     live: bool,
 }
@@ -101,6 +128,7 @@ impl Object {
             count: 0,
             length: 0,
             owner: DomainId::from_u32(0),
+            mappings: [None; MAX_MAPPINGS],
             generation: 0,
             live: false,
         }
@@ -129,6 +157,20 @@ static ARENA: SpinLock<Arena> = SpinLock::new(Rank::SharedMemory, Arena::new());
 /// Objects created and destroyed, for the leak gate.
 static CREATED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DESTROYED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Mappings removed by revocation.
+static REVOKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The direct-map base, so revocation can walk page tables without being
+/// handed one. Written once during boot.
+static HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Records the direct-map base for the revocation walk.
+///
+/// Called once during boot. Revocation cannot take an `hhdm` argument: it is
+/// reached from a capability being revoked, and that path has no reason to
+/// know about the direct map.
+pub fn set_hhdm(hhdm: u64) {
+    HHDM.store(hhdm, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// Creates an object of `length` bytes, charged to `owner`.
 ///
@@ -181,6 +223,7 @@ pub fn create(owner: DomainId, length: u64) -> Result<MemoryId, MemoryError> {
                     count: taken,
                     length: pages * FRAME_SIZE,
                     owner,
+                    mappings: [None; MAX_MAPPINGS],
                     generation,
                     live: true,
                 };
@@ -299,12 +342,18 @@ pub fn map_into(
     protection: bhaskix_mm::Protection,
 ) -> Result<(), MemoryError> {
     // The frame list is copied out from under the arena, because mapping takes
-    // the heap lock and this arena is a leaf. The object cannot be destroyed
-    // in between by anyone who does not already hold a name for it, and a
-    // caller racing its own destroy is a caller with a bug of its own.
+    // the heap lock and this arena is a leaf.
     let (frames, count) = {
         let arena = ARENA.lock();
         let object = resolve(&arena, id).ok_or(MemoryError::Gone)?;
+
+        // Refuse the ninth *before* anything is mapped. A mapping that
+        // succeeded and then could not be recorded would be one revocation
+        // could not find, which is the one failure this whole design exists to
+        // prevent.
+        if object.mappings.iter().all(Option::is_some) {
+            return Err(MemoryError::TooManyMappings);
+        }
         (object.frames, object.count)
     };
 
@@ -313,10 +362,88 @@ pub fn map_into(
 
     space
         .map_shared(range, id.index, &frames[..count], protection)
-        .map_err(|_| MemoryError::BadLength)
+        .map_err(|_| MemoryError::BadLength)?;
+
+    // Recorded after the mapping exists, and the slot was reserved above, so
+    // this cannot fail. If it somehow did, the mapping would be unreachable by
+    // revocation -- so it undoes itself rather than leaving one.
+    let mut arena = ARENA.lock();
+    let Some(object) = arena.objects.get_mut(id.index as usize) else {
+        return Err(MemoryError::Gone);
+    };
+    let Some(slot) = object.mappings.iter_mut().find(|slot| slot.is_none()) else {
+        drop(arena);
+        let _ = space.unmap(address);
+        return Err(MemoryError::TooManyMappings);
+    };
+    *slot = Some(Mapping {
+        root: space.root(),
+        address: address.as_u64(),
+        pages: count as u64,
+    });
+    Ok(())
 }
 
-/// Whether the object is live.
+/// Takes an object's pages out of every address space that mapped them, and
+/// then destroys it.
+///
+/// This is what makes revocation mean something for memory. `security.md` §2
+/// rule 3 says revocation is transitive and immediate; for a `Memory`
+/// capability that has to include the mappings, because **a revoked capability
+/// whose pages are still mapped is not revoked, it is renamed.**
+///
+/// The order is load-bearing: mappings first, then the object. The reverse
+/// would leave a window in which the object is gone and its frames are still
+/// reachable — and those frames are about to be handed to somebody else.
+///
+/// Returns how many mappings were removed.
+pub fn revoke(id: MemoryId) -> usize {
+    // Take the list out under the arena; do the page-table work outside it,
+    // because unmapping walks tables through the direct map and shooting down
+    // a TLB sends an interrupt to every other CPU.
+    let (mappings, hhdm) = {
+        let mut arena = ARENA.lock();
+        let Some(object) = resolve(&arena, id) else {
+            return 0;
+        };
+        let index = id.index as usize;
+        let mappings = object.mappings;
+        arena.objects[index].mappings = [None; MAX_MAPPINGS];
+        (mappings, HHDM.load(core::sync::atomic::Ordering::Relaxed))
+    };
+
+    let mut removed = 0;
+    for mapping in mappings.iter().flatten() {
+        for page in 0..mapping.pages {
+            let address = mapping.address + page * FRAME_SIZE;
+            // SAFETY: `root` is a page table this object was mapped into, and
+            // the frame it returns belongs to the object -- so it is
+            // deliberately *not* freed here. `destroy` returns it, once,
+            // however many address spaces had it mapped.
+            let _ = unsafe { bhaskix_arch::paging::unmap_page(mapping.root, address, hhdm) };
+
+            // Before returning, on every CPU that might have loaded this
+            // address space. An entry that survives in one CPU's TLB is a
+            // mapping that is gone from the tables and still works, which is
+            // the exact shape of a revocation with a delay fuse.
+            crate::tlb::shootdown(address);
+        }
+        removed += 1;
+    }
+
+    REVOKED.fetch_add(removed as u64, core::sync::atomic::Ordering::Relaxed);
+    destroy(id);
+    removed
+}
+
+/// How many address spaces have this object mapped.
+#[must_use]
+pub fn mapping_count(id: MemoryId) -> usize {
+    let arena = ARENA.lock();
+    resolve(&arena, id).map_or(0, |object| object.mappings.iter().flatten().count())
+}
+
+/// Whether the object is live./// Whether the object is live.
 #[must_use]
 pub fn live(id: MemoryId) -> bool {
     resolve(&ARENA.lock(), id).is_some()
@@ -332,6 +459,12 @@ pub fn statistics() -> (usize, u64, u64) {
         CREATED.load(Relaxed),
         DESTROYED.load(Relaxed),
     )
+}
+
+/// Mappings removed by revocation since boot.
+#[must_use]
+pub fn revocations() -> u64 {
+    REVOKED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 fn allocate_frame() -> Option<u64> {
@@ -387,6 +520,7 @@ mod tests {
             count: 1,
             length: FRAME_SIZE,
             owner: DomainId::from_u32(1),
+            mappings: [None; MAX_MAPPINGS],
             generation: 7,
             live: true,
         };

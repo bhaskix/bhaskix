@@ -616,6 +616,20 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
         return FaultOutcome::Refused("write to a read-only mapping");
     }
 
+    // A shared region is mapped eagerly and never demand-paged, so a fault on
+    // one means its pages have been taken away -- which is what revocation
+    // does. Servicing it would hand the faulting code a *fresh* frame at the
+    // address it was just revoked from: a revoked mapping silently replaced by
+    // blank memory, which is worse than either keeping it or refusing it.
+    //
+    // Found by reading this function while writing the revocation walk, not by
+    // a test. The region map outlives the mapping by design -- revocation
+    // works on page tables, because page tables are what grant access -- so
+    // this arm is what stops the stale entry becoming an accidental grant.
+    if matches!(region.backing, Backing::Shared { .. }) {
+        return FaultOutcome::Refused("a shared region was revoked, or never mapped");
+    }
+
     let root = space.root;
     let hhdm = space.hhdm_base;
 

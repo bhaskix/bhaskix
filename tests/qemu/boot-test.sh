@@ -416,8 +416,8 @@ fi
 # regression says by how much rather than only that there was one. This is the
 # frame-leak gate pointed at the newest thing that can leak, which is the whole
 # reason the object's frames are charged to an envelope at all.
-if grep -qE "memory objects +[1-9][0-9]* created, [1-9][0-9]* destroyed, none live; mapped and unmapped without losing a frame" "$LOG"; then
-    pass "memory objects map, charge, free, and leak nothing"
+if grep -qE "memory objects +[1-9][0-9]* created, [1-9][0-9]* destroyed, none live; [1-9][0-9]* mappings revoked out of their page tables; no frame lost" "$LOG"; then
+    pass "memory objects map, revoke out of the page tables, and leak nothing"
 else
     fail "the memory-object self test did not pass"
     status=1
