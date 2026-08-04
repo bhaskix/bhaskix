@@ -372,9 +372,11 @@ exists and only needs pointing at a new source.
    one loop. Without it, a service needs two threads. Proposal: leave it out,
    and revisit when a service has both — because the mechanism is genuinely
    intricate and the need is not yet demonstrated.
-2. **The `IRQHandler` object** — who may claim an interrupt line, how a vector
-   is allocated, and what acknowledgement looks like. Its own RFC, tangled
-   with MSI-X and the driver framework.
+2. ~~**The `IRQHandler` object** — who may claim an interrupt line, how a
+   vector is allocated, and what acknowledgement looks like.~~ **Answered:**
+   [RFC 0011](0011-irq-handler.md), which uses this object as its delivery
+   mechanism and adds the one thing this RFC's interrupt discussion did not
+   mention — the source must be *masked* before it is signalled.
 3. **A timeout on `wait`.** RFC 0008 already records that `Recv` needs one
    eventually, or a service bug becomes a caller hang. The same applies here
    and the answer should be the same answer, whatever it turns out to be.
