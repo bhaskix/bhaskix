@@ -21,6 +21,8 @@ HOST_TARGET  := x86_64-unknown-linux-gnu
 KERNEL       := target/$(TARGET)/$(PROFILE)/bhaskix
 ISO          := build/bhaskix.iso
 ISO_ROOT     := build/iso_root
+INITRD       := build/initrd.tar
+INITRD_DIR   := initrd
 LIMINE_DIR   := boot/limine/limine
 
 # 256 MiB is comfortably more than the kernel needs and small enough that the
@@ -82,10 +84,22 @@ $(CMDLINE_STAMP): FORCE
 
 FORCE:
 
-$(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) | $(LIMINE_DIR)
+# The initial ramdisk. `ustar` explicitly rather than whatever the local tar
+# defaults to: GNU tar emits its own extensions for long names and large
+# files, and the kernel's parser implements the documented format rather than
+# one vendor's superset. Sorted, so the archive is byte-identical for the same
+# inputs and a rebuild does not change the image for no reason.
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort)
+	@mkdir -p $(dir $@)
+	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
+	    --mtime='@0' -cf $@ -C $(INITRD_DIR) .
+	@echo "built $@ ($$(stat -c%s $@) bytes)"
+
+$(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) $(INITRD) | $(LIMINE_DIR)
 	@rm -rf $(ISO_ROOT)
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/bhaskix
+	cp $(INITRD) $(ISO_ROOT)/boot/initrd.tar
 	sed 's|^    cmdline:.*|    cmdline: $(CMDLINE)|' boot/limine.conf \
 	    > $(ISO_ROOT)/boot/limine/limine.conf
 	cp $(LIMINE_DIR)/limine-bios.sys \

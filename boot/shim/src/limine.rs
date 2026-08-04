@@ -248,6 +248,14 @@ struct ExecutableFileResponse {
     executable_file: *const File,
 }
 
+/// Files the bootloader loaded alongside the kernel.
+#[repr(C)]
+struct ModuleResponse {
+    revision: u64,
+    module_count: u64,
+    modules: *const *const File,
+}
+
 // --- The requests themselves --------------------------------------------
 
 macro_rules! request {
@@ -307,6 +315,12 @@ request!(
     0x31eb_5d1c_5ff2_3b69
 );
 request!(MP, MpResponse, 0x95a6_7b81_9a1b_857e, 0xa0b6_1b72_3b6a_73e0);
+request!(
+    MODULE,
+    ModuleResponse,
+    0x3e7e_2797_02be_32af,
+    0xca1c_4f3b_d128_0cee
+);
 
 // --- Translation into the Bhaskix handoff --------------------------------
 
@@ -622,7 +636,41 @@ pub unsafe fn collect_handoff() -> Handoff {
         bsp_lapic_id: MP.response().map_or(0, |r| r.bsp_lapic_id),
         start_secondaries: MP.response().map(|_| start_secondaries as _),
         regions_truncated: truncated,
+        initrd: initrd(),
     }
+}
+
+/// The first module the bootloader loaded, as a slice.
+///
+/// "First" rather than "the one named initrd": matching on a path means
+/// trusting a string the boot medium supplies to decide what the kernel
+/// treats as its filesystem, and there is exactly one module in the image
+/// this project builds. A configuration with several would need a real
+/// selection rule, and would deserve one.
+fn initrd() -> Option<&'static [u8]> {
+    let response = MODULE.response()?;
+    if response.module_count == 0 || response.modules.is_null() {
+        return None;
+    }
+
+    // SAFETY: the bootloader guarantees `modules` points at `module_count`
+    // pointers, each to a `File` it has filled in and will not reclaim.
+    let file = unsafe { *response.modules };
+    if file.is_null() {
+        return None;
+    }
+    // SAFETY: as above.
+    let file = unsafe { &*file };
+
+    if file.address.is_null() || file.size == 0 {
+        return None;
+    }
+
+    let length = usize::try_from(file.size).ok()?;
+    // SAFETY: the bootloader loaded `size` bytes at `address` and marks the
+    // memory as bootloader-reclaimable, which `docs/memory.md` §1 says the
+    // kernel does not reclaim.
+    Some(unsafe { core::slice::from_raw_parts(file.address.cast::<u8>(), length) })
 }
 
 /// Whether the bootloader acknowledged the base revision we asked for.

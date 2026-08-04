@@ -287,6 +287,13 @@ pub struct Handoff {
     /// Must be reported, never ignored. A memory map that is quietly short is
     /// how a kernel comes to allocate from memory a device already owns.
     pub regions_truncated: bool,
+    /// The initial ramdisk the bootloader loaded, if there was one.
+    ///
+    /// A borrowed slice rather than an address and a length, so that the
+    /// kernel cannot read past it by arithmetic. The bytes are entirely
+    /// untrusted — they come from a file on disk that anyone able to write the
+    /// boot medium controls — and every consumer must treat them that way.
+    pub initrd: Option<&'static [u8]>,
 }
 
 impl Handoff {
@@ -466,6 +473,7 @@ mod tests {
             bsp_lapic_id: 0,
             start_secondaries: None,
             regions_truncated: false,
+            initrd: None,
         }
     }
 

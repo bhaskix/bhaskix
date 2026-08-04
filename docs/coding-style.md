@@ -213,6 +213,19 @@ Restated per-subsystem in each design doc. The rules:
 - **Every parser that touches untrusted input gets a fuzz target before merge.** Untrusted input
   includes: ELF files, filesystem metadata, network packets, IPC messages, and *device DMA
   responses*.
+
+> **Deviation, M6-01.** Coverage-guided fuzzing (`cargo-fuzz`, libFuzzer) needs a nightly toolchain
+> for sanitizer support, and [nightly-features.md](nightly-features.md) is empty and worth keeping
+> that way. What runs instead is a **seeded mutation harness** in the parser's own test module: a
+> deterministic generator produces malformed inputs and requires the parser to terminate without
+> panicking, on stable, in CI, on every build. `BHASKIX_FUZZ_ITERATIONS` raises the count for a
+> soak.
+>
+> It is weaker, and the weakness is specific: it explores blindly and will not find a path that
+> needs several particular bytes to line up, which is exactly what coverage guidance is for. The
+> `ustar` reader has been through a million mutated archives on that harness; that is a real number
+> and it is not the same assurance as a fuzzer. When the project accepts a nightly toolchain, or an
+> external fuzzing harness, this becomes the second line of defence rather than the only one.
 - **Every bug fix adds a regression test.** No exceptions. If the bug was not testable, say what you
   changed to make it testable.
 - QEMU integration tests run on every PR. The frame-leak test

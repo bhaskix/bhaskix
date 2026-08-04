@@ -1,0 +1,5 @@
+Bhaskix initial ramdisk.
+
+Loaded by the bootloader as a module and parsed by the kernel as a ustar
+archive. Read-only: nothing writes here, and the kernel treats every byte as
+untrusted input from whoever wrote the boot medium.

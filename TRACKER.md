@@ -114,6 +114,35 @@ fairness within 2% for two equal-weight workloads.
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
 
+### M6 — Filesystem, ELF, shell
+
+| ID | Task | Status | Notes |
+|---|---|---|---|
+| M6-01 | Initial ramdisk: bootloader module, `ustar` reader | ✅ `DONE` | First untrusted input the kernel parses end to end. Seeded mutation harness, one million malformed archives, no panic. **Negative-tested**: no module, and one corrupted byte. |
+| M6-02 | VFS layer over the initrd | ⬜ `TODO` | The reader hands out bytes; there is no path resolution, no open file, no cursor. |
+| M6-03 | ELF64 loader, with a fuzz target | ⬜ `TODO` | Ring 3 currently runs a program copied in as raw bytes. |
+| M6-04 | Kernel shell | ⬜ `TODO` | Needs the console to read as well as write. |
+| M6-05 | User-mode shell over the syscall interface | ⬜ `TODO` | Needs M6-03 and a way to read input from a domain. |
+| M6-06 | `virtio-blk` driver | ⬜ `TODO` | Needs PCIe enumeration, which is Phase 2's driver framework. |
+
+### Honest notes on M6 so far
+
+- **Tests that waited a fixed time have been changed to wait for completion.** A window tuned on an
+  idle machine is a failed test on a loaded one, and this project's tests run under an interpreting
+  emulator on a shared host where cross-CPU work has varied seventy-fold between runs. The bound is
+  still there — a test that waits for ever reports nothing — but it is now an upper limit rather
+  than the measurement.
+
+- **The fuzz requirement is met by a weaker mechanism than §8 intends**, and `docs/coding-style.md`
+  §7's neighbour now records the deviation. A seeded mutation harness explores blindly; coverage
+  guidance is what finds the path needing four specific bytes in the right places. One million
+  archives is a real number and it is not the same assurance.
+- **A `ustar` member with a `prefix` field is reported under its short name.** Joining the two needs
+  a buffer and this parser does not allocate. The build never produces one, so it is wrong in a way
+  that cannot currently happen — but it is wrong, and silently.
+- **The initrd is read-only and there is no filesystem above it.** No paths, no directories to open,
+  no cursor, no permissions. `Archive::lookup` is a linear scan of the whole archive per call.
+
 ### M5 — Domains, capabilities, syscalls, user mode
 
 | ID | Task | Status | Notes |
@@ -143,6 +172,11 @@ fairness within 2% for two equal-weight workloads.
 - **The quota counts arena nodes, not CSpace slots.** A capability that has been revoked but whose
   slot is still installed is not charged, because the node is gone; the dead slot still occupies one
   of the domain's 64. Both are bounded, and they are bounded separately.
+- **A lost wakeup lived in the IPC path for two milestones.** `call` and `recv` checked the mailbox
+  and *then* marked themselves blocked, so a message delivered in between woke a thread that was not
+  blocked yet — and it slept with its answer already in hand. Fixed by marking first and checking
+  second, the same shape M4-09's wait queue got by fusing the two steps under one lock. It surfaced
+  only under heavy host load, which is why two milestones of green runs did not find it.
 - **IPC has no timeout on `Recv`**, so a service bug hangs its callers indefinitely. RFC 0008
   records it as unresolved because it needs a policy decision rather than code.
 - **"No message is ever lost" is not gated.** The IPC test asserts that every reply that arrived was
@@ -349,6 +383,50 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M6-01, the initial ramdisk — and a lost wakeup it exposed)
+
+- **A lost wakeup in the IPC path, found because the initrd shifted the timing.** `call` and `recv`
+  checked their mailbox and *then* marked themselves blocked. A message delivered in that window
+  woke a thread that was not blocked yet, so the wake did nothing, and the thread slept with its
+  answer already delivered. It measured as an IPC test that completed three rounds in eight seconds
+  with both clients stuck mid-call.
+  - The fix is the M4-09 rule in a place with no wait queue to enforce it: **mark blocked first,
+    check second.** A message delivered before the mark is found by the check; one delivered after
+    it sets the thread ready, and `block_self` returns without sleeping.
+  - Two milestones of green runs did not find this. It needed a machine loaded enough to widen a
+    two-instruction window, which is an argument for running the suite somewhere hostile rather than
+    somewhere quiet.
+- **`exit` halts instead of spinning on its runqueue lock**, the same fix `block_self` got in M5-05
+  and the only other place a thread runs with nothing to do.
+
+### 2026-08-04 (M6-01, the initial ramdisk)
+
+- **The kernel has a filesystem image**, loaded by the bootloader as a module and handed over as a
+  borrowed slice rather than an address and a length — so the kernel cannot read past it by
+  arithmetic.
+- **This is the first thing the kernel parses that an attacker controls end to end.** The archive is
+  a file on the boot medium; anyone able to write that medium writes it. The reader is built to one
+  rule: a malformed archive produces a *shorter* listing and never an out-of-bounds read.
+- **A bad header ends the listing rather than being skipped.** "Skip the bad one and continue" is
+  how a parser gets walked off the end of a buffer one malformed record at a time — and it is how a
+  payload chosen to contain a plausible header gets read as one. Negative-tested: corrupting a
+  single byte of the image drops the listing from six members to one.
+- **The checksum is verified and explicitly not trusted.** An attacker computes it as easily as
+  `tar` does. What it catches is a truncated or misaligned archive, where continuing would read a
+  payload as a header — an integrity check, not a security one, and the source says so where someone
+  might otherwise assume the opposite.
+- **GNU tar's extensions are deliberately not implemented.** The build passes `--format=ustar` so
+  they never appear, and a kernel that quietly understood a superset would be agreeing to parse
+  whatever a future tool decided to emit.
+- **The fuzz requirement is met by a seeded mutation harness rather than a coverage-guided fuzzer**,
+  because the latter needs nightly and `nightly-features.md` is empty. One million mutated archives,
+  no panic, seventeen seconds. The deviation and what it costs are recorded in
+  `docs/coding-style.md` §8 rather than left to be discovered.
+- **An API footgun found by hitting it.** `Archive` implemented `Iterator` *and* had inherent
+  `find`/`count`; method resolution picked the trait's by-value versions and consumed the archive at
+  the first call site that used them. Renamed to `lookup`/`members` rather than relying on rules
+  most readers do not carry in their heads.
 
 ### 2026-08-04 (M5-06 and M5-07: quotas, and delegation from user mode)
 

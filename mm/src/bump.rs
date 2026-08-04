@@ -249,6 +249,7 @@ mod tests {
 
     fn handoff() -> Handoff {
         Handoff {
+            initrd: None,
             version: HANDOFF_VERSION,
             memory_map: &MAP,
             hhdm_base: VirtAddr(0xffff_8000_0000_0000),

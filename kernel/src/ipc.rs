@@ -341,17 +341,30 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
         Rendezvous::Queued => {}
     }
 
-    // Block until a reply lands in this thread's mailbox. Rechecked in a loop
-    // because a wake is not proof of a reply: the endpoint may have been
-    // destroyed, and a spurious wake must not be read as an empty answer.
+    // Mark first, check second, and that order is the whole correctness of
+    // this loop.
+    //
+    // Checking first leaves a window: the reply can be delivered and the wake
+    // sent between the check and the mark, and a wake finds a thread that is
+    // not blocked yet, so it does nothing. The thread then blocks with its
+    // answer already sitting in its mailbox, for ever. That is the M4-09 lost
+    // wakeup in a place with no wait queue to fuse the two steps, and it
+    // measured as an IPC test that completed three rounds in eight seconds
+    // with both clients stuck mid-call.
+    //
+    // Marking first closes it from both sides. A reply delivered *before* the
+    // mark is found by the check below; one delivered *after* it sets this
+    // thread ready, and `block_self` returns without sleeping.
     loop {
+        sched::mark_blocked();
         if let Some((reply, _)) = sched::take_message(me) {
+            sched::cancel_block();
             return Ok(reply);
         }
         if !live(id) {
+            sched::cancel_block();
             return Err(IpcError::NoSuchEndpoint);
         }
-        sched::mark_blocked();
         sched::block_self();
     }
 }
@@ -376,18 +389,22 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
         // this thread's mailbox *before* waking it, so a wake with an empty
         // mailbox is spurious rather than an empty answer — which is why this
         // rechecks rather than trusting the wake.
+        // Mark first, check second — see `call` for why the other order loses
+        // messages.
         Rendezvous::Queued => loop {
+            sched::mark_blocked();
             if let Some((message, from)) = sched::take_message(me) {
+                sched::cancel_block();
                 return Ok((message, from));
             }
             if !live(id) {
                 // The endpoint was destroyed under us. Leaving the queue entry
                 // behind would have a later rendezvous deliver to a thread
                 // that has gone.
+                sched::cancel_block();
                 cancel(id, me);
                 return Err(IpcError::NoSuchEndpoint);
             }
-            sched::mark_blocked();
             sched::block_self();
         },
     }

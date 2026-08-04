@@ -1373,7 +1373,26 @@ pub fn exit() -> ! {
     }
     loop {
         preempt();
-        core::hint::spin_loop();
+
+        // If `preempt` returned, this CPU had nothing else to run — so halt
+        // rather than spin round to try again. Spinning here re-takes this
+        // CPU's runqueue lock through `preempt` on every pass, on a thread
+        // that has already finished, and the lock is not fair: a remote CPU
+        // spawning work onto this queue competes with the loop for the cache
+        // line and can be starved. It is the same hazard `block_self` had,
+        // in the one other place a thread runs with nothing to do.
+        //
+        // SAFETY: interrupts are enabled here -- `exit` is only reachable from
+        // thread context -- so the timer or an IPI will wake this. If they are
+        // not, the thread is finished and the CPU has no work either way.
+        if cpu::interrupts_enabled() {
+            // SAFETY: interrupts are enabled, so the timer or an IPI wakes
+            // this halt. A thread reaching `exit` with them disabled would be
+            // a bug elsewhere; spinning covers that case without hanging.
+            unsafe { cpu::halt() };
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -1465,6 +1484,25 @@ pub fn mark_blocked() {
     let current = queue.current;
     if let Some(thread) = queue.threads[current].as_mut() {
         thread.state = State::Blocked;
+    }
+}
+
+/// Undoes a [`mark_blocked`] that turned out not to be needed.
+///
+/// The counterpart to marking first and checking second. A caller that marks
+/// itself blocked, then finds the thing it was going to wait for has already
+/// arrived, must not be left in a state nothing will wake it from.
+pub fn cancel_block() {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    let mut queue = QUEUES[cpu].lock();
+    let current = queue.current;
+    if let Some(thread) = queue.threads[current].as_mut()
+        && thread.state == State::Blocked
+    {
+        thread.state = State::Running;
     }
 }
 

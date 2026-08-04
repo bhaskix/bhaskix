@@ -276,6 +276,17 @@ else
     status=1
 fi
 
+# The initial ramdisk. First time the kernel parses something an attacker
+# controls end to end -- the archive is a file on the boot medium. That a good
+# archive parses is the modest half; that a bad one cannot make the parser
+# misbehave is proved by a million mutated archives on the host.
+if grep -qE "initrd +[0-9]+ KiB, [0-9]+ members, [0-9]+ directories; etc/hostname reads back" "$LOG"; then
+    pass "initrd loaded and parsed as a ustar archive"
+else
+    fail "initrd was not loaded or did not parse"
+    status=1
+fi
+
 # The fast system-call path. Programmed values are read back from the MSRs
 # rather than trusted, because every one of them is acted on without further
 # checking and three decide what privilege level the machine returns to. The

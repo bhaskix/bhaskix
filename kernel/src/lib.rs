@@ -47,6 +47,7 @@ pub mod syscall;
 pub mod time;
 pub mod tlb;
 pub mod trap;
+pub mod ustar;
 pub mod vm;
 pub mod wait;
 
@@ -76,6 +77,7 @@ static HANDOFF: BootCell<Handoff> = BootCell::new(Handoff {
     bsp_lapic_id: 0,
     start_secondaries: None,
     regions_truncated: false,
+    initrd: None,
 });
 
 /// Version string reported at boot.
@@ -345,6 +347,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         bhaskix_arch::percpu::online_count(),
     ) {
         println!("    tickless       FAILED");
+    }
+    if !initrd_self_test(handoff) {
+        println!("    initrd         FAILED");
     }
     if !syscall_self_test(handoff.hhdm_base.as_u64()) {
         println!("    syscall        FAILED");
@@ -625,11 +630,12 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
-    // Generous, because the sample must land after the last reply rather than
-    // during it: an earlier version read six replies while the endpoint had
-    // already counted seven, which is a race in the test rather than in the
-    // rendezvous.
-    wait_millis(1200);
+    // Wait for enough rounds to have happened, not for a duration. The clients
+    // loop until the phase ends, so on a fast machine this returns at once and
+    // on a slow one it waits -- and either way what is asserted afterwards is
+    // that every reply was correct, which does not depend on how many there
+    // were.
+    wait_until(|| IPC_REPLIES.load(Ordering::Relaxed) >= 8, 8_000);
 
     let replies = IPC_REPLIES.load(Ordering::Relaxed);
     let correct = IPC_CORRECT.load(Ordering::Relaxed);
@@ -899,7 +905,15 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
-    wait_millis(1200);
+    // Three service calls and then the probe exits. Waiting for that rather
+    // than for a duration means a slow host costs seconds, not a red gate.
+    wait_until(
+        || RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed) >= 3,
+        8_000,
+    );
+    // A moment more for the revoked call that must fail, which happens after
+    // the third success and produces no counter of its own to wait on.
+    wait_millis(300);
 
     let ring3_calls = RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let ring3_badge = RING3_BADGE.load(core::sync::atomic::Ordering::Relaxed);
@@ -972,6 +986,56 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     if ok {
         println!(
             "    ring 3         {calls} syscalls, {interrupts} interrupts from user mode; {ring3_calls} ipc calls badged {ring3_badge:#x}; ring 3 derived, used and revoked its own capability ({revoked} refused after)"
+        );
+    }
+    ok
+}
+
+/// Reads the initial ramdisk and reports what is in it.
+///
+/// The bytes come from a file on the boot medium, so this is the first time
+/// the kernel parses something an attacker controls end to end. What it
+/// asserts is modest on purpose — that a known member is present with its
+/// known contents — because the interesting property is not that a good
+/// archive parses. It is that a bad one cannot make the parser misbehave, and
+/// that is proved by a million mutated archives on the host, not here.
+fn initrd_self_test(handoff: &Handoff) -> bool {
+    let Some(bytes) = handoff.initrd else {
+        println!("    initrd         FAILED: the bootloader loaded no module");
+        return false;
+    };
+
+    let archive = ustar::Archive::new(bytes);
+    let members = archive.members();
+
+    let hostname = archive.lookup(b"etc/hostname").map(|entry| entry.data());
+    let hello = archive.lookup(b"hello.txt").map(|entry| entry.data());
+    let directories = ustar::Archive::new(bytes)
+        .filter(|entry| entry.kind() == ustar::EntryKind::Directory)
+        .count();
+
+    let checks = [
+        ("the archive has members", members >= 4),
+        (
+            "a file's contents came through byte for byte",
+            hostname == Some(b"bhaskix\n".as_slice()),
+        ),
+        ("a file in the root was found", hello.is_some()),
+        ("directories are distinguished from files", directories >= 1),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!("    initrd         FAILED: {name} ({members} members, {directories} dirs)");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!(
+            "    initrd         {} KiB, {members} members, {directories} directories; etc/hostname reads back",
+            bytes.len() / 1024
         );
     }
     ok
@@ -2236,6 +2300,38 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     }
 
     ok
+}
+
+/// Waits until `done` is true, or `limit_millis` elapses.
+///
+/// Returns whether the condition was met. Preferred over a fixed wait
+/// wherever a test is waiting for *work to finish* rather than for time to
+/// pass: a fixed window turns a loaded machine into a failed test, and this
+/// project's tests run on a shared build host under an interpreting emulator
+/// where cross-CPU work has varied by seventy times between runs.
+///
+/// The bound is still there, because a test that waits for ever reports
+/// nothing at all.
+fn wait_until(mut done: impl FnMut() -> bool, limit_millis: u64) -> bool {
+    let started = bhaskix_arch::tsc::read();
+    let limit = bhaskix_arch::tsc::from_micros(limit_millis.saturating_mul(1_000));
+    let mut spins = 0u64;
+
+    loop {
+        if done() {
+            return true;
+        }
+        if let Some(limit) = limit
+            && bhaskix_arch::tsc::read().saturating_sub(started) > limit
+        {
+            return false;
+        }
+        spins += 1;
+        if spins > 8_000_000_000 {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Waits for `millis` milliseconds of real time.
