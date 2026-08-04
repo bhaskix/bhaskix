@@ -60,4 +60,11 @@ workspace = true
 # will run from, installing an address space, setting RSP0, and finally the
 # transition itself. One block per step is what lets each precondition be
 # stated where it is actually owed.
-unsafe_budget = 500
+# 580 at M6-04, the kernel shell and the console input path. Three sources.
+# Mapping firmware tables on demand: the RSDP on a BIOS machine sits in the
+# legacy area below one megabyte, which no bootloader maps, so each page is
+# translated and mapped before it is read. Driving the UART's receive side and
+# its loopback mode from the self-test. And rebuilding the `IoApic` and
+# `SerialPort` wrappers around an address held in an atomic, which is what
+# keeps the interrupt handler free of locks.
+unsafe_budget = 580

@@ -118,6 +118,32 @@ jobs:
             target/x86_64-unknown-none/release/bhaskix
           retention-days: 7
 
+  shell:
+    name: interactive shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+
+      - name: Install QEMU, xorriso
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 xorriso mtools
+
+      - name: Fetch Limine
+        run: |
+          git clone --branch v8.x-binary --depth 1 \
+            https://github.com/limine-bootloader/limine.git boot/limine/limine
+          make -C boot/limine/limine
+
+      - name: Build bootable image
+        run: make iso
+
+      # The only check here that writes to the kernel rather than only reading
+      # from it. An input path cannot be tested any other way.
+      - name: Type at the machine and assert on its replies
+        run: make test-shell
+
   faults:
     name: fault injection
     runs-on: ubuntu-latest

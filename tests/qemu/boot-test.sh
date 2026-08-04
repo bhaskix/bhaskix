@@ -299,6 +299,27 @@ else
     status=1
 fi
 
+# Device interrupts. The I/O APIC is the first piece of hardware Bhaskix
+# programs that the firmware describes rather than the architecture fixes, so
+# the numbers come out of the machine's own tables. The vector is matched
+# exactly because it is a constant this kernel chose.
+if grep -qE "io apic +at 0x[0-9a-f]+, [0-9]+ inputs, [0-9]+ overrides.*irq 4 -> gsi [0-9]+, vector 0x42" "$LOG"; then
+    pass "I/O APIC found through ACPI and a device interrupt routed"
+else
+    fail "the I/O APIC was not found or the serial line was not routed"
+    status=1
+fi
+
+# The console can now read as well as write. The byte count must be non-zero:
+# a self-test that reported zero bytes and passed would be asserting that
+# nothing happened.
+if grep -qE "shell +[0-9]+ commands; [1-9][0-9]* bytes read back through the interrupt path" "$LOG"; then
+    pass "console input arrives by interrupt, and every shell command works"
+else
+    fail "console input or the shell did not pass"
+    status=1
+fi
+
 # The fast system-call path. Programmed values are read back from the MSRs
 # rather than trusted, because every one of them is acted on without further
 # checking and three decide what privilege level the machine returns to. The

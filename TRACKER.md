@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-04 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 3/6 — ring 3 runs an ELF loaded from the ramdisk · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 4/6 — boots to a shell you can type at · CI green |
 
 ### Division of responsibility between documents
 
@@ -121,7 +121,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-01 | Initial ramdisk: bootloader module, `ustar` reader | ✅ `DONE` | First untrusted input the kernel parses end to end. Seeded mutation harness, one million malformed archives, no panic. **Negative-tested**: no module, and one corrupted byte. |
 | M6-02 | VFS layer over the initrd | ✅ `DONE` | Paths resolve, files open with a cursor, directories list what is directly under them. `..` is **refused rather than resolved** — it cannot escape a flat archive today, and would be a traversal the moment a backend walks a tree. **Negative-tested**: accepting `..` fails the boot gate. |
 | M6-03 | ELF64 loader, with a fuzz target | ✅ `DONE` | Ring 3 now runs `bin/probe`, a separately built ET_EXEC loaded out of the initrd, mapped at the addresses and with the permissions **its own headers** name. **Negative-tested**: dropping one segment fails the gate; a deliberately reintroduced wrap bug is caught by the mutation harness at seed 424. |
-| M6-04 | Kernel shell | ⬜ `TODO` | Needs the console to read as well as write. |
+| M6-04 | Kernel shell | ✅ `DONE` | The console reads: ACPI walk → I/O APIC → IRQ 4 → a vector → a lock-free ring → a blocking read. Nine read-only commands, run by the boot self-test through the same function the prompt calls. **Negative-tested**: draining one byte per interrupt fails the boot gate; removing the wake-up passes it and fails `shell-test.sh`, which is why that test exists. |
 | M6-05 | User-mode shell over the syscall interface | ⬜ `TODO` | Needs M6-03 and a way to read input from a domain. |
 | M6-06 | `virtio-blk` driver | ⬜ `TODO` | Needs PCIe enumeration, which is Phase 2's driver framework. |
 
@@ -161,6 +161,28 @@ fairness within 2% for two equal-weight workloads.
   and every choice is weaker than one segment asked for or stronger than the other did. A file
   produced by a linker Bhaskix does not control could hit this and be rejected for a reason its
   author will find surprising.
+
+- **The kernel shell is the kernel.** It runs in ring 0, calls kernel functions directly, and holds
+  no capability, so it is an operator's tool and not a security boundary. Every command is read-only
+  on purpose: a debugging shell that can write memory makes every session with it afterwards
+  suspect. M6-05's user-mode shell is the one that has to ask.
+
+- **A terminal escape sequence loses its first byte and keeps the rest.** The line editor drops
+  `0x1b` and then inserts `[A` as ordinary characters, so an arrow key types two letters. Correct
+  handling needs a state machine over escape sequences, which is a parser, and this is not the
+  milestone to add one — but the current behaviour is wrong rather than merely absent.
+
+- **One I/O APIC, and the first one.** A machine with several routes high global interrupt numbers
+  to the others, and nothing here does that. The count is reported so a machine where it matters is
+  visible rather than silently half-served. Sixteen interrupt source overrides are read; a table
+  with more says so.
+
+- **A latent one-CPU deadlock was found and closed.** `time::on_tick` woke expired sleepers with a
+  *blocking* runqueue lock, from an interrupt handler that may have interrupted a thread holding
+  that very lock. The window is a few instructions wide and a timer has to expire inside it, so it
+  had never been hit — but it was reachable, and it would have hung the machine with no output.
+  Interrupt-context wakes now use `try_lock` and record what they could not deliver for the next
+  tick.
 
 - **The loader does no relocation, so nothing dynamic loads.** `ET_DYN` — which is what a PIE is —
   is refused outright, which is also what keeps a dynamic loader's attack surface out of the
@@ -399,6 +421,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | Frame-leak test (1000 address spaces, zero drift) | M3 | memory.md §7 |
 | RT latency p99.9 < 50 µs | M4 | scheduler.md §4 |
 | Fuzz targets on every untrusted parser | M6 | coding-style.md §8 |
+| Interactive shell test (types at the machine) | M6 | Milestone exit criteria |
 | Both service placements build | Phase 2 | architecture.md §2 |
 | AI-degradation test (kill `bhaskixd-ai`, suite still passes) | Phase 4 | ai-native.md §4 |
 
@@ -407,6 +430,43 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M6-04 — the console reads, and there is a shell)
+
+- **The machine can be typed at.** Until now nothing a device did could reach the kernel: the local
+  APIC delivers the timer and messages between CPUs, and the path a device interrupt takes —
+  pin, I/O APIC, vector, local APIC — had no middle. Finding the chip means walking the firmware's
+  ACPI tables, so this milestone contains the project's third untrusted parser and its first that
+  can be made to *hang* rather than crash: an entry-length field is a loop increment, and a table
+  claiming zero is an infinite walk with interrupts disabled.
+- **The RSDP was not where "the direct map covers physical memory" said it was.** On a BIOS machine
+  it sits in the legacy area below one megabyte, which the memory map calls reserved and no
+  bootloader maps. The first version dereferenced it and page-faulted during boot at an address
+  that looked entirely plausible. The walk now asks the caller to map each range before it reads
+  it, which also keeps the mapping out of `arch`, where no allocator exists.
+- **The firmware's RSDT is not four-byte aligned on this machine.** An alignment check that looked
+  defensive rejected real firmware and reported "no tables". Every field is read a byte at a time
+  out of a slice, so alignment was never a correctness question here.
+- **A latent one-CPU deadlock, found while making room for a second interrupt-context waker.**
+  `on_tick` woke expired sleepers with a blocking runqueue lock. If the tick had landed on a thread
+  holding that lock, the handler would have waited for a thread that could not run until the handler
+  returned. Now `try_lock`, with undelivered wakes recorded and retried on the next tick — bounded
+  by the idle backstop, one second, rather than never.
+- **`match (flag, lock.try_lock())` holds the guard for the whole match.** The blocking arm then
+  waited for a lock the scrutinee was holding: a self-deadlock on the first wake, which hung the
+  wait-queue self-test. Written as an `if`, it is fine. This is the second time in this project that
+  a temporary's lifetime in a `match` scrutinee has been the bug.
+- **A new gate that writes to the kernel.** `tests/qemu/shell-test.sh` boots the machine, waits for
+  the prompt, types five commands over the serial line and asserts on the replies — and only on the
+  part of the log after the shell started, because the boot self-test runs the same commands with no
+  console input at all. Removing the interrupt's wake-up leaves the boot gate green and fails this
+  one, which is precisely the reason it exists.
+- **The shell's commands are run by the boot self-test through the same function the prompt calls.**
+  A shell whose commands can only be run by hand is a shell whose commands are tested by hand.
+- **Everything the shell prints is filtered on the way out**, with two policies rather than one. A
+  file's contents may contain newlines and tabs; a *name* may not. A name that could carry an escape
+  sequence could move the cursor, clear the screen, or print a line that looks like it came from the
+  kernel.
 
 ### 2026-08-04 (M6-02 and M6-03 — a filesystem, and a program loaded from it)
 

@@ -241,6 +241,16 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             crate::sched::preempt();
         }
 
+        // A byte arrived on the console. The handler drains the UART's FIFO
+        // and wakes whoever is reading; both are lock-free or `try_lock`,
+        // because this may have interrupted the reader itself.
+        crate::input::SERIAL_VECTOR => {
+            crate::input::on_interrupt();
+            // SAFETY: the APIC is initialised -- interrupts cannot be enabled
+            // before it is -- and this acknowledges the interrupt in service.
+            unsafe { apic::end_of_interrupt() };
+        }
+
         // TLB shootdown from another CPU. Acknowledged like any delivered
         // interrupt; the invalidation itself takes no locks, because this CPU
         // may have been interrupted anywhere.

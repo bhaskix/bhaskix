@@ -43,6 +43,10 @@ const FCR_ENABLE_CLEAR: u8 = 0b1100_0111; // enable FIFOs, clear both, 14-byte t
 const MCR_DTR_RTS_OUT2: u8 = 0b0000_1011; // DTR + RTS + OUT2 (OUT2 gates the IRQ line)
 const MCR_LOOPBACK_TEST: u8 = 0b0001_1110; // loopback + DTR/RTS/OUT1 for the self-test
 
+// Received-data-available only. Deliberately not transmit-empty: see
+// `enable_receive_interrupt`.
+const IER_RECEIVED_DATA: u8 = 0b0000_0001;
+
 const LSR_TRANSMIT_EMPTY: u8 = 0b0010_0000;
 const LSR_DATA_READY: u8 = 0b0000_0001;
 
@@ -167,6 +171,69 @@ impl SerialPort {
             }
             self.reg::<u8>(REG_DATA).write(byte);
         }
+    }
+
+    /// Reads one byte if the receiver has one, without waiting.
+    ///
+    /// `None` means the receive FIFO is empty, which is the ordinary case and
+    /// not an error. A caller servicing an interrupt must keep calling until
+    /// it gets `None`: the FIFO holds up to sixteen bytes and delivers one
+    /// interrupt for the batch, so stopping after the first byte leaves the
+    /// rest to be noticed by an interrupt that will not arrive.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure [`SerialPort::init`] has succeeded for this port.
+    #[must_use]
+    pub unsafe fn read_byte(&self) -> Option<u8> {
+        // SAFETY: reading the line status register has no side effects.
+        // Reading the data register *does* -- it removes a byte from the FIFO
+        // -- which is why it happens only when the status says one is there.
+        unsafe {
+            if self.reg::<u8>(REG_LINE_STATUS).read() & LSR_DATA_READY == 0 {
+                return None;
+            }
+            Some(self.reg::<u8>(REG_DATA).read())
+        }
+    }
+
+    /// Asks the UART to raise its interrupt line when a byte arrives.
+    ///
+    /// Only the received-data source is enabled. A transmit-empty interrupt
+    /// would fire continuously while the kernel has nothing to send, and this
+    /// driver transmits by polling — which is correct for a console that must
+    /// work inside a panic, when no interrupt will ever be serviced again.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure [`SerialPort::init`] has succeeded, that there
+    /// is an IDT gate for wherever this interrupt is routed, and that the
+    /// handler drains the FIFO and acknowledges the interrupt controller.
+    pub unsafe fn enable_receive_interrupt(&self) {
+        // SAFETY: the interrupt enable register at `base + 1`, with DLAB
+        // clear -- which `init` left it, and nothing sets it afterwards.
+        unsafe { self.reg::<u8>(REG_INT_ENABLE).write(IER_RECEIVED_DATA) };
+    }
+
+    /// Puts the UART into or out of loopback, where what it sends it receives.
+    ///
+    /// This exists for the interrupt self-test. Nothing else can produce an
+    /// inbound byte on demand: a test that waited for someone to type would
+    /// pass on a developer's terminal and hang in CI.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure [`SerialPort::init`] has succeeded, and must put
+    /// the port back — output written while in loopback goes nowhere.
+    pub unsafe fn set_loopback(&self, enable: bool) {
+        let value = if enable {
+            MCR_LOOPBACK_TEST
+        } else {
+            MCR_DTR_RTS_OUT2
+        };
+        // SAFETY: the modem control register, whose loopback bit is documented
+        // to have exactly this effect.
+        unsafe { self.reg::<u8>(REG_MODEM_CTRL).write(value) };
     }
 
     /// Writes a string, translating `\n` to `\r\n`.

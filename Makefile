@@ -77,7 +77,7 @@ OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi \
-        test-faults fmt clippy gates clean distclean help
+        test-shell test-faults fmt clippy gates clean distclean help
 
 all: iso
 
@@ -162,7 +162,7 @@ run-uefi: $(ISO)
 
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
-test: fmt clippy test-host gates test-boot test-boot-uefi test-faults
+test: fmt clippy test-host gates test-boot test-boot-uefi test-shell test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -176,6 +176,12 @@ test-boot: $(ISO)
 
 test-boot-uefi: $(ISO)
 	tests/qemu/boot-test.sh uefi
+
+# Types at the machine over the serial line and asserts on the replies. The
+# only test here that writes to the kernel rather than only reading from it,
+# which is the only way to test an input path.
+test-shell: $(ISO)
+	tests/qemu/shell-test.sh
 
 # Rebuilds the image per fault, so it must not run in parallel with the boot
 # tests -- hence its own target rather than a boot-test flag.

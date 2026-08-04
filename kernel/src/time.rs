@@ -285,8 +285,17 @@ pub unsafe fn on_tick() {
         None => 0,
     };
     for thread in expired.iter().take(count) {
-        crate::sched::wake(*thread);
+        // `wake_from_interrupt`, not `wake`: this runs in a handler that may
+        // have interrupted a thread holding this CPU's runqueue lock, and a
+        // blocking acquisition there waits for a thread that cannot run until
+        // this returns. Before M6-04 this called the blocking version, which
+        // was a one-CPU deadlock waiting for a timer to expire in a window a
+        // few instructions wide.
+        crate::sched::wake_from_interrupt(*thread);
     }
+
+    // Anything an earlier handler could not deliver, including on this CPU.
+    crate::sched::drain_deferred_wakes();
 
     // Top up this CPU's fault-path frame reserve. Here rather than in the
     // fault handler because this context can afford to fail: if the allocator

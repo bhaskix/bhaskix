@@ -55,4 +55,11 @@ workspace = true
 # stub itself is assembly, which the counter does not see; what it counts is
 # the programming around it, and that is exactly the part a reviewer should be
 # able to read one obligation at a time.
-unsafe_budget = 850
+# 900 at M6-04, device interrupts. The I/O APIC is a two-register window
+# programmed by writing an index and then reading or writing a data port, so
+# every register access is a pair of volatile accesses that must not be
+# reordered or elided -- there is no safe way to express "this write is how the
+# next read is addressed". The ACPI walk adds the rest: each table is borrowed
+# from a physical address the firmware named, and each borrow is a separate
+# obligation stated where the length it depends on was checked.
+unsafe_budget = 900

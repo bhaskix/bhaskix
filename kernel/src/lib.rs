@@ -37,10 +37,13 @@ pub mod font;
 pub mod framebuffer;
 pub mod frames;
 pub mod heap;
+pub mod input;
 pub mod ipc;
+pub mod irq;
 pub mod memory;
 pub mod panic;
 pub mod sched;
+pub mod shell;
 pub mod smp;
 pub mod stack;
 pub mod sync;
@@ -393,6 +396,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("    lock order     FAILED");
     }
 
+    // Device interrupts, and with them a console that can be typed at. Last of
+    // the bring-up, because everything above it works on a machine with no I/O
+    // APIC and this is the first thing that does not.
+    let input_ready = console_input(handoff);
+    if input_ready && !shell_self_test() {
+        println!("    shell          FAILED");
+    }
+
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
         faultinject::trigger(fault);
         println!();
@@ -401,12 +412,39 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     }
 
     println!();
-    println!("  M6 in progress. Nothing left to do at this milestone -- halting.");
-    println!(
-        "  Next: M6-04 -- a kernel shell, which needs a console that reads (docs/roadmap.md)."
-    );
 
-    cpu::halt_forever()
+    // The shell, on the CPU the serial interrupt is routed to. That pairing
+    // is required rather than tidy: `input`'s wake-up argument depends on the
+    // handler and the reader sharing a CPU.
+    if input_ready {
+        match sched::spawn_on_with(
+            0,
+            "shell",
+            shell::main,
+            0,
+            handoff.hhdm_base.as_u64(),
+            sched::SpawnOptions::new().pinned(),
+        ) {
+            Ok(_) => println!("  M6 in progress. Nothing left to do at this milestone."),
+            Err(error) => println!("  the shell could not be spawned: {error:?}"),
+        }
+    } else {
+        // Say so rather than spawning a shell that would block for ever on a
+        // console nothing can write to.
+        println!("  M6 in progress. Nothing left to do at this milestone.");
+        println!("  no console input on this machine, so no shell.");
+    }
+
+    // Not `halt_forever`: the shell is a thread, and this CPU has to be
+    // available to run it. Idling here keeps the bootstrap CPU in the
+    // scheduler's hands.
+    loop {
+        sched::yield_now();
+        // SAFETY: interrupts are enabled here -- the scheduler has been
+        // running for the whole self-test above -- so this wakes on the next
+        // one rather than stopping the CPU.
+        unsafe { cpu::halt() };
+    }
 }
 
 /// Measures the actual claim: an idle CPU stops taking timer interrupts.
@@ -1088,6 +1126,177 @@ fn initrd_self_test(handoff: &Handoff) -> bool {
         println!(
             "    initrd         {} KiB, {members} members, {directories} directories; etc/hostname reads back",
             bytes.len() / 1024
+        );
+    }
+    ok
+}
+
+/// Brings up device interrupts and points the console's input at the UART.
+///
+/// Returns whether input works. Everything here is allowed to fail: a machine
+/// with no ACPI tables, or with an I/O APIC this kernel cannot reach, still
+/// boots and still prints — it simply cannot be typed at, and says so rather
+/// than starting a shell that would wait for ever.
+fn console_input(handoff: &Handoff) -> bool {
+    let hhdm = handoff.hhdm_base.as_u64();
+
+    // SAFETY: bootstrap CPU, once, after the heap exists, with the addresses
+    // the bootloader reported.
+    let report = match unsafe { irq::init(handoff.rsdp, hhdm) } {
+        Ok(report) => report,
+        Err(error) => {
+            println!("    io apic        none: {error:?}; the console cannot read");
+            return false;
+        }
+    };
+
+    // SAFETY: `SERIAL_VECTOR` has a gate -- every vector does -- and its
+    // handler acknowledges the local APIC. From here the line is live.
+    let gsi = match unsafe {
+        irq::route_isa(
+            handoff.rsdp,
+            hhdm,
+            input::SERIAL_IRQ,
+            input::SERIAL_VECTOR,
+            handoff.bsp_lapic_id,
+        )
+    } {
+        Ok(gsi) => gsi,
+        Err(error) => {
+            println!("    io apic        found but not routed: {error:?}");
+            return false;
+        }
+    };
+
+    // Read the entry back. A write to a memory-mapped register that is never
+    // read is a write that may have gone into a cache line, into the wrong
+    // register, or nowhere -- and the symptom is a device that raises no
+    // interrupts, which looks like a hardware problem for a long time.
+    let entry = irq::redirection(gsi).unwrap_or(0);
+    let vector_ok = entry & 0xff == u32::from(input::SERIAL_VECTOR);
+    let unmasked = entry & (1 << 16) == 0;
+    if !vector_ok || !unmasked {
+        println!("    io apic        FAILED: entry for gsi {gsi} reads back {entry:#x}");
+        return false;
+    }
+
+    // SAFETY: COM1 was initialised by `init_serial` at the top of boot, the
+    // line is routed to this CPU above, and the shell -- the only reader -- is
+    // pinned to it.
+    unsafe { input::install(COM1) };
+
+    println!(
+        "    io apic        at {:#x}, {} inputs, {} overrides{}; irq {} -> gsi {gsi}, vector {:#04x}",
+        report.address,
+        report.inputs,
+        report.overrides,
+        if report.chips > 1 {
+            " (first of several)"
+        } else {
+            ""
+        },
+        input::SERIAL_IRQ,
+        input::SERIAL_VECTOR,
+    );
+    true
+}
+
+/// Checks that console input arrives by interrupt, and that commands run.
+///
+/// The input half uses the UART's loopback mode: the port is told to feed its
+/// own output back to its input, so the kernel can produce an inbound byte on
+/// demand. Without it this test would need someone to type, which means it
+/// would pass on a developer's terminal and hang in CI — and a test that
+/// cannot run in CI is a test that stops being run.
+///
+/// Nothing is printed while the port is looped back: output written then goes
+/// into its own receive buffer instead of to the serial log.
+fn shell_self_test() -> bool {
+    use bhaskix_arch::SerialPort;
+
+    const TYPED: &[u8] = b"ls /\r";
+
+    let port = SerialPort::new(COM1);
+    let (_, _, interrupts_before) = input::statistics();
+
+    // Drain anything already waiting, so what is counted below is what this
+    // test produced.
+    while input::try_read().is_some() {}
+
+    // SAFETY: COM1 is initialised, and the port is put back below on every
+    // path out of this function.
+    unsafe { port.set_loopback(true) };
+    for byte in TYPED {
+        // SAFETY: as above.
+        unsafe { port.write_byte(*byte) };
+    }
+    let arrived = wait_until(input::pending, 500);
+    // SAFETY: as above -- and this must happen before anything is printed.
+    unsafe { port.set_loopback(false) };
+
+    let mut received = [0u8; 8];
+    let mut count = 0;
+    while let Some(byte) = input::try_read() {
+        if count < received.len() {
+            received[count] = byte;
+        }
+        count += 1;
+    }
+
+    let (_, dropped, interrupts) = input::statistics();
+    let by_interrupt = interrupts > interrupts_before;
+
+    // The command half. Run through `shell::run`, which is the same function
+    // the interactive loop calls -- so this tests the commands rather than a
+    // parallel implementation of them.
+    let outcomes = [
+        (shell::run(b"help"), shell::Outcome::Ran),
+        (shell::run(b"   "), shell::Outcome::Empty),
+        (shell::run(b"echo hello"), shell::Outcome::Ran),
+        (shell::run(b"ls /"), shell::Outcome::Ran),
+        (shell::run(b"cat etc/hostname"), shell::Outcome::Ran),
+        (shell::run(b"cat ../etc/hostname"), shell::Outcome::Failed),
+        (shell::run(b"cat nothing"), shell::Outcome::Failed),
+        (shell::run(b"elf bin/probe"), shell::Outcome::Ran),
+        (shell::run(b"elf hello.txt"), shell::Outcome::Failed),
+        (shell::run(b"mem"), shell::Outcome::Ran),
+        (shell::run(b"ps"), shell::Outcome::Ran),
+        (shell::run(b"uptime"), shell::Outcome::Ran),
+        (shell::run(b"input"), shell::Outcome::Ran),
+        (shell::run(b"nosuchcommand"), shell::Outcome::Unknown),
+    ];
+    let commands = outcomes.len();
+    let wrong = outcomes
+        .iter()
+        .filter(|(actual, expected)| actual != expected)
+        .count();
+
+    let checks = [
+        ("a byte typed at the console arrived", arrived),
+        ("it arrived by interrupt rather than by luck", by_interrupt),
+        (
+            "every byte arrived, in order",
+            count == TYPED.len() && &received[..count.min(received.len())] == TYPED,
+        ),
+        ("nothing was dropped", dropped == 0),
+        ("every command did what it should", wrong == 0),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!(
+                "    shell          FAILED: {name} ({count} of {} bytes, {} interrupts, {wrong} of {commands} commands wrong)",
+                TYPED.len(),
+                interrupts - interrupts_before
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!(
+            "    shell          {commands} commands; {count} bytes read back through the interrupt path"
         );
     }
     ok

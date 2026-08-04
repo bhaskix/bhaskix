@@ -27,12 +27,14 @@
     )
 )]
 
+pub mod acpi;
 pub mod apic;
 pub mod cell;
 pub mod context;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
+pub mod ioapic;
 pub mod msr;
 pub mod paging;
 pub mod percpu;

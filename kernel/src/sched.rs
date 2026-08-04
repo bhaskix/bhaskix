@@ -86,6 +86,17 @@ pub enum State {
     Finished,
 }
 
+impl core::fmt::Display for State {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Finished => "finished",
+        })
+    }
+}
+
 impl State {
     /// Whether the scheduler may choose this thread.
     ///
@@ -1685,14 +1696,133 @@ pub fn block_self() {
 /// field under that queue's lock and never reads or writes a context. A woken
 /// thread is scheduled by its own CPU, on its own stack, as it always was.
 pub fn wake(id: u32) -> bool {
+    wake_with(id, false) == WakeResult::Woken
+}
+
+/// What an attempt to wake a thread achieved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WakeResult {
+    /// The thread was blocked and is now ready.
+    Woken,
+    /// No queue holds a blocked thread with that identifier.
+    ///
+    /// Distinct from [`WakeResult::Contended`], and the distinction is the
+    /// whole reason this enum exists rather than a `bool`. A thread that is
+    /// already awake needs nothing; a queue that was busy needs another
+    /// attempt. Conflating them means either retrying for ever on threads that
+    /// do not exist, or dropping wakes that were merely mistimed — the second
+    /// of which was written first, and hung the wait-queue self-test.
+    NotFound,
+    /// A queue could not be inspected because its lock was held.
+    Contended,
+}
+
+/// Wakes `id` from an interrupt handler, without ever waiting for a lock.
+///
+/// The distinction is not stylistic. A handler runs on a CPU that may have
+/// interrupted a thread *holding that CPU's runqueue lock*, and a blocking
+/// acquisition there waits for a thread that cannot run until the handler
+/// returns — a one-CPU deadlock with no output and nothing to inspect. This
+/// module's rule is stated in `preempt`: anything reachable from an interrupt
+/// uses `try_lock`.
+///
+/// A contended queue means the wake did not happen, which for a sleeper is
+/// indistinguishable from a lost one. So a contended attempt is **recorded**
+/// rather than dropped, and retried from the next timer tick. The worst case
+/// is a wake delayed by one tick — at most the idle backstop, one second —
+/// rather than a thread that never wakes.
+pub fn wake_from_interrupt(id: u32) -> bool {
+    match wake_with(id, true) {
+        WakeResult::Woken => true,
+        WakeResult::Contended => {
+            defer_wake(id);
+            false
+        }
+        // Nothing to retry: no queue holds a blocked thread by that name.
+        WakeResult::NotFound => false,
+    }
+}
+
+/// Retries wakes an earlier handler could not deliver.
+///
+/// Called from the timer tick, still in interrupt context, so still
+/// `try_lock`: an entry that cannot be delivered now stays for the next tick.
+pub fn drain_deferred_wakes() {
+    for slot in &DEFERRED_WAKES {
+        let id = slot.load(Ordering::Acquire);
+        if id == NO_THREAD {
+            continue;
+        }
+        // Cleared on anything but contention. A thread that has since woken
+        // by another route, or exited, must not hold a slot for ever -- eight
+        // stale entries is a table that can no longer defer anything.
+        if wake_with(id, true) != WakeResult::Contended {
+            let _ = slot.compare_exchange(id, NO_THREAD, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Records a wake that could not be delivered, if there is room.
+fn defer_wake(id: u32) {
+    for slot in &DEFERRED_WAKES {
+        if slot
+            .compare_exchange(NO_THREAD, id, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+    // Nowhere to record it. Counted rather than ignored: a full table means
+    // wakes are being deferred faster than ticks deliver them, which is a fact
+    // about the system worth seeing, and the alternative -- growing the table
+    // inside an interrupt handler -- is an allocation on the fault path.
+    DEFERRED_LOST.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Wakes that were deferred and then dropped for want of a slot.
+#[must_use]
+pub fn deferred_wakes_lost() -> u64 {
+    DEFERRED_LOST.load(Ordering::Relaxed)
+}
+
+/// Sentinel for an empty deferred-wake slot. Thread identifiers start at 1.
+const NO_THREAD: u32 = 0;
+
+/// Wakes an interrupt handler could not deliver immediately.
+static DEFERRED_WAKES: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(NO_THREAD) }; 8];
+static DEFERRED_LOST: AtomicU64 = AtomicU64::new(0);
+
+fn wake_with(id: u32, from_interrupt: bool) -> WakeResult {
     let online = percpu::online_count() as usize;
     let here = percpu::cpu_id();
+    let mut contended = false;
 
     for (cpu, queue) in QUEUES.iter().enumerate().take(online.min(MAX_CPUS)) {
         // One queue lock at a time. Two would be two locks of the same rank,
         // which have no order relative to each other and could close a cycle.
         let woken = {
-            let mut queue = queue.lock();
+            // Written as an `if`, not a `match` on `(from_interrupt,
+            // queue.try_lock())`. The tuple form evaluates `try_lock` on
+            // every path and keeps its guard alive for the whole match, so
+            // the blocking arm waits for a lock the scrutinee is holding --
+            // a self-deadlock on the first wake, which is exactly how this
+            // was written the first time.
+            let mut queue = if from_interrupt {
+                match queue.try_lock() {
+                    Some(queue) => queue,
+                    // Contended, in interrupt context: reported to the caller,
+                    // which records it for the next tick rather than waiting
+                    // for a lock this CPU may itself be preventing from being
+                    // released.
+                    None => {
+                        contended = true;
+                        continue;
+                    }
+                }
+            } else {
+                queue.lock()
+            };
             let floor = queue.min_vruntime;
             let mut woken = false;
             for thread in queue.threads.iter_mut().flatten() {
@@ -1717,10 +1847,15 @@ pub fn wake(id: u32) -> bool {
             if cpu as u32 != here {
                 notify(cpu as u32);
             }
-            return true;
+            return WakeResult::Woken;
         }
     }
-    false
+
+    if contended {
+        WakeResult::Contended
+    } else {
+        WakeResult::NotFound
+    }
 }
 
 /// Tells `cpu` that its runqueue changed.
