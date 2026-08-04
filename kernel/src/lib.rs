@@ -1590,6 +1590,17 @@ fn block_self_test(handoff: &Handoff) -> bool {
         }
     }
 
+    // `docs/memory.md` §5: a machine with no IOMMU runs in a degraded mode that
+    // is *printed at boot*. Bhaskix has no IOMMU driver, so every DMA-capable
+    // device it brings up can reach all of physical memory -- including the
+    // kernel. Saying so is not pessimism; the document commits to not
+    // silently accepting a broken threat model, and a driver that quietly
+    // enabled bus mastering would be exactly that.
+    println!(
+        "    dma            NO IOMMU: this device can reach all of physical memory \
+         (docs/memory.md §5)"
+    );
+
     if ok {
         let (bus, device, function) = virtio::location().unwrap_or((0, 0, 0));
         println!(

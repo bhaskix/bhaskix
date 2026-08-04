@@ -346,6 +346,18 @@ else
     status=1
 fi
 
+# `docs/memory.md` §5 commits the project to *printing* the degraded threat
+# model when there is no IOMMU, rather than silently accepting one. A device
+# that does DMA with no IOMMU can reach all of physical memory, and the moment
+# that line stops appearing while a driver is still running is the moment the
+# document became untrue.
+if grep -qF "NO IOMMU: this device can reach all of physical memory" "$LOG"; then
+    pass "the absent IOMMU is reported rather than silently accepted"
+else
+    fail "a DMA-capable device was brought up without saying there is no IOMMU"
+    status=1
+fi
+
 # The fast system-call path. Programmed values are read back from the MSRs
 # rather than trusted, because every one of them is acted on without further
 # checking and three decide what privilege level the machine returns to. The

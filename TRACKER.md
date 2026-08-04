@@ -76,6 +76,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **A2** | Syscall ABI shape | ⬜ Draft | **Capability invocation**, six syscall kinds, all authority arriving as a capability argument. A numbered table is ambient authority and discards the project's central claim on the first syscall. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
 | **A3** | IPC style | ⬜ Draft | **Synchronous rendezvous** is primitive; async is shared memory plus a notification capability, one layer up. Buffering forces the nucleus to answer "whose memory is it", and every answer is a denial of service or the synchronous behaviour with extra steps. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) |
 | **A4** | Userspace ABI | ⬜ Draft | **Capability-shaped**, and the native ABI *is* A2's syscall interface — there is no separate document to write. Consequence: no native `libc`; the roadmap's Phase 2 libc belongs to the Linux personality. | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
+| **M1** | Shared memory | ⬜ Draft | A **`Memory` object**: frames a capability names, mapped into the holder's *own* address space with rights no wider than the capability, unmapped from everywhere before a `revoke` returns. Completes RFC 0008's answer to **A3** — which promised shared memory and did not build it, so bulk data currently moves sixteen bytes per round trip. Its one architectural fork is whether `Untyped` memory exists at all. | [RFC 0009](docs/rfc/0009-shared-memory.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | *Blocks M3* |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
@@ -197,6 +198,11 @@ fairness within 2% for two equal-weight workloads.
   in a virtqueue is physical and the device dereferences it without asking. That is the one
   operation in this kernel no page table can contain, and the reason every buffer here comes from
   the frame allocator rather than from a pointer that happened to be at hand.
+
+  [memory.md](docs/memory.md) §5 commits the project to *printing* this degraded threat model rather
+  than silently accepting it, and until RFC 0009 was written the driver did not. It does now, and a
+  boot gate asserts the line — so the day a DMA-capable device is brought up without that warning is
+  a red build rather than a document that quietly became untrue.
 
 - **The user-mode shell moves sixteen bytes per round trip.** A message is four registers
   ([RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md)); two of them carry bytes. Printing a line of
