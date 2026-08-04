@@ -298,6 +298,18 @@ else
     status=1
 fi
 
+# Ring 3. The evidence is *where* the kernel was entered from: a system call
+# made by user code arrives with a return address inside the user program's
+# page and a stack pointer inside the user stack, neither of which the kernel
+# ever executes at or uses as a stack. Counting system calls alone would look
+# identical to calling the dispatcher directly.
+if grep -qE "ring 3 +[0-9]+ syscalls and [1-9][0-9]* interrupts from user mode, [1-9][0-9]* refused; entered at rip" "$LOG"; then
+    pass "user mode runs in ring 3 and enters the kernel through SYSCALL"
+else
+    fail "ring 3 execution did not pass"
+    status=1
+fi
+
 # Capabilities: the load-bearing security mechanism. The rules are proved
 # exhaustively on the host; this asserts they hold against the real global
 # arena, through its lock, and that nothing leaked.

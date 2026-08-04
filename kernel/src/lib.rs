@@ -340,6 +340,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !syscall_self_test(handoff.hhdm_base.as_u64()) {
         println!("    syscall        FAILED");
     }
+    if !ring3_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("    ring 3         FAILED");
+    }
     if !capability_self_test() {
         println!("    capabilities   FAILED");
     }
@@ -440,6 +446,179 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
     true
 }
 
+/// Where the ring 3 probe's code and stack live in its address space.
+const USER_CODE: u64 = 0x0000_0000_1000_0000;
+const USER_STACK: u64 = 0x0000_0000_1100_0000;
+/// One page of stack is ample: the probe pushes nothing.
+const USER_STACK_PAGES: u64 = 1;
+
+/// Runs the probe program in ring 3, and never returns.
+///
+/// Everything here happens on this thread because entering user mode is a
+/// one-way transition: the thread *becomes* the user thread, and comes back
+/// only through a system call. It leaves by calling `Exit`, which ends it.
+extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! {
+        // Something in the setup failed. Ending the thread leaves the
+        // counters at zero, which is what the test asserts on -- better than
+        // halting the machine and losing every other result.
+        sched::exit()
+    };
+
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+
+    let (Some(code), Some(stack)) = (
+        VirtRange::from_pages(VirtAddr(USER_CODE), 1),
+        VirtRange::from_pages(VirtAddr(USER_STACK), USER_STACK_PAGES),
+    ) else {
+        stop()
+    };
+
+    // Read-and-execute, not writable: W^X applies to user pages too, and the
+    // program is written through the kernel's direct map rather than through
+    // the mapping it will run from. A page that is both writable and
+    // executable would be the easiest thing to arrange and the wrong thing to
+    // ship.
+    if space.map_anonymous(code, Protection::ReadExecute).is_err()
+        || space.map_anonymous(stack, Protection::ReadWrite).is_err()
+    {
+        stop()
+    }
+
+    // Copy the probe in through its physical frame. The mapping it will run
+    // from is not writable, and making it so temporarily would mean a moment
+    // where user-executable memory was also user-writable.
+    let Some(physical) = space.translate(VirtAddr(USER_CODE)) else {
+        stop()
+    };
+    let program = bhaskix_arch::syscall::user_probe();
+    if program.len() > bhaskix_mm::FRAME_SIZE as usize {
+        stop()
+    }
+    // SAFETY: `physical` is a frame this address space just mapped, reachable
+    // through the direct map, and the length is checked against a page above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            program.as_ptr(),
+            (hhdm_base + (physical & !(bhaskix_mm::FRAME_SIZE - 1))) as *mut u8,
+            program.len(),
+        );
+    }
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = USER_STACK + USER_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+
+    // SAFETY: `USER_CODE` is user-executable in the space just installed,
+    // `rsp` is one past user-writable memory in the same, and `RSP0` was set
+    // before this thread was spawned.
+    unsafe { bhaskix_arch::syscall::enter_ring3(USER_CODE, rsp) }
+}
+
+/// Runs a program in ring 3 and checks that it really was ring 3.
+///
+/// The evidence is where the kernel was entered *from*: a system call made by
+/// user code arrives with a return address inside the user program's page and
+/// a stack pointer inside the user stack. Both are addresses this kernel never
+/// executes at and never uses as a stack, so a call that reports them cannot
+/// have come from anywhere else. Counting system calls alone would look
+/// identical to calling the dispatcher directly.
+fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("    ring 3         skipped, needs a cpu that is not running the tests");
+        return true;
+    }
+
+    // The scheduler self-test froze the world to report on it. A thread
+    // spawned into a stopped scheduler is created, is runnable, and is never
+    // chosen -- which is indistinguishable from one that failed to start, and
+    // was.
+    sched::start_all();
+
+    const CPU: u32 = 3;
+    /// Slot base for the stack an interrupt from ring 3 lands on.
+    const RSP0_SLOT: u64 = 2048;
+
+    // The stack the CPU switches to when an interrupt arrives from ring 3.
+    // Distinct from the syscall stack: an interrupt can arrive *during* a
+    // system call, and sharing one would overwrite the frame that call is
+    // standing on.
+    //
+    // SAFETY: a slot no thread or syscall stack uses.
+    let Ok(privileged) = (unsafe { stack::allocate(hhdm_base, RSP0_SLOT + u64::from(CPU)) }) else {
+        println!("    ring 3         FAILED to allocate a privilege stack");
+        return false;
+    };
+    // SAFETY: `privileged.top` is one past a freshly mapped guarded stack, and
+    // this is set before anything can enter ring 3 on that CPU.
+    unsafe { bhaskix_arch::gdt::set_privilege_stack(CPU as usize, privileged.top) };
+
+    let (calls_before, refused_before) = syscall::statistics();
+    let interrupts_before = bhaskix_arch::trap::interrupts_from_user();
+
+    let options = sched::SpawnOptions::new().pinned();
+    if let Err(error) =
+        sched::spawn_on_with(CPU, "ring3", ring3_probe, hhdm_base, hhdm_base, options)
+    {
+        println!("    ring 3         FAILED to spawn the probe: {error:?}");
+        return false;
+    }
+
+    wait_millis(600);
+
+    let (calls, refused) = syscall::statistics();
+    let calls = calls - calls_before;
+    let refused = refused - refused_before;
+    let (rip, rsp) = syscall::last_user_context();
+    let interrupts = bhaskix_arch::trap::interrupts_from_user() - interrupts_before;
+
+    let stack_top = USER_STACK + USER_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    let checks = [
+        // Ten: eight yields, one bad number, one exit.
+        ("the probe made its system calls", calls >= 10),
+        ("an unknown syscall number was refused", refused >= 1),
+        (
+            "the kernel was entered from the user code page",
+            (USER_CODE..USER_CODE + bhaskix_mm::FRAME_SIZE).contains(&rip),
+        ),
+        (
+            "the caller was on the user stack",
+            rsp > USER_STACK && rsp <= stack_top,
+        ),
+        // Without this the probe only ever enters the kernel through
+        // `SYSCALL`, and the interrupt entry path -- with its own `swapgs`,
+        // its own stack switch through the TSS, and its own way to be wrong --
+        // is never reached. Removing that `swapgs` passed a version of this
+        // test that lacked this line.
+        ("the probe was interrupted while in ring 3", interrupts > 0),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!(
+                "    ring 3         FAILED: {name} (calls {calls}, refused {refused}, rip {rip:#x}, rsp {rsp:#x})"
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!(
+            "    ring 3         {calls} syscalls and {interrupts} interrupts from user mode, {refused} refused; entered at rip {rip:#x}, rsp {rsp:#x}"
+        );
+    }
+    ok
+}
+
 /// Checks that the fast system-call path is programmed as intended.
 ///
 /// Reads the MSRs back rather than trusting the writes. Every one of them is a
@@ -494,7 +673,7 @@ fn syscall_self_test(hhdm_base: u64) -> bool {
 
     if ok {
         println!(
-            "    syscall        entry armed on {stacks} cpus, star {star:#018x}, fmask {fmask:#x}; no ring 3 caller yet"
+            "    syscall        entry armed on {stacks} cpus, star {star:#018x}, fmask {fmask:#x}"
         );
     }
     ok

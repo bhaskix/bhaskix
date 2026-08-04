@@ -38,8 +38,46 @@
 //! - **No caller.** Nothing runs in ring 3 until M5-04, so the assembly entry
 //!   path is unexercised. The dispatcher below is reached directly by tests.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::cap::{Arena, CSpace, ObjectKind, SlotRef};
 use crate::{cap, domain, sched};
+
+/// System calls dispatched.
+static CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Calls whose number was not one of the six.
+static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// The user `RIP` of the most recent call, as `SYSCALL` left it in `rcx`.
+static LAST_RIP: AtomicU64 = AtomicU64::new(0);
+
+/// The user `RSP` of the most recent call.
+static LAST_RSP: AtomicU64 = AtomicU64::new(0);
+
+/// `(calls, refused)` since boot.
+#[must_use]
+pub fn statistics() -> (u64, u64) {
+    (
+        CALLS.load(Ordering::Relaxed),
+        REFUSED.load(Ordering::Relaxed),
+    )
+}
+
+/// The user `RIP` and `RSP` most recently seen entering the kernel.
+///
+/// Evidence rather than decoration: a system call that genuinely came from
+/// ring 3 arrives with a return address inside the user program and a stack
+/// pointer inside the user stack. A test can then assert that the kernel was
+/// entered from user memory rather than from somewhere in itself, which is the
+/// difference between "ring 3 works" and "a function was called".
+#[must_use]
+pub fn last_user_context() -> (u64, u64) {
+    (
+        LAST_RIP.load(Ordering::Relaxed),
+        LAST_RSP.load(Ordering::Relaxed),
+    )
+}
 
 pub use bhaskix_arch::syscall::SyscallFrame;
 
@@ -158,6 +196,10 @@ fn resolve(cspace: &CSpace, arena: &Arena, index: u64) -> Result<(SlotRef, Objec
 
 /// Dispatches one system call against an explicit CSpace and arena.
 ///
+/// Returns an [`Outcome`] and performs no scheduling: `Yield` and `Exit` never
+/// reach here, because they are decided before any lock is taken. See
+/// [`dispatch`].
+///
 /// Separated from [`dispatch`] so that every decision here can be tested on
 /// the host against tables a test constructs, rather than only against
 /// whatever the running system happens to hold.
@@ -167,15 +209,10 @@ pub fn dispatch_with(frame: &mut SyscallFrame, cspace: &CSpace, arena: &Arena) -
     };
 
     match kind {
-        // Neither takes a capability: they are the two things a thread does to
-        // itself, and every thread may always do them. Routing them through a
-        // capability would mean every thread holding one to itself, in every
-        // CSpace, for no gain in expressiveness.
-        Kind::Yield => {
-            sched::yield_now();
-            Outcome::ok(0)
-        }
-        Kind::Exit => sched::exit(),
+        // Handled by `dispatch` before it takes anything. Reaching here would
+        // mean a caller had bypassed that, so it is an error rather than a
+        // second implementation that could drift from the first.
+        Kind::Yield | Kind::Exit => Outcome::err(Status::BadSyscall),
 
         Kind::Invoke => match resolve(cspace, arena, frame.capability) {
             // The type check that replaces a permission check. A capability
@@ -208,14 +245,38 @@ pub fn dispatch_with(frame: &mut SyscallFrame, cspace: &CSpace, arena: &Arena) -
 /// the correct answer rather than an oversight — kernel threads created before
 /// domains existed must not inherit the ability to name objects.
 pub fn dispatch(frame: &mut SyscallFrame) -> Outcome {
-    // `Yield` and `Exit` need no CSpace, and requiring one would make them
-    // unavailable to exactly the threads most likely to want to exit.
-    if matches!(
-        Kind::from_raw(frame.kind),
-        Some(Kind::Yield) | Some(Kind::Exit)
-    ) {
-        let empty = CSpace::new();
-        return cap::with_arena(|arena| dispatch_with(frame, &empty, arena));
+    // Counted before anything can divert: `Exit` never returns, so a counter
+    // incremented afterwards would miss exactly the call that ends the thread.
+    CALLS.fetch_add(1, Ordering::Relaxed);
+    let kind = Kind::from_raw(frame.kind);
+    if kind.is_none() {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+    LAST_RIP.store(frame.rip, Ordering::Relaxed);
+    LAST_RSP.store(frame.user_rsp, Ordering::Relaxed);
+
+    // `Yield` and `Exit` are handled here, before a single lock is taken, and
+    // that ordering is not tidiness.
+    //
+    // `Exit` never returns. Dispatching it with a lock held leaves that lock
+    // held for ever — and because M4-08 refuses to preempt a thread holding
+    // one, the thread then spins in `exit` instead of leaving, so the lock is
+    // never released by anything. The whole system stops at the next attempt
+    // to take it.
+    //
+    // That is exactly what happened: `Exit` was dispatched inside the
+    // capability arena's lock and the next `cap::live()` hung. The rank
+    // machinery turned a corruption into a visible stall, which is what it is
+    // for, but the fix is to take no lock at all on a path that may not
+    // return.
+    match kind {
+        Some(Kind::Yield) => {
+            sched::yield_now();
+            return Outcome::ok(0);
+        }
+        Some(Kind::Exit) => sched::exit(),
+        None => return Outcome::err(Status::BadSyscall),
+        Some(_) => {}
     }
 
     let Some(id) = sched::current_domain() else {

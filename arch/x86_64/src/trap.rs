@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Interrupt and exception entry.
 //!
+//! # A known gap: NMI against `swapgs`
+//!
+//! The entry path decides whether to `swapgs` by looking at the interrupted
+//! `CS`. That is correct for every interrupt except one arriving inside the
+//! syscall stub's first instruction — where `CS` is already the kernel's but
+//! `GS` is still the user's, so the test says "no swap" and the handler runs
+//! with a user `GS`.
+//!
+//! Only an NMI can arrive there, because `IA32_FMASK` masks `IF` before the
+//! stub runs. Nothing in Bhaskix enables an NMI source yet, so the window is
+//! unreachable rather than merely unlikely. The standard fix is a separate
+//! entry path that reads `IA32_GS_BASE` and decides from its value instead of
+//! from `CS`, and it belongs with whatever first enables an NMI.
+//!
 //! Every one of the 256 vectors enters through a small stub that normalises
 //! the stack into a [`TrapFrame`] and jumps to shared code. The stubs exist
 //! because the CPU is not consistent: some vectors push an error code and some
@@ -28,6 +42,21 @@
 //! than a crash — so the field order below is load-bearing.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
+
+/// Interrupts and exceptions taken while the CPU was in user mode.
+///
+/// Counted so a test can assert that the interrupt-from-ring-3 path was
+/// actually taken. A user-mode test that is never interrupted exercises the
+/// system-call path and nothing else — and the entry `swapgs` it does not
+/// reach is the difference between a working kernel and one that reads a
+/// user-controlled `GS` base.
+static FROM_USER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many interrupts arrived from user mode.
+#[must_use]
+pub fn interrupts_from_user() -> u64 {
+    FROM_USER.load(Ordering::Relaxed)
+}
 
 /// A saved processor state, as built by the interrupt stubs.
 ///
@@ -122,6 +151,17 @@ pub fn set_handler(handler: TrapHandler) {
 /// fully populated [`TrapFrame`] on the current stack.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn bhaskix_trap_dispatch(frame: *mut TrapFrame) {
+    // The saved CS's RPL is the only record of what ring was interrupted, and
+    // it is the same value the entry stub used to decide whether to `swapgs`.
+    // Counting it here means a test can assert the path was taken rather than
+    // hoping it was.
+    //
+    // SAFETY: the stub built this frame on the current stack and it outlives
+    // the call.
+    if unsafe { (*frame).cs } & 3 != 0 {
+        FROM_USER.fetch_add(1, Ordering::Relaxed);
+    }
+
     let handler = HANDLER.load(Ordering::Acquire);
 
     if handler.is_null() {
@@ -202,6 +242,20 @@ isr_stub_table:
 
 .align 16
 isr_common:
+    // Did this interrupt come from user mode? The saved CS's RPL says so, and
+    // it is the only thing on the stack that can: the CPU does not tell the
+    // handler what ring it interrupted.
+    //
+    // If it did, GS still holds the *user* value, and every `gs:`-relative
+    // access below -- which is most of the scheduler -- would read whatever
+    // user mode last put there. `swapgs` brings this CPU's per-CPU area back.
+    //
+    // At this point the stack is: vector, error code, rip, cs. So cs is at
+    // +24, and that offset is only correct here, before any push.
+    test qword ptr [rsp + 24], 3
+    jz 1f
+    swapgs
+1:
     // Push in reverse TrapFrame field order, so the frame reads correctly
     // from low address to high.
     push rax
@@ -250,6 +304,15 @@ isr_common:
 
     // Discard the vector and error code the stub pushed.
     add rsp, 16
+
+    // Undo the entry swap, on the same condition. The saved CS is now at +8,
+    // and it must be re-read rather than remembered: the handler may have
+    // switched threads, so nothing that was in a register on entry is
+    // necessarily still ours.
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 "#
 );

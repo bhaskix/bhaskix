@@ -192,6 +192,48 @@ const fn data_segment(privilege: u64) -> u64 {
         | LIMIT_HIGH
 }
 
+/// Records the stack the CPU switches to when an interrupt arrives from user
+/// mode.
+///
+/// Without this, `RSP0` is zero and the first interrupt taken in ring 3 pushes
+/// its frame at address zero — a triple fault, from the one place least able
+/// to explain itself.
+///
+/// Distinct from the syscall entry stack, and it must be: `SYSCALL` does not
+/// consult the TSS, and an interrupt does not consult per-CPU data, so the two
+/// paths find their stacks in different places. Sharing one would let an
+/// interrupt arriving during a system call overwrite the frame that call is
+/// standing on.
+///
+/// # Safety
+///
+/// `cpu_id` must be this CPU's, and `rsp` one past a mapped, writable kernel
+/// stack that nothing else uses. Must be called before user mode is entered.
+pub unsafe fn set_privilege_stack(cpu_id: usize, rsp: u64) {
+    if cpu_id >= crate::percpu::MAX_CPUS {
+        return;
+    }
+    // SAFETY: each CPU owns its own TSS, and the table is a `static` that
+    // never moves.
+    unsafe {
+        TSSES.get_mut()[cpu_id].privilege_stack_table[0] = rsp;
+    }
+}
+
+/// This CPU's `RSP0`, for verification.
+///
+/// # Safety
+///
+/// `cpu_id` must name a CPU whose TSS has been built.
+#[must_use]
+pub unsafe fn privilege_stack(cpu_id: usize) -> u64 {
+    if cpu_id >= crate::percpu::MAX_CPUS {
+        return 0;
+    }
+    // SAFETY: reads a field of a `static` that never moves.
+    unsafe { TSSES.get()[cpu_id].privilege_stack_table[0] }
+}
+
 /// Builds and loads this CPU's GDT and TSS.
 ///
 /// Every CPU calls this with its own dense identifier. The bootstrap CPU uses

@@ -54,4 +54,10 @@ workspace = true
 # that its own precondition -- "the APIC is initialised", "this is the timer
 # handler, after acknowledgement" -- is stated where it applies rather than
 # once for a whole function.
-unsafe_budget = 460
+# 500 at M5-04, ring 3. Entering user mode is a sequence of individually
+# unsafe steps whose preconditions differ -- mapping a user-executable page,
+# writing a program through the direct map rather than through the mapping it
+# will run from, installing an address space, setting RSP0, and finally the
+# transition itself. One block per step is what lets each precondition be
+# stated where it is actually owed.
+unsafe_budget = 500

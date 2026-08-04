@@ -121,21 +121,27 @@ fairness within 2% for two equal-weight workloads.
 | M5-00 | Decide the syscall and IPC shape | ⬜ `DRAFT` | [RFC 0008](docs/rfc/0008-syscall-and-ipc-shape.md) answers **A2**, **A3** and **A4**. Blocks M5-03 onwards; does *not* block M5-01. |
 | M5-01 | Capability objects, CSpace, derive/revoke | ✅ `DONE` | All four rules of `docs/security.md` §2 enforced and **each negative-tested**. Derivation monotonicity tested over every one of 64×64 rights pairs, not sampled. |
 | M5-02 | `Domain` with `ResourceEnvelope` | ✅ `DONE` | Envelope refuses at allocation time (T10); CPU share **divided** among a domain's threads so it does not grow with thread count; destruction revokes the domain's whole derived subtree. **Negative-tested** in both directions. |
-| M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | 🟡 `PARTIAL` | MSRs programmed and **read back**; entry stub written; dispatcher host-tested over every decision. **No caller until ring 3 (M5-04)**, so the assembly path is unexercised. Built on RFC 0008's recommendation rather than its acceptance. |
-| M5-04 | Ring 3 execution | ⬜ `TODO` | Needs M5-03. |
+| M5-03 | `SYSCALL`/`SYSRET` entry, dispatch, SMAP bracketing | ✅ `DONE` | Exercised for real as of M5-04: ten system calls from ring 3 per boot. Built on RFC 0008's recommendation rather than its acceptance. |
+| M5-04 | Ring 3 execution | ✅ `DONE` | A program runs in ring 3, enters the kernel through `SYSCALL`, and is interrupted there. **Negative-tested**: removing the interrupt-entry `swapgs` or leaving `RSP0` zero both fail the gate. |
 | M5-05 | Synchronous IPC: endpoints, `Call`/`Reply`, badges | ⬜ `TODO` | Wait queues from M4-09 are the mechanism. |
 | M5-06 | Per-domain capability quotas | 🟡 `PARTIAL` | `ResourceEnvelope::max_capabilities` exists and is unit-tested, but nothing charges it yet — there is no syscall through which a domain derives. Wired up in M5-03. |
 
 ### Honest notes on M5 so far
 
-- **The syscall entry stub has never executed.** `SYSCALL` is only reachable from ring 3, which does
-  not exist until M5-04, so what is tested is the *programming* — MSRs read back and compared, the
-  GDT layout asserted at compile time — and the *dispatcher*, called directly. The forty lines of
-  assembly between them are written, reviewed and unrun. That is the honest status and the reason
-  M5-04 should follow immediately rather than after something else.
-- **The syscall path uses a per-CPU stack, not a per-thread one**, which is correct only while at
-  most one thread per CPU can be inside a system call. True today because none can. It stops being
-  true the moment a syscall blocks, which is M5-05.
+- **`RSP0` and the syscall stack are per-CPU, not per-thread.** Correct only while at most one
+  thread per CPU can be in the kernel from user mode, which is true today because exactly one
+  thread ever enters ring 3. Two user threads on one CPU would share both stacks and corrupt each
+  other, so this must become per-thread before a second one exists — and certainly before a system
+  call can block, which is M5-05.
+- **A faulting user thread is not contained, it is fatal.** The probe never faults, so nothing
+  exercises what happens when ring 3 touches memory it does not have. Today an unserviceable fault
+  reports and halts the machine, which for a user-mode fault is exactly wrong: it should kill the
+  thread. Until that changes, "isolation" is a property of the page tables and not yet of the
+  kernel's response.
+- **There is no `swapgs` protection against an NMI.** The interrupt path decides whether to swap by
+  looking at the interrupted `CS`, which is wrong for an NMI arriving inside the syscall stub's
+  first instruction — kernel `CS`, user `GS`. Nothing enables an NMI source, so the window is
+  unreachable rather than merely unlikely, and `arch/x86_64/src/trap.rs` names the standard fix.
 - **`bhaskix-kernel` is at 459 of a 460 `unsafe` budget.** The next line will fail the gate, which is
   the gate working; it needs a raise with a reason at that point, not before.
 - **Domain CPU share is an approximation of the two-level runqueue, not a replacement.** Dividing a
@@ -325,6 +331,39 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-04 (M5-04, ring 3 — user mode runs)
+
+- **A program runs in ring 3, calls into the kernel, and is interrupted there.** Ten system calls
+  and six or seven timer interrupts from user mode on every boot. This also makes M5-03 real: the
+  entry stub written last commit had never executed.
+- **The evidence is *where* the kernel was entered from**, not that it was entered. A system call
+  from user code arrives with a return address inside the user program's page (`rip 0x10000036`) and
+  a stack pointer inside the user stack (`rsp 0x11001000`) — addresses this kernel never executes at
+  and never uses as a stack. Counting system calls alone would look identical to calling the
+  dispatcher directly.
+- **The interrupt entry path now `swapgs`es when it interrupted user mode**, decided from the saved
+  `CS`. Without it every `gs:`-relative access in the scheduler reads whatever user mode last put
+  there.
+- **`RSP0` is set, and the negative test shows why**: with it zero the probe completes nine of ten
+  system calls and then takes an exception — the first interrupt from ring 3 pushes its frame at
+  address zero.
+- **A test that could not fail, made able to.** The first version of the probe was too short to be
+  interrupted in ring 3 at all, so it exercised only the system-call path — and removing the
+  interrupt-entry `swapgs` passed. The probe now spins in user mode between calls, and the gate
+  requires a non-zero count of interrupts taken from ring 3. With that line present, removing the
+  `swapgs` stops the kernel.
+- **A syscall that never returns must hold no lock.** `Exit` was dispatched inside the capability
+  arena's lock, and `sched::exit` does not return — so the lock was held for ever. M4-08's rule
+  against preempting a lock holder then refused to switch that thread away, so it spun in `exit`
+  and nothing ever released the arena. The next `cap::live()` hung. The rank machinery turned what
+  would have been corruption into a visible stall, which is what it is for; the fix is to take no
+  lock at all on a path that may not return.
+- **`swapgs` bookkeeping corrected.** `IA32_KERNEL_GS_BASE` is initialised to *zero*, not to the
+  kernel's per-CPU pointer: the invariant is that the kernel holds its area in `GS` and the user's
+  value in `KERNEL_GS_BASE`, and the `swapgs` on the way out is what puts the kernel's value where
+  the entry path will find it. Presetting it to the kernel base would have left user mode running
+  with a `GS` base pointing into kernel per-CPU data.
 
 ### 2026-08-04 (M5-03, the `SYSCALL` fast path — partial)
 

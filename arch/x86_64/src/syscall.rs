@@ -133,10 +133,18 @@ pub unsafe fn init(kernel_gs_base: u64) {
 
         msr::write(IA32_FMASK, FMASK);
 
-        // Where `swapgs` finds the kernel's per-CPU pointer while user code is
-        // running. `GS` itself keeps the kernel value for now, because nothing
-        // has entered user mode; M5-04 is where the two start alternating.
-        msr::write(IA32_KERNEL_GS_BASE, kernel_gs_base);
+        // The invariant both transitions maintain: **in the kernel, `GS` holds
+        // this CPU's area and `IA32_KERNEL_GS_BASE` holds the user's; in user
+        // mode, the two are the other way round.** `swapgs` exchanges them, so
+        // it is executed exactly once on each crossing.
+        //
+        // While the kernel boots it has never been to user mode, so the "user"
+        // value is nothing — and it must be nothing rather than a copy of the
+        // kernel's, or user mode would run with a `GS` base pointing into
+        // kernel per-CPU data. The first `swapgs` on the way *out* is what
+        // puts the kernel's value where the entry path will find it.
+        let _ = kernel_gs_base;
+        msr::write(IA32_KERNEL_GS_BASE, 0);
 
         // Last: nothing above matters until this bit is set, and setting it
         // first would open the entry point before it had a target.
@@ -173,6 +181,51 @@ pub unsafe fn programmed() -> (u64, u64, u64, u64) {
     }
 }
 
+/// Enters ring 3 at `rip` with stack `rsp`, and does not return.
+///
+/// Uses `iretq` rather than `sysretq` because `iretq` takes every field
+/// explicitly — `CS`, `SS` and `RFLAGS` are on the stack rather than derived
+/// from an MSR — which makes the first entry into user mode auditable instead
+/// of implied.
+///
+/// # Safety
+///
+/// `rip` must point at user-accessible, executable memory in the *currently
+/// installed* address space, and `rsp` one past user-accessible, writable
+/// memory in the same. The TSS's `RSP0` must be set, or the first interrupt
+/// taken in ring 3 triple-faults. Never returns.
+pub unsafe fn enter_ring3(rip: u64, rsp: u64) -> ! {
+    /// `IF` set, everything else clear. Bit 1 reads as one on every x86.
+    const USER_RFLAGS: u64 = 0x202;
+
+    // Selectors with RPL 3. `iretq` checks that the RPL matches the target
+    // privilege level, so these are not decoration.
+    let cs = u64::from(gdt::USER_CODE | 3);
+    let ss = u64::from(gdt::USER_DATA | 3);
+
+    // SAFETY: the caller guarantees the mappings and the TSS. The `swapgs`
+    // establishes the user-mode half of the invariant described in `init`:
+    // after it, `GS` holds the user value and `IA32_KERNEL_GS_BASE` holds this
+    // CPU's area, which is what the entry paths swap back.
+    unsafe {
+        core::arch::asm!(
+            "swapgs",
+            "push {ss}",
+            "push {rsp}",
+            "push {rflags}",
+            "push {cs}",
+            "push {rip}",
+            "iretq",
+            ss = in(reg) ss,
+            rsp = in(reg) rsp,
+            rflags = in(reg) USER_RFLAGS,
+            cs = in(reg) cs,
+            rip = in(reg) rip,
+            options(noreturn)
+        );
+    }
+}
+
 /// The registers a system call arrives in and returns through.
 ///
 /// `#[repr(C)]` and the field order are load-bearing: the entry stub builds
@@ -181,13 +234,22 @@ pub unsafe fn programmed() -> (u64, u64, u64, u64) {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SyscallFrame {
+    /// The user stack pointer, recovered from per-CPU data.
+    ///
+    /// Not a register `SYSCALL` saves — the stub parked it before switching
+    /// stacks, and puts it here so the dispatcher can see where the call came
+    /// from without reaching for `gs:` itself. It is pushed *last*, and so
+    /// sits first, because recovering it needs a scratch register and the only
+    /// free one is `r11` — which holds the user's `RFLAGS` until that value is
+    /// safely on the stack.
+    pub user_rsp: u64,
     /// Fourth argument (`r9`).
     pub arg3: u64,
     /// Third argument (`r8`).
     pub arg2: u64,
     /// Second argument (`r10`, because `SYSCALL` destroys `rcx`).
     pub arg1: u64,
-    /// First argument (`rdx`).
+    /// First argument (`rdx`), and the second return value.
     pub arg0: u64,
     /// Method selector (`rsi`).
     pub method: u64,
@@ -204,6 +266,34 @@ pub struct SyscallFrame {
 unsafe extern "C" {
     /// The `SYSCALL` entry point. Never called; `IA32_LSTAR` points at it.
     pub fn bhaskix_syscall_entry();
+
+    /// First byte of the user-mode probe program.
+    pub static bhaskix_user_probe_start: u8;
+    /// One past its last byte.
+    pub static bhaskix_user_probe_end: u8;
+}
+
+/// The bytes of the user-mode probe program.
+///
+/// Copied into a user page and executed in ring 3. It is written in assembly
+/// and kept **position-independent** — only immediates and relative jumps —
+/// because it is assembled at a kernel address and runs at a user one.
+///
+/// # Safety
+///
+/// The returned slice borrows a `static` in the kernel image, which outlives
+/// everything.
+#[must_use]
+pub fn user_probe() -> &'static [u8] {
+    let start = &raw const bhaskix_user_probe_start;
+    let end = &raw const bhaskix_user_probe_end;
+    // SAFETY: both symbols are defined by the assembly below, in the same
+    // section and in this order, so the difference is the program's length and
+    // the range is one contiguous object in the kernel image.
+    unsafe {
+        let len = end.offset_from(start).unsigned_abs();
+        core::slice::from_raw_parts(start, len)
+    }
 }
 
 // The entry and exit path.
@@ -233,10 +323,10 @@ bhaskix_syscall_entry:
     mov gs:[16], rsp
     mov rsp, gs:[24]
 
-    // Build a SyscallFrame. Pushed in reverse field order, so that the
-    // structure reads naturally and the compiler's offsets match.
+    // Build a SyscallFrame, highest field first: `push` walks downwards, so
+    // the last thing pushed is the structure's first field.
     push rcx                    // rip
-    push r11                    // rflags
+    push r11                    // rflags -- pushed before r11 is reused below
     push rax                    // kind
     push rdi                    // capability
     push rsi                    // method
@@ -245,11 +335,18 @@ bhaskix_syscall_entry:
     push r8                     // arg2
     push r9                     // arg3
 
+    // Only now is `r11` free: its user value is on the stack. Every other
+    // register still belongs to the caller and must reach the far side of the
+    // call untouched.
+    mov r11, gs:[16]
+    push r11                    // user_rsp
+
     // The dispatcher takes a pointer to the frame and may modify it.
     mov rdi, rsp
     call bhaskix_syscall_dispatch
 
     // Unwind the frame, taking the results back out.
+    add rsp, 8                  // user_rsp: restored from per-CPU data below
     pop r9
     pop r8
     pop r10
@@ -266,5 +363,61 @@ bhaskix_syscall_entry:
     mov rsp, gs:[16]
     swapgs
     sysretq
+"#
+);
+
+// The user-mode probe.
+//
+// Runs in ring 3, so it may use only what ring 3 has: registers, its own
+// stack, and `syscall`. Everything it does is observable to the kernel through
+// the system calls it makes, which is the point -- the test asserts on what
+// arrives, not on what this claims to have done.
+//
+// Position-independent by construction. It is assembled here and copied to a
+// user address, so an absolute reference would point back into kernel memory
+// that ring 3 cannot read.
+//
+// `syscall` destroys `rcx` and `r11`, so the loop counter lives in `rbx`,
+// which it leaves alone.
+core::arch::global_asm!(
+    r#"
+.section .rodata
+.globl bhaskix_user_probe_start
+.globl bhaskix_user_probe_end
+.align 16
+bhaskix_user_probe_start:
+    mov rbx, 8                  // iterations
+10:
+    // Spin in ring 3 for long enough that a timer interrupt certainly lands
+    // here rather than only inside a system call. Without this the probe
+    // never exercises the interrupt-from-user path, and a missing `swapgs`
+    // in the interrupt entry passes unnoticed -- which it did.
+    //
+    // `r12` because `syscall` destroys `rcx` and `r11` and every other free
+    // register is an argument.
+    mov r12, 0x80000
+11:
+    dec r12
+    jnz 11b
+
+    mov rax, 4                  // Kind::Yield
+    xor rdi, rdi
+    syscall
+    dec rbx
+    jnz 10b
+
+    // A syscall number that does not exist, to prove the kernel rejects it as
+    // a value rather than using it as an index. The status comes back in rax
+    // and is ignored here; the kernel counts it.
+    mov rax, 999
+    syscall
+
+    mov rax, 5                  // Kind::Exit
+    syscall
+
+    // Exit does not return. If it ever does, stop here rather than running
+    // into whatever follows in the page.
+    ud2
+bhaskix_user_probe_end:
 "#
 );

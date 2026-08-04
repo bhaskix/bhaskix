@@ -1020,6 +1020,20 @@ pub fn stop() {
     }
 }
 
+/// Allows preemption on every online CPU.
+///
+/// The counterpart to [`stop_all`], for a later test that needs threads to run
+/// again after the scheduler self-test froze the world to report on it.
+/// Without it a thread spawned afterwards is created, is runnable, and is
+/// never chosen — which looks exactly like a thread that failed to start.
+pub fn start_all() {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        if let Some(mut queue) = queue.try_lock() {
+            queue.started = true;
+        }
+    }
+}
+
 /// Stops preemption everywhere, so shutdown reporting is not interleaved.
 pub fn stop_all() {
     for queue in &QUEUES {
