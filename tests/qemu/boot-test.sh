@@ -74,6 +74,7 @@ DISK="$REPO_ROOT/build/initrd.tar"
 
 MACHINE="q35"
 IOMMU_ARGS=()
+VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0)
 if [[ "$MODE" == "iommu" ]]; then
     # RFC 0012's testing plan turns on what the RFC is about. `intremap=on`
     # needs a split irqchip, and both are QEMU's requirements rather than this
@@ -82,10 +83,16 @@ if [[ "$MODE" == "iommu" ]]; then
     # described, on a machine that has one.
     MACHINE="q35,kernel-irqchip=split"
     IOMMU_ARGS=(-device intel-iommu,intremap=on)
+    # And the device must actually be *subject* to it. A virtio device without
+    # `iommu_platform` bypasses translation entirely on QEMU, so every
+    # assertion below would pass on a machine where the IOMMU protects
+    # nothing -- which is exactly what the first version of this did.
+    VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on)
 fi
 
 QEMU_ARGS=(-M "$MACHINE" -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
-           -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on" -device virtio-blk-pci,drive=disk0
+           -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on"
+           "${VIRTIO_ARGS[@]}"
            "${IOMMU_ARGS[@]}"
            -serial "file:$LOG" -display none)
 
@@ -410,7 +417,7 @@ fi
 # constant, so it passed on a machine with three IOMMUs by saying there were
 # none. What is asserted is that the machine states its DMA threat model, not
 # that it lacks the hardware.
-if grep -qE "NO IOMMU: this device can reach all of physical memory|no translation yet: this device can reach all of" "$LOG"; then
+if grep -qE "NO IOMMU: this device can reach all of physical memory|translating: this device reaches only what it was given" "$LOG"; then
     pass "the DMA threat model is reported rather than silently accepted"
 else
     fail "a DMA-capable device was brought up without saying what can reach memory"
@@ -443,10 +450,35 @@ if [[ "$MODE" == "iommu" ]]; then
     # The read-back is what checks the *indices*: an entry written at the wrong
     # offset holds entirely correct values, and is a device translating through
     # some other device's tables.
-    if grep -qE "iommu window +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9]+-bit, [0-9]+ levels, nothing mapped, not programmed" "$LOG"; then
-        pass "the device's translation structures are built, verified, and left off"
+    if grep -qE "iommu window +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9]+-bit, [0-9]+ levels, built" "$LOG"; then
+        pass "the device's translation structures are built and verified"
     else
         fail "the IOMMU window was not built, or did not read back as written"
+        status=1
+    fi
+
+    # RFC 0012 step 3, and the assertion the RFC names: translation is on and
+    # `virtio-blk` still works, with the fault counter at zero.
+    #
+    # All three parts matter and none of them alone would do. Enabled with a
+    # broken mapping is a machine that lost its disk; a working disk with
+    # translation off is the machine from before this step; and a fault means
+    # the device reached for something nobody granted it, which is the event
+    # this entire RFC exists to make visible.
+    if grep -qE "iommu enable +translating; [0-9]+ driver frames and [0-9]+ reserved pages mapped, [0-9]+ refused, a read still works, no faults, device subject to it" "$LOG"; then
+        pass "translation is enabled, the device still reads, and nothing faulted"
+    else
+        fail "translation was not enabled, or the device stopped working once it was"
+        status=1
+    fi
+
+    # And the machine says the *true* thing about what a device can reach --
+    # after enabling, not before. The line used to be printed early and said
+    # "no translation yet" on a machine that was about to have some.
+    if grep -qF "translating: this device reaches only what it was given" "$LOG"; then
+        pass "the DMA threat model reported is the one that ended up true"
+    else
+        fail "translation was enabled and the machine still reports reaching all of memory"
         status=1
     fi
 fi

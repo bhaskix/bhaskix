@@ -283,6 +283,314 @@ pub const fn table_entry(next_table: u64) -> PageEntry {
     }
 }
 
+/// A remapping unit's register window.
+///
+/// Thin on purpose: every method is one register access and a bounded wait,
+/// with the policy — which tables, which order, what to do when it does not
+/// come ready — left to the caller. The specification's sequences are subtle
+/// enough that reading them next to the decisions that use them is worth more
+/// than a tidy abstraction.
+///
+/// # The command register cannot be read
+///
+/// `GCMD` is write-only and its bits are *not* independent: a write sets the
+/// entire enable state, so a read-modify-write is impossible and writing one
+/// bit clears the others. Hence [`Unit::command`], a shadow of what was last
+/// written. Losing it would turn "enable translation" into "enable translation
+/// and disable everything else".
+pub struct Unit {
+    base: *mut u8,
+    /// What was last written to `GCMD`, because it cannot be read back.
+    command: u32,
+}
+
+/// Register offsets, in bytes from the window's base.
+mod reg {
+    /// Version.
+    pub const VER: usize = 0x00;
+    /// Capabilities.
+    pub const CAP: usize = 0x08;
+    /// Extended capabilities.
+    pub const ECAP: usize = 0x10;
+    /// Global command. Write-only.
+    pub const GCMD: usize = 0x18;
+    /// Global status.
+    pub const GSTS: usize = 0x1c;
+    /// Root table address.
+    pub const RTADDR: usize = 0x20;
+    /// Context command.
+    pub const CCMD: usize = 0x28;
+    /// Fault status.
+    pub const FSTS: usize = 0x34;
+}
+
+/// `GCMD`/`GSTS` bits. The command and status bits sit at the same positions,
+/// which is what makes "write the command, wait for the status" a loop rather
+/// than a table.
+mod command {
+    /// Translation enable, and in `GSTS` translation-enabled.
+    pub const TE: u32 = 1 << 31;
+    /// Set root table pointer, and root-table-pointer-set.
+    pub const SRTP: u32 = 1 << 30;
+}
+
+/// How long to wait for a register to report a change, in polls.
+///
+/// Bounded because this runs on the boot path with interrupts off: hardware
+/// that never answers must leave the machine reporting a failure rather than
+/// spinning in a kernel with no console yet. Generous, because the operations
+/// below invalidate caches in hardware and an emulator is not fast.
+const WAIT_POLLS: u32 = 1_000_000;
+
+impl Unit {
+    /// Wraps a mapped register window.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be the mapped register window of a DMA remapping unit, from
+    /// a `DMAR` table this kernel parsed, and nothing else may be programming
+    /// it.
+    #[must_use]
+    pub const unsafe fn new(base: *mut u8) -> Self {
+        Self { base, command: 0 }
+    }
+
+    /// Reads a 32-bit register.
+    unsafe fn read32(&self, offset: usize) -> u32 {
+        // SAFETY: an offset within the unit's 4 KiB register window, which the
+        // caller of `new` guarantees is mapped.
+        unsafe { core::ptr::read_volatile(self.base.add(offset).cast::<u32>()) }
+    }
+
+    /// Writes a 32-bit register.
+    unsafe fn write32(&self, offset: usize, value: u32) {
+        // SAFETY: as `read32`.
+        unsafe { core::ptr::write_volatile(self.base.add(offset).cast::<u32>(), value) }
+    }
+
+    /// Reads a 64-bit register.
+    unsafe fn read64(&self, offset: usize) -> u64 {
+        // SAFETY: as `read32`.
+        unsafe { core::ptr::read_volatile(self.base.add(offset).cast::<u64>()) }
+    }
+
+    /// Writes a 64-bit register.
+    unsafe fn write64(&self, offset: usize, value: u64) {
+        // SAFETY: as `read32`.
+        unsafe { core::ptr::write_volatile(self.base.add(offset).cast::<u64>(), value) }
+    }
+
+    /// The unit's version register, which is non-zero on real hardware.
+    ///
+    /// The first read of a window the firmware described. A zero here means
+    /// the `DMAR` named an address that is not a remapping unit, which is the
+    /// failure the parser's alignment checks make unlikely and this makes
+    /// visible.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`]: a mapped register window of
+    /// a real remapping unit, which nothing else is programming.
+    #[must_use]
+    pub unsafe fn version(&self) -> u32 {
+        // SAFETY: the caller's obligation from `new`.
+        unsafe { self.read32(reg::VER) }
+    }
+
+    /// The capability register.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`]: a mapped register window of
+    /// a real remapping unit, which nothing else is programming.
+    #[must_use]
+    pub unsafe fn capabilities(&self) -> u64 {
+        // SAFETY: the caller's obligation from `new`.
+        unsafe { self.read64(reg::CAP) }
+    }
+
+    /// The extended capability register.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`]: a mapped register window of
+    /// a real remapping unit, which nothing else is programming.
+    #[must_use]
+    pub unsafe fn extended_capabilities(&self) -> u64 {
+        // SAFETY: the caller's obligation from `new`.
+        unsafe { self.read64(reg::ECAP) }
+    }
+
+    /// Which address widths this unit's page tables may use.
+    ///
+    /// The `DMAR`'s host address width says what the hardware can *generate*;
+    /// this says what it can be asked to *walk*. Building tables to a width
+    /// the unit does not support is a walk to the wrong depth, so the wider
+    /// number alone is not enough to choose one.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`]: a mapped register window of
+    /// a real remapping unit, which nothing else is programming.
+    #[must_use]
+    pub unsafe fn supports_width(&self, width: AddressWidth) -> bool {
+        // SAFETY: the caller's obligation from `new`.
+        let capabilities = unsafe { self.capabilities() };
+        // SAGAW, bits 8-12: one bit per supported width, in the same order the
+        // width encoding uses.
+        let supported = (capabilities >> 8) & 0x1f;
+        supported & (1 << (width as u64)) != 0
+    }
+
+    /// Whether translation is on.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`]: a mapped register window of
+    /// a real remapping unit, which nothing else is programming.
+    #[must_use]
+    pub unsafe fn translating(&self) -> bool {
+        // SAFETY: the caller's obligation from `new`.
+        unsafe { self.read32(reg::GSTS) & command::TE != 0 }
+    }
+
+    /// Polls `GSTS` until `bit` reads as `set`, or the bound runs out.
+    unsafe fn await_status(&self, bit: u32, set: bool) -> bool {
+        for _ in 0..WAIT_POLLS {
+            // SAFETY: the caller's obligation from `new`.
+            if (unsafe { self.read32(reg::GSTS) } & bit != 0) == set {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    /// Points the unit at a root table, and waits for it to take.
+    ///
+    /// # Safety
+    ///
+    /// `physical` must be the address of a root table this kernel built and
+    /// will not free. The hardware walks it by physical address, with no page
+    /// table of its own and no notice.
+    pub unsafe fn set_root_table(&mut self, physical: u64) -> bool {
+        // SAFETY: the caller's obligation.
+        unsafe {
+            self.write64(reg::RTADDR, physical);
+            // One-shot: written with the shadow, and deliberately not kept in
+            // it. A later command that still carried `SRTP` would re-latch a
+            // root table pointer nobody asked to change.
+            self.write32(reg::GCMD, self.command | command::SRTP);
+            self.await_status(command::SRTP, true)
+        }
+    }
+
+    /// Invalidates every cached context entry.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from `new`.
+    pub unsafe fn invalidate_context(&self) -> bool {
+        /// Invalidate context cache, and the global granularity.
+        const ICC: u64 = 1 << 63;
+        const GLOBAL: u64 = 1 << 61;
+
+        // SAFETY: the caller's obligation.
+        unsafe {
+            self.write64(reg::CCMD, ICC | GLOBAL);
+            for _ in 0..WAIT_POLLS {
+                if self.read64(reg::CCMD) & ICC == 0 {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        false
+    }
+
+    /// Invalidates the whole IOTLB.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from `new`.
+    pub unsafe fn invalidate_iotlb(&self) -> bool {
+        /// Invalidate, and the global granularity.
+        const IVT: u64 = 1 << 63;
+        const GLOBAL: u64 = 1 << 60;
+
+        // The IOTLB registers are not at a fixed offset: the unit reports
+        // where they are, in sixteen-byte units, in the extended capability
+        // register. Assuming a fixed one writes into whatever is there.
+        // SAFETY: the caller's obligation.
+        let offset = unsafe { ((self.extended_capabilities() >> 8) & 0x3ff) as usize } * 16;
+        let iotlb = offset + 8;
+
+        // SAFETY: an offset the unit itself reported, within its window.
+        unsafe {
+            self.write64(iotlb, IVT | GLOBAL);
+            for _ in 0..WAIT_POLLS {
+                if self.read64(iotlb) & IVT == 0 {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        false
+    }
+
+    /// Turns translation on, and waits for the unit to say it is on.
+    ///
+    /// From this moment every DMA by every device the root table covers is
+    /// translated, and anything not mapped is refused. There is no partial
+    /// state: a device whose window is empty can reach nothing at all.
+    ///
+    /// # Safety
+    ///
+    /// A root table must have been set, every window the machine needs must
+    /// already be built and populated, and the caller must be prepared for a
+    /// device that was mid-transfer to fault.
+    pub unsafe fn enable_translation(&mut self) -> bool {
+        self.command |= command::TE;
+        // SAFETY: the caller's obligation.
+        unsafe {
+            self.write32(reg::GCMD, self.command);
+            self.await_status(command::TE, true)
+        }
+    }
+
+    /// The fault status register.
+    ///
+    /// Bit 1 is "a fault is recorded". RFC 0012's position is that a fault is
+    /// the *feature*: a device attempted an access it was not granted, which
+    /// is either a driver bug or a hostile device, and either way the event
+    /// this whole exercise exists to make visible.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`]: a mapped register window of
+    /// a real remapping unit, which nothing else is programming.
+    #[must_use]
+    pub unsafe fn fault_status(&self) -> u32 {
+        // SAFETY: the caller's obligation from `new`.
+        unsafe { self.read32(reg::FSTS) }
+    }
+
+    /// Whether any fault has been recorded.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`]: a mapped register window of
+    /// a real remapping unit, which nothing else is programming.
+    #[must_use]
+    pub unsafe fn faulted(&self) -> bool {
+        /// Primary pending fault, and fault overflow.
+        const PPF: u32 = 1 << 1;
+        const PFO: u32 = 1 << 0;
+        // SAFETY: the caller's obligation from `new`.
+        unsafe { self.fault_status() & (PPF | PFO) != 0 }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

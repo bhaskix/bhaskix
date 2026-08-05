@@ -27,6 +27,8 @@
 
 use bhaskix_boot::PhysAddr;
 
+use bhaskix_arch::vtd;
+
 use crate::println;
 
 /// What discovery found, if anything.
@@ -38,6 +40,11 @@ pub struct Report {
     pub units_seen: usize,
     /// Firmware-reserved regions recorded.
     pub regions: usize,
+    /// Those regions, as inclusive `(base, limit)` pairs.
+    ///
+    /// Carried rather than counted, because step 3 has to identity-map them
+    /// and check each against the kernel's own image before it does.
+    pub region_list: [(u64, u64); bhaskix_arch::acpi::MAX_RESERVED],
     /// Physical address bits the hardware can generate.
     pub address_width: u8,
     /// Whether the platform declares interrupt remapping.
@@ -71,10 +78,16 @@ pub unsafe fn discover(rsdp: Option<PhysAddr>, hhdm: u64) -> Option<Report> {
         })
     }?;
 
+    let mut region_list = [(0u64, 0u64); bhaskix_arch::acpi::MAX_RESERVED];
+    for (slot, region) in region_list.iter_mut().zip(dmar.regions()) {
+        *slot = (region.base, region.limit);
+    }
+
     Some(Report {
         units: dmar.unit_count(),
         units_seen: dmar.units_seen,
         regions: dmar.region_count(),
+        region_list,
         address_width: dmar.host_address_width,
         interrupt_remapping: dmar.interrupt_remapping,
         incomplete: dmar.truncated,
@@ -118,20 +131,32 @@ pub fn report(found: Option<Report>) {
                     report.units,
                 );
             }
-            println!(
-                "    dma            no translation yet: this device can reach all of \
-                 physical memory (docs/memory.md §5)"
-            );
         }
         // A `DMAR` with no usable unit is the same machine as no `DMAR`, and
         // says so in the same words -- the difference matters to whoever reads
         // the firmware, not to a device that can reach the kernel either way.
-        Some(_) | None => {
-            println!(
-                "    dma            NO IOMMU: this device can reach all of physical memory \
-                 (docs/memory.md §5)"
-            );
-        }
+        Some(_) | None => {}
+    }
+}
+
+/// States what a device can reach, once it is settled.
+///
+/// Printed *after* the attempt to enable rather than before it, because the
+/// answer is not known until then and a boot log that says one thing and then
+/// does another is worse than one that waits. `docs/memory.md` §5 asks for the
+/// degraded mode to be printed; what it is really asking for is that the
+/// machine never leaves this unsaid.
+pub fn report_dma(translating: bool) {
+    if translating {
+        println!(
+            "    dma            translating: this device reaches only what it was given \
+             (docs/memory.md §5)"
+        );
+    } else {
+        println!(
+            "    dma            NO IOMMU: this device can reach all of physical memory \
+             (docs/memory.md §5)"
+        );
     }
 }
 
@@ -444,10 +469,293 @@ pub fn verify_window(window: &Window, hhdm: u64) -> bool {
     }
 }
 
+/// Maps one page into a window, building the levels it needs.
+///
+/// Returns false if a level could not be allocated, and leaves whatever it
+/// built in place — the intermediate tables are empty and harmless, and
+/// unwinding them would be a second failure path on the boot sequence that
+/// enables translation. The caller's answer to false is to refuse to enable,
+/// not to retry.
+///
+/// # Panics on nothing, and refuses on everything else
+///
+/// An address past what the window's width can translate is refused rather
+/// than truncated: the hardware would fault on it, and building the entry
+/// would put a mapping somewhere nobody asked for.
+fn map_page(window: &Window, address: u64, physical: u64, rights: vtd::Rights, hhdm: u64) -> bool {
+    if !rights.grants_anything() || address > window.addresses.limit() {
+        return false;
+    }
+
+    let mut table = window.page_table;
+    // Down from the root to the level above the page, allocating as needed.
+    for level in (2..=window.width.levels()).rev() {
+        let index = vtd::level_index(address, level);
+        // SAFETY: `table` is a frame this module allocated and zeroed, reached
+        // through the direct map; `index` is nine bits, so it cannot leave it.
+        let entry = unsafe { core::ptr::read_volatile(((hhdm + table) as *const u64).add(index)) };
+
+        table = match vtd::PageEntry::from_bits(entry) {
+            Some(existing) => existing.address,
+            None => {
+                let Some((next, _)) = zeroed_frame(hhdm) else {
+                    return false;
+                };
+                let bits = vtd::table_entry(next).to_bits();
+                // SAFETY: as the read above.
+                unsafe {
+                    core::ptr::write_volatile(((hhdm + table) as *mut u64).add(index), bits);
+                }
+                next
+            }
+        };
+    }
+
+    let index = vtd::level_index(address, 1);
+    let bits = vtd::PageEntry {
+        address: physical,
+        rights,
+    }
+    .to_bits();
+    // SAFETY: as above -- a table this module allocated, at a nine-bit index.
+    unsafe {
+        core::ptr::write_volatile(((hhdm + table) as *mut u64).add(index), bits);
+    }
+    true
+}
+
+/// Identity-maps `frames` into a window: the device reaches them at their own
+/// physical addresses.
+///
+/// The transitional mapping RFC 0012 step 3 needs. The driver still writes
+/// physical addresses into its descriptors, so until step 4 converts it to
+/// hand over a `DevAddr`, the window must translate those addresses to
+/// themselves. Identity is not a weaker protection here: everything *not* in
+/// this list is still refused, which is the whole difference from a machine
+/// with no IOMMU.
+#[must_use]
+pub fn identity_map(window: &Window, frames: &[u64], hhdm: u64) -> usize {
+    let mut mapped = 0;
+    for frame in frames {
+        if map_page(window, *frame, *frame, vtd::Rights::READ_WRITE, hhdm) {
+            mapped += 1;
+        }
+    }
+    mapped
+}
+
+/// Identity-maps the regions firmware says a device must keep reaching.
+///
+/// **Refuses any that overlap the kernel's own image**, and says so. An `RMRR`
+/// is chosen by firmware, so a firmware that named the kernel's memory would
+/// be asking for a device to be granted access to it — RFC 0012 requires the
+/// check rather than the trust, and requires the refusal to be reported,
+/// because a machine whose firmware asked for that is a machine worth knowing
+/// about.
+///
+/// Returns `(mapped, refused)`.
+pub fn map_reserved(
+    window: &Window,
+    report: &Report,
+    kernel: (u64, u64),
+    hhdm: u64,
+) -> (usize, usize) {
+    let (kernel_start, kernel_end) = kernel;
+    let mut mapped = 0;
+    let mut refused = 0;
+
+    for region in report.region_list.iter().take(report.regions) {
+        let (base, limit) = *region;
+        // Overlap, computed on inclusive bounds because a limit is the last
+        // byte rather than one past it.
+        if overlaps_kernel((base, limit), (kernel_start, kernel_end)) {
+            refused += 1;
+            println!(
+                "    iommu          REFUSED a reserved region {base:#x}..={limit:#x} \
+                 overlapping the kernel"
+            );
+            continue;
+        }
+        let mut address = base & !(vtd::PAGE_SIZE - 1);
+        while address <= limit {
+            if map_page(window, address, address, vtd::Rights::READ_WRITE, hhdm) {
+                mapped += 1;
+            }
+            let Some(next) = address.checked_add(vtd::PAGE_SIZE) else {
+                break;
+            };
+            address = next;
+        }
+    }
+    (mapped, refused)
+}
+
+/// Whether a firmware-reserved region overlaps the kernel's own image.
+///
+/// Both bounds are inclusive: a limit is the last byte, not one past it, and
+/// treating it as exclusive lets a region ending exactly at the kernel's first
+/// byte through.
+///
+/// Pure, and tested on the host, because the machine this matters on is the
+/// one that cannot be booted here: QEMU's `intel-iommu` declares **no**
+/// reserved regions at all, so the refusal path has no natural test in the
+/// emulator. A check that only runs on firmware nobody has is a check that
+/// ships unexercised.
+#[must_use]
+pub const fn overlaps_kernel(region: (u64, u64), kernel: (u64, u64)) -> bool {
+    let (base, limit) = region;
+    let (start, end) = kernel;
+    base <= end && start <= limit
+}
+
+/// The kernel's own physical extent, from the memory map.
+///
+/// Taken from the map rather than from a linker symbol because what must not
+/// be handed to a device is every byte the loader placed, which is the kernel
+/// *and its modules* — the ramdisk among them.
+#[must_use]
+pub fn kernel_extent(handoff: &bhaskix_boot::Handoff) -> (u64, u64) {
+    let mut start = u64::MAX;
+    let mut end = 0u64;
+    for region in handoff.memory_map {
+        if region.kind == bhaskix_boot::MemoryKind::KernelAndModules {
+            let base = region.base.as_u64();
+            start = start.min(base);
+            end = end.max(base.saturating_add(region.length).saturating_sub(1));
+        }
+    }
+    if start == u64::MAX {
+        // No region said so. Refusing everything is the safe answer: a
+        // reserved region that cannot be checked against the kernel is one
+        // that must not be identity-mapped.
+        (0, u64::MAX)
+    } else {
+        (start, end)
+    }
+}
+
+/// Programs a unit with a window's root table and turns translation on.
+///
+/// From the moment this returns true, every DMA by every device the root table
+/// covers is translated and anything unmapped is refused. There is no partial
+/// state, which is why everything the machine needs must already be mapped —
+/// RFC 0012's sequence is build, identity-map, *then* enable, and the order is
+/// not a preference.
+///
+/// # Safety
+///
+/// `window` must be built and populated, and its tables must not be freed. The
+/// unit walks them by physical address with no notice.
+pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), &'static str> {
+    let base = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)
+        .ok_or("the unit's registers could not be mapped")?;
+
+    // SAFETY: the window the `DMAR` named, just mapped, and nothing else in
+    // this kernel programs a remapping unit.
+    let mut unit = unsafe { vtd::Unit::new(base as *mut u8) };
+
+    // SAFETY: a mapped register window, as above.
+    unsafe {
+        // A zero version register means the `DMAR` named an address that is
+        // not a remapping unit. The parser's alignment check makes that
+        // unlikely; this makes it visible rather than programming whatever is
+        // there.
+        if unit.version() == 0 {
+            return Err("the register window is not a remapping unit");
+        }
+        // What the hardware can *generate* is not what it can be asked to
+        // *walk*. Building tables to an unsupported width is a walk to the
+        // wrong depth, and the tables are already built by now.
+        if !unit.supports_width(window.width) {
+            return Err("the unit does not support the width the tables were built to");
+        }
+        if !unit.set_root_table(window.root_table) {
+            return Err("the unit did not accept the root table");
+        }
+        // Both caches, before enabling. A unit that had cached anything from a
+        // previous kernel would translate through it.
+        if !unit.invalidate_context() {
+            return Err("the context cache did not invalidate");
+        }
+        if !unit.invalidate_iotlb() {
+            return Err("the IOTLB did not invalidate");
+        }
+        if !unit.enable_translation() {
+            return Err("the unit did not report translation enabled");
+        }
+    }
+    Ok(())
+}
+
+/// Whether the unit has recorded a fault since translation was enabled.
+///
+/// A fault means a device attempted an access it was not granted — RFC 0012's
+/// position is that this is the feature rather than an error path, because it
+/// is either a driver bug or a hostile device and both are what the exercise
+/// exists to make visible.
+///
+/// # Safety
+///
+/// As [`enable`], and the unit must already have been mapped by it.
+#[must_use]
+pub unsafe fn faulted(report: &Report, hhdm: u64) -> Option<bool> {
+    let base = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)?;
+    // SAFETY: the same window `enable` mapped and programmed.
+    unsafe {
+        let unit = vtd::Unit::new(base as *mut u8);
+        Some(unit.faulted())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bhaskix_arch::vtd::{AddressWidth, PAGE_SIZE};
+
+    #[test]
+    fn a_reserved_region_overlapping_the_kernel_is_detected() {
+        // The check QEMU cannot exercise: its `intel-iommu` declares no
+        // reserved regions at all, so on the emulator this path is never
+        // taken. A firmware that named the kernel's memory would be asking
+        // for a device to be granted access to it, and RFC 0012 requires the
+        // check rather than the trust.
+        let kernel = (0x0010_0000, 0x0090_0000);
+
+        // Entirely inside, straddling either end, and containing it whole.
+        assert!(overlaps_kernel((0x0020_0000, 0x0030_0000), kernel));
+        assert!(overlaps_kernel((0x0000_0000, 0x0020_0000), kernel));
+        assert!(overlaps_kernel((0x0080_0000, 0x00a0_0000), kernel));
+        assert!(overlaps_kernel((0x0000_0000, 0xffff_ffff), kernel));
+    }
+
+    #[test]
+    fn a_reserved_region_beside_the_kernel_is_allowed() {
+        let kernel = (0x0010_0000, 0x0090_0000);
+        assert!(!overlaps_kernel((0x0009_0000, 0x0009_ffff), kernel));
+        assert!(!overlaps_kernel((0x0090_0001, 0x00a0_0000), kernel));
+    }
+
+    #[test]
+    fn the_bounds_are_inclusive_at_both_ends() {
+        // A limit is the last byte, not one past it. Treating it as exclusive
+        // lets a region ending exactly on the kernel's first byte through --
+        // one byte of the kernel, handed to a device.
+        let kernel = (0x0010_0000, 0x0090_0000);
+        assert!(overlaps_kernel((0x0000_0000, 0x0010_0000), kernel));
+        assert!(overlaps_kernel((0x0090_0000, 0x00ff_0000), kernel));
+        // And one byte clear on either side is clear.
+        assert!(!overlaps_kernel((0x0000_0000, 0x000f_ffff), kernel));
+        assert!(!overlaps_kernel((0x0090_0001, 0x00ff_0000), kernel));
+    }
+
+    #[test]
+    fn a_single_byte_region_is_handled_at_the_boundaries() {
+        let kernel = (0x1000, 0x1fff);
+        assert!(overlaps_kernel((0x1000, 0x1000), kernel));
+        assert!(overlaps_kernel((0x1fff, 0x1fff), kernel));
+        assert!(!overlaps_kernel((0x0fff, 0x0fff), kernel));
+        assert!(!overlaps_kernel((0x2000, 0x2000), kernel));
+    }
 
     #[test]
     fn zero_is_never_handed_out() {

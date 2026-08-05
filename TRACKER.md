@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–2) · CI green · 38 boot gates, 112 checks |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–3) · CI green · 38 boot gates, 112 checks |
 
 ### Division of responsibility between documents
 
@@ -133,6 +133,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-09 | RFC 0011 step 5: a handler does not outlive its owner | ✅ `DONE` | Destroying a domain is `RELEASE` for every handler it held — collected under the handler lock, released outside it, because masking a line reaches the chip and freeing a vector reaches the allocator and both rank below it. `NO_DOMAIN` is not a spare identifier: the console's and the block driver's handlers belong to the nucleus, and a recycled domain id must not sweep them up. **Negative-tested**: disabling the teardown gives `7 -> 8 -> 8 -> 8` and fails three checks. The assertion is the *re-claim*, not the release — a release that leaked the vector returns success just as loudly. Step 6, delegation, stays blocked on RFC 0012 as the RFC requires. |
 | M6-10 | RFC 0012 step 1: the IOMMU is found, and the warning stops being a constant | ✅ `DONE` | `DMAR` parsed as untrusted firmware input, with a **seeded mutation harness** — the fuzz target the RFC adds, and the one whose failure mode is worst, because what is built from a believed table is a register window written to as if it were an IOMMU. A structure length of zero is refused rather than looped on; a register base that is zero or unaligned is dropped, not recorded. No translation is enabled: every device still reaches all of memory, and the line says so. **Negative-tested**: a parser that records no unit fails the new gate. `boot-test.sh iommu` runs QEMU with `-device intel-iommu,intremap=on`, without which the discovery path is unreachable. |
 | M6-11 | RFC 0012 step 2: the translation structures, built and not enabled | ✅ `DONE` | `arch::vtd` is the VT-d encodings as arithmetic — root, context and second-level entries, address widths, index maths — pure, and proved against the specification's own numbers by 10 host tests on a machine with no IOMMU. `DevAddr` is a type the compiler keeps apart from `PhysAddr`, with an allocator tested for exhaustion, reuse after unmap and the below-4-GiB constraint a 32-bit device needs. On real hardware the window is built for the block device and **left empty**: default deny, nothing programmed. **Negative-tested**: a corrupted context index fails the gate — after the first version of that check failed to catch it, see below. |
+| M6-12 | RFC 0012 step 3: translation enabled, and a device that can no longer reach the kernel | ✅ `DONE` | Identity-map what must keep working, map the firmware-reserved regions after checking each against the kernel's own image, then enable — the order is the RFC's and is not a preference, because translation has no partial state. `virtio-blk` keeps working with **zero faults**, and the boot line says whether the device is *subject to* translation as well as whether translation is on. **Negative-tested**: unmap the driver's five frames and the disk disappears, failing four gates. The `RMRR`-overlaps-the-kernel refusal has four host tests, because QEMU declares no reserved regions and the path is otherwise unreachable. |
 
 ### Honest notes on M6 so far
 
@@ -515,6 +516,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0012 step 3 — the gate that passed with the protection switched off)
+
+- **Translation is on and a device is finally contained.** `5 driver frames and 0 reserved pages
+  mapped, 0 refused, a read still works, no faults, device subject to it`. Before this a
+  `virtio-blk` device could read the kernel's memory; now it reaches five frames it was given and
+  nothing else, enforced by hardware.
+- **The first version passed its own negative test.** I disabled the identity mapping entirely,
+  enabled translation with the device's memory unmapped, and the disk kept working with zero faults.
+  Translation genuinely *was* enabled — the device simply was not subject to it. QEMU routes a
+  virtio device's DMA through the IOMMU only when `iommu_platform=on` **and** the driver negotiates
+  `VIRTIO_F_ACCESS_PLATFORM`; neither was true, so the IOMMU protected nothing and every assertion
+  passed anyway.
+- **"Translation is enabled" and "this device is translated" are different claims**, and only the
+  first was being checked. The driver now accepts `ACCESS_PLATFORM` whenever it is offered, the
+  harness gives the device `disable-legacy=on,iommu_platform=on` — QEMU builds `virtio-blk-pci`
+  transitional by default and a transitional device cannot carry that feature — and the boot line
+  reports `device subject to it` as a separate fact. The same negative test now fails **four** gates.
+- **The boot log used to state the wrong thing and then do the right one.** The DMA threat-model line
+  was printed before the enable attempt, so it said "no translation yet" on a machine that was about
+  to have some. It is printed afterwards now, and says what ended up true.
+- **The refusal that QEMU cannot test.** An `RMRR` naming the kernel's memory would be firmware
+  asking for a device to be given access to it. QEMU declares no reserved regions at all, so that
+  path has no natural test here — four host tests cover the overlap arithmetic instead, including
+  both inclusive boundaries, because a limit is the last byte and treating it as one-past lets a
+  region ending on the kernel's first byte through.
+- **Two `unsafe` budgets raised with the reason written down**: arch 980 → 1010 for the register
+  window (`GCMD` cannot be read — a write sets the whole enable state — hence the shadow), and
+  kernel 890 → 950 for the page-table walk and the enable sequence.
 
 ### 2026-08-05 (RFC 0012 step 2 — and a verification that verified itself)
 

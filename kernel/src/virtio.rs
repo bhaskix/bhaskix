@@ -71,6 +71,20 @@ const STATUS_FAILED: u8 = 128;
 /// device refuses to work without.
 const FEATURE_VERSION_1: u32 = 1 << 0; // bit 32, selected by feature word 1
 
+/// `VIRTIO_F_ACCESS_PLATFORM`: the device's addresses go through whatever the
+/// platform puts in the way, which on x86 means the IOMMU.
+///
+/// Bit 33, so bit 1 of feature word 1. Without it a virtio device is entitled
+/// to bypass translation entirely — and on QEMU it does, which made an early
+/// version of RFC 0012's step 3 gate pass with the driver's memory deliberately
+/// unmapped. Translation was genuinely on; the device simply was not subject to
+/// it, so "the read still works" proved nothing at all.
+///
+/// Accepted only when the device offers it. A driver that sets a feature bit
+/// it was not offered is telling the device it speaks a protocol that device
+/// may not implement.
+const FEATURE_ACCESS_PLATFORM: u32 = 1 << 1;
+
 /// Descriptor flags.
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
@@ -195,6 +209,9 @@ static TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// A single number could not tell those apart.
 static WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether the device agreed that its addresses go through the platform's
+/// translation. See [`FEATURE_ACCESS_PLATFORM`].
+static TRANSLATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Blocks that ended with an empty notification word.
 ///
 /// `wait_once` returns what was pending when it woke. Zero means something
@@ -429,7 +446,13 @@ pub fn init(hhdm: u64) -> Result<u64, BlockError> {
         write32(common + common::DRIVER_FEATURE_SELECT, 0);
         write32(common + common::DRIVER_FEATURE, 0);
         write32(common + common::DRIVER_FEATURE_SELECT, 1);
-        write32(common + common::DRIVER_FEATURE, FEATURE_VERSION_1);
+        // Take `ACCESS_PLATFORM` whenever it is offered. It is what subjects
+        // this device's DMA to the IOMMU rather than letting it address memory
+        // directly, and a driver that declined it would be asking to be
+        // outside the protection this kernel is building.
+        let accepted = FEATURE_VERSION_1 | (offered & FEATURE_ACCESS_PLATFORM);
+        write32(common + common::DRIVER_FEATURE, accepted);
+        TRANSLATED.store(offered & FEATURE_ACCESS_PLATFORM != 0, Ordering::Relaxed);
 
         write8(
             common + common::DEVICE_STATUS,
@@ -529,6 +552,39 @@ pub fn waiting() -> (u64, u64) {
 #[must_use]
 pub fn unsignalled() -> u64 {
     UNSIGNALLED.load(Ordering::Relaxed)
+}
+
+/// The physical frames this driver hands the device by DMA.
+///
+/// The rings, the buffer and the request header — everything whose address
+/// appears in a descriptor. RFC 0012 step 3 identity-maps exactly these into
+/// the device's window before enabling translation: the driver still puts
+/// physical addresses in its descriptors, so the window must translate them to
+/// themselves or the first read after enabling faults.
+///
+/// Naming them here rather than mapping "the driver's memory" is the point.
+/// The set is five frames, it is written down, and a device that reaches
+/// anything else is refused — which is the property the whole RFC is for.
+#[must_use]
+pub fn dma_frames() -> Option<[u64; 5]> {
+    let guard = DEVICE.lock();
+    let device = guard.as_ref()?;
+    Some([
+        device.descriptors.0,
+        device.available.0,
+        device.used.0,
+        device.buffer.0,
+        device.request.0,
+    ])
+}
+
+/// Whether this device's DMA is subject to the platform's translation.
+///
+/// False means the device may address memory directly however the IOMMU is
+/// programmed, so any claim that translation protects *this* device is false.
+#[must_use]
+pub fn translated() -> bool {
+    TRANSLATED.load(Ordering::Relaxed)
 }
 
 /// Whether the device delivers interrupts rather than being polled.

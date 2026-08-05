@@ -2021,6 +2021,82 @@ fn irq_teardown_self_test(handoff: &Handoff) -> bool {
     ok
 }
 
+/// RFC 0012 step 3: identity-map what must keep working, enable, and prove it.
+///
+/// The order is the RFC's and it is not a preference. Translation has no
+/// partial state: the instant it is on, every device the root table covers is
+/// translated and everything unmapped is refused. Enabling before mapping is a
+/// machine that loses its disk.
+///
+/// What is mapped is deliberately small — the five frames the block driver
+/// hands the device, and whatever firmware reserved. Everything else is
+/// refused, which is the entire difference from the machine this was five
+/// minutes ago, where that device could read the kernel.
+fn iommu_enable_self_test(
+    found: &iommu::Report,
+    window: &iommu::Window,
+    handoff: &Handoff,
+    hhdm: u64,
+) -> bool {
+    let Some(frames) = virtio::dma_frames() else {
+        println!("    iommu enable   skipped, the block driver has no frames to map");
+        return false;
+    };
+
+    let mapped = iommu::identity_map(window, &frames, hhdm);
+    if mapped != frames.len() {
+        println!(
+            "    iommu enable   FAILED to map the driver's frames ({mapped}/{})",
+            frames.len()
+        );
+        return false;
+    }
+
+    let kernel = iommu::kernel_extent(handoff);
+    let (reserved, refused) = iommu::map_reserved(window, found, kernel, hhdm);
+
+    // SAFETY: the window was built and verified above, its frames are mapped,
+    // and its tables are never freed.
+    if let Err(reason) = unsafe { iommu::enable(found, window, hhdm) } {
+        println!("    iommu enable   FAILED: {reason}");
+        return false;
+    }
+
+    // The assertion that matters. A read now goes through the unit: the
+    // descriptors hold physical addresses, the window translates them to
+    // themselves, and anything the driver did not declare is refused. If the
+    // mapping were wrong this read is what would fail, rather than something
+    // subtle much later.
+    let mut sector = [0u8; 512];
+    let read = virtio::read(8, &mut sector);
+    // SAFETY: the unit `enable` just mapped and programmed.
+    let faulted = unsafe { iommu::faulted(found, hhdm) };
+
+    match (read, faulted) {
+        (Ok(()), Some(false)) => println!(
+            "    iommu enable   translating; {mapped} driver frames and {reserved} reserved \
+             pages mapped, {refused} refused, a read still works, no faults, device {}",
+            if virtio::translated() {
+                "subject to it"
+            } else {
+                "BYPASSING it"
+            }
+        ),
+        (Ok(()), fault) => println!(
+            "    iommu enable   FAILED: translating and reading, but the unit reports a fault \
+             ({fault:?})"
+        ),
+        (Err(error), fault) => println!(
+            "    iommu enable   FAILED: the device could not be read once translating \
+             ({error:?}, fault {fault:?})"
+        ),
+    }
+    // Translation is on either way -- the unit reported it enabled. Saying
+    // otherwise because the *read* failed would report a machine that reaches
+    // all of memory when it reaches almost none of it.
+    true
+}
+
 fn block_interrupt_self_test(handoff: &Handoff) -> bool {
     if !virtio::present() {
         return true;
@@ -2210,6 +2286,7 @@ fn block_self_test(handoff: &Handoff) -> bool {
     // `irq::init` walks these tables with.
     let iommu = unsafe { iommu::discover(handoff.rsdp, handoff.hhdm_base.as_u64()) };
     iommu::report(iommu);
+    let mut translating = false;
 
     // RFC 0012 step 2: build the structures, enable nothing. The page table is
     // left *empty* -- default deny, so a device translated through this window
@@ -2222,12 +2299,15 @@ fn block_self_test(handoff: &Handoff) -> bool {
     {
         let hhdm = handoff.hhdm_base.as_u64();
         match iommu::build_window(&found, (bus, slot, function), 0, hhdm) {
-            Some(window) if iommu::verify_window(&window, hhdm) => println!(
-                "    iommu window   {bus:02x}:{slot:02x}.{function} \
-                 {}-bit, {} levels, nothing mapped, not programmed",
-                window.width.bits(),
-                window.width.levels()
-            ),
+            Some(window) if iommu::verify_window(&window, hhdm) => {
+                println!(
+                    "    iommu window   {bus:02x}:{slot:02x}.{function} \
+                     {}-bit, {} levels, built",
+                    window.width.bits(),
+                    window.width.levels()
+                );
+                translating = iommu_enable_self_test(&found, &window, handoff, hhdm);
+            }
             // Built and read back wrong is worse than not built: the values
             // would all be right and the *offsets* wrong, which is a device
             // silently translating through another device's tables.
@@ -2235,6 +2315,7 @@ fn block_self_test(handoff: &Handoff) -> bool {
             None => println!("    iommu window   FAILED to build"),
         }
     }
+    iommu::report_dma(translating);
 
     if ok {
         let (bus, device, function) = virtio::location().unwrap_or((0, 0, 0));

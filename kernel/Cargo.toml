@@ -96,4 +96,16 @@ workspace = true
 # machine said so at boot because there was nothing else to say. This is the
 # code that ends that, and it is deliberately confined to one module so that
 # "what can a device reach" has one answer in one place.
-unsafe_budget = 890
+# 950 at M6-12, RFC 0012 step 3. The increase is the page-table walk and the
+# enable sequence: reading and writing second-level entries through the direct
+# map, and driving a remapping unit's registers. Every index is nine bits and
+# every table is a frame this module allocated and zeroed, so no access can
+# leave the page it is walking.
+#
+# The trade is worth stating plainly, because it is what the milestone bought.
+# Before this, a `virtio-blk` device could read the kernel's memory and the
+# machine said so at boot for want of anything better to say. After it, that
+# device reaches five frames it was given and nothing else -- enforced by
+# hardware, and demonstrated by deliberately unmapping them and watching the
+# disk disappear.
+unsafe_budget = 950

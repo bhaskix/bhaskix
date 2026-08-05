@@ -69,4 +69,13 @@ workspace = true
 # safely. The count is dominated by one `unsafe` block per accessor, which is
 # deliberate: each states which port pair it drives and why nothing else is
 # driving it concurrently.
-unsafe_budget = 980
+# 1010 at M6-12, RFC 0012 step 3. The increase is one register window: a
+# remapping unit's, reached by volatile reads and writes at offsets the unit
+# itself reports. It is the same shape as the I/O APIC's and PCI's -- an
+# accessor per register, each stating what it drives -- with one difference
+# worth writing down. `GCMD` cannot be read: a write sets the whole enable
+# state at once, so there is no read-modify-write and the value last written is
+# kept in a shadow. That is why enabling translation is a method on a `&mut`
+# rather than a free function, and why the count includes a field nobody else
+# needs.
+unsafe_budget = 1010
