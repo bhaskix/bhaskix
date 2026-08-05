@@ -78,4 +78,11 @@ workspace = true
 # kept in a shadow. That is why enabling translation is a method on a `&mut`
 # rather than a free function, and why the count includes a field nobody else
 # needs.
-unsafe_budget = 1010
+# 1040 at M6-13, RFC 0012 step 4. Two additions: reading a unit's fault
+# records -- which live at an offset the unit reports, and are cleared by
+# writing the fault bit back -- and `pci::quiesce`/`enable_memory`, which split
+# "the driver can read the BARs" from "the device may touch memory". That split
+# is not tidiness: doing both at once leaves a gap in which the device is still
+# configured the way firmware left it, and with translation on that
+# configuration is a fault attributed to a driver that has not started.
+unsafe_budget = 1040

@@ -165,14 +165,21 @@ struct Device {
     /// Where this queue is notified.
     notify: u64,
 
-    /// Physical and virtual addresses of the one ring's three parts.
-    descriptors: (u64, u64),
-    available: (u64, u64),
-    used: (u64, u64),
+    /// Each frame as `(physical, virtual, device-visible)`.
+    ///
+    /// The third is the address the *device* is given, and it is not the
+    /// first. With an IOMMU in front of it they differ: the driver writes a
+    /// `DevAddr` into every descriptor and register the device reads, and the
+    /// unit translates it back. Without one they are equal, which is the whole
+    /// of the no-IOMMU path — RFC 0012 step 4 does not fork the driver, it
+    /// changes what one number means.
+    descriptors: (u64, u64, u64),
+    available: (u64, u64, u64),
+    used: (u64, u64, u64),
     /// The buffer requests read into.
-    buffer: (u64, u64),
+    buffer: (u64, u64, u64),
     /// The request header and status byte.
-    request: (u64, u64),
+    request: (u64, u64, u64),
 
     /// What the driver has published to the available ring so far.
     available_index: u16,
@@ -357,6 +364,77 @@ fn find() -> Option<(pci::Address, pci::Identity)> {
 /// [`BlockError`] naming what was missing. Every one is survivable — the
 /// kernel boots without a disk, and says so.
 pub fn init(hhdm: u64) -> Result<u64, BlockError> {
+    init_mapped(hhdm, None)
+}
+
+/// Reads one sector into `device_address`, which is deliberately not checked.
+///
+/// The negative test RFC 0012 asks for, and nothing else may call it: it hands
+/// the device an address the driver did not map, so that the unit's refusal
+/// can be observed instead of assumed. Expect it to fail — a success means the
+/// device reached memory nobody gave it.
+///
+/// # Errors
+///
+/// [`BlockError::TimedOut`] is the expected outcome, because a refused access
+/// never completes.
+pub fn read_into(sector: u64, device_address: u64) -> Result<(), BlockError> {
+    let _request = Request::acquire()?;
+    let (notification, handler) = {
+        let mut guard = DEVICE.lock();
+        let device = guard.as_mut().ok_or(BlockError::NotPresent)?;
+        device.submit_to(sector, SECTOR as u32, device_address)?;
+        (device.notification, device.handler)
+    };
+    await_completion(notification, handler)
+}
+
+/// Stops the block device doing DMA, before anything else is decided.
+///
+/// Called before translation is enabled. See `pci::quiesce`: the device the
+/// firmware enumerated is still a bus master, still pointed at physical
+/// addresses, and the moment a unit starts translating those become faults
+/// attributed to a driver that has not run yet.
+///
+/// Bringing the device up afterwards re-enables bus mastering, so this costs
+/// nothing but the ordering it enforces.
+pub fn quiesce() {
+    if let Some((address, _)) = find() {
+        // SAFETY: this device is the kernel's -- it is about to be brought up
+        // by `init_mapped`, and nothing else in this kernel drives it.
+        unsafe { bhaskix_arch::pci::quiesce(address) };
+    }
+}
+
+/// Finds the block device without touching it.
+///
+/// Needed because a `DmaWindow` names the device it translates for, so the
+/// window must exist before the device is programmed — and the device's
+/// requester id is what the window is built from. Scanning twice is cheaper
+/// than threading the whole bring-up through the IOMMU.
+#[must_use]
+pub fn probe() -> Option<(u8, u8, u8)> {
+    let (address, _) = find()?;
+    Some((address.bus, address.device, address.function))
+}
+
+/// Brings the device up, mapping every frame it will hand the device.
+///
+/// `map` turns a physical frame into the address the device should be given.
+/// `None` means there is no IOMMU and the two are the same number — the path
+/// every machine without VT-d takes, and the one that must keep working.
+///
+/// The mapping happens *here*, before the device is told about any of it,
+/// because there is no moment afterwards when it would be safe: from
+/// `DRIVER_OK` the device may read the rings, and a ring it cannot translate
+/// is a request that faults instead of completing.
+///
+/// # Errors
+///
+/// [`BlockError`] naming what was refused, including a frame that could not be
+/// mapped — which is a refusal to bring the device up rather than a device
+/// brought up with an address it cannot reach.
+pub fn init_mapped(hhdm: u64, map: Option<&dyn Fn(u64) -> Option<u64>>) -> Result<u64, BlockError> {
     let (address, _) = find().ok_or(BlockError::NotFound)?;
 
     // Memory access and bus mastering before anything else: a device that is
@@ -367,8 +445,12 @@ pub fn init(hhdm: u64) -> Result<u64, BlockError> {
     // changes nothing on the machines Bhaskix is tested on. It is kept because
     // "usually" is a property of the firmware rather than of the requirement,
     // and `command()` below lets a test assert the state rather than the call.
+    // Memory space now, bus mastering *after* the device has been reset. The
+    // BARs must be readable to find the capabilities; letting the device touch
+    // memory before it has been reset means it does so with the ring firmware
+    // configured, which with translation on is a fault nobody owns.
     // SAFETY: this device is the kernel's from here on.
-    unsafe { pci::enable(address) };
+    unsafe { pci::enable_memory(address) };
 
     // Walk the capability list for the three structures a modern device must
     // expose. A device missing any of them is not one this driver understands,
@@ -427,6 +509,9 @@ pub fn init(hhdm: u64) -> Result<u64, BlockError> {
     // device this function owns.
     let capacity = unsafe {
         write8(common + common::DEVICE_STATUS, 0); // reset
+        // Reset first, then let it reach memory: from here its only
+        // configuration is this driver's.
+        pci::enable(address);
         write8(common + common::DEVICE_STATUS, STATUS_ACKNOWLEDGE);
         write8(
             common + common::DEVICE_STATUS,
@@ -470,11 +555,20 @@ pub fn init(hhdm: u64) -> Result<u64, BlockError> {
         u64::from(read32(device_config)) | (u64::from(read32(device_config + 4)) << 32)
     };
 
-    let descriptors = frame(hhdm).ok_or(BlockError::OutOfMemory)?;
-    let available = frame(hhdm).ok_or(BlockError::OutOfMemory)?;
-    let used = frame(hhdm).ok_or(BlockError::OutOfMemory)?;
-    let buffer = frame(hhdm).ok_or(BlockError::OutOfMemory)?;
-    let request = frame(hhdm).ok_or(BlockError::OutOfMemory)?;
+    // Each frame, then the address the device will see for it.
+    let translate = |frame: (u64, u64)| -> Result<(u64, u64, u64), BlockError> {
+        let device = match map {
+            Some(map) => map(frame.0).ok_or(BlockError::OutOfMemory)?,
+            None => frame.0,
+        };
+        Ok((frame.0, frame.1, device))
+    };
+
+    let descriptors = translate(frame(hhdm).ok_or(BlockError::OutOfMemory)?)?;
+    let available = translate(frame(hhdm).ok_or(BlockError::OutOfMemory)?)?;
+    let used = translate(frame(hhdm).ok_or(BlockError::OutOfMemory)?)?;
+    let buffer = translate(frame(hhdm).ok_or(BlockError::OutOfMemory)?)?;
+    let request = translate(frame(hhdm).ok_or(BlockError::OutOfMemory)?)?;
 
     // SAFETY: as above, and every address written is one of the frames just
     // allocated -- which is the only reason the device may write to them.
@@ -487,9 +581,13 @@ pub fn init(hhdm: u64) -> Result<u64, BlockError> {
         let size = offered.min(QUEUE_SIZE);
         write16(common + common::QUEUE_SIZE, size);
 
-        write64(common + common::QUEUE_DESC, descriptors.0);
-        write64(common + common::QUEUE_DRIVER, available.0);
-        write64(common + common::QUEUE_DEVICE, used.0);
+        // The device-visible addresses, not the physical ones. The rings are
+        // themselves read by DMA, so they are translated exactly like the
+        // buffers are -- a driver that mapped its buffers and then handed over
+        // a physical ring address would fault on the first request.
+        write64(common + common::QUEUE_DESC, descriptors.2);
+        write64(common + common::QUEUE_DRIVER, available.2);
+        write64(common + common::QUEUE_DEVICE, used.2);
 
         let queue_notify_off = read16(common + common::QUEUE_NOTIFY_OFF);
         write16(common + common::QUEUE_ENABLE, 1);
@@ -921,6 +1019,18 @@ fn await_completion(
 impl Device {
     /// Puts one read on the ring and rings the bell. Does not wait.
     fn submit(&mut self, sector: u64, length: u32) -> Result<(), BlockError> {
+        let buffer = self.buffer.2;
+        self.submit_to(sector, length, buffer)
+    }
+
+    /// Submits a read whose data lands at `buffer`, whatever that address is.
+    ///
+    /// Only the self-test that proves refusal passes anything but this
+    /// device's own buffer. It exists so that "an address outside the window
+    /// is refused" can be *demonstrated* rather than argued: RFC 0012's whole
+    /// claim is that the hardware stops a device reaching what it was not
+    /// given, and the only convincing evidence is to try.
+    fn submit_to(&mut self, sector: u64, length: u32, buffer: u64) -> Result<(), BlockError> {
         let header = RequestHeader {
             kind: BLK_IN,
             reserved: 0,
@@ -942,7 +1052,7 @@ impl Device {
             core::ptr::write_volatile(
                 table,
                 Descriptor {
-                    address: self.request.0,
+                    address: self.request.2,
                     length: 16,
                     flags: DESC_NEXT,
                     next: 1,
@@ -951,7 +1061,7 @@ impl Device {
             core::ptr::write_volatile(
                 table.add(1),
                 Descriptor {
-                    address: self.buffer.0,
+                    address: buffer,
                     length,
                     flags: DESC_NEXT | DESC_WRITE,
                     next: 2,
@@ -960,7 +1070,7 @@ impl Device {
             core::ptr::write_volatile(
                 table.add(2),
                 Descriptor {
-                    address: self.request.0 + 16,
+                    address: self.request.2 + 16,
                     length: 1,
                     flags: DESC_WRITE,
                     next: 0,

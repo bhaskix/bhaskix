@@ -108,4 +108,14 @@ workspace = true
 # device reaches five frames it was given and nothing else -- enforced by
 # hardware, and demonstrated by deliberately unmapping them and watching the
 # disk disappear.
-unsafe_budget = 950
+# 1000 at M6-13, RFC 0012 step 4. `MAP` and `UNMAP`: walking the second-level
+# tables to place and remove one page, and reading the unit's fault record so a
+# refusal names the device rather than counting one. Every index is nine bits
+# and every table is a frame this module allocated, so no access leaves the page
+# it is walking.
+#
+# What it buys is the sentence the boot log can now print truthfully: this
+# device reaches only what it was given. Demonstrated, not asserted -- the
+# machine hands the device an address nobody mapped and reports the hardware
+# refusing it by name.
+unsafe_budget = 1000

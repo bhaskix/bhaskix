@@ -375,6 +375,53 @@ pub unsafe fn enable(address: Address) {
     }
 }
 
+/// Enables memory space, and deliberately not bus mastering.
+///
+/// A driver needs its BARs readable to find out what the device is before it
+/// lets the device touch memory. Doing both at once is the ordering bug RFC
+/// 0012 step 4 found: between enabling bus mastering and resetting the device,
+/// it is still configured the way firmware left it, and with translation on
+/// that configuration is a fault against a driver that has not started.
+///
+/// # Safety
+///
+/// As [`enable`].
+pub unsafe fn enable_memory(address: Address) {
+    // SAFETY: the caller's obligation.
+    unsafe {
+        let existing = read16(address, 0x04);
+        write16(
+            address,
+            0x04,
+            (existing | command::MEMORY_SPACE | command::INTERRUPT_DISABLE) & !command::BUS_MASTER,
+        );
+    }
+}
+
+/// Stops a device from doing DMA, without touching anything else.
+///
+/// Clearing bus mastering is the one operation that reaches every device the
+/// same way, needs no BAR mapped and no driver: a device that is not a bus
+/// master cannot issue a memory transaction, whatever its rings still say.
+///
+/// RFC 0012 needs it before translation is enabled. Firmware enumerates a disk
+/// to decide whether to boot from it, and leaves it configured with physical
+/// addresses from a time when nothing was translating. The instant translation
+/// comes on, that configuration becomes a fault -- reported against a driver
+/// that has not been written yet, on an address that means nothing to it.
+///
+/// # Safety
+///
+/// The caller must own this device, or be about to: any driver already using
+/// it will find its transfers stop.
+pub unsafe fn quiesce(address: Address) {
+    // SAFETY: the caller's obligation.
+    unsafe {
+        let existing = read16(address, 0x04);
+        write16(address, 0x04, existing & !command::BUS_MASTER);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

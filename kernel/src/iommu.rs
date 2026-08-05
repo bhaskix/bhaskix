@@ -707,6 +707,168 @@ pub unsafe fn faulted(report: &Report, hhdm: u64) -> Option<bool> {
     }
 }
 
+/// Maps `pages` physical pages into a window and returns where the device
+/// should look for them.
+///
+/// This is RFC 0012's `MAP`. The address is allocated from the window rather
+/// than chosen by the caller, which is what makes a `DevAddr` meaningful:
+/// nothing outside what this returned is reachable, so a device that computes
+/// an address rather than being given one gets a fault.
+///
+/// `below_4gib` for a device whose descriptors hold 32-bit addresses. The
+/// constraint is satisfied by *where* the address comes from — no bounce
+/// buffer, no copy, no second lifetime.
+pub fn map(
+    window: &mut Window,
+    physical: u64,
+    pages: u64,
+    rights: vtd::Rights,
+    below_4gib: bool,
+    hhdm: u64,
+) -> Option<DevAddr> {
+    let address = window.addresses.allocate(pages, below_4gib)?;
+    for page in 0..pages {
+        let offset = page.checked_mul(vtd::PAGE_SIZE)?;
+        if !map_page(
+            window,
+            address.as_u64().checked_add(offset)?,
+            physical.checked_add(offset)?,
+            rights,
+            hhdm,
+        ) {
+            // Half a mapping is worse than none: the device would reach part
+            // of a buffer and fault on the rest, which reads as a device bug.
+            // The address is given back and nothing is programmed.
+            window.addresses.free(address, pages);
+            return None;
+        }
+    }
+    Some(address)
+}
+
+/// Removes a mapping and invalidates before returning.
+///
+/// The invalidation is the reason this cannot be a table write and a return.
+/// Until the IOTLB is invalidated the device may still be translating through
+/// the entry that was just removed, so an `UNMAP` that returned early would
+/// tell its caller a page is unreachable while the hardware still reaches it —
+/// which is exactly the window RFC 0012 calls out as the difference between
+/// strict and deferred invalidation. Strict, here, and the cost is measured
+/// rather than assumed away.
+pub fn unmap(
+    window: &mut Window,
+    report: &Report,
+    address: DevAddr,
+    pages: u64,
+    hhdm: u64,
+) -> bool {
+    for page in 0..pages {
+        let Some(offset) = page.checked_mul(vtd::PAGE_SIZE) else {
+            return false;
+        };
+        let Some(at) = address.as_u64().checked_add(offset) else {
+            return false;
+        };
+        if !clear_page(window, at, hhdm) {
+            return false;
+        }
+    }
+    window.addresses.free(address, pages);
+
+    // SAFETY: the unit this window was programmed into, already mapped by
+    // `enable`.
+    unsafe { invalidate(report, hhdm) }
+}
+
+/// Clears one page's entry, leaving the levels above it in place.
+///
+/// The intermediate tables are kept deliberately. Freeing one means proving no
+/// other mapping needs it, which is a refcount per level on a path that must
+/// not fail — and the cost of keeping it is one page per 2 MiB of address
+/// space that was used once.
+fn clear_page(window: &Window, address: u64, hhdm: u64) -> bool {
+    if address > window.addresses.limit() {
+        return false;
+    }
+    let mut table = window.page_table;
+    for level in (2..=window.width.levels()).rev() {
+        let index = vtd::level_index(address, level);
+        // SAFETY: a table this module allocated, at a nine-bit index.
+        let entry = unsafe { core::ptr::read_volatile(((hhdm + table) as *const u64).add(index)) };
+        match vtd::PageEntry::from_bits(entry) {
+            Some(existing) => table = existing.address,
+            // Nothing below this level, so nothing to clear.
+            None => return true,
+        }
+    }
+    let index = vtd::level_index(address, 1);
+    // SAFETY: as above. Zero is absent, which is what makes the page
+    // unreachable rather than reachable-with-no-rights.
+    unsafe {
+        core::ptr::write_volatile(((hhdm + table) as *mut u64).add(index), 0);
+    }
+    true
+}
+
+/// Invalidates the unit's IOTLB.
+///
+/// # Safety
+///
+/// The unit must be the one this window is programmed into.
+unsafe fn invalidate(report: &Report, hhdm: u64) -> bool {
+    let Some(base) = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)
+    else {
+        return false;
+    };
+    // SAFETY: the caller's obligation.
+    unsafe {
+        let unit = vtd::Unit::new(base as *mut u8);
+        unit.invalidate_iotlb()
+    }
+}
+
+/// What a unit recorded about a refused access.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Fault {
+    /// The requester id that attempted it, as `(bus, device, function)`.
+    pub device: (u8, u8, u8),
+    /// The address it asked for.
+    pub address: u64,
+    /// Whether it was a read. Writes are the other case.
+    pub read: bool,
+    /// The unit's reason code.
+    pub reason: u8,
+}
+
+/// Reads the first recorded fault, if there is one, and clears it.
+///
+/// A count alone cannot answer the question a fault raises. "Something
+/// faulted" is a number; "device 00:03.0 asked to read 0x4000 and was refused"
+/// names the driver to go and look at, which is what makes this the feature
+/// RFC 0012 says it is rather than an error path.
+///
+/// # Safety
+///
+/// As [`enable`], and the unit must already have been programmed by it.
+pub unsafe fn take_fault(report: &Report, hhdm: u64) -> Option<Fault> {
+    let base = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)?;
+    // SAFETY: the caller's obligation.
+    unsafe {
+        let unit = vtd::Unit::new(base as *mut u8);
+        let (address, requester, read, reason) = unit.take_fault()?;
+        Some(Fault {
+            device: (
+                (requester >> 8) as u8,
+                ((requester >> 3) & 0x1f) as u8,
+                (requester & 0x07) as u8,
+            ),
+            address,
+            read,
+            reason,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -558,6 +558,50 @@ impl Unit {
         }
     }
 
+    /// Reads and clears the first recorded fault.
+    ///
+    /// Returns `(address, requester id, was a read, reason)`. The records live
+    /// at an offset the unit reports in its capability register — not a fixed
+    /// one — and a fault is cleared by writing its `F` bit back, which is the
+    /// only way the next fault can be recorded once the log is full.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`].
+    pub unsafe fn take_fault(&self) -> Option<(u64, u16, bool, u8)> {
+        /// Fault recorded, in the high word.
+        const FAULT: u64 = 1 << 63;
+        /// The access was a read.
+        const READ: u64 = 1 << 62;
+        /// Primary pending fault, and fault overflow, in `FSTS`.
+        const PPF: u32 = 1 << 1;
+        const PFO: u32 = 1 << 0;
+
+        // SAFETY: the caller's obligation.
+        unsafe {
+            if self.read32(reg::FSTS) & (PPF | PFO) == 0 {
+                return None;
+            }
+            // Where the records are, in sixteen-byte units, from `CAP`.
+            let offset = (((self.capabilities() >> 24) & 0x3ff) as usize) * 16;
+            let low = self.read64(offset);
+            let high = self.read64(offset + 8);
+            if high & FAULT == 0 {
+                return None;
+            }
+            let requester = (high & 0xffff) as u16;
+            let reason = ((high >> 32) & 0xff) as u8;
+            let read = high & READ != 0;
+
+            // Clearing is a write-one-to-clear of the fault bit, and then of
+            // the status register's summary. Leaving either set means the unit
+            // records nothing further and the next fault is invisible.
+            self.write64(offset + 8, FAULT);
+            self.write32(reg::FSTS, PPF | PFO);
+            Some((low, requester, read, reason))
+        }
+    }
+
     /// The fault status register.
     ///
     /// Bit 1 is "a fault is recorded". RFC 0012's position is that a fault is

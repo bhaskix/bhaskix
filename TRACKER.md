@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–3) · CI green · 38 boot gates, 112 checks |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–4) · CI green · 38 boot gates, 112 checks |
 
 ### Division of responsibility between documents
 
@@ -134,6 +134,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-10 | RFC 0012 step 1: the IOMMU is found, and the warning stops being a constant | ✅ `DONE` | `DMAR` parsed as untrusted firmware input, with a **seeded mutation harness** — the fuzz target the RFC adds, and the one whose failure mode is worst, because what is built from a believed table is a register window written to as if it were an IOMMU. A structure length of zero is refused rather than looped on; a register base that is zero or unaligned is dropped, not recorded. No translation is enabled: every device still reaches all of memory, and the line says so. **Negative-tested**: a parser that records no unit fails the new gate. `boot-test.sh iommu` runs QEMU with `-device intel-iommu,intremap=on`, without which the discovery path is unreachable. |
 | M6-11 | RFC 0012 step 2: the translation structures, built and not enabled | ✅ `DONE` | `arch::vtd` is the VT-d encodings as arithmetic — root, context and second-level entries, address widths, index maths — pure, and proved against the specification's own numbers by 10 host tests on a machine with no IOMMU. `DevAddr` is a type the compiler keeps apart from `PhysAddr`, with an allocator tested for exhaustion, reuse after unmap and the below-4-GiB constraint a 32-bit device needs. On real hardware the window is built for the block device and **left empty**: default deny, nothing programmed. **Negative-tested**: a corrupted context index fails the gate — after the first version of that check failed to catch it, see below. |
 | M6-12 | RFC 0012 step 3: translation enabled, and a device that can no longer reach the kernel | ✅ `DONE` | Identity-map what must keep working, map the firmware-reserved regions after checking each against the kernel's own image, then enable — the order is the RFC's and is not a preference, because translation has no partial state. `virtio-blk` keeps working with **zero faults**, and the boot line says whether the device is *subject to* translation as well as whether translation is on. **Negative-tested**: unmap the driver's five frames and the disk disappears, failing four gates. The `RMRR`-overlaps-the-kernel refusal has four host tests, because QEMU declares no reserved regions and the path is otherwise unreachable. |
+| M6-13 | RFC 0012 step 4: `MAP`/`UNMAP`, `DevAddr`, and a refusal that names the device | ✅ `DONE` | The unit comes up **before** the device: a window names the device it translates for, and translation must be on before `DRIVER_OK` lets a device read a ring. The driver's frames are mapped as they are allocated and it is handed `DevAddr`s — its memory sits at `0xf8aa000+` and the device is told `0x100000000+`. `UNMAP` invalidates before returning, because until it does the hardware still reaches a page the caller has been told is gone. Fault records are read, so a refusal names the device, the address and the direction. **Negative test**: hand the device an address nobody mapped — `00:03.0 was refused 0x7ffffff000 (write), reason 0x05`. |
 
 ### Honest notes on M6 so far
 
@@ -516,6 +517,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0012 step 4 — three things that were wrong, and none of them found by reading)
+
+- **The device is handed `DevAddr`s now, and the numbers differ.** Driver frames at `0xf8aa000+`,
+  device told `0x100000000+`. That difference is the proof translation is doing something: the
+  addresses in every descriptor and queue register are ones only the unit can resolve.
+- **The order had to change, not just the addresses.** A window names the device it translates for,
+  so the requester id is needed before the window exists — hence a probe that finds the device
+  without touching it. And translation has to be on before `DRIVER_OK`, because from that moment the
+  device may read a ring, and a ring it cannot translate is a request that faults instead of
+  completing.
+- **A fault that was not ours.** `read 0xffdc000` — firmware memory. OVMF enumerates the disk to
+  decide whether to boot from it and leaves it bus-mastering, so it DMAs with a stale ring the
+  instant a unit starts translating. RFC 0012 predicts exactly this. Clearing bus mastering was not
+  enough: `init` re-enabled it *before* resetting the device. `pci::enable_memory` and `pci::enable`
+  are now separate — the BARs readable, then the reset, then the device may touch memory.
+- **The negative test asserted the wrong thing and reported a protected machine as unprotected.**
+  It required the read to fail, and printed *"the device READ AN ADDRESS IT WAS NOT GIVEN"* on a
+  machine where the hardware had refused perfectly. virtio posts a completion for a request whose
+  data write was refused — the ring entry is finished either way — so requiring an error tested the
+  driver's plumbing rather than the protection. The assertion is the **fault record** now: device,
+  address, direction. **The third time this session an assertion looked right and tested nothing,
+  and the second where it would have condemned working code.**
+- **`UNMAP` invalidates before returning**, which is why it cannot be a table write and a return:
+  until the IOTLB is invalidated the device still translates through the entry just removed, so an
+  early return tells the caller a page is unreachable while the hardware reaches it.
 
 ### 2026-08-05 (RFC 0012 step 3 — the gate that passed with the protection switched off)
 

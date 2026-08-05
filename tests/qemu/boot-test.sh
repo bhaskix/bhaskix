@@ -450,31 +450,42 @@ if [[ "$MODE" == "iommu" ]]; then
     # The read-back is what checks the *indices*: an entry written at the wrong
     # offset holds entirely correct values, and is a device translating through
     # some other device's tables.
-    if grep -qE "iommu window +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9]+-bit, [0-9]+ levels, built" "$LOG"; then
+    if grep -qE "iommu window +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9]+-bit, [0-9]+ levels" "$LOG"; then
         pass "the device's translation structures are built and verified"
     else
         fail "the IOMMU window was not built, or did not read back as written"
         status=1
     fi
 
-    # RFC 0012 step 3, and the assertion the RFC names: translation is on and
-    # `virtio-blk` still works, with the fault counter at zero.
-    #
-    # All three parts matter and none of them alone would do. Enabled with a
-    # broken mapping is a machine that lost its disk; a working disk with
-    # translation off is the machine from before this step; and a fault means
-    # the device reached for something nobody granted it, which is the event
-    # this entire RFC exists to make visible.
-    if grep -qE "iommu enable +translating; [0-9]+ driver frames and [0-9]+ reserved pages mapped, [0-9]+ refused, a read still works, no faults, device subject to it" "$LOG"; then
-        pass "translation is enabled, the device still reads, and nothing faulted"
+    # RFC 0012 step 4. The device is handed a `DevAddr` and translation is on
+    # before it is programmed, so this asserts the machine finished bring-up
+    # with the disk working -- which it cannot do unless every ring and buffer
+    # the device was given translates.
+    if grep -qE "virtio-blk +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9]+ sectors" "$LOG"; then
+        pass "the block device works while every address it holds is translated"
     else
-        fail "translation was not enabled, or the device stopped working once it was"
+        fail "the block device did not come up once its addresses were translated"
+        status=1
+    fi
+
+    # The negative test the RFC names, and the only convincing evidence the
+    # protection is real: hand the device an address nobody mapped and watch
+    # the unit refuse it *and say whose it was*.
+    #
+    # The assertion is the refusal, deliberately not the request failing. A
+    # virtio device completes a request whose data write was refused, so
+    # requiring an error tests the driver's plumbing rather than the hardware
+    # -- an earlier version did exactly that and reported a protected machine
+    # as unprotected.
+    if grep -qE "iommu refusal +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] was refused 0x[0-9a-f]+ \((read|write)\), reason" "$LOG"; then
+        pass "an address outside the window is refused, and the device is named"
+    else
+        fail "a device reached an address it was never given, or the refusal was not reported"
         status=1
     fi
 
     # And the machine says the *true* thing about what a device can reach --
-    # after enabling, not before. The line used to be printed early and said
-    # "no translation yet" on a machine that was about to have some.
+    # after enabling, not before.
     if grep -qF "translating: this device reaches only what it was given" "$LOG"; then
         pass "the DMA threat model reported is the one that ended up true"
     else
