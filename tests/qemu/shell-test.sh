@@ -76,9 +76,11 @@ fi
 # all would pass a test that only looked for command output it recognised.
 if [[ "$MODE" == "kernel" ]]; then
     started="a shell. 'help' lists"
+    prompt="bhaskix> "
     commands=$'help\r'$'ls /\r'$'cat etc/hostname\r'$'elf bin/probe\r'$'disk\r'$'nosuchcommand\r'
 else
     started="a user-mode shell. 'help' lists"
+    prompt="bhaskix$ "
     # `caps` is the one that matters: it asks the kernel about a slot this
     # program was not given, and the refusal comes from the kernel rather than
     # from a service saying no.
@@ -123,7 +125,14 @@ await() {
 
 # Bytes typed before the shell exists are not lost -- they queue in the UART --
 # but a test that raced would fail differently on a loaded machine.
-if await "$started"; then
+# The banner, then the prompt, and the prompt is the one that matters.
+#
+# The banner is printed *before* the shell reaches its read; the prompt is
+# printed from inside the loop that reads. Typing on the banner races the gap
+# between them, and the first line is the one that loses -- which failed as
+# "'bhaskix$ help' never appeared" on a loaded host, with every later command
+# echoing correctly because by then the shell was reading.
+if await "$started" && await "$prompt"; then
     while IFS= read -r -d $'\r' line; do
         printf '%s\r' "$line" >&3
         # One line at a time, with a pause, so each arrives as its own

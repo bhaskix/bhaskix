@@ -215,12 +215,45 @@ pub fn signal(id: NotificationId, badge: u64) -> Result<(), NotifyError> {
     SIGNALS.fetch_add(1, Ordering::Relaxed);
 
     let waiter = slot.waiter.load(Ordering::Acquire);
+    {
+        let at = SIGNAL_AT.fetch_add(1, Ordering::Relaxed) as usize;
+        SIGNAL_TRACE[at % SIGNAL_TRACE_LEN].store(
+            u64::from(id.index()) << 32 | u64::from(waiter),
+            Ordering::Relaxed,
+        );
+    }
     if waiter == 0 {
         UNWAITED.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
     crate::sched::wake_from_interrupt(waiter);
     Ok(())
+}
+
+/// The last few signals, as `(notification, waiter at the time)`.
+///
+/// `UNWAITED` says how often a signal found nobody waiting; it cannot say
+/// *which* notification, and with a console and a block device both signalling
+/// that is the whole question. A waiter of zero here is a signal that arrived
+/// before anyone asked for it — benign if the bits are collected afterwards,
+/// and the reason a wait hangs if they are not.
+static SIGNAL_TRACE: [AtomicU64; SIGNAL_TRACE_LEN] =
+    [const { AtomicU64::new(u64::MAX) }; SIGNAL_TRACE_LEN];
+static SIGNAL_AT: AtomicU64 = AtomicU64::new(0);
+
+const SIGNAL_TRACE_LEN: usize = 12;
+
+/// Replays the signal ring, oldest first, as `(notification, waiter)`.
+pub fn replay_signals(mut visit: impl FnMut(u32, u32)) {
+    let at = SIGNAL_AT.load(Ordering::Relaxed) as usize;
+    let first = at.saturating_sub(SIGNAL_TRACE_LEN);
+    for index in first..at {
+        let packed = SIGNAL_TRACE[index % SIGNAL_TRACE_LEN].load(Ordering::Relaxed);
+        if packed == u64::MAX {
+            continue;
+        }
+        visit((packed >> 32) as u32, packed as u32);
+    }
 }
 
 /// Takes the pending word without blocking. Zero means nothing is pending.

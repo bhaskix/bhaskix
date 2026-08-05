@@ -195,6 +195,15 @@ static TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// A single number could not tell those apart.
 static WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Blocks that ended with an empty notification word.
+///
+/// `wait_once` returns what was pending when it woke. Zero means something
+/// other than the device's signal ended the wait -- which, since the only
+/// other thing armed is the deadline, means the completion interrupt did not
+/// arrive. Counted because "the driver waited and the device answered" and
+/// "the driver waited and the clock answered" are the same duration and
+/// entirely different facts.
+static UNSIGNALLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Reads a `u32` from a mapped register.
 ///
@@ -516,6 +525,12 @@ pub fn waiting() -> (u64, u64) {
     (WAITS.load(Ordering::Relaxed), SPINS.load(Ordering::Relaxed))
 }
 
+/// Blocks that woke with nothing signalled -- the clock, not the device.
+#[must_use]
+pub fn unsignalled() -> u64 {
+    UNSIGNALLED.load(Ordering::Relaxed)
+}
+
 /// Whether the device delivers interrupts rather than being polled.
 #[must_use]
 pub fn interrupt_driven() -> bool {
@@ -824,8 +839,12 @@ fn await_completion(
                     WAITS.fetch_add(1, Ordering::Relaxed);
                     let woken = crate::notify::wait_once(id);
                     crate::time::cancel_wake();
-                    if woken.is_err() {
-                        return Err(BlockError::TimedOut);
+                    match woken {
+                        Ok(0) => {
+                            UNSIGNALLED.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(_) => {}
+                        Err(_) => return Err(BlockError::TimedOut),
                     }
                 } else {
                     // No timer left to wake us, so blocking here would be

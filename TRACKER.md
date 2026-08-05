@@ -514,6 +514,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-05 (why signals found no waiter — they always do)
+
+- **The anomaly was not one.** `notify::SIGNALS == notify::UNWAITED` in the hung machine was written
+  down as open. Instrumenting the signal side — a ring recording *which* notification each signal hit
+  and what its waiter slot held — shows `n0->nobody n1->nobody` on **six boots out of six, healthy
+  ones included**. `n0` is the console, `n1` the block driver.
+- **Why it is normal.** The single waiter slot is claimed *inside* `wait_once`, which the driver
+  reaches only after submitting the request and polling `completed()` once. The device finishes
+  inside that window, so the interrupt arrives before anyone has registered. `signal` ORs its badge
+  into `pending`, finds an empty waiter, and returns; the driver then takes the bits without ever
+  sleeping. That is RFC 0010's ordering working — bits published before the waiter is looked for,
+  so a waiter that has not arrived yet loses nothing. `1 waits, 0 woken by the clock` says the same
+  thing from the driver's side: the wait returns immediately with a word already there.
+- **A global counter could not answer a per-object question.** `UNWAITED` says how often, never
+  which, and with two notifications signalling that was the entire question. The counter was not
+  wrong; it was the wrong shape, and the fix was two more counters and a twelve-entry ring rather
+  than more reasoning.
+- **The lesson is about the note, not the kernel.** An "open, unexplained" line in this file is an
+  instruction to the next session to go looking. Leaving one on a normal condition spends someone's
+  time on a search with nothing at the end of it. **A recorded anomaly should be a measurement, not
+  an impression.**
+
+- **And a harness fault found while verifying it.** `shell-test.sh` typed at the machine as soon as
+  the *banner* appeared. The banner is printed before the shell reaches its read; the prompt is
+  printed from inside the loop that reads. Typing on the banner races that gap and the **first** line
+  is the one that loses -- which is exactly how it failed, `'bhaskix$ help' never appeared` with every
+  later command echoing correctly. It waits for the prompt now: 10 of 10 since, against a failure
+  in a loaded suite run before.
+
 ### 2026-08-05 (M6 status — where the milestone actually stands)
 
 **Every M6 task is built. One exit criterion is still not met, and it is the same one as before —
@@ -547,9 +576,13 @@ thing under test is broken" from "the test could not run" will eventually be bel
 wrong one** — and `fault-test` spent weeks passing at about one run in eight without anyone noticing
 that a green suite was luck.
 
-**Open, and written down rather than closed:** in the hung machine `notify::SIGNALS` equalled
-`notify::UNWAITED` — every signal found no waiter. The armed deadline makes that harmless; it does
-not explain it.
+**Closed, and it was never a fault.** The hung machine's `notify::SIGNALS` equalling
+`notify::UNWAITED` was read as an anomaly. It is the steady state of *every* boot: a notification's
+one waiter slot is claimed inside `wait_once`, which the driver reaches only after submitting and
+polling `completed()` once, and under an emulator the device finishes inside that window. The signal
+publishes its bits and finds nobody — which is what RFC 0010 designs for, since the bits are
+collected afterwards. Recording it as unexplained was a misreading of a normal condition, and it
+would have sent the next investigation somewhere there was nothing to find.
 
 ### 2026-08-05 (RFC 0011 step 5 — a handler does not outlive its owner)
 

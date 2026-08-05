@@ -412,6 +412,24 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if input_ready && !irq_teardown_self_test(handoff) {
         println!("    irq teardown   FAILED");
     }
+    if input_ready {
+        // Which notification each signal hit, and what its waiter slot held.
+        // `UNWAITED` counts signals that found nobody; with a console and a
+        // block device both signalling it cannot say which, and that is the
+        // question.
+        let (signals, unwaited, stranded) = notify::statistics();
+        print!(
+            "    notifications  {signals} signalled, {unwaited} found no waiter, {stranded} stranded;"
+        );
+        notify::replay_signals(|notification, waiter| {
+            if waiter == 0 {
+                print!(" n{notification}->nobody");
+            } else {
+                print!(" n{notification}->t{waiter}");
+            }
+        });
+        println!();
+    }
 
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
         faultinject::trigger(fault);
@@ -2079,9 +2097,10 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
     if ok {
         println!(
             "    virtio-blk irq msi-x vector {vector:#04x}; {waits} waits, {} spins, \
-             {} interrupts per request",
+             {} interrupts per request, {} woken by the clock rather than the device",
             spins - spins_before,
-            delivered - delivered_before
+            delivered - delivered_before,
+            virtio::unsignalled()
         );
     }
     ok
