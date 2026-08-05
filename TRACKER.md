@@ -7,8 +7,8 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 |---|---|
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
-| **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · CI green · 163 suite checks · 40 boot gates, 47 with an IOMMU · 271 host assertions |
+| **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 (RFC 0013 step 1) · CI green · 166 suite checks · 41 boot gates, 48 with an IOMMU · 274 host assertions |
 
 ### Division of responsibility between documents
 
@@ -141,6 +141,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-16 | RFC 0012 step 7: a `DmaWindow` a domain holds | ✅ `DONE` | `ObjectKind::DmaWindow` with `MAP`/`UNMAP`/`INFO`, resolved under the capability arena and performed after it is released — mapping allocates, and allocating takes the heap. **Both** capabilities are checked and the device gets the weaker of their rights, so a read-only share cannot become writable by being handed to a device. **The assertion is the refusal**: a domain holding the memory and *not* the window is denied. Four real bugs fell out — see the changelog. |
 | M6-17 | RFC 0011 step 6: an `IrqHandler` a domain holds | ✅ `DONE` | `BIND`, `ACK`, `RELEASE` — and **never** the MSI-X table, because an MSI is a memory write of an arbitrary vector to an arbitrary CPU and a holder that could program one would hold interrupt injection. Three refusals carry the meaning: a legacy line may not be delegated (it is shared, and a holder that never acknowledges masks a line others need), a `Notification` capability is not authority over an interrupt, and **the RFC's own precondition is enforced in code** — `irq::name` refuses when nothing is translating, because a domain driving a device needs that device's DMA constrained first. **Negative-tested**: removing the object-kind check turns the gate red. |
 | M6-18 | RFC 0009 step 6: the filesystem service's bulk path | ✅ `DONE` | `fs::READ_INTO` fills a shared region in **one** round trip where the message path needs fifteen for the same file — the RFC's own comparison, measured on the data path alone, because opening a file costs the same either way and folding that in would flatter it. The caller names a **slot in its own CSpace**, never an object identity: an identity is a caller asserting what it may reach. The register path stays for short transfers. **Negative-tested** at the third attempt — see the changelog for why the first two proved nothing. |
+| M7-01 | RFC 0013 step 1: the `Service` trait, and the nucleus placement | ✅ `DONE` | `Service`, `Context`, `Request`, `Reply`, and **one** `run::<S>()` loop both services share instead of hand-rolling their own. The success criterion was **no behaviour change** and the boot output is identical — 19 requests, 1 caller refused, 5 entries, 8 bytes, bulk path unchanged. Dispatch is by message in the nucleus too, per the acceptance decision, so the placements differ in *placement* and not in *shape*. Three host tests run the services' logic with no machine under them. The machine now prints `console=nucleus vfs=nucleus`, gated — and that line is **expected to change at step 3**. |
 
 ### Honest notes on M6 so far
 
@@ -628,6 +629,28 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 step 1 — a refactor whose success is that nothing happened)
+
+- **The boot output is identical.** That was the criterion, and it is the only one worth having for
+  a step that moves two working services behind a trait: 19 requests, 1 caller refused, 5 entries,
+  8 bytes, and the bulk path unchanged.
+- **Three decisions are encoded rather than refactored.** `Reply` is a value and not a message,
+  because the method and badge belong to the placement — a service that could set them could claim
+  to be answering a different question, or claim an identity. `Context` carries the direct map base
+  *explicitly*, which makes it the field to watch: it is the one a domain placement will not have,
+  so a service reaching for it outside a bulk path has stopped being relocatable and is now visible
+  doing so. And `Session` became public, because a service's state is part of its interface — the
+  placement holds it, which is exactly why state hangs off the trait and a static would not move.
+- **Dispatch is by message in the nucleus too.** Slower than a direct call, and the reason the two
+  placements differ in placement rather than in shape. Acceptance decided this; the cost is on the
+  record from M6-05 and M6-18.
+- **The services' logic is now testable with no machine underneath**, which is most of the point of
+  a trait: an unknown method returns a refusal rather than unwinding, and a caller with no badge is
+  refused, both on the host.
+- **The placement line is printed and gated, and is expected to change.** A line that can never
+  change is a line worth distrusting — this milestone has now learned that nine times, so the gate
+  went in with the line rather than after it.
 
 ### 2026-08-05 (RFC 0013 accepted — and a design document that described its own safeguards as existing)
 

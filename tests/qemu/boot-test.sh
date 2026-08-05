@@ -560,6 +560,19 @@ else
     status=1
 fi
 
+# RFC 0013 step 1: the services run behind a trait, and the machine names them
+# with their placement. The placement is the claim `architecture.md` §2 makes,
+# so it is printed rather than assumed -- and this line is expected to change
+# at step 3, when one of these stops saying `nucleus`. A line that can never
+# change is a line worth distrusting, which this milestone has now learned
+# nine times.
+if grep -qE "placement +console=[a-z]+ vfs=[a-z]+, dispatched by message" "$LOG"; then
+    pass "the services name themselves and where they run"
+else
+    fail "no service placement was reported"
+    status=1
+fi
+
 # RFC 0009 step 6: the filesystem service's bulk path, and the measurement the
 # RFC asks for rather than a claim that it is faster. The register path stays
 # for short transfers -- it is right for reading a filename and wrong for

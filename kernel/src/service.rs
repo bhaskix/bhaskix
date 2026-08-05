@@ -114,7 +114,187 @@ pub fn start(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     // endpoint, so it may run wherever there is room.
     sched::spawn("fs", filesystem_service, 0, hhdm_base)
         .map_err(|_| "the filesystem service would not spawn")?;
+
+    // Named with their placement, because the placement is the claim. RFC
+    // 0013 step 2 replaces this constant with a table the build supplies, and
+    // step 3 is the first time one of these says something other than
+    // `nucleus` -- so a line that never changes would be a line worth
+    // distrusting.
+    crate::println!(
+        "    placement      {}={PLACEMENT} {}={PLACEMENT}, dispatched by message",
+        Console::NAME,
+        Filesystem::NAME
+    );
     Ok(())
+}
+
+/// Where the services in this build run.
+///
+/// A constant until RFC 0013 step 2 makes it a table the build supplies. It is
+/// printed at boot rather than assumed, because "both placements work" is a
+/// claim that has to be visible somewhere before it can be checked.
+pub const PLACEMENT: &str = "nucleus";
+
+/// Everything a service may reach.
+///
+/// A value, deliberately, rather than an ambient: whatever is not in here, the
+/// service does not have. In the nucleus placement the kernel builds it; in a
+/// domain placement it is built from the domain's CSpace, and the two must
+/// carry the same names for the same things or the code above them cannot be
+/// the same code.
+///
+/// [RFC 0013](../../../docs/rfc/0013-service-framework.md).
+#[derive(Clone, Copy)]
+pub struct Context {
+    /// The endpoint this service answers on.
+    pub endpoint: ipc::EndpointId,
+    /// The direct map base, for a nucleus placement's bulk paths.
+    ///
+    /// The one field a domain placement will not have, and therefore the one
+    /// to watch: a service that reaches for it outside a bulk path is a
+    /// service that has stopped being relocatable.
+    pub hhdm: u64,
+}
+
+/// One request, as it arrived.
+pub struct Request<'a> {
+    /// Which operation.
+    pub method: u64,
+    /// Four registers. Anything larger travels as a `Memory` capability.
+    pub args: &'a [u64; 4],
+    /// Who is calling, from the capability they used — never from anything
+    /// they said.
+    pub badge: u64,
+    /// The calling thread, for resolving a capability the caller names in its
+    /// own CSpace.
+    pub caller: u32,
+}
+
+/// One reply.
+///
+/// A value rather than a message: the method and the badge belong to the
+/// placement, not to the service, and a service that could set them could
+/// claim to be answering a different question.
+pub struct Reply {
+    /// Four registers back.
+    pub args: [u64; 4],
+}
+
+impl Reply {
+    /// The ordinary case.
+    #[must_use]
+    pub const fn new(args: [u64; 4]) -> Self {
+        Self { args }
+    }
+}
+
+/// Why a service would not start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StartError {
+    /// The context did not carry something the service needs.
+    MissingCapability,
+}
+
+/// A service: state, a message handler, and nothing else.
+///
+/// The four rules `architecture.md` §2 states are shaped into this trait
+/// rather than asked for in prose:
+///
+/// - **No global mutable state**, because the state is [`Service::State`] and
+///   arrives by reference.
+/// - **No direct hardware access**, because a domain placement has no mapping
+///   for it and faults; the nucleus placement is where that rots, and the lint
+///   RFC 0013 step 2 adds is what will catch it there.
+/// - **No blocking**, because [`Service::handle`] returns a [`Reply`] and
+///   there is nowhere to wait. A service that must wait answers, and is
+///   re-entered when the thing it waited for happens.
+/// - **No panics on input**, because a malformed request is a `Reply` and not
+///   an unwind.
+///
+/// A service is constrained by the **intersection** of both placements, not
+/// the union, and the constraint that binds is nearly always the nucleus one:
+/// it is the placement with the fewest walls.
+pub trait Service {
+    /// Everything the service knows.
+    type State;
+
+    /// What it is called, in the placement table and in the boot log.
+    const NAME: &'static str;
+
+    /// Built once, from what the placement handed over.
+    ///
+    /// # Errors
+    ///
+    /// [`StartError`] if the context is missing something required.
+    fn start(context: Context) -> Result<Self::State, StartError>;
+
+    /// One request in, one reply out.
+    fn handle(state: &mut Self::State, request: Request<'_>) -> Reply;
+}
+
+/// Runs a service in the nucleus placement, for ever.
+///
+/// Dispatch is through IPC and not by direct call, which RFC 0013 decided on
+/// acceptance: a direct call is faster and is also the door through which "no
+/// direct calls" erodes, and a design that starts with the fast path never
+/// gets the slow one back. So the two placements differ in *placement* and not
+/// in *shape*, which is the whole claim being made.
+fn run<S: Service>(context: Context) -> ! {
+    let Ok(mut state) = S::start(context) else {
+        sched::exit()
+    };
+
+    loop {
+        let Ok((message, caller)) = ipc::recv(context.endpoint) else {
+            sched::exit()
+        };
+        REQUESTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+        let reply = S::handle(
+            &mut state,
+            Request {
+                method: message.method,
+                args: &message.args,
+                badge: message.badge,
+                caller,
+            },
+        );
+
+        // The method comes back so a caller can tell replies apart; the badge
+        // does not, because a reply's badge would be the service claiming an
+        // identity rather than reporting one.
+        let _ = ipc::reply(
+            caller,
+            ipc::Message {
+                method: message.method,
+                args: reply.args,
+                badge: 0,
+            },
+        );
+    }
+}
+
+/// The console: bytes out, bytes in, and no state of its own.
+pub struct Console;
+
+impl Service for Console {
+    /// Nothing. The console's state is the hardware's, and the hardware is
+    /// reached through `print!` and `input`, which every placement has to
+    /// provide for itself.
+    type State = ();
+    const NAME: &'static str = "console";
+
+    fn start(_context: Context) -> Result<Self::State, StartError> {
+        Ok(())
+    }
+
+    fn handle((): &mut Self::State, request: Request<'_>) -> Reply {
+        match request.method {
+            console::WRITE => Reply::new(write(request.args)),
+            console::READ => Reply::new(read()),
+            _ => Reply::new([with_outcome(0, outcome::WRONG_KIND), 0, 0, 0]),
+        }
+    }
 }
 
 /// Answers the console endpoint, for ever.
@@ -122,27 +302,14 @@ extern "C" fn console_service(_argument: u64) -> ! {
     let Some(endpoint) = console_endpoint() else {
         sched::exit()
     };
-
-    loop {
-        let Ok((message, caller)) = ipc::recv(endpoint) else {
-            sched::exit()
-        };
-
-        let answer = match message.method {
-            console::WRITE => write(&message.args),
-            console::READ => read(),
-            _ => ipc::Message {
-                method: message.method,
-                args: [with_outcome(0, outcome::WRONG_KIND), 0, 0, 0],
-                badge: message.badge,
-            },
-        };
-        let _ = ipc::reply(caller, answer);
-    }
+    run::<Console>(Context {
+        endpoint,
+        hhdm: crate::shared::hhdm(),
+    })
 }
 
 /// Prints a caller's bytes, and says how many were accepted.
-fn write(args: &[u64; 4]) -> ipc::Message {
+fn write(args: &[u64; 4]) -> [u64; 4] {
     let chunk = Chunk::unpack(args);
 
     // Filtered, exactly as the kernel shell filters what it prints. This is
@@ -160,15 +327,11 @@ fn write(args: &[u64; 4]) -> ipc::Message {
     }
 
     WRITTEN.fetch_add(chunk.len() as u64, core::sync::atomic::Ordering::Relaxed);
-    ipc::Message {
-        method: console::WRITE,
-        args: [chunk.len() as u64, 0, 0, 0],
-        badge: 0,
-    }
+    [chunk.len() as u64, 0, 0, 0]
 }
 
 /// Waits for something to be typed and hands it back.
-fn read() -> ipc::Message {
+fn read() -> [u64; 4] {
     // Block for the first byte, then take whatever else is already waiting.
     // Returning one byte per message would be correct and would cost a round
     // trip per keystroke; taking the rest costs nothing and matters when a
@@ -188,16 +351,15 @@ fn read() -> ipc::Message {
 
     READ.fetch_add(length as u64, core::sync::atomic::Ordering::Relaxed);
     let (chunk, _) = Chunk::take(&bytes[..length]);
-    ipc::Message {
-        method: console::READ,
-        args: chunk.pack(0),
-        badge: 0,
-    }
+    chunk.pack(0)
 }
 
 /// What one caller of the filesystem service is in the middle of.
+///
+/// Public because it is the filesystem's `Service::State`, and a service's
+/// state is part of its interface: the placement holds it.
 #[derive(Clone, Copy)]
-struct Session {
+pub struct Session {
     /// The badge on the capability this caller used, or zero for a free slot.
     badge: u64,
     path: [u8; MAX_PATH],
@@ -246,50 +408,53 @@ impl Session {
     }
 }
 
-/// Answers the filesystem endpoint, for ever.
-extern "C" fn filesystem_service(_argument: u64) -> ! {
-    let Some(endpoint) = filesystem_endpoint() else {
-        sched::exit()
-    };
+/// The filesystem: a session per caller, and a file open in each.
+pub struct Filesystem;
 
-    // On this thread's stack, not in a static: there is one service thread, so
-    // there is no second holder of this state and nothing to lock. A static
-    // would be a claim that something else might touch it.
-    let mut sessions = [Session::empty(); MAX_SESSIONS];
+impl Service for Filesystem {
+    /// One session per caller. Not a static: there is one service, so there is
+    /// no second holder and nothing to lock -- and a static would be a claim
+    /// that something else might touch it. Under the trait it is also the
+    /// thing that makes the domain placement possible, because state that
+    /// hangs off the service moves with it and a static does not.
+    type State = [Session; MAX_SESSIONS];
+    const NAME: &'static str = "vfs";
 
-    loop {
-        let Ok((message, caller)) = ipc::recv(endpoint) else {
-            sched::exit()
-        };
-        REQUESTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    fn start(_context: Context) -> Result<Self::State, StartError> {
+        Ok([Session::empty(); MAX_SESSIONS])
+    }
 
+    fn handle(sessions: &mut Self::State, request: Request<'_>) -> Reply {
         // A caller with no badge cannot be told apart from any other, and a
         // service that gave them all one session would let a second program
         // read the first one's open file. Zero is also the free-slot sentinel
         // below, so accepting it would hand out a slot that everything else
         // still considers free -- the kind of aliasing that shows up as a file
         // handle changing under a caller who did nothing.
-        let answer = if message.badge == 0 {
-            [with_outcome(0, outcome::UNIDENTIFIED), 0, 0, 0]
-        } else {
-            match session_for(&mut sessions, message.badge) {
-                Some(session) => serve(session, caller, message.method, &message.args),
-                None => {
-                    REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    [with_outcome(0, outcome::BUSY), 0, 0, 0]
-                }
+        if request.badge == 0 {
+            return Reply::new([with_outcome(0, outcome::UNIDENTIFIED), 0, 0, 0]);
+        }
+        match session_for(sessions, request.badge) {
+            Some(session) => {
+                Reply::new(serve(session, request.caller, request.method, request.args))
             }
-        };
-
-        let _ = ipc::reply(
-            caller,
-            ipc::Message {
-                method: message.method,
-                args: answer,
-                badge: 0,
-            },
-        );
+            None => {
+                REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                Reply::new([with_outcome(0, outcome::BUSY), 0, 0, 0])
+            }
+        }
     }
+}
+
+/// Answers the filesystem endpoint, for ever.
+extern "C" fn filesystem_service(_argument: u64) -> ! {
+    let Some(endpoint) = filesystem_endpoint() else {
+        sched::exit()
+    };
+    run::<Filesystem>(Context {
+        endpoint,
+        hhdm: crate::shared::hhdm(),
+    })
 }
 
 /// Finds this caller's session, or claims a free one.
@@ -464,5 +629,57 @@ fn reason(error: vfs::VfsError) -> u64 {
         vfs::VfsError::NotFound | vfs::VfsError::NotMounted => outcome::NOT_FOUND,
         vfs::VfsError::BadPath => outcome::BAD_PATH,
         vfs::VfsError::NotAFile => outcome::WRONG_KIND,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bhaskix_abi::outcome_of;
+
+    #[test]
+    fn a_service_answers_a_method_it_does_not_know() {
+        // RFC 0013's fourth rule, and the one a trait can actually enforce: a
+        // malformed request is a *reply*, not an unwind. Runnable on the host
+        // with no machine underneath it, which is most of the point of putting
+        // a service's logic behind a trait.
+        let args = [0u64; 4];
+        let reply = Console::handle(
+            &mut (),
+            Request {
+                method: 0xdead_beef,
+                args: &args,
+                badge: 1,
+                caller: 0,
+            },
+        );
+        assert_eq!(outcome_of(reply.args[0]), outcome::WRONG_KIND);
+    }
+
+    #[test]
+    fn the_filesystem_refuses_a_caller_it_cannot_tell_apart() {
+        // Badge zero is both "no identity" and the free-slot sentinel, so
+        // accepting it would hand out a session everything else still
+        // considers free.
+        let mut sessions = [Session::empty(); MAX_SESSIONS];
+        let args = [0u64; 4];
+        let reply = Filesystem::handle(
+            &mut sessions,
+            Request {
+                method: fs::PATH,
+                args: &args,
+                badge: 0,
+                caller: 0,
+            },
+        );
+        assert_eq!(outcome_of(reply.args[0]), outcome::UNIDENTIFIED);
+    }
+
+    #[test]
+    fn a_service_names_itself_for_the_placement_table() {
+        // Step 2's table is keyed by these, so a rename is a build failure
+        // rather than a service that quietly stops being placed.
+        assert_eq!(Console::NAME, "console");
+        assert_eq!(Filesystem::NAME, "vfs");
     }
 }
