@@ -16,10 +16,17 @@ set -uo pipefail
 MODE="${1:-bios}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ISO="$REPO_ROOT/build/bhaskix.iso"
-LOG="$(mktemp)"
+# Overridable so a caller can keep the serial output. The test prints the log
+# only when something fails, which is right for a gate and unhelpful when the
+# thing you want is a number the machine measured.
+LOG="${BHASKIX_BOOT_LOG:-$(mktemp)}"
 TIMEOUT="${BOOT_TEST_TIMEOUT:-120}"
 
-trap 'rm -f "$LOG"' EXIT
+# Kept when the caller named it: they asked for the log, so deleting it on the
+# way out would be answering a different question.
+if [[ -z ${BHASKIX_BOOT_LOG:-} ]]; then
+    trap 'rm -f "$LOG"' EXIT
+fi
 
 # The greeting is the milestone's contract. If you reword it, update
 # docs/roadmap.md M1 and kernel/src/lib.rs::banner in the same change.
@@ -574,6 +581,31 @@ if grep -q "a reply to a thread this one never heard from was refused" "$LOG"; t
     pass "a service cannot answer a caller it never heard from"
 else
     fail "the forged-reply refusal was not reported"
+    status=1
+fi
+
+# What the placement costs, in numbers (RFC 0013 step 5).
+#
+# The round-trip *count* is asserted here because it is structural: one per
+# operation, in either placement, on any machine. The cycle figures are
+# reported and not asserted -- a threshold would be a test of whatever machine
+# CI runs on, green on a quiet builder and red on a busy one, which is a flaky
+# test wearing a performance budget's clothes. The numbers live in the boot log
+# and in TRACKER.md, where a change is something a person notices.
+if grep -q "1 round trip per operation either way" "$LOG"; then
+    pass "the cost of each placement was measured and reported"
+else
+    fail "no placement cost was measured"
+    status=1
+fi
+
+# The bulk path is still a bulk path. Asserted in the kernel against a factor
+# of two, measured at eight to ten, so it fails when shared memory has stopped
+# paying rather than when the builder is loaded.
+if grep -qE "bulk cost +[0-9]+ bytes: [0-9]+ cycles shared, [0-9]+ by message" "$LOG"; then
+    pass "shared memory still beats the message path, and by how much is on the record"
+else
+    fail "the bulk path's cost was not reported"
     status=1
 fi
 

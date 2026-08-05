@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-05 (RFC 0013 steps 1–4) · CI green · 358 suite checks · 43 boot gates per placement (4 placements), 50 with an IOMMU · 276 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-07 (RFC 0013 steps 1–5) · CI green · 372 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
 
 ### Division of responsibility between documents
 
@@ -146,6 +146,8 @@ fairness within 2% for two equal-weight workloads.
 | M7-03 | RFC 0013 step 3a: the filesystem becomes relocatable, and a hole closes | ✅ `DONE` | The filesystem is **out of the kernel crate** — `ustar`, `vfs` and the service in `services/vfs`, building for `x86_64-unknown-none` with no kernel in the build. One function did it: the bulk path used to read caller pages through the direct map and now asks its context (`Bulk::fill`). **A security hole was found on the way and closed:** `Reply` took the caller from a register, so a server — including a ring 3 one, since `Reply` is a system call — could plant a message in *any* thread's mailbox and wake it holding what looked like the answer it was waiting for. The kernel now remembers who a thread received from and refuses anything else, which also freed the register that lets a server receive a whole four-register message at all. `Request::caller` is **gone from the trait**: a service cannot name a caller, so it cannot name the wrong one. Gated, and the gate was watched failing twice before it was believed — see the note below. |
 | M7-04 | RFC 0013 step 3: the filesystem runs in a domain | ✅ `DONE` | `bin/vfsd` **is** the filesystem service, in ring 3, holding one endpoint capability and a read-only mapping of the image — and every `fs::` method in the system is answered by it. The user-mode shell now reads files through IPC from a service that is itself unprivileged: two ring 3 programs, with the kernel routing messages and owning neither. The service crate is byte for byte the one the kernel compiles for the nucleus; what differs is the context (`Bulk::fill` is `method::FILL`) and the run loop (`serve::<S>` for `run::<S>`). `services.toml` decides which, through `kernel/build.rs`, and `make test-placements` **boots both, every build** — the placement nobody is running is compiled out, so nothing else would notice it rotting. |
 | M7-05 | RFC 0013 step 4: everything in a domain, and the address space that was missing | ✅ `DONE` | Both services run in ring 3. The console holds a `Console` capability — **put a character, take a byte, nothing else** — so a console service talked into misbehaving can still only put characters and take bytes; the same service in the nucleus could do anything. The shell, the console and the filesystem are now three unprivileged programs and the nucleus runs **no service at all** in that build. **What this found:** the kernel kept *one* installed address space for the whole of M5 and M6. With a single user program that is indistinguishable from keeping the right one — two services in domains landed on the same CPU and ran in each other's page table. Threads now carry their page-table root and load it as they resume, and the fault handler asks the hardware which space it is in rather than trusting bookkeeping. All four placement combinations boot and pass, every build. |
+| M7-06 | RFC 0013 step 5: what a placement costs, measured | ✅ `DONE` | The three numbers RFC 0013 asked for, per service and per placement. **A domain costs ~5,000 cycles (~2 µs) a round trip, about +48%**, and it is the same +48% for both services — 10.0k→15.2k for the console, 11.3k→15.8k for the filesystem. **Shared memory still pays: 10.3× in the nucleus, 7.3× in a domain** (the domain's bulk path copies through its own buffer and then makes a system call, so it costs twice the nucleus's — and still beats fifteen round trips by seven times). **Boot time is unchanged**, ~7.6 s either way. Measured as the *minimum* of 200 samples, because the first version timed whole loops and produced a nucleus filesystem four times slower than a domain one. |
+| M7-07 | The unpinned service that cost 6× | ✅ `DONE` | Chasing that reversed result found a real one: the nucleus filesystem thread was **not pinned**, so every call waited for another CPU to notice it — 66k cycles against 11k for the same code pinned, at the minimum rather than in the tail. It was unpinned deliberately, with a reasonable comment: it blocks on nothing but its own endpoint, so it could run wherever there was room. That was true, and it cost six times the latency. Pinned now, with the measurement as the reason. |
 
 ### Honest notes on M6 so far
 
@@ -633,6 +635,51 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 step 5 — the numbers, and the two the first attempt got backwards)
+
+- **A domain costs about 5,000 cycles a round trip, roughly +48%.** The same figure for both
+  services, which is the part that makes it believable: console 10.0k → 15.2k, filesystem 11.3k →
+  15.8k. On this emulated machine that is about 2 µs. It is a real cost and it is not a large one.
+- **Shared memory still pays for itself, and by a lot.** 228 bytes: 10.3× faster than fifteen round
+  trips in the nucleus, 7.3× in a domain. The domain's bulk path costs twice the nucleus's, because
+  it copies into its own buffer and then makes a system call where the nucleus writes through the
+  direct map — and it still beats the message path seven times over. RFC 0009 opened that gap for
+  exactly this.
+- **Boot time is the same either way**, ~7.6 s. The isolation is not paid for at startup.
+- **The first attempt measured the wrong thing twice, and both times it reversed the answer.**
+  Timing whole loops and dividing gave a *nucleus* filesystem four times slower than a domain one,
+  varying 84k → 114k between runs of the same build. One unlucky preemption in two hundred dominates
+  a mean. The minimum is the least-disturbed sample and the only figure that meant the same thing
+  twice; the mean is printed beside it, and the gap between them *is* the scheduling noise.
+- **The second reversal was a cold path timed against a warm one.** The bulk transfer ran first,
+  faulting in its pages and touching every cold line, and came out nine times slower than the
+  message path that followed it. Five passes with the minimum kept turned 0.11× into 10.25×.
+- **Chasing the first reversal found a real six-fold cost.** The nucleus filesystem thread was
+  unpinned — deliberately, with a comment saying it blocks on nothing but its own endpoint so it may
+  run wherever there is room. True, and it turned every call into a wait for another CPU: 66k cycles
+  against 11k pinned. The measurement is the only reason that line changed, and nothing else in the
+  suite would ever have noticed.
+- **What is asserted and what is only reported.** The round-trip *count* is asserted — one per
+  operation, either placement, on any machine. The cycle figures are reported: a threshold would be
+  a test of whichever machine CI runs on, green on a quiet builder and red on a busy one. The one
+  timing that is asserted is that shared memory beats the message path by at least 2×, against a
+  measured 7–10×, so it fails when the bulk path stops being one rather than when the builder is
+  loaded. Watched failing by demanding 100×.
+
+- **Two more things the measurement dislodged, neither of them a measurement.** Timing the
+  filesystem claimed a session and never gave it back — `MAX_SESSIONS` is two, so the shell was
+  refused with `BUSY` and had no filesystem at all. The service was behaving exactly as documented:
+  it cannot know a caller has finished unless the caller says so. And the first-command race in the
+  shell test, narrowed at M6-05 by waiting for the prompt, reopened once printing the prompt became
+  a round trip to another address space — the first line is resent now until it echoes, rather than
+  the delay being lengthened until it usually works.
+- **An unsafe path written this session, found by reading it again.** When the address-space table
+  was full, `install` dropped the space and then loaded it into `CR3` — freeing the page tables the
+  CPU was about to translate through. It is leaked now instead, which is the lesser wrong: the
+  mapping stays valid and every fault in it is refused. The table is eight entries against three in
+  use.
+
 
 ### 2026-08-05 (RFC 0013 step 4 — the nucleus runs no service, and one address space was never enough)
 

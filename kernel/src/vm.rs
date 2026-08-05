@@ -474,12 +474,16 @@ pub fn self_test(hhdm_base: u64, iterations: u32) -> bool {
 
 /// How many user address spaces can exist at once.
 ///
-/// Four: the shell and both services in their own domains, with one spare. It
-/// was one until RFC 0013 step 4, which is not a number anybody chose — the
+/// Eight. Three are in use with both services in domains — the shell and the
+/// two of them — and the headroom is deliberate: running out is handled below,
+/// and handled *safely*, but a machine that has run out has a program with no
+/// region map and every fault in it refused.
+///
+/// It was one until RFC 0013 step 4, which is not a number anybody chose — the
 /// kernel simply kept a single installed space, because until there were two
 /// programs to run at once nothing could tell. What told was two services in
 /// domains landing on the same CPU and running in each other's page table.
-pub const MAX_SPACES: usize = 4;
+pub const MAX_SPACES: usize = 8;
 
 /// Every user address space the kernel has installed, found by its root.
 ///
@@ -489,7 +493,7 @@ pub const MAX_SPACES: usize = 4;
 /// fault happened in whatever space is loaded, and asking the hardware which
 /// one that is cannot disagree with the hardware.
 static SPACES: SpinLock<[Option<AddressSpace>; MAX_SPACES]> =
-    SpinLock::new(Rank::AddressSpace, [None, None, None, None]);
+    SpinLock::new(Rank::AddressSpace, [const { None }; MAX_SPACES]);
 
 /// The page table to restore when the installed space is removed.
 static PREVIOUS_ROOT: SpinLock<u64> = SpinLock::new(Rank::AddressSpacePrevious, 0);

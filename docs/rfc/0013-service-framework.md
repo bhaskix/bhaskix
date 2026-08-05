@@ -298,6 +298,17 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
    on one CPU ran in each other's page table — and every boot gate passed while they did, because
    nothing in the boot self-tests runs two user programs at once.
 5. **The measurement**, per service and per placement, against the table above.
+
+   *Done, 2026-08-05.* Round trips: one per operation in either placement, asserted. Cycles: a
+   domain costs ~5,000 a round trip, about +48%, and the same +48% for both services. Bulk path:
+   shared memory beats fifteen round trips by 10.3× in the nucleus and 7.3× in a domain. Boot time:
+   unchanged, ~7.6 s either way.
+
+   The measurement paid for itself twice over. It found that the nucleus filesystem thread was
+   unpinned and therefore **six times** slower per round trip than the same code pinned — a cost
+   nothing else in the suite could have noticed. And it got the answer backwards twice before it was
+   right: a mean over 200 samples that one preemption dominated, and a cold path timed against a
+   warm one. Both reversals were in the direction of flattering the design.
 6. **A second service in a domain** — the block driver, which is where RFC 0011 step 6 and RFC 0012
    step 7 stop being self-tests and become a driver.
 

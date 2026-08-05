@@ -118,10 +118,23 @@ pub fn start(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     // is compiled and the other is not, which is what makes the table a
     // decision rather than a description.
     #[cfg(not(vfs_in_domain))]
-    // Not pinned: it blocks on nothing but its own endpoint, so it may run
-    // wherever there is room.
-    sched::spawn("fs", filesystem_service, 0, hhdm_base)
-        .map_err(|_| "the filesystem service would not spawn")?;
+    // Pinned, since RFC 0013 step 5 measured what leaving it free costs: a
+    // round trip to an unpinned service took **six times** longer than to a
+    // pinned one, 66k cycles against 11k, reproducibly and at the minimum
+    // rather than in the tail. It was unpinned because it blocks on nothing
+    // but its own endpoint and could therefore run wherever there was room --
+    // which was true, and turned every call into a wait for another CPU to
+    // notice. The measurement is the whole reason this line changed; without
+    // it the old comment was perfectly reasonable.
+    sched::spawn_on_with(
+        cpu,
+        "fs",
+        filesystem_service,
+        0,
+        hhdm_base,
+        sched::SpawnOptions::new().pinned(),
+    )
+    .map_err(|_| "the filesystem service would not spawn")?;
     #[cfg(vfs_in_domain)]
     crate::start_vfs_domain(cpu, hhdm_base)?;
 

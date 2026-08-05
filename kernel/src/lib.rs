@@ -559,6 +559,21 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                     "    address spaces {} in use at once, each program in its own",
                     vm::installed()
                 );
+                // The third figure RFC 0013 step 5 asks for: what the isolation
+                // costs to *start*, stated once rather than argued about. From
+                // the same clock the round trips are timed against, and taken
+                // at the point every service is answering — a boot time that
+                // stopped before the services were up would flatter whichever
+                // placement started them more slowly.
+                if let Some(nanos) = time::now_nanos() {
+                    println!(
+                        "    boot cost      {}.{:03} ms to services up, console={} vfs={}",
+                        nanos / 1_000_000,
+                        nanos % 1_000_000 / 1_000,
+                        service::CONSOLE_PLACEMENT,
+                        service::VFS_PLACEMENT
+                    );
+                }
                 println!("  M6 in progress. Nothing left to do at this milestone.");
             }
             Err(reason) => {
@@ -1725,6 +1740,11 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         println!("    bulk path      FAILED");
     }
 
+    // RFC 0013 step 5: what the placement costs, said in numbers.
+    if !measure_placements(console, filesystem) {
+        println!("    cost           FAILED");
+    }
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -1746,6 +1766,14 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
 /// What the bulk-path client found, since it cannot return a value.
 static BULK_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BULK_TRIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Cycles the bulk transfer took, and cycles the same bytes took by message.
+///
+/// Both measured in the same thread, moments apart, against the same service
+/// and the same file — so the ratio is about the *path* and not about the
+/// machine, which is the only part of a number taken on an emulator that
+/// travels.
+static BULK_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static MESSAGE_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BULK_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 static BULK_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static BULK_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1762,22 +1790,87 @@ extern "C" fn bulk_client(_argument: u64) -> ! {
     };
 
     let path = b"README";
-    let _ = send(fs::PATH, Chunk::take(path).0.pack(0));
-    let _ = send(fs::OPEN, [0; 4]);
-
     // Counted for the *data* path only. Opening a file costs the same either
     // way, and folding that into the figure would flatter the comparison --
     // the RFC's sixteen bytes a round trip is about moving bytes, not about
     // naming a file.
+    // Both paths, five times each, least reported.
+    //
+    // The first version timed one of each and had the shared path nine times
+    // *slower* than the message path -- because it ran first. The first
+    // transfer into that memory object faults its pages in, allocates frames
+    // and takes every cold line in the service; by the time the message path
+    // ran, all of that had been paid. Timing the cold run of one thing against
+    // the warm run of another is not a comparison, and it produced a number
+    // that reversed the result.
+    //
+    // Five runs, minimum kept, and the file re-opened before each so both
+    // paths start from the same place.
+    const PASSES: u64 = 5;
+    let mut shared_least = u64::MAX;
+    let mut message_least = u64::MAX;
     let mut trips = 0;
 
-    // Slot 0 holds the memory. One call, however many bytes fit.
-    if let Ok(args) = send(fs::READ_INTO, [0, 4096, 0, 0]) {
-        trips += 1;
-        if outcome_of(args[0]) == outcome::OK {
+    for pass in 0..PASSES {
+        let _ = send(fs::PATH, Chunk::take(path).0.pack(0));
+        let _ = send(fs::OPEN, [0; 4]);
+
+        // Slot 0 holds the memory. One call, however many bytes fit.
+        let start = bhaskix_arch::tsc::read();
+        let moved = send(fs::READ_INTO, [0, 4096, 0, 0]);
+        let elapsed = bhaskix_arch::tsc::read().saturating_sub(start);
+        if let Ok(args) = moved
+            && outcome_of(args[0]) == outcome::OK
+        {
+            shared_least = shared_least.min(elapsed);
             BULK_BYTES.store(args[0] & 0xffff_ffff, Ordering::Relaxed);
+            if pass == 0 {
+                trips = 1;
+            }
+        }
+
+        // The same bytes the other way. Re-opened first, because the transfer
+        // above consumed the file -- sixteen bytes a trip against an exhausted
+        // file would have made the message path look free.
+        let _ = send(fs::PATH, Chunk::take(path).0.pack(0));
+        let _ = send(fs::OPEN, [0; 4]);
+        let wanted = BULK_BYTES.load(Ordering::Relaxed);
+        let start = bhaskix_arch::tsc::read();
+        let mut by_message = 0u64;
+        while by_message < wanted {
+            match send(fs::READ, [0; 4]) {
+                Ok(args) => {
+                    let chunk = Chunk::unpack(&args);
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    by_message += chunk.len() as u64;
+                }
+                Err(_) => break,
+            }
+        }
+        let elapsed = bhaskix_arch::tsc::read().saturating_sub(start);
+        if by_message >= wanted && wanted > 0 {
+            message_least = message_least.min(elapsed);
         }
     }
+
+    BULK_CYCLES.store(
+        if shared_least == u64::MAX {
+            0
+        } else {
+            shared_least
+        },
+        Ordering::Relaxed,
+    );
+    MESSAGE_CYCLES.store(
+        if message_least == u64::MAX {
+            0
+        } else {
+            message_least
+        },
+        Ordering::Relaxed,
+    );
     BULK_TRIPS.store(trips, Ordering::Relaxed);
 
     // And the refusal: slot 1 names the same memory, read-only. A service
@@ -1874,16 +1967,146 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
 
     // What the same file costs by message, at the RFC's own figure.
     let by_message = bytes.div_ceil(bhaskix_abi::CHUNK_BYTES as u64).max(1);
-    let ok = bytes > 0 && matches && refused == bhaskix_abi::outcome::NOT_YOURS;
+    // The one thing worth asserting about a timing: that shared memory is
+    // still faster than fifteen round trips. Not a budget -- a factor of two,
+    // against a measured eight to ten, so it fails when the bulk path has
+    // stopped being one and not when the builder is busy. A tighter number
+    // here would be a test of whatever machine CI runs on.
+    let shared_cycles = BULK_CYCLES.load(Ordering::Relaxed);
+    let message_cycles = MESSAGE_CYCLES.load(Ordering::Relaxed);
+    let worth_it = shared_cycles > 0 && message_cycles >= shared_cycles.saturating_mul(2);
+
+    let ok = bytes > 0 && matches && refused == bhaskix_abi::outcome::NOT_YOURS && worth_it;
     if ok {
         println!(
             "    bulk path      {bytes} bytes in {trips} round trip against {by_message} \
              by message; contents match, and a slot the caller does not hold is refused"
         );
+        let shared_cycles = shared_cycles.max(1);
+        // Hundredths, because the interesting answers are between one and two
+        // and an integer ratio would round every one of them to "1x".
+        let ratio = message_cycles.saturating_mul(100) / shared_cycles;
+        println!(
+            "    bulk cost      {bytes} bytes: {shared_cycles} cycles shared, \
+             {message_cycles} by message, {}.{:02}x, vfs={}",
+            ratio / 100,
+            ratio % 100,
+            service::VFS_PLACEMENT
+        );
     } else {
         println!(
             "    bulk path      FAILED: {bytes} bytes, contents match {matches}, \
-             refusal {refused}"
+             refusal {refused}, shared {shared_cycles} cycles against {message_cycles} \
+             by message"
+        );
+    }
+    ok
+}
+
+/// Measures what a service costs where it is, and says so.
+///
+/// RFC 0013 step 5. The RFC asked for three numbers per placement, and the
+/// reason it asked is that "a domain is slower" is an argument and a cycle
+/// count is not.
+///
+/// # What is asserted, and what is only reported
+///
+/// The **round trips** are asserted: one per operation, in either placement.
+/// That is the number the RFC says decides whether a service can be moved, it
+/// is structural rather than temporal, and it is the same on any machine.
+///
+/// The **cycles** are reported and not asserted. A threshold here would be a
+/// test of whatever machine CI happens to run on, failing on a loaded builder
+/// and passing on a fast one — which is a flaky test wearing a performance
+/// budget's clothes. The numbers go in the boot log and into `TRACKER.md`,
+/// where a change in them is something a person notices rather than something
+/// a gate guesses at.
+///
+/// Nothing here prints to the console it is measuring: a zero-length write is
+/// a whole round trip and no output, so the measurement does not pay for the
+/// characters it would otherwise emit — and does not fill the log it is
+/// written to.
+fn measure_placements(console: ipc::EndpointId, filesystem: ipc::EndpointId) -> bool {
+    use bhaskix_abi::{Chunk, console as console_method, fs};
+
+    /// Enough that a single unlucky preemption does not dominate, few enough
+    /// that a slow emulated machine is not held up by the measurement.
+    const ROUNDS: u64 = 200;
+
+    const BADGE: u64 = 0x00c1_0000;
+
+    let Some(hertz) = bhaskix_arch::tsc::hertz() else {
+        println!("    cost           no calibrated timer; nothing measured");
+        return true;
+    };
+
+    // Timed one round trip at a time, and reported as the **minimum**.
+    //
+    // The first version timed the whole loop and divided, and produced a
+    // filesystem in the nucleus that was four times *slower* than the same
+    // filesystem in a domain -- across runs of the same build, by a factor
+    // that moved. What it was measuring was preemption: the nucleus service
+    // thread is not pinned, so a call may wait for another CPU to pick it up,
+    // and one unlucky round trip in two hundred dominates a mean.
+    //
+    // The minimum is the least-disturbed sample: the run where nothing else
+    // happened. It understates the cost a busy machine pays and it is the only
+    // figure here that means the same thing twice, so the mean is printed
+    // beside it rather than instead of it -- the gap between them is the
+    // scheduling noise, which is worth seeing.
+    let time = |call: &mut dyn FnMut() -> bool| -> (u64, u64, u64) {
+        let (mut least, mut total, mut done) = (u64::MAX, 0u64, 0u64);
+        for _ in 0..ROUNDS {
+            let start = bhaskix_arch::tsc::read();
+            let ok = call();
+            let elapsed = bhaskix_arch::tsc::read().saturating_sub(start);
+            if ok {
+                done += 1;
+                total = total.saturating_add(elapsed);
+                least = least.min(elapsed);
+            }
+        }
+        (least, total / done.max(1), done)
+    };
+
+    // An empty chunk: a real request, a real reply, and nothing printed.
+    let (empty, _) = Chunk::take(&[]);
+    let (console_least, console_mean, delivered) =
+        time(&mut || ipc::call(console, BADGE, console_method::WRITE, empty.pack(0)).is_ok());
+
+    // `fs::PATH` accumulates a path and answers. One round trip, no output.
+    let (vfs_least, vfs_mean, answered) = time(&mut || {
+        let (name, _) = Chunk::take(b"README");
+        ipc::call(filesystem, BADGE, fs::PATH, name.pack(0)).is_ok()
+    });
+
+    // Nanoseconds, because cycles are only comparable against the same clock
+    // and the clock is printed at boot anyway.
+    let nanos = |cycles: u64| cycles.saturating_mul(1_000_000_000) / hertz.max(1);
+
+    // Give the session back. `MAX_SESSIONS` is two, and a badge that has ever
+    // sent `fs::PATH` holds one until it resets -- so measuring the filesystem
+    // and walking away left the shell refused with `BUSY` and no filesystem at
+    // all. It cost three shell checks to notice, and the service was behaving
+    // exactly as documented: it has no way to know a caller has finished
+    // unless the caller says so.
+    let _ = ipc::call(filesystem, BADGE, fs::RESET, [0; 4]);
+
+    let ok = delivered == ROUNDS && answered == ROUNDS;
+    if ok {
+        println!(
+            "    cost           console={} {console_least} cycles/round trip ({} ns), mean {console_mean}; \
+             vfs={} {vfs_least} cycles ({} ns), mean {vfs_mean}; \
+             1 round trip per operation either way, {ROUNDS} samples, least reported",
+            service::CONSOLE_PLACEMENT,
+            nanos(console_least),
+            service::VFS_PLACEMENT,
+            nanos(vfs_least),
+        );
+    } else {
+        println!(
+            "    cost           FAILED: {delivered}/{ROUNDS} console replies, \
+             {answered}/{ROUNDS} filesystem replies"
         );
     }
     ok
