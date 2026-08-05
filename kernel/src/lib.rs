@@ -1401,6 +1401,245 @@ const CONSOLED_PROGRAM: &[u8] = b"bin/consoled";
 /// difference between a capability system and a permission bit.
 const CONSOLE_OBJECT: u64 = 0;
 
+/// Where the block driver's domain keeps its stack and its rings.
+const BLKD_STACK: u64 = 0x0000_0000_1100_0000;
+const BLKD_STACK_PAGES: u64 = 4;
+
+/// Where the block driver's program is.
+const BLKD_PROGRAM: &[u8] = b"bin/blkd";
+
+/// Hands the *second* block device to a domain, and starts a driver for it.
+///
+/// The kernel drives the first and never touches this one. Two drivers on one
+/// device would race resets and interleave rings; a driver in a domain gets a
+/// device of its own, which is also how a real system would do it.
+///
+/// What the domain is given, and it is everything it gets:
+///
+/// - three `Frame` capabilities, one per structure the virtio 1.0 transport
+///   defines — common configuration, queue notification, device configuration;
+/// - a `Memory` object for its rings, which it maps for itself.
+///
+/// What it is *not* given is the bus. Finding those three structures means
+/// reading PCI configuration space, which is port I/O: a domain holding that
+/// would hold every device on the machine, so the kernel enumerates and the
+/// domain drives. The split is not a convenience — it is where the hardware
+/// puts the line.
+pub fn start_block_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
+    let Some((address, _)) = virtio::find_nth(1) else {
+        // One device, so nothing to delegate. Not an error: a machine with a
+        // single disk is a machine the kernel drives, and saying so beats
+        // failing to boot.
+        println!("    block domain   no second device on the bus; nothing delegated");
+        return Ok(());
+    };
+    let layout = virtio::layout(address).ok_or("the second block device is not a modern virtio")?;
+
+    // Memory space, so its BARs answer. Bus mastering is *not* enabled here:
+    // the driver asks for that itself once it has reset the device and built
+    // its rings, and a device that could write to memory before its owner was
+    // ready would do so with whatever the firmware left in its registers.
+    // SAFETY: this device belongs to nobody yet -- the kernel's own driver
+    // took the first one, and this is the second.
+    unsafe { bhaskix_arch::pci::enable_memory(address) };
+
+    let realm = domain::create("blk", domain::ResourceEnvelope::new())
+        .map_err(|_| "the block domain would not be created")?;
+
+    // One `Frame` per structure. A `Frame` names one page, so a structure
+    // spanning two would need two capabilities -- which is worth knowing and
+    // is why the length is checked rather than assumed.
+    let windows = [layout.common, layout.notify, layout.device];
+    for (slot, (base, length)) in windows.iter().enumerate() {
+        if *length > bhaskix_mm::FRAME_SIZE {
+            return Err("a virtio structure spans more than one page");
+        }
+        let window = cap::with_arena(|arena| {
+            arena
+                .insert_root(
+                    cap::ObjectRef::new(
+                        cap::ObjectKind::Frame,
+                        base & !(bhaskix_mm::FRAME_SIZE - 1),
+                    ),
+                    cap::Rights::READ.union(cap::Rights::WRITE),
+                    0,
+                )
+                .ok()
+        })
+        .ok_or("a device window capability would not be created")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(slot, window).is_ok()) != Some(true)
+        {
+            return Err("a device window capability would not install");
+        }
+    }
+
+    // Rings. Four pages, which is more than the descriptor table, available
+    // and used rings need for a queue this small -- and the slack is where the
+    // request headers and the sector go.
+    let rings = shared::create(realm, 4 * bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the block domain's rings would not be created")?;
+    let named = shared::name(rings).map_err(|_| "the rings would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
+        return Err("the rings capability would not install");
+    }
+
+    println!(
+        "    block domain   {:02x}:{:02x}.{} delegated: common {:#x}, notify {:#x} x{}, device {:#x}",
+        address.bus,
+        address.device,
+        address.function,
+        layout.common.0,
+        layout.notify.0,
+        layout.notify_multiplier,
+        layout.device.0
+    );
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        cpu,
+        "blkd",
+        block_domain_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the block domain would not spawn")?;
+
+    BLOCK_RINGS.store(rings.as_u64(), core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// The rings the block domain was given, so its report can be read back.
+static BLOCK_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Reads what the driver in a domain wrote, and says so.
+///
+/// Through the memory the kernel granted it, because the driver holds no
+/// console capability: a driver has no business printing, and giving it one to
+/// make a test easier would have made the test prove less.
+///
+/// The marker is checked first. Without it a page of zeroes would read as a
+/// report of all-zeroes, which is exactly the answer a driver that never ran
+/// would appear to give.
+fn report_block_domain(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    const MARKER: u64 = 0x424c_4b44_5250_5431;
+
+    let raw = BLOCK_RINGS.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        // Nothing was delegated: one device on the bus, which is not a
+        // failure.
+        return true;
+    }
+    let rings = shared::MemoryId::from_u64(raw);
+
+    // The second page, through the direct map. The driver has it mapped as
+    // writable memory in its own space; the kernel reaches the same frames the
+    // way it reaches any object's.
+    let Some((frames, count)) = shared::frames_of(rings) else {
+        println!("    block domain   FAILED: the rings are gone");
+        return false;
+    };
+    if count < 2 {
+        println!("    block domain   FAILED: the rings are too small to hold a report");
+        return false;
+    }
+
+    let mut words = [0u64; 8];
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // eight little-endian words the driver wrote there.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 64) };
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    if words[0] != MARKER {
+        println!("    block domain   FAILED: the driver left no report");
+        return false;
+    }
+
+    let [
+        _,
+        untouched,
+        acknowledged,
+        queues,
+        queue_size,
+        features,
+        sectors,
+        rings_work,
+    ] = words;
+    // What is asserted is what the driver *did*, and what only this device
+    // could have told it.
+    //
+    // The status it found on arrival is reported and not asserted: the first
+    // version expected zero, on the reasoning that nobody had driven this one,
+    // and found 11 -- acknowledge, driver, features-ok. The firmware probes
+    // disks before the kernel exists, so "untouched" was never true of a
+    // device on a real bus. What it is evidence of is weaker than the capacity
+    // anyway: this disk is one sector and the kernel's is 180, so a driver
+    // handed the wrong device would say so in a number nothing else produces.
+    let ok = acknowledged == 3 && queues >= 1 && queue_size > 0 && sectors > 0 && rings_work == 1;
+    if ok {
+        println!(
+            "    block domain   ring 3 driver: found status {untouched}, drove it to \
+             {acknowledged}, {queues} queue of {queue_size}, features {features:#x}, \
+             {sectors} sectors, rings writable"
+        );
+    } else {
+        println!(
+            "    block domain   FAILED: found {untouched}, drove it to {acknowledged}, \
+             queues {queues}, queue size {queue_size}, sectors {sectors}, \
+             rings writable {rings_work}"
+        );
+    }
+    ok
+}
+
+/// Loads `bin/blkd` and becomes the block driver, in ring 3.
+extern "C" fn block_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("    block domain   FAILED: {why}");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(BLKD_PROGRAM) else {
+        stop("bin/blkd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/blkd is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(BLKD_STACK), BLKD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/blkd would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = BLKD_STACK + BLKD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+}
+
 /// Creates the domain the console service runs in, and starts it.
 ///
 /// Two capabilities, and they are not the same kind of thing: the endpoint is
@@ -1828,6 +2067,20 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // RFC 0013 step 5: what the placement costs, said in numbers.
     if !measure_placements(console, filesystem) {
         println!("    cost           FAILED");
+    }
+
+    // RFC 0013 step 6: the second block device, driven from ring 3.
+    if let Err(reason) = start_block_domain(cpu, hhdm) {
+        println!("    block domain   FAILED: {reason}");
+    } else {
+        // It has to have run before its report can be read. Waiting on a
+        // notification would be better and is what a supervisor would do; RFC
+        // 0013 says explicitly that it does not propose one, so this waits the
+        // way the rest of the boot does.
+        wait_millis(200);
+        if !report_block_domain(hhdm) {
+            println!("    block domain   FAILED");
+        }
     }
 
     let options = sched::SpawnOptions::new()
@@ -3873,13 +4126,14 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Four programs in /bin: the ring 3 probe, the user-mode shell,
-            // and both services as programs (RFC 0013 steps 3 and 4). Exact
-            // rather than "at least", so adding a fifth without noticing this
-            // line is a failure rather than a silently weaker test -- which it
-            // has now been, three times, once per program added.
+            // Five programs in /bin: the ring 3 probe, the user-mode shell,
+            // both services as programs, and the block driver (RFC 0013 steps
+            // 3, 4 and 6). Exact rather than "at least", so adding a sixth
+            // without noticing this line is a failure rather than a silently
+            // weaker test -- which it has now been, four times, once per
+            // program added. It is the cheapest assertion in the repository.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 4,
+            entries >= 3 && bin == 5,
         ),
         (
             "the user program is an ELF the loader accepts",

@@ -332,7 +332,88 @@ fn frame(hhdm: u64) -> Option<(u64, u64)> {
 
 /// Finds the block device, if there is one.
 fn find() -> Option<(pci::Address, pci::Identity)> {
+    find_nth(0)
+}
+
+/// Where a modern virtio device's three structures are, in physical memory.
+///
+/// The half of a driver that must stay in the kernel when the rest of it moves
+/// into a domain: finding these means reading PCI configuration space, which
+/// is port I/O, which a domain cannot be given without giving it every device
+/// on the bus. So the kernel enumerates and the domain drives — the split is
+/// not a convenience, it is where the hardware puts the line.
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    /// Common configuration structure.
+    pub common: (u64, u64),
+    /// Queue notification area, and how far apart consecutive queues are.
+    pub notify: (u64, u64),
+    /// The multiplier between one queue's notify address and the next.
+    pub notify_multiplier: u32,
+    /// Device-specific configuration.
+    pub device: (u64, u64),
+}
+
+/// Reads a device's capability list and says where its structures are.
+///
+/// Does not touch the device: this is configuration space, and a device that
+/// is about to be handed to somebody else must arrive in the state its owner
+/// expects rather than in one this function left behind.
+#[must_use]
+pub fn layout(address: pci::Address) -> Option<Layout> {
+    let mut common_at = None;
+    let mut notify_at = None;
+    let mut notify_multiplier = 0u32;
+    let mut device_at = None;
+
+    // SAFETY: configuration reads on the bootstrap CPU during boot.
+    unsafe {
+        pci::for_each_capability(address, |capability| {
+            if capability.id != CAP_VENDOR_SPECIFIC {
+                return true;
+            }
+            let kind = pci::read8(address, capability.offset + 3);
+            let bar_index = pci::read8(address, capability.offset + 4);
+            let offset = pci::read32(address, capability.offset + 8);
+            let length = pci::read32(address, capability.offset + 12);
+
+            let pci::Bar::Memory { address: base, .. } = pci::bar(address, bar_index) else {
+                return true;
+            };
+
+            let where_it_is = (base + u64::from(offset), u64::from(length));
+            match kind {
+                CFG_COMMON => common_at = Some(where_it_is),
+                CFG_NOTIFY => {
+                    notify_at = Some(where_it_is);
+                    notify_multiplier = pci::read32(address, capability.offset + 16);
+                }
+                CFG_DEVICE => device_at = Some(where_it_is),
+                _ => {}
+            }
+            true
+        });
+    }
+
+    Some(Layout {
+        common: common_at?,
+        notify: notify_at?,
+        notify_multiplier,
+        device: device_at?,
+    })
+}
+
+/// Finds the `skip`-th virtio block device on the bus, in bus order.
+///
+/// The kernel drives the first and hands the second to a domain. Two drivers
+/// on one device would be a disaster -- resets racing, rings interleaved --
+/// so the driver in a domain gets a device of its own rather than a share of
+/// this one. Bus order is stable within a machine configuration, which is what
+/// makes "the second one" a thing a boot can say and a test can rely on.
+#[must_use]
+pub fn find_nth(skip: usize) -> Option<(pci::Address, pci::Identity)> {
     let mut found = None;
+    let mut seen = 0usize;
     // SAFETY: bootstrap CPU during boot; nothing else is driving a
     // configuration cycle.
     unsafe {
@@ -348,8 +429,11 @@ fn find() -> Option<(pci::Address, pci::Identity)> {
                 || (identity.device == DEVICE_TRANSITIONAL
                     && identity.subsystem == SUBSYSTEM_BLOCK);
             if block {
-                found = Some((address, identity));
-                return false;
+                if seen == skip {
+                    found = Some((address, identity));
+                    return false;
+                }
+                seen += 1;
             }
             true
         });

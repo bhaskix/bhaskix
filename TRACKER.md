@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-11 (RFC 0013 steps 1–5; step 6 has all three primitives, not the driver) · CI green · 386 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-12 (RFC 0013 steps 1–5; step 6 brings up a device from ring 3, data path next) · CI green · 393 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
 
 ### Division of responsibility between documents
 
@@ -152,6 +152,7 @@ fairness within 2% for two equal-weight workloads.
 | M7-09 | RFC 0013 step 6b: device registers as a capability | ✅ `DONE` | `ATTACH` now takes a `Frame` capability too: one physical page, mapped **uncached and write-through** into the caller's own space, never executable. The kernel mints one for the block device's common configuration window; **the shell reads the device's status register from ring 3 and gets 15** — acknowledge, driver, features-ok, driver-ok, the device agreeing a driver brought it up. It cannot name a physical address, cannot ask for a different page, and is refused a writable mapping of the one it has. Watched failing by mapping one page over: `status 1`, and the gate said so. The second of the three things a driver in a domain needs. |
 | M7-10 | A test that had been told not to race, and did | ✅ `DONE` | `notify`'s test module said *"one test, because the slots are a global and cargo runs tests in parallel"* — and had two. The second drained the arena and asserted it came back empty, which it does not when the first is holding a slot. It failed once in a full run and passed on every re-run. A comment asking people to keep to one test was never going to hold; the tests take a mutex now. |
 | M7-11 | RFC 0013 step 6c: a domain is woken by a notification | ✅ `DONE` | `method::WAIT` and `method::PEEK` on a `Notification` capability. **The shell, in ring 3, is woken by one and reads the badge** — holding no vector, no interrupt controller and no way to reach either. Taking is once: the second look finds nothing, because a notification is a signal and not a queue. A capability with the write right and not the read right is **refused a take** — same object, weaker capability. The third and last of the things a driver in a domain needs. What the shell is woken by is a kernel signal rather than a device, deliberately: that an *interrupt* reaches a notification is gated where the interrupt is (M5, delegation self-test), and what was missing was only the last link. |
+| M7-12 | RFC 0013 step 6: a block driver in a domain, bringing up a device | ✅ `DONE` (bring-up; the data path is next) | `bin/blkd` drives the **second** virtio block device from ring 3. The kernel enumerates the bus and hands over three `Frame` capabilities and a `Memory` object; everything after that is the driver's — it maps its own windows, resets the device, and drives the handshake to acknowledge|driver. It reports **1 sector**, which is its own disk: the kernel's is 180, so a driver handed the wrong device says so in a number nothing else on this machine produces. Two devices because two drivers on one would race resets and interleave rings. **The bus stays in the kernel** and that is not a convenience: PCI configuration space is port I/O, and a domain holding it would hold every device on the machine. Watched failing by removing the handshake. |
 
 ### Honest notes on M6 so far
 
@@ -639,6 +640,31 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0013 step 6 — a driver in ring 3, and the device it was given)
+
+- **A program with no privilege brought up a PCI device.** It holds four capabilities: three pages
+  of registers and one memory object. It maps them itself, resets the device, and walks the
+  specification's handshake. A wild pointer in it faults in ring 3 and takes the driver down; the
+  same mistake in a kernel driver takes the machine.
+- **The bus stays in the kernel, and that is where the hardware puts the line.** Finding a device's
+  structures means reading PCI configuration space, which is port I/O — a domain holding that would
+  hold every device on the machine. So the kernel enumerates and the domain drives. That split was
+  not chosen for tidiness; there is no way to hand over less.
+- **Its own device, and the capacity proves it.** Two drivers on one device would race resets and
+  interleave rings, so the test machine has two and the kernel takes the first. The domain's disk is
+  one sector and the kernel's is 180 — a driver handed the wrong device reports a number nothing
+  else here produces, which is a better check than any status bit.
+- **"Untouched" was never true.** The first version asserted the device arrived with status zero,
+  reasoning that nobody had driven it. It arrives with 11: the firmware probes disks before the
+  kernel exists. Reported now rather than asserted, and the assertion moved to the thing only this
+  device could have said.
+- **The driver holds no console capability**, so it cannot print. Its findings go into the memory
+  the kernel granted it, behind a marker word written last with a fence before it — because a page
+  of zeroes reads exactly like a report of all-zeroes, which is what a driver that never ran would
+  appear to have written.
+- **The `/bin` count assertion fired a fourth time**, once per program this milestone added. It is
+  the cheapest assertion in the repository and has now paid four times.
 
 ### 2026-08-05 (RFC 0013 step 6c — the last link, and a negative test that was lying)
 

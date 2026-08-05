@@ -98,6 +98,16 @@ impl MemoryId {
     pub const fn index(&self) -> u32 {
         self.index
     }
+
+    /// The identity as one word, the inverse of [`MemoryId::from_u64`].
+    ///
+    /// For keeping one somewhere a capability cannot go — an atomic, so that
+    /// boot code which handed an object to a domain can find it again to read
+    /// what the domain wrote.
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
+        self.index as u64 | ((self.generation as u64) << 32)
+    }
 }
 
 /// Where an object is mapped: a page table, and where in it.

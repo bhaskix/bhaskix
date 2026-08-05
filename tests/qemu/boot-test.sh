@@ -78,10 +78,14 @@ pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 # The ramdisk image is attached as a disk as well as loaded as a module, so
 # the block driver's test knows what must come back.
 DISK="$REPO_ROOT/build/initrd.tar"
+# A second disk, for the block driver that runs in a domain. Its own device:
+# two drivers on one device would race resets and interleave rings, so the
+# domain driver gets a device rather than a share of the kernel's.
+DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
 
 MACHINE="q35"
 IOMMU_ARGS=()
-VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0)
+VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0 -device virtio-blk-pci,drive=disk1)
 if [[ "$MODE" == "iommu" ]]; then
     # RFC 0012's testing plan turns on what the RFC is about. `intremap=on`
     # needs a split irqchip, and both are QEMU's requirements rather than this
@@ -94,11 +98,13 @@ if [[ "$MODE" == "iommu" ]]; then
     # `iommu_platform` bypasses translation entirely on QEMU, so every
     # assertion below would pass on a machine where the IOMMU protects
     # nothing -- which is exactly what the first version of this did.
-    VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on)
+    VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on
+                 -device virtio-blk-pci,drive=disk1,disable-legacy=on,iommu_platform=on)
 fi
 
 QEMU_ARGS=(-M "$MACHINE" -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
            -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on"
+           -drive "file=$DOMAIN_DISK,format=raw,if=none,id=disk1,readonly=on"
            "${VIRTIO_ARGS[@]}"
            "${IOMMU_ARGS[@]}"
            -serial "file:$LOG" -display none)
@@ -343,7 +349,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 4 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 5 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -606,6 +612,25 @@ if grep -qE "bulk cost +[0-9]+ bytes: [0-9]+ cycles shared, [0-9]+ by message" "
     pass "shared memory still beats the message path, and by how much is on the record"
 else
     fail "the bulk path's cost was not reported"
+    status=1
+fi
+
+# RFC 0013 step 6: a block driver in ring 3, driving a device of its own.
+#
+# The kernel enumerates the bus -- PCI configuration space is port I/O, and a
+# domain holding that would hold every device on the machine -- and hands over
+# three `Frame` capabilities and a `Memory` object. Everything after that is
+# the driver's: it maps its own windows, resets the device, and drives the
+# handshake to 3 (acknowledge, driver).
+#
+# `1 sectors` is the assertion that matters. That is the domain's own disk; the
+# kernel's is 180. A driver handed the wrong device says so in a number nothing
+# else on this machine produces.
+if grep -qE "block domain +ring 3 driver: .*drove it to 3, 1 queue of [0-9]+, .*1 sectors" "$LOG"; then
+    pass "a driver in ring 3 brought up a device of its own"
+else
+    fail "the block driver in a domain did not report a device it had driven"
+    grep -E "block domain" "$LOG" || true
     status=1
 fi
 

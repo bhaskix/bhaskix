@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The block driver, placed in its own domain.
+#
+# Not a member of the root workspace, for the reason user/shell/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+#
+# Unlike the service placements, this is not the same code the kernel runs.
+# The kernel's virtio driver stays where it is, driving the first device; this
+# one drives the second, and the two share only the specification. That is the
+# honest arrangement for a driver: what would be shared is the queue protocol,
+# and the queue protocol is the part a domain must own.
+[workspace]
+
+[package]
+name = "bhaskix-user-blkd"
+description = "The block driver in a domain of its own."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "blkd"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# A driver is mostly `unsafe`, and that is the honest shape of one: every
+# register access is a volatile read or write of a mapping the kernel made on
+# request, and every ring entry is a store into memory a device will read.
+#
+# What matters is that none of it can reach anything this domain was not
+# given. A wild pointer here faults in ring 3 and takes the driver down; the
+# same code in the kernel would take the machine.
+unsafe_budget = 90

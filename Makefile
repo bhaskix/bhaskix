@@ -22,6 +22,11 @@ KERNEL       := target/$(TARGET)/$(PROFILE)/bhaskix
 ISO          := build/bhaskix.iso
 ISO_ROOT     := build/iso_root
 INITRD       := build/initrd.tar
+# A second disk, for the block driver that runs in a domain. Its own device and
+# its own image: two drivers on one device would be a disaster, and a domain
+# driver reading the *kernel's* disk would not show that it had read anything
+# the kernel did not hand it.
+DOMAIN_DISK  := build/domain-disk.img
 INITRD_DIR   := initrd
 INITRD_ROOT  := build/initrd_root
 LIMINE_DIR   := boot/limine/limine
@@ -35,9 +40,11 @@ PROBE        := $(PROBE_DIR)/target/$(TARGET)/release/probe
 SHELL_DIR    := user/shell
 VFSD_DIR     := user/vfsd
 CONSOLED_DIR := user/consoled
+BLKD_DIR     := user/blkd
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
 USER_CONSOLED := $(CONSOLED_DIR)/target/$(TARGET)/release/consoled
+USER_BLKD    := $(BLKD_DIR)/target/$(TARGET)/release/blkd
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
 # kernel's PIC/kernel-code-model settings are wrong for a user program linked
@@ -50,6 +57,8 @@ VFSD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(VFSD_DIR)/link.ld
 CONSOLED_FLAGS := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(CONSOLED_DIR)/link.ld
+BLKD_FLAGS   := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(BLKD_DIR)/link.ld
 
 # 256 MiB is comfortably more than the kernel needs and small enough that the
 # memory-map output stays readable.
@@ -113,6 +122,15 @@ kernel:
 
 iso: $(ISO)
 
+# One sector, with something in it only this disk has. The domain driver reads
+# sector 0 and prints what it found; a driver that returned zeroes, or the
+# other disk's bytes, is visible rather than plausible.
+$(DOMAIN_DISK):
+	@mkdir -p $(dir $@)
+	@printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > $@
+	@dd if=/dev/zero bs=1 count=484 >> $@ 2>/dev/null
+	@echo "built $@"
+
 # Depends on the phony `kernel` target directly, so the image is rebuilt every
 # time rather than when make believes the ELF changed. Regenerating costs under
 # a second; testing a stale image costs an afternoon of chasing a bug that was
@@ -128,7 +146,7 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
@@ -136,6 +154,7 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USE
 	cp $(USER_SHELL) $(INITRD_ROOT)/bin/shell
 	cp $(USER_VFSD) $(INITRD_ROOT)/bin/vfsd
 	cp $(USER_CONSOLED) $(INITRD_ROOT)/bin/consoled
+	cp $(USER_BLKD) $(INITRD_ROOT)/bin/blkd
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
 	@echo "built $@ ($$(stat -c%s $@) bytes)"
@@ -175,7 +194,15 @@ $(USER_CONSOLED): $(CONSOLED_DIR)/src/main.rs $(CONSOLED_DIR)/link.ld $(CONSOLED
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
-$(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) $(INITRD) | $(LIMINE_DIR)
+# The block driver as a program. It shares no code with the kernel's driver --
+# only the specification -- so its dependencies are the ABI and nothing else.
+$(USER_BLKD): $(BLKD_DIR)/src/main.rs $(BLKD_DIR)/link.ld $(BLKD_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs)
+	cd $(BLKD_DIR) && RUSTFLAGS="$(BLKD_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+$(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) $(INITRD) $(DOMAIN_DISK) | $(LIMINE_DIR)
 	@rm -rf $(ISO_ROOT)
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/bhaskix
@@ -286,6 +313,7 @@ fmt:
 	cd $(SHELL_DIR) && $(CARGO) fmt --all --check
 	cd $(VFSD_DIR) && $(CARGO) fmt --all --check
 	cd $(CONSOLED_DIR) && $(CARGO) fmt --all --check
+	cd $(BLKD_DIR) && $(CARGO) fmt --all --check
 
 # Two passes, because they cover different things. `--all-targets` cannot be
 # used on the freestanding target: it would try to build the test harness,
@@ -302,6 +330,8 @@ clippy:
 	cd $(VFSD_DIR) && RUSTFLAGS="$(VFSD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(CONSOLED_DIR) && RUSTFLAGS="$(CONSOLED_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(BLKD_DIR) && RUSTFLAGS="$(BLKD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 
 # The project-specific invariants from docs/. Each one is cheap and catches a
@@ -351,6 +381,7 @@ clean:
 	cd $(SHELL_DIR) && $(CARGO) clean
 	cd $(VFSD_DIR) && $(CARGO) clean
 	cd $(CONSOLED_DIR) && $(CARGO) clean
+	cd $(BLKD_DIR) && $(CARGO) clean
 	rm -rf build
 
 distclean: clean

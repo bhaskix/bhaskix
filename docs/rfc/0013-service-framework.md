@@ -328,9 +328,20 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
    shell is woken by one in ring 3, reads the badge, finds nothing on the second look, and is
    refused a take through a capability carrying the write right and not the read right.
 
-   All three primitives a driver in a domain needs now exist. **The driver itself does not**: the
-   virtio queue logic is still in the kernel, and moving it means a crate for the transport with PCI
-   configuration space left behind, because config space is port I/O and a domain cannot have it.
+   All three primitives a driver in a domain needs now exist, and so does a driver. `bin/blkd`
+   drives the *second* virtio block device from ring 3: the kernel enumerates the bus and hands over
+   three `Frame` capabilities and a `Memory` object, and the driver maps its own windows, resets the
+   device and walks the bring-up handshake. It reports the capacity of its own disk — one sector,
+   against the kernel's 180 — which is how a driver handed the wrong device would say so.
+
+   Two devices, because two drivers on one would race resets and interleave rings. PCI configuration
+   space stays in the kernel because it is port I/O: a domain holding it would hold every device on
+   the machine, so there is no way to hand over less.
+
+   **Still to do:** the data path. Descriptor rings programmed with device addresses, a request
+   submitted, the queue kicked, and the completion taken from an interrupt rather than a poll —
+   which is where RFC 0012's `DmaWindow` and RFC 0011's delegated handler finally carry a real
+   request.
 
 Steps 1–2 are the mechanism. Steps 3–5 are the proof. Step 6 is the first driver outside the
 kernel, and the reason the previous four RFCs exist.
