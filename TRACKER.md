@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–4) · CI green · 38 boot gates, 112 checks |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–5) · CI green · 38 boot gates, 112 checks |
 
 ### Division of responsibility between documents
 
@@ -135,6 +135,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-11 | RFC 0012 step 2: the translation structures, built and not enabled | ✅ `DONE` | `arch::vtd` is the VT-d encodings as arithmetic — root, context and second-level entries, address widths, index maths — pure, and proved against the specification's own numbers by 10 host tests on a machine with no IOMMU. `DevAddr` is a type the compiler keeps apart from `PhysAddr`, with an allocator tested for exhaustion, reuse after unmap and the below-4-GiB constraint a 32-bit device needs. On real hardware the window is built for the block device and **left empty**: default deny, nothing programmed. **Negative-tested**: a corrupted context index fails the gate — after the first version of that check failed to catch it, see below. |
 | M6-12 | RFC 0012 step 3: translation enabled, and a device that can no longer reach the kernel | ✅ `DONE` | Identity-map what must keep working, map the firmware-reserved regions after checking each against the kernel's own image, then enable — the order is the RFC's and is not a preference, because translation has no partial state. `virtio-blk` keeps working with **zero faults**, and the boot line says whether the device is *subject to* translation as well as whether translation is on. **Negative-tested**: unmap the driver's five frames and the disk disappears, failing four gates. The `RMRR`-overlaps-the-kernel refusal has four host tests, because QEMU declares no reserved regions and the path is otherwise unreachable. |
 | M6-13 | RFC 0012 step 4: `MAP`/`UNMAP`, `DevAddr`, and a refusal that names the device | ✅ `DONE` | The unit comes up **before** the device: a window names the device it translates for, and translation must be on before `DRIVER_OK` lets a device read a ring. The driver's frames are mapped as they are allocated and it is handed `DevAddr`s — its memory sits at `0xf8aa000+` and the device is told `0x100000000+`. `UNMAP` invalidates before returning, because until it does the hardware still reaches a page the caller has been told is gone. Fault records are read, so a refusal names the device, the address and the direction. **Negative test**: hand the device an address nobody mapped — `00:03.0 was refused 0x7ffffff000 (write), reason 0x05`. |
+| M6-14 | RFC 0012 step 5: a `Memory` object a device can reach, and a revoke that reaches the device | ✅ `DONE` | RFC 0009's object mapped into the device window — the same frames a domain shares with another domain are what a device is given, through the same object and the same revocation. `revoke` now walks the device mapping too, invalidating the IOTLB per entry. **The assertion is asked of the device**: it reads into the object successfully, the object is revoked, and the same device at the same address is refused. A new `DmaWindow` lock rank sits inside `shared::ARENA`, and the unit's registers are cached at bring-up because mapping MMIO reaches the heap — the outermost lock — while invalidation happens under the innermost. |
 
 ### Honest notes on M6 so far
 
@@ -517,6 +518,30 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0012 step 5 — where the two RFCs meet, and a test that had to be deleted)
+
+- **Revocation now reaches the hardware.** `an object was reachable at 0x100000000, 1 mappings
+  revoked, and the device was then refused it`. RFC 0009's `Memory` is frames, an owner and a
+  revocation that must complete; RFC 0012 makes a device window one of the places such an object
+  lives. A revoke that removed a page from every address space and left a device reaching it would
+  be the same failure as leaving one CPU's TLB entry behind — gone from the tables, and still
+  working.
+- **Two deliberate-refusal tests could not coexist, and merging them was the fix.** A refused
+  request never completes, so it leaves the virtqueue unusable: whichever of step 4's and step 5's
+  tests ran second found a device that no longer answers, and reported *"nothing refused it"* about
+  a machine where nothing had been **asked**. That is the same shape as every other blind spot this
+  milestone — a result that is not about the property.
+- **The merged test is the stronger one**, which is why deleting the other cost nothing. An address
+  the device **had and lost** isolates the page tables from every other reason an access could fail;
+  an address that was never mapped does not distinguish "the entry is absent" from "the width
+  refused it" or "the device never asked".
+- **A lock rank, and a cache that exists for the ranking rather than for speed.** `DmaWindow` sits
+  inside `shared::ARENA`, because revoking takes the arena first and unmaps from the device
+  afterwards. Invalidating an IOTLB happens while holding it — so the unit's register window is
+  mapped **once** at bring-up and cached, because `mmio::map` reaches the heap, and the heap is the
+  outermost lock here. Mapping per use would have been an inversion on every single unmap.
+- **No budget raise this time**: arch 1032/1040, kernel 977/1000.
 
 ### 2026-08-05 (RFC 0012 step 4 — three things that were wrong, and none of them found by reading)
 

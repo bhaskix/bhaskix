@@ -468,19 +468,26 @@ if [[ "$MODE" == "iommu" ]]; then
         status=1
     fi
 
-    # The negative test the RFC names, and the only convincing evidence the
-    # protection is real: hand the device an address nobody mapped and watch
-    # the unit refuse it *and say whose it was*.
+    # RFC 0012 steps 4 and 5, in the one demonstration that covers both: a
+    # `Memory` object the device can reach, revoked, and then refused to that
+    # same device at that same address.
     #
-    # The assertion is the refusal, deliberately not the request failing. A
-    # virtio device completes a request whose data write was refused, so
+    # One test rather than two because a refused request never completes and
+    # leaves the queue unusable -- whichever ran second would find a device
+    # that no longer answers and report "nothing refused it" about a machine
+    # where nothing had been asked. It is also the sharper assertion: an
+    # address the device *had* and lost isolates the page tables from every
+    # other reason an access could fail.
+    #
+    # The assertion is the fault record, deliberately not the request failing.
+    # A virtio device completes a request whose data write was refused, so
     # requiring an error tests the driver's plumbing rather than the hardware
     # -- an earlier version did exactly that and reported a protected machine
     # as unprotected.
-    if grep -qE "iommu refusal +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] was refused 0x[0-9a-f]+ \((read|write)\), reason" "$LOG"; then
-        pass "an address outside the window is refused, and the device is named"
+    if grep -qE "iommu memory +an object was reachable at 0x[0-9a-f]+.*revoked, and the device was then refused it" "$LOG"; then
+        pass "a revoked object is taken away from the device, not just from the page tables"
     else
-        fail "a device reached an address it was never given, or the refusal was not reported"
+        fail "a device kept reaching a revoked object, or the refusal was not reported"
         status=1
     fi
 

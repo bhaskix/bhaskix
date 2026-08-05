@@ -142,8 +142,17 @@ pub enum Rank {
     /// not by blocking. Outside the console, because a driver reports what it
     /// found while holding itself.
     Block = 14,
+    /// `iommu::WINDOW` — the device windows a unit translates through.
+    ///
+    /// Inside `shared::ARENA`, because revoking a memory object takes the arena
+    /// first and unmaps from the device afterwards. A leaf otherwise: the
+    /// register window is mapped once at bring-up and cached, so invalidating
+    /// an IOTLB while holding this takes nothing — which it must not, because
+    /// mapping MMIO reaches the heap, and the heap is the *outermost* lock
+    /// here.
+    DmaWindow = 15,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
-    Console = 15,
+    Console = 16,
 }
 
 impl Rank {
@@ -183,6 +192,7 @@ impl Rank {
             Self::IrqHandlers => "irq::HANDLERS",
             Self::Vectors => "vectors::TABLE",
             Self::Block => "virtio::DEVICE",
+            Self::DmaWindow => "iommu::WINDOW",
             Self::Console => "console::CONSOLE",
         }
     }

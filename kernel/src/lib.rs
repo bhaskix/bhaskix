@@ -372,13 +372,6 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("    virtio-blk     FAILED");
     }
 
-    // Last thing done to the device: it leaves a request unanswered on purpose.
-    if let Some((found, window)) = iommu_state.as_ref()
-        && !iommu_refusal_self_test(found, window, handoff.hhdm_base.as_u64())
-    {
-        println!("    iommu refusal  FAILED");
-    }
-
     // What a device can reach, said once it is settled rather than before.
     iommu::report_dma(iommu_state.is_some());
     if let Some((found, _)) = iommu_state.as_ref() {
@@ -486,6 +479,23 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             "    lock order     clean through bring-up too ({} acquisitions checked)",
             sync::acquisitions()
         );
+    }
+
+    // RFC 0012 steps 4 and 5 in one demonstration, and it is deliberately one.
+    //
+    // A refused request never completes, so it leaves the queue unusable and
+    // whichever of these ran second would find a device that no longer
+    // answers -- reporting "nothing refused it" about a machine where nothing
+    // had been *asked*. Merging them also makes the sharper test the only one:
+    // an address the device *had* and lost isolates the page tables from every
+    // other reason an access might fail, which an address that was never
+    // mapped does not.
+    //
+    // Last thing done to the device.
+    if let Some((found, _)) = iommu_state.as_ref()
+        && !iommu_memory_self_test(found, handoff.hhdm_base.as_u64())
+    {
+        println!("    iommu memory   FAILED");
     }
 
     println!();
@@ -2155,69 +2165,84 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
 ///
 /// `None` on any machine without a usable unit, which is every machine this
 /// project was tested on until today, and the path that must stay unchanged.
-/// RFC 0012's negative test: an address outside the window is refused.
+/// RFC 0012 step 5: a `Memory` object a device can reach, and a revoke that
+/// takes it away from the device too.
 ///
-/// The claim this whole RFC makes is that hardware stops a device reaching
-/// what it was not given. The only convincing evidence is to try it, so this
-/// hands the device an address the driver never mapped and asserts two things:
-/// the read does **not** succeed, and the unit records a fault naming *this*
-/// device, the address, and the direction.
+/// The two RFCs meet here. RFC 0009's object is frames plus an owner plus a
+/// revocation that must complete; RFC 0012 makes a device window one of the
+/// places such an object can be mapped. What has to be true afterwards is not
+/// "the tables were edited" but that the **device** can no longer reach it —
+/// so that is what this asks the device.
 ///
-/// Runs only where translation is actually on, which is the machine with a
-/// unit. It deliberately leaves an unanswered request in the queue — a refused
-/// access never completes — so it is the last thing done to the device.
-fn iommu_refusal_self_test(found: &iommu::Report, window: &iommu::Window, hhdm: u64) -> bool {
-    // Inside the window's range so the *width* is not what refuses it, and far
-    // from anything mapped. What must refuse this is the absent page-table
-    // entry, not an address the hardware could not form.
-    let unmapped = window.addresses.limit() & !(bhaskix_arch::vtd::PAGE_SIZE - 1);
+/// Runs last, and only where translation is on. It deliberately ends with a
+/// refused request outstanding.
+fn iommu_memory_self_test(found: &iommu::Report, hhdm: u64) -> bool {
+    let Ok(owner) = domain::create("dma-object", domain::ResourceEnvelope::new()) else {
+        println!("    iommu memory   FAILED to create a domain");
+        return false;
+    };
+    let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
+        println!("    iommu memory   FAILED to create a memory object");
+        domain::destroy(owner);
+        return false;
+    };
 
-    let outcome = virtio::read_into(0, unmapped);
+    let Some(address) =
+        iommu::map_memory(object, bhaskix_arch::vtd::Rights::READ_WRITE, false, hhdm)
+    else {
+        println!("    iommu memory   FAILED to map the object into the device window");
+        domain::destroy(owner);
+        return false;
+    };
+
+    // Reachable: the device is asked to write a sector into the object, and
+    // the unit must not complain.
+    let before = virtio::read_into(0, address.as_u64());
     // SAFETY: the unit `iommu_bringup` mapped and programmed.
-    let fault = unsafe { iommu::take_fault(found, hhdm) };
+    let faulted_while_mapped = unsafe { iommu::take_fault(found, hhdm) };
 
-    // The assertion is the *refusal*, not the request failing.
-    //
-    // A first version required `read_into` to return an error, and the device
-    // completed the request anyway: virtio posts a completion for a request
-    // whose data write the IOMMU refused, because from the device's side the
-    // transfer was attempted and the ring entry is finished. Requiring an
-    // error therefore tested the driver's plumbing, not the protection —
-    // and reported "the device read an address it was not given" about a
-    // machine where the hardware had refused exactly as designed.
-    match fault {
-        Some(fault)
-            if fault.device == window.device
-                && fault.address & !(bhaskix_arch::vtd::PAGE_SIZE - 1) == unmapped =>
-        {
-            let (bus, slot, function) = fault.device;
+    // Revoked. RFC 0009's walk now has a device window in it.
+    let removed = shared::revoke(object);
+
+    // And unreachable, which is the whole assertion: the same address, the
+    // same device, and now a refusal.
+    let _after = virtio::read_into(0, address.as_u64());
+    // SAFETY: as above.
+    let faulted_after = unsafe { iommu::take_fault(found, hhdm) };
+
+    domain::destroy(owner);
+
+    match (before, faulted_while_mapped, faulted_after) {
+        (Ok(()) | Err(_), None, Some(fault)) => {
             println!(
-                "    iommu refusal  {bus:02x}:{slot:02x}.{function} was refused {:#x} ({}), \
-                 reason {:#04x}; the request {} -- the device cannot reach what it was not given",
-                fault.address,
-                if fault.read { "read" } else { "write" },
-                fault.reason,
-                if outcome.is_err() {
-                    "failed"
+                "    iommu memory   an object was reachable at {:#x}{}, {removed} mappings \
+                 revoked, and the device was then refused it ({:#x}, reason {:#04x})",
+                address.as_u64(),
+                if before.is_ok() {
+                    ""
                 } else {
-                    "completed"
-                }
+                    " (the request did not complete)"
+                },
+                fault.address,
+                fault.reason
             );
             true
         }
-        // A fault, but not the one asked for. Naming the wrong device or the
-        // wrong address is worse than none: it would send an investigation
-        // somewhere there is nothing to find.
-        Some(fault) => {
+        (_, Some(fault), _) => {
             println!(
-                "    iommu refusal  FAILED: a fault was recorded, but for {:?} at {:#x}",
-                fault.device, fault.address
+                "    iommu memory   FAILED: the device could not reach a mapped object \
+                 ({:#x}, reason {:#04x})",
+                fault.address, fault.reason
             );
             false
         }
-        // The dangerous one: nothing refused it.
-        None => {
-            println!("    iommu refusal  FAILED: THE DEVICE REACHED AN ADDRESS IT WAS NOT GIVEN");
+        // The one that matters. Revocation edited the tables and the device
+        // kept reaching the frames anyway.
+        (_, _, None) => {
+            println!(
+                "    iommu memory   FAILED: THE DEVICE STILL REACHED A REVOKED OBJECT at {:#x}",
+                address.as_u64()
+            );
             false
         }
     }
@@ -2263,6 +2288,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // SAFETY: the unit just programmed above.
     let transition = unsafe { iommu::take_fault(&found, hhdm) };
 
+    iommu::install(found, window);
     println!(
         "    iommu window   {bus:02x}:{slot:02x}.{function} {}-bit, {} levels, \
          {reserved} reserved pages mapped, {refused} refused",

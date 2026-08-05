@@ -30,6 +30,23 @@ use bhaskix_boot::PhysAddr;
 use bhaskix_arch::vtd;
 
 use crate::println;
+use crate::sync::{Rank, SpinLock};
+
+/// The one window, once it exists.
+///
+/// Global because revocation must reach it. RFC 0009's `revoke` walks an
+/// object's mappings and removes them; step 5 makes a device window one of the
+/// places an object can be mapped, so the revoke path needs the window without
+/// having been handed it.
+static WINDOW: SpinLock<Option<(Report, Window)>> = SpinLock::new(Rank::DmaWindow, None);
+
+/// The unit's register window, mapped once.
+///
+/// Cached rather than mapped per use, and that is a locking decision rather
+/// than a performance one: mapping MMIO reaches the heap, which is the
+/// outermost lock here, and invalidating an IOTLB happens while holding the
+/// innermost. Doing it per use would be an inversion on every unmap.
+static UNIT_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// What discovery found, if anything.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -175,6 +192,12 @@ impl DevAddr {
     #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// Rebuilds one from an address this module handed out.
+    #[must_use]
+    pub const fn from_u64(address: u64) -> Self {
+        Self(address)
     }
 }
 
@@ -590,6 +613,100 @@ pub fn map_reserved(
     (mapped, refused)
 }
 
+/// Installs the window everything else will reach through.
+///
+/// Called once, at bring-up. Revocation needs the window without having been
+/// handed it — an object's owner asks for it to be revoked, and what that has
+/// to reach is whichever device was given the object.
+pub fn install(report: Report, window: Window) {
+    *WINDOW.lock() = Some((report, window));
+}
+
+/// Whether a window exists to map into.
+#[must_use]
+pub fn present() -> bool {
+    WINDOW.lock().is_some()
+}
+
+/// Maps a `Memory` object into the device window, and records it.
+///
+/// RFC 0012 step 5, and RFC 0009's `Memory` on the other side of it: the same
+/// frames a domain can share with another domain are what a device is given,
+/// through the same object and the same revocation. Returns where the device
+/// should look.
+///
+/// `None` if there is no window, the object is gone, or the window has no
+/// room — all refusals, because a device that was told an address for a
+/// mapping that did not happen reads whatever is there instead.
+pub fn map_memory(
+    id: crate::shared::MemoryId,
+    rights: vtd::Rights,
+    below_4gib: bool,
+    hhdm: u64,
+) -> Option<DevAddr> {
+    let (frames, count) = crate::shared::frames_of(id)?;
+    if count == 0 {
+        return None;
+    }
+
+    let mut guard = WINDOW.lock();
+    let (_, window) = guard.as_mut()?;
+
+    // The object's frames need not be contiguous in physical memory, and the
+    // device needs them contiguous in *its* address space -- which is most of
+    // what an IOMMU is for. So the address is allocated once and each frame is
+    // placed at its own offset within it.
+    let address = window.addresses.allocate(count as u64, below_4gib)?;
+    for (page, frame) in frames.iter().take(count).enumerate() {
+        let at = address.as_u64() + (page as u64) * vtd::PAGE_SIZE;
+        let physical = frame * bhaskix_mm::FRAME_SIZE;
+        if !map_page(window, at, physical, rights, hhdm) {
+            // Nothing half-mapped: the device would reach part of an object
+            // and fault on the rest, which reads as a driver bug.
+            for done in 0..page {
+                let at = address.as_u64() + (done as u64) * vtd::PAGE_SIZE;
+                let _ = clear_page(window, at, hhdm);
+            }
+            window.addresses.free(address, count as u64);
+            return None;
+        }
+    }
+    drop(guard);
+
+    if !crate::shared::record_device_mapping(id, address.as_u64(), count as u64) {
+        // Recorded or not mapped. An object whose device mapping is not
+        // written down is one revocation cannot find, which is a page a device
+        // keeps after the object naming it is destroyed.
+        unmap_device(address.as_u64(), count as u64);
+        return None;
+    }
+    Some(address)
+}
+
+/// Removes a device mapping recorded against a `Memory` object.
+///
+/// Called by RFC 0009's `revoke`. Invalidates before returning, for the same
+/// reason `unmap` does: until the IOTLB is invalidated the device still
+/// reaches the page that has just been taken away from it.
+pub fn unmap_device(address: u64, pages: u64) -> bool {
+    let mut guard = WINDOW.lock();
+    let Some((_, window)) = guard.as_mut() else {
+        return false;
+    };
+    let hhdm = crate::shared::hhdm();
+    for page in 0..pages {
+        let at = address + page * vtd::PAGE_SIZE;
+        if !clear_page(window, at, hhdm) {
+            return false;
+        }
+    }
+    window.addresses.free(DevAddr::from_u64(address), pages);
+    drop(guard);
+
+    // SAFETY: the unit `enable` programmed and whose registers it cached.
+    unsafe { invalidate() }
+}
+
 /// Whether a firmware-reserved region overlaps the kernel's own image.
 ///
 /// Both bounds are inclusive: a limit is the last byte, not one past it, and
@@ -684,6 +801,7 @@ pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), 
             return Err("the unit did not report translation enabled");
         }
     }
+    UNIT_BASE.store(base, core::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -755,13 +873,7 @@ pub fn map(
 /// which is exactly the window RFC 0012 calls out as the difference between
 /// strict and deferred invalidation. Strict, here, and the cost is measured
 /// rather than assumed away.
-pub fn unmap(
-    window: &mut Window,
-    report: &Report,
-    address: DevAddr,
-    pages: u64,
-    hhdm: u64,
-) -> bool {
+pub fn unmap(window: &mut Window, address: DevAddr, pages: u64, hhdm: u64) -> bool {
     for page in 0..pages {
         let Some(offset) = page.checked_mul(vtd::PAGE_SIZE) else {
             return false;
@@ -775,9 +887,8 @@ pub fn unmap(
     }
     window.addresses.free(address, pages);
 
-    // SAFETY: the unit this window was programmed into, already mapped by
-    // `enable`.
-    unsafe { invalidate(report, hhdm) }
+    // SAFETY: the unit this window was programmed into, mapped by `enable`.
+    unsafe { invalidate() }
 }
 
 /// Clears one page's entry, leaving the levels above it in place.
@@ -815,11 +926,11 @@ fn clear_page(window: &Window, address: u64, hhdm: u64) -> bool {
 /// # Safety
 ///
 /// The unit must be the one this window is programmed into.
-unsafe fn invalidate(report: &Report, hhdm: u64) -> bool {
-    let Some(base) = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)
-    else {
+unsafe fn invalidate() -> bool {
+    let base = UNIT_BASE.load(core::sync::atomic::Ordering::Acquire);
+    if base == 0 {
         return false;
-    };
+    }
     // SAFETY: the caller's obligation.
     unsafe {
         let unit = vtd::Unit::new(base as *mut u8);

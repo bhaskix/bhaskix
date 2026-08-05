@@ -103,6 +103,15 @@ struct Mapping {
     pages: u64,
 }
 
+/// Where a device reaches an object.
+#[derive(Clone, Copy)]
+pub struct DeviceMapping {
+    /// The address the *device* uses, which is not a physical one.
+    pub address: u64,
+    /// How many pages from there.
+    pub pages: u64,
+}
+
 /// One object.
 #[derive(Clone, Copy)]
 struct Object {
@@ -117,6 +126,14 @@ struct Object {
     owner: DomainId,
     /// Every address space this is mapped into. Walked by [`revoke`].
     mappings: [Option<Mapping>; MAX_MAPPINGS],
+    /// Where a *device* reaches this object, if one was given it.
+    ///
+    /// RFC 0012 step 5. A device mapping is the case that makes the bound on
+    /// `mappings` worth having: revoking must complete, and it now has an
+    /// IOTLB to invalidate per entry as well as a page table to edit. One
+    /// window exists today; when there are more this becomes an array with
+    /// exactly the same reasoning behind its size.
+    device: Option<DeviceMapping>,
     generation: u32,
     live: bool,
 }
@@ -129,6 +146,7 @@ impl Object {
             length: 0,
             owner: DomainId::from_u32(0),
             mappings: [None; MAX_MAPPINGS],
+            device: None,
             generation: 0,
             live: false,
         }
@@ -224,6 +242,7 @@ pub fn create(owner: DomainId, length: u64) -> Result<MemoryId, MemoryError> {
                     length: pages * FRAME_SIZE,
                     owner,
                     mappings: [None; MAX_MAPPINGS],
+                    device: None,
                     generation,
                     live: true,
                 };
@@ -401,15 +420,21 @@ pub fn revoke(id: MemoryId) -> usize {
     // Take the list out under the arena; do the page-table work outside it,
     // because unmapping walks tables through the direct map and shooting down
     // a TLB sends an interrupt to every other CPU.
-    let (mappings, hhdm) = {
+    let (mappings, device, hhdm) = {
         let mut arena = ARENA.lock();
         let Some(object) = resolve(&arena, id) else {
             return 0;
         };
         let index = id.index as usize;
         let mappings = object.mappings;
+        let device = object.device;
         arena.objects[index].mappings = [None; MAX_MAPPINGS];
-        (mappings, HHDM.load(core::sync::atomic::Ordering::Relaxed))
+        arena.objects[index].device = None;
+        (
+            mappings,
+            device,
+            HHDM.load(core::sync::atomic::Ordering::Relaxed),
+        )
     };
 
     let mut removed = 0;
@@ -431,9 +456,55 @@ pub fn revoke(id: MemoryId) -> usize {
         removed += 1;
     }
 
+    // And out of the device's window, which is the half RFC 0012 step 5 adds.
+    // A revocation that removed a page from every address space and left a
+    // device reaching it would be the same failure as leaving one CPU's TLB
+    // entry behind -- gone from the tables, and still working.
+    if let Some(device) = device {
+        removed += usize::from(crate::iommu::unmap_device(device.address, device.pages));
+    }
+
     REVOKED.fetch_add(removed as u64, core::sync::atomic::Ordering::Relaxed);
     destroy(id);
     removed
+}
+
+/// The direct map base this module was given at bring-up.
+///
+/// Kept because unmapping happens from paths that were not handed one — a
+/// revocation reaches a device window, and the caller asking for the revoke
+/// has no reason to know where physical memory is mapped.
+#[must_use]
+pub fn hhdm() -> u64 {
+    HHDM.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records that a device can reach this object at `address`.
+///
+/// Returns false if the object is gone, or already reachable by a device —
+/// mapping one twice would leave the first address unrevoked, which is a page
+/// a device keeps after the object naming it has been destroyed.
+pub fn record_device_mapping(id: MemoryId, address: u64, pages: u64) -> bool {
+    let mut arena = ARENA.lock();
+    if resolve(&arena, id).is_none() {
+        return false;
+    }
+    let object = &mut arena.objects[id.index as usize];
+    if object.device.is_some() {
+        return false;
+    }
+    object.device = Some(DeviceMapping { address, pages });
+    true
+}
+
+/// The frames this object is made of, in order.
+///
+/// For whoever is about to map them somewhere this module does not know about
+/// — a device window, today. Returns `None` for an object that has gone.
+pub fn frames_of(id: MemoryId) -> Option<([u64; MAX_FRAMES], usize)> {
+    let arena = ARENA.lock();
+    let object = resolve(&arena, id)?;
+    Some((object.frames, object.count))
 }
 
 /// Names a `Memory` object with a capability, so it can be granted.
@@ -583,6 +654,7 @@ mod tests {
             length: FRAME_SIZE,
             owner: DomainId::from_u32(1),
             mappings: [None; MAX_MAPPINGS],
+            device: None,
             generation: 7,
             live: true,
         };
