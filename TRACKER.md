@@ -504,6 +504,63 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-05 (a deadline that could never be reached)
+
+- **One boot in four, on one CPU, stopped dead.** `fault-test` is the only harness that runs
+  single-processor, and it boots six times: at 29% a boot, a clean sweep had about a **one in eight**
+  chance. Every green run of the suite this milestone was luck, including the one that was pushed on.
+- **Not a regression, and I said it was.** The first comparison was 0-of-8 against 2-of-8 and I read
+  it as "I broke this". Twenty-four runs of each: **HEAD 7/24, the working tree 5/24** -- the same
+  bug, present since the driver started waiting on interrupts.
+- **The machine was asked where it was.** No output, so the QEMU monitor: `HLT=1`, and the halted
+  `RIP` minus the KASLR slide symbolised to `sched::block_self`. Then the counters, read out of the
+  hung guest at their symbol addresses: `DEFERRED_WAKES` empty, `DEFERRED_LOST` 0, and
+  `notify::SIGNALS 2` against `notify::UNWAITED 2`. Nothing had been deferred and nothing lost --
+  **no wake had been sent to a waiter at all.**
+- **`await_completion` computed a deadline and then blocked past it.** `notify::wait_once` sleeps
+  until it is signalled and no longer, so the deadline check at the top of the loop was unreachable.
+  On one CPU the waiting thread is the only runnable one: the scheduler halts, the tick stops for
+  being idle, and nothing is left that could re-evaluate anything. `time::wake_at` arms the clock
+  before blocking, which the tickless path already honours -- it arms for the soonest outstanding
+  timer. **RFC 0011 says a device that stops answering must not stop the kernel; the driver simply
+  never armed the clock that made it true.**
+- **What this does not fix.** All 24 runs now report `1 waits, 0 spins` and *no* timeout, so the
+  deadline is not firing -- it is guaranteeing the CPU wakes and looks again. Why a signal found no
+  waiter is still unexplained. The hang is gone; the oddity underneath it is written down rather
+  than declared solved.
+- **Two real windows closed on the way**, neither sufficient on its own: `restore_interrupts` then
+  `cpu::halt` let an interrupt land between the `sti` and the `hlt` and be acted on before the CPU
+  slept anyway (now the architectural `sti; hlt` pair), and deferred wakes are now drained before
+  halting rather than only from a tick that an idle CPU has stopped.
+- **The soak harness could not have found this.** It boots with four CPUs, where another thread
+  keeps the machine alive and the fault is invisible: **0 in 100**. One CPU is a different machine.
+
+### 2026-08-05 (the same window, everywhere it was)
+
+- **The rendezvous fix named a pattern, so the pattern was worth hunting.** `mark_blocked`, then a
+  check, then either `cancel_block` or `block_self`, leaves a thread *marked blocked and still
+  running*. Where the check **consumes** what it was waiting for, a tick landing in that window is
+  fatal: the wake is already spent and nothing will ever select the thread again.
+- **`notify::wait` and `wait_once` had it exactly.** The look is `pending.swap(0)` -- it takes the
+  bits. A thread preempted between taking them and clearing its own mark has swallowed the only
+  signal that was coming; the block driver raises **one interrupt per request**, so there is no
+  second one to save it. Same bug as the IPC stall, in a place with an atomic instead of a mailbox.
+- **`sched::block_unless` is the shape that cannot go wrong.** The condition and the mark happen
+  under one hold of the runqueue lock, which `preempt` reaches with `try_lock` and declines. Its
+  one rule is written on it: **the closure must not take a lock**, because it runs under one.
+- **The IPC fix had a smaller version of its own residual.** `mark_blocked` and
+  `take_message_awake` were two lock acquisitions, so a tick between them stranded a thread whose
+  message had arrived while it was awake -- the wake missed, then the mark, then nothing.
+  `take_message_or_block` now decides all three outcomes under the single lock.
+- **And the endpoint-destroyed paths, which is why `LIVE` exists.** Giving up needs to be decided
+  in that same locked step, but `live()` takes the table lock and a table lock under a runqueue lock
+  inverts against every path that takes them the other way. A lock-free mirror of the flag, written
+  before the queues are cleared and before anyone is woken, lets the decision happen where it has
+  to. **No `cancel_block` remains in `ipc.rs` or `notify.rs`.**
+- **40 boots on the machine that used to fail 14 of 40.** `wait.rs` keeps the older shape and is
+  correct with it: it enqueues *before* marking, so its check does not consume anything and a waker
+  always finds it. `time.rs` likewise -- an expired deadline does not go away when it is read.
+
 ### 2026-08-05 (the rendezvous that stalled, and the machine that could see it)
 
 - **A second machine changed the answer.** The same ISO that passes here failed the IPC self-test

@@ -807,9 +807,32 @@ fn await_completion(
 
         match notification {
             Some(id) => {
-                WAITS.fetch_add(1, Ordering::Relaxed);
-                if crate::notify::wait_once(id).is_err() {
-                    return Err(BlockError::TimedOut);
+                // Arm the deadline *before* blocking, or it is not a deadline.
+                //
+                // `wait_once` sleeps until the notification is signalled and
+                // no longer. Without a timer the check at the top of this loop
+                // is unreachable, so a completion interrupt that never arrives
+                // does not fail this request -- it stops the machine. On a
+                // single-processor boot, where the waiting thread is the only
+                // runnable one, that is a dead machine with no output, and it
+                // is what the fault-injection harness had been reporting about
+                // one boot in four.
+                //
+                // RFC 0011: a device that stops answering must not stop the
+                // kernel.
+                if crate::time::wake_at(deadline) {
+                    WAITS.fetch_add(1, Ordering::Relaxed);
+                    let woken = crate::notify::wait_once(id);
+                    crate::time::cancel_wake();
+                    if woken.is_err() {
+                        return Err(BlockError::TimedOut);
+                    }
+                } else {
+                    // No timer left to wake us, so blocking here would be
+                    // sleeping without a deadline. Spin instead: slower, and
+                    // it still ends.
+                    SPINS.fetch_add(1, Ordering::Relaxed);
+                    core::hint::spin_loop();
                 }
             }
             None => {

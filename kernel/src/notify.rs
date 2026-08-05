@@ -247,19 +247,28 @@ pub fn wait(id: NotificationId) -> Result<u64, NotifyError> {
         .map_err(|_| NotifyError::Congested)?;
 
     let outcome = loop {
-        // Mark blocked first, look second. A signal landing in between is
-        // found by the look; one landing after it finds a thread that is
+        // Look and mark under one hold of the runqueue lock. A signal landing
+        // before the look is found by it; one landing after finds a thread
         // already `Blocked` and wakes it.
-        crate::sched::mark_blocked();
-
-        let word = slot.pending.swap(0, Ordering::AcqRel);
-        if word != 0 {
-            crate::sched::cancel_block();
-            break Ok(word);
-        }
-        if !slot.live.load(Ordering::Acquire) {
-            crate::sched::cancel_block();
-            break Err(NotifyError::Gone);
+        //
+        // The two must not come apart, and this is why: the look *consumes*
+        // the pending word. A thread that took the bits and was then preempted
+        // while still marked blocked has spent the only signal that was coming
+        // -- the block driver raises exactly one interrupt per request -- and
+        // sleeps for ever holding the event it was woken for. That is the
+        // failure the IPC rendezvous had, in a place with an atomic instead of
+        // a mailbox.
+        if let Some(outcome) = crate::sched::block_unless(|| {
+            let word = slot.pending.swap(0, Ordering::AcqRel);
+            if word != 0 {
+                Some(Ok(word))
+            } else if slot.live.load(Ordering::Acquire) {
+                None
+            } else {
+                Some(Err(NotifyError::Gone))
+            }
+        }) {
+            break outcome;
         }
         crate::sched::block_self();
     };
@@ -294,11 +303,13 @@ pub fn wait_once(id: NotificationId) -> Result<u64, NotifyError> {
         .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| NotifyError::Congested)?;
 
-    // Mark blocked first, look second -- the rule, once more.
-    crate::sched::mark_blocked();
-    let word = slot.pending.swap(0, Ordering::AcqRel);
-    if word != 0 {
-        crate::sched::cancel_block();
+    // Look and mark together -- the rule, once more, and for the same reason:
+    // the look takes the bits, so a thread preempted between taking them and
+    // clearing its own blocked mark has nothing left to wake it.
+    if let Some(word) = crate::sched::block_unless(|| {
+        let word = slot.pending.swap(0, Ordering::AcqRel);
+        (word != 0).then_some(word)
+    }) {
         slot.waiter.store(0, Ordering::Release);
         return Ok(word);
     }

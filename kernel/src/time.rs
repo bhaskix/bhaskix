@@ -205,6 +205,35 @@ fn arm_for(thread: u32, deadline: u64) -> bool {
     TIMERS[cpu].lock().insert(Timer { deadline, thread })
 }
 
+/// Wakes the calling thread at `deadline`, whatever else it is waiting for.
+///
+/// For a caller that is about to block on something *else* and must not sleep
+/// past a deadline it has already decided on. [`crate::notify::wait_once`]
+/// blocks until it is signalled and no longer; a driver that computes a
+/// timeout and then blocks without arming this has computed a deadline it can
+/// never reach, and an interrupt that does not arrive stops the machine rather
+/// than the request.
+///
+/// The tickless path arms for the soonest outstanding timer, so this keeps an
+/// otherwise idle CPU ticking until it fires.
+///
+/// Returns `false` if this CPU's timer queue is full, in which case the caller
+/// **must not** block indefinitely — there is nothing left to wake it.
+#[must_use]
+pub fn wake_at(deadline: u64) -> bool {
+    let Some(me) = crate::sched::current_thread_id() else {
+        return false;
+    };
+    arm_for(me, deadline)
+}
+
+/// Cancels a timer armed by [`wake_at`].
+pub fn cancel_wake() {
+    if let Some(me) = crate::sched::current_thread_id() {
+        cancel_for(me);
+    }
+}
+
 /// Cancels any timer for `thread` on this CPU.
 fn cancel_for(thread: u32) {
     let cpu = percpu::cpu_id() as usize;

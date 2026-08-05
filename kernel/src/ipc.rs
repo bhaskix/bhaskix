@@ -52,7 +52,7 @@
 //!   own CPU and takes an IPI otherwise; either way the woken thread runs when
 //!   its CPU next schedules.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sched;
 use crate::sync::{Rank, SpinLock};
@@ -147,6 +147,29 @@ pub fn replay(mut visit: impl FnMut(&'static str, u32, u32)) {
 
 /// Endpoints that can exist at once.
 pub const MAX_ENDPOINTS: usize = 32;
+
+/// Mirrors each endpoint's `live` flag outside the table lock.
+///
+/// A blocked receiver has to notice that its endpoint died *while holding its
+/// runqueue lock* -- that is the only way the decision and the blocked mark can
+/// be one step. [`live`] cannot serve: it takes the table lock, and a table
+/// lock nested under a runqueue lock is an inversion against every path that
+/// takes them the other way round.
+///
+/// Written false before [`destroy`] clears the queues and before it wakes
+/// anyone, so a receiver either reads false here or is woken afterwards.
+static LIVE: [AtomicBool; MAX_ENDPOINTS] = [const { AtomicBool::new(false) }; MAX_ENDPOINTS];
+
+/// Whether an endpoint still exists.
+///
+/// The only way to ask. A table-lock version existed and was deleted rather
+/// than kept beside this one: it cannot be called from where the question
+/// actually matters -- under a runqueue lock -- and a second, more obvious
+/// spelling of "is it alive" is a trap for whoever reaches for it there.
+fn live(id: EndpointId) -> bool {
+    LIVE.get(id.0 as usize)
+        .is_some_and(|live| live.load(Ordering::Acquire))
+}
 
 /// Threads that can be queued on one endpoint in each direction.
 ///
@@ -342,6 +365,7 @@ pub fn create() -> Result<EndpointId, IpcError> {
         receivers: [None; MAX_QUEUED],
         live: true,
     };
+    LIVE[index].store(true, Ordering::Release);
     Ok(EndpointId(index as u32))
 }
 
@@ -372,6 +396,9 @@ pub fn destroy(id: EndpointId) -> usize {
         }
 
         endpoint.live = false;
+        // Before the queues are cleared and before anyone is woken: a receiver
+        // that looks after this point gives up on its own.
+        LIVE[id.0 as usize].store(false, Ordering::Release);
         endpoint.generation = endpoint.generation.wrapping_add(1);
         endpoint.senders = [None; MAX_QUEUED];
         endpoint.receivers = [None; MAX_QUEUED];
@@ -450,17 +477,14 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
     // mark is found by the check below; one delivered *after* it sets this
     // thread ready, and `block_self` returns without sleeping.
     loop {
-        sched::mark_blocked();
-        // Takes the reply and clears the blocked mark together: separating them
-        // loses this thread if a tick lands between the two.
-        if let Some((reply, _)) = sched::take_message_awake(me) {
-            return Ok(reply);
+        // Reply, keep waiting, or give up -- decided and marked under one hold
+        // of the runqueue lock, so a tick cannot land between the decision and
+        // the mark and leave this thread blocked with nothing left to wake it.
+        match sched::take_message_or_block(me, || live(id)) {
+            sched::Delivery::Message((reply, _)) => return Ok(reply),
+            sched::Delivery::Abandoned => return Err(IpcError::NoSuchEndpoint),
+            sched::Delivery::Blocked => sched::block_self(),
         }
-        if !live(id) {
-            sched::cancel_block();
-            return Err(IpcError::NoSuchEndpoint);
-        }
-        sched::block_self();
     }
 }
 
@@ -490,22 +514,24 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
         // Mark first, check second — see `call` for why the other order loses
         // messages.
         Rendezvous::Queued => loop {
-            sched::mark_blocked();
-            if let Some((message, from)) = sched::take_message_awake(me) {
-                RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
-                trace(Event::RecvTook, me, from);
-                return Ok((message, from));
-            }
-            RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
-            if !live(id) {
+            match sched::take_message_or_block(me, || live(id)) {
+                sched::Delivery::Message((message, from)) => {
+                    RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
+                    trace(Event::RecvTook, me, from);
+                    return Ok((message, from));
+                }
                 // The endpoint was destroyed under us. Leaving the queue entry
-                // behind would have a later rendezvous deliver to a thread
-                // that has gone.
-                sched::cancel_block();
-                cancel(id, me);
-                return Err(IpcError::NoSuchEndpoint);
+                // behind would have a later rendezvous deliver to a thread that
+                // has gone.
+                sched::Delivery::Abandoned => {
+                    cancel(id, me);
+                    return Err(IpcError::NoSuchEndpoint);
+                }
+                sched::Delivery::Blocked => {
+                    RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
+                    sched::block_self();
+                }
             }
-            sched::block_self();
         },
     }
 }
@@ -529,16 +555,6 @@ pub fn reply(caller: u32, message: Message) -> Result<(), IpcError> {
     TABLE.lock().replied += 1;
     sched::wake(caller);
     Ok(())
-}
-
-/// Whether an endpoint still exists.
-#[must_use]
-pub fn live(id: EndpointId) -> bool {
-    TABLE
-        .lock()
-        .endpoints
-        .get(id.0 as usize)
-        .is_some_and(|endpoint| endpoint.live)
 }
 
 /// `(dropped, wake_missed, recv_returned, reply_tried, reply_no_caller, recv_empty)`.

@@ -77,6 +77,34 @@ pub unsafe fn halt() {
     }
 }
 
+/// Enables interrupts and halts, with nothing in between.
+///
+/// The two must be one instruction pair, and this is the whole reason the
+/// function exists. Enabling interrupts and *then* halting as two separate
+/// steps leaves a window: an interrupt delivered in it runs its handler — which
+/// may be the very handler that makes a thread runnable — returns, and then
+/// `hlt` executes anyway. The CPU sleeps with work waiting, and wakes only if
+/// something else happens to interrupt it. Where the timer has been stopped for
+/// being idle and a device's line is masked until its driver acknowledges,
+/// nothing else does: the machine stops for good.
+///
+/// `sti` does not take effect until after the instruction following it, so
+/// `sti; hlt` cannot be interrupted between the two. That shadow is
+/// architectural and exists for exactly this sequence.
+///
+/// # Safety
+///
+/// Safe to execute at CPL 0. The caller must intend for interrupts to be
+/// enabled on return — this leaves them enabled whatever they were before.
+pub unsafe fn enable_interrupts_and_halt() {
+    // SAFETY: `sti` followed immediately by `hlt` at CPL 0. The interrupt
+    // shadow of `sti` covers the `hlt`, so no interrupt can be taken between
+    // them. Neither instruction touches memory.
+    unsafe {
+        core::arch::asm!("sti", "hlt", options(nomem, nostack));
+    }
+}
+
 /// Stops this CPU permanently.
 ///
 /// Disables interrupts and halts in a loop. The loop matters: `hlt` can wake

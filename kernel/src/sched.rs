@@ -997,19 +997,42 @@ pub fn has_message(thread: u32) -> bool {
 ///
 /// Measured as an IPC rendezvous that stalled after exactly one delivery, on a
 /// host fast enough to land a timer tick in a two-instruction window.
-#[must_use]
-pub fn take_message_awake(thread: u32) -> Option<(crate::ipc::Message, u32)> {
+pub fn take_message_or_block(
+    thread: u32,
+    still_waiting: impl FnOnce() -> bool,
+) -> Delivery<(crate::ipc::Message, u32)> {
     for queue in QUEUES.iter().take(percpu::online_count() as usize) {
         let mut queue = queue.lock();
         if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
-            let message = target.mailbox.take();
-            if message.is_some() && target.state == State::Blocked {
+            // All three outcomes decided here, under the one lock. Marking
+            // from a separate call would release it in between, and a tick
+            // landing there strands a thread whose message had already arrived
+            // and whose wake had already been spent finding it awake.
+            if let Some(message) = target.mailbox.take() {
                 target.state = State::Running;
+                return Delivery::Message(message);
             }
-            return message;
+            if still_waiting() {
+                target.state = State::Blocked;
+                return Delivery::Blocked;
+            }
+            target.state = State::Running;
+            return Delivery::Abandoned;
         }
     }
-    None
+    Delivery::Abandoned
+}
+
+/// What [`take_message_or_block`] concluded.
+pub enum Delivery<T> {
+    /// A message was waiting. The thread is running.
+    Message(T),
+    /// Nothing yet, and the thing being waited on is still there. The thread is
+    /// marked blocked and should yield.
+    Blocked,
+    /// What was being waited on has gone. The thread is running and should give
+    /// up rather than sleep for something that will never arrive.
+    Abandoned,
 }
 
 /// Takes the message waiting for `thread`, if there is one.
@@ -1545,6 +1568,41 @@ pub fn current_thread_id() -> Option<u32> {
     queue.threads[current].as_ref().map(|thread| thread.id)
 }
 
+/// Blocks the calling thread unless `ready` produces something first — the
+/// decision and the mark under one hold of the runqueue lock.
+///
+/// This is the safe shape of "check a condition, and sleep if it has not
+/// happened". Doing it as [`mark_blocked`], then a check, then either
+/// [`cancel_block`] or [`block_self`], leaves the thread marked `Blocked`
+/// while it is still running. A tick landing in that window switches it out
+/// blocked, and if the event it was waiting for has already been consumed —
+/// its wake spent, its bits taken — nothing will ever wake it again.
+///
+/// Holding the lock across the pair closes it: [`preempt`] reaches this
+/// runqueue with `try_lock` and gives up rather than switching a thread out
+/// mid-decision.
+///
+/// # `ready` must not take a lock
+///
+/// It runs with this CPU's runqueue lock held. Reading atomics is what it is
+/// for. Taking another lock inside it either inverts an order or, for a second
+/// runqueue lock, closes a cycle against a lock of its own rank.
+pub fn block_unless<T>(ready: impl FnOnce() -> Option<T>) -> Option<T> {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return ready();
+    }
+    let mut queue = QUEUES[cpu].lock();
+    let taken = ready();
+    if taken.is_none() {
+        let current = queue.current;
+        if let Some(thread) = queue.threads[current].as_mut() {
+            thread.state = State::Blocked;
+        }
+    }
+    taken
+}
+
 /// Marks the running thread blocked, without yielding.
 ///
 /// Split from [`block_self`] because the two happen either side of releasing a
@@ -1712,10 +1770,36 @@ pub fn block_self() {
             None => {
                 // Nothing to run here. Interrupts must be *open* while
                 // waiting, or the tick that would make something runnable can
-                // never be delivered and this loop spins for ever.
-                restore_interrupts(interrupts_were_enabled);
+                // never be delivered and this loop spins for ever -- but they
+                // are opened by the halt itself, below, and not before it.
+                //
+                // Opening them here was a lost wakeup with a two-instruction
+                // window: the interrupt that makes a thread runnable arrives
+                // between the `sti` and the `hlt`, its handler runs, and the
+                // `hlt` executes anyway. The CPU then sleeps with a `Ready`
+                // thread on its runqueue, and nothing wakes it -- the tick is
+                // stopped for being idle, and the device that would interrupt
+                // has had its source masked until a driver that is now asleep
+                // acknowledges it.
+                //
+                // Before sleeping on the belief that nothing is runnable,
+                // deliver anything an interrupt handler could not.
+                //
+                // A handler that loses `try_lock` records the wake for the
+                // tick to retry. On one CPU the lock it loses to is held by
+                // *this* thread, on its way to sleep -- and the thread it was
+                // trying to wake is this one. Halting here stops the tick that
+                // was going to deliver it, so the machine sleeps holding a
+                // wake it has already promised. Measured as a single-processor
+                // boot that stopped dead the moment the block driver waited
+                // for its completion interrupt.
+                if drain_deferred_wakes() {
+                    continue;
+                }
 
                 if interrupts_were_enabled {
+                    // `sti; hlt` as one step -- see `enable_interrupts_and_halt`.
+                    //
                     // Halt rather than spin, and the reason is not power.
                     //
                     // Spinning here means re-taking this CPU's runqueue lock
@@ -1726,9 +1810,11 @@ pub fn block_self() {
                     // because the lock is not fair. It measured as an IPC
                     // rendezvous that completed once and then stopped.
                     //
-                    // SAFETY: interrupts were enabled on entry and have just
-                    // been restored, so a timer or an IPI will wake this.
-                    unsafe { cpu::halt() };
+                    // SAFETY: interrupts were enabled on entry, so enabling
+                    // them here restores the caller's state, and the `sti`
+                    // shadow means the `hlt` cannot be reached with one
+                    // already taken and acted on.
+                    unsafe { cpu::enable_interrupts_and_halt() };
                     // SAFETY: re-masking for the next pass, as at entry.
                     unsafe { cpu::disable_interrupts() };
                 } else {
@@ -1814,7 +1900,8 @@ pub fn wake_from_interrupt(id: u32) -> bool {
 ///
 /// Called from the timer tick, still in interrupt context, so still
 /// `try_lock`: an entry that cannot be delivered now stays for the next tick.
-pub fn drain_deferred_wakes() {
+pub fn drain_deferred_wakes() -> bool {
+    let mut delivered = false;
     for slot in &DEFERRED_WAKES {
         let id = slot.load(Ordering::Acquire);
         if id == NO_THREAD {
@@ -1823,10 +1910,13 @@ pub fn drain_deferred_wakes() {
         // Cleared on anything but contention. A thread that has since woken
         // by another route, or exited, must not hold a slot for ever -- eight
         // stale entries is a table that can no longer defer anything.
-        if wake_with(id, true) != WakeResult::Contended {
+        let outcome = wake_with(id, true);
+        if outcome != WakeResult::Contended {
+            delivered |= outcome == WakeResult::Woken;
             let _ = slot.compare_exchange(id, NO_THREAD, Ordering::AcqRel, Ordering::Relaxed);
         }
     }
+    delivered
 }
 
 /// Records a wake that could not be delivered, if there is room.
@@ -1844,6 +1934,14 @@ fn defer_wake(id: u32) {
     // about the system worth seeing, and the alternative -- growing the table
     // inside an interrupt handler -- is an allocation on the fault path.
     DEFERRED_LOST.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether any wake is waiting for a tick to retry it.
+#[must_use]
+pub fn deferred_wakes_pending() -> bool {
+    DEFERRED_WAKES
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) != NO_THREAD)
 }
 
 /// Wakes that were deferred and then dropped for want of a slot.
@@ -1955,6 +2053,19 @@ fn notify(cpu: u32) {
 #[must_use]
 pub fn needs_preemption_tick(cpu: usize) -> bool {
     if cpu >= MAX_CPUS {
+        return true;
+    }
+    // A deferred wake is retried from the tick and from nowhere else, so a CPU
+    // holding one must keep ticking or it has undertaken to deliver something
+    // and then gone to sleep. That is not a slow wake, it is a lost one: the
+    // thread it was for is blocked, so the runqueue looks idle, so the tick
+    // stops, so the retry never runs.
+    //
+    // Reachable whenever an interrupt handler's `try_lock` loses to the thread
+    // it interrupted, which on one CPU is exactly when a waiter is deciding to
+    // sleep. Measured as a single-processor boot that stopped dead after the
+    // console's notification was signalled.
+    if deferred_wakes_pending() {
         return true;
     }
     let Some(queue) = QUEUES[cpu].try_lock() else {
