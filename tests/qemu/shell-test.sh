@@ -218,6 +218,12 @@ else
         # the *right* and not about the lookup, which is why the two
         # capabilities name one object.
         "a writable mapping is refused where only reading was granted:4 +memory ro +refused a writable mapping"
+        # A page of *hardware*, reached from ring 3 through a capability and
+        # nothing else. 15 is acknowledge|driver|features-ok|driver-ok: the
+        # device agreeing that a driver brought it up, which is a value only a
+        # mapping that reaches the hardware could return.
+        "a program reads device registers through a capability:5 +device ro +status 15"
+        "device registers cannot be written without the right:5 +device rw +refused a writable mapping"
         "ls read the filesystem through IPC:hello.txt"
         "cat read a file through IPC:^bhaskix.?$"
         "an unknown command was refused:nosuchcommand: not a command"

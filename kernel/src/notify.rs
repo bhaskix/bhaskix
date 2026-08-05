@@ -403,13 +403,29 @@ pub fn count() -> usize {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
     use super::*;
 
-    /// One test, because the slots are a global and cargo runs tests in
-    /// parallel. A shared arena raced by two tests is exactly the failure that
-    /// gets blamed on something else.
+    /// Held by every test in this module, one at a time.
+    ///
+    /// The slots are a global and cargo runs tests in parallel. This module
+    /// used to say "one test" for that reason and then acquired a second one,
+    /// which raced the first: the exhaustion test drains the arena and asserts
+    /// it comes back empty, and it does not if another test is holding a slot
+    /// at that moment. It failed once in a full suite run and passed on every
+    /// re-run, which is the shape of a race and the reason a comment asking
+    /// people to keep to one test was never going to hold.
+    static ARENA: Mutex<()> = Mutex::new(());
+
+    fn alone() -> MutexGuard<'static, ()> {
+        ARENA.lock().unwrap_or_else(PoisonError::into_inner)
+    }
     #[test]
     fn the_object_behaves_as_rfc_0010_specifies() {
+        let _alone = alone();
         let id = create().expect("a fresh table has room");
         assert!(live(id));
         assert_eq!(poll(id), 0, "nothing signalled yet");
@@ -450,6 +466,7 @@ mod tests {
 
     #[test]
     fn every_slot_can_be_used_and_exhaustion_is_reported() {
+        let _alone = alone();
         let mut held = alloc::vec::Vec::new();
         while let Ok(id) = create() {
             held.push(id);

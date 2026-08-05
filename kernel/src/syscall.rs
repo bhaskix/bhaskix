@@ -761,8 +761,19 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // which ranks outside the capability arena the method was resolved under.
     // Mapping memory into the caller's own address space.
     if kind == Some(Kind::Invoke) && frame.method == method::ATTACH {
+        // A `Memory` object, or one page of device registers. Two kinds, one
+        // method, because from the caller's side it is one question -- "let me
+        // see what I hold" -- and the difference is what it holds. Resolving
+        // for `Memory` first and falling back keeps the error for a capability
+        // that is neither: `WrongObject`, from the second attempt.
         let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Memory) {
             Ok(resolved) => resolved,
+            Err(Status::WrongObject) => {
+                match resolve_for_ipc(frame.capability, ObjectKind::Frame) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return Outcome::err(status),
+                }
+            }
             Err(status) => return Outcome::err(status),
         };
 
@@ -784,8 +795,28 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         } else {
             bhaskix_mm::Protection::ReadOnly
         };
-        let id = crate::shared::MemoryId::from_u64(resolved.object.id);
         let at = bhaskix_boot::VirtAddr(frame.arg0);
+
+        // Device registers: one page, at the physical address the capability
+        // names. The identity of a `Frame` *is* the address, which is why
+        // minting one is the kernel's business and never a domain's -- a
+        // capability a domain could make would be permission to map any
+        // physical page, which is permission to be the kernel.
+        if resolved.object.kind == ObjectKind::Frame {
+            let physical = resolved.object.id;
+            let Some(range) = bhaskix_mm::VirtRange::from_pages(at, 1) else {
+                return Outcome::err(Status::SlotUnavailable);
+            };
+            let mapped =
+                crate::vm::with_active(|space| space.map_device(range, physical, protection));
+            return match mapped {
+                Some(Ok(())) => Outcome::ok(frame.arg0),
+                Some(Err(_)) => Outcome::err(Status::SlotUnavailable),
+                None => Outcome::err(Status::WrongObject),
+            };
+        }
+
+        let id = crate::shared::MemoryId::from_u64(resolved.object.id);
 
         // Into whichever space is loaded: the caller's, because the caller is
         // what is running. Asked of the hardware rather than of bookkeeping,

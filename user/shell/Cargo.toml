@@ -34,10 +34,15 @@ bhaskix-abi = { path = "../../abi" }
 # the one dangerous thing it can do is ask the kernel, which is what the
 # syscall block is for.
 #
-# 20 counts those two blocks and their operand lists. It should not grow: a
-# third `unsafe` in an unprivileged program would need a reason this one does
-# not have.
-unsafe_budget = 20
+# 26 counts four blocks: the syscall and its operand list, the `ud2` a panic
+# ends at, and two reads of memory the kernel mapped on request -- one of
+# ordinary memory this program holds, one of a page of device registers.
+#
+# The last two are the reason the number went up, and they are the reason it
+# should be watched: `unsafe` in an unprivileged program is always a promise
+# about something the kernel did, and the promise is only as good as the
+# capability behind it. A fifth block would need a reason these four have.
+unsafe_budget = 26
 
 [profile.release]
 panic = "abort"

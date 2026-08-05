@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-08 (RFC 0013 steps 1–5, step 6 partial) · CI green · 376 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-10 (RFC 0013 steps 1–5, step 6 two thirds) · CI green · 380 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
 
 ### Division of responsibility between documents
 
@@ -149,6 +149,8 @@ fairness within 2% for two equal-weight workloads.
 | M7-06 | RFC 0013 step 5: what a placement costs, measured | ✅ `DONE` | The three numbers RFC 0013 asked for, per service and per placement. **A domain costs ~5,000 cycles (~2 µs) a round trip, about +48%**, and it is the same +48% for both services — 10.0k→15.2k for the console, 11.3k→15.8k for the filesystem. **Shared memory still pays: 10.3× in the nucleus, 7.3× in a domain** (the domain's bulk path copies through its own buffer and then makes a system call, so it costs twice the nucleus's — and still beats fifteen round trips by seven times). **Boot time is unchanged**, ~7.6 s either way. Measured as the *minimum* of 200 samples, because the first version timed whole loops and produced a nucleus filesystem four times slower than a domain one. |
 | M7-07 | The unpinned service that cost 6× | ✅ `DONE` | Chasing that reversed result found a real one: the nucleus filesystem thread was **not pinned**, so every call waited for another CPU to notice it — 66k cycles against 11k for the same code pinned, at the minimum rather than in the tail. It was unpinned deliberately, with a reasonable comment: it blocks on nothing but its own endpoint, so it could run wherever there was room. That was true, and it cost six times the latency. Pinned now, with the measurement as the reason. |
 | M7-08 | RFC 0013 step 6a: a domain can map memory it holds | ✅ `DONE` | `method::ATTACH` — a domain maps a `Memory` capability into **its own** address space, at an address of its choosing, from frames the object supplies rather than any it names. Never executable, per RFC 0009. **The first thing a driver in a domain needs:** its descriptor rings are memory it holds and the device reaches by `DevAddr`, and it cannot fill them in without seeing them. Exercised from ring 3 by the shell's new `map` command, which holds **two capabilities to one object** — writable and read-only — so the refusal tests the *right* and not the lookup. Watched failing: with the rights check removed the shell gets a writable mapping of read-only memory and the gate says so. |
+| M7-09 | RFC 0013 step 6b: device registers as a capability | ✅ `DONE` | `ATTACH` now takes a `Frame` capability too: one physical page, mapped **uncached and write-through** into the caller's own space, never executable. The kernel mints one for the block device's common configuration window; **the shell reads the device's status register from ring 3 and gets 15** — acknowledge, driver, features-ok, driver-ok, the device agreeing a driver brought it up. It cannot name a physical address, cannot ask for a different page, and is refused a writable mapping of the one it has. Watched failing by mapping one page over: `status 1`, and the gate said so. The second of the three things a driver in a domain needs. |
+| M7-10 | A test that had been told not to race, and did | ✅ `DONE` | `notify`'s test module said *"one test, because the slots are a global and cargo runs tests in parallel"* — and had two. The second drained the arena and asserted it came back empty, which it does not when the first is holding a slot. It failed once in a full run and passed on every re-run. A comment asking people to keep to one test was never going to hold; the tests take a mutex now. |
 
 ### Honest notes on M6 so far
 
@@ -636,6 +638,28 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 step 6b — a page of hardware, reached by capability)
+
+- **A ring 3 program read the block device's status register.** Through a `Frame` capability and
+  through nothing else: it cannot name a physical address, cannot ask for a neighbouring page, and
+  is refused a writable mapping of the page it holds. The value is 15 — the device agreeing that a
+  driver brought it up — which is a number only a mapping that reaches the hardware returns. Mapping
+  one page over gives 1, and the gate says so.
+- **The kernel is the only thing that can mint one, and that is the whole security argument.** A
+  `Frame` capability *is* a physical address; a capability a domain could make would be permission
+  to map any page, which is permission to be the kernel.
+- **Uncached and write-through**, the same flags the kernel's own MMIO takes. A cached mapping of a
+  device works on an emulator and then fails on hardware in the way that is hardest to diagnose.
+- **One method, two kinds.** `ATTACH` takes `Memory` or `Frame`, because from the caller's side it
+  is one question — let me see what I hold — and the difference is what it holds. `Backing::Direct`
+  has been in the region map since M3 and had never been used from a user address space; tearing one
+  down must not free the frame, because the frame is a device.
+- **A test module said "one test, because the slots are a global", and had two.** The second drains
+  the notification arena and asserts it comes back empty, which it does not while the first holds a
+  slot. It failed once in a full suite run and passed on every re-run — the shape of a race. Fixed by
+  making the rule enforceable rather than written down: both tests take a mutex. A comment asking
+  people to keep to one test survives exactly until somebody adds a second.
 
 ### 2026-08-05 (RFC 0013 step 6a — the primitive a driver needs, before the driver)
 

@@ -348,6 +348,84 @@ impl AddressSpace {
         }
     }
 
+    /// Maps one page of device registers at a fixed physical address.
+    ///
+    /// [`Backing::Direct`], which the region map has had since M3 and nothing
+    /// had used from a *user* address space: tearing this space down must not
+    /// free the frame, because the frame is a device and was never anybody's
+    /// to free.
+    ///
+    /// Uncached and write-through, because these are registers. A cached
+    /// mapping of a device works on an emulator and then fails on hardware in
+    /// the way that is hardest to diagnose — a write that the CPU is still
+    /// holding, or a read that answers from a line the device has since
+    /// changed. The kernel's own MMIO takes the same flags, and this is the
+    /// same decision made in the same place rather than a second one.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Refused`] for an executable protection — device registers
+    /// are not code, and a domain that could execute them could execute
+    /// whatever a device chose to return.
+    pub fn map_device(
+        &mut self,
+        range: VirtRange,
+        physical: u64,
+        protection: Protection,
+    ) -> Result<(), VmError> {
+        if protection.executable() {
+            return Err(VmError::Refused);
+        }
+
+        let region = VmRegion::new(range, protection, Backing::Direct { physical });
+        self.regions.insert(region)?;
+
+        let root = self.root;
+        let hhdm = self.hhdm_base;
+        let user = range.start.as_u64() < KERNEL_HALF;
+
+        let result = heap::with(|heap| {
+            let pmm = heap.pmm_mut();
+            for (index, page) in range.pages_iter().enumerate() {
+                let target = physical + index as u64 * FRAME_SIZE;
+                let mut entry = flags::DEVICE;
+                if !protection.writable() {
+                    entry &= !flags::WRITABLE;
+                }
+                if user {
+                    entry |= flags::USER;
+                }
+                // SAFETY: `root` is this space's PML4, `hhdm` the direct map
+                // base, and `target` is a device window the kernel found in a
+                // config register -- not memory, and not this space's to free.
+                let outcome = unsafe {
+                    paging::map_page(root, page.as_u64(), target, entry, hhdm, &mut || {
+                        pmm.allocate(0, Zone::Normal)
+                            .ok()
+                            .map(|pfn| u64::from(pfn) * FRAME_SIZE)
+                    })
+                };
+                if let Err(error) = outcome {
+                    return Err((VmError::Paging(error), index as u64));
+                }
+            }
+            Ok(())
+        });
+
+        match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err((error, mapped))) => {
+                self.unmap_pages(range, mapped);
+                let _ = self.regions.remove(range.start);
+                Err(error)
+            }
+            None => {
+                let _ = self.regions.remove(range.start);
+                Err(VmError::OutOfMemory)
+            }
+        }
+    }
+
     /// [`VmError::Region`] if no region starts there.
     pub fn unmap(&mut self, start: VirtAddr) -> Result<(), VmError> {
         let region = self.regions.remove(start)?;

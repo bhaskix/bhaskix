@@ -625,6 +625,26 @@ pub fn present() -> bool {
     DEVICE.lock().is_some()
 }
 
+/// The physical page the device's common configuration registers live in.
+///
+/// For handing a *domain* the registers, as a `Frame` capability. The kernel
+/// keeps its own mapping; this is the address, not the mapping, because a
+/// capability names a thing and each holder maps it into its own space.
+///
+/// Page-aligned and one page: the common configuration is far smaller than a
+/// page, and a holder gets what the hardware can be divided into rather than
+/// what it asked for. Whatever else shares that page shares it — which is a
+/// property of the device's layout and worth knowing about before a driver is
+/// given one.
+#[must_use]
+pub fn registers(hhdm: u64) -> Option<u64> {
+    let device = DEVICE.lock();
+    let common = device.as_ref()?.common;
+    common
+        .checked_sub(hhdm)
+        .map(|physical| physical & !(FRAME_SIZE - 1))
+}
+
 /// How many 512-byte sectors the device has.
 #[must_use]
 pub fn capacity() -> u64 {

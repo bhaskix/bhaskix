@@ -44,6 +44,8 @@ const FILESYSTEM: u64 = 1;
 const MEMORY_RW: u64 = 3;
 /// The same memory, read-only. Same object, weaker capability.
 const MEMORY_RO: u64 = 4;
+/// One page of the block device's registers, read-only.
+const DEVICE_WINDOW: u64 = 5;
 
 /// What a system call returned: the status, and the message's four registers.
 struct Reply {
@@ -295,6 +297,7 @@ fn capabilities() {
 fn map() {
     const WRITABLE_AT: u64 = 0x3000_0000;
     const READ_ONLY_AT: u64 = 0x3100_0000;
+    const DEVICE_AT: u64 = 0x3200_0000;
     const PATTERN: u64 = 0x5041_5454_4552_4e21;
 
     let attach = |slot: u64, at: u64, writable: u64| {
@@ -323,6 +326,40 @@ fn map() {
 
     write(b"  4  memory ro  ");
     match attach(MEMORY_RO, READ_ONLY_AT, 1) {
+        status::INSUFFICIENT_RIGHTS => write(b"refused a writable mapping\n"),
+        status::OK => write(b"WRITABLE, which it should not be\n"),
+        other => {
+            write(b"status ");
+            write_number(other);
+            write(b"\n");
+        }
+    }
+
+    // The block device's registers. A page of hardware, reached from ring 3
+    // through a capability and through nothing else: this program cannot name
+    // a physical address, cannot ask for a different page, and cannot write to
+    // this one.
+    write(b"  5  device ro  ");
+    if attach(DEVICE_WINDOW, DEVICE_AT, 0) == status::OK {
+        // The virtio 1.0 common configuration structure. `device_status` is
+        // what the kernel's driver left there, so a value of 15 -- acknowledge,
+        // driver, features-ok, driver-ok -- is the device agreeing that a
+        // driver brought it up. Reading it here proves the mapping reaches the
+        // hardware and not a copy of it.
+        //
+        // SAFETY: the kernel mapped one page of device registers, read-only
+        // and uncached, at exactly this address. The offset is inside that
+        // page, and this is a read of a register that reading does not change.
+        let device_status = unsafe { core::ptr::read_volatile((DEVICE_AT + 0x14) as *const u8) };
+        write(b"status ");
+        write_number(u64::from(device_status));
+        write(b"\n");
+    } else {
+        write(b"could not be mapped\n");
+    }
+
+    write(b"  5  device rw  ");
+    match attach(DEVICE_WINDOW, DEVICE_AT + 0x1000, 1) {
         status::INSUFFICIENT_RIGHTS => write(b"refused a writable mapping\n"),
         status::OK => write(b"WRITABLE, which it should not be\n"),
         other => {

@@ -317,7 +317,15 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
    notification it can wait on. The first is built — `method::ATTACH` maps a `Memory` capability
    into the caller's own space, at an address of its choosing, from frames the object supplies —
    and is exercised from ring 3 with two capabilities to one object, so the refusal tests the right
-   rather than the lookup. The other two are not started.
+   rather than the lookup.
+
+   The second is built too: `ATTACH` takes a `Frame` capability, one physical page mapped uncached
+   into the caller's space, and the shell reads the block device's status register from ring 3
+   through one. Only the kernel can mint a `Frame`, because a `Frame` *is* a physical address and a
+   capability a domain could make would be permission to be the kernel.
+
+   The third — interrupts delivered to a domain as a notification it can wait on — is not started,
+   and neither is the driver.
 
 Steps 1–2 are the mechanism. Steps 3–5 are the proof. Step 6 is the first driver outside the
 kernel, and the reason the previous four RFCs exist.

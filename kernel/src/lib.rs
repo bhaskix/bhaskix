@@ -1737,6 +1737,32 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         return Err("the shell's memory capabilities would not install");
     }
 
+    // The block device's registers, read-only, at slot 5. A `Frame`
+    // capability names one physical page and the kernel is the only thing that
+    // can mint one -- a capability a domain could make would be permission to
+    // map any physical page, which is permission to be the kernel.
+    //
+    // Read-only because this shell has no business driving the device. A
+    // driver in a domain gets a writable one, and that is the entire
+    // difference between the two: same object, same mechanism, different
+    // rights. Installed only if there *is* a device, so a machine booted
+    // without one still gets a shell.
+    if let Some(registers) = virtio::registers(hhdm) {
+        let window = cap::with_arena(|arena| {
+            arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Frame, registers),
+                    cap::Rights::READ,
+                    0,
+                )
+                .ok()
+        })
+        .ok_or("the device window capability would not be created")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(5, window).is_ok()) != Some(true) {
+            return Err("the device window capability would not install");
+        }
+    }
+
     // Clamped to what the machine actually has, so a single-processor machine
     // gets a shell on the only CPU there is rather than an error.
     let cpu = SHELL_CPU.min(bhaskix_arch::percpu::online_count().saturating_sub(1));
