@@ -143,10 +143,19 @@ the both-placements CI job below stops being a formality.
 
 **The caveat, stated plainly:** "write once, place anywhere" is a claim many systems have made and
 few have delivered. The usual failure is that in-nucleus services quietly acquire direct calls,
-shared statics, and pointer-passing, and the userspace placement rots. Our mitigations are (a) CI
-builds *both* placements for every service on every PR, and (b) the QEMU test suite runs the full
-boot with all services forced to `domain`. If we ever cannot afford to keep both placements green,
-we will say so in this document rather than quietly dropping the goal.
+shared statics, and pointer-passing, and the userspace placement rots.
+
+**None of this is built yet, and this paragraph used to say otherwise.** It described two
+mitigations — CI building both placements for every service, and a QEMU boot with all services
+forced to `domain` — in the present tense, when there is no `Service` trait, no placement
+selection, and no service that has ever run outside the nucleus. A design document that describes
+its own safeguards as existing is the same failure as a warning that prints unconditionally: it
+cannot tell the safe case from the dangerous one.
+
+Both mitigations are specified by [RFC 0013](rfc/0013-service-framework.md), accepted, and land
+with its steps 2 and 4. Until then this section describes an intention. If we ever cannot afford to
+keep both placements green, we will say so here rather than quietly dropping the goal — and the
+tense will be correct either way.
 
 ---
 

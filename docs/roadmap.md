@@ -137,8 +137,11 @@ Order within the phase is flexible; dependencies are noted.
   with it. Between them they complete RFC 0008's answer to A3, and they precede everything below:
   a service framework whose bulk paths move sixteen bytes per round trip is a framework nobody will
   measure twice
-- **Service framework** — the `Service` trait, both placements, and the CI job that builds both
-  (this is the milestone that makes [architecture.md](architecture.md) §2 true rather than aspirational)
+- **Service framework** — [RFC 0013](rfc/0013-service-framework.md) (accepted). The `Service` trait,
+  both placements, and the CI job that builds both (this is the milestone that makes
+  [architecture.md](architecture.md) §2 true rather than aspirational). Its precondition is met:
+  until the bulk paths used shared memory the two placements were identical *by accident*, because
+  four registers map into nobody
 - **IOMMU: discovery, per-device domains, strict mapping** — [RFC 0012](rfc/0012-iommu.md)
   (accepted). VT-d first, because QEMU emulates it and a design CI cannot test will be wrong
   unnoticed; an AMD machine runs degraded and says so. This is what funds `security.md` §1 T3

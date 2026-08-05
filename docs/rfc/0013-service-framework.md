@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🚧 **Draft — for discussion.** |
+| **Status** | ✅ **Accepted 2026-08-05**, including the `architecture.md` correction it asks for. Resolves **SF1**. Two of its four open questions are decided by acceptance; the other two stay open and are named below. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`service`, `cap`, `ipc`), tools (build, CI), userspace |
 | **Milestone** | Phase 2 in [roadmap.md](../roadmap.md) |
@@ -224,17 +224,24 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
 
 ## Unresolved questions
 
+**Decided by acceptance:**
+
+- **The nucleus placement dispatches through IPC**, not by direct call (question 2). Direct is
+  faster and is also the door through which "no direct calls" erodes, and a measurement can reopen
+  it later — a design that started with the fast path would never get the slow one back.
+- **The placement table is a build-time input** (question 3), with a command-line override
+  permitted **for tests only**, because the QEMU run that forces every service into a domain is the
+  mechanism this RFC exists for and it must not require a second image. The override is a testing
+  affordance and not a runtime feature: a machine whose placements can be changed at boot has a
+  security-relevant table outside the build.
+
+**Still open, and deliberately not answered here:**
+
 1. **What happens to a caller whose service died?** Today an endpoint whose holder has gone leaves
    the caller blocked for ever — `service.rs` records this as a known limitation and the fix needs
    a mechanism that does not exist: an endpoint that reports when the capability reaching it is
    revoked. This RFC surfaces the problem and does not solve it.
-2. **Does the nucleus placement dispatch through IPC or by direct call?** Direct is faster and is
-   also the door through which "no direct calls" erodes. The proposal is IPC in both placements
-   until a measurement says otherwise, so the two paths differ in *placement* and not in *shape*.
-3. **Where does the placement table live** — the build, the image, or the kernel command line? A
-   command line makes the both-placements QEMU run trivial and makes the placement a runtime
-   property, which contradicts the design above.
-4. **How much does the domain placement cost the console?** Every printed line would cross a
+2. **How much does the domain placement cost the console?** Every printed line would cross a
    boundary. It may be that the console is permanently in-nucleus and the honest thing is to say so in the
    table rather than pretend it is relocatable.
 

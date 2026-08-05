@@ -80,7 +80,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **NF1** | Notifications | ✅ **Accepted** 2026-08-04 | A **`Notification` object**: one word of pending badge bits, at most one waiter, signalled without blocking and safely from an interrupt handler. Completes the other half of RFC 0008's answer to **A3**. Its immediate consequence is that `virtio-blk` can stop polling and `input.rs`'s hand-written reader becomes an instance of a general object. Interrupt *delivery* is ready; who may *claim* a line needs an `IRQHandler` object and its own RFC. | [RFC 0010](docs/rfc/0010-notifications.md) |
 | **IR1** | Interrupt authority | ✅ **Accepted** 2026-08-04 | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU (RFC 0012, draft), and the RFC says so rather than implying otherwise — **steps 1–4 are unblocked and worth doing alone.** | [RFC 0011](docs/rfc/0011-irq-handler.md) |
 | **IO1** | IOMMU | ✅ **Accepted** 2026-08-04 | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Roadmap changed on acceptance**: discovery, per-device domains and strict mapping moved from Phase 3 to Phase 2; interrupt remapping and nested translation stay. | [RFC 0012](docs/rfc/0012-iommu.md) |
-| **SF1** | Service framework | 🚧 **Draft** 2026-08-05 | The trait, the two placements, the build selection, and the CI job that builds **both** for every service. `architecture.md` §2 has claimed relocatable services since Phase 0 and **none of it exists** — no trait, no placement selection, no service that has ever run outside the nucleus. Could not have been written before M6-18: until the bulk path used shared memory the two placements were identical *by accident*, because four registers map into nobody. The open question it does not answer: a caller whose service died is blocked for ever, and the fix needs an endpoint that reports revocation. | [RFC 0013](docs/rfc/0013-service-framework.md) |
+| **SF1** | Service framework | ✅ **Accepted** 2026-08-05 | The trait, the two placements, the build selection, and the CI job that builds **both** for every service. `architecture.md` §2 has claimed relocatable services since Phase 0 and **none of it exists** — no trait, no placement selection, no service that has ever run outside the nucleus. Could not have been written before M6-18: until the bulk path used shared memory the two placements were identical *by accident*, because four registers map into nobody. Acceptance decides two of its four open questions — the nucleus placement dispatches **through IPC** rather than by direct call, and the placement table is a **build-time** input with a command-line override for tests only. Two stay open: a caller whose service died blocks for ever (the fix needs an endpoint that reports revocation), and whether the console is honestly relocatable at all. Acceptance also corrected `architecture.md`, which described both of this RFC's safeguards in the present tense when neither existed. | [RFC 0013](docs/rfc/0013-service-framework.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | *Blocks M3* |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
@@ -628,6 +628,30 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 accepted — and a design document that described its own safeguards as existing)
+
+- **Accepted with two of its four open questions decided.** The nucleus placement dispatches
+  **through IPC** rather than by direct call: direct is faster and is also the door through which
+  "no direct calls" erodes, and a design that starts with the fast path never gets the slow one
+  back. The placement table is a **build-time** input, with a command-line override permitted for
+  *tests only* — the QEMU run that forces every service into a domain is the mechanism this RFC
+  exists for and must not need a second image, but a machine whose placements can be changed at
+  boot has a security-relevant table outside the build.
+- **Two stay open and are named**: a caller whose service died blocks for ever, and the fix needs a
+  mechanism that does not exist — an endpoint that reports when the capability reaching it is
+  revoked. And whether the console is honestly relocatable at all, which is a measurement rather
+  than an argument.
+- **Acceptance corrected `architecture.md`, which was not true.** The section on relocatable
+  services described both safeguards — CI building both placements, a QEMU boot with everything in
+  a domain — **in the present tense**, when there is no `Service` trait, no placement selection, and
+  no service that has ever run outside the nucleus. That is the same failure as the "NO IOMMU"
+  warning that printed unconditionally: a document describing its own safeguards as existing cannot
+  tell the safe case from the dangerous one. It now says what is intended, what is specified, and
+  which step each lands with.
+- **The precondition is what made the RFC writable at all.** Until M6-18's bulk path, the two
+  placements were identical *by accident* — four registers map into nobody, so "the same code runs
+  either way" was true and meaningless.
 
 ### 2026-08-05 (M6 status — where the milestone actually ended)
 
