@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 step 1) · CI green · 38 boot gates, 112 checks |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–2) · CI green · 38 boot gates, 112 checks |
 
 ### Division of responsibility between documents
 
@@ -132,6 +132,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-06 | `virtio-blk` driver | ✅ `DONE` | PCI enumeration, modern virtio 1.0 discovered through the device's own capability list, a split virtqueue driven by DMA. `root=disk` mounts the filesystem off the device, so the user-mode shell is a file the driver read. **Negative-tested**: a driver that ignored the sector number reads sector zero four times and fails the gate, because the disk is the ramdisk image and the kernel has the same bytes from the bootloader to compare against. |
 | M6-09 | RFC 0011 step 5: a handler does not outlive its owner | ✅ `DONE` | Destroying a domain is `RELEASE` for every handler it held — collected under the handler lock, released outside it, because masking a line reaches the chip and freeing a vector reaches the allocator and both rank below it. `NO_DOMAIN` is not a spare identifier: the console's and the block driver's handlers belong to the nucleus, and a recycled domain id must not sweep them up. **Negative-tested**: disabling the teardown gives `7 -> 8 -> 8 -> 8` and fails three checks. The assertion is the *re-claim*, not the release — a release that leaked the vector returns success just as loudly. Step 6, delegation, stays blocked on RFC 0012 as the RFC requires. |
 | M6-10 | RFC 0012 step 1: the IOMMU is found, and the warning stops being a constant | ✅ `DONE` | `DMAR` parsed as untrusted firmware input, with a **seeded mutation harness** — the fuzz target the RFC adds, and the one whose failure mode is worst, because what is built from a believed table is a register window written to as if it were an IOMMU. A structure length of zero is refused rather than looped on; a register base that is zero or unaligned is dropped, not recorded. No translation is enabled: every device still reaches all of memory, and the line says so. **Negative-tested**: a parser that records no unit fails the new gate. `boot-test.sh iommu` runs QEMU with `-device intel-iommu,intremap=on`, without which the discovery path is unreachable. |
+| M6-11 | RFC 0012 step 2: the translation structures, built and not enabled | ✅ `DONE` | `arch::vtd` is the VT-d encodings as arithmetic — root, context and second-level entries, address widths, index maths — pure, and proved against the specification's own numbers by 10 host tests on a machine with no IOMMU. `DevAddr` is a type the compiler keeps apart from `PhysAddr`, with an allocator tested for exhaustion, reuse after unmap and the below-4-GiB constraint a 32-bit device needs. On real hardware the window is built for the block device and **left empty**: default deny, nothing programmed. **Negative-tested**: a corrupted context index fails the gate — after the first version of that check failed to catch it, see below. |
 
 ### Honest notes on M6 so far
 
@@ -514,6 +515,33 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0012 step 2 — and a verification that verified itself)
+
+- **The structures are built and nothing is enabled.** `iommu window 00:03.0 39-bit, 3 levels,
+  nothing mapped, not programmed`. The page table is deliberately **empty** — default deny, so a
+  device translated through this window could reach nothing at all. It is not shown to hardware
+  until step 3 identity-maps the reserved regions, because enabling before that wedges the machines
+  that need it most.
+- **The encodings are arithmetic, and tested as arithmetic.** The hard part of an IOMMU is the bit
+  layout of four table entries; the hard part to *test* is the hardware. Keeping them apart means
+  the first is checked against the specification's numbers on a machine with no IOMMU, and only
+  "was the right structure placed at the right address" needs the emulator.
+- **My first read-back check was fake, and the negative test is the only reason I know.**
+  `verify_window` located the entries with the same `context_index` that had written them. Corrupt
+  that index and it writes at the wrong offset, reads at the wrong offset, and agrees — the gate
+  passed a deliberately broken build. **A check that finds a thing using the same function that put
+  it there cannot catch an error in that function.** It now recomputes the offsets from the
+  requester id, with the duplication marked deliberate, and counts present context entries so a
+  stray one is caught too. Same corruption now fails.
+- **That is the sixth check this milestone that was not looking at the thing**, and the first I
+  wrote myself in the same session I caught it. The rule that saved it is the project's own: every
+  gate is negative-tested by deliberately breaking the property. Without that step this would have
+  shipped as a verification that verified nothing, and it would have read convincingly in review.
+- **The `unsafe` budget gate did its job**: 882 against 860, raised to 890 with the justification
+  written in `kernel/Cargo.toml`. Three functions, all writing structures the *hardware* walks
+  rather than the CPU, confined to one module so that "what can a device reach" has one answer in
+  one place.
 
 ### 2026-08-05 (RFC 0012 step 1 — a warning that could not be wrong, and therefore said nothing)
 

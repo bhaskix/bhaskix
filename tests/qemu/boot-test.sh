@@ -432,6 +432,23 @@ if [[ "$MODE" == "iommu" ]]; then
         fail "the DMAR parsed only partially"
         status=1
     fi
+
+    # RFC 0012 step 2: the structures are built, read back, and not programmed.
+    #
+    # "not programmed" is asserted with the rest. A window that had been shown
+    # to the hardware at this step would be a device translating through an
+    # empty table -- default deny working exactly as designed, and the machine
+    # losing its disk.
+    #
+    # The read-back is what checks the *indices*: an entry written at the wrong
+    # offset holds entirely correct values, and is a device translating through
+    # some other device's tables.
+    if grep -qE "iommu window +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9]+-bit, [0-9]+ levels, nothing mapped, not programmed" "$LOG"; then
+        pass "the device's translation structures are built, verified, and left off"
+    else
+        fail "the IOMMU window was not built, or did not read back as written"
+        status=1
+    fi
 fi
 
 # RFC 0011 step 4: the block driver stops polling. The assertion is a pair of

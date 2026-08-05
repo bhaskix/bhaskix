@@ -83,4 +83,17 @@ workspace = true
 # place that does so -- an MSI is a device write of an arbitrary vector to an
 # arbitrary CPU, so this is the code the RFC says must never be delegated, and
 # keeping it in one function is what makes "never delegated" checkable.
-unsafe_budget = 860
+# 890 at M6-10, RFC 0012 step 2. The increase is three functions in `iommu`,
+# and every one of them writes a structure the *hardware* will walk rather than
+# the CPU: a zeroed frame for a table, the root and context entries that select
+# a device's page tables, and the read-back that checks them. They are volatile
+# writes through the direct map at offsets bounded by construction -- a root
+# index is a byte, a context index is masked to eight bits, so neither can
+# leave its page.
+#
+# It buys the thing the whole RFC exists for. Until now every DMA-capable
+# device could reach all of physical memory, including the kernel, and the
+# machine said so at boot because there was nothing else to say. This is the
+# code that ends that, and it is deliberately confined to one module so that
+# "what can a device reach" has one answer in one place.
+unsafe_budget = 890

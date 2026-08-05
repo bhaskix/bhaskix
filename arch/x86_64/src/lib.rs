@@ -46,6 +46,7 @@ pub mod syscall;
 pub mod trap;
 pub mod tsc;
 pub mod uaccess;
+pub mod vtd;
 
 pub use context::Context;
 pub use serial::SerialPort;

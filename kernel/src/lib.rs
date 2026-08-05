@@ -2211,6 +2211,31 @@ fn block_self_test(handoff: &Handoff) -> bool {
     let iommu = unsafe { iommu::discover(handoff.rsdp, handoff.hhdm_base.as_u64()) };
     iommu::report(iommu);
 
+    // RFC 0012 step 2: build the structures, enable nothing. The page table is
+    // left *empty* -- default deny, so a device translated through this window
+    // could reach nothing at all. It is not shown to any hardware until step 3
+    // identity-maps what firmware says a device must keep reaching, because
+    // enabling before that wedges the machines that need it most.
+    if let Some(found) = iommu
+        && found.units > 0
+        && let Some((bus, slot, function)) = virtio::location()
+    {
+        let hhdm = handoff.hhdm_base.as_u64();
+        match iommu::build_window(&found, (bus, slot, function), 0, hhdm) {
+            Some(window) if iommu::verify_window(&window, hhdm) => println!(
+                "    iommu window   {bus:02x}:{slot:02x}.{function} \
+                 {}-bit, {} levels, nothing mapped, not programmed",
+                window.width.bits(),
+                window.width.levels()
+            ),
+            // Built and read back wrong is worse than not built: the values
+            // would all be right and the *offsets* wrong, which is a device
+            // silently translating through another device's tables.
+            Some(_) => println!("    iommu window   FAILED: the tables did not read back"),
+            None => println!("    iommu window   FAILED to build"),
+        }
+    }
+
     if ok {
         let (bus, device, function) = virtio::location().unwrap_or((0, 0, 0));
         println!(
