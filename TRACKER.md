@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01, M7-02 (RFC 0013 steps 1–2) · CI green · 178 suite checks · 41 boot gates, 48 with an IOMMU · 277 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-03 (RFC 0013 steps 1–2, step 3 partial) · CI green · 183 suite checks · 42 boot gates, 49 with an IOMMU · 277 host assertions |
 
 ### Division of responsibility between documents
 
@@ -143,6 +143,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-18 | RFC 0009 step 6: the filesystem service's bulk path | ✅ `DONE` | `fs::READ_INTO` fills a shared region in **one** round trip where the message path needs fifteen for the same file — the RFC's own comparison, measured on the data path alone, because opening a file costs the same either way and folding that in would flatter it. The caller names a **slot in its own CSpace**, never an object identity: an identity is a caller asserting what it may reach. The register path stays for short transfers. **Negative-tested** at the third attempt — see the changelog for why the first two proved nothing. |
 | M7-01 | RFC 0013 step 1: the `Service` trait, and the nucleus placement | ✅ `DONE` | `Service`, `Context`, `Request`, `Reply`, and **one** `run::<S>()` loop both services share instead of hand-rolling their own. The success criterion was **no behaviour change** and the boot output is identical — 19 requests, 1 caller refused, 5 entries, 8 bytes, bulk path unchanged. Dispatch is by message in the nucleus too, per the acceptance decision, so the placements differ in *placement* and not in *shape*. Three host tests run the services' logic with no machine under them. The machine now prints `console=nucleus vfs=nucleus`, gated — and that line is **expected to change at step 3**. |
 | M7-02 | RFC 0013 step 2: the placement table, and what makes it true | ✅ `DONE` | `services.toml`, and `tools/check-placements.sh` to give it teeth. The console is now **its own crate**, compiled for `x86_64-unknown-none` with **no kernel in the build** — that compile *is* the domain placement's, and unlike a lint it cannot pass by accident. The rule is enforced against the **resolved dependency graph**, not a search for suspicious lines: a service cannot name `crate::vfs` without depending on the kernel. Two negative fixtures, both run by `make gates`: a service that calls into the kernel (must be rejected **naming `bhaskix-kernel`**), and a table wrong about itself (a name listed twice, a placement of `orbit` — **both** must be reported). The boot line is now built from the table, so the machine and the file cannot drift. **What it cost:** the filesystem is `relocatable = false` in the table, in the file rather than in a comment — its bulk path reads caller pages through the direct map, so it does not compile without the kernel. That is step 3's actual work, now named. |
+| M7-03 | RFC 0013 step 3a: the filesystem becomes relocatable, and a hole closes | ✅ `DONE` | The filesystem is **out of the kernel crate** — `ustar`, `vfs` and the service in `services/vfs`, building for `x86_64-unknown-none` with no kernel in the build. One function did it: the bulk path used to read caller pages through the direct map and now asks its context (`Bulk::fill`). **A security hole was found on the way and closed:** `Reply` took the caller from a register, so a server — including a ring 3 one, since `Reply` is a system call — could plant a message in *any* thread's mailbox and wake it holding what looked like the answer it was waiting for. The kernel now remembers who a thread received from and refuses anything else, which also freed the register that lets a server receive a whole four-register message at all. `Request::caller` is **gone from the trait**: a service cannot name a caller, so it cannot name the wrong one. Gated, and the gate was watched failing twice before it was believed — see the note below. |
 
 ### Honest notes on M6 so far
 
@@ -630,6 +631,36 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 step 3a — what moving one service out of the kernel found)
+
+- **The filesystem is relocatable, and one function is why.** Everything in it was already
+  placement-neutral except the bulk path, which read a caller's pages through the kernel's direct
+  map. It now asks its context to do that (`Bulk::fill`): the direct map in the nucleus, a system
+  call in a domain, and the service above cannot tell which. `check-placements.sh` proves the claim
+  by building `services/vfs` with no kernel in the build.
+- **A server could answer a question nobody asked it.** `Reply` took the caller from a register, and
+  `deliver` writes a message into whichever thread it is given and wakes it. So any server — and
+  `Reply` is a system call, so that includes a ring 3 one — could plant a message in an arbitrary
+  thread's mailbox and wake it holding what looked like the reply it was waiting for. The badge
+  could not be forged, so this could not fake an identity; it could fake an *answer*. The kernel now
+  records who a thread received from and refuses a reply to anyone else.
+- **The fix paid for itself twice.** Seven values did not fit in six registers, which is why the
+  server side of `Recv` only ever delivered one argument register — and a service that packs a
+  `Chunk` across four could therefore never have run in a domain. Not accepting the caller freed the
+  register. `Request::caller` is gone from the trait entirely: a service that cannot name a caller
+  cannot name the wrong one, which is a better property than checking the one it names.
+- **Two checks in a row were not looking at what they claimed to.** The eleventh: the boot line said
+  "was refused" whatever happened, so the gate passed while the check under it failed. Fixed, and
+  then the twelfth immediately: the *failure* message contained the same sentence the gate greps
+  for, so a failing check still matched. Two identical strings, one of which is evidence, is not two
+  strings. Both were found by deliberately weakening the rule and re-running — neither by reading.
+- **What is left of step 3.** The service is relocatable and not yet relocated: `services.toml` says
+  `nucleus`, and those are two different claims the table makes separately on purpose. Still to do
+  are the domain run loop's first real user (`service/domain` exists and compiles, nothing runs it
+  yet), the system call behind `Bulk::fill` for a domain, the storage a domain filesystem reads
+  from, and a program to be the domain. The boot line will say `vfs=domain` when that lands, and not
+  before.
 
 ### 2026-08-05 (RFC 0013 step 2 — the table, and the thing that makes it true)
 

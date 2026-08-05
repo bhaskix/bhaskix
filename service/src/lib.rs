@@ -21,12 +21,17 @@ pub struct Request<'a> {
     /// Who is calling, from the capability they used — never from anything
     /// they said.
     pub badge: u64,
-    /// The caller, as an opaque number the placement understands and the
-    /// service does not. A service may hand it back to something its context
-    /// gave it; it may not do arithmetic on it, and there is nothing here it
-    /// could usefully do with it otherwise.
-    pub caller: u32,
 }
+
+// There is deliberately no caller identity here.
+//
+// An earlier version carried one, as an opaque number a service handed back to
+// its context. It was removed when the domain placement was built: the caller
+// arrived in a register, which meant a service could hand back a *different*
+// one, and a placement that trusted it would act for a caller this service was
+// never speaking to. The placement already knows who is being answered — it is
+// the party whose message this is — so the service does not need to be told,
+// and being unable to say is the property worth having.
 
 /// One reply.
 ///

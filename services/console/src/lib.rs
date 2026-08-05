@@ -156,7 +156,6 @@ mod tests {
             method,
             args,
             badge: 1,
-            caller: 0,
         }
     }
 

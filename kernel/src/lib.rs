@@ -56,11 +56,16 @@ pub mod syscall;
 pub mod time;
 pub mod tlb;
 pub mod trap;
-pub mod ustar;
 pub mod vectors;
-pub mod vfs;
 pub mod virtio;
 pub mod vm;
+
+// The archive parser and the namespace over it live in the filesystem service
+// crate as of RFC 0013 step 3, and are re-exported here because the kernel's
+// own shell reads files too. The arrow points from the kernel to the service
+// and never back: nothing in those modules can name anything in this crate,
+// which is what let the service move out at all.
+pub use bhaskix_service_vfs::{ustar, vfs};
 pub mod wait;
 
 use bhaskix_arch::cell::BootCell;
@@ -852,8 +857,27 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
     wait_millis(200);
     domain::destroy(clients);
 
+    // A reply to a thread this one never heard from. Refused, or a service
+    // could plant a message in any thread's mailbox and wake it holding what
+    // looks like the answer it was waiting for -- which was reachable from
+    // ring 3, because `Reply` is a system call and the caller used to be a
+    // number in a register. Tried against every thread id the test knows of,
+    // including ones that exist: the rule is not "that thread is gone", it is
+    // "this thread is owed nothing".
+    let forged = resting
+        .iter()
+        .take(resting_len)
+        .all(|(id, _, _)| ipc::reply(*id, ipc::Message::default()).is_err())
+        && ipc::reply(1, ipc::Message::default()).is_err();
+
     let mut ok = true;
     let checks = [
+        // Named differently from the sentence the summary prints, and
+        // deliberately: the gate greps for that sentence, and the first
+        // version of this check spelled the two the same -- so a failure
+        // printed `FAILED: <the sentence>` and the gate matched the failure.
+        // Two identical strings, one of which is evidence, is not two strings.
+        ("the forged-reply rule held", forged),
         // Correctness, not throughput. Every reply that arrived carried the
         // value the service computed for *that* request, which is what catches
         // a reply delivered to the wrong caller -- possible precisely because
@@ -870,6 +894,16 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
         ("the endpoint counted the rendezvous", delivered >= 8),
         ("the endpoint counted the replies", replied >= 8),
     ];
+
+    // Reported from the result, not printed alongside it. The first version
+    // of this line said "was refused" unconditionally, so the boot gate that
+    // greps for it passed while the check underneath it failed -- a sentence
+    // that is printed whatever happened is evidence of nothing.
+    let forged_note = if forged {
+        "a reply to a thread this one never heard from was refused"
+    } else {
+        "A REPLY TO A THREAD THIS ONE NEVER HEARD FROM WAS ACCEPTED"
+    };
 
     let (dropped, wake_missed, received, replies_tried, no_caller, empty) = ipc::diagnostics();
     for (name, passed) in checks {
@@ -900,7 +934,7 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     if ok {
         println!(
-            "    ipc            {delivered} rendezvous, {replied} replies, {correct}/{replies} correct; two badges distinguished, {stranded} stranded on teardown"
+            "    ipc            {delivered} rendezvous, {replied} replies, {correct}/{replies} correct; two badges distinguished, {stranded} stranded on teardown; {forged_note}"
         );
     }
     ok

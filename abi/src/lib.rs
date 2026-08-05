@@ -54,8 +54,25 @@ pub mod syscall {
     /// Invoke, then block for a reply.
     pub const CALL: u64 = 1;
     /// Answer a `Call`, consuming the reply capability.
+    ///
+    /// All four argument registers are the reply. Nothing says *who* to
+    /// answer: the kernel remembers the caller this thread received from and
+    /// has not yet answered, and refuses a reply to anyone else. A server that
+    /// could name its own reply target could plant a message in a thread it
+    /// never heard from and wake it holding an answer to a question it did not
+    /// ask. The badge is not settable either — a server that could stamp an
+    /// identity on its answer would defeat every caller that checks one.
     pub const REPLY: u64 = 2;
     /// Block until a message arrives on an endpoint.
+    ///
+    /// Returns the method and all four argument registers as they were sent,
+    /// and the badge in the capability register. Four arguments, and not one,
+    /// because a message *is* four registers: a server that received fewer
+    /// could not implement the protocols this system already has, which made
+    /// "the same service in either placement" false at the boundary rather
+    /// than in the service.
+    ///
+    /// The caller is not returned, because [`REPLY`] does not accept one.
     pub const RECV: u64 = 3;
     /// Give up the rest of this thread's slice.
     pub const YIELD: u64 = 4;

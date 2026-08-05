@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhaskix-service-domain"
+description = "The run loop a service gets when it runs in its own domain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_service_domain"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../abi" }
+bhaskix-service = { path = "../service" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# One `unsafe` block: the `syscall` instruction, whose operand list is what
+# makes it fifteen lines. Everything a domain does goes through it, and nothing
+# else here could need a raw pointer -- the whole exchange is registers, which
+# is the property that makes a domain placement possible at all. A second
+# block appearing in this crate would mean a domain had found a way to touch
+# something directly, which is the thing this placement exists to prevent.
+unsafe_budget = 16

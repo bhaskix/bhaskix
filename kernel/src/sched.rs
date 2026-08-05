@@ -226,6 +226,16 @@ pub struct Thread {
     /// True for the thread each CPU registers for itself: it runs on the stack
     /// that CPU booted on, so "move it elsewhere" is not a meaningful request.
     pub pinned: bool,
+    /// The caller this thread received from and has not yet answered.
+    ///
+    /// Set when a message is taken, cleared when it is answered. It exists so
+    /// that a reply does not have to be *told* who to answer: a server that
+    /// could name the thread to reply to could plant a message in the mailbox
+    /// of a thread it never heard from, and wake it holding an answer to a
+    /// question it did not ask. The caller is not a secret, so hiding it was
+    /// never the point -- not accepting it is.
+    pub reply_to: Option<u32>,
+
     /// The domain this thread belongs to, or `u32::MAX` for none.
     ///
     /// Kernel threads created before domains exist have no domain, and must
@@ -652,6 +662,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         runs: 1,
         migrations: 0,
         held_locks: 0,
+        reply_to: None,
         domain: u32::MAX,
         mailbox: None,
         // The thread a CPU registers for itself is already running on the
@@ -845,6 +856,7 @@ pub fn spawn_on_with(
         runs: 0,
         migrations: 0,
         held_locks: 0,
+        reply_to: None,
         domain: options.domain,
         mailbox: None,
         kernel_stack_top: guarded.top,
@@ -943,6 +955,53 @@ pub fn deliver(thread: u32, message: crate::ipc::Message, from: u32) -> bool {
         }
     }
     false
+}
+
+/// Records that `thread` owes `caller` an answer.
+///
+/// Called when a message is taken, so that [`take_reply_target`] can say who a
+/// reply may go to without the replying thread being asked.
+pub fn set_reply_target(thread: u32, caller: u32) {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            target.reply_to = Some(caller);
+            return;
+        }
+    }
+}
+
+/// Who `thread` owes an answer to, without taking the obligation.
+///
+/// For the work a service does *while* answering -- the filesystem writing a
+/// file's bytes into the memory its caller named. The obligation is still
+/// owed, so this reads rather than takes.
+#[must_use]
+pub fn reply_target(thread: u32) -> Option<u32> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        if let Some(target) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return target.reply_to;
+        }
+    }
+    None
+}
+
+/// Takes the caller `thread` owes an answer to, if it owes one.
+///
+/// Taking rather than reading: an answer is owed once. A server that replied
+/// twice would otherwise be able to deliver a second message into a thread
+/// that had moved on to asking something else, and the second answer would
+/// look exactly like the first one's.
+#[must_use]
+pub fn take_reply_target(thread: u32) -> Option<u32> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            return target.reply_to.take();
+        }
+    }
+    None
 }
 
 /// How many threads are holding a message nobody has collected.
@@ -2201,6 +2260,7 @@ mod tests {
             runs: 0,
             migrations: 0,
             held_locks: 0,
+            reply_to: None,
             domain: u32::MAX,
             mailbox: None,
             kernel_stack_top: 0,

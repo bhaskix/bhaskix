@@ -47,7 +47,9 @@ LAYERS = {
     # here is the same rule stated once more, in the place that would catch a
     # dependency added to a service crate by hand.
     "bhaskix-service": -1,
+    "bhaskix-service-domain": 0,
     "bhaskix-service-console": 0,
+    "bhaskix-service-vfs": 0,
 
     "bhaskix-boot": 0,        # pure types, depends on nothing
     "bhaskix-arch-x86-64": 0,  # arch -> nothing

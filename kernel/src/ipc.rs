@@ -504,6 +504,7 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
         // A sender was already waiting; its message is in hand.
         Rendezvous::Matched { partner, message } => {
             RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
+            sched::set_reply_target(me, partner);
             Ok((message, partner))
         }
 
@@ -518,6 +519,7 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
                 sched::Delivery::Message((message, from)) => {
                     RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
                     trace(Event::RecvTook, me, from);
+                    sched::set_reply_target(me, from);
                     return Ok((message, from));
                 }
                 // The endpoint was destroyed under us. Leaving the queue entry
@@ -546,6 +548,33 @@ pub fn reply(caller: u32, message: Message) -> Result<(), IpcError> {
         return Err(IpcError::NoSuchCaller);
     };
     REPLY_TRIED.fetch_add(1, Ordering::Relaxed);
+
+    // A reply may go to the thread this one received from, and to no other.
+    //
+    // `deliver` writes a message into whichever thread it is given and wakes
+    // it, so without this a server could answer a question nobody asked it:
+    // pick any thread id, plant a message in its mailbox, and wake it holding
+    // what looks like the reply it was waiting for. That was reachable from
+    // ring 3, because `Reply` is a system call and the caller was a number in
+    // a register. It is now taken from what this thread actually received.
+    //
+    // Taken and not read, so an answer is owed exactly once.
+    match sched::take_reply_target(me) {
+        Some(owed) if owed == caller => {}
+        Some(owed) => {
+            // Put it back: this thread still owes an answer, to somebody else.
+            sched::set_reply_target(me, owed);
+            REPLY_NO_CALLER.fetch_add(1, Ordering::Relaxed);
+            trace(Event::ReplyRefused, me, caller);
+            return Err(IpcError::NoSuchCaller);
+        }
+        None => {
+            REPLY_NO_CALLER.fetch_add(1, Ordering::Relaxed);
+            trace(Event::ReplyRefused, me, caller);
+            return Err(IpcError::NoSuchCaller);
+        }
+    }
+
     if !sched::deliver(caller, message, me) {
         REPLY_NO_CALLER.fetch_add(1, Ordering::Relaxed);
         trace(Event::ReplyRefused, me, caller);

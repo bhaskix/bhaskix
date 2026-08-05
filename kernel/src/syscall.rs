@@ -770,24 +770,55 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             };
             let endpoint = crate::ipc::EndpointId::from_u32(resolved.object.id as u32);
             match crate::ipc::recv(endpoint) {
-                Ok((message, caller)) => {
-                    // The badge tells the receiver which route the caller
-                    // used, and `arg1` names who to reply to.
+                Ok((message, _caller)) => {
+                    // All four registers, because a message is four registers
+                    // (RFC 0008) and a server that received one of them could
+                    // not speak the protocols this system already has. The
+                    // filesystem packs a `Chunk` across all four; until this
+                    // was symmetric, "the same service in either placement"
+                    // was false at the boundary rather than in the service.
+                    //
+                    // The caller is not returned at all. It used to be, and a
+                    // server then handed it back on `Reply` -- which meant a
+                    // server could hand back a different one. The kernel
+                    // remembers who this thread received from, so the badge
+                    // gets the freed register and a service cannot address any
+                    // caller but the one it is answering.
                     frame.method = message.method;
                     frame.arg0 = message.args[0];
-                    frame.arg1 = u64::from(caller);
-                    frame.arg2 = message.badge;
-                    return Outcome::ok(message.badge);
+                    frame.arg1 = message.args[1];
+                    frame.arg2 = message.args[2];
+                    frame.arg3 = message.args[3];
+                    frame.capability = message.badge;
+                    // `value` lands in the same register as `arg0`, so it has
+                    // to agree with it rather than carry something else.
+                    return Outcome::ok(message.args[0]);
                 }
                 Err(error) => return Outcome::err(ipc_status(error)),
             }
         }
         Some(Kind::Reply) => {
-            // `arg1` names the caller, as `Recv` returned it.
-            let caller = frame.arg1 as u32;
+            // Nothing in the frame says who to answer. The kernel knows: it is
+            // the caller this thread received from and has not yet answered,
+            // and `ipc::reply` refuses anything else. A server that could name
+            // its own reply target could plant a message in a thread it never
+            // heard from and wake it holding an answer to a question it did
+            // not ask.
+            // Read, not taken: `ipc::reply` is the one that decides whether a
+            // reply is allowed, and it must make that decision from the same
+            // place every other caller of it does.
+            let Some(caller) =
+                crate::sched::current_thread_id().and_then(crate::sched::reply_target)
+            else {
+                return Outcome::err(Status::NoSuchCapability);
+            };
+
             let answer = crate::ipc::Message {
                 method: frame.method,
-                args: [frame.arg0, 0, 0, 0],
+                args: [frame.arg0, frame.arg1, frame.arg2, frame.arg3],
+                // Never from the frame. A server that could set a badge could
+                // stamp its answer with an identity it was not given, and a
+                // caller checking badges would believe it.
                 badge: 0,
             };
             return match crate::ipc::reply(caller, answer) {

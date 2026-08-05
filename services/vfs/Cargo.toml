@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhaskix-service-vfs"
+description = "The filesystem service, and the archive it reads."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_service_vfs"
+path = "src/lib.rs"
+
+# Two, as for every service crate. The filesystem is the one that had to be
+# argued down to this: its bulk path used to read a caller's pages through the
+# kernel's direct map, and the whole of RFC 0013 step 3 was turning that into
+# something a context can hand over.
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-service = { path = "../../service" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# The archive parser reads a caller-supplied byte slice and must never trust
+# it; there is nothing here that needs a raw pointer, and the `mount` entry
+# point is the one place that takes a promise from outside.
+unsafe_budget = 6

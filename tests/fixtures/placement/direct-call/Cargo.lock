@@ -24,6 +24,7 @@ dependencies = [
  "bhaskix-mm",
  "bhaskix-service",
  "bhaskix-service-console",
+ "bhaskix-service-vfs",
 ]
 
 [[package]]
@@ -54,5 +55,13 @@ version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
  "bhaskix-kernel",
+ "bhaskix-service",
+]
+
+[[package]]
+name = "bhaskix-service-vfs"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-abi",
  "bhaskix-service",
 ]

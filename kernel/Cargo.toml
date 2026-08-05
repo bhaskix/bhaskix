@@ -21,6 +21,7 @@ bhaskix-mm = { path = "../mm" }
 # points this way and only this way -- a service crate never depends back.
 bhaskix-service = { path = "../service" }
 bhaskix-service-console = { path = "../services/console" }
+bhaskix-service-vfs = { path = "../services/vfs" }
 
 [lints]
 workspace = true

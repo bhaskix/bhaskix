@@ -28,12 +28,15 @@ relocatable = true
 [[service]]
 name = "vfs"
 placement = "nucleus"
-crate = "kernel"
-package = "bhaskix-kernel"
-# Not yet. The filesystem's bulk path reads a caller's pages through the
-# direct map by calling into `shared` directly, so it cannot compile without
-# the kernel and there is no honest way to mark it otherwise. Extracting it
-# means deciding what a context hands over for bulk transfer, which is RFC
-# 0013 step 3's actual work — the step is "the filesystem in a domain", and
-# this line is the reason that step is not free.
-relocatable = false
+crate = "services/vfs"
+package = "bhaskix-service-vfs"
+# True as of RFC 0013 step 3. What changed is one function: the bulk path used
+# to read a caller's pages through the kernel's direct map, and now asks its
+# context to do it (`Bulk::fill`). In the nucleus that is still the direct
+# map; in a domain it is a system call. The service above cannot tell which it
+# got, and `check-placements.sh` proves the claim by building this crate with
+# no kernel in the build at all.
+#
+# Still `nucleus`: it is relocatable and not yet relocated. Those are two
+# different claims, and the table can make them separately on purpose.
+relocatable = true

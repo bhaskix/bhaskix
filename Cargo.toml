@@ -35,7 +35,9 @@ members = [
     # A service crate depends on the two above it and on nothing else, which
     # `tools/check-placements.sh` checks against `services.toml`.
     "service",
+    "service-domain",
     "services/console",
+    "services/vfs",
 
     # "net",
 ]

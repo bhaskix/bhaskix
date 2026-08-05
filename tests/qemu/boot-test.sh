@@ -560,6 +560,19 @@ else
     status=1
 fi
 
+# A server may answer the caller it received from, and nobody else. Until RFC
+# 0013 step 3 the caller was a number the server passed back, so any thread
+# could be sent a message that looked like the reply it was waiting for -- and
+# `Reply` is a system call, so ring 3 could do it too. The kernel now remembers
+# who a thread received from, which is also what freed the register that made a
+# whole four-argument message fit on the server side.
+if grep -q "a reply to a thread this one never heard from was refused" "$LOG"; then
+    pass "a service cannot answer a caller it never heard from"
+else
+    fail "the forged-reply refusal was not reported"
+    status=1
+fi
+
 # RFC 0013: the services run behind a trait, and the machine names them with
 # their placement. The placement is the claim `architecture.md` §2 makes, so it
 # is printed rather than assumed -- and this line is expected to change at step
