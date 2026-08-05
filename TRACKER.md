@@ -535,6 +535,29 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-05 (RFC 0012 step 6, second attempt — two red herrings named so they are not chased again)
+
+- **Still unsolved, and better understood.** Under remapping QEMU pops and completes about 140
+  requests a boot, exactly as it does without it, so the device works and its DMA is fine. The I/O
+  APIC's line is remapped and delivered. The one thing that never happens is an MSI leaving the
+  device — the unit sees a remap request for the line and none for the device.
+- **Two things that looked like the cause and were not**, both of which cost real time:
+  `virtio: zero sized buffers are not allowed`, which QEMU reports at translation-enable time and
+  which turns out to be the *firmware's* stale ring read through a translation that no longer maps
+  it — it happens with remapping off as well, and the device reset that follows clears it. And
+  `virtio_notify` tracing as zero, which is not evidence of anything: that event is not on the MSI-X
+  path and reads zero in the configuration that works.
+- **They are written into the code beside the flag**, not just here. A ruled-out list is only worth
+  having where the next person will be standing when they need it.
+- **The two encoding fixes stand on their own** — an IRTE destination at bit 40 rather than 32, and
+  a format bit at 4 with SHV at 3 — and both are pinned by host tests. Either one produces an entry
+  the hardware accepts and never delivers.
+- **The recommendation is unchanged and now better supported**: try a QEMU newer than 4.2 before
+  assuming the kernel is wrong. Two of this session's hardest faults were invisible until the
+  environment changed. If a newer QEMU delivers it, the answer is upstream; if it does not, the
+  remaining suspect is whether the queue's MSI-X vector assignment survives the table being
+  rewritten.
+
 ### 2026-08-05 (RFC 0009 step 6 — and a negative test that took three tries to mean anything)
 
 - **228 bytes in one round trip against fifteen by message.** The RFC's opening complaint was that
@@ -606,7 +629,7 @@ demonstrated by taking them away and watching the disk stop.
 
 | Open | What is known |
 |---|---|
-| The block device's MSI is not delivered under interrupt remapping | The I/O APIC's line *is*; the device never fires. Two encoding bugs found and fixed on the way |
+| The block device's MSI is not delivered under interrupt remapping | The device **works**: QEMU pops and completes ~140 requests a boot, the same as without remapping. The I/O APIC's line *is* remapped and delivered. What never happens is an MSI leaving the device — no remap request for it reaches the unit. Ruled out: the destination field's position and the format/SHV bits (**both real bugs, both fixed**), `eim` on and off, SHV on and off, and two red herrings — the `zero sized buffers` complaint (the firmware's stale ring, present with remapping off too) and `virtio_notify` reading zero (that trace is not on the MSI-X path, and reads zero in the working case as well) |
 | A reused device address keeps its translation | Entry reads back zero, invalidation issued, device still reaches it. Reuse is disabled until this is explained |
 
 Both are worth trying on a QEMU newer than 4.2 before assuming the kernel is wrong. **The two hardest

@@ -2789,6 +2789,18 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // So: `iommu=remap-irq` turns it on for whoever is finishing it, and the
     // boot line says which world the machine is in either way.
     //
+    // What is known, so the next attempt does not repeat it. Under remapping
+    // QEMU still pops and completes every request -- around 140 a boot, the
+    // same as without it -- so the device is working and its DMA is fine. The
+    // I/O APIC's line *is* remapped and delivered. What never happens is an
+    // MSI leaving the device: no remap request for it reaches the unit, while
+    // the I/O APIC's does. Ruled out: the destination field's position and the
+    // format/SHV bits (both were real bugs, both fixed), `eim` on and off, SHV
+    // on and off, and the "zero sized buffers" complaint QEMU makes at
+    // translation-enable time -- that one is the firmware's stale ring being
+    // read through a translation that no longer maps it, it happens with
+    // remapping off as well, and the device reset that follows clears it.
+    //
     // SAFETY: the unit is programmed, and nothing has been routed yet --
     // `console_input` and the block driver's MSI-X both come later.
     let asked = handoff
