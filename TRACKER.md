@@ -628,10 +628,15 @@ Newest first. One entry per meaningful change of project state.
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
 
-### 2026-08-05 (M6 status — a milestone that ended somewhere else)
+### 2026-08-05 (M6 status — where the milestone actually ended)
 
-**Every M6 task is built. The unmet exit criterion is unchanged. What the milestone actually became
-is three RFCs of protection work that were not in its scope, and a long lesson about tests.**
+> **One status section, deliberately.** Three accumulated here — one per time the question was
+> asked — and they disagreed about the check counts and about which RFCs were finished. A file whose
+> first line calls it the single source of truth cannot carry three answers to "where are we".
+> Status is rewritten in place; the changelog below records *events*.
+
+**Every M6 task is built. The unmet exit criterion is unchanged. What the milestone became is four
+RFCs of protection work that were not in its scope, and a long lesson about tests.**
 
 | Criterion | Status |
 |---|---|
@@ -640,24 +645,27 @@ is three RFCs of protection work that were not in its scope, and a long lesson a
 | Load and run an ELF binary from disk | ✅ `root=disk` makes "from disk" literal |
 | **The ELF loader survives 24 hours of fuzzing** | ❌ **Not met**, and unchanged since it was written down |
 
-**Beyond the task list**: RFC 0009 steps 1–5, RFC 0011 steps 1–5, RFC 0012 steps 1–5 and 7. Step 6
-is built and switched off. The headline result is that a `virtio-blk` device which could read the
-kernel's memory this morning now reaches only frames it was given, enforced by hardware and
-demonstrated by taking them away and watching the disk stop.
-
-**What is genuinely open**, and neither is a mystery worth guessing about:
-
-| Open | What is known |
+| RFC | Status |
 |---|---|
-| The block device's MSI is not delivered under interrupt remapping | Reproduces **identically on QEMU 7.2**, so it is not an old emulator. The device works throughout — ~280 queue operations either way — and the I/O APIC's remapped interrupt *is* delivered. What never happens is an MSI leaving the device. Ruled out: the destination field's position and the format/SHV bits (**both real bugs, both fixed**); `eim` and SHV either way; the **message format** (compatibility fares no better); the **ordering** (enabling after the device's interrupts work breaks them at once, and rewriting the entry afterwards does not restore them); the **missing invalidation queue**, which the specification does require and is enabled now. Two red herrings named: `zero sized buffers` (the firmware's stale ring; QEMU 7.2 does not report it at all) and `virtio_notify` reading zero (not on the MSI-X path; reads zero in the working case too) |
-| A reused device address keeps its translation | Entry reads back zero, invalidation issued, device still reaches it. Reuse is disabled until this is explained |
+| 0009 — shared memory | steps 1–6 (step 7 belongs to the IOMMU, done there) |
+| 0010 — notifications | **COMPLETE** |
+| 0011 — `IrqHandler` | **COMPLETE** |
+| 0012 — IOMMU | steps 1–5 and 7; **step 6 built and switched off** |
 
-Both are worth trying on a QEMU newer than 4.2 before assuming the kernel is wrong. **The two hardest
-faults this session were only visible because the environment changed** — the IPC stall needed real
-parallelism, the boot hang needed a single CPU.
+**The result in one sentence**: a `virtio-blk` device that could read the kernel's memory at the
+start of this milestone now reaches only the frames it was given — enforced by hardware,
+demonstrated by taking them away and watching the disk stop, and delegable to a domain that holds
+the authority for it and refused to one that does not.
 
-**The count that matters more than the feature list: eight checks this milestone were not looking at
-the thing they claimed to check.**
+**Two faults are open, with what is known and what is ruled out beside each.** Neither is a mystery
+to guess at; both have a shorter list of candidates than they did.
+
+| Open | Ruled out |
+|---|---|
+| The block device's MSI is not delivered under interrupt remapping | A newer QEMU (7.2 fails identically), the message format, the ordering, the missing invalidation queue, and two red herrings |
+| A reused device address keeps its translation | Nothing yet. Reuse is disabled until it is explained, and `free` still records the extent |
+
+**Nine checks this milestone were not looking at the thing they claimed to check.**
 
 | Check | What it actually did |
 |---|---|
@@ -669,9 +677,39 @@ the thing they claimed to check.**
 | "NO IOMMU" warning | A constant, printed on machines with three of them |
 | Window read-back | Located entries with the same function that placed them |
 | Step 5's "reachable" | "No fault" passes on a mapping that points at nothing |
+| Bulk path's refusal | An empty slot, then a wrong-kind capability — neither reached the check being claimed |
 
-Three of those were mine, written and caught in the same session, and every one was caught by the
-same rule: **break the property deliberately and watch the gate.** None was caught by reading.
+Four of those were written and caught in the same session. Every one was caught the same way:
+**break the property deliberately and watch the gate.** None was caught by reading.
+
+**And the machines see different bugs.** The IPC stall needed real parallelism — 14 failures in 40
+on a two-socket host, never once locally. The single-processor boot hang needed *one* CPU — 7 in 24
+there, 0 in 100 under the four-CPU soak written to catch that class. The newer-QEMU theory died on
+the same borrowed machine. Before trusting a green run, ask which machine it was green on.
+
+### 2026-08-05 (RFC 0011 step 6 — the last blocked step, and a precondition written as code)
+
+- **The step RFC 0011 would not take until there was an IOMMU.** There is one, so it is taken: a
+  domain can hold an interrupt, bind it to a notification it owns, and acknowledge it. That is the
+  first moment a driver could run outside the kernel and still be told when its device wants
+  attention.
+- **What a holder does *not* get is the MSI-X table.** An MSI is a memory write of an arbitrary
+  vector to an arbitrary CPU, so a holder able to program one holds an interrupt injection
+  primitive obtained by writing two words. The kernel programs it and delegates the rest.
+- **The precondition is enforced rather than remembered.** `irq::name` refuses unless something is
+  translating. A comment saying "do not do this without an IOMMU" is a comment; a refusal is a
+  property. On a machine with no unit the self-test skips and says why, and the gate takes that as
+  a pass — the honest outcome for a machine where the step is not safe to take.
+- **Three refusals are the substance, not the success path.** A legacy line cannot be delegated at
+  all: it is shared, and a holder that never acknowledges masks a line other devices need — a
+  domain wedging its own device is its problem, wedging somebody else's is the kernel's. A
+  `Notification` capability is not authority over an interrupt however much of it is held. And
+  `BIND` checks *both* capabilities, so an interrupt cannot be aimed at another domain's
+  notification.
+- **The test puts the interrupt back.** It hands the block device's real handler to a domain, and
+  `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
+  driver would spend the rest of the boot on the timer, working and slower, which is the quiet
+  degradation this milestone keeps finding.
 
 ### 2026-08-05 (RFC 0012 step 7 — delegation, and four bugs it dragged out)
 
@@ -887,47 +925,6 @@ same rule: **break the property deliberately and watch the gate.** None was caug
   is the one that loses -- which is exactly how it failed, `'bhaskix$ help' never appeared` with every
   later command echoing correctly. It waits for the prompt now: 10 of 10 since, against a failure
   in a loaded suite run before.
-
-### 2026-08-05 (M6 status — where the milestone actually stands)
-
-**Every M6 task is built. One exit criterion is still not met, and it is the same one as before —
-nothing this session changed it.**
-
-| Criterion | Status |
-|---|---|
-| Boot to a shell | ✅ Ring 3, holding two capabilities and nothing else |
-| `ls` a real filesystem | ✅ Through IPC, from the ramdisk or from the block device |
-| Load and run an ELF binary from disk | ✅ `root=disk` makes "from disk" literal |
-| **The ELF loader survives 24 hours of fuzzing** | ❌ **Not met.** 20 million mutated inputs per parser, clean — a substitute, not the thing asked for |
-
-Beyond the task list, M6 also carries **RFC 0009 steps 1–5** and **RFC 0011 steps 1–5**. RFC 0011
-step 6 — delegating an interrupt to a domain — is blocked on RFC 0012 and must stay blocked: handing
-a domain an interrupt without an IOMMU is handing it a DMA engine.
-
-**What the last session was actually spent on was not features.** Three concurrency faults, none of
-them found by writing code and all of them found by making a machine fail and then asking it why:
-
-| Fault | Where it hid | How it was found |
-|---|---|---|
-| IPC rendezvous stalls after one delivery | Needed genuine parallelism; never once failed locally | 14/40 on a two-socket host, then a trace ring after four wrong theories |
-| Single-processor boot hangs, one in four | Needed **one** CPU; the four-CPU soak was 0/100 | QEMU monitor: `HLT=1`, symbolised `RIP`, then kernel counters read out of the hung guest |
-| `mark_blocked` / consume / `cancel_block` | A tick inside a two-line window | Found by pattern, once the first one had a name |
-
-**The standing lesson is now four for four this milestone.** The frame-leak gate's phantom sixteen
-frames, the harness that blamed the kernel for QEMU's disk lock, the lock check that ran before the
-code it checked, and now a boot-hang class that the soak harness is structurally unable to see. Each
-time the check was fine and it was not looking at the thing. **A test that cannot distinguish "the
-thing under test is broken" from "the test could not run" will eventually be believed about the
-wrong one** — and `fault-test` spent weeks passing at about one run in eight without anyone noticing
-that a green suite was luck.
-
-**Closed, and it was never a fault.** The hung machine's `notify::SIGNALS` equalling
-`notify::UNWAITED` was read as an anomaly. It is the steady state of *every* boot: a notification's
-one waiter slot is claimed inside `wait_once`, which the driver reaches only after submitting and
-polling `completed()` once, and under an emulator the device finishes inside that window. The signal
-publishes its bits and finds nobody — which is what RFC 0010 designs for, since the bits are
-collected afterwards. Recording it as unexplained was a misreading of a normal condition, and it
-would have sent the next investigation somewhere there was nothing to find.
 
 ### 2026-08-05 (RFC 0011 step 5 — a handler does not outlive its owner)
 
