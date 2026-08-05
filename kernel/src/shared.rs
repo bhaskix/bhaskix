@@ -524,6 +524,80 @@ pub fn frames_of(id: MemoryId) -> Option<([u64; MAX_FRAMES], usize)> {
     Some((object.frames, object.count))
 }
 
+/// Resolves a `Memory` capability a *caller* holds, by slot in its own CSpace.
+///
+/// For a service acting on somebody else's behalf. The caller names a slot it
+/// holds rather than an object identity: an identity would be the caller
+/// asserting what it may reach, and a service that believed it would write
+/// into whatever was named. A slot is a caller pointing at authority it
+/// already has, which is checkable.
+///
+/// `None` if the thread has no domain, the slot is empty or revoked, or it
+/// names something that is not memory.
+#[must_use]
+pub fn caller_object(caller: u32, slot: u64) -> Option<MemoryId> {
+    let domain = crate::sched::domain_of(caller)?;
+    let index = usize::try_from(slot).ok()?;
+
+    crate::domain::with(domain, |owner| {
+        let cspace = core::mem::take(&mut owner.cspace);
+        let found = cspace.get(index).and_then(|slot| {
+            crate::cap::with_arena(|arena| {
+                let (object, rights) = arena.lookup(slot)?;
+                // Writing into it, so the caller must be entitled to write.
+                if object.kind != crate::cap::ObjectKind::Memory
+                    || !rights.contains(crate::cap::Rights::WRITE)
+                {
+                    return None;
+                }
+                Some(MemoryId::from_u64(object.id))
+            })
+        });
+        owner.cspace = cspace;
+        found
+    })
+    .flatten()
+}
+
+/// Fills an object's frames from `source`, returning how many bytes landed.
+///
+/// The bulk path RFC 0009 step 6 asks for. `source` is handed one frame's
+/// worth at a time and returns how much it produced; a short read ends the
+/// transfer, which is what makes this work for a file that ends mid-page.
+///
+/// `None` if the object has gone. Never writes past the object: the length is
+/// the object's, not the caller's claim about it, because a caller that could
+/// name a length would be naming memory beyond what it holds.
+pub fn fill_from(
+    id: MemoryId,
+    limit: usize,
+    mut source: impl FnMut(&mut [u8]) -> usize,
+) -> Option<usize> {
+    let (frames, count) = frames_of(id)?;
+    let hhdm = hhdm();
+    let capacity = (count * FRAME_SIZE as usize).min(limit);
+
+    let mut written = 0;
+    for frame in frames.iter().take(count) {
+        if written >= capacity {
+            break;
+        }
+        let room = (capacity - written).min(FRAME_SIZE as usize);
+        // SAFETY: a frame this object owns, reached through the direct map,
+        // and `room` is bounded by the frame size.
+        let page = unsafe { core::slice::from_raw_parts_mut((hhdm + frame) as *mut u8, room) };
+        let produced = source(page);
+        written += produced;
+        if produced < room {
+            // Short: the source has run out, and the rest of the object is
+            // deliberately left as it was rather than zeroed. A caller reads
+            // what it was told arrived.
+            break;
+        }
+    }
+    Some(written)
+}
+
 /// Names a `Memory` object with a capability, so it can be granted.
 ///
 /// Returns a root capability with every right, from which the owner derives

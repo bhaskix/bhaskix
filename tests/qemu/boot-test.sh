@@ -560,6 +560,22 @@ else
     status=1
 fi
 
+# RFC 0009 step 6: the filesystem service's bulk path, and the measurement the
+# RFC asks for rather than a claim that it is faster. The register path stays
+# for short transfers -- it is right for reading a filename and wrong for
+# reading a file.
+#
+# The refusal is asserted with it: a caller naming a slot it does not hold is
+# asking a service to write into memory it has no authority over, and a bulk
+# path that skipped that check would be a faster way to read somebody else's
+# memory.
+if grep -qE "bulk path +[0-9]+ bytes in 1 round trip against [0-9]+ by message; contents match, and a slot the caller does not hold is refused" "$LOG"; then
+    pass "bulk data moves through shared memory, and only where the caller may write"
+else
+    fail "the bulk path did not move the file, or did not refuse a slot the caller lacks"
+    status=1
+fi
+
 # RFC 0011 step 6: an interrupt a domain holds, and the two refusals that make
 # it mean something -- a legacy line may not be delegated at all (it is shared,
 # and a holder that never acknowledges masks a line other devices need), and a

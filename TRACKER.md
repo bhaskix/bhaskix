@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-17 (RFC 0009 steps 1–5, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · CI green · 160 suite checks · 39 boot gates, 46 with an IOMMU · 271 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · CI green · 163 suite checks · 40 boot gates, 47 with an IOMMU · 271 host assertions |
 
 ### Division of responsibility between documents
 
@@ -139,6 +139,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-15 | RFC 0012 step 6: interrupt remapping, built and **off** | ⚠️ `PARTIAL` | The table, entries that validate **which device** may present a handle — the only thing that answers "who sent this", which is why RFC 0011 left the risk open — remappable I/O APIC lines and MSI messages, and compatibility format blocked. The I/O APIC path works under it, confirmed by QEMU's own trace. **The block device's MSI is never sent once remapping is on, and that is unresolved.** Two real encoding bugs were found and fixed chasing it; a third cause is unidentified. Off by default because enabling it costs that driver its interrupt and leaves it polling behind the timer — a machine that works while quietly degraded. `iommu=remap-irq` turns it on; the boot line says which world the machine is in, and a gate asserts it says something either way. |
 | M6-16 | RFC 0012 step 7: a `DmaWindow` a domain holds | ✅ `DONE` | `ObjectKind::DmaWindow` with `MAP`/`UNMAP`/`INFO`, resolved under the capability arena and performed after it is released — mapping allocates, and allocating takes the heap. **Both** capabilities are checked and the device gets the weaker of their rights, so a read-only share cannot become writable by being handed to a device. **The assertion is the refusal**: a domain holding the memory and *not* the window is denied. Four real bugs fell out — see the changelog. |
 | M6-17 | RFC 0011 step 6: an `IrqHandler` a domain holds | ✅ `DONE` | `BIND`, `ACK`, `RELEASE` — and **never** the MSI-X table, because an MSI is a memory write of an arbitrary vector to an arbitrary CPU and a holder that could program one would hold interrupt injection. Three refusals carry the meaning: a legacy line may not be delegated (it is shared, and a holder that never acknowledges masks a line others need), a `Notification` capability is not authority over an interrupt, and **the RFC's own precondition is enforced in code** — `irq::name` refuses when nothing is translating, because a domain driving a device needs that device's DMA constrained first. **Negative-tested**: removing the object-kind check turns the gate red. |
+| M6-18 | RFC 0009 step 6: the filesystem service's bulk path | ✅ `DONE` | `fs::READ_INTO` fills a shared region in **one** round trip where the message path needs fifteen for the same file — the RFC's own comparison, measured on the data path alone, because opening a file costs the same either way and folding that in would flatter it. The caller names a **slot in its own CSpace**, never an object identity: an identity is a caller asserting what it may reach. The register path stays for short transfers. **Negative-tested** at the third attempt — see the changelog for why the first two proved nothing. |
 
 ### Honest notes on M6 so far
 
@@ -533,6 +534,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0009 step 6 — and a negative test that took three tries to mean anything)
+
+- **228 bytes in one round trip against fifteen by message.** The RFC's opening complaint was that
+  bulk data moves at sixteen bytes a round trip, which is right for reading a filename and wrong for
+  reading a file. The register path stays for the short case; `fs::READ_INTO` fills a shared region
+  for the long one.
+- **The measurement was flattering itself first.** The initial figure counted the path chunk and the
+  open as part of the transfer and reported "76 bytes per trip". Opening a file costs the same
+  either way, so the comparison is now the *data* path alone. A number that includes setup is an
+  argument for the wrong thing.
+- **The caller names a slot it holds, never an object identity.** An identity would be a caller
+  asserting what it may reach, and a service that believed it would write into whatever was named.
+  A slot is a caller pointing at authority it already has, which is checkable — the same shape the
+  capability syscalls use.
+- **The negative test proved nothing, twice, before it proved anything.** Naming an *empty* slot is
+  refused by the lookup before any check of the capability. Naming a capability of the *wrong kind*
+  is refused a second time by the generation check, so the gate still could not say whether rights
+  had been consulted at all. Only a **read-only capability to the same object** isolates it: the
+  caller genuinely holds it, it genuinely names memory, and the only thing that refuses it is the
+  rights check. Disabling that check now flips the result.
+- **The property it pins down is worth the three attempts**: a service asked to write into something
+  the caller may only read must refuse, however genuinely the caller holds it.
+- **`fs::READ_INTO` collided with `fs::RESET`**, both numbered 5. The compiler noticed only because
+  a match arm became unreachable. There is a `const` assertion over the method numbers now, so the
+  next collision fails the build rather than answering the wrong question.
 
 ### 2026-08-05 (RFC 0011 step 6 — the last blocked step, and a precondition written as code)
 

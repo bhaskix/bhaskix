@@ -102,6 +102,26 @@ pub mod fs {
     pub const READ: u64 = 3;
     /// Begin listing the accumulated path, then return one entry per call.
     pub const LIST: u64 = 4;
+    /// Read into a shared region instead of into registers.
+    ///
+    /// `arg0` = the caller's own capability slot holding a `Memory` object,
+    /// `arg1` = how many bytes at most. Returns the number written.
+    ///
+    /// The register path stays for short transfers: RFC 0009 measured it at
+    /// sixteen bytes a round trip, which is right for a path that reads a
+    /// filename and wrong for one that reads a file.
+    pub const READ_INTO: u64 = 6;
+
+    // Two methods with one number is a service answering the wrong question,
+    // and the compiler only noticed because one arm became unreachable. Said
+    // here as an assertion so the next one fails the build instead.
+    const _: () = {
+        assert!(PATH != OPEN && PATH != READ && PATH != LIST && PATH != RESET && PATH != READ_INTO);
+        assert!(OPEN != READ && OPEN != LIST && OPEN != RESET && OPEN != READ_INTO);
+        assert!(READ != LIST && READ != RESET && READ != READ_INTO);
+        assert!(LIST != RESET && LIST != READ_INTO);
+        assert!(RESET != READ_INTO);
+    };
     /// Forget this caller's path, open file, and listing.
     pub const RESET: u64 = 5;
 }
@@ -123,6 +143,13 @@ pub mod outcome {
     /// The caller reached the service through a capability with no badge, so
     /// it cannot be told apart from any other such caller.
     pub const UNIDENTIFIED: u64 = 6;
+    /// The caller named a capability it does not hold, or one of the wrong
+    /// kind.
+    ///
+    /// Distinct from `BAD_PATH`: the request was well formed and the caller
+    /// was not entitled to it, which is the answer a service must be able to
+    /// give without saying anything about what it was asked for.
+    pub const NOT_YOURS: u64 = 7;
 }
 
 /// Bytes one message carries.

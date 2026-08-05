@@ -1047,6 +1047,25 @@ pub fn take_message(thread: u32) -> Option<(crate::ipc::Message, u32)> {
     None
 }
 
+/// The domain a given thread belongs to.
+///
+/// Distinct from [`current_domain`], which answers for the running thread. A
+/// service is asked to act on a *caller's* behalf and has only that caller's
+/// thread id, so resolving the caller's own capabilities needs this.
+#[must_use]
+pub fn domain_of(thread: u32) -> Option<crate::domain::DomainId> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        if let Some(target) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            if target.domain == u32::MAX {
+                return None;
+            }
+            return Some(crate::domain::DomainId::from_u32(target.domain));
+        }
+    }
+    None
+}
+
 /// The domain the calling thread belongs to.
 ///
 /// `None` for a thread created before domains existed, which is the correct

@@ -273,7 +273,7 @@ extern "C" fn filesystem_service(_argument: u64) -> ! {
             [with_outcome(0, outcome::UNIDENTIFIED), 0, 0, 0]
         } else {
             match session_for(&mut sessions, message.badge) {
-                Some(session) => serve(session, message.method, &message.args),
+                Some(session) => serve(session, caller, message.method, &message.args),
                 None => {
                     REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     [with_outcome(0, outcome::BUSY), 0, 0, 0]
@@ -313,7 +313,7 @@ fn session_for(sessions: &mut [Session; MAX_SESSIONS], badge: u64) -> Option<&mu
     Some(&mut sessions[index])
 }
 
-fn serve(session: &mut Session, method: u64, args: &[u64; 4]) -> [u64; 4] {
+fn serve(session: &mut Session, caller: u32, method: u64, args: &[u64; 4]) -> [u64; 4] {
     match method {
         fs::PATH => {
             let chunk = Chunk::unpack(args);
@@ -360,6 +360,28 @@ fn serve(session: &mut Session, method: u64, args: &[u64; 4]) -> [u64; 4] {
             let read = file.read(&mut bytes);
             let (chunk, _) = Chunk::take(&bytes[..read]);
             chunk.pack(0)
+        }
+
+        fs::READ_INTO => {
+            let Some(file) = session.open.as_mut() else {
+                return [with_outcome(0, outcome::NOTHING_OPEN), 0, 0, 0];
+            };
+
+            // The caller names a slot in **its own** CSpace, not an object
+            // identity. Naming an identity would be a caller asserting what it
+            // may reach; naming a slot is a caller pointing at authority it
+            // already holds, which the service then checks -- the same shape
+            // the capability syscalls use, and the reason this cannot be used
+            // to read into somebody else's memory.
+            let Some(object) = crate::shared::caller_object(caller, args[0]) else {
+                return [with_outcome(0, outcome::NOT_YOURS), 0, 0, 0];
+            };
+
+            let limit = args[1] as usize;
+            match crate::shared::fill_from(object, limit, |bytes| file.read(bytes)) {
+                Some(written) => [with_outcome(written as u64, outcome::OK), 0, 0, 0],
+                None => [with_outcome(0, outcome::NOT_YOURS), 0, 0, 0],
+            }
         }
 
         fs::LIST => {

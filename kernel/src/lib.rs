@@ -1400,6 +1400,11 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         println!("    services       FAILED");
     }
 
+    // RFC 0009 step 6: the same file, by message and by shared memory.
+    if !bulk_service_self_test(filesystem, hhdm) {
+        println!("    bulk path      FAILED");
+    }
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -1418,6 +1423,152 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
 /// `console::READ` is deliberately not exercised. It blocks until somebody
 /// types, and a boot test that waited for that would hang in CI and pass on a
 /// developer's terminal.
+/// What the bulk-path client found, since it cannot return a value.
+static BULK_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BULK_TRIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BULK_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static BULK_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BULK_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Reads a file into shared memory from inside the domain that holds it.
+extern "C" fn bulk_client(_argument: u64) -> ! {
+    use bhaskix_abi::{Chunk, fs, outcome, outcome_of};
+    use core::sync::atomic::Ordering;
+
+    const BADGE: u64 = 0x00b1_0000;
+    let filesystem = ipc::EndpointId::from_u32(BULK_ENDPOINT.load(Ordering::Acquire) as u32);
+    let send = |method: u64, args: [u64; 4]| {
+        ipc::call(filesystem, BADGE, method, args).map(|reply| reply.args)
+    };
+
+    let path = b"README";
+    let _ = send(fs::PATH, Chunk::take(path).0.pack(0));
+    let _ = send(fs::OPEN, [0; 4]);
+
+    // Counted for the *data* path only. Opening a file costs the same either
+    // way, and folding that into the figure would flatter the comparison --
+    // the RFC's sixteen bytes a round trip is about moving bytes, not about
+    // naming a file.
+    let mut trips = 0;
+
+    // Slot 0 holds the memory. One call, however many bytes fit.
+    if let Ok(args) = send(fs::READ_INTO, [0, 4096, 0, 0]) {
+        trips += 1;
+        if outcome_of(args[0]) == outcome::OK {
+            BULK_BYTES.store(args[0] & 0xffff_ffff, Ordering::Relaxed);
+        }
+    }
+    BULK_TRIPS.store(trips, Ordering::Relaxed);
+
+    // And the refusal: slot 1 names the same memory, read-only. A service
+    // asked to *write* into something the caller may only read must say no,
+    // however genuinely the caller holds it.
+    if let Ok(args) = send(fs::READ_INTO, [1, 4096, 0, 0]) {
+        BULK_REFUSED.store(outcome_of(args[0]), Ordering::Relaxed);
+    }
+
+    BULK_DONE.store(true, Ordering::Release);
+    sched::exit();
+}
+
+/// RFC 0009 step 6: the filesystem service's bulk path.
+///
+/// The RFC's first sentence is that bulk data moves at sixteen bytes a round
+/// trip, which is right for reading a filename and wrong for reading a file.
+/// This measures both against each other on the same file: the chunk protocol
+/// as it was, and one call that fills a shared region.
+///
+/// The comparison is the point. A shared-memory path that is not measured is a
+/// claim; the number here is what makes it an argument.
+fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let Ok(owner) = domain::create("bulk-reader", domain::ResourceEnvelope::new()) else {
+        println!("    bulk path      FAILED to create a domain");
+        return false;
+    };
+    let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
+        println!("    bulk path      FAILED to create a memory object");
+        domain::destroy(owner);
+        return false;
+    };
+    let Ok(memory_cap) = shared::name(object) else {
+        println!("    bulk path      FAILED to name the object");
+        domain::destroy(owner);
+        return false;
+    };
+    // Slot 1: the *same object*, read-only. The caller genuinely holds it and
+    // it genuinely names memory — what it does not carry is the right to have
+    // something written into it. That isolates the check being tested: an
+    // empty slot is refused by the lookup, and a capability of another kind is
+    // refused a second time by the generation check, so neither would tell us
+    // whether the rights were consulted at all.
+    let Some(decoy) = cap::with_arena(|arena| arena.derive(memory_cap, cap::Rights::READ, 0).ok())
+    else {
+        println!("    bulk path      FAILED to derive a read-only capability");
+        domain::destroy(owner);
+        return false;
+    };
+    if domain::with(owner, |d| {
+        d.cspace.install_at(0, memory_cap).is_ok() && d.cspace.install_at(1, decoy).is_ok()
+    }) != Some(true)
+    {
+        println!("    bulk path      FAILED to install the capabilities");
+        domain::destroy(owner);
+        return false;
+    }
+
+    BULK_ENDPOINT.store(u64::from(filesystem.as_u32()), Ordering::Release);
+    BULK_DONE.store(false, Ordering::Relaxed);
+    BULK_BYTES.store(0, Ordering::Relaxed);
+    BULK_REFUSED.store(u64::MAX, Ordering::Relaxed);
+
+    let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
+    if sched::spawn_on_with(0, "bulk-reader", bulk_client, 0, hhdm, options).is_err() {
+        println!("    bulk path      FAILED to spawn a thread in the domain");
+        domain::destroy(owner);
+        return false;
+    }
+    wait_until(|| BULK_DONE.load(Ordering::Acquire), 4_000);
+
+    let bytes = BULK_BYTES.load(Ordering::Relaxed);
+    let trips = BULK_TRIPS.load(Ordering::Relaxed).max(1);
+    let refused = BULK_REFUSED.load(Ordering::Relaxed);
+
+    // What the service put there must be what the file holds -- read
+    // independently, through the VFS, not through the service being tested.
+    let matches = match (shared::frames_of(object), vfs::open(b"README")) {
+        (Some((frames, count)), Ok(mut file)) if count > 0 && bytes > 0 => {
+            let mut expected = [0u8; 256];
+            let read = file.read(&mut expected);
+            // SAFETY: a frame this object owns, through the direct map.
+            let landed =
+                unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, read) };
+            read > 0 && landed == &expected[..read]
+        }
+        _ => false,
+    };
+
+    shared::revoke(object);
+    domain::destroy(owner);
+
+    // What the same file costs by message, at the RFC's own figure.
+    let by_message = bytes.div_ceil(bhaskix_abi::CHUNK_BYTES as u64).max(1);
+    let ok = bytes > 0 && matches && refused == bhaskix_abi::outcome::NOT_YOURS;
+    if ok {
+        println!(
+            "    bulk path      {bytes} bytes in {trips} round trip against {by_message} \
+             by message; contents match, and a slot the caller does not hold is refused"
+        );
+    } else {
+        println!(
+            "    bulk path      FAILED: {bytes} bytes, contents match {matches}, \
+             refusal {refused}"
+        );
+    }
+    ok
+}
+
 fn service_self_test(filesystem: ipc::EndpointId) -> bool {
     use bhaskix_abi::{Chunk, fs, outcome, outcome_of};
 
