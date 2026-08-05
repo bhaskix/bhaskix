@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-16 (RFC 0009 steps 1–5, RFC 0011 steps 1–5, RFC 0012 steps 1–5 and 7, step 6 partial) · CI green · 157 suite checks · 38 boot gates, 45 with an IOMMU · 271 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-17 (RFC 0009 steps 1–5, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · CI green · 160 suite checks · 39 boot gates, 46 with an IOMMU · 271 host assertions |
 
 ### Division of responsibility between documents
 
@@ -138,6 +138,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-14 | RFC 0012 step 5: a `Memory` object a device can reach, and a revoke that reaches the device | ✅ `DONE` | RFC 0009's object mapped into the device window — the same frames a domain shares with another domain are what a device is given, through the same object and the same revocation. `revoke` now walks the device mapping too, invalidating the IOTLB per entry. **The assertion is asked of the device**: it reads into the object successfully, the object is revoked, and the same device at the same address is refused. A new `DmaWindow` lock rank sits inside `shared::ARENA`, and the unit's registers are cached at bring-up because mapping MMIO reaches the heap — the outermost lock — while invalidation happens under the innermost. |
 | M6-15 | RFC 0012 step 6: interrupt remapping, built and **off** | ⚠️ `PARTIAL` | The table, entries that validate **which device** may present a handle — the only thing that answers "who sent this", which is why RFC 0011 left the risk open — remappable I/O APIC lines and MSI messages, and compatibility format blocked. The I/O APIC path works under it, confirmed by QEMU's own trace. **The block device's MSI is never sent once remapping is on, and that is unresolved.** Two real encoding bugs were found and fixed chasing it; a third cause is unidentified. Off by default because enabling it costs that driver its interrupt and leaves it polling behind the timer — a machine that works while quietly degraded. `iommu=remap-irq` turns it on; the boot line says which world the machine is in, and a gate asserts it says something either way. |
 | M6-16 | RFC 0012 step 7: a `DmaWindow` a domain holds | ✅ `DONE` | `ObjectKind::DmaWindow` with `MAP`/`UNMAP`/`INFO`, resolved under the capability arena and performed after it is released — mapping allocates, and allocating takes the heap. **Both** capabilities are checked and the device gets the weaker of their rights, so a read-only share cannot become writable by being handed to a device. **The assertion is the refusal**: a domain holding the memory and *not* the window is denied. Four real bugs fell out — see the changelog. |
+| M6-17 | RFC 0011 step 6: an `IrqHandler` a domain holds | ✅ `DONE` | `BIND`, `ACK`, `RELEASE` — and **never** the MSI-X table, because an MSI is a memory write of an arbitrary vector to an arbitrary CPU and a holder that could program one would hold interrupt injection. Three refusals carry the meaning: a legacy line may not be delegated (it is shared, and a holder that never acknowledges masks a line others need), a `Notification` capability is not authority over an interrupt, and **the RFC's own precondition is enforced in code** — `irq::name` refuses when nothing is translating, because a domain driving a device needs that device's DMA constrained first. **Negative-tested**: removing the object-kind check turns the gate red. |
 
 ### Honest notes on M6 so far
 
@@ -532,6 +533,30 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0011 step 6 — the last blocked step, and a precondition written as code)
+
+- **The step RFC 0011 would not take until there was an IOMMU.** There is one, so it is taken: a
+  domain can hold an interrupt, bind it to a notification it owns, and acknowledge it. That is the
+  first moment a driver could run outside the kernel and still be told when its device wants
+  attention.
+- **What a holder does *not* get is the MSI-X table.** An MSI is a memory write of an arbitrary
+  vector to an arbitrary CPU, so a holder able to program one holds an interrupt injection
+  primitive obtained by writing two words. The kernel programs it and delegates the rest.
+- **The precondition is enforced rather than remembered.** `irq::name` refuses unless something is
+  translating. A comment saying "do not do this without an IOMMU" is a comment; a refusal is a
+  property. On a machine with no unit the self-test skips and says why, and the gate takes that as
+  a pass — the honest outcome for a machine where the step is not safe to take.
+- **Three refusals are the substance, not the success path.** A legacy line cannot be delegated at
+  all: it is shared, and a holder that never acknowledges masks a line other devices need — a
+  domain wedging its own device is its problem, wedging somebody else's is the kernel's. A
+  `Notification` capability is not authority over an interrupt however much of it is held. And
+  `BIND` checks *both* capabilities, so an interrupt cannot be aimed at another domain's
+  notification.
+- **The test puts the interrupt back.** It hands the block device's real handler to a domain, and
+  `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
+  driver would spend the rest of the boot on the timer, working and slower, which is the quiet
+  degradation this milestone keeps finding.
 
 ### 2026-08-05 (M6 status — a milestone that ended somewhere else)
 

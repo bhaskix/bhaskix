@@ -676,6 +676,32 @@ pub fn dma_frames() -> Option<[u64; 5]> {
     ])
 }
 
+/// The interrupt handler this driver claimed, if it has one.
+#[must_use]
+pub fn handler() -> Option<crate::irq::HandlerId> {
+    DEVICE.lock().as_ref()?.handler
+}
+
+/// Points this device's interrupt back at the driver's own notification.
+///
+/// Needed because `BIND` is exactly the authority to redirect an interrupt,
+/// and a self-test that hands that authority to a domain has the domain use
+/// it. Putting it back is the test cleaning up after itself rather than the
+/// driver losing its interrupt for the rest of the boot.
+pub fn rebind_notification() -> bool {
+    let (handler, notification) = {
+        let guard = DEVICE.lock();
+        let Some(device) = guard.as_ref() else {
+            return false;
+        };
+        match (device.handler, device.notification) {
+            (Some(handler), Some(notification)) => (handler, notification),
+            _ => return false,
+        }
+    };
+    crate::irq::bind(handler, notification, 1).is_ok()
+}
+
 /// Whether this device's DMA is subject to the platform's translation.
 ///
 /// False means the device may address memory directly however the IOMMU is

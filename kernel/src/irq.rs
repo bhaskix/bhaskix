@@ -342,6 +342,11 @@ pub enum ClaimError {
     NotRouted,
     /// The handler has been released, or the name is stale.
     Gone,
+    /// This source may not be delegated to a domain.
+    ///
+    /// Only message-signalled sources may. A legacy line is shared, so a
+    /// holder that never acknowledges masks a line other devices need.
+    NotDelegable,
 }
 
 /// One claimed source. Behind a lock; the interrupt path does not read this.
@@ -621,6 +626,60 @@ pub fn acknowledge(id: HandlerId) -> Result<(), ClaimError> {
         unsafe { bhaskix_arch::cpu::enable_interrupts() };
     }
     outcome.map_err(|_| ClaimError::NotRouted)
+}
+
+/// Names a claimed handler with a capability, so it can be granted.
+///
+/// RFC 0011 step 6, and the restriction is the RFC's: **only a
+/// message-signalled source may be delegated.** A legacy line is shared
+/// between devices, so a holder that never acknowledges masks a line the
+/// others need — and the kernel cannot fix that without a driver for each of
+/// them. A domain that wedges its own device is its own problem; one that
+/// wedges somebody else's is the kernel's.
+///
+/// What the holder gets is `BIND`, `ACK` and `RELEASE`. It does not get the
+/// MSI-X table, and there is no method that would let it program one.
+///
+/// # Errors
+///
+/// [`ClaimError::NotDelegable`] for a source that may not be delegated, or
+/// [`ClaimError::Gone`] if the handler has been released.
+pub fn name(id: HandlerId) -> Result<crate::cap::SlotRef, ClaimError> {
+    let source = {
+        let handlers = HANDLERS.lock();
+        resolve(&handlers, id).ok_or(ClaimError::Gone)?.source
+    };
+    if !source.delegable() {
+        return Err(ClaimError::NotDelegable);
+    }
+
+    // RFC 0011 would not take this step until there was an IOMMU, and that is
+    // enforced here rather than remembered. A domain driving a device needs
+    // the device's DMA constrained; without translation the driver it runs
+    // can point that device at the kernel's memory, and an interrupt
+    // capability would be the least of it.
+    if !crate::iommu::present() {
+        return Err(ClaimError::NotDelegable);
+    }
+
+    let identity = u64::from(id.index) | (u64::from(id.generation) << 32);
+    crate::cap::with_arena(|arena| {
+        arena.insert_root(
+            crate::cap::ObjectRef::new(crate::cap::ObjectKind::IrqHandler, identity),
+            crate::cap::Rights::ALL,
+            0,
+        )
+    })
+    .map_err(|_| ClaimError::Exhausted)
+}
+
+/// Rebuilds a handler identity from the packed form a capability carries.
+#[must_use]
+pub const fn handler_from_u64(identity: u64) -> HandlerId {
+    HandlerId {
+        index: identity as u32,
+        generation: (identity >> 32) as u32,
+    }
 }
 
 /// Releases every handler `domain` held, returning how many there were.

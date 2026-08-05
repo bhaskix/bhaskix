@@ -560,6 +560,21 @@ else
     status=1
 fi
 
+# RFC 0011 step 6: an interrupt a domain holds, and the two refusals that make
+# it mean something -- a legacy line may not be delegated at all (it is shared,
+# and a holder that never acknowledges masks a line other devices need), and a
+# notification capability is not authority over an interrupt however much of it
+# a domain holds.
+#
+# "skipped" is a pass: the RFC will not take this step without an IOMMU, and
+# `irq::name` enforces that rather than trusting anyone to remember it.
+if grep -qE "irq grant +(a domain bound and acknowledged an interrupt it was given|skipped, no IOMMU)" "$LOG"; then
+    pass "an interrupt is delegated only with the authority and the containment for it"
+else
+    fail "a domain took an interrupt it was not given, or delegation said nothing"
+    status=1
+fi
+
 # RFC 0009 step 1: memory objects. The number in parentheses is the frame count
 # before and after -- asserted as *equal* by the kernel, and printed so that a
 # regression says by how much rather than only that there was one. This is the

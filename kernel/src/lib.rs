@@ -481,6 +481,13 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         );
     }
 
+    // RFC 0011 step 6: an interrupt a domain holds. Before the DMA tests,
+    // because it hands the block device's interrupt to a domain and puts it
+    // back — and a device with no interrupt is a driver on the timer.
+    if !irq_delegation_self_test(handoff) {
+        println!("    irq grant      FAILED");
+    }
+
     // RFC 0012 step 7, before the refusal test leaves the device unusable.
     if iommu::present() && !iommu_delegation_self_test(handoff.hhdm_base.as_u64()) {
         println!("    iommu grant    FAILED");
@@ -2211,6 +2218,160 @@ extern "C" fn dma_client(_argument: u64) -> ! {
 
     GRANT_DONE.store(true, Ordering::Release);
     sched::exit();
+}
+
+/// What the delegated driver's thread found.
+static IRQ_BOUND: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static IRQ_ACKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static IRQ_WITHOUT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static IRQ_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Exercises `BIND`, `ACK` and a refusal, from inside the domain that holds
+/// the capabilities.
+extern "C" fn irq_client(_argument: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    // Slot 0 the handler, slot 1 the notification it may signal.
+    let mut bind = syscall::SyscallFrame {
+        kind: syscall::Kind::Invoke as u64,
+        capability: 0,
+        method: syscall::method::BIND,
+        arg0: 1,
+        arg1: 1,
+        ..syscall::SyscallFrame::default()
+    };
+    IRQ_BOUND.store(
+        syscall::dispatch(&mut bind).status as u32,
+        Ordering::Relaxed,
+    );
+
+    let mut ack = syscall::SyscallFrame {
+        kind: syscall::Kind::Invoke as u64,
+        capability: 0,
+        method: syscall::method::ACK,
+        ..syscall::SyscallFrame::default()
+    };
+    IRQ_ACKED.store(syscall::dispatch(&mut ack).status as u32, Ordering::Relaxed);
+
+    // And the refusal: acknowledging through the *notification* capability,
+    // which is not authority over an interrupt however much it is held.
+    let mut without = syscall::SyscallFrame {
+        kind: syscall::Kind::Invoke as u64,
+        capability: 1,
+        method: syscall::method::ACK,
+        ..syscall::SyscallFrame::default()
+    };
+    IRQ_WITHOUT.store(
+        syscall::dispatch(&mut without).status as u32,
+        Ordering::Relaxed,
+    );
+
+    IRQ_DONE.store(true, Ordering::Release);
+    sched::exit();
+}
+
+/// RFC 0011 step 6: an `IrqHandler` a domain holds.
+///
+/// The step the RFC would not take until there was an IOMMU, and there is one
+/// now. What a holder gets is `BIND`, `ACK` and `RELEASE` — never the MSI-X
+/// table, because an MSI is a memory write of an arbitrary vector to an
+/// arbitrary CPU and a holder that could program one would hold an interrupt
+/// injection primitive. The kernel keeps that.
+///
+/// Only a message-signalled source may be delegated at all, which this checks
+/// by trying a legacy line and expecting a refusal: a line is shared, and a
+/// holder that never acknowledges masks a line other devices need.
+fn irq_delegation_self_test(handoff: &Handoff) -> bool {
+    if !iommu::present() {
+        // The RFC's own precondition, and `irq::name` refuses here too. A
+        // machine with no translation is one where delegating a device is not
+        // safe to do, so it is not done and the machine says so.
+        println!("    irq grant      skipped, no IOMMU: a device cannot be delegated safely");
+        return true;
+    }
+    let apic = handoff.bsp_lapic_id;
+    let rsdp = handoff.rsdp;
+    let hhdm = handoff.hhdm_base.as_u64();
+
+    // A spare legacy line, which must be refused for delegation.
+    let line = irq::Source::Line { gsi: 11 };
+    // SAFETY: `trap` dispatches unclaimed vectors to `irq::on_interrupt`.
+    let Ok(line_handler) = (unsafe { irq::claim(line, "irq delegation test", apic, rsdp, hhdm) })
+    else {
+        println!("    irq grant      skipped, no spare line to claim");
+        return true;
+    };
+    let line_refused = matches!(irq::name(line_handler), Err(irq::ClaimError::NotDelegable));
+    irq::release(line_handler);
+
+    // The block device's own handler is message-signalled, so it is the one
+    // that may be delegated. Claiming a second is not possible -- a source is
+    // claimed once -- so this names the handler the driver already holds.
+    let Some(handler) = virtio::handler() else {
+        println!("    irq grant      skipped, the block driver holds no handler");
+        return line_refused;
+    };
+    let (Ok(handler_cap), Ok(notification)) = (irq::name(handler), notify::create()) else {
+        println!("    irq grant      FAILED to name the handler or make a notification");
+        return false;
+    };
+    let Ok(notify_cap) = notify::name(notification) else {
+        println!("    irq grant      FAILED to name the notification");
+        return false;
+    };
+
+    let Ok(owner) = domain::create("irq-holder", domain::ResourceEnvelope::new()) else {
+        println!("    irq grant      FAILED to create a domain");
+        return false;
+    };
+    let placed = domain::with(owner, |domain| {
+        domain.cspace.install_at(0, handler_cap).is_ok()
+            && domain.cspace.install_at(1, notify_cap).is_ok()
+    });
+    if placed != Some(true) {
+        println!("    irq grant      FAILED to install the capabilities");
+        domain::destroy(owner);
+        return false;
+    }
+
+    IRQ_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
+    let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
+    if sched::spawn_on_with(0, "irq-holder", irq_client, 0, hhdm, options).is_err() {
+        println!("    irq grant      FAILED to spawn a thread in the domain");
+        domain::destroy(owner);
+        return false;
+    }
+    wait_until(
+        || IRQ_DONE.load(core::sync::atomic::Ordering::Acquire),
+        4_000,
+    );
+
+    let bound = IRQ_BOUND.load(core::sync::atomic::Ordering::Relaxed);
+    let acked = IRQ_ACKED.load(core::sync::atomic::Ordering::Relaxed);
+    let without = IRQ_WITHOUT.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Put the driver's own notification back: the domain pointed the block
+    // device's interrupt at its own, and the driver is still using it.
+    let _ = virtio::rebind_notification();
+    domain::destroy(owner);
+    notify::destroy(notification);
+
+    let ok = bound == syscall::Status::Ok as u32
+        && acked == syscall::Status::Ok as u32
+        && without == syscall::Status::WrongObject as u32
+        && line_refused;
+    if ok {
+        println!(
+            "    irq grant      a domain bound and acknowledged an interrupt it was given; \
+             a legacy line was refused delegation, and a notification is not an interrupt"
+        );
+    } else {
+        println!(
+            "    irq grant      FAILED: bind {bound}, ack {acked}, refusal {without}, \
+             legacy line refused {line_refused}"
+        );
+    }
+    ok
 }
 
 /// RFC 0012 step 7: a `DmaWindow` a domain holds, and what it cannot do without

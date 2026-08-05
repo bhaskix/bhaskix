@@ -176,6 +176,14 @@ pub enum ObjectKind {
     Reply,
     /// A signal with no payload.
     Notification,
+    /// One claimed interrupt source: [RFC 0011](../../docs/rfc/0011-irq-handler.md).
+    ///
+    /// Holding one is the authority to *receive* an interrupt and to
+    /// acknowledge it. Deliberately not the authority to **program** one: an
+    /// MSI is a memory write of an arbitrary vector to an arbitrary CPU, so a
+    /// holder that could program its own table entry would hold an interrupt
+    /// injection primitive. The kernel keeps that and hands out this.
+    IrqHandler,
     /// A device's DMA address space: [RFC 0012](../../docs/rfc/0012-iommu.md).
     ///
     /// Holding one is the authority to say what a *device* may reach. That is

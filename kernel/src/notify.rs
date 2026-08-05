@@ -256,6 +256,31 @@ pub fn replay_signals(mut visit: impl FnMut(u32, u32)) {
     }
 }
 
+/// Names a notification with a capability, so it can be granted to a domain.
+///
+/// A delegated driver needs one to bind its interrupt to: RFC 0011's `BIND`
+/// takes the notification the holder wants signalled, and a domain can only
+/// name one it holds.
+///
+/// # Errors
+///
+/// [`NotifyError::Gone`] if it has been destroyed, or [`NotifyError::Exhausted`]
+/// if the capability arena is full.
+pub fn name(id: NotificationId) -> Result<crate::cap::SlotRef, NotifyError> {
+    if resolve(id).is_none() {
+        return Err(NotifyError::Gone);
+    }
+    let identity = u64::from(id.index()) | (u64::from(id.generation()) << 32);
+    crate::cap::with_arena(|arena| {
+        arena.insert_root(
+            crate::cap::ObjectRef::new(crate::cap::ObjectKind::Notification, identity),
+            crate::cap::Rights::ALL,
+            0,
+        )
+    })
+    .map_err(|_| NotifyError::Exhausted)
+}
+
 /// Takes the pending word without blocking. Zero means nothing is pending.
 #[must_use]
 pub fn poll(id: NotificationId) -> u64 {

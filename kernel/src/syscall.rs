@@ -183,6 +183,18 @@ pub mod method {
     pub const UNMAP: u64 = 33;
     /// How many pages this window has mapped.
     pub const INFO: u64 = 34;
+    /// Signal a notification when this `IrqHandler`'s source fires.
+    ///
+    /// `arg0` = the caller's slot holding the `Notification` capability,
+    /// `arg1` = the badge to signal with. RFC 0011.
+    pub const BIND: u64 = 35;
+    /// Unmask this source, so the next interrupt may be delivered.
+    ///
+    /// The whole of a delegated driver's interrupt duty: the kernel masks on
+    /// delivery, and nothing arrives again until the holder says it is ready.
+    pub const ACK: u64 = 36;
+    /// Give the source up: masked permanently, vector freed, claim released.
+    pub const RELEASE: u64 = 37;
 }
 
 /// What a system call returns in `rax`.
@@ -482,6 +494,74 @@ fn resolve_window(frame: &SyscallFrame) -> Result<ResolvedWindow, Status> {
     outcome.unwrap_or(Err(Status::NoDomain))
 }
 
+/// What an `IrqHandler` invocation resolved to, with every lock released.
+///
+/// Same reason as [`resolve_window`]: binding and acknowledging reach the
+/// handler table and the interrupt controller, which rank inside the
+/// capability arena this was resolved under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ResolvedHandler {
+    handler: crate::irq::HandlerId,
+    notification: Option<crate::notify::NotificationId>,
+}
+
+/// Resolves an `IrqHandler` method against the caller's own capabilities.
+///
+/// `BIND` checks **both**: the handler, and the notification it is asked to
+/// signal. A domain may only point an interrupt at something it already holds
+/// — otherwise a holder could aim a device's interrupt at another domain's
+/// notification, which is a wake nobody asked for delivered on somebody
+/// else's behalf.
+fn resolve_handler(frame: &SyscallFrame) -> Result<ResolvedHandler, Status> {
+    let Some(id) = sched::current_domain() else {
+        return Err(Status::NoDomain);
+    };
+
+    let outcome = domain::with(id, |owner| {
+        let cspace = core::mem::take(&mut owner.cspace);
+        let result = cap::with_arena(|arena| {
+            let index = usize::try_from(frame.capability).map_err(|_| Status::NoSuchCapability)?;
+            let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
+            let (object, rights) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            if object.kind != ObjectKind::IrqHandler {
+                return Err(Status::WrongObject);
+            }
+            if !rights.contains(crate::cap::Rights::WRITE) {
+                // Acknowledging and binding both change what the hardware
+                // does next. A read-only handle to an interrupt is a thing to
+                // observe, not to steer.
+                return Err(Status::InsufficientRights);
+            }
+            let handler = crate::irq::handler_from_u64(object.id);
+
+            if frame.method != method::BIND {
+                return Ok(ResolvedHandler {
+                    handler,
+                    notification: None,
+                });
+            }
+
+            let notify_index = usize::try_from(frame.arg0).map_err(|_| Status::NoSuchCapability)?;
+            let notify_slot = cspace.get(notify_index).ok_or(Status::NoSuchCapability)?;
+            let (notification, _) = arena.lookup(notify_slot).ok_or(Status::Revoked)?;
+            if notification.kind != ObjectKind::Notification {
+                return Err(Status::WrongObject);
+            }
+            Ok(ResolvedHandler {
+                handler,
+                notification: Some(crate::notify::NotificationId::from_parts(
+                    notification.id as u32,
+                    (notification.id >> 32) as u32,
+                )),
+            })
+        });
+        owner.cspace = cspace;
+        result
+    });
+
+    outcome.unwrap_or(Err(Status::NoDomain))
+}
+
 /// What a capability resolved to, for an operation that must run unlocked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Resolved {
@@ -577,6 +657,40 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         Some(Kind::Exit) => sched::exit(),
         None => return Outcome::err(Status::BadSyscall),
         Some(_) => {}
+    }
+
+    // An `IrqHandler` method, unlocked for the same reason as the window's:
+    // binding and acknowledging reach the handler table and the controller,
+    // both of which rank inside the capability arena it was resolved under.
+    if kind == Some(Kind::Invoke)
+        && matches!(frame.method, method::BIND | method::ACK | method::RELEASE)
+    {
+        let resolved = match resolve_handler(frame) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        return match frame.method {
+            method::BIND => match resolved.notification {
+                Some(notification) => {
+                    match crate::irq::bind(resolved.handler, notification, frame.arg1) {
+                        Ok(()) => Outcome::ok(0),
+                        Err(_) => Outcome::err(Status::NoSuchCapability),
+                    }
+                }
+                None => Outcome::err(Status::WrongObject),
+            },
+            method::ACK => match crate::irq::acknowledge(resolved.handler) {
+                Ok(()) => Outcome::ok(0),
+                Err(_) => Outcome::err(Status::NoSuchCapability),
+            },
+            _ => {
+                if crate::irq::release(resolved.handler) {
+                    Outcome::ok(0)
+                } else {
+                    Outcome::err(Status::NoSuchCapability)
+                }
+            }
+        };
     }
 
     // A `DmaWindow` method, which does not block but must not run locked: a
