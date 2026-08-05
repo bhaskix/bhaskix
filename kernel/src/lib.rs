@@ -2799,7 +2799,19 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // on and off, and the "zero sized buffers" complaint QEMU makes at
     // translation-enable time -- that one is the firmware's stale ring being
     // read through a translation that no longer maps it, it happens with
-    // remapping off as well, and the device reset that follows clears it.
+    // remapping off as well, and QEMU 7.2 does not report it at all.
+    //
+    // Also eliminated, on QEMU **7.2** as well as 4.2, so this is not an old
+    // emulator: the message format (compatibility fares no better than
+    // remappable), the ordering (enabling after the device's interrupts
+    // already work breaks them immediately, and rewriting the entry
+    // afterwards does not bring them back), and the missing invalidation
+    // queue -- which the specification does require before remapping, so it
+    // is enabled now and changed nothing.
+    //
+    // What is left: the device's MSI never reaches the unit in any of these
+    // arrangements, while the I/O APIC's does, and the device keeps completing
+    // requests throughout.
     //
     // SAFETY: the unit is programmed, and nothing has been routed yet --
     // `console_input` and the block driver's MSI-X both come later.

@@ -770,6 +770,13 @@ pub unsafe fn enable_interrupt_remapping(hhdm: u64) -> Result<(), &'static str> 
         if !unit.supports_interrupt_remapping() {
             return Err("the unit does not support interrupt remapping");
         }
+        // The specification wants the invalidation queue on before remapping,
+        // and register-based invalidation working without it is exactly why
+        // that is easy to miss.
+        let (queue, _) = zeroed_frame(hhdm).ok_or("no frame for the invalidation queue")?;
+        if !unit.enable_queued_invalidation(queue) {
+            return Err("the unit did not report queued invalidation enabled");
+        }
         if !unit.set_interrupt_remap_table(table, vtd::IRT_ENTRIES) {
             return Err("the unit did not accept the remapping table");
         }
@@ -824,6 +831,12 @@ pub fn remap_interrupt(source: Option<(u8, u8, u8)>, vector: u8, destination: u8
     // SAFETY: the unit that owns this table.
     unsafe {
         let _ = invalidate_interrupt_cache();
+        let entry = ((hhdm + table) as *const u64).add(handle as usize * 2);
+        crate::println!(
+            "  MARK irte[{handle}] low={:#x} high={:#x}",
+            core::ptr::read_volatile(entry),
+            core::ptr::read_volatile(entry.add(1))
+        );
     }
     u16::try_from(handle).ok()
 }

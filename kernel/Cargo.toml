@@ -123,4 +123,10 @@ workspace = true
 # an entry whose source and destination are still zero is a handle anything may
 # use. The table is a frame this module allocated and zeroed, at an index
 # bounded before the write.
-unsafe_budget = 1040
+# 1070 at M6-19. Queued invalidation: a zeroed page for the unit's own ring,
+# which the specification requires be enabled before interrupt remapping.
+# Register-based invalidation keeps working without it, which is exactly why
+# the requirement is easy to miss -- it was, here, until an experiment went
+# looking for it. It did not fix the undelivered MSI and the code is still
+# more correct for it.
+unsafe_budget = 1070

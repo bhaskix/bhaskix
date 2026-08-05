@@ -464,6 +464,12 @@ mod reg {
     pub const FSTS: usize = 0x34;
     /// Interrupt remapping table address.
     pub const IRTA: usize = 0xb8;
+    /// Invalidation queue tail and address.
+    ///
+    /// The head register at `0x80` is the unit's side of the ring and is not
+    /// read here: nothing is queued yet, so nothing waits for it to advance.
+    pub const IQT: usize = 0x88;
+    pub const IQA: usize = 0x90;
 }
 
 /// `GCMD`/`GSTS` bits. The command and status bits sit at the same positions,
@@ -478,6 +484,8 @@ mod command {
     pub const IRE: u32 = 1 << 25;
     /// Set interrupt remap table pointer, and the status that it took.
     pub const SIRTP: u32 = 1 << 24;
+    /// Queued invalidation enable, and the status that it took.
+    pub const QIE: u32 = 1 << 26;
     /// Compatibility format interrupts *permitted*.
     ///
     /// Left clear, deliberately. Setting it would keep old-format interrupts
@@ -752,6 +760,29 @@ impl Unit {
             self.write64(offset + 8, FAULT);
             self.write32(reg::FSTS, PPF | PFO);
             Some((low, requester, read, reason))
+        }
+    }
+
+    /// Turns on the invalidation queue.
+    ///
+    /// The specification requires this **before** interrupt remapping is
+    /// enabled, and the requirement is easy to miss because register-based
+    /// invalidation keeps working without it. Whether a unit enforces it is a
+    /// property of the unit.
+    ///
+    /// # Safety
+    ///
+    /// `physical` must be a zeroed page this kernel owns and will not free.
+    pub unsafe fn enable_queued_invalidation(&mut self, physical: u64) -> bool {
+        // SAFETY: the caller's obligation.
+        unsafe {
+            // Size zero: 256 descriptors in one page, which is the smallest
+            // the format allows and more than this kernel will ever queue.
+            self.write64(reg::IQA, physical & !(PAGE_SIZE - 1));
+            self.write64(reg::IQT, 0);
+            self.command |= command::QIE;
+            self.write32(reg::GCMD, self.command);
+            self.await_status(command::QIE, true)
         }
     }
 

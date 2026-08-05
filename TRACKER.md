@@ -535,6 +535,26 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-05 (RFC 0012 step 6, third attempt — the leading theory was wrong)
+
+- **A newer QEMU fails identically.** 7.2 on the two-socket host behaves exactly as 4.2 does here,
+  which kills the hypothesis I had been recommending as the next step. That is the most useful thing
+  this round produced: the answer is in our code or our understanding, not in the emulator's age.
+- **Four more theories eliminated**, all on the newer QEMU. The message *format* — compatibility
+  fares no better than remappable. The *ordering* — enabling remapping after the device's interrupts
+  already work breaks them immediately, and rewriting the table entry afterwards does not bring them
+  back. The missing **invalidation queue** — the specification requires it before remapping, we were
+  not doing it, and doing it changed nothing. And `zero sized buffers`, which QEMU 7.2 does not
+  report at all.
+- **Queued invalidation is kept.** It did not fix anything and the code is more correct with it:
+  register-based invalidation keeps working without it, which is exactly why the requirement is easy
+  to miss, and it was missed here until an experiment went looking.
+- **What remains true**: the device completes requests throughout, the I/O APIC's remapped interrupt
+  is delivered, and the device's MSI never reaches the unit in any arrangement tried.
+- **The value of a wrong hypothesis, tested.** "Try a newer QEMU" was written into this file twice
+  as the recommended next step. It was cheap, it was wrong, and the next person now spends that
+  effort somewhere else.
+
 ### 2026-08-05 (RFC 0012 step 6, second attempt — two red herrings named so they are not chased again)
 
 - **Still unsolved, and better understood.** Under remapping QEMU pops and completes about 140
@@ -629,7 +649,7 @@ demonstrated by taking them away and watching the disk stop.
 
 | Open | What is known |
 |---|---|
-| The block device's MSI is not delivered under interrupt remapping | The device **works**: QEMU pops and completes ~140 requests a boot, the same as without remapping. The I/O APIC's line *is* remapped and delivered. What never happens is an MSI leaving the device — no remap request for it reaches the unit. Ruled out: the destination field's position and the format/SHV bits (**both real bugs, both fixed**), `eim` on and off, SHV on and off, and two red herrings — the `zero sized buffers` complaint (the firmware's stale ring, present with remapping off too) and `virtio_notify` reading zero (that trace is not on the MSI-X path, and reads zero in the working case as well) |
+| The block device's MSI is not delivered under interrupt remapping | Reproduces **identically on QEMU 7.2**, so it is not an old emulator. The device works throughout — ~280 queue operations either way — and the I/O APIC's remapped interrupt *is* delivered. What never happens is an MSI leaving the device. Ruled out: the destination field's position and the format/SHV bits (**both real bugs, both fixed**); `eim` and SHV either way; the **message format** (compatibility fares no better); the **ordering** (enabling after the device's interrupts work breaks them at once, and rewriting the entry afterwards does not restore them); the **missing invalidation queue**, which the specification does require and is enabled now. Two red herrings named: `zero sized buffers` (the firmware's stale ring; QEMU 7.2 does not report it at all) and `virtio_notify` reading zero (not on the MSI-X path; reads zero in the working case too) |
 | A reused device address keeps its translation | Entry reads back zero, invalidation issued, device still reaches it. Reuse is disabled until this is explained |
 
 Both are worth trying on a QEMU newer than 4.2 before assuming the kernel is wrong. **The two hardest
