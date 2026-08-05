@@ -5,10 +5,10 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 
 | | |
 |---|---|
-| **Last updated** | 2026-08-04 |
+| **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07, M6-08 (RFC 0011 steps 1–4, RFC 0009 steps 1–5) · CI green |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07, M6-08, M6-09 (RFC 0011 steps 1–5, RFC 0009 steps 1–5) · CI green · 38 boot gates, 112 checks |
 
 ### Division of responsibility between documents
 
@@ -130,6 +130,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-08 | RFC 0009 steps 1–5: `Memory` objects, mapping, revocation, transfer, the channel | ✅ `DONE` | An object is frames, a length and an owner, charged to a `ResourceEnvelope` and released when it goes; `Backing::Shared` lets an address space borrow frames it does not own. `ObjectKind::Untyped` deleted, per the RFC's acceptance. **Negative-tested**: a `destroy` that leaks four frames fails the gate. The teardown invariant — a destroyed address space must not free a shared region's frames — is asserted directly rather than inferred. Step 3 adds the reverse map, the revocation walk and the shootdown: after `revoke` returns the pages are gone from the *page tables*, which is what grants access. **Negative-tested** twice: a `destroy` that leaks four frames, and a `revoke` that removes the bookkeeping but leaves the page-table entry. Step 4 gives an object a capability that can be granted: two domains reach the same frames at different addresses, the recipient's rights are narrower, and one revoke takes it from both. Step 5 adds the ring layout in `abi`, which touches no memory and keeps that crate's `unsafe` budget at zero. |
 | M6-07 | RFC 0011 steps 1–4: a vector allocator, `IrqHandler`, and a driver that stops polling | ✅ `DONE` | One registry for all 256 vectors; `IrqControl`/`IrqHandler` with exclusive claims and reserved sources; the delivery path is mask → signal a notification → acknowledge. RFC 0010's `Notification` landed with it, because step 3 binds one. `input.rs` and `virtio-blk` are both clients now rather than special cases. **Negative-tested**: leaving the notification unbound fails the gate. |
 | M6-06 | `virtio-blk` driver | ✅ `DONE` | PCI enumeration, modern virtio 1.0 discovered through the device's own capability list, a split virtqueue driven by DMA. `root=disk` mounts the filesystem off the device, so the user-mode shell is a file the driver read. **Negative-tested**: a driver that ignored the sector number reads sector zero four times and fails the gate, because the disk is the ramdisk image and the kernel has the same bytes from the bootloader to compare against. |
+| M6-09 | RFC 0011 step 5: a handler does not outlive its owner | ✅ `DONE` | Destroying a domain is `RELEASE` for every handler it held — collected under the handler lock, released outside it, because masking a line reaches the chip and freeing a vector reaches the allocator and both rank below it. `NO_DOMAIN` is not a spare identifier: the console's and the block driver's handlers belong to the nucleus, and a recycled domain id must not sweep them up. **Negative-tested**: disabling the teardown gives `7 -> 8 -> 8 -> 8` and fails three checks. The assertion is the *re-claim*, not the release — a release that leaked the vector returns success just as loudly. Step 6, delegation, stays blocked on RFC 0012 as the RFC requires. |
 
 ### Honest notes on M6 so far
 
@@ -149,6 +150,15 @@ fairness within 2% for two equal-weight workloads.
 - **The initrd is read-only, and so is the filesystem over it.** Nothing creates, truncates or
   appends. Every lookup is still a linear scan of the whole archive, and a listing is a scan per
   call.
+
+- **Two bugs this milestone were invisible to the harness that was supposed to catch them, in
+  opposite directions.** The IPC rendezvous stall needed *real parallelism* — 14 failures in 40 on a
+  two-socket host, and not one in any local run ever. The single-processor boot hang needed *one
+  CPU* — 7 in 24 there, and 0 in 100 under the four-CPU soak that was written to find exactly this
+  kind of fault. Neither harness can see both, because they are not the same machine: oversubscribing
+  a host serialises the guest's CPUs, and a second CPU keeps a machine alive that one CPU would let
+  die. A green suite says less than its wording suggests, and `fault-test` — the only
+  single-processor stage — was passing at roughly one run in eight for weeks.
 
 - **`vfs::open` takes no capability.** `docs/security.md` §2 says authority must be held rather than
   ambient, and this is a place where it is not: anything that can reach the module can read the
@@ -503,6 +513,43 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (M6 status — where the milestone actually stands)
+
+**Every M6 task is built. One exit criterion is still not met, and it is the same one as before —
+nothing this session changed it.**
+
+| Criterion | Status |
+|---|---|
+| Boot to a shell | ✅ Ring 3, holding two capabilities and nothing else |
+| `ls` a real filesystem | ✅ Through IPC, from the ramdisk or from the block device |
+| Load and run an ELF binary from disk | ✅ `root=disk` makes "from disk" literal |
+| **The ELF loader survives 24 hours of fuzzing** | ❌ **Not met.** 20 million mutated inputs per parser, clean — a substitute, not the thing asked for |
+
+Beyond the task list, M6 also carries **RFC 0009 steps 1–5** and **RFC 0011 steps 1–5**. RFC 0011
+step 6 — delegating an interrupt to a domain — is blocked on RFC 0012 and must stay blocked: handing
+a domain an interrupt without an IOMMU is handing it a DMA engine.
+
+**What the last session was actually spent on was not features.** Three concurrency faults, none of
+them found by writing code and all of them found by making a machine fail and then asking it why:
+
+| Fault | Where it hid | How it was found |
+|---|---|---|
+| IPC rendezvous stalls after one delivery | Needed genuine parallelism; never once failed locally | 14/40 on a two-socket host, then a trace ring after four wrong theories |
+| Single-processor boot hangs, one in four | Needed **one** CPU; the four-CPU soak was 0/100 | QEMU monitor: `HLT=1`, symbolised `RIP`, then kernel counters read out of the hung guest |
+| `mark_blocked` / consume / `cancel_block` | A tick inside a two-line window | Found by pattern, once the first one had a name |
+
+**The standing lesson is now four for four this milestone.** The frame-leak gate's phantom sixteen
+frames, the harness that blamed the kernel for QEMU's disk lock, the lock check that ran before the
+code it checked, and now a boot-hang class that the soak harness is structurally unable to see. Each
+time the check was fine and it was not looking at the thing. **A test that cannot distinguish "the
+thing under test is broken" from "the test could not run" will eventually be believed about the
+wrong one** — and `fault-test` spent weeks passing at about one run in eight without anyone noticing
+that a green suite was luck.
+
+**Open, and written down rather than closed:** in the hung machine `notify::SIGNALS` equalled
+`notify::UNWAITED` — every signal found no waiter. The armed deadline makes that harmless; it does
+not explain it.
 
 ### 2026-08-05 (RFC 0011 step 5 — a handler does not outlive its owner)
 
