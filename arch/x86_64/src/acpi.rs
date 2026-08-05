@@ -163,6 +163,214 @@ fn checksum_ok(bytes: &[u8]) -> bool {
     bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) == 0
 }
 
+/// Remapping units a `DMAR` table may declare before this parser stops
+/// recording them.
+///
+/// Fixed, because this runs before the heap on a path that programs hardware.
+/// A machine with more is reported as truncated rather than silently served by
+/// the first eight — a unit that was dropped is a set of devices nobody is
+/// translating, which is exactly the state RFC 0012 refuses to be in quietly.
+pub const MAX_UNITS: usize = 8;
+
+/// Firmware-reserved regions recorded, for the same reason.
+pub const MAX_RESERVED: usize = 8;
+
+/// One DMA remapping hardware unit — an IOMMU, and where its registers are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Unit {
+    /// PCI segment this unit covers.
+    pub segment: u16,
+    /// Physical address of its register window.
+    pub register_base: u64,
+    /// Whether it covers every device on its segment not claimed by another.
+    pub covers_all: bool,
+}
+
+/// A region firmware says a device may always reach.
+///
+/// Named by firmware, and therefore an attack surface by design: a firmware
+/// that named the kernel's memory would be asking for a device to be given
+/// access to it. RFC 0012 requires the kernel to check these against its own
+/// image before identity-mapping any of them. This parser reports what was
+/// claimed and vouches for none of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Reserved {
+    /// PCI segment.
+    pub segment: u16,
+    /// First byte.
+    pub base: u64,
+    /// Last byte, inclusive.
+    pub limit: u64,
+}
+
+/// What the DMA Remapping table said.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Dmar {
+    units: [Option<Unit>; MAX_UNITS],
+    unit_count: usize,
+    regions: [Option<Reserved>; MAX_RESERVED],
+    region_count: usize,
+    /// Physical address bits the hardware can generate.
+    pub host_address_width: u8,
+    /// Whether the platform declares interrupt remapping.
+    pub interrupt_remapping: bool,
+    /// Units the table declared, including any there was no room for.
+    pub units_seen: usize,
+    /// Reserved regions declared, likewise.
+    pub regions_seen: usize,
+    /// Whether anything was dropped for want of room, or refused as malformed.
+    ///
+    /// Reported rather than folded into the counts, because "there are three
+    /// units and two were understood" is a different machine from "there are
+    /// two units", and only one of them is safe to enable translation on.
+    pub truncated: bool,
+}
+
+impl Dmar {
+    /// The remapping units recorded.
+    pub fn units(&self) -> impl Iterator<Item = Unit> + '_ {
+        self.units.iter().take(self.unit_count).flatten().copied()
+    }
+
+    /// How many units were recorded.
+    #[must_use]
+    pub const fn unit_count(&self) -> usize {
+        self.unit_count
+    }
+
+    /// The firmware-reserved regions recorded.
+    pub fn regions(&self) -> impl Iterator<Item = Reserved> + '_ {
+        self.regions
+            .iter()
+            .take(self.region_count)
+            .flatten()
+            .copied()
+    }
+
+    /// How many reserved regions were recorded.
+    #[must_use]
+    pub const fn region_count(&self) -> usize {
+        self.region_count
+    }
+}
+
+/// Reads a `DMAR` table out of `bytes`.
+///
+/// Another untrusted parser of the same kind as the MADT walk, and with a
+/// worse failure mode: believing this one wrongly means programming a register
+/// window that is not an IOMMU. Nothing here is trusted to be sensible. Every
+/// length is checked against what is left, **a structure length of zero is
+/// refused rather than looped on** — it is the loop increment, so believing it
+/// is a hang rather than a crash — and a unit whose register base is not a
+/// plausible page-aligned address is dropped rather than recorded.
+///
+/// Returns `None` only when the buffer is not a `DMAR` table at all.
+#[must_use]
+pub fn parse_dmar(bytes: &[u8]) -> Option<Dmar> {
+    /// Header, plus the host address width byte, the flags byte, and ten
+    /// reserved bytes.
+    const DMAR_HEADER: usize = HEADER_LENGTH + 12;
+    const TYPE_DRHD: u16 = 0;
+    const TYPE_RMRR: u16 = 1;
+    /// DRHD: type, length, flags, reserved, segment, register base.
+    const DRHD_LENGTH: usize = 16;
+    /// RMRR: type, length, reserved, segment, base, limit.
+    const RMRR_LENGTH: usize = 24;
+    /// Fewer address bits than a page offset describes hardware that cannot
+    /// address a page, which is not a machine.
+    const MIN_ADDRESS_WIDTH: u8 = 12;
+
+    if bytes.len() < DMAR_HEADER || bytes.get(0..4)? != b"DMAR" {
+        return None;
+    }
+    let length = u32_at(bytes, 4)? as usize;
+    if length < DMAR_HEADER || length > bytes.len() {
+        return None;
+    }
+    let bytes = bytes.get(..length)?;
+    if !checksum_ok(bytes) {
+        return None;
+    }
+
+    // Stored as width-minus-one, so a byte can describe a 64-bit machine.
+    let width = (*bytes.get(HEADER_LENGTH)?).saturating_add(1);
+    let flags = *bytes.get(HEADER_LENGTH + 1)?;
+
+    let mut dmar = Dmar {
+        units: [None; MAX_UNITS],
+        unit_count: 0,
+        regions: [None; MAX_RESERVED],
+        region_count: 0,
+        host_address_width: width,
+        interrupt_remapping: flags & 1 != 0,
+        units_seen: 0,
+        regions_seen: 0,
+        truncated: width < MIN_ADDRESS_WIDTH,
+    };
+
+    let mut offset = DMAR_HEADER;
+    while offset + 4 <= bytes.len() {
+        let kind = u16_at(bytes, offset)?;
+        let structure = u16_at(bytes, offset + 2)? as usize;
+
+        // Anything that does not fit what is left ends the walk: the rest of
+        // the table cannot be trusted to start where this structure claims to
+        // end.
+        if structure < 4 || offset + structure > bytes.len() {
+            dmar.truncated = true;
+            break;
+        }
+        let entry = bytes.get(offset..offset + structure)?;
+        offset += structure;
+
+        match kind {
+            TYPE_DRHD if structure >= DRHD_LENGTH => {
+                dmar.units_seen += 1;
+                let base = u64_at(entry, 8)?;
+                // Non-zero and page-aligned, or it is not a register window.
+                // This address is dereferenced as hardware, so a wrong one is
+                // not a wrong answer, it is a write to whatever was there.
+                if base == 0 || base % 4096 != 0 {
+                    dmar.truncated = true;
+                } else if dmar.unit_count < MAX_UNITS {
+                    dmar.units[dmar.unit_count] = Some(Unit {
+                        segment: u16_at(entry, 6)?,
+                        register_base: base,
+                        covers_all: entry.get(4)? & 1 != 0,
+                    });
+                    dmar.unit_count += 1;
+                } else {
+                    dmar.truncated = true;
+                }
+            }
+            TYPE_RMRR if structure >= RMRR_LENGTH => {
+                dmar.regions_seen += 1;
+                let base = u64_at(entry, 8)?;
+                let limit = u64_at(entry, 16)?;
+                if base > limit {
+                    dmar.truncated = true;
+                } else if dmar.region_count < MAX_RESERVED {
+                    dmar.regions[dmar.region_count] = Some(Reserved {
+                        segment: u16_at(entry, 6)?,
+                        base,
+                        limit,
+                    });
+                    dmar.region_count += 1;
+                } else {
+                    dmar.truncated = true;
+                }
+            }
+            // A DRHD or RMRR too short to be what it says it is.
+            TYPE_DRHD | TYPE_RMRR => dmar.truncated = true,
+            // A structure this parser does not read, skipped by its own
+            // length — which is what lets an older kernel read a newer table.
+            _ => {}
+        }
+    }
+
+    Some(dmar)
+}
+
 /// Reads a MADT out of `bytes`.
 ///
 /// Pure, and the reason the walk below is thin: every refusal this makes can
@@ -307,7 +515,13 @@ unsafe fn table_at(physical: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option
     Some(unsafe { core::slice::from_raw_parts(address as *const u8, length) })
 }
 
-/// Finds the MADT by walking the RSDP and the table it points at.
+/// Walks the ACPI tables, returning the first that `read` accepts.
+///
+/// Every table the firmware lists is offered to `read`, which returns `None`
+/// for one it does not recognise. That is what lets one walk serve the MADT
+/// and the `DMAR` without either knowing about the other, and it keeps the
+/// pointer-chasing — the part that cannot be tested without a machine — in one
+/// place with the parsers pure beside it.
 ///
 /// # Safety
 ///
@@ -315,7 +529,12 @@ unsafe fn table_at(physical: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option
 /// direct map base. Both come from the handoff; nothing else may pass an
 /// address here. `ensure` must map what it claims to map.
 #[must_use]
-pub unsafe fn madt(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Madt> {
+unsafe fn tables<T>(
+    rsdp: u64,
+    hhdm: u64,
+    ensure: EnsureMapped<'_>,
+    read: impl Fn(&'static [u8]) -> Option<T>,
+) -> Option<T> {
     let address = hhdm.checked_add(rsdp)?;
     // 36 bytes rather than 20, so a version 2 pointer's extended fields are in
     // the same borrow as the rest.
@@ -365,12 +584,37 @@ pub unsafe fn madt(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Mad
         // SAFETY: an address from the root table, which was checksummed, and
         // mapped on demand by the caller's closure.
         if let Some(table) = unsafe { table_at(physical, hhdm, ensure) }
-            && let Some(madt) = parse_madt(table)
+            && let Some(parsed) = read(table)
         {
-            return Some(madt);
+            return Some(parsed);
         }
     }
     None
+}
+
+/// Finds and parses the MADT.
+///
+/// # Safety
+///
+/// As [`tables`].
+pub unsafe fn madt(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Madt> {
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { tables(rsdp, hhdm, ensure, parse_madt) }
+}
+
+/// Finds and parses the `DMAR` table, if the firmware provided one.
+///
+/// `None` means no IOMMU is described — which RFC 0012 treats as a *reported*
+/// degraded mode rather than a detail, because it is the difference between a
+/// device that can reach the memory it was given and one that can reach all of
+/// it.
+///
+/// # Safety
+///
+/// As [`tables`].
+pub unsafe fn dmar(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Dmar> {
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { tables(rsdp, hhdm, ensure, parse_dmar) }
 }
 
 #[cfg(test)]
@@ -634,6 +878,218 @@ mod tests {
                 // whoever programs it; a GSI this parser cannot vouch for is a
                 // refused redirection, not a wild write.
                 let _ = madt.route(4);
+            }
+        }
+    }
+
+    /// Builds a `DMAR` with the structures given, and a correct checksum.
+    fn dmar_bytes(width: u8, flags: u8, entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DMAR");
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // length, filled in below
+        bytes.push(1); // revision
+        bytes.push(0); // checksum, filled in below
+        bytes.extend_from_slice(b"BHASKXBHASKIX  ");
+        bytes.resize(36, 0);
+        bytes.push(width.saturating_sub(1)); // host address width, minus one
+        bytes.push(flags);
+        bytes.resize(48, 0); // ten reserved bytes
+        for entry in entries {
+            bytes.extend_from_slice(entry);
+        }
+
+        let length = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        let sum = bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        bytes[9] = sum.wrapping_neg();
+        bytes
+    }
+
+    fn drhd(segment: u16, base: u64, covers_all: bool) -> Vec<u8> {
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&0u16.to_le_bytes()); // type
+        entry.extend_from_slice(&16u16.to_le_bytes()); // length
+        entry.push(u8::from(covers_all)); // flags
+        entry.push(0); // reserved
+        entry.extend_from_slice(&segment.to_le_bytes());
+        entry.extend_from_slice(&base.to_le_bytes());
+        entry
+    }
+
+    fn rmrr(segment: u16, base: u64, limit: u64) -> Vec<u8> {
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&1u16.to_le_bytes()); // type
+        entry.extend_from_slice(&24u16.to_le_bytes()); // length
+        entry.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        entry.extend_from_slice(&segment.to_le_bytes());
+        entry.extend_from_slice(&base.to_le_bytes());
+        entry.extend_from_slice(&limit.to_le_bytes());
+        entry
+    }
+
+    #[test]
+    fn a_well_formed_dmar_reports_its_units_and_reserved_regions() {
+        let bytes = dmar_bytes(
+            39,
+            1,
+            &[
+                drhd(0, 0xfed9_0000, false),
+                rmrr(0, 0x0009_0000, 0x0009_ffff),
+                drhd(0, 0xfed9_1000, true),
+            ],
+        );
+        let dmar = parse_dmar(&bytes).expect("a well-formed table parses");
+
+        assert_eq!(dmar.host_address_width, 39);
+        assert!(dmar.interrupt_remapping);
+        assert!(!dmar.truncated);
+        assert_eq!(dmar.unit_count(), 2);
+        assert_eq!(dmar.region_count(), 1);
+
+        let units: Vec<_> = dmar.units().collect();
+        assert_eq!(units[0].register_base, 0xfed9_0000);
+        assert!(!units[0].covers_all);
+        assert!(units[1].covers_all);
+
+        let regions: Vec<_> = dmar.regions().collect();
+        assert_eq!(regions[0].base, 0x0009_0000);
+        assert_eq!(regions[0].limit, 0x0009_ffff);
+    }
+
+    #[test]
+    fn a_structure_claiming_no_length_ends_the_walk() {
+        // The length is the loop increment. Believing a zero is not a wrong
+        // answer, it is a kernel that never finishes booting -- and a hang in
+        // firmware parsing is a hang with no output to explain it.
+        let mut entry = drhd(0, 0xfed9_0000, false);
+        entry[2..4].copy_from_slice(&0u16.to_le_bytes());
+        let bytes = dmar_bytes(39, 0, &[entry]);
+
+        let dmar = parse_dmar(&bytes).expect("the table itself is still valid");
+        assert!(
+            dmar.truncated,
+            "a zero length must be reported, not looped on"
+        );
+        assert_eq!(dmar.unit_count(), 0);
+    }
+
+    #[test]
+    fn a_register_base_that_is_not_a_register_window_is_refused() {
+        // This address is dereferenced as hardware. Recording a misaligned or
+        // zero one is not a wrong number, it is a write to whatever is there.
+        for base in [0u64, 0xfed9_0001, 0x0000_0fff] {
+            let bytes = dmar_bytes(39, 0, &[drhd(0, base, false)]);
+            let dmar = parse_dmar(&bytes).expect("the table parses");
+            assert_eq!(dmar.unit_count(), 0, "base {base:#x} was recorded");
+            assert!(dmar.truncated, "base {base:#x} was refused silently");
+            assert_eq!(dmar.units_seen, 1, "base {base:#x} was not even counted");
+        }
+    }
+
+    #[test]
+    fn a_reserved_region_that_ends_before_it_starts_is_refused() {
+        let bytes = dmar_bytes(39, 0, &[rmrr(0, 0x2000, 0x1000)]);
+        let dmar = parse_dmar(&bytes).expect("the table parses");
+        assert_eq!(dmar.region_count(), 0);
+        assert!(dmar.truncated);
+    }
+
+    #[test]
+    fn more_units_than_there_is_room_for_are_reported_rather_than_dropped() {
+        // A unit nobody recorded is a set of devices nobody is translating.
+        // Reporting nine as eight would be a kernel that believes memory is
+        // protected while a whole unit's devices reach all of it.
+        let entries: Vec<_> = (0..MAX_UNITS + 1)
+            .map(|index| drhd(0, 0xfed9_0000 + (index as u64) * 0x1000, false))
+            .collect();
+        let bytes = dmar_bytes(39, 0, &entries);
+        let dmar = parse_dmar(&bytes).expect("the table parses");
+
+        assert_eq!(dmar.unit_count(), MAX_UNITS);
+        assert_eq!(dmar.units_seen, MAX_UNITS + 1);
+        assert!(dmar.truncated);
+    }
+
+    #[test]
+    fn a_table_that_is_not_a_dmar_is_not_read_as_one() {
+        let mut bytes = dmar_bytes(39, 0, &[drhd(0, 0xfed9_0000, false)]);
+        assert!(parse_dmar(&bytes).is_some());
+
+        // Wrong signature.
+        let mut wrong = bytes.clone();
+        wrong[0..4].copy_from_slice(b"APIC");
+        assert!(parse_dmar(&wrong).is_none());
+
+        // Broken checksum.
+        let mut broken = bytes.clone();
+        broken[9] = broken[9].wrapping_add(1);
+        assert!(parse_dmar(&broken).is_none());
+
+        // A length longer than the buffer is a truncated read, not a table.
+        let over = (bytes.len() as u32) + 64;
+        bytes[4..8].copy_from_slice(&over.to_le_bytes());
+        assert!(parse_dmar(&bytes).is_none());
+    }
+
+    #[test]
+    fn a_mutation_harness_never_makes_the_dmar_parser_hang_or_panic() {
+        // The fuzz target RFC 0012 adds. The MADT's harness explains why this
+        // shape of parser needs one; this one matters more, because what is
+        // built from a believed `DMAR` is a register window that gets written
+        // to as if it were an IOMMU.
+        let iterations: usize = std::env::var("BHASKIX_FUZZ_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20_000);
+
+        let base = dmar_bytes(
+            39,
+            1,
+            &[
+                drhd(0, 0xfed9_0000, false),
+                rmrr(0, 0x0009_0000, 0x0009_ffff),
+                drhd(0, 0xfed9_1000, true),
+            ],
+        );
+
+        for seed in 0..iterations as u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(7));
+            let mut bytes = base.clone();
+
+            for _ in 0..1 + rng.below(6) {
+                match rng.below(3) {
+                    0 if !bytes.is_empty() => {
+                        let index = rng.below(bytes.len());
+                        bytes[index] = rng.next() as u8;
+                    }
+                    // The structure lengths, which are the loop increment and
+                    // therefore the only field that can hang this parser
+                    // rather than crash it. Aimed at deliberately: uniform
+                    // flips reach them, eventually, and M6-03 measured what
+                    // "eventually" costs.
+                    1 if bytes.len() > 49 => {
+                        let index = 48 + rng.below(bytes.len() - 48);
+                        bytes[index] = [0u8, 1, 2, 4, 255, 128][rng.below(6)];
+                    }
+                    _ => {
+                        let length = rng.below(bytes.len().max(1));
+                        bytes.truncate(length);
+                    }
+                }
+            }
+
+            if let Some(dmar) = parse_dmar(&bytes) {
+                // Anything accepted must be usable without further checking:
+                // the caller maps and programs what this reports.
+                assert!(dmar.unit_count() <= MAX_UNITS, "seed {seed}");
+                assert!(dmar.region_count() <= MAX_RESERVED, "seed {seed}");
+                for unit in dmar.units() {
+                    assert!(unit.register_base != 0, "seed {seed}");
+                    assert!(unit.register_base % 4096 == 0, "seed {seed}");
+                }
+                for region in dmar.regions() {
+                    assert!(region.base <= region.limit, "seed {seed}");
+                }
             }
         }
     }

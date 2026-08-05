@@ -92,7 +92,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi \
+.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
         test-shell test-faults fmt clippy gates clean distclean help
 
 all: iso
@@ -188,20 +188,27 @@ run-uefi: $(ISO)
 
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
-test: fmt clippy test-host gates test-boot test-boot-uefi test-shell test-faults
+test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-shell test-faults
 	@echo
 	@echo "  all checks passed"
 
 # Host unit tests. The overridden --target is what takes these off the
 # freestanding target and onto something that can run a test harness.
 test-host:
-	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-mm
+	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios
 
 test-boot-uefi: $(ISO)
 	tests/qemu/boot-test.sh uefi
+
+# The same boot with an IOMMU present. RFC 0012's discovery path is otherwise
+# unreachable: a machine without one has no DMAR table, so every run would
+# exercise only the absent case -- which is how the "NO IOMMU" line managed to
+# be a constant for a milestone.
+test-boot-iommu: $(ISO)
+	tests/qemu/boot-test.sh iommu
 
 # Types at the machine over the serial line and asserts on the replies. The
 # only tests here that write to the kernel rather than only reading from it,

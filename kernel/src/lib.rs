@@ -38,6 +38,7 @@ pub mod framebuffer;
 pub mod frames;
 pub mod heap;
 pub mod input;
+pub mod iommu;
 pub mod ipc;
 pub mod irq;
 pub mod memory;
@@ -2198,15 +2199,17 @@ fn block_self_test(handoff: &Handoff) -> bool {
     }
 
     // `docs/memory.md` §5: a machine with no IOMMU runs in a degraded mode that
-    // is *printed at boot*. Bhaskix has no IOMMU driver, so every DMA-capable
-    // device it brings up can reach all of physical memory -- including the
-    // kernel. Saying so is not pessimism; the document commits to not
-    // silently accepting a broken threat model, and a driver that quietly
-    // enabled bus mastering would be exactly that.
-    println!(
-        "    dma            NO IOMMU: this device can reach all of physical memory \
-         (docs/memory.md §5)"
-    );
+    // is *printed at boot*. That line used to be a constant, which meant it
+    // said "NO IOMMU" on machines with three of them -- a warning printed
+    // unconditionally cannot tell the dangerous case from the safe one, which
+    // is the whole job of a warning. RFC 0012 step 1 makes it true: the units
+    // are found and described, and nothing is programmed, so the degraded mode
+    // is still real and is now stated for the right reason.
+    //
+    // SAFETY: the handoff's addresses, and `mmio::map` is the same mapper
+    // `irq::init` walks these tables with.
+    let iommu = unsafe { iommu::discover(handoff.rsdp, handoff.hhdm_base.as_u64()) };
+    iommu::report(iommu);
 
     if ok {
         let (bus, device, function) = virtio::location().unwrap_or((0, 0, 0));

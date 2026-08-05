@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07, M6-08, M6-09 (RFC 0011 steps 1–5, RFC 0009 steps 1–5) · CI green · 38 boot gates, 112 checks |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 step 1) · CI green · 38 boot gates, 112 checks |
 
 ### Division of responsibility between documents
 
@@ -131,6 +131,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-07 | RFC 0011 steps 1–4: a vector allocator, `IrqHandler`, and a driver that stops polling | ✅ `DONE` | One registry for all 256 vectors; `IrqControl`/`IrqHandler` with exclusive claims and reserved sources; the delivery path is mask → signal a notification → acknowledge. RFC 0010's `Notification` landed with it, because step 3 binds one. `input.rs` and `virtio-blk` are both clients now rather than special cases. **Negative-tested**: leaving the notification unbound fails the gate. |
 | M6-06 | `virtio-blk` driver | ✅ `DONE` | PCI enumeration, modern virtio 1.0 discovered through the device's own capability list, a split virtqueue driven by DMA. `root=disk` mounts the filesystem off the device, so the user-mode shell is a file the driver read. **Negative-tested**: a driver that ignored the sector number reads sector zero four times and fails the gate, because the disk is the ramdisk image and the kernel has the same bytes from the bootloader to compare against. |
 | M6-09 | RFC 0011 step 5: a handler does not outlive its owner | ✅ `DONE` | Destroying a domain is `RELEASE` for every handler it held — collected under the handler lock, released outside it, because masking a line reaches the chip and freeing a vector reaches the allocator and both rank below it. `NO_DOMAIN` is not a spare identifier: the console's and the block driver's handlers belong to the nucleus, and a recycled domain id must not sweep them up. **Negative-tested**: disabling the teardown gives `7 -> 8 -> 8 -> 8` and fails three checks. The assertion is the *re-claim*, not the release — a release that leaked the vector returns success just as loudly. Step 6, delegation, stays blocked on RFC 0012 as the RFC requires. |
+| M6-10 | RFC 0012 step 1: the IOMMU is found, and the warning stops being a constant | ✅ `DONE` | `DMAR` parsed as untrusted firmware input, with a **seeded mutation harness** — the fuzz target the RFC adds, and the one whose failure mode is worst, because what is built from a believed table is a register window written to as if it were an IOMMU. A structure length of zero is refused rather than looped on; a register base that is zero or unaligned is dropped, not recorded. No translation is enabled: every device still reaches all of memory, and the line says so. **Negative-tested**: a parser that records no unit fails the new gate. `boot-test.sh iommu` runs QEMU with `-device intel-iommu,intremap=on`, without which the discovery path is unreachable. |
 
 ### Honest notes on M6 so far
 
@@ -513,6 +514,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0012 step 1 — a warning that could not be wrong, and therefore said nothing)
+
+- **`docs/memory.md` §5's degraded-mode line was a constant.** It printed "NO IOMMU: this device can
+  reach all of physical memory" on every boot — including, as it turns out, on a machine with three
+  of them. A warning that is printed unconditionally cannot distinguish the dangerous case from the
+  safe one, which is the entire job of a warning. It was not wrong about *this* machine; it was
+  incapable of being wrong about any.
+- **The `DMAR` is now parsed, and nothing is programmed.** Step 1 is discovery only, so the line
+  still reports that every device reaches all of memory — for the right reason, and only when true.
+  On QEMU with `-device intel-iommu,intremap=on`: *1 unit found, not enabled; 39-bit addresses,
+  interrupt remapping supported.* "not enabled" is asserted by the gate along with the rest, because
+  a line claiming an IOMMU without it would read as protection the machine does not have.
+- **The parser gets the treatment the RFC asks for.** A structure length of zero is the loop
+  increment, so believing it is a hang rather than a crash — refused, with a test that says so. A
+  register base that is zero or not page-aligned is dropped rather than recorded, because that
+  address is dereferenced as hardware. More units than there is room for are **reported**, never
+  silently truncated: a unit nobody recorded is a set of devices nobody is translating.
+- **The discovery path is unreachable without an IOMMU to discover**, so `boot-test.sh` gained an
+  `iommu` mode that supplies one. Without it every run would exercise only the absent case — which
+  is precisely how the constant survived a milestone.
+- **And the harness that was meant to catch this class was never running.** `make test-host` did not
+  include `bhaskix-arch-x86-64`, so the MADT mutation harness — written to satisfy
+  `docs/coding-style.md` §8 — had never executed in CI or in `make test`. It passes; it had simply
+  never been asked. That is the fifth tooling blind spot this milestone, and the same shape as the
+  other four: **the check was fine, and nothing was looking at it.**
 
 ### 2026-08-05 (why signals found no waiter — they always do)
 

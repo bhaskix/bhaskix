@@ -72,8 +72,21 @@ pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 # the block driver's test knows what must come back.
 DISK="$REPO_ROOT/build/initrd.tar"
 
-QEMU_ARGS=(-M q35 -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
+MACHINE="q35"
+IOMMU_ARGS=()
+if [[ "$MODE" == "iommu" ]]; then
+    # RFC 0012's testing plan turns on what the RFC is about. `intremap=on`
+    # needs a split irqchip, and both are QEMU's requirements rather than this
+    # kernel's -- nothing here programs the unit yet, so what is under test is
+    # discovery: that the `DMAR` the firmware writes is found, parsed, and
+    # described, on a machine that has one.
+    MACHINE="q35,kernel-irqchip=split"
+    IOMMU_ARGS=(-device intel-iommu,intremap=on)
+fi
+
+QEMU_ARGS=(-M "$MACHINE" -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
            -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on" -device virtio-blk-pci,drive=disk0
+           "${IOMMU_ARGS[@]}"
            -serial "file:$LOG" -display none)
 
 if [[ "$MODE" == "uefi" ]]; then
@@ -392,11 +405,33 @@ fi
 # that does DMA with no IOMMU can reach all of physical memory, and the moment
 # that line stops appearing while a driver is still running is the moment the
 # document became untrue.
-if grep -qF "NO IOMMU: this device can reach all of physical memory" "$LOG"; then
-    pass "the absent IOMMU is reported rather than silently accepted"
+#
+# Either wording satisfies it, and that is the point: the line used to be a
+# constant, so it passed on a machine with three IOMMUs by saying there were
+# none. What is asserted is that the machine states its DMA threat model, not
+# that it lacks the hardware.
+if grep -qE "NO IOMMU: this device can reach all of physical memory|no translation yet: this device can reach all of" "$LOG"; then
+    pass "the DMA threat model is reported rather than silently accepted"
 else
-    fail "a DMA-capable device was brought up without saying there is no IOMMU"
+    fail "a DMA-capable device was brought up without saying what can reach memory"
     status=1
+fi
+
+# RFC 0012 step 1, and only on the machine that has one: the units the firmware
+# describes are found and described. "not enabled" is asserted with them --
+# nothing is programmed at this step, and a line that claimed an IOMMU without
+# saying so would read as protection the machine does not have.
+if [[ "$MODE" == "iommu" ]]; then
+    if grep -qE "iommu +[1-9][0-9]* unit(s)? found, not enabled; [0-9]+-bit addresses" "$LOG"; then
+        pass "the IOMMU the firmware describes is found and reported"
+    else
+        fail "an intel-iommu was present and the DMAR table was not read"
+        status=1
+    fi
+    if grep -qE "iommu +WARNING" "$LOG"; then
+        fail "the DMAR parsed only partially"
+        status=1
+    fi
 fi
 
 # RFC 0011 step 4: the block driver stops polling. The assertion is a pair of
