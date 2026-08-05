@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The filesystem service, placed in its own domain.
+#
+# Not a member of the root workspace, for the reason user/shell/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+#
+# This program is a *placement* and not a service. Everything it knows about
+# filesystems comes from bhaskix-service-vfs, which is the same crate the
+# kernel compiles into itself for the nucleus placement -- byte for byte the
+# same logic, reached through a context this file builds out of system calls
+# instead of out of the kernel's own functions.
+[workspace]
+
+[package]
+name = "bhaskix-user-vfsd"
+description = "The filesystem service in a domain of its own."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "vfsd"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-service = { path = "../../service" }
+bhaskix-service-vfs = { path = "../../services/vfs" }
+bhaskix-service-domain = { path = "../../service-domain" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# Four blocks, eighteen lines: the `syscall` instruction with its operand list,
+# the `ud2` a panic ends at, the slice built from the mapping the kernel hands
+# over at entry, and the mount of that slice. Every one is about the boundary
+# with the kernel, which is the only thing this program is -- the filesystem
+# logic it serves lives in bhaskix-service-vfs, whose budget is zero. A fifth
+# block here would mean a placement had started doing the service's work.
+unsafe_budget = 20

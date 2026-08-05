@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-03 (RFC 0013 steps 1–2, step 3 partial) · CI green · 183 suite checks · 42 boot gates, 49 with an IOMMU · 277 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-04 (RFC 0013 steps 1–3) · CI green · 267 suite checks · 42 boot gates per placement, 49 with an IOMMU · 277 host assertions |
 
 ### Division of responsibility between documents
 
@@ -144,6 +144,7 @@ fairness within 2% for two equal-weight workloads.
 | M7-01 | RFC 0013 step 1: the `Service` trait, and the nucleus placement | ✅ `DONE` | `Service`, `Context`, `Request`, `Reply`, and **one** `run::<S>()` loop both services share instead of hand-rolling their own. The success criterion was **no behaviour change** and the boot output is identical — 19 requests, 1 caller refused, 5 entries, 8 bytes, bulk path unchanged. Dispatch is by message in the nucleus too, per the acceptance decision, so the placements differ in *placement* and not in *shape*. Three host tests run the services' logic with no machine under them. The machine now prints `console=nucleus vfs=nucleus`, gated — and that line is **expected to change at step 3**. |
 | M7-02 | RFC 0013 step 2: the placement table, and what makes it true | ✅ `DONE` | `services.toml`, and `tools/check-placements.sh` to give it teeth. The console is now **its own crate**, compiled for `x86_64-unknown-none` with **no kernel in the build** — that compile *is* the domain placement's, and unlike a lint it cannot pass by accident. The rule is enforced against the **resolved dependency graph**, not a search for suspicious lines: a service cannot name `crate::vfs` without depending on the kernel. Two negative fixtures, both run by `make gates`: a service that calls into the kernel (must be rejected **naming `bhaskix-kernel`**), and a table wrong about itself (a name listed twice, a placement of `orbit` — **both** must be reported). The boot line is now built from the table, so the machine and the file cannot drift. **What it cost:** the filesystem is `relocatable = false` in the table, in the file rather than in a comment — its bulk path reads caller pages through the direct map, so it does not compile without the kernel. That is step 3's actual work, now named. |
 | M7-03 | RFC 0013 step 3a: the filesystem becomes relocatable, and a hole closes | ✅ `DONE` | The filesystem is **out of the kernel crate** — `ustar`, `vfs` and the service in `services/vfs`, building for `x86_64-unknown-none` with no kernel in the build. One function did it: the bulk path used to read caller pages through the direct map and now asks its context (`Bulk::fill`). **A security hole was found on the way and closed:** `Reply` took the caller from a register, so a server — including a ring 3 one, since `Reply` is a system call — could plant a message in *any* thread's mailbox and wake it holding what looked like the answer it was waiting for. The kernel now remembers who a thread received from and refuses anything else, which also freed the register that lets a server receive a whole four-register message at all. `Request::caller` is **gone from the trait**: a service cannot name a caller, so it cannot name the wrong one. Gated, and the gate was watched failing twice before it was believed — see the note below. |
+| M7-04 | RFC 0013 step 3: the filesystem runs in a domain | ✅ `DONE` | `bin/vfsd` **is** the filesystem service, in ring 3, holding one endpoint capability and a read-only mapping of the image — and every `fs::` method in the system is answered by it. The user-mode shell now reads files through IPC from a service that is itself unprivileged: two ring 3 programs, with the kernel routing messages and owning neither. The service crate is byte for byte the one the kernel compiles for the nucleus; what differs is the context (`Bulk::fill` is `method::FILL`) and the run loop (`serve::<S>` for `run::<S>`). `services.toml` decides which, through `kernel/build.rs`, and `make test-placements` **boots both, every build** — the placement nobody is running is compiled out, so nothing else would notice it rotting. |
 
 ### Honest notes on M6 so far
 
@@ -631,6 +632,37 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 step 3 — the filesystem is a program now)
+
+- **Every `fs::` method in the system is answered by a program with no privilege.** The shell, in
+  ring 3, calls a filesystem that is also in ring 3. The kernel routes the message and owns neither
+  end. That is the thing the whole design was for, and it took one context and one run loop rather
+  than a rewrite — which is the only evidence that the trait was worth having.
+- **The table decides, and the machine reports.** `kernel/build.rs` reads `services.toml` and emits
+  a `cfg`, so one of the two paths compiles and the other does not; the boot line says what the
+  kernel *did*, and the gate compares the two. Keeping those separate is the point: a report
+  generated from the same file the build read would agree with it whatever the machine did.
+- **Both placements boot, every build.** `make test-placements`, using the command-line override the
+  RFC's question 3 resolved on — because a test that edited the table to test the table would not be
+  testing it. Two boots and not two builds: a build proves it compiles, and the claim is that it
+  *answers* the same either way.
+- **The two placements disagreed about a refusal, and only the negative test saw it.** The nucleus
+  checks the caller's capability before reading anything; the domain version read first and returned
+  early on an empty read, so a caller with no right to that memory got "fine, nothing" where the
+  nucleus said "not yours". Both placements were otherwise passing. This is exactly the divergence
+  the design exists to prevent, and it appeared anyway within an hour of there being two placements.
+- **A counter is not a witness.** The services gate keyed on the service's refusal counter, which a
+  service in its own domain has no way to add to — it would have passed in one placement and failed
+  in the other while the service behaved identically in both. It now reports what the test
+  *observed*, which is what it should have done when there was only one placement.
+- **The vfs listing test caught its own author.** It asserted exactly two programs in `/bin` and
+  said in a comment that a third should fail rather than silently weaken it. Adding `bin/vfsd` made
+  it fail. That is the second time this milestone an exact-count assertion earned its keep.
+- **What step 3 did not do.** The console is still nucleus-only: a console in a domain needs a
+  driver to talk to, which is step 6. And the domain filesystem is handed its image at entry rather
+  than reading a device — real storage in a domain is step 6's problem too, and pretending otherwise
+  here would have been a second unfinished thing hiding behind a finished one.
 
 ### 2026-08-05 (RFC 0013 step 3a — what moving one service out of the kernel found)
 

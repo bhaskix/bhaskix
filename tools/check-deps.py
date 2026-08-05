@@ -70,6 +70,26 @@ LAYERS = {
     "bhaskix-user-shell": -1,
 }
 
+# Programs that *place* a service, and exactly what each may reach.
+#
+# Enumerated rather than derived from a layer, because the layer rule cannot
+# say what is actually true of these: a placement program may depend on the
+# service crates and the framework, and on nothing else the kernel uses. The
+# service crates sit at the same layer as `arch`, so any layer number that let
+# one of them through would let `arch` through too -- and a ring 3 program that
+# depended on `arch` would be a category error, not a layering violation.
+#
+# A new entry here is a new program that runs a service somewhere. That should
+# be a deliberate line in this file, which is why it is a list and not a rule.
+PLACEMENTS: dict[str, set[str]] = {
+    "bhaskix-user-vfsd": {
+        "bhaskix-abi",
+        "bhaskix-service",
+        "bhaskix-service-domain",
+        "bhaskix-service-vfs",
+    },
+}
+
 # Third-party crates permitted in the tree. Empty on purpose: Bhaskix has no
 # external dependencies, and adding the first one should require a
 # conversation, which an empty allowlist guarantees.
@@ -110,6 +130,15 @@ def main() -> int:
         graph[name] = deps
 
     for crate, deps in sorted(graph.items()):
+        if crate in PLACEMENTS:
+            for dep in sorted(set(deps) - PLACEMENTS[crate]):
+                print(f"{RED}FAIL{RESET}  {crate} depends on '{dep}', which a placement "
+                      "program may not reach.")
+                print("        A program that places a service may depend on the service")
+                print("        crates and the framework, and on nothing else.")
+                status = 1
+            continue
+
         if crate not in LAYERS:
             print(f"{RED}FAIL{RESET}  {crate}: not listed in the layer map in this script.")
             print("        Add it, so its allowed dependencies are an explicit decision.")

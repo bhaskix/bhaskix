@@ -80,6 +80,26 @@ pub mod syscall {
     pub const EXIT: u64 = 5;
 }
 
+/// Methods invoked on a capability, for the programs that need to name one.
+///
+/// Only the ones an unprivileged program uses are here. The kernel keeps the
+/// full set and a static assertion between the two definitions, which is what
+/// makes having two of them safe.
+pub mod method {
+    /// Write bytes into memory the caller of this endpoint named.
+    ///
+    /// Only on an `Endpoint` capability, and only from the thread answering a
+    /// message taken from it. `arg0` = the *caller's* slot holding the
+    /// `Memory` capability, `arg1` = the address of the bytes in this domain,
+    /// `arg2` = how many.
+    ///
+    /// The bulk path a service gets when it runs in its own domain. Which
+    /// caller is not an argument: it is the one being answered, and a service
+    /// that could name it could write a file's contents into a third party's
+    /// memory.
+    pub const FILL: u64 = 38;
+}
+
 /// What a system call returned in `rax`.
 pub mod status {
     /// The call succeeded.

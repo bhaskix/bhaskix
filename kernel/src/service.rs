@@ -102,31 +102,49 @@ pub fn start(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     let pinned = sched::SpawnOptions::new().pinned();
     sched::spawn_on_with(cpu, "console", console_service, 0, hhdm_base, pinned)
         .map_err(|_| "the console service would not spawn")?;
-    // The filesystem service is not pinned: it blocks on nothing but its own
-    // endpoint, so it may run wherever there is room.
+    // The filesystem, wherever `services.toml` put it. One of these two lines
+    // is compiled and the other is not, which is what makes the table a
+    // decision rather than a description.
+    #[cfg(not(vfs_in_domain))]
+    // Not pinned: it blocks on nothing but its own endpoint, so it may run
+    // wherever there is room.
     sched::spawn("fs", filesystem_service, 0, hhdm_base)
         .map_err(|_| "the filesystem service would not spawn")?;
+    #[cfg(vfs_in_domain)]
+    crate::start_vfs_domain(cpu, hhdm_base)?;
 
-    // Named with their placement, because the placement is the claim. Step 3
-    // is the first time one of these says something other than `nucleus` --
-    // so a line that never changes would be a line worth distrusting.
+    // Reported from what was actually done, not from the table. A line
+    // generated from the same file the build read would agree with it whatever
+    // the machine did; `tests/qemu/boot-test.sh` compares this against
+    // `services.toml`, and that comparison is only worth making because the two
+    // could differ.
     crate::println!(
-        "    placement      {}={PLACEMENT} {}={PLACEMENT}, dispatched by message",
+        "    placement      {}={} {}={}, dispatched by message",
         Console::NAME,
-        Filesystem::NAME
+        CONSOLE_PLACEMENT,
+        Filesystem::NAME,
+        VFS_PLACEMENT
     );
     Ok(())
 }
 
-/// Where the services in this build run.
+/// Where the console runs in this build.
 ///
-/// Both are in the nucleus, which is what `services.toml` says. It stays a
-/// constant here and not a generated one: a build script that read the table
-/// and produced this string would make the boot line agree with the table by
-/// construction, and a line that cannot disagree cannot report anything. The
-/// table is checked against the crates by `tools/check-placements.sh`; this
-/// line is checked against reality by being printed.
-pub const PLACEMENT: &str = "nucleus";
+/// In the nucleus, and there is nowhere else for it yet: a console in a domain
+/// needs a driver to talk to, which is RFC 0013 step 6's problem.
+pub const CONSOLE_PLACEMENT: &str = "nucleus";
+
+/// Where the filesystem runs in this build.
+///
+/// Two constants either side of a `cfg`, and not one string from the build
+/// script, because this is what the kernel *did*: the same `cfg` chose between
+/// spawning a thread and loading a program, and a service that failed to start
+/// says so on its own line.
+#[cfg(vfs_in_domain)]
+pub const VFS_PLACEMENT: &str = "domain";
+/// Where the filesystem runs in this build.
+#[cfg(not(vfs_in_domain))]
+pub const VFS_PLACEMENT: &str = "nucleus";
 
 /// Runs a service in the nucleus placement, for ever.
 ///
@@ -179,6 +197,7 @@ extern "C" fn console_service(_argument: u64) -> ! {
 }
 
 /// Answers the filesystem endpoint, for ever.
+#[cfg(not(vfs_in_domain))]
 extern "C" fn filesystem_service(_argument: u64) -> ! {
     let Some(endpoint) = filesystem_endpoint() else {
         sched::exit()
@@ -193,6 +212,7 @@ extern "C" fn filesystem_service(_argument: u64) -> ! {
 /// and the service above it cannot tell which it got — which is the claim RFC
 /// 0013 makes, and the reason this function exists rather than the service
 /// calling `shared::fill_from` itself.
+#[cfg(not(vfs_in_domain))]
 fn filesystem_bulk() -> Bulk {
     Bulk {
         fill: |slot, limit, source| {

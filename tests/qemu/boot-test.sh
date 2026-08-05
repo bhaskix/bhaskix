@@ -336,7 +336,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 2 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 3 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -389,7 +389,11 @@ fi
 # The services an unprivileged program is given. Checked here by calling the
 # endpoints directly, so a protocol bug is reported as one rather than as a
 # shell that prints nothing.
-if grep -qE "services +[0-9]+ entries listed, [0-9]+ bytes read by message; [0-9]+ requests, [1-9][0-9]* callers refused" "$LOG"; then
+# Keyed on what the test observed and not on a counter: a service in its own
+# domain has no way to add to a number the kernel prints, so a gate reading the
+# counter would pass in one placement and fail in the other while the service
+# behaved identically in both.
+if grep -qE "services +[0-9]+ entries listed, [0-9]+ bytes read by message; a third caller was refused" "$LOG"; then
     pass "the console and filesystem services answer, and refuse a third caller"
 else
     fail "the services did not pass"
@@ -587,6 +591,15 @@ expected=$(awk '
     /^name *=/     { gsub(/[" ]/, ""); sub(/^name=/, ""); name = $0 }
     /^placement *=/ { gsub(/[" ]/, ""); sub(/^placement=/, ""); printf "%s%s=%s", sep, name, $0; sep = " " }
 ' "$(dirname "$0")/../../services.toml")
+
+# An override changes what the machine was *built* to do, so it changes what
+# this gate should expect -- otherwise testing the other placement would mean
+# editing the table, and a test that edits the file it is testing is not
+# testing it. The comparison stays real: the line still comes from what the
+# machine did, and only the expectation moves.
+if [[ -n ${BHASKIX_PLACEMENT_VFS:-} ]]; then
+    expected=$(sed "s/vfs=[a-z]*/vfs=$BHASKIX_PLACEMENT_VFS/" <<<"$expected")
+fi
 
 if [[ -z $expected ]]; then
     fail "services.toml lists no services, so the placement gate would check nothing"

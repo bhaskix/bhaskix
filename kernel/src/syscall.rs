@@ -120,6 +120,7 @@ const _: () = {
     assert!(Kind::Recv as u64 == bhaskix_abi::syscall::RECV);
     assert!(Kind::Yield as u64 == bhaskix_abi::syscall::YIELD);
     assert!(Kind::Exit as u64 == bhaskix_abi::syscall::EXIT);
+    assert!(method::FILL == bhaskix_abi::method::FILL);
     assert!(Status::Ok as u64 == bhaskix_abi::status::OK);
     assert!(Status::NoSuchCapability as u64 == bhaskix_abi::status::NO_SUCH_CAPABILITY);
     assert!(Status::Revoked as u64 == bhaskix_abi::status::REVOKED);
@@ -195,6 +196,19 @@ pub mod method {
     pub const ACK: u64 = 36;
     /// Give the source up: masked permanently, vector freed, claim released.
     pub const RELEASE: u64 = 37;
+    /// Write bytes into memory the caller of this endpoint named.
+    ///
+    /// Only on an `Endpoint` capability, and only from the thread that is
+    /// answering a message taken from it. `arg0` = the *caller's* slot holding
+    /// the `Memory` capability, `arg1` = address of the bytes in this domain,
+    /// `arg2` = how many. Returns how many landed.
+    ///
+    /// This is the bulk path a service gets when it runs in its own domain:
+    /// the nucleus placement writes through the direct map, which a domain has
+    /// no way to do and must not have. Which caller is not an argument — it is
+    /// the one this thread is answering, and a service that could name it
+    /// could write a file's contents into a third party's memory.
+    pub const FILL: u64 = 38;
 }
 
 /// What a system call returns in `rax`.
@@ -696,6 +710,49 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // A `DmaWindow` method, which does not block but must not run locked: a
     // map may allocate a page-table level, and allocating takes the heap,
     // which ranks outside the capability arena the method was resolved under.
+    // The domain placement's bulk path. Held to the same three checks the
+    // nucleus one passes, in the same order: the endpoint capability proves
+    // this thread is a server, the reply obligation says which caller, and the
+    // caller's own slot says which memory -- authority that the caller already
+    // held and pointed at, never a name the service chose.
+    if kind == Some(Kind::Invoke) && frame.method == method::FILL {
+        let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Endpoint) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        let _ = resolved;
+
+        let Some(caller) = crate::sched::current_thread_id().and_then(crate::sched::reply_target)
+        else {
+            // Not answering anybody. A thread that is not mid-request has no
+            // caller, so there is no memory it is entitled to write into.
+            return Outcome::err(Status::WrongObject);
+        };
+        let Some(object) = crate::shared::caller_object(caller, frame.arg0) else {
+            return Outcome::err(Status::NoSuchCapability);
+        };
+
+        let source = frame.arg1;
+        let limit = frame.arg2 as usize;
+        let written = crate::shared::fill_from(object, limit, &mut |bytes: &mut [u8]| {
+            // From the domain's own address space, through the exception
+            // table: a service that passed an address it does not own gets a
+            // short write, not a kernel fault.
+            let taken = bytes.len();
+            // SAFETY: `bytes` is a kernel buffer of `taken` bytes, and
+            // `copy_from_user` is the fault-protected read -- an unmapped or
+            // unreadable source is a failure it reports rather than a fault it
+            // takes. `source` is not dereferenced anywhere else.
+            let copied =
+                unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), source, taken) };
+            if copied.is_ok() { taken } else { 0 }
+        });
+        return match written {
+            Some(written) => Outcome::ok(written as u64),
+            None => Outcome::err(Status::NoSuchCapability),
+        };
+    }
+
     if kind == Some(Kind::Invoke)
         && matches!(frame.method, method::MAP | method::UNMAP | method::INFO)
     {

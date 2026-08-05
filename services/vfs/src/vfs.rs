@@ -69,6 +69,15 @@ pub unsafe fn mount(bytes: &'static [u8]) {
     }
 }
 
+/// The mounted image, for a placement that has to hand it to somebody.
+///
+/// The domain placement maps these bytes into the program that serves them,
+/// which is the one thing a service in its own domain cannot go and find.
+#[must_use]
+pub fn image() -> Option<&'static [u8]> {
+    root()
+}
+
 fn root() -> Option<&'static [u8]> {
     // SAFETY: written once during boot, before any other CPU can reach it, and
     // never again.

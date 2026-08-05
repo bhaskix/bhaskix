@@ -266,6 +266,26 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
    relocatable service with no kernel in the build at all, which is the domain placement's compile.
 3. **The domain placement for one service.** The filesystem, because its bulk path is the one that
    differs and M6-18 gives it a measurement to beat.
+
+   *Done, 2026-08-05.* `bin/vfsd` is the filesystem service in ring 3, holding one endpoint
+   capability and a read-only mapping of the image, answering every `fs::` method in the system.
+   The service crate is byte for byte the one the kernel compiles for the nucleus placement; what
+   differs is the context (`Bulk::fill` is a system call, `method::FILL`) and the run loop
+   (`serve::<S>` instead of `run::<S>`). `make test-placements` boots both, every build.
+
+   Three things this found, none of which were visible from the design:
+
+   - `Recv` delivered one of a message's four registers, so no service that packs a `Chunk` could
+     ever have run in a domain. Fixed by not accepting a caller from the server, which also closed
+     a hole: a server could reply to a thread it had never heard from.
+   - The two placements disagreed about a refusal. The nucleus checks the caller's capability
+     before reading; the domain version read first and returned early on an empty read, so a caller
+     with no right to that memory got "fine, nothing" instead of "not yours". Caught by the
+     negative half of the bulk test and by nothing else.
+   - A counter is not a witness. The boot report keyed a gate on the service's refusal counter,
+     which a service in its own domain has no way to add to — so the gate would have passed in one
+     placement and failed in the other while the service behaved identically in both. It now
+     reports what the test observed.
 4. **The boot with everything in a domain**, and the shell tests running against it.
 5. **The measurement**, per service and per placement, against the table above.
 6. **A second service in a domain** — the block driver, which is where RFC 0011 step 6 and RFC 0012

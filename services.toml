@@ -27,7 +27,7 @@ relocatable = true
 
 [[service]]
 name = "vfs"
-placement = "nucleus"
+placement = "domain"
 crate = "services/vfs"
 package = "bhaskix-service-vfs"
 # True as of RFC 0013 step 3. What changed is one function: the bulk path used

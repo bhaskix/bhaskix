@@ -33,7 +33,9 @@ LIMINE_DIR   := boot/limine/limine
 PROBE_DIR    := user/probe
 PROBE        := $(PROBE_DIR)/target/$(TARGET)/release/probe
 SHELL_DIR    := user/shell
+VFSD_DIR     := user/vfsd
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
+USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
 # kernel's PIC/kernel-code-model settings are wrong for a user program linked
@@ -42,6 +44,8 @@ PROBE_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(PROBE_DIR)/link.ld
 SHELL_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(SHELL_DIR)/link.ld
+VFSD_FLAGS   := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(VFSD_DIR)/link.ld
 
 # 256 MiB is comfortably more than the kernel needs and small enough that the
 # memory-map output stays readable.
@@ -93,6 +97,7 @@ OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
+        test-placements \
         test-shell test-faults fmt clippy gates clean distclean help
 
 all: iso
@@ -119,12 +124,13 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
 	cp $(PROBE) $(INITRD_ROOT)/bin/probe
 	cp $(USER_SHELL) $(INITRD_ROOT)/bin/shell
+	cp $(USER_VFSD) $(INITRD_ROOT)/bin/vfsd
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
 	@echo "built $@ ($$(stat -c%s $@) bytes)"
@@ -142,6 +148,17 @@ $(PROBE): $(PROBE_DIR)/src/main.rs $(PROBE_DIR)/link.ld $(PROBE_DIR)/Cargo.toml
 $(USER_SHELL): $(SHELL_DIR)/src/main.rs $(SHELL_DIR)/link.ld $(SHELL_DIR)/Cargo.toml \
                $(wildcard abi/src/*.rs)
 	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# The filesystem service as a program, for the domain placement. Rebuilt when
+# the service crate changes too: the same crate is compiled into the kernel for
+# the nucleus placement, and the two must be the same code or the claim this
+# program exists to make is not being made.
+$(USER_VFSD): $(VFSD_DIR)/src/main.rs $(VFSD_DIR)/link.ld $(VFSD_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs) $(wildcard services/vfs/src/*.rs) \
+              $(wildcard service/src/*.rs) $(wildcard service-domain/src/*.rs)
+	cd $(VFSD_DIR) && RUSTFLAGS="$(VFSD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
@@ -188,7 +205,8 @@ run-uefi: $(ISO)
 
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
-test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-shell test-faults
+test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-placements \
+      test-shell test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -197,6 +215,23 @@ test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-s
 test-host:
 	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm \
 	    -p bhaskix-service -p bhaskix-service-console
+
+# Every service that has two placements, in both of them, every build.
+#
+# RFC 0013's testing plan asks for exactly this, and it is the only thing that
+# stops the placement nobody is running from rotting: the code for it is
+# compiled out, so nothing else would notice. The placement comes from the
+# environment rather than from `services.toml` -- a test that edited the file
+# it is testing would not be testing it.
+#
+# Two boots, not two builds. A build proves it compiles; only a boot proves the
+# service answers, and the whole claim is that it answers the same either way.
+test-placements:
+	@for placement in nucleus domain; do \
+	    echo "  vfs=$$placement"; \
+	    BHASKIX_PLACEMENT_VFS=$$placement $(MAKE) --no-print-directory iso >/dev/null || exit 1; \
+	    BHASKIX_PLACEMENT_VFS=$$placement tests/qemu/boot-test.sh bios || exit 1; \
+	done
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios
@@ -232,6 +267,7 @@ fmt:
 	$(CARGO) fmt --all --check
 	cd $(PROBE_DIR) && $(CARGO) fmt --all --check
 	cd $(SHELL_DIR) && $(CARGO) fmt --all --check
+	cd $(VFSD_DIR) && $(CARGO) fmt --all --check
 
 # Two passes, because they cover different things. `--all-targets` cannot be
 # used on the freestanding target: it would try to build the test harness,
@@ -244,6 +280,8 @@ clippy:
 	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(VFSD_DIR) && RUSTFLAGS="$(VFSD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 
 # The project-specific invariants from docs/. Each one is cheap and catches a
@@ -291,6 +329,7 @@ clean:
 	$(CARGO) clean
 	cd $(PROBE_DIR) && $(CARGO) clean
 	cd $(SHELL_DIR) && $(CARGO) clean
+	cd $(VFSD_DIR) && $(CARGO) clean
 	rm -rf build
 
 distclean: clean

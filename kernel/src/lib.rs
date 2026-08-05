@@ -1089,7 +1089,7 @@ extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
     // segment it accepted was mapped above. `rsp` is one past user-writable
     // memory in the same space, and `RSP0` was set before this thread was
     // spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp) }
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
 }
 
 /// Runs a program in ring 3 and checks that it really was ring 3.
@@ -1327,6 +1327,165 @@ fn initrd_self_test(handoff: &Handoff) -> bool {
         );
     }
     ok
+}
+
+/// Where the filesystem domain's stack, image and program live.
+///
+/// The same addresses the shell uses for the same things, because they never
+/// share an address space and using different ones would suggest the kernel
+/// keeps a map of who is where. It does not: each program says where it goes.
+const VFSD_STACK: u64 = 0x0000_0000_1100_0000;
+const VFSD_STACK_PAGES: u64 = 4;
+
+/// Where the filesystem image is mapped in the domain that serves it.
+///
+/// Read-only, and the only memory in that domain it did not allocate itself.
+/// A service in the nucleus reaches storage by calling into the kernel; a
+/// service in a domain is *handed* exactly what it may read, at entry, and can
+/// reach nothing else — which is the difference the placement is for.
+const VFSD_IMAGE: u64 = 0x0000_0000_2000_0000;
+
+/// Where the filesystem service's program is.
+const VFSD_PROGRAM: &[u8] = b"bin/vfsd";
+
+/// Loads `bin/vfsd` and becomes the filesystem service, in ring 3.
+///
+/// The domain placement of RFC 0013. The kernel reads the program and the
+/// image with its own filesystem code — it still has some, for its own shell —
+/// maps both, hands over the endpoint, and enters ring 3, after which every
+/// `fs::` method in the system is answered by a program with no privilege at
+/// all.
+///
+/// Two things are given and nothing else: an endpoint capability at slot 0,
+/// and the image. A domain that could find its own storage would not be a
+/// domain.
+/// Creates the domain the filesystem service runs in, and starts it.
+///
+/// The domain and its one capability are made *here* rather than in the thread
+/// because a thread joins a domain when it is spawned: a program that could
+/// join one afterwards could choose which.
+pub fn start_vfs_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
+    let endpoint = service::filesystem_endpoint().ok_or("there is no filesystem endpoint")?;
+
+    let realm = domain::create("vfs", domain::ResourceEnvelope::new())
+        .map_err(|_| "the filesystem domain would not be created")?;
+
+    // One capability: the endpoint it answers on. Unbadged, because a badge is
+    // what a *client* is stamped with, and this is the other end of the wire.
+    let granted = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the endpoint capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(0, granted).is_ok()) != Some(true) {
+        return Err("the endpoint capability would not be installed");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(cpu, "vfsd", vfs_domain_entry, hhdm_base, hhdm_base, options)
+        .map_err(|_| "the filesystem domain would not spawn")?;
+    Ok(())
+}
+
+/// Loads `bin/vfsd` and becomes the filesystem service, in ring 3.
+///
+/// The domain placement of RFC 0013. The kernel reads the program and the
+/// image with its own filesystem code — it still has some, for its own shell —
+/// maps both, and enters ring 3, after which every `fs::` method in the system
+/// is answered by a program with no privilege at all.
+///
+/// Two things are given and nothing else: the endpoint capability its domain
+/// was created with, and the image. A domain that could find its own storage
+/// would not be a domain.
+extern "C" fn vfs_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("    vfs domain     FAILED: {why}");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(VFSD_PROGRAM) else {
+        stop("bin/vfsd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/vfsd is not an ELF this kernel will load")
+    };
+    let Some(root) = vfs::image() else {
+        stop("there is no filesystem image to hand over")
+    };
+
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(VFSD_STACK), VFSD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+
+    // The image, read-only. Mapped before the copy and filled through the
+    // direct map, exactly as the ELF loader places a read-only segment: the
+    // protection says what *ring 3* may do, and the kernel filling it in first
+    // is not ring 3.
+    let pages = root.len().div_ceil(bhaskix_mm::FRAME_SIZE as usize) as u64;
+    let Some(range) = VirtRange::from_pages(VirtAddr(VFSD_IMAGE), pages) else {
+        stop("the image range is not a range")
+    };
+    if space.map_anonymous(range, Protection::ReadOnly).is_err() {
+        stop("the image would not map")
+    }
+    let mut copied = 0usize;
+    while copied < root.len() {
+        let virtual_address = VFSD_IMAGE + copied as u64;
+        let page = virtual_address & !(bhaskix_mm::FRAME_SIZE - 1);
+        let within = (virtual_address - page) as usize;
+        let chunk = (bhaskix_mm::FRAME_SIZE as usize - within).min(root.len() - copied);
+        let Some(physical) = space.translate(VirtAddr(page)) else {
+            stop("a page of the image did not stay mapped")
+        };
+        // SAFETY: `physical` names a frame this address space just mapped for
+        // the image, reachable through the direct map, and `chunk` is bounded
+        // by what remains in that page. The source is the mounted image, which
+        // outlives every program.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                root.as_ptr().add(copied),
+                (hhdm_base + (physical & !(bhaskix_mm::FRAME_SIZE - 1)) + within as u64) as *mut u8,
+                chunk,
+            );
+        }
+        copied += chunk;
+    }
+
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/vfsd would not load")
+    };
+
+    println!(
+        "    vfs domain     bin/vfsd loaded, {} KiB of filesystem mapped read-only at {VFSD_IMAGE:#x}",
+        root.len() / 1024
+    );
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = VFSD_STACK + VFSD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [VFSD_IMAGE, root.len() as u64]) }
 }
 
 /// Where the user-mode shell's stack goes, and how much of it there is.
@@ -1713,9 +1872,18 @@ fn service_self_test(filesystem: ipc::EndpointId) -> bool {
 
     if ok {
         let (written, read, requests, refused_callers) = service::statistics();
+        // The refusal is reported from what this test *observed*, not from the
+        // service's counter. The counter lives wherever the service does, and
+        // a service in its own domain has no way to add to a number the kernel
+        // prints -- so a gate keyed on the counter would have been a gate that
+        // only worked in one placement, which is the opposite of what these
+        // two placements are for. `busy` is checked above either way.
         println!(
             "    services       {entries} entries listed, {length} bytes read by message; \
-             {requests} requests, {refused_callers} callers refused, console {written}/{read} b w/r"
+             a third caller was refused; console {written}/{read} b w/r; \
+             {requests} requests and {refused_callers} refusals counted in the nucleus \
+             (vfs={})",
+            service::VFS_PLACEMENT
         );
     }
     ok
@@ -1765,7 +1933,7 @@ extern "C" fn user_shell_entry(hhdm_base: u64) -> ! {
     // installed -- `elf::parse` refuses an entry point that is not -- `rsp` is
     // one past user-writable memory in the same space, and `RSP0` was set
     // before this thread was spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp) }
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
 }
 
 /// Largest filesystem image this will read off a disk.
@@ -3270,12 +3438,13 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Two programs in /bin since M6-05: the ring 3 probe and the
-            // user-mode shell. Exact rather than "at least", so adding a
-            // third without noticing this line is a failure rather than a
-            // silently weaker test.
+            // Three programs in /bin: the ring 3 probe, the user-mode shell,
+            // and the filesystem service as a program (RFC 0013 step 3).
+            // Exact rather than "at least", so adding a fourth without
+            // noticing this line is a failure rather than a silently weaker
+            // test -- which is what it just did.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 2,
+            entries >= 3 && bin == 3,
         ),
         (
             "the user program is an ELF the loader accepts",

@@ -194,7 +194,7 @@ pub unsafe fn programmed() -> (u64, u64, u64, u64) {
 /// installed* address space, and `rsp` one past user-accessible, writable
 /// memory in the same. The TSS's `RSP0` must be set, or the first interrupt
 /// taken in ring 3 triple-faults. Never returns.
-pub unsafe fn enter_ring3(rip: u64, rsp: u64) -> ! {
+pub unsafe fn enter_ring3(rip: u64, rsp: u64, arguments: [u64; 2]) -> ! {
     /// `IF` set, everything else clear. Bit 1 reads as one on every x86.
     const USER_RFLAGS: u64 = 0x202;
 
@@ -216,6 +216,14 @@ pub unsafe fn enter_ring3(rip: u64, rsp: u64) -> ! {
             "push {cs}",
             "push {rip}",
             "iretq",
+            // The System V argument registers, so a program can be handed
+            // something at entry. Everything else a domain has arrives through
+            // its CSpace; this is for the one thing that cannot -- where its
+            // memory is. Set explicitly rather than left at whatever the
+            // kernel happened to have in them, because "undefined" is a value
+            // a program will eventually read.
+            in("rdi") arguments[0],
+            in("rsi") arguments[1],
             ss = in(reg) ss,
             rsp = in(reg) rsp,
             rflags = in(reg) USER_RFLAGS,
