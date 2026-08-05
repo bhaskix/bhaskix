@@ -626,8 +626,25 @@ fi
 # `1 sectors` is the assertion that matters. That is the domain's own disk; the
 # kernel's is 180. A driver handed the wrong device says so in a number nothing
 # else on this machine produces.
-if grep -qE "block domain +ring 3 driver: .*drove it to 3, 1 queue of [0-9]+, .*1 sectors" "$LOG"; then
-    pass "a driver in ring 3 brought up a device of its own"
+if [[ "$MODE" == "iommu" ]]; then
+    # With a unit to contain it, the driver is given a DMA window and is
+    # expected to have *read the disk*: status 15, and the first bytes of
+    # sector zero off its own image. `BHASKIX-` is on that disk and on no
+    # other, so a driver reading the kernel's device, or reading nothing and
+    # reporting a zeroed page, says so.
+    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*1 sectors, sector 0 begins "BHASKIX-"' "$LOG"; then
+        pass "a driver in ring 3 read its disk, by DMA, through its own translation"
+    else
+        fail "the block driver in a domain did not read its disk"
+        grep -E "block domain" "$LOG" || true
+        status=1
+    fi
+elif grep -qE "block domain +ring 3 driver: .*drove it to 3, .*1 sectors" "$LOG"; then
+    # Without a unit the driver gets registers and no window, so it brings the
+    # device up and stops. That is the refusal, not a shortcoming: a domain
+    # that could aim a device with physical addresses would be a domain that
+    # could aim it at the kernel.
+    pass "a driver in ring 3 brought up a device it was given no way to make read"
 else
     fail "the block driver in a domain did not report a device it had driven"
     grep -E "block domain" "$LOG" || true

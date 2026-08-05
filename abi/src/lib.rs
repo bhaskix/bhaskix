@@ -99,6 +99,18 @@ pub mod method {
     /// memory.
     pub const FILL: u64 = 38;
 
+    /// Map a `Memory` object into this `DmaWindow`, and return a `DevAddr`.
+    ///
+    /// Only on a `DmaWindow` capability. `arg0` = the caller's slot holding
+    /// the `Memory` capability, `arg1` = rights for the device. RFC 0012.
+    ///
+    /// The number that comes back is not a physical address and this program
+    /// could not have named one: it is where the *device* looks, and what the
+    /// unit translates back to the frames the object owns. A driver in a
+    /// domain is aimed at its own memory by a number that means nothing
+    /// anywhere else.
+    pub const MAP: u64 = 32;
+
     /// Wait until this notification has been signalled, then take the word.
     ///
     /// Only on a `Notification` capability. Blocks, and returns the badges of

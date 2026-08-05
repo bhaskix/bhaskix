@@ -338,10 +338,20 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
    space stays in the kernel because it is port I/O: a domain holding it would hold every device on
    the machine, so there is no way to hand over less.
 
-   **Still to do:** the data path. Descriptor rings programmed with device addresses, a request
-   submitted, the queue kicked, and the completion taken from an interrupt rather than a poll —
-   which is where RFC 0012's `DmaWindow` and RFC 0011's delegated handler finally carry a real
-   request.
+   *The data path landed 2026-08-06.* The driver programs a virtqueue with device addresses it
+   could not have invented, kicks the device, and reads sector zero of its own disk. The DMA goes
+   through a page table of its own, under the same unit, with a domain id of its own — sharing the
+   kernel's would have contained the driver from the kernel's memory and not from the kernel's
+   device.
+
+   The window is granted **only when there is a unit to contain it**. Without one the driver gets
+   registers and no way to make the device read: a domain that could aim a device with physical
+   addresses could aim it at the kernel, and a driver in a domain doing untranslated DMA is the same
+   trusted base further away rather than a smaller one.
+
+   Completion is polled, not taken from an interrupt. The primitives for that exist —
+   `method::WAIT` on a `Notification`, and RFC 0011's delegated `IrqHandler` — and wiring the
+   device's MSI-X to them is the obvious next thing; a bounded spin is honest about being a spin.
 
 Steps 1–2 are the mechanism. Steps 3–5 are the proof. Step 6 is the first driver outside the
 kernel, and the reason the previous four RFCs exist.

@@ -134,7 +134,10 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1130
+unsafe_budget = 1150
+# Raised again for the block domain's data path: enabling bus mastering on a
+# device the kernel does not drive, and reading the report the driver leaves
+# in memory the kernel granted it.
 # Raised from 1090 for RFC 0013 step 6: mapping a device window into a user
 # address space, and reading back through the direct map what a driver in a
 # domain wrote into memory the kernel granted it. The device pages themselves

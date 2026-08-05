@@ -132,6 +132,14 @@ pub struct DeviceMapping {
     pub address: u64,
     /// How many pages from there.
     pub pages: u64,
+    /// Which device, packed as bus/slot/function.
+    ///
+    /// Recorded because a device address only means anything in one device's
+    /// translation, and there is more than one now. Revocation has to unmap it
+    /// from the window it was mapped into: unmapping the same number from
+    /// somebody else's would leave the device that holds it still reaching the
+    /// page, which is the exact failure revocation exists to prevent.
+    pub device: u64,
 }
 
 /// One object.
@@ -488,7 +496,13 @@ pub fn revoke(id: MemoryId) -> usize {
     // device reaching it would be the same failure as leaving one CPU's TLB
     // entry behind -- gone from the tables, and still working.
     if let Some(device) = device {
-        removed += usize::from(crate::iommu::unmap_device(device.address, device.pages));
+        // Unmapped from the window it was mapped into, named by the device
+        // recorded with it.
+        removed += usize::from(crate::iommu::unmap_device(
+            crate::iommu::device_of(device.device),
+            device.address,
+            device.pages,
+        ));
     }
 
     REVOKED.fetch_add(removed as u64, core::sync::atomic::Ordering::Relaxed);
@@ -511,7 +525,7 @@ pub fn hhdm() -> u64 {
 /// Returns false if the object is gone, or already reachable by a device —
 /// mapping one twice would leave the first address unrevoked, which is a page
 /// a device keeps after the object naming it has been destroyed.
-pub fn record_device_mapping(id: MemoryId, address: u64, pages: u64) -> bool {
+pub fn record_device_mapping(id: MemoryId, device: u64, address: u64, pages: u64) -> bool {
     let mut arena = ARENA.lock();
     if resolve(&arena, id).is_none() {
         return false;
@@ -520,7 +534,11 @@ pub fn record_device_mapping(id: MemoryId, address: u64, pages: u64) -> bool {
     if object.device.is_some() {
         return false;
     }
-    object.device = Some(DeviceMapping { address, pages });
+    object.device = Some(DeviceMapping {
+        address,
+        pages,
+        device,
+    });
     true
 }
 

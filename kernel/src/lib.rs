@@ -1483,6 +1483,24 @@ pub fn start_block_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> 
         return Err("the rings capability would not install");
     }
 
+    // The authority to say what this *device* may reach, which is strictly
+    // more than holding memory: a device writes with no page table and asks
+    // nobody. Granted only when there is a unit to contain it — without one a
+    // device address is a physical address, and a domain that could name one
+    // could point its device at the kernel. A driver in a domain doing DMA
+    // with nothing translating is not a smaller trusted base, it is the same
+    // trusted base further away.
+    let delegated = (address.bus, address.device, address.function);
+    let contained = if iommu::present_for(delegated) {
+        let window = iommu::name(delegated).map_err(|_| "the dma window would not be named")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(4, window).is_ok()) != Some(true) {
+            return Err("the dma window capability would not install");
+        }
+        true
+    } else {
+        false
+    };
+
     println!(
         "    block domain   {:02x}:{:02x}.{} delegated: common {:#x}, notify {:#x} x{}, device {:#x}",
         address.bus,
@@ -1493,6 +1511,29 @@ pub fn start_block_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> 
         layout.notify_multiplier,
         layout.device.0
     );
+    if contained {
+        println!("    block domain   dma window granted; the device translates through its own");
+    } else {
+        println!(
+            "    block domain   no dma window: nothing would contain the device, so the \
+             driver gets registers and no way to make it read"
+        );
+    }
+
+    // Bus mastering, last. A device that is not a bus master cannot write to
+    // memory at all: its rings stay empty and every request times out, which
+    // reads as a broken device rather than as a missing bit. It cost an
+    // afternoon to find, and `pci::enable`'s own comment says exactly that --
+    // the kernel's driver had learned it and this one had not read it.
+    //
+    // Safe to grant before the driver has reset the device *because the device
+    // translates*: a stray DMA with the configuration firmware left behind
+    // reaches nothing it was not given, and shows up as a fault rather than as
+    // somebody else's memory. Without a unit this would be handing a domain
+    // the ability to point a device anywhere, which is why the window is
+    // granted first and this follows it.
+    // SAFETY: this device is the block domain's; nothing else drives it.
+    unsafe { bhaskix_arch::pci::enable(address) };
 
     let options = sched::SpawnOptions::new()
         .pinned()
@@ -1513,6 +1554,29 @@ pub fn start_block_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> 
 
 /// The rings the block domain was given, so its report can be read back.
 static BLOCK_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether the driver has left its report yet.
+///
+/// The marker only, so that waiting for it costs nothing and cannot be
+/// confused with reading it: a page of zeroes has no marker, and a driver that
+/// never ran leaves the page as it found it.
+fn block_domain_reported(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = BLOCK_RINGS.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return true;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return true;
+    };
+    if count < 4 {
+        return true;
+    }
+    // SAFETY: a frame this object owns, through the direct map.
+    let marker = unsafe { core::ptr::read_volatile((hhdm + frames[3]) as *const u64) };
+    marker == 0x424c_4b44_5250_5431
+}
 
 /// Reads what the driver in a domain wrote, and says so.
 ///
@@ -1543,15 +1607,18 @@ fn report_block_domain(hhdm: u64) -> bool {
         println!("    block domain   FAILED: the rings are gone");
         return false;
     };
-    if count < 2 {
+    if count < 4 {
         println!("    block domain   FAILED: the rings are too small to hold a report");
         return false;
     }
 
-    let mut words = [0u64; 8];
+    let mut words = [0u64; 10];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // eight little-endian words the driver wrote there.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 64) };
+    // The last page. The first three are the descriptor table, the rings and
+    // the request the *device* reads and writes -- a report living in any of
+    // them would be a report the device could overwrite.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3]) as *const u8, 80) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -1562,16 +1629,20 @@ fn report_block_domain(hhdm: u64) -> bool {
         return false;
     }
 
-    let [
-        _,
-        untouched,
-        acknowledged,
-        queues,
-        queue_size,
-        features,
-        sectors,
-        rings_work,
-    ] = words;
+    // What the unit saw, if anything. A device refused a page and a device
+    // that never asked look identical from here, and this is the only thing
+    // that tells them apart.
+    if let Some(fault) = iommu::fault(hhdm) {
+        let (bus, slot, function) = fault.device;
+        println!(
+            "    block domain   iommu FAULT {bus:02x}:{slot:02x}.{function} {} {:#x}, \
+             reason {:#04x}",
+            if fault.read { "read" } else { "write" },
+            fault.address,
+            fault.reason
+        );
+    }
+
     // What is asserted is what the driver *did*, and what only this device
     // could have told it.
     //
@@ -1582,18 +1653,42 @@ fn report_block_domain(hhdm: u64) -> bool {
     // device on a real bus. What it is evidence of is weaker than the capacity
     // anyway: this disk is one sector and the kernel's is 180, so a driver
     // handed the wrong device would say so in a number nothing else produces.
-    let ok = acknowledged == 3 && queues >= 1 && queue_size > 0 && sectors > 0 && rings_work == 1;
+    let [
+        _,
+        found,
+        drove_to,
+        rings_at_device,
+        queue_size,
+        sectors,
+        first_bytes,
+        read_ok,
+        used_index,
+        request_status,
+    ] = words;
+
+    // With a window, the driver is expected to have *read the disk*: status
+    // 15 (acknowledge, driver, features-ok, driver-ok) and eight bytes off
+    // sector zero. Without one it gets as far as the handshake and stops,
+    // because nothing would contain a device it aimed at memory.
+    let contained = iommu::present();
+    let ok = if contained {
+        drove_to == 15 && read_ok == 1 && queue_size > 0 && sectors > 0
+    } else {
+        drove_to == 3 && queue_size > 0 && sectors > 0
+    };
     if ok {
+        let text = first_bytes.to_le_bytes();
+        let text = core::str::from_utf8(&text).unwrap_or("????????");
         println!(
-            "    block domain   ring 3 driver: found status {untouched}, drove it to \
-             {acknowledged}, {queues} queue of {queue_size}, features {features:#x}, \
-             {sectors} sectors, rings writable"
+            "    block domain   ring 3 driver: found status {found}, drove it to {drove_to}, \
+             rings at {rings_at_device:#x} for the device, queue of {queue_size}, \
+             {sectors} sectors, sector 0 begins {text:?}"
         );
     } else {
         println!(
-            "    block domain   FAILED: found {untouched}, drove it to {acknowledged}, \
-             queues {queues}, queue size {queue_size}, sectors {sectors}, \
-             rings writable {rings_work}"
+            "    block domain   FAILED: found {found}, drove it to {drove_to}, \
+             rings at {rings_at_device:#x}, queue size {queue_size}, sectors {sectors}, \
+             read {read_ok}, used index {used_index}, request status {request_status:#x}"
         );
     }
     ok
@@ -2077,7 +2172,17 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // notification would be better and is what a supervisor would do; RFC
         // 0013 says explicitly that it does not propose one, so this waits the
         // way the rest of the boot does.
-        wait_millis(200);
+        // Waited *for the report* rather than for a duration. A fixed wait is
+        // a guess that is either too short on a loaded machine or too long on
+        // every boot, and this one was both in turn. A supervisor would wait
+        // on a notification; RFC 0013 says explicitly that it does not propose
+        // one, so this looks for the thing it is waiting for.
+        for _ in 0..60 {
+            if block_domain_reported(hhdm) {
+                break;
+            }
+            wait_millis(50);
+        }
         if !report_block_domain(hhdm) {
             println!("    block domain   FAILED");
         }
@@ -3436,7 +3541,10 @@ fn iommu_delegation_self_test(hhdm: u64) -> bool {
         return false;
     };
 
-    let (Ok(memory_cap), Ok(window_cap)) = (shared::name(object), iommu::name()) else {
+    let Some(device) = virtio::probe() else {
+        return false;
+    };
+    let (Ok(memory_cap), Ok(window_cap)) = (shared::name(object), iommu::name(device)) else {
         println!("    iommu grant    FAILED to name the object or the window");
         domain::destroy(owner);
         return false;
@@ -3530,9 +3638,17 @@ fn iommu_memory_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -
         return false;
     };
 
-    let Some(address) =
-        iommu::map_memory(object, bhaskix_arch::vtd::Rights::READ_WRITE, false, hhdm)
-    else {
+    let Some(device) = virtio::probe() else {
+        domain::destroy(owner);
+        return false;
+    };
+    let Some(address) = iommu::map_memory(
+        device,
+        object,
+        bhaskix_arch::vtd::Rights::READ_WRITE,
+        false,
+        hhdm,
+    ) else {
         println!("    iommu memory   FAILED to map the object into the device window");
         domain::destroy(owner);
         return false;
@@ -3634,7 +3750,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     let (bus, slot, function) = device;
 
     let window = iommu::build_window(&found, device, 0, hhdm)?;
-    if !iommu::verify_window(&window, hhdm) {
+    if !iommu::verify_window(&window, 1, hhdm) {
         // Built and read back wrong is worse than not built: every value would
         // be right and the offsets wrong, which is a device translating
         // through some other device's tables.
@@ -3716,13 +3832,52 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         None
     };
 
-    iommu::install(found, window);
+    iommu::install(device, found, window);
     println!(
         "    iommu window   {bus:02x}:{slot:02x}.{function} {}-bit, {} levels, \
          {reserved} reserved pages mapped, {refused} refused",
         window.width.bits(),
         window.width.levels()
     );
+
+    // The second block device, if there is one, gets a translation of its own
+    // under the same unit: its own page table and its own domain id, reached
+    // through its own context entry. Sharing the first device's page table
+    // would have been one line and would have meant a driver in a domain could
+    // reach whatever the kernel's device had mapped -- contained from the
+    // kernel's memory and not from the kernel's device, which is not
+    // containment.
+    if let Some((second, _)) = virtio::find_nth(1) {
+        let delegated = (second.bus, second.device, second.function);
+        match iommu::attach_device(&window, delegated, 1, hhdm) {
+            Some(second_window) => {
+                if iommu::verify_window(&second_window, 2, hhdm) {
+                    iommu::install(delegated, found, second_window);
+                    // The unit is already translating, and it caches context
+                    // entries: without this it goes on believing this device
+                    // has none, and every request it makes is dropped with the
+                    // entry sitting correct in memory.
+                    // SAFETY: the unit these windows are programmed into.
+                    if !unsafe { iommu::invalidate_contexts() } {
+                        println!("    iommu window   FAILED: the context cache did not invalidate");
+                    }
+                    println!(
+                        "    iommu window   {:02x}:{:02x}.{} translating too, its own page table \
+                         and domain, {} in use",
+                        delegated.0,
+                        delegated.1,
+                        delegated.2,
+                        iommu::windows()
+                    );
+                } else {
+                    println!(
+                        "    iommu window   FAILED: the second device's tables did not read back"
+                    );
+                }
+            }
+            None => println!("    iommu window   FAILED: no page table for the second device"),
+        }
+    }
     match &remapped {
         Some(Ok(())) => println!(
             "    iommu irq      remapping interrupts; compatibility format blocked, \
@@ -3755,8 +3910,12 @@ fn block_self_test(handoff: &Handoff) -> bool {
     // and given a `DevAddr` the device is told about instead of the physical
     // address the kernel knows it by. Without a unit the two are equal and
     // this is the path every machine has always taken.
-    let capacity = if iommu::present() {
-        let translate = |physical: u64| iommu::map_frame(physical, hhdm).map(|a| a.as_u64());
+    let capacity = if let Some(device) = virtio::probe().filter(|d| iommu::present_for(*d)) {
+        // The kernel's own device, translating through its own window. Named
+        // rather than implied: there is a second device now, with a window of
+        // its own, and "the window" would have been whichever came first.
+        let translate =
+            |physical: u64| iommu::map_frame(device, physical, hhdm).map(|a| a.as_u64());
         virtio::init_mapped(hhdm, Some(&translate))
     } else {
         virtio::init(hhdm)

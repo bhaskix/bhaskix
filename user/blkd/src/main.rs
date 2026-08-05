@@ -35,6 +35,8 @@ const NOTIFY: u64 = 1;
 const DEVICE: u64 = 2;
 /// Slot: memory for the rings.
 const RINGS: u64 = 3;
+/// Slot: the authority to say what this device may reach.
+const WINDOW: u64 = 4;
 
 /// Where each mapping goes in this program's address space.
 const COMMON_AT: u64 = 0x2000_0000;
@@ -42,20 +44,58 @@ const NOTIFY_AT: u64 = 0x2001_0000;
 const DEVICE_AT: u64 = 0x2002_0000;
 const RINGS_AT: u64 = 0x2010_0000;
 
+/// Where each structure sits inside the four pages of rings.
+///
+/// Laid out by hand because the device reads it: the descriptor table must be
+/// sixteen-byte aligned, the used ring four-byte aligned, and the whole lot
+/// has to be at offsets this program can turn into device addresses by adding
+/// them to one base. A page each keeps every alignment true by construction.
+mod ring {
+    /// Descriptor table: sixteen bytes per entry.
+    pub const DESCRIPTORS: u64 = 0x0000;
+    /// Available ring, where the driver publishes what it wants done.
+    pub const AVAILABLE: u64 = 0x0800;
+    /// Used ring, where the device publishes what it has done.
+    pub const USED: u64 = 0x1000;
+    /// The sixteen-byte request header the device reads.
+    pub const HEADER: u64 = 0x2000;
+    /// One byte, which the device writes when it is finished.
+    pub const STATUS: u64 = 0x2010;
+    /// Where the sector lands.
+    pub const DATA: u64 = 0x2800;
+    /// Where this program leaves its findings for the kernel.
+    pub const REPORT: u64 = 0x3000;
+}
+
+/// Descriptor flags, from the specification.
+mod descriptor {
+    /// The next field is meaningful.
+    pub const NEXT: u16 = 1;
+    /// The device writes this one; without it the device reads.
+    pub const WRITE: u16 = 2;
+}
+
 /// Offsets into the common configuration structure, from the specification.
 mod common {
-    pub const DEVICE_FEATURE_SELECT: u64 = 0x00;
-    pub const DEVICE_FEATURE: u64 = 0x04;
     pub const DEVICE_STATUS: u64 = 0x14;
     pub const NUM_QUEUES: u64 = 0x12;
+    pub const DRIVER_FEATURE_SELECT: u64 = 0x08;
+    pub const DRIVER_FEATURE: u64 = 0x0c;
     pub const QUEUE_SELECT: u64 = 0x16;
     pub const QUEUE_SIZE: u64 = 0x18;
+    pub const QUEUE_ENABLE: u64 = 0x1c;
+    pub const QUEUE_NOTIFY_OFF: u64 = 0x1e;
+    pub const QUEUE_DESC: u64 = 0x20;
+    pub const QUEUE_DRIVER: u64 = 0x28;
+    pub const QUEUE_DEVICE: u64 = 0x30;
 }
 
 /// Status bits, written in the order the specification fixes.
 mod device_status {
     pub const ACKNOWLEDGE: u8 = 1;
     pub const DRIVER: u8 = 2;
+    pub const DRIVER_OK: u8 = 4;
+    pub const FEATURES_OK: u8 = 8;
 }
 
 /// There is nothing to unwind and nowhere to print to.
@@ -164,6 +204,27 @@ unsafe fn write32(at: u64, value: u32) {
     unsafe { core::ptr::write_volatile(at as *mut u32, value) }
 }
 
+/// Writes a 64-bit register, as two 32-bit stores.
+///
+/// Two stores and not one, because the specification defines these registers
+/// as a low and a high half and a device model is entitled to notice the
+/// difference. QEMU does: a single eight-byte store to `queue_desc` left the
+/// device with a queue it never looked at — no fault, no completion, and
+/// nothing anywhere saying why. The kernel's own driver had this comment
+/// already, which is where the answer was.
+///
+/// # Safety
+///
+/// As [`write8`], and `at` must be four-byte aligned.
+unsafe fn write64(at: u64, value: u64) {
+    // SAFETY: delegated to the caller. The low half first, which is the order
+    // the specification fixes.
+    unsafe {
+        core::ptr::write_volatile(at as *mut u32, value as u32);
+        core::ptr::write_volatile((at + 4) as *mut u32, (value >> 32) as u32);
+    }
+}
+
 /// Where the program actually starts.
 #[unsafe(no_mangle)]
 extern "C" fn blkd_main() -> ! {
@@ -178,24 +239,91 @@ extern "C" fn blkd_main() -> ! {
         exit()
     }
 
-    // The device as the kernel left it: untouched. Nobody has driven this one,
-    // so its status is zero and reading zero is the evidence — the kernel's own
-    // device reads 15, and a driver that had been handed the wrong one would
-    // see that instead.
+    // The device as this driver found it. Reported and not asserted: the
+    // firmware probes disks before a kernel exists, so a device on a real bus
+    // is never untouched.
     //
     // SAFETY: `COMMON_AT` is a device window this program mapped, and these
     // offsets are inside it. Reading a status register does not change it.
-    let untouched = unsafe { read8(COMMON_AT + common::DEVICE_STATUS) };
-    // SAFETY: as above -- the same window, a register two bytes wide at an
-    // offset inside it, and reading it does not change it.
+    let found = unsafe { read8(COMMON_AT + common::DEVICE_STATUS) };
+    // SAFETY: as above -- a register two bytes wide at an offset inside the
+    // same window.
     let queues = unsafe { read16(COMMON_AT + common::NUM_QUEUES) };
 
-    // The bring-up handshake, as far as the specification's first two steps:
-    // acknowledge that the device is there, then that a driver is present.
-    // Feature negotiation and the queue are the next step's work.
-    //
-    // SAFETY: as above; these writes are the values the specification defines
-    // for that register, in the order it fixes.
+    // Where the device will look for the rings. Not a physical address: this
+    // program cannot name one, and the number the device is given is whatever
+    // the unit translates back to the frames the kernel gave it. Without a
+    // window there is no such number and no read to be had — which is the
+    // point, because a device with no translation in front of it would be
+    // aimed with physical addresses by a program that must not know any.
+    let (mapped, rings_at_device) = call(syscall::INVOKE, WINDOW, method::MAP, [RINGS, 0, 0, 0]);
+    let translated = mapped == status::OK;
+
+    let read = if translated {
+        bring_up(rings_at_device)
+    } else {
+        // SAFETY: as above; the bring-up handshake as far as it can go
+        // without a queue to enable.
+        unsafe {
+            write8(COMMON_AT + common::DEVICE_STATUS, 0);
+            write8(
+                COMMON_AT + common::DEVICE_STATUS,
+                device_status::ACKNOWLEDGE,
+            );
+            write8(
+                COMMON_AT + common::DEVICE_STATUS,
+                device_status::ACKNOWLEDGE | device_status::DRIVER,
+            );
+        }
+        None
+    };
+
+    // SAFETY: as above.
+    let status_now = unsafe { read8(COMMON_AT + common::DEVICE_STATUS) };
+    // SAFETY: `DEVICE_AT` is the device configuration window this program
+    // mapped read-only, and a block device's capacity is its first field.
+    let sectors = unsafe { read32(DEVICE_AT) };
+    // SAFETY: `RINGS_AT` is memory this program holds and mapped writable.
+    let queue_size = unsafe {
+        write16(COMMON_AT + common::QUEUE_SELECT, 0);
+        read16(COMMON_AT + common::QUEUE_SIZE)
+    };
+
+    let _ = queues;
+    let (used_index, request_status) = aftermath();
+    report(
+        found,
+        status_now,
+        rings_at_device,
+        queue_size,
+        sectors,
+        read,
+        used_index,
+        request_status,
+    );
+    exit()
+}
+
+/// Brings the device up and reads sector zero.
+///
+/// The bring-up order is the specification's and the order *is* the protocol: a
+/// status bit written early is a promise this driver has not yet kept. The
+/// features are the two a virtio 1.0 device behind an IOMMU requires — version
+/// 1, and that the driver uses the platform's addresses rather than physical
+/// ones. The second is not a formality: without it the device bypasses
+/// translation entirely and the window this program was given would contain
+/// nothing.
+///
+/// Returns the first eight bytes of sector zero, or `None` if the device never
+/// finished.
+fn bring_up(rings_at_device: u64) -> Option<u64> {
+    // Device addresses are the ring base plus the same offsets this program
+    // uses, because the window maps the object's pages in order.
+    let device_address = |offset: u64| rings_at_device + offset;
+
+    // SAFETY: `COMMON_AT` is the common configuration window this program
+    // mapped writable, and every offset below is inside it. The values and
+    // their order are the specification's.
     unsafe {
         write8(COMMON_AT + common::DEVICE_STATUS, 0);
         write8(
@@ -206,48 +334,138 @@ extern "C" fn blkd_main() -> ! {
             COMMON_AT + common::DEVICE_STATUS,
             device_status::ACKNOWLEDGE | device_status::DRIVER,
         );
-    }
-    // SAFETY: as above.
-    let acknowledged = unsafe { read8(COMMON_AT + common::DEVICE_STATUS) };
 
-    // What the device offers, and how big its queue is. Both are read from the
-    // hardware, and neither is anything this program could have invented.
-    //
-    // SAFETY: as above.
-    let (features, queue_size) = unsafe {
-        write32(COMMON_AT + common::DEVICE_FEATURE_SELECT, 0);
-        let features = read32(COMMON_AT + common::DEVICE_FEATURE);
+        // Feature bits 32 and 33: VERSION_1 and ACCESS_PLATFORM.
+        write32(COMMON_AT + common::DRIVER_FEATURE_SELECT, 1);
+        write32(COMMON_AT + common::DRIVER_FEATURE, 0b11);
+        write32(COMMON_AT + common::DRIVER_FEATURE_SELECT, 0);
+        write32(COMMON_AT + common::DRIVER_FEATURE, 0);
+
+        write8(
+            COMMON_AT + common::DEVICE_STATUS,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        );
+        // Read back: a device that will not accept the feature set clears this
+        // bit, and going on from there configures a queue nobody will service.
+        if read8(COMMON_AT + common::DEVICE_STATUS) & device_status::FEATURES_OK == 0 {
+            return None;
+        }
+
         write16(COMMON_AT + common::QUEUE_SELECT, 0);
-        (features, read16(COMMON_AT + common::QUEUE_SIZE))
-    };
+        write64(
+            COMMON_AT + common::QUEUE_DESC,
+            device_address(ring::DESCRIPTORS),
+        );
+        write64(
+            COMMON_AT + common::QUEUE_DRIVER,
+            device_address(ring::AVAILABLE),
+        );
+        write64(COMMON_AT + common::QUEUE_DEVICE, device_address(ring::USED));
+        write16(COMMON_AT + common::QUEUE_ENABLE, 1);
 
-    // The capacity, in 512-byte sectors, from the device configuration
-    // structure. This is the disk the kernel never opened.
-    //
-    // SAFETY: `DEVICE_AT` is the device configuration window this program
-    // mapped read-only, and a block device's capacity is its first field.
-    let sectors = unsafe { read32(DEVICE_AT) };
+        write8(
+            COMMON_AT + common::DEVICE_STATUS,
+            device_status::ACKNOWLEDGE
+                | device_status::DRIVER
+                | device_status::FEATURES_OK
+                | device_status::DRIVER_OK,
+        );
+    }
 
-    // The rings are this program's own memory, and writing to them proves the
-    // mapping is writable before a device is ever pointed at it.
+    // The request: a header the device reads, a buffer it writes the sector
+    // into, and a byte it writes when it is done. Three descriptors, chained,
+    // because the device is told what each part is for by its flags and not by
+    // its position.
     //
     // SAFETY: `RINGS_AT` is four pages of memory this program holds and mapped
-    // writable, and nothing else in this program uses it.
-    let rings_work = unsafe {
-        core::ptr::write_volatile(RINGS_AT as *mut u64, 0x0123_4567_89ab_cdef);
-        core::ptr::read_volatile(RINGS_AT as *const u64) == 0x0123_4567_89ab_cdef
-    };
+    // writable, and every offset below is inside it.
+    unsafe {
+        // Header: type 0 (read), reserved 0, sector 0.
+        let header = (RINGS_AT + ring::HEADER) as *mut u32;
+        core::ptr::write_volatile(header, 0);
+        core::ptr::write_volatile(header.add(1), 0);
+        core::ptr::write_volatile((RINGS_AT + ring::HEADER + 8) as *mut u64, 0);
+        core::ptr::write_volatile((RINGS_AT + ring::STATUS) as *mut u8, 0xff);
 
-    report(
-        untouched,
-        acknowledged,
-        queues,
-        queue_size,
-        features,
-        sectors,
-        rings_work,
-    );
-    exit()
+        let descriptor = |index: u64, address: u64, length: u32, flags: u16, next: u16| {
+            let at = (RINGS_AT + ring::DESCRIPTORS + index * 16) as *mut u64;
+            core::ptr::write_volatile(at, address);
+            core::ptr::write_volatile(at.add(1).cast::<u32>(), length);
+            core::ptr::write_volatile((at as *mut u16).add(6), flags);
+            core::ptr::write_volatile((at as *mut u16).add(7), next);
+        };
+        descriptor(0, device_address(ring::HEADER), 16, descriptor::NEXT, 1);
+        descriptor(
+            1,
+            device_address(ring::DATA),
+            512,
+            descriptor::NEXT | descriptor::WRITE,
+            2,
+        );
+        descriptor(2, device_address(ring::STATUS), 1, descriptor::WRITE, 0);
+
+        // Available ring: flags, index, then the ring itself. The head goes in
+        // first and the index after it, with a fence between -- a device that
+        // saw the index before the entry would follow a descriptor nobody had
+        // written.
+        let available = (RINGS_AT + ring::AVAILABLE) as *mut u16;
+        core::ptr::write_volatile(available, 0);
+        core::ptr::write_volatile(available.add(2), 0);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        core::ptr::write_volatile(available.add(1), 1);
+    }
+
+    // Kick. The offset is the device's, in units it chose.
+    //
+    // SAFETY: the notify window this program mapped, at the offset the device
+    // published for this queue.
+    unsafe {
+        let offset = u64::from(read16(COMMON_AT + common::QUEUE_NOTIFY_OFF));
+        write16(NOTIFY_AT + offset * 4, 0);
+    }
+
+    // Wait for it, by looking. An interrupt would be better and is the next
+    // thing this driver needs; a bounded spin is honest about being a spin,
+    // where a wait with no bound would hang a machine on a device that never
+    // answers.
+    for _ in 0..2_000_000u64 {
+        // SAFETY: the used ring, in memory this program holds.
+        let used = unsafe { core::ptr::read_volatile((RINGS_AT + ring::USED + 2) as *const u16) };
+        if used != 0 {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            // SAFETY: as above -- the status byte the device wrote, and the
+            // first eight bytes of where it put the sector.
+            unsafe {
+                if core::ptr::read_volatile((RINGS_AT + ring::STATUS) as *const u8) != 0 {
+                    return None;
+                }
+                return Some(core::ptr::read_volatile(
+                    (RINGS_AT + ring::DATA) as *const u64,
+                ));
+            }
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// What the device left in the used ring and the status byte.
+///
+/// Read whether or not the request completed, because "the device wrote
+/// nothing" and "the device wrote a failure" are different answers and the
+/// difference is the whole diagnosis.
+fn aftermath() -> (u64, u64) {
+    // SAFETY: the used ring and the status byte, in memory this program holds.
+    unsafe {
+        (
+            u64::from(core::ptr::read_volatile(
+                (RINGS_AT + ring::USED + 2) as *const u16,
+            )),
+            u64::from(core::ptr::read_volatile(
+                (RINGS_AT + ring::STATUS) as *const u8,
+            )),
+        )
+    }
 }
 
 /// Says what was found, through the one thing this domain does not hold.
@@ -258,29 +476,33 @@ extern "C" fn blkd_main() -> ! {
 /// offset, which the kernel checks and reports.
 #[allow(clippy::too_many_arguments)]
 fn report(
-    untouched: u8,
-    acknowledged: u8,
-    queues: u16,
+    found: u8,
+    status_now: u8,
+    rings_at_device: u64,
     queue_size: u16,
-    features: u32,
     sectors: u32,
-    rings_work: bool,
+    read: Option<u64>,
+    used_index: u64,
+    request_status: u64,
 ) {
     // A word the kernel looks for, so a zeroed page is not mistaken for a
     // report nobody wrote.
     const MARKER: u64 = 0x424c_4b44_5250_5431;
 
-    // SAFETY: the second page of the rings, which this program holds and
-    // mapped writable. The kernel reads the same offsets.
+    // SAFETY: the last page of the rings, which this program holds and mapped
+    // writable, and which nothing the device was told about overlaps. The
+    // kernel reads the same offsets.
     unsafe {
-        let at = (RINGS_AT + 0x1000) as *mut u64;
-        core::ptr::write_volatile(at.add(1), u64::from(untouched));
-        core::ptr::write_volatile(at.add(2), u64::from(acknowledged));
-        core::ptr::write_volatile(at.add(3), u64::from(queues));
+        let at = (RINGS_AT + ring::REPORT) as *mut u64;
+        core::ptr::write_volatile(at.add(1), u64::from(found));
+        core::ptr::write_volatile(at.add(2), u64::from(status_now));
+        core::ptr::write_volatile(at.add(3), rings_at_device);
         core::ptr::write_volatile(at.add(4), u64::from(queue_size));
-        core::ptr::write_volatile(at.add(5), u64::from(features));
-        core::ptr::write_volatile(at.add(6), u64::from(sectors));
-        core::ptr::write_volatile(at.add(7), u64::from(rings_work));
+        core::ptr::write_volatile(at.add(5), u64::from(sectors));
+        core::ptr::write_volatile(at.add(6), read.unwrap_or(0));
+        core::ptr::write_volatile(at.add(7), u64::from(read.is_some()));
+        core::ptr::write_volatile(at.add(8), used_index);
+        core::ptr::write_volatile(at.add(9), request_status);
         // The marker last, and with a fence before it, so a kernel that sees
         // the marker sees everything under it.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);

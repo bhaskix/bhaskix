@@ -40,7 +40,33 @@ use crate::sync::{Rank, SpinLock};
 /// object's mappings and removes them; step 5 makes a device window one of the
 /// places an object can be mapped, so the revoke path needs the window without
 /// having been handed it.
-static WINDOW: SpinLock<Option<(Report, Window)>> = SpinLock::new(Rank::DmaWindow, None);
+/// How many devices can have a translation of their own at once.
+///
+/// Two: the device the kernel drives, and one delegated to a domain. It was
+/// one until the block driver moved out, and one was not a decision either --
+/// there had only ever been one device doing DMA.
+///
+/// Sharing a window between them was the tempting shortcut and would have
+/// undone the thing RFC 0012 is for: two devices translating through one page
+/// table can reach each other's buffers, so a driver in a domain would have
+/// been contained from the kernel's memory and not from the kernel's *device*.
+pub const MAX_WINDOWS: usize = 2;
+
+/// Every device with a translation of its own, found by where it is on the bus.
+///
+/// Keyed by bus/device/function packed into a word, because that is what a
+/// `DmaWindow` capability names: the authority is over one device's view of
+/// memory, and a capability that named "the window" would name whichever one
+/// happened to be first.
+static WINDOWS: SpinLock<[Option<(u64, Report, Window)>; MAX_WINDOWS]> =
+    SpinLock::new(Rank::DmaWindow, [None, None]);
+
+/// Packs a device's bus address into the word a `DmaWindow` capability names.
+#[must_use]
+pub const fn device_key(device: (u8, u8, u8)) -> u64 {
+    let (bus, slot, function) = device;
+    ((bus as u64) << 16) | ((slot as u64) << 8) | (function as u64)
+}
 
 /// The unit's register window, mapped once.
 ///
@@ -345,6 +371,13 @@ pub struct Window {
     pub page_table: u64,
     /// How many address bits it translates.
     pub width: bhaskix_arch::vtd::AddressWidth,
+    /// The domain id in this device's context entry.
+    ///
+    /// Kept because the verifier has to expect the right one, and because two
+    /// devices sharing a domain id are entitled to share IOTLB entries —
+    /// which would make two separate page tables one cache, and undo the
+    /// separation they exist for.
+    pub domain: u16,
     /// Which device it translates for.
     pub device: (u8, u8, u8),
     /// Which of that window's addresses are free.
@@ -430,8 +463,76 @@ pub fn build_window(
         context_table,
         page_table,
         width,
+        domain,
         device,
         addresses: DevAddrSpace::new(width),
+    })
+}
+
+/// Gives a second device a translation of its own, under the same unit.
+///
+/// The unit has one root table, so a second device cannot have a second
+/// `build_window`: enabling that would point the hardware at the new root and
+/// the first device would stop translating. What it gets instead is its own
+/// **page table**, reached through its own context entry in the tables that
+/// already exist.
+///
+/// That is the difference between two devices being isolated and two devices
+/// merely being translated: sharing a page table would let each reach whatever
+/// the other had mapped, which is most of what RFC 0012 is for.
+///
+/// `domain` must differ from every other device's, or the hardware is entitled
+/// to share IOTLB entries between them.
+#[must_use]
+pub fn attach_device(
+    existing: &Window,
+    device: (u8, u8, u8),
+    domain: u16,
+    hhdm: u64,
+) -> Option<Window> {
+    use bhaskix_arch::vtd;
+
+    let (page_table, _) = zeroed_frame(hhdm)?;
+    let (bus, slot, function) = device;
+
+    // The root entry for this bus may already exist -- devices on one bus
+    // share it -- and writing it again with the same context table is
+    // harmless. Writing it with a *different* one would not be, which is why
+    // the context table comes from the window that is already installed rather
+    // than from a fresh allocation.
+    let root = vtd::RootEntry {
+        context_table: existing.context_table,
+    };
+    let (root_low, root_high) = root.to_bits();
+    let context = vtd::ContextEntry {
+        page_table,
+        width: existing.width,
+        domain,
+    };
+    let (context_low, context_high) = context.to_bits();
+
+    // SAFETY: the root and context tables belong to the installed window and
+    // are never freed; the indices are bounded by construction, a root index
+    // being a byte and a context index masked to eight bits.
+    unsafe {
+        let root_entry = ((hhdm + existing.root_table) as *mut u64).add(vtd::root_index(bus) * 2);
+        core::ptr::write_volatile(root_entry, root_low);
+        core::ptr::write_volatile(root_entry.add(1), root_high);
+
+        let context_entry = ((hhdm + existing.context_table) as *mut u64)
+            .add(vtd::context_index(slot, function) * 2);
+        core::ptr::write_volatile(context_entry, context_low);
+        core::ptr::write_volatile(context_entry.add(1), context_high);
+    }
+
+    Some(Window {
+        root_table: existing.root_table,
+        context_table: existing.context_table,
+        page_table,
+        width: existing.width,
+        domain,
+        device,
+        addresses: DevAddrSpace::new(existing.width),
     })
 }
 
@@ -442,7 +543,7 @@ pub fn build_window(
 /// silently uses another device's tables, and every value in it would still be
 /// correct.
 #[must_use]
-pub fn verify_window(window: &Window, hhdm: u64) -> bool {
+pub fn verify_window(window: &Window, devices: usize, hhdm: u64) -> bool {
     use bhaskix_arch::vtd;
 
     let (bus, slot, function) = window.device;
@@ -453,7 +554,10 @@ pub fn verify_window(window: &Window, hhdm: u64) -> bool {
     let expected_context = vtd::ContextEntry {
         page_table: window.page_table,
         width: window.width,
-        domain: 0,
+        // From the window rather than a constant. It was zero here, which was
+        // true of the only window there was and became a false expectation the
+        // moment a second device was given a domain of its own.
+        domain: window.domain,
     }
     .to_bits();
 
@@ -481,10 +585,15 @@ pub fn verify_window(window: &Window, hhdm: u64) -> bool {
             return false;
         }
 
-        // And exactly one context entry is present. An entry written at the
-        // wrong offset leaves the right one absent -- caught above -- and a
-        // stray one behind, which is a second device this window would
-        // translate for without anyone asking.
+        // And exactly as many context entries are present as there are
+        // devices attached to this table. An entry written at the wrong offset
+        // leaves the right one absent -- caught above -- and a stray one
+        // behind, which is a device this table would translate for without
+        // anyone asking.
+        //
+        // The count was `== 1` while there was one device, which is the same
+        // property and a different number. It stopped being true the moment a
+        // second device was attached, and said so.
         let context = (hhdm + window.context_table) as *const u64;
         let mut present = 0;
         for index in 0..256 {
@@ -492,7 +601,7 @@ pub fn verify_window(window: &Window, hhdm: u64) -> bool {
                 present += 1;
             }
         }
-        present == 1
+        present == devices
     }
 }
 
@@ -622,14 +731,44 @@ pub fn map_reserved(
 /// Called once, at bring-up. Revocation needs the window without having been
 /// handed it — an object's owner asks for it to be revoked, and what that has
 /// to reach is whichever device was given the object.
-pub fn install(report: Report, window: Window) {
-    *WINDOW.lock() = Some((report, window));
+pub fn install(device: (u8, u8, u8), report: Report, window: Window) {
+    let key = device_key(device);
+    let mut windows = WINDOWS.lock();
+    // Replace an entry for the same device before taking a free slot: two
+    // entries for one device would make which page table answers a mapping
+    // depend on search order.
+    let slot = windows
+        .iter()
+        .position(|held| held.as_ref().is_some_and(|(held, ..)| *held == key))
+        .or_else(|| windows.iter().position(Option::is_none));
+    if let Some(slot) = slot {
+        windows[slot] = Some((key, report, window));
+    } else {
+        crate::println!("    iommu window   no free slot; this device will not translate");
+    }
 }
 
 /// Whether a window exists to map into.
 #[must_use]
 pub fn present() -> bool {
-    WINDOW.lock().is_some()
+    WINDOWS.lock().iter().flatten().count() > 0
+}
+
+/// Whether `device` has a translation of its own.
+#[must_use]
+pub fn present_for(device: (u8, u8, u8)) -> bool {
+    let key = device_key(device);
+    WINDOWS
+        .lock()
+        .iter()
+        .flatten()
+        .any(|(held, ..)| *held == key)
+}
+
+/// How many devices are translating.
+#[must_use]
+pub fn windows() -> usize {
+    WINDOWS.lock().iter().flatten().count()
 }
 
 /// Maps a `Memory` object into the device window, and records it.
@@ -643,6 +782,7 @@ pub fn present() -> bool {
 /// room — all refusals, because a device that was told an address for a
 /// mapping that did not happen reads whatever is there instead.
 pub fn map_memory(
+    device: (u8, u8, u8),
     id: crate::shared::MemoryId,
     rights: vtd::Rights,
     below_4gib: bool,
@@ -653,8 +793,9 @@ pub fn map_memory(
         return None;
     }
 
-    let mut guard = WINDOW.lock();
-    let (_, window) = guard.as_mut()?;
+    let key = device_key(device);
+    let mut guard = WINDOWS.lock();
+    let (_, _, window) = guard.iter_mut().flatten().find(|(held, ..)| *held == key)?;
 
     // The object's frames need not be contiguous in physical memory, and the
     // device needs them contiguous in *its* address space -- which is most of
@@ -684,11 +825,11 @@ pub fn map_memory(
 
     MAPPED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
 
-    if !crate::shared::record_device_mapping(id, address.as_u64(), count as u64) {
+    if !crate::shared::record_device_mapping(id, key, address.as_u64(), count as u64) {
         // Recorded or not mapped. An object whose device mapping is not
         // written down is one revocation cannot find, which is a page a device
         // keeps after the object naming it is destroyed.
-        unmap_device(address.as_u64(), count as u64);
+        unmap_device(device, address.as_u64(), count as u64);
         return None;
     }
     Some(address)
@@ -699,9 +840,10 @@ pub fn map_memory(
 /// Called by RFC 0009's `revoke`. Invalidates before returning, for the same
 /// reason `unmap` does: until the IOTLB is invalidated the device still
 /// reaches the page that has just been taken away from it.
-pub fn unmap_device(address: u64, pages: u64) -> bool {
-    let mut guard = WINDOW.lock();
-    let Some((_, window)) = guard.as_mut() else {
+pub fn unmap_device(device: (u8, u8, u8), address: u64, pages: u64) -> bool {
+    let key = device_key(device);
+    let mut guard = WINDOWS.lock();
+    let Some((_, _, window)) = guard.iter_mut().flatten().find(|(held, ..)| *held == key) else {
         return false;
     };
     let hhdm = crate::shared::hhdm();
@@ -867,17 +1009,46 @@ unsafe fn invalidate_interrupt_cache() -> bool {
 /// # Errors
 ///
 /// [`crate::cap::CapError`] if the arena is full, or there is no window.
-pub fn name() -> Result<crate::cap::SlotRef, crate::cap::CapError> {
-    if !present() {
+pub fn name(device: (u8, u8, u8)) -> Result<crate::cap::SlotRef, crate::cap::CapError> {
+    if !present_for(device) {
         return Err(crate::cap::CapError::NotFound);
     }
     crate::cap::with_arena(|arena| {
         arena.insert_root(
-            crate::cap::ObjectRef::new(crate::cap::ObjectKind::DmaWindow, 0),
+            crate::cap::ObjectRef::new(crate::cap::ObjectKind::DmaWindow, device_key(device)),
             crate::cap::Rights::ALL,
             0,
         )
     })
+}
+
+/// Unpacks the device a `DmaWindow` capability names.
+#[must_use]
+pub const fn device_of(key: u64) -> (u8, u8, u8) {
+    (
+        ((key >> 16) & 0xff) as u8,
+        ((key >> 8) & 0xff) as u8,
+        (key & 0xff) as u8,
+    )
+}
+
+/// Any fault the unit has recorded, from whichever report is installed.
+///
+/// For asking *after* something has run, rather than during bring-up. A device
+/// that reached for something nobody granted it leaves a record, and the
+/// difference between "the device was refused" and "the device never asked" is
+/// the difference between a wrong mapping and a driver that never kicked —
+/// which look identical from the outside and take a long time to tell apart by
+/// any other means.
+#[must_use]
+pub fn fault(hhdm: u64) -> Option<Fault> {
+    let report = {
+        let windows = WINDOWS.lock();
+        let (_, report, _) = windows.iter().flatten().next()?;
+        *report
+    };
+    // SAFETY: a report this module discovered and whose unit it programmed.
+    unsafe { take_fault(&report, hhdm) }
 }
 
 /// How many pages this window has mapped, for `INFO`.
@@ -896,9 +1067,10 @@ static MAPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 /// translation to an address that does not exist is dropped silently rather
 /// than refused.
 #[must_use]
-pub fn entry_at(address: u64, hhdm: u64) -> Option<u64> {
-    let guard = WINDOW.lock();
-    let (_, window) = guard.as_ref()?;
+pub fn entry_at(device: (u8, u8, u8), address: u64, hhdm: u64) -> Option<u64> {
+    let key = device_key(device);
+    let guard = WINDOWS.lock();
+    let (_, _, window) = guard.iter().flatten().find(|(held, ..)| *held == key)?;
     let mut table = window.page_table;
     for level in (2..=window.width.levels()).rev() {
         let index = vtd::level_index(address, level);
@@ -920,9 +1092,10 @@ pub fn entry_at(address: u64, hhdm: u64) -> Option<u64> {
 /// were free. The second mapping landed on top of the first -- same page
 /// tables, different idea of what was taken -- and the device read a
 /// descriptor ring that was no longer there.
-pub fn map_frame(physical: u64, hhdm: u64) -> Option<DevAddr> {
-    let mut guard = WINDOW.lock();
-    let (_, window) = guard.as_mut()?;
+pub fn map_frame(device: (u8, u8, u8), physical: u64, hhdm: u64) -> Option<DevAddr> {
+    let key = device_key(device);
+    let mut guard = WINDOWS.lock();
+    let (_, _, window) = guard.iter_mut().flatten().find(|(held, ..)| *held == key)?;
     let address = window.addresses.allocate(1, false)?;
     if !map_page(
         window,
@@ -1150,6 +1323,34 @@ fn clear_page(window: &Window, address: u64, hhdm: u64) -> bool {
         core::ptr::write_volatile(((hhdm + table) as *mut u64).add(index), 0);
     }
     true
+}
+
+/// Invalidates the unit's cached context entries.
+///
+/// A unit caches the context entry it used for a device, so a device added to
+/// a unit that is already translating is a device the hardware still believes
+/// has no context. Nothing had ever added one to a live unit before — the
+/// kernel's device was attached before translation was enabled — so nothing
+/// had ever needed this, and the entry was correct in memory while the
+/// hardware went on using what it had cached.
+///
+/// # Safety
+///
+/// The unit must be the one the windows are programmed into.
+pub unsafe fn invalidate_contexts() -> bool {
+    let base = UNIT_BASE.load(core::sync::atomic::Ordering::Acquire);
+    if base == 0 {
+        return false;
+    }
+    // SAFETY: the caller's obligation. Invalidating a cache cannot make a
+    // translation wrong; it can only make a stale one stop being used.
+    unsafe {
+        let unit = vtd::Unit::new(base as *mut u8);
+        // The IOTLB after the context cache, in that order: entries cached
+        // through the old context must go too, and invalidating them first
+        // would leave a window in which the old context could fill them again.
+        unit.invalidate_context() && unit.invalidate_iotlb()
+    }
 }
 
 /// Invalidates the unit's IOTLB.

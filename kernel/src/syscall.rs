@@ -122,6 +122,7 @@ const _: () = {
     assert!(Kind::Exit as u64 == bhaskix_abi::syscall::EXIT);
     assert!(method::FILL == bhaskix_abi::method::FILL);
     assert!(method::ATTACH == bhaskix_abi::method::ATTACH);
+    assert!(method::MAP == bhaskix_abi::method::MAP);
     assert!(method::WAIT == bhaskix_abi::method::WAIT);
     assert!(method::PEEK == bhaskix_abi::method::PEEK);
     assert!(Status::InsufficientRights as u64 == bhaskix_abi::status::INSUFFICIENT_RIGHTS);
@@ -510,6 +511,12 @@ fn invoke_capability(
 /// be an inversion on every map.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ResolvedWindow {
+    /// Which device's translation this capability is authority over.
+    ///
+    /// Carried because there is more than one window now: a capability names
+    /// a device's view of memory, and mapping into "the window" would map into
+    /// whichever one happened to be first.
+    device: (u8, u8, u8),
     /// The `Memory` object to map, for `MAP`.
     memory: Option<crate::shared::MemoryId>,
     /// What the device may do, already narrowed by both capabilities' rights.
@@ -539,6 +546,7 @@ fn resolve_window(frame: &SyscallFrame) -> Result<ResolvedWindow, Status> {
 
             if frame.method != crate::syscall::method::MAP {
                 return Ok(ResolvedWindow {
+                    device: crate::iommu::device_of(window.id),
                     memory: None,
                     rights: bhaskix_arch::vtd::Rights::READ,
                 });
@@ -563,6 +571,7 @@ fn resolve_window(frame: &SyscallFrame) -> Result<ResolvedWindow, Status> {
             }
 
             Ok(ResolvedWindow {
+                device: crate::iommu::device_of(window.id),
                 memory: Some(crate::shared::MemoryId::from_u64(memory.id)),
                 rights: bhaskix_arch::vtd::Rights { read: true, write },
             })
@@ -999,7 +1008,13 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         return match frame.method {
             method::MAP => match resolved.memory {
                 Some(memory) => {
-                    match crate::iommu::map_memory(memory, resolved.rights, false, hhdm) {
+                    match crate::iommu::map_memory(
+                        resolved.device,
+                        memory,
+                        resolved.rights,
+                        false,
+                        hhdm,
+                    ) {
                         Some(address) => Outcome::ok(address.as_u64()),
                         // No window, no room, or the object has gone. All
                         // refusals: a caller told an address for a mapping
@@ -1011,7 +1026,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 None => Outcome::err(Status::WrongObject),
             },
             method::UNMAP => {
-                if crate::iommu::unmap_device(frame.arg0, frame.arg1) {
+                if crate::iommu::unmap_device(resolved.device, frame.arg0, frame.arg1) {
                     Outcome::ok(0)
                 } else {
                     Outcome::err(Status::NoSuchCapability)

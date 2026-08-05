@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-12 (RFC 0013 steps 1–5; step 6 brings up a device from ring 3, data path next) · CI green · 393 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-13 (**RFC 0013 COMPLETE**, steps 1–6) · CI green · 393 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 276 host assertions |
 
 ### Division of responsibility between documents
 
@@ -153,6 +153,7 @@ fairness within 2% for two equal-weight workloads.
 | M7-10 | A test that had been told not to race, and did | ✅ `DONE` | `notify`'s test module said *"one test, because the slots are a global and cargo runs tests in parallel"* — and had two. The second drained the arena and asserted it came back empty, which it does not when the first is holding a slot. It failed once in a full run and passed on every re-run. A comment asking people to keep to one test was never going to hold; the tests take a mutex now. |
 | M7-11 | RFC 0013 step 6c: a domain is woken by a notification | ✅ `DONE` | `method::WAIT` and `method::PEEK` on a `Notification` capability. **The shell, in ring 3, is woken by one and reads the badge** — holding no vector, no interrupt controller and no way to reach either. Taking is once: the second look finds nothing, because a notification is a signal and not a queue. A capability with the write right and not the read right is **refused a take** — same object, weaker capability. The third and last of the things a driver in a domain needs. What the shell is woken by is a kernel signal rather than a device, deliberately: that an *interrupt* reaches a notification is gated where the interrupt is (M5, delegation self-test), and what was missing was only the last link. |
 | M7-12 | RFC 0013 step 6: a block driver in a domain, bringing up a device | ✅ `DONE` (bring-up; the data path is next) | `bin/blkd` drives the **second** virtio block device from ring 3. The kernel enumerates the bus and hands over three `Frame` capabilities and a `Memory` object; everything after that is the driver's — it maps its own windows, resets the device, and drives the handshake to acknowledge|driver. It reports **1 sector**, which is its own disk: the kernel's is 180, so a driver handed the wrong device says so in a number nothing else on this machine produces. Two devices because two drivers on one would race resets and interleave rings. **The bus stays in the kernel** and that is not a convenience: PCI configuration space is port I/O, and a domain holding it would hold every device on the machine. Watched failing by removing the handshake. |
+| M7-13 | RFC 0013 step 6 COMPLETE: a driver in a domain reads its disk by DMA | ✅ `DONE` | `bin/blkd`, in ring 3, programs a virtqueue with **device addresses it could not have invented**, kicks the device, and reads sector 0 of its own disk: `sector 0 begins "BHASKIX-"`, which is on that image and no other. The DMA goes through a **page table of its own** — RFC 0012's `DmaWindow`, granted to the domain, with its own domain id under the same unit. **The window is granted only when there is a unit to contain it**: without one the driver gets registers and no way to make the device read, because a domain that could aim a device with physical addresses could aim it at the kernel. Three bugs found, all of them things the kernel's own driver already knew — see the note. |
 
 ### Honest notes on M6 so far
 
@@ -640,6 +641,38 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (the data path — three bugs, and the kernel's driver knew all three)
+
+- **A program with no privilege read a disk by DMA.** It built a virtqueue in memory it holds,
+  aimed the device with addresses the IOMMU translates back to that memory, kicked it, and got
+  `BHASKIX-` off sector zero — bytes that are on its own image and on no other disk in the machine.
+- **DMA authority is granted only when something can contain it.** With a unit, the domain gets a
+  `DmaWindow` and reads its disk; without one it gets registers and no window, brings the device up
+  and stops. A domain that could name physical addresses could point a device at the kernel, and a
+  driver in a domain doing untranslated DMA is not a smaller trusted base — it is the same trusted
+  base further away.
+- **Two devices, two page tables, two domain ids, one unit.** Sharing the kernel's page table was
+  one line and would have meant a delegated driver could reach whatever the kernel's device had
+  mapped: contained from the kernel's *memory* and not from the kernel's *device*.
+- **Three bugs, and the kernel's driver had learned every one of them already.**
+  1. `queue_desc` written as one eight-byte store instead of two four-byte ones. The device took the
+     queue and never looked at it. `virtio.rs` has a comment saying exactly this, three lines long,
+     written when it cost somebody else the same afternoon.
+  2. **Bus mastering never enabled.** A device that is not a bus master cannot write memory at all,
+     so the rings stay empty and every request times out. `pci::enable`'s doc comment predicts the
+     symptom word for word: *"which reads as a broken device rather than as a missing bit"*.
+  3. A context entry added to a unit that was **already translating**, with no context-cache
+     invalidation. Nothing had ever added a device to a live unit before, so nothing had ever needed
+     it, and the entry sat correct in memory while the hardware used what it had cached.
+  The lesson is not that the mistakes were subtle. It is that a driver written next to a working one
+  should be read against it first, and the cost of not doing that was an afternoon of a device that
+  said nothing at all.
+- **No fault, no completion — and telling those apart is what solved it.** A device refused a page
+  and a device that never asked look identical from outside. `iommu::fault()` distinguishes them,
+  and it said "never asked", which ruled out every mapping theory at once.
+- **The wait for the driver's report is now a wait for the report.** A fixed delay was too short on
+  a loaded machine and too long on every boot, in that order.
 
 ### 2026-08-06 (RFC 0013 step 6 — a driver in ring 3, and the device it was given)
 

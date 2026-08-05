@@ -34,11 +34,15 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-# A driver is mostly `unsafe`, and that is the honest shape of one: every
-# register access is a volatile read or write of a mapping the kernel made on
-# request, and every ring entry is a store into memory a device will read.
+unsafe_budget = 200
+# 166 lines, and a driver is mostly `unsafe` because a driver is mostly
+# registers and rings: every access is a volatile read or write of a mapping
+# the kernel made on request, and every descriptor is a store into memory a
+# device will read.
 #
-# What matters is that none of it can reach anything this domain was not
-# given. A wild pointer here faults in ring 3 and takes the driver down; the
-# same code in the kernel would take the machine.
-unsafe_budget = 90
+# What matters is not the count but the reach. None of it can touch anything
+# this domain was not given: three pages of registers, four of its own memory,
+# and a device that translates through a page table of its own. A wild pointer
+# faults in ring 3 and takes the driver down; the same mistake in a kernel
+# driver takes the machine. That is the trade this placement makes, and the
+# number going up is what it looks like from here.
