@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–5 and 7, step 6 partial) · CI green · 38 boot gates, 112 checks |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-16 (RFC 0009 steps 1–5, RFC 0011 steps 1–5, RFC 0012 steps 1–5 and 7, step 6 partial) · CI green · 157 suite checks · 38 boot gates, 45 with an IOMMU · 271 host assertions |
 
 ### Division of responsibility between documents
 
@@ -157,6 +157,18 @@ fairness within 2% for two equal-weight workloads.
 - **The initrd is read-only, and so is the filesystem over it.** Nothing creates, truncates or
   appends. Every lookup is still a linear scan of the whole archive, and a listing is a scan per
   call.
+
+- **The soak harness and the suite are different machines, and neither sees both.** The IPC
+  rendezvous stall needed *real parallelism* — 14 failures in 40 on a two-socket host, never once
+  locally. The single-processor boot hang needed *one* CPU — 7 in 24 there, 0 in 100 under the
+  four-CPU soak written to catch exactly that class. Before trusting a green run, ask which machine
+  it was green on.
+
+- **Two open faults are recorded rather than closed**, both in RFC 0012: the block device's MSI is
+  not delivered under interrupt remapping, and a reused device address keeps its translation. Each
+  has what is known and what was ruled out written beside it. An "open" line in this file is an
+  instruction to go looking, so it is only worth writing when there is something to find — a lesson
+  from recording a *normal* condition as an anomaly earlier in the same session.
 
 - **Two bugs this milestone were invisible to the harness that was supposed to catch them, in
   opposite directions.** The IPC rendezvous stall needed *real parallelism* — 14 failures in 40 on a
@@ -520,6 +532,51 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (M6 status — a milestone that ended somewhere else)
+
+**Every M6 task is built. The unmet exit criterion is unchanged. What the milestone actually became
+is three RFCs of protection work that were not in its scope, and a long lesson about tests.**
+
+| Criterion | Status |
+|---|---|
+| Boot to a shell | ✅ Ring 3, holding two capabilities and nothing else |
+| `ls` a real filesystem | ✅ Through IPC, from the ramdisk or from the block device |
+| Load and run an ELF binary from disk | ✅ `root=disk` makes "from disk" literal |
+| **The ELF loader survives 24 hours of fuzzing** | ❌ **Not met**, and unchanged since it was written down |
+
+**Beyond the task list**: RFC 0009 steps 1–5, RFC 0011 steps 1–5, RFC 0012 steps 1–5 and 7. Step 6
+is built and switched off. The headline result is that a `virtio-blk` device which could read the
+kernel's memory this morning now reaches only frames it was given, enforced by hardware and
+demonstrated by taking them away and watching the disk stop.
+
+**What is genuinely open**, and neither is a mystery worth guessing about:
+
+| Open | What is known |
+|---|---|
+| The block device's MSI is not delivered under interrupt remapping | The I/O APIC's line *is*; the device never fires. Two encoding bugs found and fixed on the way |
+| A reused device address keeps its translation | Entry reads back zero, invalidation issued, device still reaches it. Reuse is disabled until this is explained |
+
+Both are worth trying on a QEMU newer than 4.2 before assuming the kernel is wrong. **The two hardest
+faults this session were only visible because the environment changed** — the IPC stall needed real
+parallelism, the boot hang needed a single CPU.
+
+**The count that matters more than the feature list: eight checks this milestone were not looking at
+the thing they claimed to check.**
+
+| Check | What it actually did |
+|---|---|
+| Frame-leak gate | Phantom ±16 frames, from reading two counters non-atomically |
+| Fault harness | Blamed the kernel for QEMU's exclusive disk lock |
+| Lock-order check | Ran before most of bring-up, so it verified the code preceding it |
+| Soak harness | Four CPUs, structurally unable to see a single-CPU hang |
+| `make test-host` | Never ran the arch crate — its fuzz harness had never executed |
+| "NO IOMMU" warning | A constant, printed on machines with three of them |
+| Window read-back | Located entries with the same function that placed them |
+| Step 5's "reachable" | "No fault" passes on a mapping that points at nothing |
+
+Three of those were mine, written and caught in the same session, and every one was caught by the
+same rule: **break the property deliberately and watch the gate.** None was caught by reading.
 
 ### 2026-08-05 (RFC 0012 step 7 — delegation, and four bugs it dragged out)
 
