@@ -99,6 +99,17 @@ pub mod method {
     /// memory.
     pub const FILL: u64 = 38;
 
+    /// Map the memory this capability names into the caller's address space.
+    ///
+    /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
+    /// non-zero asks for a writable mapping, which needs the write right.
+    /// Never executable.
+    ///
+    /// A domain maps what it *holds*, at an address of its choosing in its own
+    /// space. The frames come from the object and not from anything the caller
+    /// said, which is why naming an address here is safe.
+    pub const ATTACH: u64 = 42;
+
     /// Put one character on the console this capability names.
     ///
     /// Only on a `Console` capability. `arg0` = the character.
@@ -127,6 +138,15 @@ pub mod status {
     pub const NO_SUCH_CAPABILITY: u64 = 2;
     /// The capability was revoked, or its slot has been reused.
     pub const REVOKED: u64 = 3;
+    /// The capability does not carry the rights this operation needs.
+    ///
+    /// Distinct from [`NO_SUCH_CAPABILITY`] on purpose: "you do not hold this"
+    /// and "you hold it and may not do that with it" are different answers,
+    /// and a program that could not tell them apart would not know whether to
+    /// ask for the thing or for the right.
+    pub const INSUFFICIENT_RIGHTS: u64 = 5;
+    /// The address named is unusable: unaligned, occupied, or out of range.
+    pub const SLOT_UNAVAILABLE: u64 = 11;
     /// The object does not answer that method.
     pub const NO_SUCH_METHOD: u64 = 10;
 }

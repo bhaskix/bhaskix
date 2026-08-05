@@ -1717,6 +1717,26 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
     }
 
+    // Memory the shell holds, twice: writable at slot 3 and read-only at slot
+    // 4, naming the *same object*. Two capabilities to one thing is what makes
+    // the refusal in `map` a test of rights rather than of lookup -- a program
+    // refused because it holds nothing has learned nothing about rights.
+    //
+    // Slot 2 stays empty, because `caps` reports it as "no authority" and a
+    // program holding something in every slot could not show what not holding
+    // one looks like.
+    let memory = shared::create(realm, 4 * bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the shell's memory object would not be created")?;
+    let named = shared::name(memory).map_err(|_| "the shell's memory would not be named")?;
+    let read_only = cap::with_arena(|arena| arena.derive(named, cap::Rights::READ, 0).ok())
+        .ok_or("the read-only capability would not derive")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(3, named).is_ok() && owner.cspace.install_at(4, read_only).is_ok()
+    }) != Some(true)
+    {
+        return Err("the shell's memory capabilities would not install");
+    }
+
     // Clamped to what the machine actually has, so a single-processor machine
     // gets a shell on the only CPU there is rather than an error.
     let cpu = SHELL_CPU.min(bhaskix_arch::percpu::online_count().saturating_sub(1));

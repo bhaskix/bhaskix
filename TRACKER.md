@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-07 (RFC 0013 steps 1–5) · CI green · 372 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-08 (RFC 0013 steps 1–5, step 6 partial) · CI green · 376 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
 
 ### Division of responsibility between documents
 
@@ -148,6 +148,7 @@ fairness within 2% for two equal-weight workloads.
 | M7-05 | RFC 0013 step 4: everything in a domain, and the address space that was missing | ✅ `DONE` | Both services run in ring 3. The console holds a `Console` capability — **put a character, take a byte, nothing else** — so a console service talked into misbehaving can still only put characters and take bytes; the same service in the nucleus could do anything. The shell, the console and the filesystem are now three unprivileged programs and the nucleus runs **no service at all** in that build. **What this found:** the kernel kept *one* installed address space for the whole of M5 and M6. With a single user program that is indistinguishable from keeping the right one — two services in domains landed on the same CPU and ran in each other's page table. Threads now carry their page-table root and load it as they resume, and the fault handler asks the hardware which space it is in rather than trusting bookkeeping. All four placement combinations boot and pass, every build. |
 | M7-06 | RFC 0013 step 5: what a placement costs, measured | ✅ `DONE` | The three numbers RFC 0013 asked for, per service and per placement. **A domain costs ~5,000 cycles (~2 µs) a round trip, about +48%**, and it is the same +48% for both services — 10.0k→15.2k for the console, 11.3k→15.8k for the filesystem. **Shared memory still pays: 10.3× in the nucleus, 7.3× in a domain** (the domain's bulk path copies through its own buffer and then makes a system call, so it costs twice the nucleus's — and still beats fifteen round trips by seven times). **Boot time is unchanged**, ~7.6 s either way. Measured as the *minimum* of 200 samples, because the first version timed whole loops and produced a nucleus filesystem four times slower than a domain one. |
 | M7-07 | The unpinned service that cost 6× | ✅ `DONE` | Chasing that reversed result found a real one: the nucleus filesystem thread was **not pinned**, so every call waited for another CPU to notice it — 66k cycles against 11k for the same code pinned, at the minimum rather than in the tail. It was unpinned deliberately, with a reasonable comment: it blocks on nothing but its own endpoint, so it could run wherever there was room. That was true, and it cost six times the latency. Pinned now, with the measurement as the reason. |
+| M7-08 | RFC 0013 step 6a: a domain can map memory it holds | ✅ `DONE` | `method::ATTACH` — a domain maps a `Memory` capability into **its own** address space, at an address of its choosing, from frames the object supplies rather than any it names. Never executable, per RFC 0009. **The first thing a driver in a domain needs:** its descriptor rings are memory it holds and the device reaches by `DevAddr`, and it cannot fill them in without seeing them. Exercised from ring 3 by the shell's new `map` command, which holds **two capabilities to one object** — writable and read-only — so the refusal tests the *right* and not the lookup. Watched failing: with the rights check removed the shell gets a writable mapping of read-only memory and the gate says so. |
 
 ### Honest notes on M6 so far
 
@@ -635,6 +636,25 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 step 6a — the primitive a driver needs, before the driver)
+
+- **A domain can now map memory it holds.** `ATTACH` on a `Memory` capability, into the address
+  space that is *running* — asked of the hardware, like the fault handler, rather than of any
+  bookkeeping. The address is the caller's choice; the frames are the object's. That asymmetry is
+  the whole safety argument: naming an address is harmless because nothing about the address decides
+  what memory arrives.
+- **Two capabilities to one object is what makes the negative test mean anything.** The shell holds
+  slot 3 writable and slot 4 read-only, naming the same memory. A program refused because it holds
+  nothing has learned nothing about rights; refused because the capability it holds is weaker, it
+  has. The reading right and the writing right are checked separately, and a caller asking for a
+  writable mapping of read-only memory is refused rather than quietly handed a read-only one — it
+  would otherwise find out by faulting, later, somewhere else.
+- **Why this and not the driver.** Step 6 is the block driver in a domain, and a driver needs three
+  things it cannot have yet: its rings mapped (this), its device registers mapped, and its
+  interrupts delivered as a notification it can wait on. This is the first of the three, and it is
+  the one every other domain will want as well. The remaining two are named rather than started, so
+  the gap between "step 6" and "what is built" is a fact in this table and not an impression.
 
 ### 2026-08-05 (RFC 0013 step 5 — the numbers, and the two the first attempt got backwards)
 

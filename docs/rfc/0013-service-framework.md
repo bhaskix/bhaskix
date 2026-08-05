@@ -312,5 +312,12 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
 6. **A second service in a domain** — the block driver, which is where RFC 0011 step 6 and RFC 0012
    step 7 stop being self-tests and become a driver.
 
+   *Started, 2026-08-05.* A driver in a domain needs three things it did not have: its rings mapped
+   into its own address space, its device registers mapped, and its interrupts delivered as a
+   notification it can wait on. The first is built — `method::ATTACH` maps a `Memory` capability
+   into the caller's own space, at an address of its choosing, from frames the object supplies —
+   and is exercised from ring 3 with two capabilities to one object, so the refusal tests the right
+   rather than the lookup. The other two are not started.
+
 Steps 1–2 are the mechanism. Steps 3–5 are the proof. Step 6 is the first driver outside the
 kernel, and the reason the previous four RFCs exist.

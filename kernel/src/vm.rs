@@ -513,7 +513,11 @@ pub fn installed() -> usize {
 /// Runs `f` against the address space currently loaded in `CR3`.
 ///
 /// `None` if this CPU is not running in one the kernel installed.
-fn with_active<T>(f: impl FnOnce(&mut AddressSpace) -> T) -> Option<T> {
+///
+/// The address space of whoever is *running*, which for a system call is the
+/// caller. Asked of the hardware rather than of any bookkeeping, for the same
+/// reason the fault handler does: the bookkeeping is what may be wrong.
+pub fn with_active<T>(f: impl FnOnce(&mut AddressSpace) -> T) -> Option<T> {
     // SAFETY: reading CR3 at CPL 0 has no side effects and cannot fault.
     let root = unsafe { paging::active_page_table() };
     let mut spaces = SPACES.lock();

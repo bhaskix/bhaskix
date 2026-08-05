@@ -28,12 +28,22 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{CHUNK_BYTES, Chunk, Edit, LineEditor, console, entry_of, fs, outcome, status};
+use bhaskix_abi::{
+    CHUNK_BYTES, Chunk, Edit, LineEditor, console, entry_of, fs, method, outcome, status, syscall,
+};
 
 /// The capability slot the console endpoint was installed in.
 const CONSOLE: u64 = 0;
 /// The capability slot the filesystem endpoint was installed in.
 const FILESYSTEM: u64 = 1;
+/// Memory this program holds and may write.
+///
+/// Slot 2 is left empty deliberately: `caps` reports it as "no authority", and
+/// a program that held something in every slot could not show what not holding
+/// one looks like.
+const MEMORY_RW: u64 = 3;
+/// The same memory, read-only. Same object, weaker capability.
+const MEMORY_RO: u64 = 4;
 
 /// What a system call returned: the status, and the message's four registers.
 struct Reply {
@@ -226,6 +236,9 @@ fn help() {
     write(b"    ls [path]         list a directory\n");
     write(b"    cat <path>        print a file\n");
     write(b"    caps              what this program is allowed to do\n");
+    write(
+        b"    map               map memory this program holds, and be refused what it does not\n",
+    );
     write(b"    exit              end this shell\n");
     write(b"\n");
     write(b"  this shell runs in ring 3. it holds two capabilities -- one for\n");
@@ -263,6 +276,59 @@ fn capabilities() {
                 write_number(reply.status);
                 write(b"\n");
             }
+        }
+    }
+}
+
+/// Maps memory this program holds, and is refused memory it does not.
+///
+/// The first thing a driver in a domain needs. Its descriptor rings are memory
+/// it holds and the device reaches by device address; it cannot fill them in
+/// without being able to see them, and `ATTACH` is how it comes to see them —
+/// at an address of its own choosing, from frames the object supplies rather
+/// than any it names.
+///
+/// Both halves are here on purpose. Slot 3 may be written and slot 4 names the
+/// *same memory* read-only, so asking for a writable mapping of slot 4 tests
+/// the right and not the lookup: a refusal that came from "no such capability"
+/// would prove nothing about rights.
+fn map() {
+    const WRITABLE_AT: u64 = 0x3000_0000;
+    const READ_ONLY_AT: u64 = 0x3100_0000;
+    const PATTERN: u64 = 0x5041_5454_4552_4e21;
+
+    let attach = |slot: u64, at: u64, writable: u64| {
+        syscall(syscall::INVOKE, slot, method::ATTACH, [at, writable, 0, 0]).status
+    };
+
+    write(b"  3  memory rw  ");
+    if attach(MEMORY_RW, WRITABLE_AT, 1) == status::OK {
+        let cell = WRITABLE_AT as *mut u64;
+        // SAFETY: the kernel mapped four pages of memory this program holds,
+        // writable, at exactly this address, and nothing else in this program
+        // uses it. The mapping either happened or the status above was not
+        // `OK`, which is the branch this is inside.
+        let read_back = unsafe {
+            core::ptr::write_volatile(cell, PATTERN);
+            core::ptr::read_volatile(cell)
+        };
+        if read_back == PATTERN {
+            write(b"mapped and holds what was written\n");
+        } else {
+            write(b"mapped but did not keep the value\n");
+        }
+    } else {
+        write(b"could not be mapped\n");
+    }
+
+    write(b"  4  memory ro  ");
+    match attach(MEMORY_RO, READ_ONLY_AT, 1) {
+        status::INSUFFICIENT_RIGHTS => write(b"refused a writable mapping\n"),
+        status::OK => write(b"WRITABLE, which it should not be\n"),
+        other => {
+            write(b"status ");
+            write_number(other);
+            write(b"\n");
         }
     }
 }
@@ -393,6 +459,7 @@ fn run(line: &[u8]) {
         }
         b"ls" => list(rest),
         b"caps" => capabilities(),
+        b"map" => map(),
         b"cat" => {
             if rest.is_empty() {
                 write(b"  cat: which file?\n");

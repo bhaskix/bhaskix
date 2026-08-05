@@ -84,7 +84,7 @@ else
     # `caps` is the one that matters: it asks the kernel about a slot this
     # program was not given, and the refusal comes from the kernel rather than
     # from a service saying no.
-    commands=$'help\r'$'caps\r'$'ls /\r'$'cat etc/hostname\r'$'nosuchcommand\r'
+    commands=$'help\r'$'caps\r'$'map\r'$'ls /\r'$'cat etc/hostname\r'$'nosuchcommand\r'
 fi
 
 # A named pipe rather than a pipeline, for two reasons. QEMU does not exit
@@ -209,6 +209,15 @@ else
         "the console capability works:0  console   reachable"
         "the filesystem capability works:1  files     reachable"
         "a slot it was not given is refused:2 +[(]nothing[)] no authority"
+        # RFC 0013 step 6: a program maps memory it holds, at an address of its
+        # own choosing, and writes to it -- the first thing a driver in a
+        # domain needs, since its rings are memory it holds and cannot fill in
+        # without seeing.
+        "a program maps memory it holds:3 +memory rw +mapped and holds what was written"
+        # The same object, through a weaker capability. A refusal here is about
+        # the *right* and not about the lookup, which is why the two
+        # capabilities name one object.
+        "a writable mapping is refused where only reading was granted:4 +memory ro +refused a writable mapping"
         "ls read the filesystem through IPC:hello.txt"
         "cat read a file through IPC:^bhaskix.?$"
         "an unknown command was refused:nosuchcommand: not a command"

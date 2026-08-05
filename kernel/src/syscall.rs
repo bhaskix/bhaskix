@@ -121,6 +121,9 @@ const _: () = {
     assert!(Kind::Yield as u64 == bhaskix_abi::syscall::YIELD);
     assert!(Kind::Exit as u64 == bhaskix_abi::syscall::EXIT);
     assert!(method::FILL == bhaskix_abi::method::FILL);
+    assert!(method::ATTACH == bhaskix_abi::method::ATTACH);
+    assert!(Status::InsufficientRights as u64 == bhaskix_abi::status::INSUFFICIENT_RIGHTS);
+    assert!(Status::SlotUnavailable as u64 == bhaskix_abi::status::SLOT_UNAVAILABLE);
     assert!(method::PUT == bhaskix_abi::method::PUT);
     assert!(method::TAKE == bhaskix_abi::method::TAKE);
     assert!(method::POLL == bhaskix_abi::method::POLL);
@@ -200,6 +203,23 @@ pub mod method {
     pub const ACK: u64 = 36;
     /// Give the source up: masked permanently, vector freed, claim released.
     pub const RELEASE: u64 = 37;
+    /// Map the memory this capability names into the caller's address space.
+    ///
+    /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
+    /// non-zero asks for a writable mapping, which needs `Rights::WRITE`.
+    ///
+    /// A domain cannot allocate its own physical memory and must not be able
+    /// to name any: it maps what it *holds*, at an address of its choosing in
+    /// its own space, and the frames come from the object rather than from
+    /// anything it said. Never executable — RFC 0009 refuses that outright,
+    /// because revocation unmaps while the other side is running and a
+    /// receiver whose code vanishes faults at an instruction that no longer
+    /// exists.
+    ///
+    /// This is what a driver in a domain needs before anything else: its
+    /// descriptor rings are memory it holds and the device reaches by
+    /// `DevAddr`, and it cannot fill them in without being able to see them.
+    pub const ATTACH: u64 = 42;
     /// Put one character on the console this capability names.
     ///
     /// Only on a `Console` capability. `arg0` = the character.
@@ -602,6 +622,10 @@ fn resolve_handler(frame: &SyscallFrame) -> Result<ResolvedHandler, Status> {
 struct Resolved {
     object: crate::cap::ObjectRef,
     badge: u64,
+    /// What this capability permits. Looked up alongside the object and kept,
+    /// because `ATTACH` needs it: mapping something writable is a different
+    /// authority from being able to name it.
+    rights: crate::cap::Rights,
 }
 
 /// Resolves the capability an IPC syscall names, and its badge.
@@ -620,12 +644,16 @@ fn resolve_for_ipc(index: u64, expected: ObjectKind) -> Result<Resolved, Status>
         let result = cap::with_arena(|arena| {
             let index = usize::try_from(index).map_err(|_| Status::NoSuchCapability)?;
             let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
-            let (object, _) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            let (object, rights) = arena.lookup(slot).ok_or(Status::Revoked)?;
             if object.kind != expected {
                 return Err(Status::WrongObject);
             }
             let badge = arena.badge_of(slot).unwrap_or(0);
-            Ok(Resolved { object, badge })
+            Ok(Resolved {
+                object,
+                badge,
+                rights,
+            })
         });
         owner.cspace = cspace;
         result
@@ -731,6 +759,54 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // A `DmaWindow` method, which does not block but must not run locked: a
     // map may allocate a page-table level, and allocating takes the heap,
     // which ranks outside the capability arena the method was resolved under.
+    // Mapping memory into the caller's own address space.
+    if kind == Some(Kind::Invoke) && frame.method == method::ATTACH {
+        let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Memory) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+
+        let writable = frame.arg1 != 0;
+        // Two separate questions. Naming the memory is one authority; being
+        // allowed to write into it is another, and a caller that asked for a
+        // writable mapping of read-only memory is refused rather than quietly
+        // given a read-only one -- it would find out by faulting, later,
+        // somewhere else.
+        if !resolved.rights.contains(crate::cap::Rights::READ) {
+            return Outcome::err(Status::InsufficientRights);
+        }
+        if writable && !resolved.rights.contains(crate::cap::Rights::WRITE) {
+            return Outcome::err(Status::InsufficientRights);
+        }
+
+        let protection = if writable {
+            bhaskix_mm::Protection::ReadWrite
+        } else {
+            bhaskix_mm::Protection::ReadOnly
+        };
+        let id = crate::shared::MemoryId::from_u64(resolved.object.id);
+        let at = bhaskix_boot::VirtAddr(frame.arg0);
+
+        // Into whichever space is loaded: the caller's, because the caller is
+        // what is running. Asked of the hardware rather than of bookkeeping,
+        // for the same reason the fault handler does.
+        let mapped =
+            crate::vm::with_active(|space| crate::shared::map_into(id, space, at, protection));
+        return match mapped {
+            Some(Ok(())) => Outcome::ok(frame.arg0),
+            // The address was unusable: not page-aligned, overlapping
+            // something already mapped, or asking for more pages than the
+            // object has. All the same answer from out here on purpose -- a
+            // domain that could tell them apart could map its way around its
+            // own address space looking for what is already there.
+            Some(Err(_)) => Outcome::err(Status::SlotUnavailable),
+            // No user address space loaded. A kernel thread has no business
+            // asking for this, and saying so beats mapping into whatever
+            // happened to be in CR3.
+            None => Outcome::err(Status::WrongObject),
+        };
+    }
+
     // The console, as a capability. Three methods and no more: put a
     // character, take a byte, look for a byte. A console service in its own
     // domain holds one of these and can do exactly that; the same service in
