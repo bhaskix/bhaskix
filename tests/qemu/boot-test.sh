@@ -416,6 +416,24 @@ else
     status=1
 fi
 
+# RFC 0011 step 5: a domain's death releases the handlers it held. The
+# assertion is the *re-claim*, not the release: a release that ran and leaked
+# the vector, or left the claim standing, returns success just as loudly, and
+# the only thing a later driver needs is to be able to take the source. The
+# vector count either side is printed so a leak of one is visible rather than
+# inferred.
+#
+# "skipped" is a pass on a machine whose chip has no such input -- there was no
+# handler to release -- and says so in the log rather than counting silently.
+if grep -qE "irq teardown +a domain's handler released on its death; gsi [0-9]+ claimed again" "$LOG"; then
+    pass "a domain's death releases its interrupt handlers"
+elif grep -qE "irq teardown +skipped" "$LOG"; then
+    pass "a domain's interrupt teardown was skipped, and said so"
+else
+    fail "a domain died holding an interrupt handler and the source stayed claimed"
+    status=1
+fi
+
 # RFC 0009 step 1: memory objects. The number in parentheses is the frame count
 # before and after -- asserted as *equal* by the kernel, and printed so that a
 # regression says by how much rather than only that there was one. This is the

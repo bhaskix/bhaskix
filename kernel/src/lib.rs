@@ -409,6 +409,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if input_ready && !block_interrupt_self_test(handoff) {
         println!("    virtio-blk irq FAILED");
     }
+    if input_ready && !irq_teardown_self_test(handoff) {
+        println!("    irq teardown   FAILED");
+    }
 
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
         faultinject::trigger(fault);
@@ -1895,6 +1898,110 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
 /// counters rather than a duration: **a request on MSI-X blocks once and spins
 /// never**, and the reverse before this ran. A timing measurement could not
 /// tell those apart on an emulator.
+/// Checks that a domain's death releases the interrupt handlers it held.
+///
+/// RFC 0011 step 5. The assertion the RFC asks for is not "the release ran" —
+/// that is a call returning — but that **the source can be claimed again**,
+/// which is the only thing a later driver actually needs and the only thing
+/// that fails if the vector or the claim leaked.
+///
+/// A legacy line rather than an MSI-X entry, because MSI-X programming writes
+/// a real device's table and there is no spare device to write. `delegable`
+/// says only message-signalled sources may be *given* to a domain; that rule
+/// belongs to the syscall boundary in step 6. This records ownership inside
+/// the kernel and proves teardown honours it.
+fn irq_teardown_self_test(handoff: &Handoff) -> bool {
+    /// A line with nothing behind it on this machine. Claiming it routes a
+    /// chip input and masks it again on release, so a device that did appear
+    /// there would be left exactly as it was found.
+    const SPARE_GSI: u32 = 11;
+
+    let source = irq::Source::Line { gsi: SPARE_GSI };
+    let apic = handoff.bsp_lapic_id;
+    let rsdp = handoff.rsdp;
+    let hhdm = handoff.hhdm_base.as_u64();
+
+    let (vectors_before, _) = vectors::usage();
+
+    let Ok(owner) = domain::create("irq-teardown", domain::ResourceEnvelope::new()) else {
+        println!("    irq teardown   FAILED to create a domain");
+        return false;
+    };
+
+    // SAFETY: `trap` dispatches every unclaimed vector to `irq::on_interrupt`,
+    // which is what the claim requires of its caller.
+    let claimed = unsafe {
+        irq::claim_for(
+            source,
+            owner.as_u32(),
+            "irq teardown test",
+            apic,
+            rsdp,
+            hhdm,
+        )
+    };
+    let Ok(_handler) = claimed else {
+        // Not a failure of the property under test: a machine whose chip has
+        // no such input never had a handler to release. Say so rather than
+        // reporting a teardown bug.
+        println!("    irq teardown   skipped, gsi {SPARE_GSI} could not be claimed");
+        domain::destroy(owner);
+        return true;
+    };
+
+    // While it is alive, the source is exclusive -- otherwise "claimed again
+    // afterwards" would prove nothing, because it was never unavailable.
+    // SAFETY: as above.
+    let second = unsafe { irq::claim(source, "irq teardown test", apic, rsdp, hhdm) };
+    let exclusive = matches!(second, Err(irq::ClaimError::AlreadyClaimed));
+    if let Ok(extra) = second {
+        irq::release(extra);
+    }
+    let (vectors_held, _) = vectors::usage();
+
+    domain::destroy(owner);
+
+    let (vectors_after, _) = vectors::usage();
+
+    // SAFETY: as above.
+    let again = unsafe { irq::claim(source, "irq teardown test", apic, rsdp, hhdm) };
+    let reclaimed = again.is_ok();
+    if let Ok(id) = again {
+        irq::release(id);
+    }
+    let (vectors_end, _) = vectors::usage();
+
+    let checks = [
+        (
+            "the source was exclusive while the domain held it",
+            exclusive,
+        ),
+        ("the claim took a vector", vectors_held > vectors_before),
+        (
+            "the domain's death freed it",
+            vectors_after == vectors_before,
+        ),
+        ("and the source could be claimed again", reclaimed),
+        ("with nothing left over", vectors_end == vectors_before),
+    ];
+
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!(
+                "    irq teardown   FAILED: {name} (vectors {vectors_before} -> {vectors_held} -> {vectors_after} -> {vectors_end})"
+            );
+            ok = false;
+        }
+    }
+    if ok {
+        println!(
+            "    irq teardown   a domain's handler released on its death; gsi {SPARE_GSI} claimed again, {vectors_before} vectors either side"
+        );
+    }
+    ok
+}
+
 fn block_interrupt_self_test(handoff: &Handoff) -> bool {
     if !virtio::present() {
         return true;

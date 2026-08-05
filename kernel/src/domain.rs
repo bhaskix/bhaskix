@@ -426,6 +426,14 @@ pub fn destroy(id: DomainId) -> bool {
     let objects = crate::shared::destroy_owned_by(id);
     let _ = objects;
 
+    // Interrupt handlers next, and for the same reason: a handler outlives its
+    // owner as a masked line and a spent vector, which nothing later can claim
+    // and nobody can explain. RFC 0011 step 5 -- destroying a domain is
+    // `RELEASE` for every handler it held. Outside the table lock, because
+    // releasing reaches the chip and the vector allocator.
+    let handlers = crate::irq::release_owned_by(id.0);
+    let _ = handlers;
+
     let root = {
         let mut table = TABLE.lock();
         let Some(domain) = table.domains.get_mut(id.0 as usize) else {

@@ -504,6 +504,29 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-05 (RFC 0011 step 5 — a handler does not outlive its owner)
+
+- **Destroying a domain is `RELEASE` for every handler it held.** `irq::release_owned_by` collects
+  under the handler lock and releases outside it, like `ipc::destroy` — releasing masks a line
+  through the chip and frees a vector through the allocator, both of which rank below it.
+  `domain::destroy` calls it beside `shared::destroy_owned_by`, for the same reason: what a domain
+  holds when it dies is otherwise unreachable and unexplainable.
+- **`NO_DOMAIN` is not a spare number.** The console's and the block driver's handlers belong to the
+  nucleus, and a teardown that swept them up because a recycled domain id happened to match would
+  take the console away from a running machine.
+- **The assertion is the re-claim, not the release.** A release that ran and leaked the vector, or
+  left the claim standing, returns success exactly as loudly. So the test claims a spare line for a
+  domain, checks a *second* claim is refused while it lives — otherwise "claimed again afterwards"
+  proves nothing, because it was never unavailable — kills the domain, and claims it again. The
+  vector count is asserted equal either side and printed, so a leak of one is visible rather than
+  inferred.
+- **Negative-tested by disabling the teardown**: `7 -> 8 -> 8 -> 8`, three failed checks and the
+  gate red. A skip on a machine whose chip has no such input is a pass that says so in the log.
+- **Ownership is recorded, not yet delegated.** `Source::delegable` — only message-signalled sources
+  may be *given* to a domain — is a rule about a syscall boundary that does not exist until step 6,
+  and is deliberately not enforced in `claim_for`. This is the half that can be built and tested
+  without an IOMMU; step 6 remains blocked on RFC 0012.
+
 ### 2026-08-05 (a deadline that could never be reached)
 
 - **One boot in four, on one CPU, stopped dead.** `fault-test` is the only harness that runs

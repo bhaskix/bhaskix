@@ -327,7 +327,17 @@ struct Handler {
     vector: u8,
     generation: u32,
     live: bool,
+    /// Which domain must lose this when it dies, or [`NO_DOMAIN`].
+    domain: u32,
 }
+
+/// A handler the nucleus holds for itself, which no domain's death releases.
+///
+/// Not a domain identifier that happens to be unused — the console's and the
+/// block driver's handlers belong to the kernel, and a teardown that swept
+/// them up because it matched a stale number would take the console away from
+/// a running machine.
+pub const NO_DOMAIN: u32 = u32::MAX;
 
 /// What the interrupt path needs, per vector, without taking a lock.
 ///
@@ -395,6 +405,38 @@ pub unsafe fn claim(
     rsdp: Option<PhysAddr>,
     hhdm: u64,
 ) -> Result<HandlerId, ClaimError> {
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { claim_for(source, NO_DOMAIN, owner, apic_id, rsdp, hhdm) }
+}
+
+/// Claims `source` on behalf of `domain`, which loses it when it dies.
+///
+/// The same claim as [`claim`], recording who it is for. Step 6 will set this
+/// from the capability a domain invoked; step 5 is the half that can be built
+/// and tested without one — a handler that outlives its owner leaves a line
+/// masked and a vector spent for the life of the machine, and RFC 0011 says
+/// destroying a domain is `RELEASE` for every handler it held.
+///
+/// `Source::delegable` — only message-signalled sources may be *given* to a
+/// domain — is a rule about the syscall boundary that does not exist yet, and
+/// is deliberately not enforced here. This records ownership; it does not hand
+/// anything out.
+///
+/// # Errors
+///
+/// [`ClaimError`] naming what was refused.
+///
+/// # Safety
+///
+/// As [`claim`].
+pub unsafe fn claim_for(
+    source: Source,
+    domain: u32,
+    owner: &'static str,
+    apic_id: u32,
+    rsdp: Option<PhysAddr>,
+    hhdm: u64,
+) -> Result<HandlerId, ClaimError> {
     use core::sync::atomic::Ordering;
 
     if source.reserved() {
@@ -431,6 +473,7 @@ pub unsafe fn claim(
             vector: 0,
             generation,
             live: true,
+            domain,
         });
         (index, generation)
     };
@@ -554,6 +597,54 @@ pub fn acknowledge(id: HandlerId) -> Result<(), ClaimError> {
         unsafe { bhaskix_arch::cpu::enable_interrupts() };
     }
     outcome.map_err(|_| ClaimError::NotRouted)
+}
+
+/// Releases every handler `domain` held, returning how many there were.
+///
+/// RFC 0011: destroying a domain is `RELEASE` for every handler it held. A
+/// domain that dies mid-request must not leave a line masked and a vector
+/// spent for the life of the machine — the source would be unclaimable, and
+/// the device behind it silently dead, with nothing to point at.
+///
+/// Collected under the lock and released outside it, like `ipc::destroy`:
+/// [`release`] takes the same lock, and masking a line reaches the chip while
+/// freeing a vector reaches the allocator, both of which rank below it.
+///
+/// [`NO_DOMAIN`] matches nothing, so the kernel's own handlers are never swept
+/// up by a domain's death.
+pub fn release_owned_by(domain: u32) -> u32 {
+    if domain == NO_DOMAIN {
+        return 0;
+    }
+
+    let mut held = [HandlerId {
+        index: 0,
+        generation: 0,
+    }; MAX_HANDLERS];
+    let mut count = 0;
+    {
+        let handlers = HANDLERS.lock();
+        for (index, handler) in handlers.iter().enumerate() {
+            if let Some(handler) = handler
+                && handler.live
+                && handler.domain == domain
+            {
+                held[count] = HandlerId {
+                    index: index as u32,
+                    generation: handler.generation,
+                };
+                count += 1;
+            }
+        }
+    }
+
+    let mut released = 0;
+    for id in held.iter().take(count) {
+        if release(*id) {
+            released += 1;
+        }
+    }
+    released
 }
 
 /// Releases a claim: masks the source permanently and frees the vector.
