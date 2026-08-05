@@ -179,13 +179,20 @@ pub unsafe fn route_isa(
     // SAFETY: the caller guarantees a handler for `vector`; the chip is the
     // one `init` mapped, and this runs on the bootstrap CPU only.
     unsafe {
-        chip.route(
-            routing.gsi,
-            vector,
-            destination,
-            routing.active_low,
-            routing.level,
-        )
+        if let Some(handle) = crate::iommu::remap_interrupt(None, vector, destination) {
+            chip.route_remapped(routing.gsi, handle, vector, routing.level)
+        } else if crate::iommu::remapping() {
+            // See `route_gsi`: no fallback once the old format is blocked.
+            Err(bhaskix_arch::ioapic::IoApicError::NoSuchInput)
+        } else {
+            chip.route(
+                routing.gsi,
+                vector,
+                destination,
+                routing.active_low,
+                routing.level,
+            )
+        }
     }
     .map_err(|_| IrqError::NotRouted)?;
 
@@ -215,6 +222,23 @@ pub unsafe fn route_gsi(
 ) -> Result<(), IrqError> {
     let mut chip = chip().ok_or(IrqError::NotPresent)?;
     let destination = u8::try_from(apic_id).map_err(|_| IrqError::UnreachableCpu)?;
+    // Remappable if the unit is remapping, and there is no choice about it:
+    // with compatibility format blocked, an entry in the old format is a line
+    // that stops being delivered. A line carries `None` for its source --
+    // it is raised by a chip this kernel programs, not by a device choosing a
+    // message, so there is no forgery to validate against.
+    if let Some(handle) = crate::iommu::remap_interrupt(None, vector, destination) {
+        // SAFETY: as below, and the handle names an entry just programmed.
+        return unsafe { chip.route_remapped(gsi, handle, vector, false) }
+            .map_err(|_| IrqError::NotRouted);
+    }
+    if crate::iommu::remapping() {
+        // Remapping is on and no handle was issued. Falling back to the old
+        // format would program a source that is never delivered, which looks
+        // like a broken device rather than a full table.
+        return Err(IrqError::NotRouted);
+    }
+
     // SAFETY: the caller guarantees a handler for `vector`; the chip is the
     // one `init` mapped, and this runs on the bootstrap CPU only.
     unsafe { chip.route(gsi, vector, destination, false, false) }.map_err(|_| IrqError::NotRouted)
@@ -868,9 +892,33 @@ unsafe fn program_msix(
         // Masked while it is programmed, so a device that fires mid-write does
         // not deliver a half-written vector.
         core::ptr::write_volatile((slot + 12) as *mut u32, 1);
-        core::ptr::write_volatile(slot as *mut u32, 0xfee0_0000 | (apic_id << 12));
-        core::ptr::write_volatile((slot + 4) as *mut u32, 0);
-        core::ptr::write_volatile((slot + 8) as *mut u32, u32::from(vector));
+        // A remapped message names a *handle*, not a CPU and not a vector --
+        // which is the whole mechanism. The handle is issued against this
+        // device's requester id, so presenting it from anywhere else is
+        // refused by the unit: RFC 0011's residual risk, retired.
+        let remapped = crate::iommu::remap_interrupt(
+            Some((device.bus, device.device, device.function)),
+            vector,
+            u8::try_from(apic_id).unwrap_or(0),
+        );
+        match remapped {
+            Some(handle) => {
+                core::ptr::write_volatile(
+                    slot as *mut u32,
+                    bhaskix_arch::vtd::remappable_message_address(handle),
+                );
+                core::ptr::write_volatile((slot + 4) as *mut u32, 0);
+                core::ptr::write_volatile(
+                    (slot + 8) as *mut u32,
+                    bhaskix_arch::vtd::remappable_message_data(),
+                );
+            }
+            None => {
+                core::ptr::write_volatile(slot as *mut u32, 0xfee0_0000 | (apic_id << 12));
+                core::ptr::write_volatile((slot + 4) as *mut u32, 0);
+                core::ptr::write_volatile((slot + 8) as *mut u32, u32::from(vector));
+            }
+        }
         // Unmasked last.
         core::ptr::write_volatile((slot + 12) as *mut u32, 0);
     }

@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–5) · CI green · 38 boot gates, 112 checks |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–5, step 6 partial) · CI green · 38 boot gates, 112 checks |
 
 ### Division of responsibility between documents
 
@@ -136,6 +136,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-12 | RFC 0012 step 3: translation enabled, and a device that can no longer reach the kernel | ✅ `DONE` | Identity-map what must keep working, map the firmware-reserved regions after checking each against the kernel's own image, then enable — the order is the RFC's and is not a preference, because translation has no partial state. `virtio-blk` keeps working with **zero faults**, and the boot line says whether the device is *subject to* translation as well as whether translation is on. **Negative-tested**: unmap the driver's five frames and the disk disappears, failing four gates. The `RMRR`-overlaps-the-kernel refusal has four host tests, because QEMU declares no reserved regions and the path is otherwise unreachable. |
 | M6-13 | RFC 0012 step 4: `MAP`/`UNMAP`, `DevAddr`, and a refusal that names the device | ✅ `DONE` | The unit comes up **before** the device: a window names the device it translates for, and translation must be on before `DRIVER_OK` lets a device read a ring. The driver's frames are mapped as they are allocated and it is handed `DevAddr`s — its memory sits at `0xf8aa000+` and the device is told `0x100000000+`. `UNMAP` invalidates before returning, because until it does the hardware still reaches a page the caller has been told is gone. Fault records are read, so a refusal names the device, the address and the direction. **Negative test**: hand the device an address nobody mapped — `00:03.0 was refused 0x7ffffff000 (write), reason 0x05`. |
 | M6-14 | RFC 0012 step 5: a `Memory` object a device can reach, and a revoke that reaches the device | ✅ `DONE` | RFC 0009's object mapped into the device window — the same frames a domain shares with another domain are what a device is given, through the same object and the same revocation. `revoke` now walks the device mapping too, invalidating the IOTLB per entry. **The assertion is asked of the device**: it reads into the object successfully, the object is revoked, and the same device at the same address is refused. A new `DmaWindow` lock rank sits inside `shared::ARENA`, and the unit's registers are cached at bring-up because mapping MMIO reaches the heap — the outermost lock — while invalidation happens under the innermost. |
+| M6-15 | RFC 0012 step 6: interrupt remapping, built and **off** | ⚠️ `PARTIAL` | The table, entries that validate **which device** may present a handle — the only thing that answers "who sent this", which is why RFC 0011 left the risk open — remappable I/O APIC lines and MSI messages, and compatibility format blocked. The I/O APIC path works under it, confirmed by QEMU's own trace. **The block device's MSI is never sent once remapping is on, and that is unresolved.** Two real encoding bugs were found and fixed chasing it; a third cause is unidentified. Off by default because enabling it costs that driver its interrupt and leaves it polling behind the timer — a machine that works while quietly degraded. `iommu=remap-irq` turns it on; the boot line says which world the machine is in, and a gate asserts it says something either way. |
 
 ### Honest notes on M6 so far
 
@@ -518,6 +519,31 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0012 step 6 — built, and switched off on purpose)
+
+- **RFC 0011's residual risk is not retired, and the code that would retire it is written.** A
+  device raising an MSI it was never programmed to raise is answered by one field: the remapping
+  entry's **source validation**, which checks that the device presenting a handle is the device the
+  handle was issued to. Everything around it is built — the table, remappable lines and messages,
+  and compatibility format blocked, because remapping alone routes what a device sends and blocking
+  the old format is what stops it sending something else instead.
+- **The I/O APIC works under it; the block device's message does not.** QEMU's trace shows the
+  console's line remapped and delivered, and `msix_write_config enabled 1 masked 0` for the device
+  followed by **no** `msix_notify` at all — it is not being rejected, it is not being sent.
+- **Two real encoding bugs found on the way, both silent by construction.** The IRTE's destination
+  sits at **bit 40**, not 32 — an xAPIC id is shifted within the destination field, exactly as the
+  legacy message address does it. And the remappable message's **format bit is bit 4 with SHV at
+  3**, which I had transposed. Either one produces an entry the unit accepts and never delivers: no
+  fault, no message, and a driver that looks broken. Both are now host tests.
+- **It ships off, and that is the point.** Enabling it costs the block driver its interrupt and
+  leaves it running on the timer deadline — a machine that still works while quietly polling. That
+  is the exact shape of degradation this milestone has caught five times in other people's checks,
+  and introducing one deliberately to claim a step complete would be worse than the missing feature.
+  `iommu=remap-irq` turns it on for whoever finishes it.
+- **What is left**: find why the device does not fire. Ruled out so far — `eim` on and off, SHV on
+  and off, the destination and format bugs above. Worth trying on a newer QEMU than 4.2 before
+  assuming the kernel is at fault; the IPC stall this session was found the same way.
 
 ### 2026-08-05 (RFC 0012 step 5 — where the two RFCs meet, and a test that had to be deleted)
 

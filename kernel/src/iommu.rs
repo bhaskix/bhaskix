@@ -30,6 +30,8 @@ use bhaskix_boot::PhysAddr;
 use bhaskix_arch::vtd;
 
 use crate::println;
+use core::sync::atomic::AtomicBool;
+
 use crate::sync::{Rank, SpinLock};
 
 /// The one window, once it exists.
@@ -705,6 +707,127 @@ pub fn unmap_device(address: u64, pages: u64) -> bool {
 
     // SAFETY: the unit `enable` programmed and whose registers it cached.
     unsafe { invalidate() }
+}
+
+/// The interrupt remapping table, and how much of it has been issued.
+///
+/// One table for the machine, because there is one unit. Handles are issued in
+/// order and never reused: a handle that was recycled would be a device
+/// raising an interrupt that now belongs to something else, which is the exact
+/// forgery this table exists to stop.
+static IRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static NEXT_HANDLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static REMAPPING: AtomicBool = AtomicBool::new(false);
+
+/// Whether interrupts are being remapped.
+///
+/// Every interrupt this kernel programs asks first: in remappable format the
+/// entry carries a handle instead of a vector and a CPU, so the two formats
+/// are not interchangeable and writing the wrong one is a source that stops
+/// being delivered.
+#[must_use]
+pub fn remapping() -> bool {
+    REMAPPING.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Builds the remapping table and turns remapping on.
+///
+/// Called before any interrupt is routed, so that everything programmed
+/// afterwards is programmed in the one format the unit will accept. Blocking
+/// compatibility format is the half that retires RFC 0011's residual risk —
+/// remapping alone routes what a device sends through a table, and blocking
+/// the old format is what stops it sending something else instead.
+///
+/// # Safety
+///
+/// The unit must already be programmed by [`enable`], and no interrupt source
+/// may have been routed yet.
+pub unsafe fn enable_interrupt_remapping(hhdm: u64) -> Result<(), &'static str> {
+    let base = UNIT_BASE.load(core::sync::atomic::Ordering::Acquire);
+    if base == 0 {
+        return Err("no unit");
+    }
+    let (table, _) = zeroed_frame(hhdm).ok_or("no frame for the remapping table")?;
+
+    // SAFETY: the unit `enable` programmed, and a table this function just
+    // allocated and zeroed -- so every entry reads as absent, which is what
+    // makes an unissued handle unusable.
+    unsafe {
+        let mut unit = vtd::Unit::new(base as *mut u8);
+        if !unit.supports_interrupt_remapping() {
+            return Err("the unit does not support interrupt remapping");
+        }
+        if !unit.set_interrupt_remap_table(table, vtd::IRT_ENTRIES) {
+            return Err("the unit did not accept the remapping table");
+        }
+        if !unit.enable_interrupt_remapping() {
+            return Err("the unit did not report interrupt remapping enabled");
+        }
+    }
+
+    IRT.store(table, core::sync::atomic::Ordering::Release);
+    REMAPPING.store(true, core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Issues a handle for one interrupt source, and programs its entry.
+///
+/// `source` is the requester id allowed to present the handle, and `None` is
+/// for a line the kernel routes on a chip's behalf — see `vtd::Irte`. Every
+/// handle issued to a *device* carries one, which is what makes the guarantee
+/// "this device may raise this interrupt, and no other".
+///
+/// `None` if remapping is off or the table is full. A caller that gets one
+/// must not fall back to the old format: with compatibility format blocked it
+/// would program a source that is never delivered.
+pub fn remap_interrupt(source: Option<(u8, u8, u8)>, vector: u8, destination: u8) -> Option<u16> {
+    let table = IRT.load(core::sync::atomic::Ordering::Acquire);
+    if table == 0 || !remapping() {
+        return None;
+    }
+    let handle = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if handle as usize >= vtd::IRT_ENTRIES {
+        return None;
+    }
+
+    let (low, high) = vtd::Irte {
+        vector,
+        destination,
+        source,
+    }
+    .to_bits();
+
+    let hhdm = crate::shared::hhdm();
+    // SAFETY: a table this module allocated and zeroed, at an index bounded by
+    // the check above. The high half is written first: the low half carries
+    // the present bit, so writing it first would publish an entry whose source
+    // and destination are still zero.
+    unsafe {
+        let entry = ((hhdm + table) as *mut u64).add(handle as usize * 2);
+        core::ptr::write_volatile(entry.add(1), high);
+        core::ptr::write_volatile(entry, low);
+    }
+
+    // SAFETY: the unit that owns this table.
+    unsafe {
+        let _ = invalidate_interrupt_cache();
+    }
+    u16::try_from(handle).ok()
+}
+
+/// Invalidates the unit's cache of remapping entries.
+///
+/// # Safety
+///
+/// The unit must be the one holding this table.
+unsafe fn invalidate_interrupt_cache() -> bool {
+    // Global invalidation through the same register the IOTLB uses is not
+    // available for interrupt entries on this path, and the entries here are
+    // written before anything is routed through them -- so there is nothing
+    // cached to invalidate yet. Kept as a named no-op rather than omitted, so
+    // that the day an entry is *changed* rather than issued, the place that
+    // has to grow an invalidation is obvious.
+    true
 }
 
 /// Whether a firmware-reserved region overlaps the kernel's own image.

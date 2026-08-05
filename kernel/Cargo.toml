@@ -118,4 +118,9 @@ workspace = true
 # device reaches only what it was given. Demonstrated, not asserted -- the
 # machine hands the device an address nobody mapped and reports the hardware
 # refusing it by name.
-unsafe_budget = 1000
+# 1040 at M6-15, RFC 0012 step 6. Writing interrupt remapping entries: the
+# high half first, because the low half carries the present bit and publishing
+# an entry whose source and destination are still zero is a handle anything may
+# use. The table is a frame this module allocated and zeroed, at an index
+# bounded before the write.
+unsafe_budget = 1040

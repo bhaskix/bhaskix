@@ -283,6 +283,146 @@ pub const fn table_entry(next_table: u64) -> PageEntry {
     }
 }
 
+/// Entries in the interrupt remapping table this kernel builds.
+///
+/// One page holds 256 sixteen-byte entries, which is far more interrupt
+/// sources than this kernel claims. The table size is encoded as a power of
+/// two, so this is the smallest size that is not absurd.
+pub const IRT_ENTRIES: usize = 256;
+
+/// How a device may deliver a remapped interrupt.
+///
+/// Fixed delivery to one CPU, which is the only mode this kernel programs.
+/// Lowest-priority delivery lets the hardware choose a CPU, and a kernel that
+/// cannot say which CPU will take an interrupt cannot reason about what that
+/// handler may touch.
+const DELIVERY_FIXED: u64 = 0;
+
+/// One interrupt remapping table entry.
+///
+/// The security property is `source`, and it is the whole point of the step.
+/// Without it a remapping table turns a vector into another vector; with it
+/// the unit checks that the device *presenting* the handle is the device the
+/// handle was issued to. RFC 0011 left "a device raises an MSI it was not
+/// programmed to raise" as a residual risk precisely because nothing in the
+/// MSI path could answer "who sent this".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Irte {
+    /// The vector the CPU will see.
+    pub vector: u8,
+    /// Which CPU, as an xAPIC id.
+    pub destination: u8,
+    /// The requester id permitted to use this handle, as `(bus, device,
+    /// function)`, or `None` for an entry the kernel programs on hardware's
+    /// behalf.
+    ///
+    /// `None` is for the I/O APIC's own lines. A line is raised by a chip this
+    /// kernel programs, not by a device choosing a message, so there is no
+    /// forgery to validate against — and guessing the chip's requester id
+    /// wrong would block the console rather than protect it. Every entry
+    /// issued to a *device* carries `Some`, which is where the risk is.
+    pub source: Option<(u8, u8, u8)>,
+}
+
+impl Irte {
+    /// The two 64-bit words the hardware reads, low first.
+    #[must_use]
+    pub const fn to_bits(self) -> (u64, u64) {
+        // Present, fixed delivery, physical destination, edge triggered.
+        let low = 1
+            | (DELIVERY_FIXED << 5)
+            | ((self.vector as u64) << 16)
+            // The destination *field* is bits 32-63, but an xAPIC id does not
+            // sit at the bottom of it: it goes at bit 40, the same place the
+            // legacy message address puts it. Writing it at 32 costs nothing
+            // visible -- the entry is well formed, the unit accepts it, and
+            // the interrupt is simply never delivered.
+            | ((self.destination as u64) << 40);
+
+        // Source validation: SVT = 1 checks the full requester id against SID,
+        // with SQ = 0 meaning "all sixteen bits must match". Anything less
+        // would let one function of a device use another's handle.
+        let high = match self.source {
+            Some((bus, device, function)) => {
+                let sid = ((bus as u64) << 8)
+                    | (((device & 0x1f) as u64) << 3)
+                    | ((function & 0x07) as u64);
+                sid | (1 << 18)
+            }
+            None => 0,
+        };
+
+        (low, high)
+    }
+
+    /// An absent entry: present bit clear, everything else zero.
+    ///
+    /// Not "an entry with no rights" — the hardware has no such thing for
+    /// interrupts. An absent entry is what makes a handle unusable, and it is
+    /// what every entry this kernel has not issued must be.
+    #[must_use]
+    pub const fn absent() -> (u64, u64) {
+        (0, 0)
+    }
+}
+
+/// The address a device writes to raise a remapped interrupt.
+///
+/// Not the same shape as a compatibility-format MSI at all: the destination
+/// APIC id is *gone*, replaced by a handle into the remapping table. That is
+/// the mechanism — a device can no longer name a CPU or a vector, only a
+/// handle, and the handle only works for the device it was issued to.
+#[must_use]
+pub const fn remappable_message_address(handle: u16) -> u32 {
+    // 0xFEE in the high bits as always. Then, and the order of these two is
+    // the whole difference between a delivered interrupt and a silent one:
+    // **bit 4 is the format bit** that says "remappable", and bit 3 is SHV.
+    // Transposing them produces an address the unit accepts and never
+    // delivers -- no fault, no message, and a driver that looks broken.
+    //
+    // `handle[14:0]` at bit 5, and `handle[15]` alone at bit 2 because the
+    // field is split around the two flag bits.
+    0xfee0_0000
+        | (((handle & 0x7fff) as u32) << 5)
+        | (1 << 4)
+        | (1 << 3)
+        | ((((handle >> 15) & 1) as u32) << 2)
+}
+
+/// The data a device writes with it.
+///
+/// Zero. In remappable format the vector lives in the table entry, not in the
+/// message — which is exactly why a device can no longer choose one.
+#[must_use]
+pub const fn remappable_message_data() -> u32 {
+    0
+}
+
+/// An I/O APIC redirection entry in remappable format.
+///
+/// A line is remapped like a message is, and it has to be: with compatibility
+/// format blocked, an entry left in the old format stops delivering, and the
+/// console is the first thing to go quiet.
+#[must_use]
+pub const fn remappable_redirection(handle: u16, vector: u8, masked: bool, level: bool) -> u64 {
+    // The low byte is still the vector -- the hardware uses it only to keep
+    // the entry well formed; what is delivered comes from the table.
+    let mut entry = vector as u64;
+    if level {
+        entry |= 1 << 15;
+    }
+    if masked {
+        entry |= 1 << 16;
+    }
+    // Handle bit 15 sits on its own at bit 11, the format bit at 48, and the
+    // low fifteen handle bits at 49. The split is the specification's, not a
+    // convenience: bit 48 had to stay where the old format's reserved bit was.
+    entry |= (((handle >> 15) & 1) as u64) << 11;
+    entry |= 1 << 48;
+    entry |= ((handle & 0x7fff) as u64) << 49;
+    entry
+}
+
 /// A remapping unit's register window.
 ///
 /// Thin on purpose: every method is one register access and a bounded wait,
@@ -322,6 +462,8 @@ mod reg {
     pub const CCMD: usize = 0x28;
     /// Fault status.
     pub const FSTS: usize = 0x34;
+    /// Interrupt remapping table address.
+    pub const IRTA: usize = 0xb8;
 }
 
 /// `GCMD`/`GSTS` bits. The command and status bits sit at the same positions,
@@ -332,6 +474,17 @@ mod command {
     pub const TE: u32 = 1 << 31;
     /// Set root table pointer, and root-table-pointer-set.
     pub const SRTP: u32 = 1 << 30;
+    /// Interrupt remapping enable, and interrupt-remapping-enabled.
+    pub const IRE: u32 = 1 << 25;
+    /// Set interrupt remap table pointer, and the status that it took.
+    pub const SIRTP: u32 = 1 << 24;
+    /// Compatibility format interrupts *permitted*.
+    ///
+    /// Left clear, deliberately. Setting it would keep old-format interrupts
+    /// working — including any a device chose to send — which is the thing
+    /// remapping exists to stop. Clearing it is what makes the guarantee
+    /// "every interrupt came from a table this kernel wrote".
+    pub const CFI: u32 = 1 << 23;
 }
 
 /// How long to wait for a register to report a change, in polls.
@@ -602,6 +755,75 @@ impl Unit {
         }
     }
 
+    /// Points the unit at an interrupt remapping table.
+    ///
+    /// `entries` must be a power of two; the register takes its log minus one.
+    ///
+    /// # Safety
+    ///
+    /// `physical` must be a table this kernel built and will not free, with at
+    /// least `entries` entries. The hardware walks it by physical address.
+    pub unsafe fn set_interrupt_remap_table(&mut self, physical: u64, entries: usize) -> bool {
+        if !entries.is_power_of_two() || entries < 2 {
+            return false;
+        }
+        let size = (entries.trailing_zeros() - 1) as u64;
+        // SAFETY: the caller's obligation.
+        unsafe {
+            self.write64(reg::IRTA, (physical & !(PAGE_SIZE - 1)) | size);
+            // One-shot, like `SRTP`, and kept out of the shadow for the same
+            // reason: a later command carrying it would re-latch a table
+            // pointer nobody asked to change.
+            self.write32(reg::GCMD, self.command | command::SIRTP);
+            self.await_status(command::SIRTP, true)
+        }
+    }
+
+    /// Turns interrupt remapping on, and blocks compatibility format.
+    ///
+    /// Both halves matter. Remapping alone routes what devices send through a
+    /// table; blocking compatibility format is what stops a device sending
+    /// something else instead. RFC 0011's residual risk is only retired by the
+    /// pair.
+    ///
+    /// # Safety
+    ///
+    /// Every interrupt source the machine needs must already be remapped —
+    /// including the I/O APIC's lines. From here, anything in the old format
+    /// is refused, and a console whose line was left alone goes quiet.
+    pub unsafe fn enable_interrupt_remapping(&mut self) -> bool {
+        self.command |= command::IRE;
+        self.command &= !command::CFI;
+        // SAFETY: the caller's obligation.
+        unsafe {
+            self.write32(reg::GCMD, self.command);
+            self.await_status(command::IRE, true)
+        }
+    }
+
+    /// Whether interrupt remapping is on.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`].
+    #[must_use]
+    pub unsafe fn remapping_interrupts(&self) -> bool {
+        // SAFETY: the caller's obligation.
+        unsafe { self.read32(reg::GSTS) & command::IRE != 0 }
+    }
+
+    /// Whether the unit supports interrupt remapping at all.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`].
+    #[must_use]
+    pub unsafe fn supports_interrupt_remapping(&self) -> bool {
+        // `IR`, bit 3 of the extended capability register.
+        // SAFETY: the caller's obligation.
+        unsafe { self.extended_capabilities() & (1 << 3) != 0 }
+    }
+
     /// The fault status register.
     ///
     /// Bit 1 is "a fault is recorded". RFC 0012's position is that a fault is
@@ -638,6 +860,91 @@ impl Unit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remapping_entry_validates_the_source_that_may_use_it() {
+        // The security property. Without the source check a remapping table
+        // turns one vector into another; with it, the unit refuses a handle
+        // presented by a device it was not issued to -- which is the whole of
+        // RFC 0011's residual risk.
+        let entry = Irte {
+            vector: 0xfc,
+            destination: 3,
+            source: Some((0, 3, 0)),
+        };
+        let (low, high) = entry.to_bits();
+
+        assert_eq!(low & 1, 1, "present");
+        assert_eq!((low >> 16) & 0xff, 0xfc, "vector");
+        assert_eq!((low >> 40) & 0xff, 3, "destination, at bit 40 and not 32");
+        assert_eq!((low >> 32) & 0xff, 0, "nothing at the bottom of the field");
+        // SVT = 1 in bits 18-19, and the requester id of 00:03.0 is 0x18.
+        assert_eq!((high >> 18) & 0b11, 1, "source validation on");
+        assert_eq!(high & 0xffff, 0x18, "the requester id");
+
+        // And an entry the kernel programs for a chip validates nothing,
+        // because there is no requester to validate: guessing the I/O APIC's
+        // id wrong blocks the console instead of protecting it.
+        let line = Irte {
+            vector: 0x21,
+            destination: 0,
+            source: None,
+        };
+        assert_eq!(line.to_bits().1, 0, "no source validation for a line");
+        assert_eq!(line.to_bits().0 & 1, 1, "still present");
+    }
+
+    #[test]
+    fn an_absent_entry_is_all_zeroes() {
+        // The hardware has no "present but grants nothing" for interrupts, so
+        // absent is the only way a handle is unusable -- and every handle this
+        // kernel has not issued must be exactly this.
+        assert_eq!(Irte::absent(), (0, 0));
+    }
+
+    #[test]
+    fn a_remappable_message_names_a_handle_and_not_a_cpu() {
+        // A compatibility MSI carries the destination APIC id and the vector,
+        // which is why a device could raise anything it liked. A remappable
+        // one carries neither.
+        let address = remappable_message_address(7);
+        assert_eq!(address >> 20, 0xfee);
+        assert_eq!((address >> 5) & 0x7fff, 7, "handle");
+        assert_eq!((address >> 4) & 1, 1, "remappable format is bit 4");
+        assert_eq!((address >> 3) & 1, 1, "sub-handle valid is bit 3");
+        assert_eq!(
+            remappable_message_data(),
+            0,
+            "the vector is not in the message"
+        );
+
+        // Handle 15 and above splits: the top bit sits at bit 2 on its own.
+        let high = remappable_message_address(0x8001);
+        assert_eq!((high >> 5) & 0x7fff, 1);
+        assert_eq!((high >> 2) & 1, 1);
+    }
+
+    #[test]
+    fn a_remappable_redirection_puts_the_handle_where_the_format_bit_says() {
+        // The I/O APIC's entry has to be remapped too, or a console whose line
+        // was left in the old format goes quiet the moment compatibility
+        // format is blocked.
+        let entry = remappable_redirection(4, 0x21, false, true);
+        assert_eq!(entry & 0xff, 0x21, "vector still in the low byte");
+        assert_eq!((entry >> 15) & 1, 1, "level triggered");
+        assert_eq!((entry >> 16) & 1, 0, "not masked");
+        assert_eq!((entry >> 48) & 1, 1, "remappable format");
+        assert_eq!((entry >> 49) & 0x7fff, 4, "handle");
+
+        let masked = remappable_redirection(4, 0x21, true, false);
+        assert_eq!((masked >> 16) & 1, 1);
+        assert_eq!((masked >> 15) & 1, 0);
+
+        // The sixteenth handle bit is split out to bit 11, not adjacent.
+        let split = remappable_redirection(0x8000, 0x21, false, false);
+        assert_eq!((split >> 11) & 1, 1);
+        assert_eq!((split >> 49) & 0x7fff, 0);
+    }
 
     #[test]
     fn a_root_entry_is_a_present_bit_and_a_page_address() {

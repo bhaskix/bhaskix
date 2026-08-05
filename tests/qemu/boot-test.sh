@@ -491,6 +491,19 @@ if [[ "$MODE" == "iommu" ]]; then
         status=1
     fi
 
+    # RFC 0012 step 6 is built and **off**, and the machine says so. The
+    # assertion is that it states which world it is in, not that remapping is
+    # on: under remapping the I/O APIC's line is delivered and the block
+    # device's message is not, so enabling it by default would cost that driver
+    # its interrupt and leave it polling behind a timer. A machine that quietly
+    # degraded would pass every other gate here.
+    if grep -qE "iommu irq +(interrupts NOT remapped|remapping interrupts;)" "$LOG"; then
+        pass "the machine says whether a device can still forge an interrupt"
+    else
+        fail "nothing was said about interrupt remapping either way"
+        status=1
+    fi
+
     # And the machine says the *true* thing about what a device can reach --
     # after enabling, not before.
     if grep -qF "translating: this device reaches only what it was given" "$LOG"; then

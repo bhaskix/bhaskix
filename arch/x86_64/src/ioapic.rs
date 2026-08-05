@@ -198,6 +198,51 @@ impl IoApic {
         Ok(())
     }
 
+    /// Routes `gsi` through an interrupt remapping handle.
+    ///
+    /// The remappable form of [`IoApic::route`]. The entry no longer names a
+    /// CPU: what it carries is a handle into the unit's table, and the vector
+    /// and destination come from there. A line left in the old format stops
+    /// being delivered the moment compatibility format is blocked, so this is
+    /// not an optimisation — it is what keeps the console alive.
+    ///
+    /// # Errors
+    ///
+    /// As [`IoApic::route`].
+    ///
+    /// # Safety
+    ///
+    /// As [`IoApic::route`], and the handle must name an entry the unit has
+    /// already been given.
+    pub unsafe fn route_remapped(
+        &mut self,
+        gsi: u32,
+        handle: u16,
+        vector: u8,
+        level: bool,
+    ) -> Result<(), IoApicError> {
+        if !self.owns(gsi) {
+            return Err(IoApicError::NoSuchInput);
+        }
+        if vector < FIRST_LEGAL_VECTOR {
+            return Err(IoApicError::ReservedVector);
+        }
+
+        let index = REDIRECTION + 2 * (gsi - self.gsi_base);
+        let entry = crate::vtd::remappable_redirection(handle, vector, false, level);
+
+        // High half first, as in `route`, and for the same reason: the low
+        // half carries the mask bit, so writing it first would unmask an entry
+        // whose upper half still describes the previous routing.
+        // SAFETY: the caller's obligations; `index` is within this chip's
+        // entries because `owns` was checked above.
+        unsafe {
+            self.write(index + 1, (entry >> 32) as u32);
+            self.write(index, entry as u32);
+        }
+        Ok(())
+    }
+
     /// Masks `gsi`, so nothing is delivered from it.
     ///
     /// # Errors

@@ -2288,6 +2288,36 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // SAFETY: the unit just programmed above.
     let transition = unsafe { iommu::take_fault(&found, hhdm) };
 
+    // Interrupt remapping, and **off unless asked for**. RFC 0012 step 6 is
+    // built -- the table, entries that validate which device may present a
+    // handle, remappable lines and messages, and compatibility format blocked
+    // -- and it is not yet correct end to end.
+    //
+    // Under it the I/O APIC's line is remapped and delivered; the block
+    // device's message is not. Two real encoding bugs were found and fixed
+    // chasing that (the destination field sits at bit 40, not 32; the format
+    // bit is bit 4 and SHV bit 3, not the reverse) and a third cause is
+    // unidentified. Enabling it by default would cost the block driver its
+    // interrupt and leave it on the timer -- a working machine that quietly
+    // polls, which is exactly the kind of degradation this project refuses to
+    // ship silently.
+    //
+    // So: `iommu=remap-irq` turns it on for whoever is finishing it, and the
+    // boot line says which world the machine is in either way.
+    //
+    // SAFETY: the unit is programmed, and nothing has been routed yet --
+    // `console_input` and the block driver's MSI-X both come later.
+    let asked = handoff
+        .cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == "iommu=remap-irq");
+    let remapped = if asked {
+        // SAFETY: as above -- the unit is programmed and nothing is routed yet.
+        Some(unsafe { iommu::enable_interrupt_remapping(hhdm) })
+    } else {
+        None
+    };
+
     iommu::install(found, window);
     println!(
         "    iommu window   {bus:02x}:{slot:02x}.{function} {}-bit, {} levels, \
@@ -2295,6 +2325,19 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         window.width.bits(),
         window.width.levels()
     );
+    match &remapped {
+        Some(Ok(())) => println!(
+            "    iommu irq      remapping interrupts; compatibility format blocked, \
+             every message is a handle this kernel issued"
+        ),
+        Some(Err(reason)) => println!("    iommu irq      asked to remap interrupts: {reason}"),
+        // The default, and it says what is still true rather than what is
+        // built: a device may raise an MSI it was never programmed to raise.
+        None => println!(
+            "    iommu irq      interrupts NOT remapped (RFC 0011's residual risk stands); \
+             built but off by default, pass iommu=remap-irq"
+        ),
+    }
     if let Some(fault) = transition {
         println!(
             "    iommu          a device was mid-DMA when translation came on: {} {:#x} \
