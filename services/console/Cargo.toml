@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhaskix-service-console"
+description = "The console service: bytes out, bytes in."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_service_console"
+path = "src/lib.rs"
+
+# These two, and there will never be a third. A service crate that needs
+# something else needs it through its context, and `tools/check-placements.sh`
+# is what says so out loud.
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-service = { path = "../../service" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero. A service reaches hardware through its context or not at all, and in a
+# domain placement there is no mapping for it to be unsafe about.
+unsafe_budget = 0

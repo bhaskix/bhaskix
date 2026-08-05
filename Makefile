@@ -195,7 +195,8 @@ test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-s
 # Host unit tests. The overridden --target is what takes these off the
 # freestanding target and onto something that can run a test harness.
 test-host:
-	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm
+	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm \
+	    -p bhaskix-service -p bhaskix-service-console
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios
@@ -238,7 +239,8 @@ fmt:
 clippy:
 	$(CARGO) clippy --profile $(PROFILE) --target $(TARGET) --lib --bins -- -D warnings
 	$(CARGO) clippy --target $(HOST_TARGET) --all-targets \
-	    -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm -- -D warnings
+	    -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm \
+	    -p bhaskix-service -p bhaskix-service-console -- -D warnings
 	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
@@ -250,6 +252,38 @@ gates:
 	tools/check-containment.sh
 	tools/check-unsafe-budget.py
 	tools/check-deps.py
+	tools/check-placements.sh
+# The placement check has to be watched failing or it is worth nothing, so the
+# negative fixture runs immediately after it: a service that reaches into the
+# kernel, which must be rejected, and rejected for *that* reason rather than
+# for any of the ordinary reasons a build does not work.
+	@if tools/check-placements.sh tests/fixtures/placement/services.toml \
+	        >build/placement-fixture.log 2>&1; then \
+	    echo "  FAIL  the placement check accepted a service that calls into the kernel"; \
+	    exit 1; \
+	elif ! grep -q "reaches bhaskix-kernel" build/placement-fixture.log; then \
+	    echo "  FAIL  the placement check rejected the fixture for the wrong reason:"; \
+	    cat build/placement-fixture.log; \
+	    exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the placement check rejects a service that calls into the kernel\n'; \
+	fi
+# And a table that is wrong about itself rather than about a dependency: a
+# service listed twice and a placement that is not a placement. Both must be
+# reported, not just the first -- a check that stops at the first thing it
+# finds reports the shape of its own control flow rather than of the mistakes.
+	@if tools/check-placements.sh tests/fixtures/placement/malformed.toml \
+	        >build/placement-malformed.log 2>&1; then \
+	    echo "  FAIL  the placement check accepted a malformed table"; \
+	    exit 1; \
+	elif ! grep -q "is neither nucleus nor domain" build/placement-malformed.log \
+	        || ! grep -q "listed twice" build/placement-malformed.log; then \
+	    echo "  FAIL  the placement check missed one of the two faults in the malformed table:"; \
+	    cat build/placement-malformed.log; \
+	    exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the placement check reports both faults in a malformed table\n'; \
+	fi
 
 # --- housekeeping --------------------------------------------------------
 

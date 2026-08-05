@@ -560,16 +560,29 @@ else
     status=1
 fi
 
-# RFC 0013 step 1: the services run behind a trait, and the machine names them
-# with their placement. The placement is the claim `architecture.md` §2 makes,
-# so it is printed rather than assumed -- and this line is expected to change
-# at step 3, when one of these stops saying `nucleus`. A line that can never
-# change is a line worth distrusting, which this milestone has now learned
-# nine times.
-if grep -qE "placement +console=[a-z]+ vfs=[a-z]+, dispatched by message" "$LOG"; then
-    pass "the services name themselves and where they run"
+# RFC 0013: the services run behind a trait, and the machine names them with
+# their placement. The placement is the claim `architecture.md` §2 makes, so it
+# is printed rather than assumed -- and this line is expected to change at step
+# 3, when one of these stops saying `nucleus`. A line that can never change is
+# a line worth distrusting, which this milestone has now learned nine times.
+#
+# Step 2 makes it say something harder: the line must agree with
+# `services.toml`, which is the file that is supposed to decide placement.
+# Built from the table rather than written out here, so that a table nobody
+# reads and a machine nobody checked cannot drift apart while both look right.
+expected=$(awk '
+    /^name *=/     { gsub(/[" ]/, ""); sub(/^name=/, ""); name = $0 }
+    /^placement *=/ { gsub(/[" ]/, ""); sub(/^placement=/, ""); printf "%s%s=%s", sep, name, $0; sep = " " }
+' "$(dirname "$0")/../../services.toml")
+
+if [[ -z $expected ]]; then
+    fail "services.toml lists no services, so the placement gate would check nothing"
+    status=1
+elif grep -qF "placement      $expected, dispatched by message" "$LOG"; then
+    pass "the machine's placement matches services.toml ($expected)"
 else
-    fail "no service placement was reported"
+    fail "placement disagrees with services.toml (expected: $expected)"
+    grep -E "placement" "$LOG" || true
     status=1
 fi
 

@@ -31,9 +31,21 @@ members = [
     # "fs",
     # "drivers",
 
-    # Phase 2
+    # Phase 2 — M7, RFC 0013. The framework, then one crate per service.
+    # A service crate depends on the two above it and on nothing else, which
+    # `tools/check-placements.sh` checks against `services.toml`.
+    "service",
+    "services/console",
+
     # "net",
 ]
+
+# The negative fixture for `tools/check-placements.sh`: a service that reaches
+# into the kernel and is *expected* to be rejected. Excluded because it must
+# never be built by anything else, and because the check reads it exactly the
+# way it reads a real service — through `--manifest-path`, one code path, so
+# what the fixture proves is what the check does.
+exclude = ["tests/fixtures/placement/direct-call"]
 
 [workspace.package]
 version = "0.0.0"

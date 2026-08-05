@@ -26,12 +26,28 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SKIP = {"target", "build", "limine"}
 
+# The negative fixtures. They violate on purpose -- a service that depends on
+# the kernel, which tools/check-placements.sh has to be seen rejecting -- so a
+# gate that also rejected them would make `make gates` unrunnable and the
+# fixture would have to be deleted, which is exactly how a gate loses the one
+# test that proves it works.
+SKIP_PATHS = ("tests/fixtures/",)
+
 # Layer index: a crate may depend only on strictly lower layers.
 LAYERS = {
     # The interface between the kernel and the programs it runs. Below
     # everything, because it is compiled into both sides: anything it depended
     # on would become part of the interface too.
     "bhaskix-abi": -2,
+
+    # The service framework, and the services compiled against it. Between the
+    # ABI and everything else: a service crate may reach these two and nothing
+    # more, which is the property RFC 0013 rests on and which
+    # tools/check-placements.sh checks against services.toml. The layering
+    # here is the same rule stated once more, in the place that would catch a
+    # dependency added to a service crate by hand.
+    "bhaskix-service": -1,
+    "bhaskix-service-console": 0,
 
     "bhaskix-boot": 0,        # pure types, depends on nothing
     "bhaskix-arch-x86-64": 0,  # arch -> nothing
@@ -66,6 +82,7 @@ def manifests() -> list[pathlib.Path]:
         # Dot-directories are skipped by prefix rather than by name, so this
         # script contains no string the vendor check would reject.
         if not any(part in SKIP or part.startswith(".") for part in m.parts)
+        and not str(m.relative_to(REPO)).startswith(SKIP_PATHS)
     ]
 
 

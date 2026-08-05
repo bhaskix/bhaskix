@@ -35,7 +35,9 @@
 //! bounded at [`MAX_SESSIONS`], so a second caller is refused rather than
 //! quietly given the first one's open file.
 
-use bhaskix_abi::{Chunk, console, fs, outcome, with_outcome};
+use bhaskix_abi::{Chunk, fs, outcome, with_outcome};
+pub use bhaskix_service::{Reply, Request, Service, StartError};
+use bhaskix_service_console::{Console, Ports};
 
 use crate::{ipc, sched, ustar, vfs};
 
@@ -115,11 +117,9 @@ pub fn start(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     sched::spawn("fs", filesystem_service, 0, hhdm_base)
         .map_err(|_| "the filesystem service would not spawn")?;
 
-    // Named with their placement, because the placement is the claim. RFC
-    // 0013 step 2 replaces this constant with a table the build supplies, and
-    // step 3 is the first time one of these says something other than
-    // `nucleus` -- so a line that never changes would be a line worth
-    // distrusting.
+    // Named with their placement, because the placement is the claim. Step 3
+    // is the first time one of these says something other than `nucleus` --
+    // so a line that never changes would be a line worth distrusting.
     crate::println!(
         "    placement      {}={PLACEMENT} {}={PLACEMENT}, dispatched by message",
         Console::NAME,
@@ -130,106 +130,25 @@ pub fn start(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
 
 /// Where the services in this build run.
 ///
-/// A constant until RFC 0013 step 2 makes it a table the build supplies. It is
-/// printed at boot rather than assumed, because "both placements work" is a
-/// claim that has to be visible somewhere before it can be checked.
+/// Both are in the nucleus, which is what `services.toml` says. It stays a
+/// constant here and not a generated one: a build script that read the table
+/// and produced this string would make the boot line agree with the table by
+/// construction, and a line that cannot disagree cannot report anything. The
+/// table is checked against the crates by `tools/check-placements.sh`; this
+/// line is checked against reality by being printed.
 pub const PLACEMENT: &str = "nucleus";
 
-/// Everything a service may reach.
+/// What the filesystem may reach.
 ///
-/// A value, deliberately, rather than an ambient: whatever is not in here, the
-/// service does not have. In the nucleus placement the kernel builds it; in a
-/// domain placement it is built from the domain's CSpace, and the two must
-/// carry the same names for the same things or the code above them cannot be
-/// the same code.
-///
-/// [RFC 0013](../../../docs/rfc/0013-service-framework.md).
+/// The direct map base, for the bulk path, and nothing else. This is the one
+/// field a domain placement will not have, which makes it the field to watch:
+/// a service that reaches for it outside a bulk path has stopped being
+/// relocatable, and `services.toml` records — in the file, not in a comment —
+/// that this service has not been moved out of the kernel yet because of it.
 #[derive(Clone, Copy)]
-pub struct Context {
-    /// The endpoint this service answers on.
-    pub endpoint: ipc::EndpointId,
-    /// The direct map base, for a nucleus placement's bulk paths.
-    ///
-    /// The one field a domain placement will not have, and therefore the one
-    /// to watch: a service that reaches for it outside a bulk path is a
-    /// service that has stopped being relocatable.
+pub struct Direct {
+    /// Where physical memory is mapped.
     pub hhdm: u64,
-}
-
-/// One request, as it arrived.
-pub struct Request<'a> {
-    /// Which operation.
-    pub method: u64,
-    /// Four registers. Anything larger travels as a `Memory` capability.
-    pub args: &'a [u64; 4],
-    /// Who is calling, from the capability they used — never from anything
-    /// they said.
-    pub badge: u64,
-    /// The calling thread, for resolving a capability the caller names in its
-    /// own CSpace.
-    pub caller: u32,
-}
-
-/// One reply.
-///
-/// A value rather than a message: the method and the badge belong to the
-/// placement, not to the service, and a service that could set them could
-/// claim to be answering a different question.
-pub struct Reply {
-    /// Four registers back.
-    pub args: [u64; 4],
-}
-
-impl Reply {
-    /// The ordinary case.
-    #[must_use]
-    pub const fn new(args: [u64; 4]) -> Self {
-        Self { args }
-    }
-}
-
-/// Why a service would not start.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StartError {
-    /// The context did not carry something the service needs.
-    MissingCapability,
-}
-
-/// A service: state, a message handler, and nothing else.
-///
-/// The four rules `architecture.md` §2 states are shaped into this trait
-/// rather than asked for in prose:
-///
-/// - **No global mutable state**, because the state is [`Service::State`] and
-///   arrives by reference.
-/// - **No direct hardware access**, because a domain placement has no mapping
-///   for it and faults; the nucleus placement is where that rots, and the lint
-///   RFC 0013 step 2 adds is what will catch it there.
-/// - **No blocking**, because [`Service::handle`] returns a [`Reply`] and
-///   there is nowhere to wait. A service that must wait answers, and is
-///   re-entered when the thing it waited for happens.
-/// - **No panics on input**, because a malformed request is a `Reply` and not
-///   an unwind.
-///
-/// A service is constrained by the **intersection** of both placements, not
-/// the union, and the constraint that binds is nearly always the nucleus one:
-/// it is the placement with the fewest walls.
-pub trait Service {
-    /// Everything the service knows.
-    type State;
-
-    /// What it is called, in the placement table and in the boot log.
-    const NAME: &'static str;
-
-    /// Built once, from what the placement handed over.
-    ///
-    /// # Errors
-    ///
-    /// [`StartError`] if the context is missing something required.
-    fn start(context: Context) -> Result<Self::State, StartError>;
-
-    /// One request in, one reply out.
-    fn handle(state: &mut Self::State, request: Request<'_>) -> Reply;
 }
 
 /// Runs a service in the nucleus placement, for ever.
@@ -239,19 +158,20 @@ pub trait Service {
 /// direct calls" erodes, and a design that starts with the fast path never
 /// gets the slow one back. So the two placements differ in *placement* and not
 /// in *shape*, which is the whole claim being made.
-fn run<S: Service>(context: Context) -> ! {
+fn run<S: Service>(endpoint: ipc::EndpointId, context: S::Context) -> ! {
     let Ok(mut state) = S::start(context) else {
         sched::exit()
     };
 
     loop {
-        let Ok((message, caller)) = ipc::recv(context.endpoint) else {
+        let Ok((message, caller)) = ipc::recv(endpoint) else {
             sched::exit()
         };
         REQUESTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         let reply = S::handle(
             &mut state,
+            &context,
             Request {
                 method: message.method,
                 args: &message.args,
@@ -274,84 +194,31 @@ fn run<S: Service>(context: Context) -> ! {
     }
 }
 
-/// The console: bytes out, bytes in, and no state of its own.
-pub struct Console;
-
-impl Service for Console {
-    /// Nothing. The console's state is the hardware's, and the hardware is
-    /// reached through `print!` and `input`, which every placement has to
-    /// provide for itself.
-    type State = ();
-    const NAME: &'static str = "console";
-
-    fn start(_context: Context) -> Result<Self::State, StartError> {
-        Ok(())
-    }
-
-    fn handle((): &mut Self::State, request: Request<'_>) -> Reply {
-        match request.method {
-            console::WRITE => Reply::new(write(request.args)),
-            console::READ => Reply::new(read()),
-            _ => Reply::new([with_outcome(0, outcome::WRONG_KIND), 0, 0, 0]),
-        }
-    }
-}
-
 /// Answers the console endpoint, for ever.
 extern "C" fn console_service(_argument: u64) -> ! {
     let Some(endpoint) = console_endpoint() else {
         sched::exit()
     };
-    run::<Console>(Context {
-        endpoint,
-        hhdm: crate::shared::hhdm(),
-    })
+    run::<Console>(endpoint, console_ports())
 }
 
-/// Prints a caller's bytes, and says how many were accepted.
-fn write(args: &[u64; 4]) -> [u64; 4] {
-    let chunk = Chunk::unpack(args);
-
-    // Filtered, exactly as the kernel shell filters what it prints. This is
-    // the *kernel's* console: a program that could emit an escape sequence
-    // here could clear the screen, move the cursor, or print a line that looks
-    // like it came from the kernel. Newline and tab pass through, because
-    // without them nothing can be laid out.
-    for byte in chunk.bytes() {
-        let character = match byte {
-            b if b.is_ascii_graphic() || *b == b' ' => *byte as char,
-            b'\n' | b'\t' => *byte as char,
-            _ => '?',
-        };
-        crate::print!("{character}");
+/// What the console gets to reach, built out of the kernel's own routines.
+///
+/// The whole of the nucleus placement for this service: four functions. In a
+/// domain these become calls out to a driver, and the console itself does not
+/// change — which is the claim RFC 0013 makes, and the reason the console is
+/// the first service to be compiled apart from the kernel.
+fn console_ports() -> Ports {
+    use core::sync::atomic::Ordering::Relaxed;
+    Ports {
+        put: |character| crate::print!("{character}"),
+        read: crate::input::read,
+        try_read: crate::input::try_read,
+        counted: |written, read| {
+            WRITTEN.fetch_add(written, Relaxed);
+            READ.fetch_add(read, Relaxed);
+        },
     }
-
-    WRITTEN.fetch_add(chunk.len() as u64, core::sync::atomic::Ordering::Relaxed);
-    [chunk.len() as u64, 0, 0, 0]
-}
-
-/// Waits for something to be typed and hands it back.
-fn read() -> [u64; 4] {
-    // Block for the first byte, then take whatever else is already waiting.
-    // Returning one byte per message would be correct and would cost a round
-    // trip per keystroke; taking the rest costs nothing and matters when a
-    // terminal pastes a line.
-    let mut bytes = [0u8; bhaskix_abi::CHUNK_BYTES];
-    bytes[0] = crate::input::read();
-    let mut length = 1;
-    while length < bytes.len() {
-        match crate::input::try_read() {
-            Some(byte) => {
-                bytes[length] = byte;
-                length += 1;
-            }
-            None => break,
-        }
-    }
-
-    READ.fetch_add(length as u64, core::sync::atomic::Ordering::Relaxed);
-    let (chunk, _) = Chunk::take(&bytes[..length]);
-    chunk.pack(0)
 }
 
 /// What one caller of the filesystem service is in the middle of.
@@ -420,11 +287,13 @@ impl Service for Filesystem {
     type State = [Session; MAX_SESSIONS];
     const NAME: &'static str = "vfs";
 
-    fn start(_context: Context) -> Result<Self::State, StartError> {
+    type Context = Direct;
+
+    fn start(_direct: Self::Context) -> Result<Self::State, StartError> {
         Ok([Session::empty(); MAX_SESSIONS])
     }
 
-    fn handle(sessions: &mut Self::State, request: Request<'_>) -> Reply {
+    fn handle(sessions: &mut Self::State, _direct: &Self::Context, request: Request<'_>) -> Reply {
         // A caller with no badge cannot be told apart from any other, and a
         // service that gave them all one session would let a second program
         // read the first one's open file. Zero is also the free-slot sentinel
@@ -451,10 +320,12 @@ extern "C" fn filesystem_service(_argument: u64) -> ! {
     let Some(endpoint) = filesystem_endpoint() else {
         sched::exit()
     };
-    run::<Filesystem>(Context {
+    run::<Filesystem>(
         endpoint,
-        hhdm: crate::shared::hhdm(),
-    })
+        Direct {
+            hhdm: crate::shared::hhdm(),
+        },
+    )
 }
 
 /// Finds this caller's session, or claims a free one.
@@ -646,6 +517,7 @@ mod tests {
         let args = [0u64; 4];
         let reply = Console::handle(
             &mut (),
+            &console_ports(),
             Request {
                 method: 0xdead_beef,
                 args: &args,
@@ -665,6 +537,7 @@ mod tests {
         let args = [0u64; 4];
         let reply = Filesystem::handle(
             &mut sessions,
+            &Direct { hhdm: 0 },
             Request {
                 method: fs::PATH,
                 args: &args,

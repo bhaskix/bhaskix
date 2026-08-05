@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhaskix-service"
+description = "The shape a Bhaskix service has, in either placement."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_service"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../abi" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, and for the same reason as the ABI crate's zero: this is the crate
+# every service is compiled against, in both placements. An `unsafe` here
+# would be an obligation owed by a service that has no way to discharge it,
+# because it does not know which placement it is in.
+unsafe_budget = 0

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The placement table (RFC 0013).
+#
+# Where each service runs. Changing a `placement` here is meant to be the
+# whole of moving a service between the nucleus and its own domain — that is
+# the claim RFC 0013 makes, and steps 3 to 5 are what will test it. Until then
+# this table records the truth rather than the intention, which is what
+# `relocatable` is for: a service that is not yet compiled apart from the
+# kernel says so here, in the file, instead of being quietly assumed ready.
+#
+# `tools/check-placements.sh` enforces:
+#
+#   - every relocatable service builds with no kernel in the build at all,
+#     which is the domain placement's compile and cannot be faked;
+#   - every relocatable service's crate depends on nothing but the ABI and the
+#     service framework;
+#   - the name here is the name the crate declares and the name the machine
+#     prints at boot.
+
+[[service]]
+name = "console"
+placement = "nucleus"
+crate = "services/console"
+package = "bhaskix-service-console"
+relocatable = true
+
+[[service]]
+name = "vfs"
+placement = "nucleus"
+crate = "kernel"
+package = "bhaskix-kernel"
+# Not yet. The filesystem's bulk path reads a caller's pages through the
+# direct map by calling into `shared` directly, so it cannot compile without
+# the kernel and there is no honest way to mark it otherwise. Extracting it
+# means deciding what a context hands over for bulk transfer, which is RFC
+# 0013 step 3's actual work — the step is "the filesystem in a domain", and
+# this line is the reason that step is not free.
+relocatable = false

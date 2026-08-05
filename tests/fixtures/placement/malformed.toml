@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The second negative fixture: a table that is wrong about itself rather than
+# about a dependency. `tools/check-placements.sh` run against this must FAIL
+# twice — a service listed twice, and a placement that is not a placement.
+#
+# RFC 0013's testing plan asks for exactly these two, which is why they are
+# here rather than assumed to be covered by the reading of the parser.
+
+[[service]]
+name = "console"
+placement = "nucleus"
+crate = "services/console"
+package = "bhaskix-service-console"
+relocatable = false
+
+[[service]]
+name = "console"
+placement = "orbit"
+crate = "services/console"
+package = "bhaskix-service-console"
+relocatable = false

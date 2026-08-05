@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A service that reaches into the kernel. This is the negative fixture for
+# `tools/check-placements.sh` and it is SUPPOSED to be rejected: the check
+# runs against it and fails, and the suite asserts that it failed and that it
+# failed *for this reason* rather than for any of the ordinary reasons a build
+# does not work.
+#
+# A build gate nobody has watched fail is a build gate nobody should trust.
+# This milestone has now found nine checks that were not looking at the thing
+# they claimed to check, so the gate and the proof that it bites landed in the
+# same commit.
+[package]
+name = "bhaskix-service-direct-call"
+description = "Negative fixture: a service that depends on the kernel."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "bhaskix_service_direct_call"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../../../abi" }
+bhaskix-service = { path = "../../../../service" }
+# The offence, and the only line of this crate that matters.
+bhaskix-kernel = { path = "../../../../kernel" }
+
+[package.metadata.bhaskix]
+# Zero, and declared even though this crate is never built: the budget check
+# walks every manifest in the tree, and a fixture that made it complain would
+# be a fixture that trains people to ignore it.
+unsafe_budget = 0

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The negative fixture's table. `tools/check-placements.sh` run against this
+# must FAIL, naming bhaskix-kernel — see the comment in
+# `direct-call/Cargo.toml`.
+
+[[service]]
+name = "direct-call"
+placement = "nucleus"
+crate = "tests/fixtures/placement/direct-call"
+package = "bhaskix-service-direct-call"
+relocatable = true

@@ -206,7 +206,9 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
 - The trait's contract: a service that returns an error for malformed input, and a test that feeds
   it every shape of malformed request the message layer can produce.
 - The placement table parser, including a service named twice and a placement that is not a
-  placement.
+  placement. *Both are fixtures under `tests/fixtures/placement/`, run by `make gates`, and the
+  gate asserts that **both** faults in the malformed table are reported: the first version stopped
+  at the first one it found and hid the other.*
 
 **In QEMU — and this is the part that makes the design true rather than aspirational:**
 
@@ -254,6 +256,14 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
    existing gate still passes — that is the success criterion.
 2. **The placement table and the build.** Parsed at build time, one crate per service, and the CI
    job that builds both placements for each. The negative fixture lands here.
+
+   *Done, 2026-08-05, with one deviation recorded here rather than quietly.* "One crate per
+   service" is one crate per *relocatable* service: the console moved out, the filesystem did not,
+   and `services.toml` carries `relocatable = false` for it. The filesystem's bulk path reads a
+   caller's pages through the direct map, so deciding what a context hands over for bulk transfer
+   is a design question — and it is step 3's question, not something to answer in passing here.
+   The check enforces the rule against the resolved dependency graph and by building each
+   relocatable service with no kernel in the build at all, which is the domain placement's compile.
 3. **The domain placement for one service.** The filesystem, because its bulk path is the one that
    differs and M6-18 gives it a measurement to beat.
 4. **The boot with everything in a domain**, and the shell tests running against it.
