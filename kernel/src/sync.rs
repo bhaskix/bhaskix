@@ -72,55 +72,67 @@ pub enum Rank {
     AddressSpace = 0,
     /// `vm::PREVIOUS_ROOT` — the page-table root to restore on deactivate.
     AddressSpacePrevious = 1,
+    /// `iommu::WINDOW` — the device windows a unit translates through.
+    ///
+    /// **Outside the heap**, because mapping a page into a device's window may
+    /// have to allocate a level of its page tables, and allocating takes the
+    /// heap while this is held. It was ranked innermost at first, on the
+    /// reasoning that revocation reaches it last — and the detector reported
+    /// the inversion on the first boot that mapped anything.
+    ///
+    /// Nothing is held when this is taken: `shared::revoke` releases the arena
+    /// before unmapping from a device, and the syscall path resolves its
+    /// capabilities and lets go before it maps.
+    DmaWindow = 2,
     /// `heap::HEAP` — the kernel allocator, and the physical allocator inside it.
-    Heap = 2,
+    Heap = 3,
     /// `tlb::SENDER` — serialises shootdowns over the one shared address slot.
-    TlbSender = 3,
+    TlbSender = 4,
     /// `time::TIMERS` — one CPU's pending timer deadlines.
     ///
     /// Outside the runqueues for the same reason the wait queues are: expiring
     /// a timer wakes a thread, which takes a runqueue lock while this is held.
-    Timers = 4,
+    Timers = 5,
     /// `domain::TABLE` — the domain table.
     ///
     /// Outside the capability arena: destroying a domain revokes its root
     /// capability, so the table lock is taken first and the arena second.
     /// Nothing goes the other way.
-    Domains = 5,
+    Domains = 6,
     /// `cap::ARENA` — the global capability derivation tree.
     ///
     /// Outside the wait queues: revoking a capability to an endpoint will need
     /// to wake whoever is blocked on it, and that takes a wait queue and then a
     /// runqueue. Nothing goes the other way — the IPC paths resolve
     /// capabilities before they block, never after.
-    Capabilities = 6,
+    Capabilities = 7,
     /// `ipc::TABLE` — the endpoint table.
     ///
     /// Inside the capability arena, because a syscall resolves the endpoint
     /// capability before it touches the endpoint; outside the runqueues,
     /// because completing a rendezvous wakes the thread on the other side.
-    Endpoints = 7,
+    Endpoints = 8,
     /// `wait::WaitQueue` — the waiter list of a blocking primitive.
     ///
     /// Outside the runqueues, because both halves of a sleep take them in that
     /// order: a sleeper holds this while marking itself blocked, and a waker
     /// holds it while marking a sleeper ready. Either one taking them the
     /// other way round is the deadlock this ordering exists to make visible.
-    WaitQueue = 8,
+    WaitQueue = 9,
     /// `sched::QUEUES` — one runqueue per CPU.
-    SchedRunqueue = 9,
+    SchedRunqueue = 10,
     /// `notify::ALLOCATION` — creation and destruction of notifications.
     ///
     /// Outside the runqueues, because destroying one wakes whoever was
     /// waiting. The *signal* path takes no lock at all, which is what lets an
     /// interrupt handler call it.
-    Notifications = 10,
+    Notifications = 11,
     /// `shared::ARENA` — memory objects (RFC 0009).
     ///
     /// Outside the heap, because creating one allocates frames while it is
     /// held; inside the domain table, because charging an envelope happens
     /// before the arena is taken. Nothing goes the other way.
-    SharedMemory = 11,
+    SharedMemory = 12,
     /// `irq::HANDLERS` — claimed interrupt sources.
     ///
     /// Outside `vectors::TABLE`, because claiming a source takes this and then
@@ -128,29 +140,20 @@ pub enum Rank {
     /// same rank, which the checker reported on the first boot: two locks of
     /// one rank have no declared order and can close a cycle just as easily as
     /// an inversion.
-    IrqHandlers = 12,
+    IrqHandlers = 13,
     /// `vectors::TABLE` — who owns which interrupt vector.
     ///
     /// A leaf: taken at boot and when a driver claims a source, with nothing
     /// acquired while it is held. Inside the scheduler's queues because a
     /// claim never wakes anything.
-    Vectors = 13,
+    Vectors = 14,
     /// `virtio::DEVICE` — the one block device.
     ///
     /// Inside the scheduler's queues because nothing here wakes a thread: the
     /// driver waits for its device by spinning on a ring the device writes,
     /// not by blocking. Outside the console, because a driver reports what it
     /// found while holding itself.
-    Block = 14,
-    /// `iommu::WINDOW` — the device windows a unit translates through.
-    ///
-    /// Inside `shared::ARENA`, because revoking a memory object takes the arena
-    /// first and unmaps from the device afterwards. A leaf otherwise: the
-    /// register window is mapped once at bring-up and cached, so invalidating
-    /// an IOTLB while holding this takes nothing — which it must not, because
-    /// mapping MMIO reaches the heap, and the heap is the *outermost* lock
-    /// here.
-    DmaWindow = 15,
+    Block = 15,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
     Console = 16,
 }

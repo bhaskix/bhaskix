@@ -176,6 +176,13 @@ pub enum ObjectKind {
     Reply,
     /// A signal with no payload.
     Notification,
+    /// A device's DMA address space: [RFC 0012](../../docs/rfc/0012-iommu.md).
+    ///
+    /// Holding one is the authority to say what a *device* may reach. That is
+    /// a strictly larger power than holding the memory itself — a device
+    /// writes without a page table and without asking anyone — which is why it
+    /// is a capability of its own rather than a right on a memory object.
+    DmaWindow,
 }
 
 /// What a capability names: a kind and an identity within that kind.

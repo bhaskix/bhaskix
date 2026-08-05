@@ -367,8 +367,8 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // device it translates for, and the device must be programmed with
     // addresses from that window -- so the window has to exist first, and
     // translation has to be on before `DRIVER_OK` lets the device read a ring.
-    let mut iommu_state = iommu_bringup(handoff);
-    if !block_self_test(handoff, iommu_state.as_mut()) {
+    let iommu_state = iommu_bringup(handoff);
+    if !block_self_test(handoff) {
         println!("    virtio-blk     FAILED");
     }
 
@@ -481,6 +481,11 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         );
     }
 
+    // RFC 0012 step 7, before the refusal test leaves the device unusable.
+    if iommu::present() && !iommu_delegation_self_test(handoff.hhdm_base.as_u64()) {
+        println!("    iommu grant    FAILED");
+    }
+
     // RFC 0012 steps 4 and 5 in one demonstration, and it is deliberately one.
     //
     // A refused request never completes, so it leaves the queue unusable and
@@ -493,7 +498,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     //
     // Last thing done to the device.
     if let Some((found, _)) = iommu_state.as_ref()
-        && !iommu_memory_self_test(found, handoff.hhdm_base.as_u64())
+        && !iommu_memory_self_test(found, handoff, handoff.hhdm_base.as_u64())
     {
         println!("    iommu memory   FAILED");
     }
@@ -2165,6 +2170,142 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
 ///
 /// `None` on any machine without a usable unit, which is every machine this
 /// project was tested on until today, and the path that must stay unchanged.
+/// What the delegated domain's thread found, since it cannot return a value.
+static GRANT_ADDRESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static GRANT_WITHOUT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static GRANT_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Runs the two `MAP` calls from inside the domain that holds the capabilities.
+///
+/// From inside, because that is the only way the check under test is the one
+/// that runs: `resolve_window` looks up the caller's own CSpace, and a call
+/// made from the kernel's thread would resolve against a different one.
+extern "C" fn dma_client(_argument: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    // Slot 1 is the window, slot 0 the memory it is allowed to map.
+    let mut mapping = syscall::SyscallFrame {
+        kind: syscall::Kind::Invoke as u64,
+        capability: 1,
+        method: syscall::method::MAP,
+        arg0: 0,
+        ..syscall::SyscallFrame::default()
+    };
+    let granted = syscall::dispatch(&mut mapping);
+    if granted.status == syscall::Status::Ok {
+        GRANT_ADDRESS.store(granted.value, Ordering::Relaxed);
+    }
+
+    // The same call naming the *memory* capability where a window belongs.
+    // Authority to say what a device may reach has to be held; this is the
+    // call that proves it is not ambient.
+    let mut refused = syscall::SyscallFrame {
+        kind: syscall::Kind::Invoke as u64,
+        capability: 0,
+        method: syscall::method::MAP,
+        arg0: 0,
+        ..syscall::SyscallFrame::default()
+    };
+    let without = syscall::dispatch(&mut refused);
+    GRANT_WITHOUT.store(without.status as u32, Ordering::Relaxed);
+
+    GRANT_DONE.store(true, Ordering::Release);
+    sched::exit();
+}
+
+/// RFC 0012 step 7: a `DmaWindow` a domain holds, and what it cannot do without
+/// one.
+///
+/// The step every earlier RFC was building toward, and the assertion is about
+/// **refusal** rather than capability. That a domain holding both capabilities
+/// can map is the easy half; that a domain holding the memory and *not* the
+/// window cannot is the half that makes delegation mean anything. A device
+/// writes with no page table and asks nobody, so the authority to say what one
+/// may reach has to be held rather than ambient.
+fn iommu_delegation_self_test(hhdm: u64) -> bool {
+    let _ = hhdm;
+    let Ok(owner) = domain::create("dma-holder", domain::ResourceEnvelope::new()) else {
+        println!("    iommu grant    FAILED to create a domain");
+        return false;
+    };
+    let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
+        println!("    iommu grant    FAILED to create a memory object");
+        domain::destroy(owner);
+        return false;
+    };
+
+    let (Ok(memory_cap), Ok(window_cap)) = (shared::name(object), iommu::name()) else {
+        println!("    iommu grant    FAILED to name the object or the window");
+        domain::destroy(owner);
+        return false;
+    };
+
+    // Slot 0 holds the memory, slot 1 the window. A second domain gets only
+    // the memory, which is the interesting one.
+    let placed = domain::with(owner, |domain| {
+        domain.cspace.install_at(0, memory_cap).is_ok()
+            && domain.cspace.install_at(1, window_cap).is_ok()
+    });
+    if placed != Some(true) {
+        println!("    iommu grant    FAILED to install the capabilities");
+        domain::destroy(owner);
+        return false;
+    }
+
+    // Run from inside the domain, because `resolve_window` resolves against
+    // the caller's own CSpace -- a call made here would check the kernel's.
+    GRANT_ADDRESS.store(0, core::sync::atomic::Ordering::Relaxed);
+    GRANT_WITHOUT.store(u32::MAX, core::sync::atomic::Ordering::Relaxed);
+    GRANT_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
+
+    let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
+    if sched::spawn_on_with(0, "dma-holder", dma_client, 0, hhdm, options).is_err() {
+        println!("    iommu grant    FAILED to spawn a thread in the domain");
+        domain::destroy(owner);
+        return false;
+    }
+    wait_until(
+        || GRANT_DONE.load(core::sync::atomic::Ordering::Acquire),
+        4_000,
+    );
+
+    let address = GRANT_ADDRESS.load(core::sync::atomic::Ordering::Relaxed);
+    let without = GRANT_WITHOUT.load(core::sync::atomic::Ordering::Relaxed);
+
+    let mapped = address != 0;
+    let denied = without == syscall::Status::WrongObject as u32;
+
+    shared::revoke(object);
+    domain::destroy(owner);
+
+    match (mapped, denied) {
+        (true, true) => {
+            println!(
+                "    iommu grant    a domain mapped its own memory for a device at {:#x}; \
+                 the same call without a window capability was refused",
+                address
+            );
+            true
+        }
+        (false, _) => {
+            println!(
+                "    iommu grant    FAILED: a domain holding both capabilities could not map \
+                 (status {})",
+                without
+            );
+            false
+        }
+        // The dangerous one: authority that is ambient rather than held.
+        (_, false) => {
+            println!(
+                "    iommu grant    FAILED: A DOMAIN MAPPED FOR A DEVICE WITHOUT A WINDOW \
+                 CAPABILITY (status {without})"
+            );
+            false
+        }
+    }
+}
+
 /// RFC 0012 step 5: a `Memory` object a device can reach, and a revoke that
 /// takes it away from the device too.
 ///
@@ -2176,7 +2317,7 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
 ///
 /// Runs last, and only where translation is on. It deliberately ends with a
 /// refused request outstanding.
-fn iommu_memory_self_test(found: &iommu::Report, hhdm: u64) -> bool {
+fn iommu_memory_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -> bool {
     let Ok(owner) = domain::create("dma-object", domain::ResourceEnvelope::new()) else {
         println!("    iommu memory   FAILED to create a domain");
         return false;
@@ -2195,11 +2336,35 @@ fn iommu_memory_self_test(found: &iommu::Report, hhdm: u64) -> bool {
         return false;
     };
 
+    // Any fault recorded before this point belongs to something else, and
+    // reading it here would attribute it to this test's own access -- which is
+    // exactly what happened when the delegation test began running first.
+    // SAFETY: the unit `iommu_bringup` mapped and programmed.
+    let _ = unsafe { iommu::take_fault(found, hhdm) };
+
     // Reachable: the device is asked to write a sector into the object, and
     // the unit must not complain.
     let before = virtio::read_into(0, address.as_u64());
     // SAFETY: the unit `iommu_bringup` mapped and programmed.
     let faulted_while_mapped = unsafe { iommu::take_fault(found, hhdm) };
+
+    // And the object holds what the device was asked to fetch.
+    //
+    // "No fault was recorded" is not evidence that a mapping is right, and
+    // that is not a hypothetical: this test passed for a whole step while
+    // every device mapping pointed 4096 times too high, because a translation
+    // to an address that does not exist is dropped quietly rather than
+    // refused. Comparing the bytes is what makes "reachable" mean reached.
+    let expected = handoff.initrd.unwrap_or(&[]);
+    let landed = match crate::shared::frames_of(object) {
+        Some((frames, count)) if count > 0 && expected.len() >= 512 => {
+            // SAFETY: a frame this object owns, read through the direct map.
+            let written =
+                unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, 512) };
+            written == &expected[..512]
+        }
+        _ => false,
+    };
 
     // Revoked. RFC 0009's walk now has a device window in it.
     let removed = shared::revoke(object);
@@ -2213,6 +2378,13 @@ fn iommu_memory_self_test(found: &iommu::Report, hhdm: u64) -> bool {
     domain::destroy(owner);
 
     match (before, faulted_while_mapped, faulted_after) {
+        _ if !landed => {
+            println!(
+                "    iommu memory   FAILED: the device wrote nothing the object can see -- \
+                 mapped, unfaulted, and pointing somewhere else"
+            );
+            false
+        }
         (Ok(()) | Err(_), None, Some(fault)) => {
             println!(
                 "    iommu memory   an object was reachable at {:#x}{}, {removed} mappings \
@@ -2350,34 +2522,18 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     Some((found, window))
 }
 
-fn block_self_test(
-    handoff: &Handoff,
-    iommu_state: Option<&mut (iommu::Report, iommu::Window)>,
-) -> bool {
+fn block_self_test(handoff: &Handoff) -> bool {
     let hhdm = handoff.hhdm_base.as_u64();
 
     // Every frame the driver will hand the device, mapped as it is allocated
     // and given a `DevAddr` the device is told about instead of the physical
     // address the kernel knows it by. Without a unit the two are equal and
     // this is the path every machine has always taken.
-    let capacity = match iommu_state {
-        Some((_, window)) => {
-            let mapped = core::cell::RefCell::new(&mut *window);
-            let translate = |physical: u64| -> Option<u64> {
-                let mut window = mapped.borrow_mut();
-                iommu::map(
-                    &mut window,
-                    physical,
-                    1,
-                    bhaskix_arch::vtd::Rights::READ_WRITE,
-                    false,
-                    hhdm,
-                )
-                .map(|address| address.as_u64())
-            };
-            virtio::init_mapped(hhdm, Some(&translate))
-        }
-        None => virtio::init(hhdm),
+    let capacity = if iommu::present() {
+        let translate = |physical: u64| iommu::map_frame(physical, hhdm).map(|a| a.as_u64());
+        virtio::init_mapped(hhdm, Some(&translate))
+    } else {
+        virtio::init(hhdm)
     };
     let capacity = match capacity {
         Ok(capacity) => capacity,

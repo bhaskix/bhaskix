@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **M6 — Filesystem, ELF, shell** |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–5, step 6 partial) · CI green · 38 boot gates, 112 checks |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-10 (RFC 0011 steps 1–5, RFC 0009 steps 1–5, RFC 0012 steps 1–5 and 7, step 6 partial) · CI green · 38 boot gates, 112 checks |
 
 ### Division of responsibility between documents
 
@@ -137,6 +137,7 @@ fairness within 2% for two equal-weight workloads.
 | M6-13 | RFC 0012 step 4: `MAP`/`UNMAP`, `DevAddr`, and a refusal that names the device | ✅ `DONE` | The unit comes up **before** the device: a window names the device it translates for, and translation must be on before `DRIVER_OK` lets a device read a ring. The driver's frames are mapped as they are allocated and it is handed `DevAddr`s — its memory sits at `0xf8aa000+` and the device is told `0x100000000+`. `UNMAP` invalidates before returning, because until it does the hardware still reaches a page the caller has been told is gone. Fault records are read, so a refusal names the device, the address and the direction. **Negative test**: hand the device an address nobody mapped — `00:03.0 was refused 0x7ffffff000 (write), reason 0x05`. |
 | M6-14 | RFC 0012 step 5: a `Memory` object a device can reach, and a revoke that reaches the device | ✅ `DONE` | RFC 0009's object mapped into the device window — the same frames a domain shares with another domain are what a device is given, through the same object and the same revocation. `revoke` now walks the device mapping too, invalidating the IOTLB per entry. **The assertion is asked of the device**: it reads into the object successfully, the object is revoked, and the same device at the same address is refused. A new `DmaWindow` lock rank sits inside `shared::ARENA`, and the unit's registers are cached at bring-up because mapping MMIO reaches the heap — the outermost lock — while invalidation happens under the innermost. |
 | M6-15 | RFC 0012 step 6: interrupt remapping, built and **off** | ⚠️ `PARTIAL` | The table, entries that validate **which device** may present a handle — the only thing that answers "who sent this", which is why RFC 0011 left the risk open — remappable I/O APIC lines and MSI messages, and compatibility format blocked. The I/O APIC path works under it, confirmed by QEMU's own trace. **The block device's MSI is never sent once remapping is on, and that is unresolved.** Two real encoding bugs were found and fixed chasing it; a third cause is unidentified. Off by default because enabling it costs that driver its interrupt and leaves it polling behind the timer — a machine that works while quietly degraded. `iommu=remap-irq` turns it on; the boot line says which world the machine is in, and a gate asserts it says something either way. |
+| M6-16 | RFC 0012 step 7: a `DmaWindow` a domain holds | ✅ `DONE` | `ObjectKind::DmaWindow` with `MAP`/`UNMAP`/`INFO`, resolved under the capability arena and performed after it is released — mapping allocates, and allocating takes the heap. **Both** capabilities are checked and the device gets the weaker of their rights, so a read-only share cannot become writable by being handed to a device. **The assertion is the refusal**: a domain holding the memory and *not* the window is denied. Four real bugs fell out — see the changelog. |
 
 ### Honest notes on M6 so far
 
@@ -519,6 +520,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-05 (RFC 0012 step 7 — delegation, and four bugs it dragged out)
+
+- **A domain can now say what a device may reach, and only if it was given that authority.** A
+  `DmaWindow` capability, `MAP` taking a `Memory` capability the caller already holds, and the
+  device granted the weaker of the two capabilities' rights. The assertion is the *refusal* — that
+  a domain holding both can map is the easy half; that one holding only the memory cannot is what
+  makes delegation mean anything.
+- **Device mappings had been 4096 times too high since step 5.** `shared`'s frame array holds
+  physical *addresses* — `allocate_frame` multiplies before storing — and the doc comment said
+  "frame numbers", so the caller multiplied again. Fixed, and the comment with it.
+- **Step 5's test could not see that**, which is why it survived a step. It asserted "no fault was
+  recorded", and a translation to an address that does not exist is dropped **silently** rather than
+  refused. It now compares the bytes the device wrote against the sector it was asked for. *The
+  third assertion this session that looked right and tested nothing.*
+- **`Window` is `Copy`, so there were two of them.** `install` stored a copy: the driver mapped its
+  rings through one allocator while the global one still believed those addresses free, and the
+  delegated domain mapped its object **on top of the driver's descriptor ring** — same page tables,
+  different idea of what was taken. One window now, and the addresses say so: driver
+  `0x100000000`–`0x100004000`, domain `0x100005000`, object `0x100006000`.
+- **The window lock was ranked innermost, and mapping allocates.** `map_page` takes the heap while
+  holding it, so the heap was being acquired inside it. Ranked on what revocation does last rather
+  than on what mapping does while held; the detector reported it on the first boot that mapped
+  anything. `DmaWindow` is rank 2 now, outside the heap.
+- **Device-address reuse is disabled, deliberately.** After map → unmap-with-invalidation → map of
+  the same address, a device still reached it: the entry read back as zero and the access was not
+  refused. Handing an address out again while hardware may still translate it is a revocation with
+  a delay fuse. Bump-only until invalidation is proven; the reuse test is `#[ignore]`d with that
+  reason rather than deleted, and `free` still records the extent.
 
 ### 2026-08-05 (RFC 0012 step 6 — built, and switched off on purpose)
 

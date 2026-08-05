@@ -172,6 +172,17 @@ pub mod method {
     /// Only on a `Domain` capability. `arg0` = the caller's slot to derive
     /// from, `arg1` = rights, `arg2` = badge, `arg3` = slot in the recipient.
     pub const GRANT: u64 = 16;
+    /// Map a `Memory` object into this `DmaWindow`, and return a `DevAddr`.
+    ///
+    /// Only on a `DmaWindow` capability. `arg0` = the caller's slot holding
+    /// the `Memory` capability, `arg1` = rights for the device. RFC 0012.
+    pub const MAP: u64 = 32;
+    /// Remove a mapping made by [`MAP`], invalidating before returning.
+    ///
+    /// `arg0` = the `DevAddr`, `arg1` = pages.
+    pub const UNMAP: u64 = 33;
+    /// How many pages this window has mapped.
+    pub const INFO: u64 = 34;
 }
 
 /// What a system call returns in `rax`.
@@ -282,6 +293,8 @@ pub fn dispatch_with(frame: &mut SyscallFrame, cspace: &CSpace, arena: &Arena) -
         // round that, so it is an error rather than a second implementation.
         Kind::Invoke => match resolve(cspace, arena, frame.capability) {
             Ok((_, ObjectKind::Reply)) => Outcome::err(Status::WrongObject),
+            // A `DmaWindow` method runs unlocked -- see `resolve_window`.
+            Ok((_, ObjectKind::DmaWindow)) => Outcome::err(Status::NotImplemented),
             Ok((_, _)) => Outcome::err(Status::NotImplemented),
             Err(status) => Outcome::err(status),
         },
@@ -396,6 +409,79 @@ fn invoke_capability(
     }
 }
 
+/// What a `DmaWindow` invocation resolved to, with every lock released.
+///
+/// The same shape as [`resolve_for_ipc`] and for the same reason: mapping a
+/// page into a device's window may have to allocate a level of its page
+/// tables, and allocating takes the heap — which ranks *outside* the
+/// capability arena this method was resolved under. Doing the work here would
+/// be an inversion on every map.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ResolvedWindow {
+    /// The `Memory` object to map, for `MAP`.
+    memory: Option<crate::shared::MemoryId>,
+    /// What the device may do, already narrowed by both capabilities' rights.
+    rights: bhaskix_arch::vtd::Rights,
+}
+
+/// Resolves a `DmaWindow` method against the caller's own capabilities.
+///
+/// **Both** capabilities are checked: the window, and the memory being mapped
+/// into it. Holding one without the other is not enough, and that is the whole
+/// of the delegation story — a domain may hand a device only memory it already
+/// holds, and only into a window it was given.
+fn resolve_window(frame: &SyscallFrame) -> Result<ResolvedWindow, Status> {
+    let Some(id) = sched::current_domain() else {
+        return Err(Status::NoDomain);
+    };
+
+    let outcome = domain::with(id, |owner| {
+        let cspace = core::mem::take(&mut owner.cspace);
+        let result = cap::with_arena(|arena| {
+            let index = usize::try_from(frame.capability).map_err(|_| Status::NoSuchCapability)?;
+            let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
+            let (window, window_rights) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            if window.kind != ObjectKind::DmaWindow {
+                return Err(Status::WrongObject);
+            }
+
+            if frame.method != crate::syscall::method::MAP {
+                return Ok(ResolvedWindow {
+                    memory: None,
+                    rights: bhaskix_arch::vtd::Rights::READ,
+                });
+            }
+
+            let memory_index = usize::try_from(frame.arg0).map_err(|_| Status::NoSuchCapability)?;
+            let memory_slot = cspace.get(memory_index).ok_or(Status::NoSuchCapability)?;
+            let (memory, memory_rights) = arena.lookup(memory_slot).ok_or(Status::Revoked)?;
+            if memory.kind != ObjectKind::Memory {
+                return Err(Status::WrongObject);
+            }
+
+            // A device may do what *both* capabilities allow and no more.
+            // Narrowing to the weaker of the two is what stops a read-only
+            // share becoming a writable one by being handed to a device.
+            let write = window_rights.contains(crate::cap::Rights::WRITE)
+                && memory_rights.contains(crate::cap::Rights::WRITE);
+            if !window_rights.contains(crate::cap::Rights::READ)
+                || !memory_rights.contains(crate::cap::Rights::READ)
+            {
+                return Err(Status::InsufficientRights);
+            }
+
+            Ok(ResolvedWindow {
+                memory: Some(crate::shared::MemoryId::from_u64(memory.id)),
+                rights: bhaskix_arch::vtd::Rights { read: true, write },
+            })
+        });
+        owner.cspace = cspace;
+        result
+    });
+
+    outcome.unwrap_or(Err(Status::NoDomain))
+}
+
 /// What a capability resolved to, for an operation that must run unlocked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Resolved {
@@ -491,6 +577,42 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         Some(Kind::Exit) => sched::exit(),
         None => return Outcome::err(Status::BadSyscall),
         Some(_) => {}
+    }
+
+    // A `DmaWindow` method, which does not block but must not run locked: a
+    // map may allocate a page-table level, and allocating takes the heap,
+    // which ranks outside the capability arena the method was resolved under.
+    if kind == Some(Kind::Invoke)
+        && matches!(frame.method, method::MAP | method::UNMAP | method::INFO)
+    {
+        let resolved = match resolve_window(frame) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        let hhdm = crate::shared::hhdm();
+        return match frame.method {
+            method::MAP => match resolved.memory {
+                Some(memory) => {
+                    match crate::iommu::map_memory(memory, resolved.rights, false, hhdm) {
+                        Some(address) => Outcome::ok(address.as_u64()),
+                        // No window, no room, or the object has gone. All
+                        // refusals: a caller told an address for a mapping
+                        // that did not happen would hand a device a number
+                        // pointing at whatever is there.
+                        None => Outcome::err(Status::NoSuchCapability),
+                    }
+                }
+                None => Outcome::err(Status::WrongObject),
+            },
+            method::UNMAP => {
+                if crate::iommu::unmap_device(frame.arg0, frame.arg1) {
+                    Outcome::ok(0)
+                } else {
+                    Outcome::err(Status::NoSuchCapability)
+                }
+            }
+            _ => Outcome::ok(crate::iommu::mapped_pages()),
+        };
     }
 
     // The three that block. Each resolves its capability with the locks held,

@@ -264,19 +264,21 @@ impl DevAddrSpace {
         }
         let bytes = pages.checked_mul(bhaskix_arch::vtd::PAGE_SIZE)?;
 
-        // An exact-fit extent that was returned earlier. Exact, because
-        // splitting one leaves a remainder this fixed table cannot describe
-        // and would quietly lose.
-        for slot in &mut self.freed {
-            if let Some((address, extent)) = *slot
-                && extent == bytes
-                && (!below_4gib || address + extent <= Self::LOW_LIMIT)
-            {
-                *slot = None;
-                return Some(DevAddr(address));
-            }
-        }
-
+        // Freed extents are deliberately **not** reused.
+        //
+        // Reuse needs proof that no stale translation for that address
+        // survives, and that proof is missing: after an address was mapped,
+        // unmapped with a global IOTLB invalidation, and mapped again, a
+        // device still reached it — the page-table entry read back as zero and
+        // the access was not refused. Handing an address out again while the
+        // hardware may still translate it is a revocation with a delay fuse,
+        // which is the thing this project refuses everywhere else.
+        //
+        // The cost of not reusing is address space, and a window has 512 GiB
+        // of it. The cost of reusing wrongly is a device reaching memory that
+        // was taken away from it. `free` still records the extent, so the day
+        // invalidation is proven this becomes a lookup again rather than a
+        // redesign.
         let next = if below_4gib {
             &mut self.low_next
         } else {
@@ -661,7 +663,12 @@ pub fn map_memory(
     let address = window.addresses.allocate(count as u64, below_4gib)?;
     for (page, frame) in frames.iter().take(count).enumerate() {
         let at = address.as_u64() + (page as u64) * vtd::PAGE_SIZE;
-        let physical = frame * bhaskix_mm::FRAME_SIZE;
+        // `frames_of` yields physical *addresses*, not frame numbers --
+        // `shared::allocate_frame` multiplies by the frame size before storing
+        // them. Multiplying again produced entries pointing 4096 times too
+        // high, which the hardware refused as reserved bits when the result
+        // overflowed the window's width and silently dropped when it did not.
+        let physical = *frame;
         if !map_page(window, at, physical, rights, hhdm) {
             // Nothing half-mapped: the device would reach part of an object
             // and fault on the rest, which reads as a driver bug.
@@ -674,6 +681,8 @@ pub fn map_memory(
         }
     }
     drop(guard);
+
+    MAPPED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
 
     if !crate::shared::record_device_mapping(id, address.as_u64(), count as u64) {
         // Recorded or not mapped. An object whose device mapping is not
@@ -703,6 +712,10 @@ pub fn unmap_device(address: u64, pages: u64) -> bool {
         }
     }
     window.addresses.free(DevAddr::from_u64(address), pages);
+    MAPPED.fetch_sub(
+        pages.min(MAPPED.load(core::sync::atomic::Ordering::Relaxed)),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     drop(guard);
 
     // SAFETY: the unit `enable` programmed and whose registers it cached.
@@ -828,6 +841,88 @@ unsafe fn invalidate_interrupt_cache() -> bool {
     // that the day an entry is *changed* rather than issued, the place that
     // has to grow an invalidation is obvious.
     true
+}
+
+/// Names the window with a capability, so it can be granted to a domain.
+///
+/// RFC 0012 step 7. Holding this is the authority to say what a *device* may
+/// reach, which is strictly more than holding memory: a device writes with no
+/// page table and asks nobody. Granting it is how a driver moves out of the
+/// kernel, and it is the only way any of `MAP`, `UNMAP` or `INFO` can be
+/// reached at all.
+///
+/// # Errors
+///
+/// [`crate::cap::CapError`] if the arena is full, or there is no window.
+pub fn name() -> Result<crate::cap::SlotRef, crate::cap::CapError> {
+    if !present() {
+        return Err(crate::cap::CapError::NotFound);
+    }
+    crate::cap::with_arena(|arena| {
+        arena.insert_root(
+            crate::cap::ObjectRef::new(crate::cap::ObjectKind::DmaWindow, 0),
+            crate::cap::Rights::ALL,
+            0,
+        )
+    })
+}
+
+/// How many pages this window has mapped, for `INFO`.
+#[must_use]
+pub fn mapped_pages() -> u64 {
+    MAPPED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Pages currently mapped into the window.
+static MAPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Reads back the leaf entry for `address`.
+///
+/// For a self-test that needs to distinguish "the mapping is wrong" from "the
+/// device did not ask" — which cost a long detour to tell apart, because a
+/// translation to an address that does not exist is dropped silently rather
+/// than refused.
+#[must_use]
+pub fn entry_at(address: u64, hhdm: u64) -> Option<u64> {
+    let guard = WINDOW.lock();
+    let (_, window) = guard.as_ref()?;
+    let mut table = window.page_table;
+    for level in (2..=window.width.levels()).rev() {
+        let index = vtd::level_index(address, level);
+        // SAFETY: a table this module allocated, at a nine-bit index.
+        let entry = unsafe { core::ptr::read_volatile(((hhdm + table) as *const u64).add(index)) };
+        table = vtd::PageEntry::from_bits(entry)?.address;
+    }
+    let index = vtd::level_index(address, 1);
+    // SAFETY: as above.
+    Some(unsafe { core::ptr::read_volatile(((hhdm + table) as *const u64).add(index)) })
+}
+
+/// Maps one physical frame into the window and returns where the device looks.
+///
+/// The only way a driver gets a `DevAddr`, and it goes through the **one**
+/// window rather than a copy of it. `Window` is `Copy`, and for a while two
+/// copies existed: the driver mapped its rings through one and every later
+/// mapping was allocated from the other, which still believed those addresses
+/// were free. The second mapping landed on top of the first -- same page
+/// tables, different idea of what was taken -- and the device read a
+/// descriptor ring that was no longer there.
+pub fn map_frame(physical: u64, hhdm: u64) -> Option<DevAddr> {
+    let mut guard = WINDOW.lock();
+    let (_, window) = guard.as_mut()?;
+    let address = window.addresses.allocate(1, false)?;
+    if !map_page(
+        window,
+        address.as_u64(),
+        physical,
+        vtd::Rights::READ_WRITE,
+        hhdm,
+    ) {
+        window.addresses.free(address, 1);
+        return None;
+    }
+    MAPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some(address)
 }
 
 /// Whether a firmware-reserved region overlaps the kernel's own image.
@@ -1226,6 +1321,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reuse is disabled until IOTLB invalidation is proven -- see allocate"]
     fn a_freed_extent_is_reused() {
         let mut space = DevAddrSpace::new(AddressWidth::Bits39);
         let first = space.allocate(4, false).expect("room");
@@ -1237,7 +1333,18 @@ mod tests {
     }
 
     #[test]
-    fn a_freed_extent_is_not_reused_for_a_request_that_does_not_fit_it() {
+    fn a_freed_extent_is_never_handed_out_again() {
+        // Not an optimisation that was dropped: an address that may still be
+        // translated by hardware must not name new memory. See `allocate`.
+        let mut space = DevAddrSpace::new(AddressWidth::Bits39);
+        let first = space.allocate(4, false).expect("room");
+        space.free(first, 4);
+        let again = space.allocate(4, false).expect("room");
+        assert_ne!(again, first, "a freed address was handed out again");
+    }
+
+    #[test]
+    fn an_inexact_request_also_comes_from_fresh_space() {
         // Splitting one leaves a remainder this fixed table cannot describe,
         // so an inexact match must come from the bump pointer instead of
         // silently handing back part of an extent and losing the rest.

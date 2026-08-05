@@ -504,6 +504,17 @@ if [[ "$MODE" == "iommu" ]]; then
         status=1
     fi
 
+    # RFC 0012 step 7: a domain holding a `DmaWindow` may say what a device
+    # reaches, and one holding only the memory may not. The refusal is the
+    # assertion -- that a domain with both capabilities can map is the easy
+    # half, and authority that is ambient rather than held would pass it.
+    if grep -qE "iommu grant +a domain mapped its own memory for a device at 0x[0-9a-f]+; the same call without a window capability was refused" "$LOG"; then
+        pass "a domain maps for a device only with a window capability"
+    else
+        fail "delegation is not enforced, or a domain could map without a window"
+        status=1
+    fi
+
     # And the machine says the *true* thing about what a device can reach --
     # after enabling, not before.
     if grep -qF "translating: this device reaches only what it was given" "$LOG"; then

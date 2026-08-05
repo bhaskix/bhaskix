@@ -81,6 +81,18 @@ pub struct MemoryId {
 }
 
 impl MemoryId {
+    /// Rebuilds an identity from the packed form a capability carries.
+    ///
+    /// The generation travels with the index, so a capability that outlived
+    /// its object names nothing rather than naming whatever took the slot.
+    #[must_use]
+    pub const fn from_u64(identity: u64) -> Self {
+        Self {
+            index: identity as u32,
+            generation: (identity >> 32) as u32,
+        }
+    }
+
     /// The slot this names, for reporting.
     #[must_use]
     pub const fn index(&self) -> u32 {
@@ -115,7 +127,12 @@ pub struct DeviceMapping {
 /// One object.
 #[derive(Clone, Copy)]
 struct Object {
-    /// Physical frame numbers, in order. Index *i* is the object's *i*-th page.
+    /// Physical *addresses*, in order. Index *i* is the object's *i*-th page.
+    ///
+    /// Addresses, not frame numbers: `allocate_frame` multiplies by the frame
+    /// size before storing them. This comment said "numbers" for a milestone,
+    /// and a caller that believed it multiplied again and built device
+    /// mappings pointing 4096 times too high.
     frames: [u64; MAX_FRAMES],
     /// How many of them are real.
     count: usize,
