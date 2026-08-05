@@ -472,14 +472,53 @@ pub fn self_test(hhdm_base: u64, iterations: u32) -> bool {
 // Demand paging and copy-on-write
 // ---------------------------------------------------------------------------
 
-/// The address space currently loaded in `CR3`, if the kernel installed one.
+/// How many user address spaces can exist at once.
+///
+/// Four: the shell and both services in their own domains, with one spare. It
+/// was one until RFC 0013 step 4, which is not a number anybody chose — the
+/// kernel simply kept a single installed space, because until there were two
+/// programs to run at once nothing could tell. What told was two services in
+/// domains landing on the same CPU and running in each other's page table.
+pub const MAX_SPACES: usize = 4;
+
+/// Every user address space the kernel has installed, found by its root.
 ///
 /// The page-fault handler needs the region map to decide whether a fault is
-/// legal, and it has no other way to find it.
-static ACTIVE: SpinLock<Option<AddressSpace>> = SpinLock::new(Rank::AddressSpace, None);
+/// legal, and it has no other way to find it. Keyed by the page-table root
+/// rather than by thread or domain, because the root is what `CR3` holds: the
+/// fault happened in whatever space is loaded, and asking the hardware which
+/// one that is cannot disagree with the hardware.
+static SPACES: SpinLock<[Option<AddressSpace>; MAX_SPACES]> =
+    SpinLock::new(Rank::AddressSpace, [None, None, None, None]);
 
 /// The page table to restore when the installed space is removed.
 static PREVIOUS_ROOT: SpinLock<u64> = SpinLock::new(Rank::AddressSpacePrevious, 0);
+
+/// How many user address spaces exist at once.
+///
+/// Printed at boot because it was one for the whole of M5 and M6 and nothing
+/// said so: the kernel kept a single installed space, and with one user
+/// program at a time that is indistinguishable from keeping the right one. A
+/// number here is what makes "more than one program has its own memory" a
+/// claim the machine states rather than one the design implies.
+#[must_use]
+pub fn installed() -> usize {
+    SPACES.lock().iter().flatten().count()
+}
+
+/// Runs `f` against the address space currently loaded in `CR3`.
+///
+/// `None` if this CPU is not running in one the kernel installed.
+fn with_active<T>(f: impl FnOnce(&mut AddressSpace) -> T) -> Option<T> {
+    // SAFETY: reading CR3 at CPL 0 has no side effects and cannot fault.
+    let root = unsafe { paging::active_page_table() };
+    let mut spaces = SPACES.lock();
+    let space = spaces
+        .iter_mut()
+        .flatten()
+        .find(|space| space.root() == root)?;
+    Some(f(space))
+}
 
 /// What the fault handler did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -560,10 +599,35 @@ impl AddressSpace {
 /// creation copies the higher half rather than sharing a live view of it.
 pub unsafe fn install(space: AddressSpace) {
     let root = space.root();
-    *ACTIVE.lock() = Some(space);
+    {
+        let mut spaces = SPACES.lock();
+        // Replace an entry with the same root before taking a new slot: a
+        // space is identified by its root, and two entries claiming one root
+        // would make which region map answers a fault depend on search order.
+        let slot = spaces
+            .iter()
+            .position(|held| held.as_ref().is_some_and(|held| held.root() == root))
+            .or_else(|| spaces.iter().position(Option::is_none));
+        match slot {
+            Some(slot) => spaces[slot] = Some(space),
+            // Out of slots. The space is dropped, the switch below still
+            // happens, and every fault in it will be unserviceable -- loud,
+            // and better than evicting somebody else's mappings.
+            None => {
+                crate::println!("    address space  no free slot; faults in it will be refused")
+            }
+        }
+    }
     // SAFETY: delegated to the caller's obligation above.
     let previous = unsafe { paging::switch_address_space(root) };
     *PREVIOUS_ROOT.lock() = previous;
+
+    // The thread carries its root from here on, so that a context switch can
+    // put it back. Without this a user thread resumes in whichever space ran
+    // last on that CPU -- which, with one user program, is always its own.
+    if let Some(me) = crate::sched::current_thread_id() {
+        crate::sched::set_space_root(me, root);
+    }
 }
 
 /// Restores the previous page table and returns the installed space.
@@ -572,6 +636,8 @@ pub unsafe fn install(space: AddressSpace) {
 ///
 /// The previously recorded root must still be a valid page table.
 pub unsafe fn uninstall() -> Option<AddressSpace> {
+    // SAFETY: reading CR3 has no side effects.
+    let root = unsafe { paging::active_page_table() };
     let previous = *PREVIOUS_ROOT.lock();
     if previous != 0 {
         // SAFETY: `previous` was read from CR3 by `install`, so it is the page
@@ -579,7 +645,11 @@ pub unsafe fn uninstall() -> Option<AddressSpace> {
         // everything currently in use.
         unsafe { paging::switch_address_space(previous) };
     }
-    ACTIVE.lock().take()
+    let mut spaces = SPACES.lock();
+    let slot = spaces
+        .iter()
+        .position(|held| held.as_ref().is_some_and(|held| held.root() == root))?;
+    spaces[slot].take()
 }
 
 /// Services a page fault against the installed address space.
@@ -597,10 +667,20 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
     // lock, and spinning here would hang the machine with no output. Reporting
     // an unserviceable fault is worse than servicing it and far better than a
     // silent lock-up.
-    let Some(mut guard) = ACTIVE.try_lock() else {
+    let Some(mut guard) = SPACES.try_lock() else {
         return FaultOutcome::Unserviceable("address space lock held");
     };
-    let Some(space) = guard.as_mut() else {
+    // Whichever space is loaded *now*. Asked of the hardware rather than of
+    // any bookkeeping, for the reason in this function's doc comment: the
+    // bookkeeping is what may be wrong when a fault is being handled.
+    //
+    // SAFETY: reading CR3 at CPL 0 has no side effects and cannot fault.
+    let root = unsafe { paging::active_page_table() };
+    let Some(space) = guard
+        .iter_mut()
+        .flatten()
+        .find(|space| space.root() == root)
+    else {
         return FaultOutcome::NotOurs;
     };
 
@@ -837,11 +917,8 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
     let _ =
         unsafe { uaccess::copy_to_user(EAGER, (&raw const seed).cast::<u8>(), size_of::<u64>()) };
 
-    let cow_ready = ACTIVE
-        .lock()
-        .as_mut()
-        .map(|s| s.make_copy_on_write(VirtAddr(EAGER)).is_ok())
-        .unwrap_or(false);
+    let cow_ready =
+        with_active(|space| space.make_copy_on_write(VirtAddr(EAGER)).is_ok()).unwrap_or(false);
 
     // This write must fault -- the page is now read-only -- and the handler
     // must copy rather than refuse.
@@ -866,10 +943,7 @@ pub fn demand_paging_self_test(hhdm_base: u64) -> bool {
         0
     };
 
-    let eager_frame_after = ACTIVE
-        .lock()
-        .as_ref()
-        .and_then(|s| s.translate(VirtAddr(EAGER)));
+    let eager_frame_after = with_active(|space| space.translate(VirtAddr(EAGER))).flatten();
 
     // The original frame must still hold the old value: that is what makes it
     // a copy rather than an in-place write.

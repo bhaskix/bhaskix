@@ -98,6 +98,25 @@ pub mod method {
     /// that could name it could write a file's contents into a third party's
     /// memory.
     pub const FILL: u64 = 38;
+
+    /// Put one character on the console this capability names.
+    ///
+    /// Only on a `Console` capability. `arg0` = the character.
+    pub const PUT: u64 = 39;
+    /// Take a byte that was typed, waiting until there is one.
+    ///
+    /// Only on a `Console` capability, and it blocks: a holder waiting here is
+    /// not answering anything else while it waits.
+    pub const TAKE: u64 = 40;
+    /// Take a byte only if one is already waiting.
+    ///
+    /// Returns the byte, or [`NOTHING`].
+    pub const POLL: u64 = 41;
+    /// What [`POLL`] returns when nobody has typed.
+    ///
+    /// Out of a byte's range on purpose, so "nothing" cannot be confused with
+    /// a byte that was read.
+    pub const NOTHING: u64 = 0x100;
 }
 
 /// What a system call returned in `rax`.

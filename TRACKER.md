@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-04 (RFC 0013 steps 1–3) · CI green · 267 suite checks · 42 boot gates per placement, 49 with an IOMMU · 277 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-05 (RFC 0013 steps 1–4) · CI green · 358 suite checks · 43 boot gates per placement (4 placements), 50 with an IOMMU · 276 host assertions |
 
 ### Division of responsibility between documents
 
@@ -145,6 +145,7 @@ fairness within 2% for two equal-weight workloads.
 | M7-02 | RFC 0013 step 2: the placement table, and what makes it true | ✅ `DONE` | `services.toml`, and `tools/check-placements.sh` to give it teeth. The console is now **its own crate**, compiled for `x86_64-unknown-none` with **no kernel in the build** — that compile *is* the domain placement's, and unlike a lint it cannot pass by accident. The rule is enforced against the **resolved dependency graph**, not a search for suspicious lines: a service cannot name `crate::vfs` without depending on the kernel. Two negative fixtures, both run by `make gates`: a service that calls into the kernel (must be rejected **naming `bhaskix-kernel`**), and a table wrong about itself (a name listed twice, a placement of `orbit` — **both** must be reported). The boot line is now built from the table, so the machine and the file cannot drift. **What it cost:** the filesystem is `relocatable = false` in the table, in the file rather than in a comment — its bulk path reads caller pages through the direct map, so it does not compile without the kernel. That is step 3's actual work, now named. |
 | M7-03 | RFC 0013 step 3a: the filesystem becomes relocatable, and a hole closes | ✅ `DONE` | The filesystem is **out of the kernel crate** — `ustar`, `vfs` and the service in `services/vfs`, building for `x86_64-unknown-none` with no kernel in the build. One function did it: the bulk path used to read caller pages through the direct map and now asks its context (`Bulk::fill`). **A security hole was found on the way and closed:** `Reply` took the caller from a register, so a server — including a ring 3 one, since `Reply` is a system call — could plant a message in *any* thread's mailbox and wake it holding what looked like the answer it was waiting for. The kernel now remembers who a thread received from and refuses anything else, which also freed the register that lets a server receive a whole four-register message at all. `Request::caller` is **gone from the trait**: a service cannot name a caller, so it cannot name the wrong one. Gated, and the gate was watched failing twice before it was believed — see the note below. |
 | M7-04 | RFC 0013 step 3: the filesystem runs in a domain | ✅ `DONE` | `bin/vfsd` **is** the filesystem service, in ring 3, holding one endpoint capability and a read-only mapping of the image — and every `fs::` method in the system is answered by it. The user-mode shell now reads files through IPC from a service that is itself unprivileged: two ring 3 programs, with the kernel routing messages and owning neither. The service crate is byte for byte the one the kernel compiles for the nucleus; what differs is the context (`Bulk::fill` is `method::FILL`) and the run loop (`serve::<S>` for `run::<S>`). `services.toml` decides which, through `kernel/build.rs`, and `make test-placements` **boots both, every build** — the placement nobody is running is compiled out, so nothing else would notice it rotting. |
+| M7-05 | RFC 0013 step 4: everything in a domain, and the address space that was missing | ✅ `DONE` | Both services run in ring 3. The console holds a `Console` capability — **put a character, take a byte, nothing else** — so a console service talked into misbehaving can still only put characters and take bytes; the same service in the nucleus could do anything. The shell, the console and the filesystem are now three unprivileged programs and the nucleus runs **no service at all** in that build. **What this found:** the kernel kept *one* installed address space for the whole of M5 and M6. With a single user program that is indistinguishable from keeping the right one — two services in domains landed on the same CPU and ran in each other's page table. Threads now carry their page-table root and load it as they resume, and the fault handler asks the hardware which space it is in rather than trusting bookkeeping. All four placement combinations boot and pass, every build. |
 
 ### Honest notes on M6 so far
 
@@ -632,6 +633,35 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 step 4 — the nucleus runs no service, and one address space was never enough)
+
+- **Three unprivileged programs, and a nucleus with no service in it.** The shell asks the console
+  service to print and the filesystem service to read, and neither of those is in the kernel. In the
+  `console=domain vfs=domain` build the nucleus runs no service at all, which is the state RFC 0013
+  was aiming at from the first paragraph.
+- **The console capability is the point, not the console.** Holding it permits putting a character
+  and taking a byte. The driver stays in the kernel — moving that out is step 6 — so what this buys
+  is not a smaller kernel but a smaller blast radius, and that is the half worth having first.
+- **The kernel had one address space, and had had one since M5.** Not by decision: `vm::install`
+  kept a single `ACTIVE` space, the scheduler never touched `CR3`, and with one user program at a
+  time that is indistinguishable from keeping the right one. Two services in their own domains,
+  pinned to the same CPU, ran in *each other's page table*. Threads now carry their root and load it
+  as they resume; the fault handler reads `CR3` rather than trusting bookkeeping, because
+  bookkeeping is exactly what may be wrong when a fault is being handled.
+- **The boot gates passed while the machine was broken.** All 42 of them, in the very configuration
+  that faulted — because nothing in the boot self-tests runs two user programs at once. The shell
+  test caught it. A suite that is green is evidence about what it exercises and about nothing else.
+- **Every argument register is an output.** Both domain programs declared the system call's argument
+  registers as inputs. The kernel writes the whole frame back, so that was a lie the compiler was
+  entitled to believe: it kept a live value in `r8` across a `syscall` and then dereferenced the
+  kernel's leftovers. The one program that got this right was the shell, which had been doing it
+  correctly since M6-05 for no reason anybody wrote down.
+- **The address-space gate is derived, not fixed.** It expects one space for the shell plus one per
+  service in a domain, because a fixed number would be wrong in three of the four placements — and
+  a gate that is wrong in three configurations gets deleted rather than fixed.
+- **The `/bin` count assertion fired a third time**, once per program added. It is the cheapest
+  test in the repo and has now earned its keep three times over.
 
 ### 2026-08-05 (RFC 0013 step 3 — the filesystem is a program now)
 

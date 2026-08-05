@@ -548,7 +548,19 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         }
     } else {
         match user_shell(handoff) {
-            Ok(()) => println!("  M6 in progress. Nothing left to do at this milestone."),
+            Ok(()) => {
+                // Said out loud because it was one for the whole of M5 and M6
+                // and nothing reported it: with a single user program at a
+                // time, keeping one installed address space is
+                // indistinguishable from keeping the right one. Two services
+                // in domains on one CPU is what told the difference, by
+                // running in each other's page table.
+                println!(
+                    "    address spaces {} in use at once, each program in its own",
+                    vm::installed()
+                );
+                println!("  M6 in progress. Nothing left to do at this milestone.");
+            }
             Err(reason) => {
                 println!("  the user-mode shell could not be started: {reason}");
                 println!("  falling back to the kernel shell.");
@@ -1359,6 +1371,121 @@ const VFSD_PROGRAM: &[u8] = b"bin/vfsd";
 /// Two things are given and nothing else: an endpoint capability at slot 0,
 /// and the image. A domain that could find its own storage would not be a
 /// domain.
+/// Where the console domain's stack and program live.
+const CONSOLED_STACK: u64 = 0x0000_0000_1100_0000;
+const CONSOLED_STACK_PAGES: u64 = 4;
+
+/// Where the console service's program is.
+const CONSOLED_PROGRAM: &[u8] = b"bin/consoled";
+
+/// The console object every `Console` capability names.
+///
+/// One, because there is one console. The identity is not used for anything —
+/// the kernel prints to the machine's console either way — but it exists so
+/// that a capability names an object rather than naming nothing, which is the
+/// difference between a capability system and a permission bit.
+const CONSOLE_OBJECT: u64 = 0;
+
+/// Creates the domain the console service runs in, and starts it.
+///
+/// Two capabilities, and they are not the same kind of thing: the endpoint is
+/// what callers reach it through, and the `Console` is the whole of what it
+/// may do to the machine. A console service in the nucleus can do anything the
+/// kernel can; this one can put a character and take a byte.
+pub fn start_console_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
+    let endpoint = service::console_endpoint().ok_or("there is no console endpoint")?;
+
+    let realm = domain::create("console", domain::ResourceEnvelope::new())
+        .map_err(|_| "the console domain would not be created")?;
+
+    let installed = cap::with_arena(|arena| {
+        let endpoint_cap = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        let console_cap = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Console, CONSOLE_OBJECT),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        Some((endpoint_cap, console_cap))
+    })
+    .ok_or("the console domain's capabilities would not be created")?;
+
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(0, installed.0).is_ok()
+            && owner.cspace.install_at(1, installed.1).is_ok()
+    }) != Some(true)
+    {
+        return Err("the console domain's capabilities would not be installed");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        cpu,
+        "consoled",
+        console_domain_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the console domain would not spawn")?;
+    Ok(())
+}
+
+/// Loads `bin/consoled` and becomes the console service, in ring 3.
+extern "C" fn console_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("    console domain FAILED: {why}");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(CONSOLED_PROGRAM) else {
+        stop("bin/consoled is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/consoled is not an ELF this kernel will load")
+    };
+
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(CONSOLED_STACK), CONSOLED_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/consoled would not load")
+    };
+
+    println!(
+        "    console domain bin/consoled loaded, holding a console capability and nothing else"
+    );
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = CONSOLED_STACK + CONSOLED_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+}
+
 /// Creates the domain the filesystem service runs in, and starts it.
 ///
 /// The domain and its one capability are made *here* rather than in the thread
@@ -3438,13 +3565,13 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Three programs in /bin: the ring 3 probe, the user-mode shell,
-            // and the filesystem service as a program (RFC 0013 step 3).
-            // Exact rather than "at least", so adding a fourth without
-            // noticing this line is a failure rather than a silently weaker
-            // test -- which is what it just did.
+            // Four programs in /bin: the ring 3 probe, the user-mode shell,
+            // and both services as programs (RFC 0013 steps 3 and 4). Exact
+            // rather than "at least", so adding a fifth without noticing this
+            // line is a failure rather than a silently weaker test -- which it
+            // has now been, three times, once per program added.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 3,
+            entries >= 3 && bin == 4,
         ),
         (
             "the user program is an ELF the loader accepts",

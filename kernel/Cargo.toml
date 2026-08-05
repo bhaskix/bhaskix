@@ -134,4 +134,9 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1070
+unsafe_budget = 1090
+# Raised from 1070 for RFC 0013 step 4: reading and loading `CR3` so that each
+# user thread resumes in its own address space, and the fault handler asking
+# the hardware which space it is in rather than trusting bookkeeping. Two
+# blocks. The kernel kept one installed address space until now, which with a
+# single user program is indistinguishable from keeping the right one.

@@ -191,6 +191,21 @@ pub enum ObjectKind {
     /// writes without a page table and without asking anyone — which is why it
     /// is a capability of its own rather than a right on a memory object.
     DmaWindow,
+    /// The machine's console: [RFC 0013](../../docs/rfc/0013-service-framework.md).
+    ///
+    /// Holding one is the authority to put a character on the console and to
+    /// take a byte that was typed. Deliberately not the authority to *drive*
+    /// the hardware: the console service in its own domain holds this and can
+    /// do those two things, where the same service in the nucleus could do
+    /// anything at all. That difference is the entire reason for placing it
+    /// somewhere else, and it is only real because this capability is narrow.
+    ///
+    /// A read is a *blocking* operation, which is unusual for an invocation
+    /// and is why it is worth naming here: a holder that takes a byte nobody
+    /// typed waits, and while it waits it is not answering anything else. The
+    /// console service is single-threaded and always has been; that limit
+    /// moved with it.
+    Console,
 }
 
 /// What a capability names: a kind and an identity within that kind.

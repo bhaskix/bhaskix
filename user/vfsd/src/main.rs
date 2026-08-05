@@ -58,18 +58,22 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 fn call(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> u64 {
     let status: u64;
     // SAFETY: the system call convention from RFC 0008. Nothing is
-    // dereferenced on this side; `syscall` destroys `rcx` and `r11`, which are
-    // declared clobbered.
+    // dereferenced on this side.
+    //
+    // Every argument register is declared as an output too, because the kernel
+    // writes the whole frame back on the way out. Declaring them as inputs
+    // said they survive the call, which is not true and which the compiler is
+    // entitled to believe. `rcx` and `r11` are destroyed by the instruction.
     unsafe {
         core::arch::asm!(
             "syscall",
             inlateout("rax") kind => status,
-            in("rdi") capability,
-            in("rsi") method,
-            in("rdx") args[0],
-            in("r10") args[1],
-            in("r8") args[2],
-            in("r9") args[3],
+            inlateout("rdi") capability => _,
+            inlateout("rsi") method => _,
+            inlateout("rdx") args[0] => _,
+            inlateout("r10") args[1] => _,
+            inlateout("r8") args[2] => _,
+            inlateout("r9") args[3] => _,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),

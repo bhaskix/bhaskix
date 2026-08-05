@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The console service, placed in its own domain.
+#
+# Not a member of the root workspace, for the reason user/shell/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+#
+# This program is a *placement* and not a service. Everything it knows about
+# consoles comes from bhaskix-service-console, which is the same crate the
+# kernel compiles into itself for the nucleus placement -- byte for byte the
+# same logic, reached through a context this file builds out of system calls
+# instead of out of the kernel's own functions.
+[workspace]
+
+[package]
+name = "bhaskix-user-consoled"
+description = "The console service in a domain of its own."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "consoled"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-service = { path = "../../service" }
+bhaskix-service-console = { path = "../../services/console" }
+bhaskix-service-domain = { path = "../../service-domain" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# Two blocks, sixteen lines: the `syscall` instruction with its operand list
+# -- every argument register is an output, because the kernel writes the frame
+# back -- and the `ud2` a
+# panic ends at. Fewer than the filesystem's placement needs, because this one
+# is handed no memory -- every byte it moves goes through a system call, which
+# is slower and is the whole of what a console capability permits.
+unsafe_budget = 20

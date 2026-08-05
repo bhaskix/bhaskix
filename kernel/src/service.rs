@@ -36,10 +36,16 @@
 //! quietly given the first one's open file.
 
 pub use bhaskix_service::{Reply, Request, Service, StartError};
-use bhaskix_service_console::{Console, Ports};
+use bhaskix_service_console::Console;
+#[cfg(not(console_in_domain))]
+use bhaskix_service_console::Ports;
 pub use bhaskix_service_vfs::{Bulk, Filesystem, MAX_PATH, MAX_SESSIONS};
 
-use crate::{ipc, sched};
+use crate::ipc;
+// Only the nucleus placement's run loop needs the scheduler; a build where
+// every service is in a domain does not spawn a service thread at all.
+#[cfg(any(not(console_in_domain), not(vfs_in_domain)))]
+use crate::sched;
 
 /// Where the console service's endpoint is, once created.
 static CONSOLE_ENDPOINT: core::sync::atomic::AtomicU64 =
@@ -99,9 +105,15 @@ pub fn start(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     CONSOLE_ENDPOINT.store(u64::from(console.as_u32()), Release);
     FS_ENDPOINT.store(u64::from(filesystem.as_u32()), Release);
 
-    let pinned = sched::SpawnOptions::new().pinned();
-    sched::spawn_on_with(cpu, "console", console_service, 0, hhdm_base, pinned)
-        .map_err(|_| "the console service would not spawn")?;
+    // The console, wherever the table put it.
+    #[cfg(not(console_in_domain))]
+    {
+        let pinned = sched::SpawnOptions::new().pinned();
+        sched::spawn_on_with(cpu, "console", console_service, 0, hhdm_base, pinned)
+            .map_err(|_| "the console service would not spawn")?;
+    }
+    #[cfg(console_in_domain)]
+    crate::start_console_domain(cpu, hhdm_base)?;
     // The filesystem, wherever `services.toml` put it. One of these two lines
     // is compiled and the other is not, which is what makes the table a
     // decision rather than a description.
@@ -130,8 +142,14 @@ pub fn start(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
 
 /// Where the console runs in this build.
 ///
-/// In the nucleus, and there is nowhere else for it yet: a console in a domain
-/// needs a driver to talk to, which is RFC 0013 step 6's problem.
+/// In a domain it holds a `Console` capability: put a character, take a byte,
+/// and nothing else. The driver stays in the kernel — moving *that* out is
+/// step 6 — so what this placement buys is not a smaller kernel but a smaller
+/// blast radius, which is the half worth having first.
+#[cfg(console_in_domain)]
+pub const CONSOLE_PLACEMENT: &str = "domain";
+/// Where the console runs in this build.
+#[cfg(not(console_in_domain))]
 pub const CONSOLE_PLACEMENT: &str = "nucleus";
 
 /// Where the filesystem runs in this build.
@@ -147,6 +165,11 @@ pub const VFS_PLACEMENT: &str = "domain";
 pub const VFS_PLACEMENT: &str = "nucleus";
 
 /// Runs a service in the nucleus placement, for ever.
+///
+/// Compiled out when every service is in a domain, which is a build where the
+/// nucleus runs no service at all — the state RFC 0013 is aiming at, reached
+/// here for the first time.
+#[cfg(any(not(console_in_domain), not(vfs_in_domain)))]
 ///
 /// Dispatch is through IPC and not by direct call, which RFC 0013 decided on
 /// acceptance: a direct call is faster and is also the door through which "no
@@ -189,6 +212,7 @@ fn run<S: Service>(endpoint: ipc::EndpointId, context: S::Context) -> ! {
 }
 
 /// Answers the console endpoint, for ever.
+#[cfg(not(console_in_domain))]
 extern "C" fn console_service(_argument: u64) -> ! {
     let Some(endpoint) = console_endpoint() else {
         sched::exit()
@@ -241,42 +265,51 @@ fn filesystem_bulk() -> Bulk {
 /// domain these become calls out to a driver, and the console itself does not
 /// change — which is the claim RFC 0013 makes, and the reason the console is
 /// the first service to be compiled apart from the kernel.
+#[cfg(not(console_in_domain))]
 fn console_ports() -> Ports {
-    use core::sync::atomic::Ordering::Relaxed;
     Ports {
-        put: |character| crate::print!("{character}"),
-        read: crate::input::read,
-        try_read: crate::input::try_read,
-        counted: |written, read| {
-            WRITTEN.fetch_add(written, Relaxed);
-            READ.fetch_add(read, Relaxed);
+        put: |character| {
+            crate::print!("{character}");
+            counted(1, 0);
+        },
+        read: || {
+            let byte = crate::input::read();
+            counted(0, 1);
+            byte
+        },
+        try_read: || {
+            let byte = crate::input::try_read();
+            if byte.is_some() {
+                counted(0, 1);
+            }
+            byte
         },
     }
+}
+
+/// Records what the console moved, wherever the service that asked for it runs.
+///
+/// Counted by the placement and not by the service, because these are things
+/// the placement *does*: in the nucleus it is the three functions above, and in
+/// a domain it is the three system calls behind the console capability. Either
+/// way the number means the same, which a counter inside the service could not
+/// have managed without a fourth system call for bookkeeping.
+pub fn counted(written: u64, read: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    WRITTEN.fetch_add(written, Relaxed);
+    READ.fetch_add(read, Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bhaskix_abi::{outcome, outcome_of};
 
-    #[test]
-    fn a_service_answers_a_method_it_does_not_know() {
-        // RFC 0013's fourth rule, and the one a trait can actually enforce: a
-        // malformed request is a *reply*, not an unwind. Runnable on the host
-        // with no machine underneath it, which is most of the point of putting
-        // a service's logic behind a trait.
-        let args = [0u64; 4];
-        let reply = Console::handle(
-            &mut (),
-            &console_ports(),
-            Request {
-                method: 0xdead_beef,
-                args: &args,
-                badge: 1,
-            },
-        );
-        assert_eq!(outcome_of(reply.args[0]), outcome::WRONG_KIND);
-    }
+    // The trait's fourth rule -- a malformed request is a reply, not an
+    // unwind -- was tested here against the nucleus placement's ports. It has
+    // moved to the console crate, where it runs against fake ports and is
+    // therefore true of *both* placements. A test that only compiles when a
+    // service is in the nucleus is a test that stops running exactly when the
+    // service starts being somewhere new.
 
     #[test]
     fn a_service_names_itself_for_the_placement_table() {

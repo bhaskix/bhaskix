@@ -336,7 +336,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 3 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 4 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -600,6 +600,9 @@ expected=$(awk '
 if [[ -n ${BHASKIX_PLACEMENT_VFS:-} ]]; then
     expected=$(sed "s/vfs=[a-z]*/vfs=$BHASKIX_PLACEMENT_VFS/" <<<"$expected")
 fi
+if [[ -n ${BHASKIX_PLACEMENT_CONSOLE:-} ]]; then
+    expected=$(sed "s/console=[a-z]*/console=$BHASKIX_PLACEMENT_CONSOLE/" <<<"$expected")
+fi
 
 if [[ -z $expected ]]; then
     fail "services.toml lists no services, so the placement gate would check nothing"
@@ -609,6 +612,25 @@ elif grep -qF "placement      $expected, dispatched by message" "$LOG"; then
 else
     fail "placement disagrees with services.toml (expected: $expected)"
     grep -E "placement" "$LOG" || true
+    status=1
+fi
+
+# One address space per user program, and the count says how many. This was one
+# for the whole of M5 and M6 -- the kernel kept a single installed space, which
+# with one user program at a time is indistinguishable from keeping the right
+# one, and nothing reported it. Two services in their own domains landed on one
+# CPU and ran in each other's page table.
+#
+# The expectation is derived rather than fixed: the shell always has one, and
+# each service placed in a domain is another program with its own memory. A
+# fixed number would have to be wrong in three of the four placements.
+domains=$(grep -o "=domain" <<<"$expected" | wc -l)
+want=$((1 + domains))
+spaces=$(sed -n 's/.*address spaces \([0-9]*\) in use at once.*/\1/p' "$LOG" | tail -1)
+if [[ -n $spaces ]] && ((spaces >= want)); then
+    pass "each user program has an address space of its own ($spaces, wanted $want)"
+else
+    fail "wanted at least $want address spaces in use, found ${spaces:-none}"
     status=1
 fi
 

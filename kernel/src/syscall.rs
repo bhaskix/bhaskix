@@ -121,6 +121,10 @@ const _: () = {
     assert!(Kind::Yield as u64 == bhaskix_abi::syscall::YIELD);
     assert!(Kind::Exit as u64 == bhaskix_abi::syscall::EXIT);
     assert!(method::FILL == bhaskix_abi::method::FILL);
+    assert!(method::PUT == bhaskix_abi::method::PUT);
+    assert!(method::TAKE == bhaskix_abi::method::TAKE);
+    assert!(method::POLL == bhaskix_abi::method::POLL);
+    assert!(method::NOTHING == bhaskix_abi::method::NOTHING);
     assert!(Status::Ok as u64 == bhaskix_abi::status::OK);
     assert!(Status::NoSuchCapability as u64 == bhaskix_abi::status::NO_SUCH_CAPABILITY);
     assert!(Status::Revoked as u64 == bhaskix_abi::status::REVOKED);
@@ -196,6 +200,23 @@ pub mod method {
     pub const ACK: u64 = 36;
     /// Give the source up: masked permanently, vector freed, claim released.
     pub const RELEASE: u64 = 37;
+    /// Put one character on the console this capability names.
+    ///
+    /// Only on a `Console` capability. `arg0` = the character.
+    pub const PUT: u64 = 39;
+    /// Take a byte that was typed, waiting until there is one.
+    ///
+    /// Only on a `Console` capability. Blocks, which is why a holder that
+    /// does this is not answering anything else while it waits.
+    pub const TAKE: u64 = 40;
+    /// Take a byte only if one is already waiting.
+    ///
+    /// Only on a `Console` capability. Returns the byte, or [`NOTHING`] if
+    /// nobody has typed — the value is out of a byte's range, so "nothing"
+    /// cannot be confused with a byte that was read.
+    pub const POLL: u64 = 41;
+    /// What [`POLL`] returns when nothing was waiting.
+    pub const NOTHING: u64 = 0x100;
     /// Write bytes into memory the caller of this endpoint named.
     ///
     /// Only on an `Endpoint` capability, and only from the thread that is
@@ -710,6 +731,50 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // A `DmaWindow` method, which does not block but must not run locked: a
     // map may allocate a page-table level, and allocating takes the heap,
     // which ranks outside the capability arena the method was resolved under.
+    // The console, as a capability. Three methods and no more: put a
+    // character, take a byte, look for a byte. A console service in its own
+    // domain holds one of these and can do exactly that; the same service in
+    // the nucleus can do anything, which is what the placement is for.
+    if kind == Some(Kind::Invoke)
+        && matches!(frame.method, method::PUT | method::TAKE | method::POLL)
+    {
+        let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Console) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        let _ = resolved;
+
+        return match frame.method {
+            method::PUT => {
+                // One character, filtered by the *service* and not here. The
+                // kernel's job is the device; deciding that an escape
+                // sequence must not reach it is policy, and policy is what
+                // was moved out.
+                let character = char::from_u32(frame.arg0 as u32).unwrap_or('?');
+                crate::print!("{character}");
+                crate::service::counted(1, 0);
+                Outcome::ok(0)
+            }
+            method::TAKE => {
+                // Blocks. A holder waiting here is not answering anything
+                // else, which is the same limit the service has always had
+                // and which travelled with it.
+                let byte = crate::input::read();
+                crate::service::counted(0, 1);
+                Outcome::ok(u64::from(byte))
+            }
+            _ => match crate::input::try_read() {
+                Some(byte) => {
+                    crate::service::counted(0, 1);
+                    Outcome::ok(u64::from(byte))
+                }
+                // Out of a byte's range, so a caller cannot mistake "nothing"
+                // for something somebody typed.
+                None => Outcome::ok(method::NOTHING),
+            },
+        };
+    }
+
     // The domain placement's bulk path. Held to the same three checks the
     // nucleus one passes, in the same order: the endpoint capability proves
     // this thread is a server, the reply obligation says which caller, and the

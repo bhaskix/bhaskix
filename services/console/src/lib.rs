@@ -27,11 +27,16 @@ pub struct Ports {
     pub read: fn() -> u8,
     /// Takes a byte if one is already waiting, without blocking.
     pub try_read: fn() -> Option<u8>,
-    /// Records bytes written and bytes read, for the boot report. The service
-    /// counts nothing itself: a counter in here would be state that a restart
-    /// silently resets, and the numbers are the placement's to keep.
-    pub counted: fn(written: u64, read: u64),
 }
+
+// There is deliberately no counter here.
+//
+// An earlier version had one, and the service called it. That works in the
+// nucleus, where the service is inside the thing keeping the number, and not
+// in a domain, where it would have to be a fourth system call whose only
+// purpose is bookkeeping — or a number the boot report cannot see. The three
+// above are all done *by* the placement, so the placement counts them, and the
+// count means the same thing wherever the service runs.
 
 /// The console.
 pub struct Console;
@@ -76,7 +81,6 @@ fn write(ports: &Ports, args: &[u64; 4]) -> [u64; 4] {
         (ports.put)(character);
     }
 
-    (ports.counted)(chunk.len() as u64, 0);
     [chunk.len() as u64, 0, 0, 0]
 }
 
@@ -99,7 +103,6 @@ fn read(ports: &Ports) -> [u64; 4] {
         }
     }
 
-    (ports.counted)(0, length as u64);
     let (chunk, _) = Chunk::take(&bytes[..length]);
     chunk.pack(0)
 }
@@ -124,7 +127,6 @@ mod tests {
     /// wired up the way the kernel is rather than a more convenient way.
     static PUT: Mutex<String> = Mutex::new(String::new());
     static TYPED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-    static COUNTED: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
     /// A poisoned lock is recovered rather than unwrapped: the workspace
     /// denies `unwrap` everywhere including tests, and here that lint is
@@ -142,11 +144,6 @@ mod tests {
             try_read: || {
                 let mut typed = held(&TYPED);
                 (!typed.is_empty()).then(|| typed.remove(0))
-            },
-            counted: |written, read| {
-                let mut counted = held(&COUNTED);
-                counted.0 += written;
-                counted.1 += read;
             },
         }
     }

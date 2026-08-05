@@ -34,8 +34,10 @@ PROBE_DIR    := user/probe
 PROBE        := $(PROBE_DIR)/target/$(TARGET)/release/probe
 SHELL_DIR    := user/shell
 VFSD_DIR     := user/vfsd
+CONSOLED_DIR := user/consoled
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
+USER_CONSOLED := $(CONSOLED_DIR)/target/$(TARGET)/release/consoled
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
 # kernel's PIC/kernel-code-model settings are wrong for a user program linked
@@ -46,6 +48,8 @@ SHELL_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(SHELL_DIR)/link.ld
 VFSD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(VFSD_DIR)/link.ld
+CONSOLED_FLAGS := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(CONSOLED_DIR)/link.ld
 
 # 256 MiB is comfortably more than the kernel needs and small enough that the
 # memory-map output stays readable.
@@ -124,13 +128,14 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
 	cp $(PROBE) $(INITRD_ROOT)/bin/probe
 	cp $(USER_SHELL) $(INITRD_ROOT)/bin/shell
 	cp $(USER_VFSD) $(INITRD_ROOT)/bin/vfsd
+	cp $(USER_CONSOLED) $(INITRD_ROOT)/bin/consoled
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
 	@echo "built $@ ($$(stat -c%s $@) bytes)"
@@ -159,6 +164,14 @@ $(USER_VFSD): $(VFSD_DIR)/src/main.rs $(VFSD_DIR)/link.ld $(VFSD_DIR)/Cargo.toml
               $(wildcard abi/src/*.rs) $(wildcard services/vfs/src/*.rs) \
               $(wildcard service/src/*.rs) $(wildcard service-domain/src/*.rs)
 	cd $(VFSD_DIR) && RUSTFLAGS="$(VFSD_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# The console service as a program, for the domain placement.
+$(USER_CONSOLED): $(CONSOLED_DIR)/src/main.rs $(CONSOLED_DIR)/link.ld $(CONSOLED_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs) $(wildcard services/console/src/*.rs) \
+              $(wildcard service/src/*.rs) $(wildcard service-domain/src/*.rs)
+	cd $(CONSOLED_DIR) && RUSTFLAGS="$(CONSOLED_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
@@ -227,10 +240,14 @@ test-host:
 # Two boots, not two builds. A build proves it compiles; only a boot proves the
 # service answers, and the whole claim is that it answers the same either way.
 test-placements:
-	@for placement in nucleus domain; do \
-	    echo "  vfs=$$placement"; \
-	    BHASKIX_PLACEMENT_VFS=$$placement $(MAKE) --no-print-directory iso >/dev/null || exit 1; \
-	    BHASKIX_PLACEMENT_VFS=$$placement tests/qemu/boot-test.sh bios || exit 1; \
+	@for console in nucleus domain; do \
+	  for vfs in nucleus domain; do \
+	    echo "  console=$$console vfs=$$vfs"; \
+	    BHASKIX_PLACEMENT_CONSOLE=$$console BHASKIX_PLACEMENT_VFS=$$vfs \
+	        $(MAKE) --no-print-directory iso >/dev/null || exit 1; \
+	    BHASKIX_PLACEMENT_CONSOLE=$$console BHASKIX_PLACEMENT_VFS=$$vfs \
+	        tests/qemu/boot-test.sh bios || exit 1; \
+	  done; \
 	done
 
 test-boot: $(ISO)
@@ -268,6 +285,7 @@ fmt:
 	cd $(PROBE_DIR) && $(CARGO) fmt --all --check
 	cd $(SHELL_DIR) && $(CARGO) fmt --all --check
 	cd $(VFSD_DIR) && $(CARGO) fmt --all --check
+	cd $(CONSOLED_DIR) && $(CARGO) fmt --all --check
 
 # Two passes, because they cover different things. `--all-targets` cannot be
 # used on the freestanding target: it would try to build the test harness,
@@ -282,6 +300,8 @@ clippy:
 	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(VFSD_DIR) && RUSTFLAGS="$(VFSD_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(CONSOLED_DIR) && RUSTFLAGS="$(CONSOLED_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 
 # The project-specific invariants from docs/. Each one is cheap and catches a
@@ -330,6 +350,7 @@ clean:
 	cd $(PROBE_DIR) && $(CARGO) clean
 	cd $(SHELL_DIR) && $(CARGO) clean
 	cd $(VFSD_DIR) && $(CARGO) clean
+	cd $(CONSOLED_DIR) && $(CARGO) clean
 	rm -rf build
 
 distclean: clean

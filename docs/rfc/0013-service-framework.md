@@ -287,6 +287,16 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
      placement and failed in the other while the service behaved identically in both. It now
      reports what the test observed.
 4. **The boot with everything in a domain**, and the shell tests running against it.
+
+   *Done, 2026-08-05.* `bin/consoled` joins `bin/vfsd`: the console service holds a `Console`
+   capability — put a character, take a byte — and nothing else. In that build the nucleus runs no
+   service at all. All four placement combinations boot and pass, every build.
+
+   It also found the thing that made "everything in a domain" impossible: the kernel had kept a
+   single installed address space since M5, and the scheduler never touched `CR3`. With one user
+   program at a time that is indistinguishable from keeping the right one. Two services in domains
+   on one CPU ran in each other's page table — and every boot gate passed while they did, because
+   nothing in the boot self-tests runs two user programs at once.
 5. **The measurement**, per service and per placement, against the table above.
 6. **A second service in a domain** — the block driver, which is where RFC 0011 step 6 and RFC 0012
    step 7 stop being self-tests and become a driver.

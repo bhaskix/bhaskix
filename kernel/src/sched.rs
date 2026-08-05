@@ -226,6 +226,17 @@ pub struct Thread {
     /// True for the thread each CPU registers for itself: it runs on the stack
     /// that CPU booted on, so "move it elsewhere" is not a meaningful request.
     pub pinned: bool,
+    /// The page table this thread runs in, or zero for the kernel's.
+    ///
+    /// Kernel threads leave this zero and run in whatever is loaded, which is
+    /// safe because every address space carries the same higher half. A user
+    /// thread cannot: its code, stack and data are in the lower half, and
+    /// resuming in the space that happened to run last would put it in another
+    /// program's memory. That is not hypothetical — it is what two services in
+    /// domains on one CPU did, and the only reason it had never happened is
+    /// that there had never been two user programs on one CPU at once.
+    pub space_root: u64,
+
     /// The caller this thread received from and has not yet answered.
     ///
     /// Set when a message is taken, cleared when it is answered. It exists so
@@ -662,6 +673,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         runs: 1,
         migrations: 0,
         held_locks: 0,
+        space_root: 0,
         reply_to: None,
         domain: u32::MAX,
         mailbox: None,
@@ -856,6 +868,7 @@ pub fn spawn_on_with(
         runs: 0,
         migrations: 0,
         held_locks: 0,
+        space_root: 0,
         reply_to: None,
         domain: options.domain,
         mailbox: None,
@@ -955,6 +968,40 @@ pub fn deliver(thread: u32, message: crate::ipc::Message, from: u32) -> bool {
         }
     }
     false
+}
+
+/// Records the page table `thread` runs in.
+///
+/// Called by `vm::install`, which is the only thing that gives a thread one.
+pub fn set_space_root(thread: u32, root: u64) {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            target.space_root = root;
+            return;
+        }
+    }
+}
+
+/// Loads `thread`'s page table if it has one and it is not already loaded.
+///
+/// Called on the way into a thread, with the runqueue lock released. Skipped
+/// for kernel threads, which every address space maps identically.
+fn enter_space(root: u64) {
+    if root == 0 {
+        return;
+    }
+    // SAFETY: reading CR3 has no side effects.
+    let current = unsafe { bhaskix_arch::paging::active_page_table() };
+    if current == root {
+        return;
+    }
+    // SAFETY: `root` was recorded by `vm::install` for a space it built, and
+    // every such space copies the kernel's higher half -- so the code running
+    // here, its stack and the descriptor tables stay mapped across the load.
+    unsafe {
+        bhaskix_arch::paging::switch_address_space(root);
+    }
 }
 
 /// Records that `thread` owes `caller` an answer.
@@ -1237,9 +1284,24 @@ fn try_steal(cpu: usize, mine: &mut RunQueue) -> Option<usize> {
 /// missing a path does not corrupt anything, it quietly stops balancing.
 fn finish_switch() {
     let cpu = percpu::cpu_id() as usize;
+    let mut root = 0;
     if cpu < MAX_CPUS {
-        QUEUES[cpu].lock().switching = false;
+        let mut queue = QUEUES[cpu].lock();
+        queue.switching = false;
+        root = queue
+            .threads
+            .get(queue.current)
+            .and_then(|thread| thread.as_ref())
+            .map_or(0, |thread| thread.space_root);
     }
+
+    // Each thread loads its own address space as it resumes, rather than
+    // something loading it on the way out. That way a thread stolen to another
+    // CPU still arrives in its own space, and a CPU that has been running
+    // kernel threads need not remember whose space it left loaded. The
+    // runqueue lock above has gone out of scope by now: switching `CR3`
+    // touches no kernel data, so there is no reason to hold one across it.
+    enter_space(root);
 }
 
 /// Hook the thread trampoline calls before a brand-new thread starts.
@@ -2260,6 +2322,7 @@ mod tests {
             runs: 0,
             migrations: 0,
             held_locks: 0,
+            space_root: 0,
             reply_to: None,
             domain: u32::MAX,
             mailbox: None,

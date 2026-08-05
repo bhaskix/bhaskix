@@ -20,9 +20,14 @@
 
 [[service]]
 name = "console"
-placement = "nucleus"
+placement = "domain"
 crate = "services/console"
 package = "bhaskix-service-console"
+# In a domain as of RFC 0013 step 4. It holds a `Console` capability -- put a
+# character, take a byte -- and nothing else, so a console service talked into
+# doing something it should not can still only put characters and take bytes.
+# The driver stays in the kernel; moving that out is step 6. What this buys is
+# not a smaller kernel but a smaller blast radius.
 relocatable = true
 
 [[service]]

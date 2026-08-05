@@ -88,6 +88,12 @@ PLACEMENTS: dict[str, set[str]] = {
         "bhaskix-service-domain",
         "bhaskix-service-vfs",
     },
+    "bhaskix-user-consoled": {
+        "bhaskix-abi",
+        "bhaskix-service",
+        "bhaskix-service-domain",
+        "bhaskix-service-console",
+    },
 }
 
 # Third-party crates permitted in the tree. Empty on purpose: Bhaskix has no

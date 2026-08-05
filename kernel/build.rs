@@ -28,18 +28,29 @@ fn main() {
     let table = Path::new("..").join("services.toml");
     println!("cargo::rerun-if-changed={}", table.display());
     println!("cargo::rustc-check-cfg=cfg(vfs_in_domain)");
+    println!("cargo::rustc-check-cfg=cfg(console_in_domain)");
 
     // The override RFC 0013 resolved question 3 with. It exists so that CI can
     // build *both* placements of a service from one tree: without it, testing
     // the other placement would mean editing the table, and a test that edits
     // the file it is testing is not testing it.
-    println!("cargo::rerun-if-env-changed=BHASKIX_PLACEMENT_VFS");
-    if let Ok(placement) = std::env::var("BHASKIX_PLACEMENT_VFS") {
-        match placement.as_str() {
-            "domain" => println!("cargo::rustc-cfg=vfs_in_domain"),
-            "nucleus" => {}
-            other => panic!("BHASKIX_PLACEMENT_VFS={other:?} is not a placement"),
+    let mut overridden = false;
+    for (service, cfg) in [("VFS", "vfs_in_domain"), ("CONSOLE", "console_in_domain")] {
+        let variable = format!("BHASKIX_PLACEMENT_{service}");
+        println!("cargo::rerun-if-env-changed={variable}");
+        if let Ok(placement) = std::env::var(&variable) {
+            overridden = true;
+            match placement.as_str() {
+                "domain" => println!("cargo::rustc-cfg={cfg}"),
+                "nucleus" => {}
+                other => panic!("{variable}={other:?} is not a placement"),
+            }
         }
+    }
+    // All or nothing: overriding one service and reading the table for the
+    // other would build a machine that no single description of it matches,
+    // and the boot gate compares against one description.
+    if overridden {
         return;
     }
 
@@ -57,8 +68,12 @@ fn main() {
                 "nucleus" | "domain" => {}
                 other => panic!("services.toml: {name} has placement {other:?}"),
             }
-            if name == "vfs" && placement == "domain" {
-                println!("cargo::rustc-cfg=vfs_in_domain");
+            if placement == "domain" {
+                match name.as_str() {
+                    "vfs" => println!("cargo::rustc-cfg=vfs_in_domain"),
+                    "console" => println!("cargo::rustc-cfg=console_in_domain"),
+                    other => panic!("services.toml: {other} has no domain placement to build"),
+                }
             }
         }
     }
