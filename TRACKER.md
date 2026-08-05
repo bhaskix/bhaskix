@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-10 (RFC 0013 steps 1–5, step 6 two thirds) · CI green · 380 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-11 (RFC 0013 steps 1–5; step 6 has all three primitives, not the driver) · CI green · 386 suite checks · 45 boot gates per placement (4 placements), 52 with an IOMMU · 276 host assertions |
 
 ### Division of responsibility between documents
 
@@ -151,6 +151,7 @@ fairness within 2% for two equal-weight workloads.
 | M7-08 | RFC 0013 step 6a: a domain can map memory it holds | ✅ `DONE` | `method::ATTACH` — a domain maps a `Memory` capability into **its own** address space, at an address of its choosing, from frames the object supplies rather than any it names. Never executable, per RFC 0009. **The first thing a driver in a domain needs:** its descriptor rings are memory it holds and the device reaches by `DevAddr`, and it cannot fill them in without seeing them. Exercised from ring 3 by the shell's new `map` command, which holds **two capabilities to one object** — writable and read-only — so the refusal tests the *right* and not the lookup. Watched failing: with the rights check removed the shell gets a writable mapping of read-only memory and the gate says so. |
 | M7-09 | RFC 0013 step 6b: device registers as a capability | ✅ `DONE` | `ATTACH` now takes a `Frame` capability too: one physical page, mapped **uncached and write-through** into the caller's own space, never executable. The kernel mints one for the block device's common configuration window; **the shell reads the device's status register from ring 3 and gets 15** — acknowledge, driver, features-ok, driver-ok, the device agreeing a driver brought it up. It cannot name a physical address, cannot ask for a different page, and is refused a writable mapping of the one it has. Watched failing by mapping one page over: `status 1`, and the gate said so. The second of the three things a driver in a domain needs. |
 | M7-10 | A test that had been told not to race, and did | ✅ `DONE` | `notify`'s test module said *"one test, because the slots are a global and cargo runs tests in parallel"* — and had two. The second drained the arena and asserted it came back empty, which it does not when the first is holding a slot. It failed once in a full run and passed on every re-run. A comment asking people to keep to one test was never going to hold; the tests take a mutex now. |
+| M7-11 | RFC 0013 step 6c: a domain is woken by a notification | ✅ `DONE` | `method::WAIT` and `method::PEEK` on a `Notification` capability. **The shell, in ring 3, is woken by one and reads the badge** — holding no vector, no interrupt controller and no way to reach either. Taking is once: the second look finds nothing, because a notification is a signal and not a queue. A capability with the write right and not the read right is **refused a take** — same object, weaker capability. The third and last of the things a driver in a domain needs. What the shell is woken by is a kernel signal rather than a device, deliberately: that an *interrupt* reaches a notification is gated where the interrupt is (M5, delegation self-test), and what was missing was only the last link. |
 
 ### Honest notes on M6 so far
 
@@ -638,6 +639,26 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-05 (RFC 0013 step 6c — the last link, and a negative test that was lying)
+
+- **A program in ring 3 is woken by a notification**, takes the badge, and finds nothing on the
+  second look. That is the whole of what a driver in a domain needs for interrupts: its device
+  raises one, the kernel masks the source and signals, and the driver wakes — holding no vector and
+  no way to reach an interrupt controller.
+- **The signal here comes from the kernel, not from a device, and that is deliberate.** An interrupt
+  reaching a notification is already gated in the delegation self-test. What had never been
+  exercised was the last link, and testing it against a real device interrupt would have meant a
+  test that blocks until the machine happens to interrupt — a test of luck.
+- **The negative test passed for two runs while testing nothing.** The edit that was supposed to
+  remove the rights check never applied — a `replace` that matched nothing and said nothing, the
+  same silent no-op that the em dash in `services.toml` caused earlier this session. Both times the
+  check "passed" and both times that was the tell: a gate that stays green when you break the thing
+  it guards is either wrong or was never broken. Applying the edit by line number rather than by
+  text made the machine say `TOOK, which it should not`, which is what the gate is for.
+- **`shell-test.sh` can keep its log now**, like `boot-test.sh`. Both print the serial output only
+  on failure, which is right for a gate and useless when the question is what the machine actually
+  said — and answering that question with `head -5` cost a wrong conclusion before the log existed.
 
 ### 2026-08-05 (RFC 0013 step 6b — a page of hardware, reached by capability)
 

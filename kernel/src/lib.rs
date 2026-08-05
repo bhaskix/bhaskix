@@ -1763,6 +1763,45 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
     }
 
+    // A notification, at slot 6, and the same one write-only at slot 7.
+    //
+    // Signalled here, before the shell exists, so that waiting on it answers
+    // immediately: a test that blocked until something happened to interrupt
+    // would be a test of the machine's luck. The *source* of a signal is not
+    // what this exercises -- an interrupt reaching a notification is already
+    // gated, in the delegation self-test above. What was missing is the last
+    // link: a program in ring 3 waiting on one and being woken.
+    //
+    // Slot 7 carries the write right and not the read right, which is the
+    // wrong way round for waiting and is exactly the point: a capability that
+    // names the notification and may not take from it.
+    const SHELL_SIGNAL: u64 = 0xb10c;
+    let notification = notify::create().map_err(|_| "no notification for the shell")?;
+    let (readable, writable) = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(
+                    cap::ObjectKind::Notification,
+                    u64::from(notification.index()) | (u64::from(notification.generation()) << 32),
+                ),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        let readable = arena.derive(root, cap::Rights::READ, 0).ok()?;
+        let writable = arena.derive(root, cap::Rights::WRITE, 0).ok()?;
+        Some((readable, writable))
+    })
+    .ok_or("the shell's notification capabilities would not be created")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(6, readable).is_ok() && owner.cspace.install_at(7, writable).is_ok()
+    }) != Some(true)
+    {
+        return Err("the shell's notification capabilities would not install");
+    }
+    notify::signal(notification, SHELL_SIGNAL)
+        .map_err(|_| "the shell's notification would not signal")?;
+
     // Clamped to what the machine actually has, so a single-processor machine
     // gets a shell on the only CPU there is rather than an error.
     let cpu = SHELL_CPU.min(bhaskix_arch::percpu::online_count().saturating_sub(1));

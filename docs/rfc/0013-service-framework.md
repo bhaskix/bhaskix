@@ -324,8 +324,13 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
    through one. Only the kernel can mint a `Frame`, because a `Frame` *is* a physical address and a
    capability a domain could make would be permission to be the kernel.
 
-   The third — interrupts delivered to a domain as a notification it can wait on — is not started,
-   and neither is the driver.
+   The third is built: `method::WAIT` and `method::PEEK` on a `Notification` capability, and the
+   shell is woken by one in ring 3, reads the badge, finds nothing on the second look, and is
+   refused a take through a capability carrying the write right and not the read right.
+
+   All three primitives a driver in a domain needs now exist. **The driver itself does not**: the
+   virtio queue logic is still in the kernel, and moving it means a crate for the transport with PCI
+   configuration space left behind, because config space is port I/O and a domain cannot have it.
 
 Steps 1–2 are the mechanism. Steps 3–5 are the proof. Step 6 is the first driver outside the
 kernel, and the reason the previous four RFCs exist.

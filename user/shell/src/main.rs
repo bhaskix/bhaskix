@@ -46,6 +46,10 @@ const MEMORY_RW: u64 = 3;
 const MEMORY_RO: u64 = 4;
 /// One page of the block device's registers, read-only.
 const DEVICE_WINDOW: u64 = 5;
+/// A notification this program may wait on.
+const SIGNAL: u64 = 6;
+/// The same notification, with the write right and not the read right.
+const SIGNAL_WRITE_ONLY: u64 = 7;
 
 /// What a system call returned: the status, and the message's four registers.
 struct Reply {
@@ -370,6 +374,52 @@ fn map() {
     }
 }
 
+/// Waits on a notification, and is refused one it may not take from.
+///
+/// The last thing a driver in a domain needs. Its device raises an interrupt,
+/// the kernel masks the source and signals a notification, and the driver
+/// wakes here — holding no vector, no interrupt controller and no way to reach
+/// either. This program is woken by the kernel rather than by a device, which
+/// is the same last link: what a device causes is the *signal*, and that an
+/// interrupt reaches a notification is gated where the interrupt is.
+fn signals() {
+    write(b"  6  signal rd  ");
+    let woken = syscall(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+    if woken.status == status::OK {
+        write(b"woke with badge ");
+        write_number(woken.args[0]);
+        write(b"\n");
+    } else {
+        write(b"status ");
+        write_number(woken.status);
+        write(b"\n");
+    }
+
+    // Taken means taken. A notification is a signal and not a queue, so the
+    // second look finds nothing rather than the same wake again.
+    write(b"  6  signal rd  ");
+    let again = syscall(syscall::INVOKE, SIGNAL, method::PEEK, [0; 4]);
+    if again.status == status::OK && again.args[0] == 0 {
+        write(b"nothing left after taking it\n");
+    } else {
+        write(b"still ");
+        write_number(again.args[0]);
+        write(b"\n");
+    }
+
+    // The same notification, through a capability that may not take from it.
+    write(b"  7  signal wr  ");
+    match syscall(syscall::INVOKE, SIGNAL_WRITE_ONLY, method::PEEK, [0; 4]).status {
+        status::INSUFFICIENT_RIGHTS => write(b"refused a take\n"),
+        status::OK => write(b"TOOK, which it should not\n"),
+        other => {
+            write(b"status ");
+            write_number(other);
+            write(b"\n");
+        }
+    }
+}
+
 fn list(path: &[u8]) {
     let _ = call(FILESYSTEM, fs::RESET, [0; 4]);
     if !send_path(path) {
@@ -497,6 +547,7 @@ fn run(line: &[u8]) {
         b"ls" => list(rest),
         b"caps" => capabilities(),
         b"map" => map(),
+        b"irq" => signals(),
         b"cat" => {
             if rest.is_empty() {
                 write(b"  cat: which file?\n");

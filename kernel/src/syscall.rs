@@ -122,6 +122,8 @@ const _: () = {
     assert!(Kind::Exit as u64 == bhaskix_abi::syscall::EXIT);
     assert!(method::FILL == bhaskix_abi::method::FILL);
     assert!(method::ATTACH == bhaskix_abi::method::ATTACH);
+    assert!(method::WAIT == bhaskix_abi::method::WAIT);
+    assert!(method::PEEK == bhaskix_abi::method::PEEK);
     assert!(Status::InsufficientRights as u64 == bhaskix_abi::status::INSUFFICIENT_RIGHTS);
     assert!(Status::SlotUnavailable as u64 == bhaskix_abi::status::SLOT_UNAVAILABLE);
     assert!(method::PUT == bhaskix_abi::method::PUT);
@@ -203,6 +205,29 @@ pub mod method {
     pub const ACK: u64 = 36;
     /// Give the source up: masked permanently, vector freed, claim released.
     pub const RELEASE: u64 = 37;
+    /// Wait until this notification has been signalled, then take the word.
+    ///
+    /// Only on a `Notification` capability. Blocks, and returns everything
+    /// that was pending — the badges of every signal since the last take,
+    /// or-ed together, which is what makes a notification a *signal* and not a
+    /// queue: two interrupts before the holder looks are one wake carrying
+    /// both badges, and no interrupt is lost by the second overwriting the
+    /// first.
+    ///
+    /// The last thing a driver in a domain needs. Its device raises an
+    /// interrupt, the kernel masks the source and signals the notification,
+    /// and the driver wakes here — with no way to reach the interrupt
+    /// controller, which is the point of it being a capability rather than a
+    /// vector.
+    ///
+    /// One waiter, per RFC 0010: a second is refused rather than queued.
+    pub const WAIT: u64 = 43;
+    /// Take whatever this notification has pending, without waiting.
+    ///
+    /// Only on a `Notification` capability. Zero if nothing has been
+    /// signalled, which is a real answer and not an error — a driver polling
+    /// between requests wants to know "nothing yet" without blocking.
+    pub const PEEK: u64 = 44;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -759,6 +784,44 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // A `DmaWindow` method, which does not block but must not run locked: a
     // map may allocate a page-table level, and allocating takes the heap,
     // which ranks outside the capability arena the method was resolved under.
+    // Waiting on a notification, from a domain.
+    //
+    // In the blocking group below rather than here would be tidier, and wrong:
+    // that group resolves for `Endpoint`. This resolves its own capability,
+    // releases every lock, and only then blocks -- the same shape and the same
+    // reason, which is that blocking while holding the capability arena is how
+    // M5-04 deadlocked the machine.
+    if kind == Some(Kind::Invoke) && matches!(frame.method, method::WAIT | method::PEEK) {
+        let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Notification) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        if !resolved.rights.contains(crate::cap::Rights::READ) {
+            return Outcome::err(Status::InsufficientRights);
+        }
+
+        // The identity is packed the same way `BIND` unpacks it: index in the
+        // low half, generation in the high. One encoding, two readers, and
+        // they have to agree or a holder waits on a notification that is not
+        // the one it was given.
+        let id = crate::notify::NotificationId::from_parts(
+            resolved.object.id as u32,
+            (resolved.object.id >> 32) as u32,
+        );
+        if frame.method == method::PEEK {
+            return Outcome::ok(crate::notify::poll(id));
+        }
+        return match crate::notify::wait(id) {
+            Ok(bits) => Outcome::ok(bits),
+            // Congested: somebody is already waiting, and RFC 0010 refuses a
+            // second rather than queueing. Gone: the notification was
+            // destroyed, which for a holder is indistinguishable from never
+            // having had it and is reported the same way.
+            Err(crate::notify::NotifyError::Congested) => Outcome::err(Status::Congested),
+            Err(_) => Outcome::err(Status::Revoked),
+        };
+    }
+
     // Mapping memory into the caller's own address space.
     if kind == Some(Kind::Invoke) && frame.method == method::ATTACH {
         // A `Memory` object, or one page of device registers. Two kinds, one

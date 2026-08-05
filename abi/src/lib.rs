@@ -99,6 +99,20 @@ pub mod method {
     /// memory.
     pub const FILL: u64 = 38;
 
+    /// Wait until this notification has been signalled, then take the word.
+    ///
+    /// Only on a `Notification` capability. Blocks, and returns the badges of
+    /// every signal since the last take, or-ed together: two signals before
+    /// the holder looks are one wake carrying both, and neither is lost.
+    ///
+    /// One waiter at a time. A second is refused rather than queued.
+    pub const WAIT: u64 = 43;
+    /// Take whatever this notification has pending, without waiting.
+    ///
+    /// Zero if nothing has been signalled, which is an answer and not an
+    /// error.
+    pub const PEEK: u64 = 44;
+
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`

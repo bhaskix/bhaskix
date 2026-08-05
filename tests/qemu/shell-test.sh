@@ -27,7 +27,10 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ISO="$REPO_ROOT/build/bhaskix.iso"
-LOG="$(mktemp)"
+# Overridable so a caller can keep the serial output. The test prints it only
+# when something fails, which is right for a gate and unhelpful when what you
+# want is to see what the machine actually said.
+LOG="${BHASKIX_SHELL_LOG:-$(mktemp)}"
 # Longer than the boot tests', because this one waits for a whole boot *and*
 # then holds a conversation with the machine, and every pause between typed
 # lines is deliberate.
@@ -84,7 +87,7 @@ else
     # `caps` is the one that matters: it asks the kernel about a slot this
     # program was not given, and the refusal comes from the kernel rather than
     # from a service saying no.
-    commands=$'help\r'$'caps\r'$'map\r'$'ls /\r'$'cat etc/hostname\r'$'nosuchcommand\r'
+    commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'ls /\r'$'cat etc/hostname\r'$'nosuchcommand\r'
 fi
 
 # A named pipe rather than a pipeline, for two reasons. QEMU does not exit
@@ -94,7 +97,13 @@ fi
 # be paced against what the machine has actually printed.
 FIFO="$(mktemp -u)"
 mkfifo "$FIFO"
-trap 'rm -f "$LOG" "$FIFO"' EXIT
+# The log survives when the caller named it: they asked for it, so removing it
+# on the way out would answer a different question.
+if [[ -n ${BHASKIX_SHELL_LOG:-} ]]; then
+    trap 'rm -f "$FIFO"' EXIT
+else
+    trap 'rm -f "$LOG" "$FIFO"' EXIT
+fi
 
 echo "booting and typing at it, up to ${TIMEOUT}s..."
 
@@ -180,7 +189,11 @@ status=0
 # not a hypothetical: it did, when the wake-up was removed to check that this
 # test could fail. Only the conversation counts.
 SESSION="$(mktemp)"
-trap 'rm -f "$LOG" "$FIFO" "$SESSION"' EXIT
+if [[ -n ${BHASKIX_SHELL_LOG:-} ]]; then
+    trap 'rm -f "$FIFO" "$SESSION"' EXIT
+else
+    trap 'rm -f "$LOG" "$FIFO" "$SESSION"' EXIT
+fi
 sed -n "/$started/,\$p" "$LOG" > "$SESSION"
 
 # Each check is a *reply* to something typed, not an echo of it. The shell
@@ -224,6 +237,12 @@ else
         # mapping that reaches the hardware could return.
         "a program reads device registers through a capability:5 +device ro +status 15"
         "device registers cannot be written without the right:5 +device rw +refused a writable mapping"
+        # The last link a driver in a domain needs: woken in ring 3 by a
+        # notification, holding no vector and no way to reach an interrupt
+        # controller. 45324 is 0xb10c, the badge the kernel signalled with.
+        "a program in ring 3 is woken by a notification:6 +signal rd +woke with badge 45324"
+        "a notification is a signal and not a queue:6 +signal rd +nothing left after taking it"
+        "taking from a notification needs the right to:7 +signal wr +refused a take"
         "ls read the filesystem through IPC:hello.txt"
         "cat read a file through IPC:^bhaskix.?$"
         "an unknown command was refused:nosuchcommand: not a command"
