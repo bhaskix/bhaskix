@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhaskix-device"
+description = "Registers, and the accessors that make a width a property of one."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_device"
+path = "src/lib.rs"
+
+# Nothing. A register block is arithmetic over an address and two volatile
+# operations, and a crate every driver compiles against should be reachable
+# from a domain, from the kernel, and from a host test harness -- which means
+# depending on none of them.
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# One block: the volatile load and store behind `Volatile`. Every driver that
+# uses this crate gets its register accesses from there instead of writing its
+# own, which is the point -- `user/blkd` has forty-two hand-rolled accesses and
+# each one is an `unsafe` somebody had to be trusted to get right.
+unsafe_budget = 30

@@ -7,8 +7,8 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 |---|---|
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
-| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) is complete; the driver framework is next |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-14) · CI green · 393 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 277 host assertions |
+| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) is complete; the driver framework (M8) is under way |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01 (RFC 0014 step 1) · CI green · 395 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 282 host assertions |
 
 ### Division of responsibility between documents
 
@@ -118,6 +118,18 @@ fairness within 2% for two equal-weight workloads.
 | M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape; there is no network stack. |
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
+
+
+### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
+
+**What it set out to prove:** that the *third* driver will not repeat the first two. RFC 0014's case
+is an invoice — `bin/blkd` cost three bugs the kernel's driver had already learned and written down
+in comments — so the test of this milestone is whether those bugs become impossible rather than
+documented.
+
+| ID | Task | Status | Notes |
+|---|---|---|---|
+| M8-01 | RFC 0014 step 1: `Mmio<T>` and `register_block!` | ✅ `DONE` | **`Bus` has no 64-bit access.** Not one used carefully — it does not have one, so a 64-bit register is two 32-bit accesses because there is nothing else it could be. That is bug 1 made *unrepresentable* rather than fixed. Constructing an `Mmio` is unsafe and using one is not, so a driver spends one `unsafe` per block instead of one per access: `blkd` has forty-two. `register_block!` declares offsets once and checks the layout **at compile time** — two negative fixtures, excluded from the workspace because they must not build, and `make gates` asserts they fail *and say why*. Watched failing: removing the overlap check makes the overlapping block compile and the gate says so. Four host tests, one of which is the test that would have caught the bug this RFC exists for. |
 
 ### M7 — Service framework ([RFC 0013](docs/rfc/0013-service-framework.md))
 
@@ -548,7 +560,7 @@ what is actually ahead.
 | Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
-| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **RFC 0014 accepted**, not started | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
+| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — step 1 done | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ⬜ `TODO` | The filesystem service reads a read-only archive it is handed at entry |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
@@ -691,6 +703,29 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0014 step 1 — a bug made unrepresentable)
+
+- **The fix for bug 1 is that `Bus` has no 64-bit access.** A 64-bit register is two 32-bit
+  accesses because the trait offers nothing else, so the mistake that left a device holding a queue
+  it never looked at cannot be written down. Fixing it in one place would have been enough to be
+  correct; leaving the operation out is what makes it stay correct.
+- **One `unsafe` per block, not one per access.** Constructing an `Mmio` is the promise that an
+  address is a register; reading and writing one is safe afterwards. `user/blkd` currently spends
+  forty-two `unsafe` blocks on the same authority, declared forty-two times where it cannot be
+  checked.
+- **The layout check is a build failure, and it has been watched being one.** A test that asserts a
+  layout at run time is an assertion that ships. `register_block!` checks overlap and overrun in a
+  `const`, so a bad block fails to compile — which cannot be tested from inside the crate, because a
+  test that fails to compile fails the build it is part of. Two fixture crates, excluded from the
+  workspace, and the gate asserts they fail **and say why**: a build broken for an unrelated reason
+  would otherwise read as the check working.
+- **The test that would have caught the original bug now exists.** It asserts the *width and order*
+  of every access, against a fake bus that records both — because a byte buffer cannot tell one
+  eight-byte store from two four-byte ones, and that difference is the whole bug.
+- **The fake bus takes a lock, rather than a comment asking for one.** `notify`'s test module said
+  "one test, because the slots are a global" and then acquired a second that raced the first. This
+  module shares one fake bus between four tests and serialises them.
 
 ### 2026-08-06 (RFC 0014 accepted — a framework whose case is an invoice)
 

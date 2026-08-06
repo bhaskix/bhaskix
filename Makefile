@@ -364,6 +364,30 @@ gates:
 	else \
 	    printf '  \033[1;32mok\033[0m    the placement check rejects a service that calls into the kernel\n'; \
 	fi
+# Register blocks that are wrong about themselves must not build.
+#
+# A compile-time layout check is only worth having if somebody has watched it
+# reject something, and it cannot be tested from inside the crate: a test that
+# fails to compile fails the build it is part of. So the fixtures are separate
+# crates, excluded from the workspace, and the assertion is that `cargo build`
+# fails *and says why* -- a build that failed for an unrelated reason would
+# otherwise read as the check working.
+	@for kind in overlap:"two registers overlap" overrun:"a register leaves the block"; do \
+	    name=$${kind%%:*}; want=$${kind#*:}; \
+	    if $(CARGO) build --quiet --manifest-path tests/fixtures/registers/$$name/Cargo.toml \
+	            >build/registers-$$name.log 2>&1; then \
+	        echo "  FAIL  a register block that is wrong about itself compiled ($$name)"; \
+	        exit 1; \
+	    elif ! grep -q "$$want" build/registers-$$name.log; then \
+	        echo "  FAIL  the $$name fixture failed to build for the wrong reason:"; \
+	        tail -20 build/registers-$$name.log; \
+	        exit 1; \
+	    else \
+	        printf '  \033[1;32mok\033[0m    a register block that %s does not compile\n' \
+	            "$$(test $$name = overlap && echo overlaps || echo overruns)"; \
+	    fi; \
+	done
+
 # And a table that is wrong about itself rather than about a dependency: a
 # service listed twice and a placement that is not a placement. Both must be
 # reported, not just the first -- a check that stops at the first thing it

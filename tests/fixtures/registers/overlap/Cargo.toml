@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A register block that is wrong about itself, and must not build.
+#
+# See src/lib.rs. Excluded from the workspace because it is *supposed* to fail
+# to compile, and `make gates` asserts that it does.
+[package]
+name = "bhaskix-registers-overlap"
+description = "Negative fixture: a register block that must not compile."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "bhaskix_registers_overlap"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-device = { path = "../../../../device" }
+
+[package.metadata.bhaskix]
+unsafe_budget = 0

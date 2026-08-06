@@ -34,6 +34,7 @@ members = [
     # Phase 2 — M7, RFC 0013. The framework, then one crate per service.
     # A service crate depends on the two above it and on nothing else, which
     # `tools/check-placements.sh` checks against `services.toml`.
+    "device",
     "service",
     "service-domain",
     "services/console",
@@ -47,7 +48,14 @@ members = [
 # never be built by anything else, and because the check reads it exactly the
 # way it reads a real service — through `--manifest-path`, one code path, so
 # what the fixture proves is what the check does.
-exclude = ["tests/fixtures/placement/direct-call"]
+exclude = [
+    "tests/fixtures/placement/direct-call",
+    # Register blocks that are wrong about themselves. They must *not* compile,
+    # and `make gates` asserts that -- so they cannot be workspace members,
+    # because a member that never builds is a workspace that never builds.
+    "tests/fixtures/registers/overlap",
+    "tests/fixtures/registers/overrun",
+]
 
 [workspace.package]
 version = "0.0.0"

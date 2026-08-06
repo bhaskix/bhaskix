@@ -46,6 +46,10 @@ LAYERS = {
     # tools/check-placements.sh checks against services.toml. The layering
     # here is the same rule stated once more, in the place that would catch a
     # dependency added to a service crate by hand.
+    # Registers and their accessors. Below everything that drives hardware and
+    # above nothing: it depends on no crate at all, because every driver
+    # compiles against it -- in the kernel, in a domain, and in a host test.
+    "bhaskix-device": -2,
     "bhaskix-service": -1,
     "bhaskix-service-domain": 0,
     "bhaskix-service-console": 0,
