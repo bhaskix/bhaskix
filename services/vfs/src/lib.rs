@@ -11,6 +11,20 @@
 //! shell, which is allowed: the arrow points from the kernel to the service
 //! crate and never back.
 #![no_std]
+// The panic bans exist to stop a fallible operation taking down the service,
+// and a test that cannot panic cannot fail. Stated here because the workspace
+// lint table cannot express a cfg-conditional allow — and stated *now* because
+// until `make test-host` learned to say `--workspace`, this crate's tests were
+// neither run nor linted, so nothing had ever asked.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::undocumented_unsafe_blocks
+    )
+)]
 
 // For the tests only: the archive fixtures build tar images at runtime, which
 // wants a growable buffer. Nothing outside `#[cfg(test)]` allocates -- the

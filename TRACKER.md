@@ -7,8 +7,8 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 |---|---|
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
-| **Active milestone** | **Phase 2 — Core Operating System** (M6 complete but for its fuzzing criterion) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · Phase 2: M7-01 … M7-13 (**RFC 0013 COMPLETE**, steps 1–6) · CI green · 393 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 276 host assertions |
+| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) is complete; the driver framework is next |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-14) · CI green · 393 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 277 host assertions |
 
 ### Division of responsibility between documents
 
@@ -119,6 +119,65 @@ fairness within 2% for two equal-weight workloads.
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
 
+### M7 — Service framework ([RFC 0013](docs/rfc/0013-service-framework.md))
+
+Not a milestone `docs/roadmap.md` numbers: Phase 2 lists its work as bullets rather than milestones,
+and these are the **service framework** one. The numbering is this document's, so that the tasks can
+be referred to at all.
+
+**What it set out to prove**, from `architecture.md` §2: that a service can run inside the kernel or
+in a domain of its own, chosen at build time, with the interface not knowing which. That sentence
+had been in the design documents since M1 and nothing had ever tested it.
+
+**Status: RFC 0013 is complete, steps 1–6.** Both services run in ring 3, a block driver runs in a
+domain of its own, and `services.toml` decides placement at build time. What the milestone did *not*
+do is listed under "What M7 did not do" below — it is short, and none of it is hidden.
+
+| ID | Task | Status | Notes |
+|---|---|---|---|
+| M7-01 | RFC 0013 step 1: the `Service` trait, and the nucleus placement | ✅ `DONE` | `Service`, `Context`, `Request`, `Reply`, and **one** `run::<S>()` loop both services share instead of hand-rolling their own. The success criterion was **no behaviour change** and the boot output is identical — 19 requests, 1 caller refused, 5 entries, 8 bytes, bulk path unchanged. Dispatch is by message in the nucleus too, per the acceptance decision, so the placements differ in *placement* and not in *shape*. Three host tests run the services' logic with no machine under them. The machine now prints `console=nucleus vfs=nucleus`, gated — and that line is **expected to change at step 3**. |
+| M7-02 | RFC 0013 step 2: the placement table, and what makes it true | ✅ `DONE` | `services.toml`, and `tools/check-placements.sh` to give it teeth. The console is now **its own crate**, compiled for `x86_64-unknown-none` with **no kernel in the build** — that compile *is* the domain placement's, and unlike a lint it cannot pass by accident. The rule is enforced against the **resolved dependency graph**, not a search for suspicious lines: a service cannot name `crate::vfs` without depending on the kernel. Two negative fixtures, both run by `make gates`: a service that calls into the kernel (must be rejected **naming `bhaskix-kernel`**), and a table wrong about itself (a name listed twice, a placement of `orbit` — **both** must be reported). The boot line is now built from the table, so the machine and the file cannot drift. **What it cost:** the filesystem is `relocatable = false` in the table, in the file rather than in a comment — its bulk path reads caller pages through the direct map, so it does not compile without the kernel. That is step 3's actual work, now named. |
+| M7-03 | RFC 0013 step 3a: the filesystem becomes relocatable, and a hole closes | ✅ `DONE` | The filesystem is **out of the kernel crate** — `ustar`, `vfs` and the service in `services/vfs`, building for `x86_64-unknown-none` with no kernel in the build. One function did it: the bulk path used to read caller pages through the direct map and now asks its context (`Bulk::fill`). **A security hole was found on the way and closed:** `Reply` took the caller from a register, so a server — including a ring 3 one, since `Reply` is a system call — could plant a message in *any* thread's mailbox and wake it holding what looked like the answer it was waiting for. The kernel now remembers who a thread received from and refuses anything else, which also freed the register that lets a server receive a whole four-register message at all. `Request::caller` is **gone from the trait**: a service cannot name a caller, so it cannot name the wrong one. Gated, and the gate was watched failing twice before it was believed — see the note below. |
+| M7-04 | RFC 0013 step 3: the filesystem runs in a domain | ✅ `DONE` | `bin/vfsd` **is** the filesystem service, in ring 3, holding one endpoint capability and a read-only mapping of the image — and every `fs::` method in the system is answered by it. The user-mode shell now reads files through IPC from a service that is itself unprivileged: two ring 3 programs, with the kernel routing messages and owning neither. The service crate is byte for byte the one the kernel compiles for the nucleus; what differs is the context (`Bulk::fill` is `method::FILL`) and the run loop (`serve::<S>` for `run::<S>`). `services.toml` decides which, through `kernel/build.rs`, and `make test-placements` **boots both, every build** — the placement nobody is running is compiled out, so nothing else would notice it rotting. |
+| M7-05 | RFC 0013 step 4: everything in a domain, and the address space that was missing | ✅ `DONE` | Both services run in ring 3. The console holds a `Console` capability — **put a character, take a byte, nothing else** — so a console service talked into misbehaving can still only put characters and take bytes; the same service in the nucleus could do anything. The shell, the console and the filesystem are now three unprivileged programs and the nucleus runs **no service at all** in that build. **What this found:** the kernel kept *one* installed address space for the whole of M5 and M6. With a single user program that is indistinguishable from keeping the right one — two services in domains landed on the same CPU and ran in each other's page table. Threads now carry their page-table root and load it as they resume, and the fault handler asks the hardware which space it is in rather than trusting bookkeeping. All four placement combinations boot and pass, every build. |
+| M7-06 | RFC 0013 step 5: what a placement costs, measured | ✅ `DONE` | The three numbers RFC 0013 asked for, per service and per placement. **A domain costs ~5,000 cycles (~2 µs) a round trip, about +48%**, and it is the same +48% for both services — 10.0k→15.2k for the console, 11.3k→15.8k for the filesystem. **Shared memory still pays: 10.3× in the nucleus, 7.3× in a domain** (the domain's bulk path copies through its own buffer and then makes a system call, so it costs twice the nucleus's — and still beats fifteen round trips by seven times). **Boot time is unchanged**, ~7.6 s either way. Measured as the *minimum* of 200 samples, because the first version timed whole loops and produced a nucleus filesystem four times slower than a domain one. |
+| M7-07 | The unpinned service that cost 6× | ✅ `DONE` | Chasing that reversed result found a real one: the nucleus filesystem thread was **not pinned**, so every call waited for another CPU to notice it — 66k cycles against 11k for the same code pinned, at the minimum rather than in the tail. It was unpinned deliberately, with a reasonable comment: it blocks on nothing but its own endpoint, so it could run wherever there was room. That was true, and it cost six times the latency. Pinned now, with the measurement as the reason. |
+| M7-08 | RFC 0013 step 6a: a domain can map memory it holds | ✅ `DONE` | `method::ATTACH` — a domain maps a `Memory` capability into **its own** address space, at an address of its choosing, from frames the object supplies rather than any it names. Never executable, per RFC 0009. **The first thing a driver in a domain needs:** its descriptor rings are memory it holds and the device reaches by `DevAddr`, and it cannot fill them in without seeing them. Exercised from ring 3 by the shell's new `map` command, which holds **two capabilities to one object** — writable and read-only — so the refusal tests the *right* and not the lookup. Watched failing: with the rights check removed the shell gets a writable mapping of read-only memory and the gate says so. |
+| M7-09 | RFC 0013 step 6b: device registers as a capability | ✅ `DONE` | `ATTACH` now takes a `Frame` capability too: one physical page, mapped **uncached and write-through** into the caller's own space, never executable. The kernel mints one for the block device's common configuration window; **the shell reads the device's status register from ring 3 and gets 15** — acknowledge, driver, features-ok, driver-ok, the device agreeing a driver brought it up. It cannot name a physical address, cannot ask for a different page, and is refused a writable mapping of the one it has. Watched failing by mapping one page over: `status 1`, and the gate said so. The second of the three things a driver in a domain needs. |
+| M7-10 | A test that had been told not to race, and did | ✅ `DONE` | `notify`'s test module said *"one test, because the slots are a global and cargo runs tests in parallel"* — and had two. The second drained the arena and asserted it came back empty, which it does not when the first is holding a slot. It failed once in a full run and passed on every re-run. A comment asking people to keep to one test was never going to hold; the tests take a mutex now. |
+| M7-11 | RFC 0013 step 6c: a domain is woken by a notification | ✅ `DONE` | `method::WAIT` and `method::PEEK` on a `Notification` capability. **The shell, in ring 3, is woken by one and reads the badge** — holding no vector, no interrupt controller and no way to reach either. Taking is once: the second look finds nothing, because a notification is a signal and not a queue. A capability with the write right and not the read right is **refused a take** — same object, weaker capability. The third and last of the things a driver in a domain needs. What the shell is woken by is a kernel signal rather than a device, deliberately: that an *interrupt* reaches a notification is gated where the interrupt is (M5, delegation self-test), and what was missing was only the last link. |
+| M7-12 | RFC 0013 step 6: a block driver in a domain, bringing up a device | ✅ `DONE` (bring-up; the data path is next) | `bin/blkd` drives the **second** virtio block device from ring 3. The kernel enumerates the bus and hands over three `Frame` capabilities and a `Memory` object; everything after that is the driver's — it maps its own windows, resets the device, and drives the handshake to acknowledge|driver. It reports **1 sector**, which is its own disk: the kernel's is 180, so a driver handed the wrong device says so in a number nothing else on this machine produces. Two devices because two drivers on one would race resets and interleave rings. **The bus stays in the kernel** and that is not a convenience: PCI configuration space is port I/O, and a domain holding it would hold every device on the machine. Watched failing by removing the handshake. |
+| M7-13 | RFC 0013 step 6 COMPLETE: a driver in a domain reads its disk by DMA | ✅ `DONE` | `bin/blkd`, in ring 3, programs a virtqueue with **device addresses it could not have invented**, kicks the device, and reads sector 0 of its own disk: `sector 0 begins "BHASKIX-"`, which is on that image and no other. The DMA goes through a **page table of its own** — RFC 0012's `DmaWindow`, granted to the domain, with its own domain id under the same unit. **The window is granted only when there is a unit to contain it**: without one the driver gets registers and no way to make the device read, because a domain that could aim a device with physical addresses could aim it at the kernel. Three bugs found, all of them things the kernel's own driver already knew — see the note. |
+| M7-14 | The delegated device's MSI-X wired to the domain's notification | ✅ `DONE` | The driver in ring 3 is now **woken by its own device**. The kernel claims the MSI-X entry and programs it — an MSI is a memory write of an arbitrary vector to an arbitrary CPU, so that authority is never delegated — and hands over two capabilities: the handler, and the notification it signals. The driver says *which* table entry its queue uses, in a register it holds, and waits; the kernel says what that entry contains. It acknowledges to unmask, which is the whole of a delegated driver's interrupt duty. Gated on `woken by the device`, watched failing by not binding: the read stops working **and** the stray-interrupt detector fires, because the vector is programmed and nobody owns it. |
+
+| M7-15 | The tests that left the suite when the code left the kernel | ✅ `DONE` | `make test-host` and `make clippy` **named their packages**, so when `ustar` and `vfs` moved into a crate of their own at step 3a their tests stopped running — including the archive mutation harness, a million malformed archives. Twenty-two assertions were out of the suite for a day and nothing said so; clippy had never seen the crate either. `--workspace --exclude bhaskix-boot-shim` now: one exclusion, with a reason, instead of a list that has to be remembered. Found by checking the suite's own numbers against the packages rather than by anything failing. |
+
+#### Where M7 ended
+
+| Question | Answer |
+|---|---|
+| Can a service run in either placement? | **Yes**, and both are booted every build. Four combinations of two services, 46 gates each. |
+| Is it the same code? | **Byte for byte.** `services/console` and `services/vfs` are compiled into the kernel for the nucleus placement and into `bin/consoled` / `bin/vfsd` for the domain one. What differs is a context and a run loop. |
+| What does the isolation cost? | **~5,000 cycles (~2 µs) a round trip, about +48%**, the same for both services. Boot time unchanged. Shared memory still beats the message path 7–10×. |
+| Can a driver run outside the kernel? | **Yes.** `bin/blkd` brings up its own PCI device, reads a sector by DMA through a page table of its own, and is woken by that device's interrupt. |
+| What stayed in the kernel, and why? | The bus (PCI configuration space is port I/O), the MSI-X table (an MSI is a memory write of an arbitrary vector to an arbitrary CPU), and the page tables. Each is a thing that cannot be handed over in a smaller piece. |
+
+#### What M7 did not do
+
+- **No supervisor.** RFC 0013 says explicitly that it does not propose one, and it does not have one:
+  no restart policy, no health checks, and a service that dies stays dead. The boot waits for the
+  block driver's report by looking for it, which is what a supervisor would do properly.
+- **The console's driver is still in the kernel.** The console *service* is in a domain and holds a
+  `Console` capability — put a character, take a byte — but the thing that talks to the UART is not.
+  What that bought is a smaller blast radius, not a smaller kernel.
+- **The domain filesystem is handed its image at entry** rather than reading a device. Real storage
+  behind a service in a domain needs the block driver to become one, which is the next thing.
+- **A domain gets DMA only where there is an IOMMU.** Without a unit the block driver is given
+  registers and no window. That is a refusal and not a gap: a domain that could aim a device with
+  physical addresses could aim it at the kernel.
+- **One outstanding request.** The driver submits one, waits, and reads it. A queue with more than
+  one request in flight is not tested and almost certainly not right.
+
 ### M6 — Filesystem, ELF, shell
 
 | ID | Task | Status | Notes |
@@ -141,20 +200,6 @@ fairness within 2% for two equal-weight workloads.
 | M6-16 | RFC 0012 step 7: a `DmaWindow` a domain holds | ✅ `DONE` | `ObjectKind::DmaWindow` with `MAP`/`UNMAP`/`INFO`, resolved under the capability arena and performed after it is released — mapping allocates, and allocating takes the heap. **Both** capabilities are checked and the device gets the weaker of their rights, so a read-only share cannot become writable by being handed to a device. **The assertion is the refusal**: a domain holding the memory and *not* the window is denied. Four real bugs fell out — see the changelog. |
 | M6-17 | RFC 0011 step 6: an `IrqHandler` a domain holds | ✅ `DONE` | `BIND`, `ACK`, `RELEASE` — and **never** the MSI-X table, because an MSI is a memory write of an arbitrary vector to an arbitrary CPU and a holder that could program one would hold interrupt injection. Three refusals carry the meaning: a legacy line may not be delegated (it is shared, and a holder that never acknowledges masks a line others need), a `Notification` capability is not authority over an interrupt, and **the RFC's own precondition is enforced in code** — `irq::name` refuses when nothing is translating, because a domain driving a device needs that device's DMA constrained first. **Negative-tested**: removing the object-kind check turns the gate red. |
 | M6-18 | RFC 0009 step 6: the filesystem service's bulk path | ✅ `DONE` | `fs::READ_INTO` fills a shared region in **one** round trip where the message path needs fifteen for the same file — the RFC's own comparison, measured on the data path alone, because opening a file costs the same either way and folding that in would flatter it. The caller names a **slot in its own CSpace**, never an object identity: an identity is a caller asserting what it may reach. The register path stays for short transfers. **Negative-tested** at the third attempt — see the changelog for why the first two proved nothing. |
-| M7-01 | RFC 0013 step 1: the `Service` trait, and the nucleus placement | ✅ `DONE` | `Service`, `Context`, `Request`, `Reply`, and **one** `run::<S>()` loop both services share instead of hand-rolling their own. The success criterion was **no behaviour change** and the boot output is identical — 19 requests, 1 caller refused, 5 entries, 8 bytes, bulk path unchanged. Dispatch is by message in the nucleus too, per the acceptance decision, so the placements differ in *placement* and not in *shape*. Three host tests run the services' logic with no machine under them. The machine now prints `console=nucleus vfs=nucleus`, gated — and that line is **expected to change at step 3**. |
-| M7-02 | RFC 0013 step 2: the placement table, and what makes it true | ✅ `DONE` | `services.toml`, and `tools/check-placements.sh` to give it teeth. The console is now **its own crate**, compiled for `x86_64-unknown-none` with **no kernel in the build** — that compile *is* the domain placement's, and unlike a lint it cannot pass by accident. The rule is enforced against the **resolved dependency graph**, not a search for suspicious lines: a service cannot name `crate::vfs` without depending on the kernel. Two negative fixtures, both run by `make gates`: a service that calls into the kernel (must be rejected **naming `bhaskix-kernel`**), and a table wrong about itself (a name listed twice, a placement of `orbit` — **both** must be reported). The boot line is now built from the table, so the machine and the file cannot drift. **What it cost:** the filesystem is `relocatable = false` in the table, in the file rather than in a comment — its bulk path reads caller pages through the direct map, so it does not compile without the kernel. That is step 3's actual work, now named. |
-| M7-03 | RFC 0013 step 3a: the filesystem becomes relocatable, and a hole closes | ✅ `DONE` | The filesystem is **out of the kernel crate** — `ustar`, `vfs` and the service in `services/vfs`, building for `x86_64-unknown-none` with no kernel in the build. One function did it: the bulk path used to read caller pages through the direct map and now asks its context (`Bulk::fill`). **A security hole was found on the way and closed:** `Reply` took the caller from a register, so a server — including a ring 3 one, since `Reply` is a system call — could plant a message in *any* thread's mailbox and wake it holding what looked like the answer it was waiting for. The kernel now remembers who a thread received from and refuses anything else, which also freed the register that lets a server receive a whole four-register message at all. `Request::caller` is **gone from the trait**: a service cannot name a caller, so it cannot name the wrong one. Gated, and the gate was watched failing twice before it was believed — see the note below. |
-| M7-04 | RFC 0013 step 3: the filesystem runs in a domain | ✅ `DONE` | `bin/vfsd` **is** the filesystem service, in ring 3, holding one endpoint capability and a read-only mapping of the image — and every `fs::` method in the system is answered by it. The user-mode shell now reads files through IPC from a service that is itself unprivileged: two ring 3 programs, with the kernel routing messages and owning neither. The service crate is byte for byte the one the kernel compiles for the nucleus; what differs is the context (`Bulk::fill` is `method::FILL`) and the run loop (`serve::<S>` for `run::<S>`). `services.toml` decides which, through `kernel/build.rs`, and `make test-placements` **boots both, every build** — the placement nobody is running is compiled out, so nothing else would notice it rotting. |
-| M7-05 | RFC 0013 step 4: everything in a domain, and the address space that was missing | ✅ `DONE` | Both services run in ring 3. The console holds a `Console` capability — **put a character, take a byte, nothing else** — so a console service talked into misbehaving can still only put characters and take bytes; the same service in the nucleus could do anything. The shell, the console and the filesystem are now three unprivileged programs and the nucleus runs **no service at all** in that build. **What this found:** the kernel kept *one* installed address space for the whole of M5 and M6. With a single user program that is indistinguishable from keeping the right one — two services in domains landed on the same CPU and ran in each other's page table. Threads now carry their page-table root and load it as they resume, and the fault handler asks the hardware which space it is in rather than trusting bookkeeping. All four placement combinations boot and pass, every build. |
-| M7-06 | RFC 0013 step 5: what a placement costs, measured | ✅ `DONE` | The three numbers RFC 0013 asked for, per service and per placement. **A domain costs ~5,000 cycles (~2 µs) a round trip, about +48%**, and it is the same +48% for both services — 10.0k→15.2k for the console, 11.3k→15.8k for the filesystem. **Shared memory still pays: 10.3× in the nucleus, 7.3× in a domain** (the domain's bulk path copies through its own buffer and then makes a system call, so it costs twice the nucleus's — and still beats fifteen round trips by seven times). **Boot time is unchanged**, ~7.6 s either way. Measured as the *minimum* of 200 samples, because the first version timed whole loops and produced a nucleus filesystem four times slower than a domain one. |
-| M7-07 | The unpinned service that cost 6× | ✅ `DONE` | Chasing that reversed result found a real one: the nucleus filesystem thread was **not pinned**, so every call waited for another CPU to notice it — 66k cycles against 11k for the same code pinned, at the minimum rather than in the tail. It was unpinned deliberately, with a reasonable comment: it blocks on nothing but its own endpoint, so it could run wherever there was room. That was true, and it cost six times the latency. Pinned now, with the measurement as the reason. |
-| M7-08 | RFC 0013 step 6a: a domain can map memory it holds | ✅ `DONE` | `method::ATTACH` — a domain maps a `Memory` capability into **its own** address space, at an address of its choosing, from frames the object supplies rather than any it names. Never executable, per RFC 0009. **The first thing a driver in a domain needs:** its descriptor rings are memory it holds and the device reaches by `DevAddr`, and it cannot fill them in without seeing them. Exercised from ring 3 by the shell's new `map` command, which holds **two capabilities to one object** — writable and read-only — so the refusal tests the *right* and not the lookup. Watched failing: with the rights check removed the shell gets a writable mapping of read-only memory and the gate says so. |
-| M7-09 | RFC 0013 step 6b: device registers as a capability | ✅ `DONE` | `ATTACH` now takes a `Frame` capability too: one physical page, mapped **uncached and write-through** into the caller's own space, never executable. The kernel mints one for the block device's common configuration window; **the shell reads the device's status register from ring 3 and gets 15** — acknowledge, driver, features-ok, driver-ok, the device agreeing a driver brought it up. It cannot name a physical address, cannot ask for a different page, and is refused a writable mapping of the one it has. Watched failing by mapping one page over: `status 1`, and the gate said so. The second of the three things a driver in a domain needs. |
-| M7-10 | A test that had been told not to race, and did | ✅ `DONE` | `notify`'s test module said *"one test, because the slots are a global and cargo runs tests in parallel"* — and had two. The second drained the arena and asserted it came back empty, which it does not when the first is holding a slot. It failed once in a full run and passed on every re-run. A comment asking people to keep to one test was never going to hold; the tests take a mutex now. |
-| M7-11 | RFC 0013 step 6c: a domain is woken by a notification | ✅ `DONE` | `method::WAIT` and `method::PEEK` on a `Notification` capability. **The shell, in ring 3, is woken by one and reads the badge** — holding no vector, no interrupt controller and no way to reach either. Taking is once: the second look finds nothing, because a notification is a signal and not a queue. A capability with the write right and not the read right is **refused a take** — same object, weaker capability. The third and last of the things a driver in a domain needs. What the shell is woken by is a kernel signal rather than a device, deliberately: that an *interrupt* reaches a notification is gated where the interrupt is (M5, delegation self-test), and what was missing was only the last link. |
-| M7-12 | RFC 0013 step 6: a block driver in a domain, bringing up a device | ✅ `DONE` (bring-up; the data path is next) | `bin/blkd` drives the **second** virtio block device from ring 3. The kernel enumerates the bus and hands over three `Frame` capabilities and a `Memory` object; everything after that is the driver's — it maps its own windows, resets the device, and drives the handshake to acknowledge|driver. It reports **1 sector**, which is its own disk: the kernel's is 180, so a driver handed the wrong device says so in a number nothing else on this machine produces. Two devices because two drivers on one would race resets and interleave rings. **The bus stays in the kernel** and that is not a convenience: PCI configuration space is port I/O, and a domain holding it would hold every device on the machine. Watched failing by removing the handshake. |
-| M7-13 | RFC 0013 step 6 COMPLETE: a driver in a domain reads its disk by DMA | ✅ `DONE` | `bin/blkd`, in ring 3, programs a virtqueue with **device addresses it could not have invented**, kicks the device, and reads sector 0 of its own disk: `sector 0 begins "BHASKIX-"`, which is on that image and no other. The DMA goes through a **page table of its own** — RFC 0012's `DmaWindow`, granted to the domain, with its own domain id under the same unit. **The window is granted only when there is a unit to contain it**: without one the driver gets registers and no way to make the device read, because a domain that could aim a device with physical addresses could aim it at the kernel. Three bugs found, all of them things the kernel's own driver already knew — see the note. |
-| M7-14 | The delegated device's MSI-X wired to the domain's notification | ✅ `DONE` | The driver in ring 3 is now **woken by its own device**. The kernel claims the MSI-X entry and programs it — an MSI is a memory write of an arbitrary vector to an arbitrary CPU, so that authority is never delegated — and hands over two capabilities: the handler, and the notification it signals. The driver says *which* table entry its queue uses, in a register it holds, and waits; the kernel says what that entry contains. It acknowledges to unmask, which is the whole of a delegated driver's interrupt duty. Gated on `woken by the device`, watched failing by not binding: the read stops working **and** the stray-interrupt detector fires, because the vector is programmed and nobody owns it. |
 
 ### Honest notes on M6 so far
 
@@ -491,18 +536,22 @@ fairness within 2% for two equal-weight workloads.
 | Repo metadata | GitHub description and topics are unset, and `main` has no branch protection — `GOVERNANCE.md` §2 requires review for non-trivial changes and nothing enforces it. Deploy keys have no API scope, so these need the web UI. | Tarun Kumar Kushwaha |
 | CI log access | Reading Actions logs needs authentication; unauthenticated API gives 60 requests/hour and only pass/fail. A fine-grained token with `Actions: read` would remove both limits. | Tarun Kumar Kushwaha |
 
-## 4. Upcoming milestones
+## 4. Upcoming work
 
-Scope and exit criteria are in [docs/roadmap.md](docs/roadmap.md). Not started; listed so the
-dependency order is visible.
+Scope is in [docs/roadmap.md](docs/roadmap.md). This table listed M2 to M6 as `TODO` long after all
+five were finished — it was written when they were ahead and never revisited, which is what a
+table nobody has a reason to read becomes. It is Phase 2's remaining bullets now, because those are
+what is actually ahead.
 
-| Milestone | Scope | Status | Gated on |
-|---|---|---|---|
-| M2 | GDT, TSS, IDT, exceptions, APIC, bump allocator | `TODO` | M1 |
-| M3 | Buddy PMM, paging, slab heap, COW, demand paging, KASLR | `TODO` | M2, **A5** |
-| M4 | Threads, context switch, runqueues, SMP, timers | `TODO` | M3 |
-| M5 | Capabilities, domains, syscalls, user mode, IPC | `TODO` | M4, **A2, A3, A4** |
-| M6 | VFS, ELF loader, shell, virtio-blk | `TODO` | M5 |
+| Phase 2 bullet | Status | Notes |
+|---|---|---|
+| Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
+| Service framework | ✅ done | RFC 0013, M7 above |
+| IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
+| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ⬜ next | `bin/blkd` is a driver in a domain written by hand. A *framework* is what makes the second one cheap, and there is no second one yet |
+| Full VFS — mount points, writable filesystem, journal, page cache | ⬜ `TODO` | The filesystem service reads a read-only archive it is handed at entry |
+| Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
+| Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
 ---
 
@@ -642,6 +691,47 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (M7 status — where the service framework ended)
+
+`architecture.md` §2 has said since M1 that a service can run inside the kernel or in a domain of
+its own, chosen at build time, with the interface not knowing which. Nothing had ever tested it. M7
+is that sentence made true, and the shape of what it cost.
+
+**What is now the case.** Both services run in ring 3 and the nucleus runs none. A block driver runs
+in a domain, brings up its own PCI device, reads a sector by DMA through a page table of its own,
+and is woken by that device's interrupt. `services.toml` decides placement; `make test-placements`
+boots all four combinations every build. The isolation costs about 5,000 cycles a round trip — the
+same +48% for both services — and nothing at boot.
+
+**What M7 did not do**, in the milestone section above rather than here, because a list of gaps is
+worth more next to the claims than at the bottom of a changelog. In short: no supervisor, the
+console's *driver* is still in the kernel, the domain filesystem is handed its image, DMA is granted
+only where an IOMMU can contain it, and one request is in flight at a time.
+
+**What the milestone found that nobody was looking for.** Four things, and every one of them was
+already true before M7 started:
+
+- A server could **reply to a thread it had never heard from** — a forged answer to a question
+  somebody else had asked. Reachable from ring 3, because `Reply` is a system call and the caller
+  was a number in a register.
+- The kernel had **one address space**, since M5. With one user program at a time that is
+  indistinguishable from keeping the right one, so nothing could tell; two services in domains on
+  one CPU ran in each other's page table.
+- A service thread that was **unpinned cost six times the latency** of the same code pinned. The
+  comment explaining why it was unpinned was correct and the decision was still wrong.
+- `verify_window` asserted **exactly one** context entry — the same property as "no strays" and a
+  different number, which stopped being true the moment a second device translated.
+
+None of the four was found by reading. Three were found by measuring or by adding a second of
+something; the first was found by trying to move a service and discovering the boundary would not
+let it.
+
+**And one this update found.** `make test-host` named its packages, and when `ustar` and `vfs` moved
+into a crate of their own their tests — including the archive mutation harness — quietly stopped
+running. Twenty-two assertions were out of the suite for a day, and the suite said nothing, because
+a crate that is not named is a crate that is not tested. It is `--workspace --exclude` now: one
+entry, with a reason, instead of a list that has to be remembered.
 
 ### 2026-08-06 (the interrupt — RFC 0011 and RFC 0012 both stop being self-tests)
 

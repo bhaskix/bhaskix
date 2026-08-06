@@ -252,9 +252,18 @@ test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-p
 
 # Host unit tests. The overridden --target is what takes these off the
 # freestanding target and onto something that can run a test harness.
+#
+# `--workspace` and not a list. The list was a list until RFC 0013 step 3 moved
+# `ustar` and `vfs` out of the kernel into a crate of their own -- and their
+# tests, including the archive mutation harness, quietly stopped running,
+# because a crate that is not named is a crate that is not tested and nothing
+# says so. Twenty-two assertions were missing from the suite for a day.
+#
+# The shim is excluded because it is a freestanding binary with its own panic
+# handler, which collides with the test harness's. That is a reason, and it is
+# the only entry here that needs one.
 test-host:
-	$(CARGO) test --target $(HOST_TARGET) -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm \
-	    -p bhaskix-service -p bhaskix-service-console
+	$(CARGO) test --target $(HOST_TARGET) --workspace --exclude bhaskix-boot-shim
 
 # Every service that has two placements, in both of them, every build.
 #
@@ -321,8 +330,7 @@ fmt:
 clippy:
 	$(CARGO) clippy --profile $(PROFILE) --target $(TARGET) --lib --bins -- -D warnings
 	$(CARGO) clippy --target $(HOST_TARGET) --all-targets \
-	    -p bhaskix-abi -p bhaskix-boot -p bhaskix-kernel -p bhaskix-arch-x86-64 -p bhaskix-mm \
-	    -p bhaskix-service -p bhaskix-service-console -- -D warnings
+	    --workspace --exclude bhaskix-boot-shim -- -D warnings
 	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
