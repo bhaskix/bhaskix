@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📝 **Draft** — proposed 2026-08-06 |
+| **Status** | ✅ **Accepted 2026-08-06.** Three of its four open questions are decided by acceptance and recorded below; the fourth — how much of the command register is mediated — stays open and is decided at step 6, where it can be answered against code rather than in the abstract. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | arch (`pci`), kernel (`virtio`, `mmio`), a new `device` crate, userspace drivers |
 | **Milestone** | Phase 2 in [roadmap.md](../roadmap.md) — the *driver framework* bullet |
@@ -250,16 +250,36 @@ figures are the baseline: ~5,000 cycles a round trip for a domain placement.
 
 ## Unresolved questions
 
-1. **How much of configuration space is delegable?** The table above is a proposal. The command
-   register in particular is a judgement call: mediating it means a syscall per bus-master enable,
-   and granting it means granting DMA without a window.
-2. **Does the kernel keep its own driver?** If a virtqueue crate is shared and a domain driver
-   works, the kernel's block driver is a second implementation of a solved problem — but it is also
-   how the machine reads its root filesystem before any domain exists. Probably it stays and shrinks.
-3. **Where does `register_block!` live?** A `device` crate below the kernel, or in `arch`? It is not
-   architecture-specific, but MMIO ordering is.
-4. **Legacy PCI on machines with no MCFG.** Keep the port-I/O path as a fallback, or refuse? A
-   fallback that is never tested is a fallback that does not work.
+### Decided by acceptance
+
+**Configuration space is read-only to a domain, and BARs and the MSI-X table are never delegable at
+all.** The table in the design section is the decision, not a proposal. The BAR reasoning is the
+load-bearing part and is worth restating: a BAR decides *where in physical address space a device
+answers*, and an IOMMU governs what a device reads rather than where it responds — so no amount of
+translation makes a writable BAR safe. What remains open is the command register alone; see below.
+
+**The kernel keeps its own block driver, and it shrinks.** It is how the machine reads its root
+filesystem before any domain exists, so deleting it would mean a boot that depends on a domain to
+find the program that becomes that domain. It loses its hand-written virtqueue to the shared crate
+at step 5, which is most of its size.
+
+**`register_block!` and `Mmio<T>` live in a new `device` crate, below the kernel and above `arch`.**
+Registers are not architecture-specific; the *ordering primitives* they compile to are, and those
+stay in `arch` where the rest of the memory model lives. A driver crate depending on `arch` would
+be the category error `tools/check-deps.py` already refuses for user programs.
+
+**The port-I/O path stays, and it is tested because it is the oracle.** The question was whether a
+fallback nobody exercises is worth keeping. It is exercised: step 4's gate compares ECAM enumeration
+against port-I/O enumeration on the same machine, because "the new one found three devices" is not
+evidence it found the right three. The fallback is tested by being the thing ECAM is checked
+against, which is a better reason to keep it than "some machine might need it".
+
+### Still open
+
+1. **How much of the command register is mediated.** Mediating it means a system call per
+   bus-master enable; granting it means granting DMA without a window, which RFC 0012 forbids in
+   substance. Decided at step 6, against code, because the cost of the syscall is measurable there
+   and guessable here.
 
 ---
 

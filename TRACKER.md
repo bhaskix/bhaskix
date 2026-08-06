@@ -548,7 +548,7 @@ what is actually ahead.
 | Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
-| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 📝 **RFC 0014 draft** | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
+| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **RFC 0014 accepted**, not started | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ⬜ `TODO` | The filesystem service reads a read-only archive it is handed at entry |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
@@ -691,6 +691,33 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0014 accepted — a framework whose case is an invoice)
+
+Accepted as written, with three of its four open questions decided by acceptance.
+
+- **Configuration space is read-only to a domain; BARs and the MSI-X table are never delegable.**
+  The BAR reasoning is the load-bearing part: a BAR decides *where in physical address space a
+  device answers*, and an IOMMU governs what a device reads rather than where it responds — so no
+  amount of translation makes a writable BAR safe. This is the first thing in the project a
+  capability may not name for a reason that is not about rights.
+- **The kernel keeps its own block driver, and it shrinks.** It is how the machine reads its root
+  filesystem before any domain exists; deleting it would mean a boot that depends on a domain to
+  find the program that becomes that domain. It loses its hand-written virtqueue at step 5.
+- **`register_block!` and `Mmio<T>` go in a new `device` crate**, below the kernel and above `arch`.
+  Registers are not architecture-specific; the ordering primitives they compile to are.
+- **The port-I/O path stays, because it is the oracle.** The question was whether a fallback nobody
+  exercises is worth keeping. It is exercised: step 4's gate compares ECAM enumeration against the
+  port-I/O path on the same machine, because "the new one found three devices" is not evidence that
+  it found the right three. A fallback that is the thing the new path is checked against is tested
+  by construction, which is a better reason to keep it than "some machine might need it".
+- **Left open on purpose:** how much of the command register is mediated. Mediating it costs a
+  system call per bus-master enable; granting it grants DMA without a window. Decided at step 6,
+  against code, because the cost is measurable there and guessable here.
+
+The RFC's case is not that the framework is elegant. It is that the second driver cost three bugs
+the first driver had already learned and written down in comments — so the mechanism has to be
+something other than a comment.
 
 ### 2026-08-06 (M7 status — where the service framework ended)
 
