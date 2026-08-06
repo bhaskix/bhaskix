@@ -43,6 +43,7 @@ pub mod ipc;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
+pub mod namespace;
 pub mod notify;
 pub mod panic;
 pub mod sched;
@@ -1487,18 +1488,34 @@ fn filesystem_self_test() -> bool {
     // what makes this two filesystems rather than one read twice.
     let separate = vfs::open(b"greeting").is_err();
 
-    let ok = matches && separate && names >= 2;
+    // The same bytes, kept for `Directory` capabilities to resolve in. Done
+    // here and not earlier so that nothing hands out a capability into an
+    // image that has not been read successfully once.
+    let mounted_for_capabilities = namespace::mount(image.bytes());
+
+    // What a directory capability would name, at both levels. Printed rather
+    // than merely computed because the shell's own report is about what it
+    // *cannot* reach, and a reader has no way to see that `sub` is a real
+    // directory of this filesystem and the root is a different one -- which is
+    // what makes "it holds one of these and not the other" a statement.
+    let named = namespace::root_identity()
+        .zip(namespace::directory_under_root(b"sub"))
+        .map_or((0, 0), |(root, sub)| (root as u32, sub as u32));
+
+    let ok = matches && separate && names >= 2 && mounted_for_capabilities;
     if ok {
         let superblock = mounted.superblock();
         println!(
             "    filesystem     bhfs mounted from the archive: {} blocks, {names} entries, \
-             `greeting` is inode {index} and reads {read} bytes that the archive does not have",
-            superblock.blocks
+             `greeting` is inode {index} and reads {read} bytes that the archive does not have; \
+             the root is inode {} and `sub` is inode {}, and a program is given one of them",
+            superblock.blocks, named.0, named.1
         );
     } else {
         println!(
             "    filesystem     FAILED: {read} bytes, contents match {matches}, \
-             separate from the archive {separate}, {names} entries"
+             separate from the archive {separate}, {names} entries, \
+             mounted for capabilities {mounted_for_capabilities}"
         );
     }
     ok
@@ -2641,6 +2658,60 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         .ok_or("the device window capability would not be created")?;
         if domain::with(realm, |owner| owner.cspace.install_at(5, window).is_ok()) != Some(true) {
             return Err("the device window capability would not install");
+        }
+    }
+
+    // One directory, at slot 8: `sub`, and deliberately **not** the root.
+    //
+    // The whole of RFC 0015 step 4 is visible in that choice. The shell can
+    // open `inner`, because `inner` is in the directory it holds. It cannot
+    // open `greeting`, which is on the same filesystem, in the directory
+    // above, and reachable by nothing this program holds -- and it fails with
+    // the same answer it would get for a name that exists nowhere. There is no
+    // `..` to climb and no path to name, so the refusal is not a check that
+    // could be forgotten: there is no expressible request to check.
+    //
+    // Read-only rights, so that when there is something to write the
+    // difference is already carried by the capability rather than added to it.
+    if let Some(identity) = namespace::directory_under_root(b"sub") {
+        let directory = cap::with_arena(|arena| {
+            arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Directory, identity),
+                    cap::Rights::READ,
+                    0,
+                )
+                .ok()
+        })
+        .ok_or("the directory capability would not be created")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(8, directory).is_ok()) != Some(true)
+        {
+            return Err("the directory capability would not install");
+        }
+    }
+
+    // And at slot 10, the same directory one generation on: a capability that
+    // outlived the thing it named.
+    //
+    // Manufactured, because nothing writes to this image and so nothing can go
+    // stale on its own. The alternative is to leave the check untested until
+    // the step that introduces reuse, which is the step least able to afford
+    // finding out it does not work -- a stale capability that resolved would
+    // hand a program a directory that now belongs to somebody else, and it
+    // would do it silently.
+    if let Some(identity) = namespace::stale_directory_under_root(b"sub") {
+        let stale = cap::with_arena(|arena| {
+            arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Directory, identity),
+                    cap::Rights::READ,
+                    0,
+                )
+                .ok()
+        })
+        .ok_or("the stale directory capability would not be created")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(10, stale).is_ok()) != Some(true) {
+            return Err("the stale directory capability would not install");
         }
     }
 

@@ -11,7 +11,10 @@
 //! ```
 //!
 //! Files named on the command line are copied into the root directory, which
-//! is what makes an image worth booting rather than merely valid.
+//! is what makes an image worth booting rather than merely valid. A name with
+//! one `/` in it puts the file in a subdirectory of that name — enough of a
+//! tree to test that a capability to one directory does not reach another,
+//! which is the whole of RFC 0015 step 4.
 
 // This is a developer's tool, run on a developer's machine. The panic bans
 // exist to stop a fallible operation taking down the nucleus; here, failing
@@ -34,13 +37,19 @@ fn main() {
     let mut bytes = vec![0u8; blocks * BLOCK];
     let superblock = format(&mut bytes, 128).expect("the image is large enough");
 
-    // Whatever was asked for, into the root.
+    // Whatever was asked for, into the root -- or into one subdirectory, when
+    // the name says so.
     let mut entries: Vec<Entry> = Vec::new();
+    let mut subdirectories: Vec<(String, Vec<Entry>)> = Vec::new();
     let mut next_inode = superblock.root + 1;
     for argument in arguments {
-        let (name, source) = argument
+        let (path, source) = argument
             .split_once('=')
             .expect("arguments are name=file after the block count");
+        let (directory, name) = match path.split_once('/') {
+            Some((directory, name)) => (Some(directory.to_string()), name),
+            None => (None, path),
+        };
         let contents = std::fs::read(source).expect("the file exists");
 
         let mut direct = [0u32; 10];
@@ -80,6 +89,42 @@ fn main() {
         inode
             .write(&mut bytes, &superblock, next_inode)
             .expect("room in the table");
+        let entry = Entry::new(next_inode, name.as_bytes()).expect("a usable name");
+        match directory {
+            Some(directory) => match subdirectories.iter_mut().find(|(at, _)| *at == directory) {
+                Some((_, held)) => held.push(entry),
+                None => subdirectories.push((directory, vec![entry])),
+            },
+            None => entries.push(entry),
+        }
+        next_inode += 1;
+    }
+
+    // Each subdirectory: a block of its entries, an inode, and a name in the
+    // root that points at it.
+    for (name, held) in &subdirectories {
+        let block = {
+            let mut bitmap = Bitmap::of(&mut bytes, &superblock).expect("the bitmap");
+            bitmap.allocate().expect("a free block for a directory")
+        };
+        let at = usize::try_from(block).unwrap() * BLOCK;
+        for (which, entry) in held.iter().enumerate() {
+            entry
+                .write(&mut bytes[at..at + BLOCK], which * ENTRY)
+                .expect("inside the block");
+        }
+        let mut direct = [0u32; 10];
+        direct[0] = u32::try_from(block).unwrap();
+        Inode {
+            kind: Kind::Directory,
+            links: 1,
+            generation: 1,
+            size: (held.len() * ENTRY) as u64,
+            direct,
+            indirect: 0,
+        }
+        .write(&mut bytes, &superblock, next_inode)
+        .expect("room in the table");
         entries.push(Entry::new(next_inode, name.as_bytes()).expect("a usable name"));
         next_inode += 1;
     }

@@ -126,6 +126,12 @@ const _: () = {
     assert!(method::ACK == bhaskix_abi::method::ACK);
     assert!(method::WAIT == bhaskix_abi::method::WAIT);
     assert!(method::PEEK == bhaskix_abi::method::PEEK);
+    assert!(method::OPEN_AT == bhaskix_abi::method::OPEN_AT);
+    assert!(method::INFO == bhaskix_abi::method::INFO);
+    assert!(method::DELETE == bhaskix_abi::method::DELETE);
+    assert!(method::IS_DIRECTORY == bhaskix_abi::method::IS_DIRECTORY);
+    assert!(Status::NoSuchName as u64 == bhaskix_abi::status::NO_SUCH_NAME);
+    assert!(Status::BadName as u64 == bhaskix_abi::status::BAD_NAME);
     assert!(Status::InsufficientRights as u64 == bhaskix_abi::status::INSUFFICIENT_RIGHTS);
     assert!(Status::SlotUnavailable as u64 == bhaskix_abi::status::SLOT_UNAVAILABLE);
     assert!(method::PUT == bhaskix_abi::method::PUT);
@@ -264,6 +270,18 @@ pub mod method {
     pub const POLL: u64 = 41;
     /// What [`POLL`] returns when nothing was waiting.
     pub const NOTHING: u64 = 0x100;
+    /// Resolve one name inside the directory this capability names.
+    ///
+    /// Only on a `Directory` capability. `arg0..3` = the name as a `Chunk`:
+    /// one component, no separators, no `.` or `..`. Replies with the slot the
+    /// resulting capability landed in, and [`IS_DIRECTORY`] set if it is one.
+    ///
+    /// There is no method that takes a path and no capability naming a root,
+    /// so this is the only way to reach a file — and it starts from something
+    /// the caller was given. RFC 0015 step 4.
+    pub const OPEN_AT: u64 = 45;
+    /// Set in [`OPEN_AT`]'s reply when what it opened is a directory.
+    pub const IS_DIRECTORY: u64 = 1 << 32;
     /// Write bytes into memory the caller of this endpoint named.
     ///
     /// Only on an `Endpoint` capability, and only from the thread that is
@@ -313,6 +331,21 @@ pub enum Status {
     SlotUnavailable = 11,
     /// The domain's capability quota is full.
     QuotaExceeded = 12,
+    /// Nothing of that name is in the directory that was asked.
+    ///
+    /// Not distinguished from a name that exists *elsewhere* on the same
+    /// filesystem: a program that could tell those apart could map a
+    /// filesystem it holds one directory of, one question at a time. RFC 0015.
+    NoSuchName = 13,
+    /// That is not a name this system resolves: a separator, `.`, `..`, empty.
+    ///
+    /// Separate from [`Status::NoSuchName`] for two reasons. It gives nothing
+    /// away — it describes the syntax the caller used, which the caller
+    /// already knows. And a rejection that answered "no such name" would be
+    /// indistinguishable from no rejection at all, because `..` is not an
+    /// entry in any directory this format writes: a lookup that never checked
+    /// would simply fail to find it and say the same thing.
+    BadName = 14,
 }
 
 impl Status {
@@ -953,6 +986,25 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 None => Outcome::ok(method::NOTHING),
             },
         };
+    }
+
+    // A name, resolved inside a directory somebody was given. Unlocked for
+    // the same reason as the window's methods: it takes the capability arena
+    // to mint what it produces, which ranks inside the resolution it would
+    // otherwise be holding.
+    if kind == Some(Kind::Invoke) && frame.method == method::OPEN_AT {
+        return crate::namespace::open_at(frame);
+    }
+
+    // `INFO` on a file is its size. Tried before the window's `INFO`, and
+    // falling through rather than refusing when the capability is not a file,
+    // so that one method number can mean two things without either object
+    // having to know about the other.
+    if kind == Some(Kind::Invoke)
+        && frame.method == method::INFO
+        && let Some(size) = crate::namespace::size_of(frame.capability)
+    {
+        return Outcome::ok(size);
     }
 
     // The domain placement's bulk path. Held to the same three checks the

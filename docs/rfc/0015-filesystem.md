@@ -72,14 +72,45 @@ domain boundaries per block, in 16-byte messages, would be slower than the disk.
 A new object kind, `Directory`, and one new method on it:
 
 ```
-OPEN_AT   arg0 = the caller's slot holding a Directory
-          arg1..3 = the name, as a chunk
-      ->  a capability to the file or directory named, in a slot the caller gives
+OPEN_AT   the capability register = the Directory to resolve in
+          arg0..2 = the name, as a chunk
+          arg3    = the slot to put the result in
+      ->  that slot, with IS_DIRECTORY set if what landed in it is one
 ```
 
+*(Amended in step 4 from the sketch this RFC was accepted with, which put the directory in `arg0`
+and left no room for a destination. The directory belongs in the capability register, where every
+other invocation puts the object being invoked; `Chunk::pack` already carries a spare word for the
+destination, which is what its `extra` argument is for. The caller names the destination rather than
+the kernel choosing a free slot, for the same reason `DERIVE` does: a program's CSpace is its own to
+arrange, and the shell keeps slot 2 empty on purpose. A name longer than one chunk is **refused**,
+not truncated — a truncated name opens a different file and does it silently. A multi-chunk `OPEN`
+is future work and is noted below.)*
+
 A program is given a `Directory` capability at boot, as it is given a console and a filesystem
-endpoint today. It can reach what is under it and nothing else — not by a check on `..`, but because
-a name that leaves the directory resolves to nothing there is a capability for.
+endpoint today. It can reach what is under it and nothing else.
+
+**A correction from step 4, to the sentence this paragraph used to end with.** It said containment
+needs no check on `..`, because a name that leaves the directory resolves to nothing there is a
+capability for. The first half is true and is the point; the second half made a claim about
+`..` that does not survive contact with a test. `..` is not an entry in any directory this format
+writes, so a lookup that never rejected it would simply fail to find it — and a build with the check
+deleted would behave *identically* to one with it. The check therefore exists, it is explicit, and
+it answers with a **different status** from a name that is merely absent:
+
+| | |
+|---|---|
+| `NO_SUCH_NAME` | nothing of that name is in this directory |
+| `BAD_NAME` | that is not a name this system resolves: a separator, `.`, `..`, an embedded zero, empty |
+
+The distinction is safe to make, and it is the only one here that is. `BAD_NAME` describes the
+syntax the caller used, which the caller already knows; it says nothing about what is on the
+filesystem. A name that exists *elsewhere* on the same filesystem stays indistinguishable from a
+name that exists nowhere, because a program that could tell those apart could map a filesystem it
+holds one directory of, one question at a time.
+
+Without the distinction the guard would be untestable, and an untestable guard in this system has
+historically meant an absent one.
 
 **Mounting is granting.** A mount point is a `Directory` capability installed in another
 filesystem's namespace; there is no mount *table* in the kernel, because a table is a global and a
@@ -261,6 +292,22 @@ every step below. The general answer is "the thing that hands a new program its 
 a supervisor — RFC 0013 declined to propose one and process management is where it belongs. Naming
 it here would be this RFC deciding something it does not have to.
 
+### Raised by step 4
+
+- **A name is at most one chunk — sixteen bytes.** Longer names are refused rather than truncated,
+  which is the safe failure, but the format allows twenty-seven. An `OPEN_AT` that accumulates a
+  name across chunks the way the filesystem service accumulates a path is the fix; it is not needed
+  by anything yet and would have been built untested.
+- **Resolution is a function call, not a message.** Step 4's `Directory` capabilities resolve in an
+  image the kernel mounted, so the kernel parses the filesystem — which is what RFC 0013 moved out.
+  That is deliberate for one step, because a namespace built on a read-only image cannot destroy
+  anything while it is being got right, and none of the design above changes when the backing store
+  moves behind the block service. It does mean the `unsafe`-free `fs` crate is now called from the
+  nucleus, and step 6 has to move it back out.
+- **Rights on a directory are the rights on what it opens.** A lookup gives the new capability the
+  rights the directory was held with, and never more. There is no way yet to hand out a directory
+  that may be *listed* but not *opened through*, which is a distinction a supervisor will want.
+
 ### Still open
 
 **How large may the cache grow?** The resource envelope counts frames a domain owns, and a cache
@@ -291,7 +338,7 @@ whether the order is right.
 3. **A read-only mount of that format**, beside the archive, to prove the format works before
    anything writes to it.
 4. **`Directory` capabilities and `OPEN_AT`.** The namespace change, on the read-only filesystem
-   where a mistake cannot destroy anything.
+   where a mistake cannot destroy anything. ✅ Done — see the amendment and the correction above.
 5. **Writes, and the journal.** With the interruption harness, because the journal's claim is the
    only thing here that cannot be checked by looking.
 6. **The page cache**, last, because the journal decides when a dirty page may go home.

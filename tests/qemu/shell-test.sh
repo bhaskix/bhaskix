@@ -87,7 +87,14 @@ else
     # `caps` is the one that matters: it asks the kernel about a slot this
     # program was not given, and the refusal comes from the kernel rather than
     # from a service saying no.
-    commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'ls /\r'$'cat etc/hostname\r'$'nosuchcommand\r'
+    #
+    # The four `open` lines are RFC 0015 step 4, and the order is the argument:
+    # a name inside the directory held resolves; the same filesystem's other
+    # names do not; a path is not a thing that can be asked for; and there is
+    # no way to go up.
+    commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'open inner\r'$'open greeting\r'
+    commands+=$'open sub/inner\r'$'open ..\r'$'ls /\r'$'cat etc/hostname\r'
+    commands+=$'nosuchcommand\r'
 fi
 
 # A named pipe rather than a pipeline, for two reasons. QEMU does not exit
@@ -245,6 +252,31 @@ else
         "a program in ring 3 is woken by a notification:6 +signal rd +woke with badge 45324"
         "a notification is a signal and not a queue:6 +signal rd +nothing left after taking it"
         "taking from a notification needs the right to:7 +signal wr +refused a take"
+        # RFC 0015 step 4. The shell holds a capability to one directory --
+        # `sub` -- and nothing naming the directory above it.
+        "a directory is a capability:8 +directory +reachable"
+        # What is *in* the directory held resolves, and the size comes from a
+        # second invocation on the capability that came back rather than from
+        # the lookup, so it is proof that the thing in the slot is the file.
+        # A capability that outlived the directory it named. It resolves to
+        # nothing rather than to whatever took the inode -- which is the bug
+        # every filesystem with integer handles has had, and the check is here
+        # before the step that can produce one for real.
+        "a capability that outlived its directory resolves to nothing:10 +stale dir +the directory it named is gone"
+        "a name inside the directory held resolves:inner: a file of 40 bytes"
+        # The line the step exists for. `greeting` is on the same filesystem,
+        # one level up, and the kernel reads it at boot -- and this program
+        # cannot reach it, with no check to forget: it holds nothing that names
+        # the directory it is in. The answer is the same one a name that exists
+        # nowhere gets.
+        "a name outside the directory held is unreachable:greeting: no such name in this directory"
+        # There is no path resolver, so a path is not a thing that can be
+        # asked. Refused as a name, because that is what it is.
+        "a path is not a name this system resolves:sub/inner: not a name this system resolves"
+        # And no way upwards. A capability to a directory that answered `..`
+        # would be a capability to its parent, and so to everything, one level
+        # at a time.
+        "there is no way up out of a directory:[.][.]: not a name this system resolves"
         "ls read the filesystem through IPC:hello.txt"
         "cat read a file through IPC:^bhaskix.?$"
         "an unknown command was refused:nosuchcommand: not a command"

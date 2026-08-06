@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-05 (RFC 0015 steps 1–3) · CI green · 424 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 307 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-06 (RFC 0015 steps 1–4) · CI green · 443 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 309 host assertions |
 
 ### Division of responsibility between documents
 
@@ -132,6 +132,8 @@ fairness within 2% for two equal-weight workloads.
 | M9-04 | Three negative tests that did not bite, and why | ✅ `DONE` | Every one of the first three deliberate breakages **passed**. Not because the properties were false but because each was guarded twice: the entry length is clamped in `read` *and* in `name()`; the allocator's floor is backed by the bitmap `format` marks; and one range clause was covered by whichever of the four ran first. Each test now targets the guard it names — the stored field rather than the accessor, a bitmap cleared through `set` so only the floor stands, and one case per clause. All three now fail for their own reason and only their own. This is the fourth time this milestone that redundancy hid an untested check. |
 
 | M9-05 | RFC 0015 step 3: the format mounts in a machine, beside the archive | ✅ `DONE` | The image is a **member of the archive**, which makes "beside" literal: the machine mounts both and reads a file from each. The bytes it reads are in no other file on the machine, and the same name is asserted **absent** from the archive — that is what makes it two filesystems rather than one read twice. Read-only, and in that order deliberately: the format is proved by reading an image built elsewhere before anything may write one, so a bug in a writer cannot be mistaken for a bug in the reader. Four more host tests, including a block pointer off the end of the image, which must read as absent rather than as whatever is at that offset. Watched failing by letting a read run past the size the inode declares — which fails the host test **and** the boot gate. |
+
+| M9-06 | RFC 0015 step 4: directories are capabilities, and there is no root | ✅ `DONE` | A new object kind and one method: `OPEN_AT` resolves **one** name inside a `Directory` capability the caller was given. There is no call that takes a path and no capability naming a root, so a program reaches what it holds and whatever is under it. The shell is handed `sub` and **not** the directory above: it opens `inner`, and `greeting` — same filesystem, one level up, read by the kernel at boot — comes back as "no such name", with no check to forget, because it holds nothing that names the directory it is in. A capability names an inode **and** a generation; nothing writes yet, so the kernel manufactures a stale one to prove the check works *before* the step that can produce one. Watched failing four ways, including handing the shell the root instead — where the containment gates fail by **succeeding**: `greeting: a file of 43 bytes`. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -587,7 +589,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — steps 1–3 done: a block service, a format, and a machine that mounts it | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
+| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — steps 1–4 done: a block service, a format, a machine that mounts it, and a namespace with no root | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -729,6 +731,35 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0015 step 4 — directories are capabilities, and there is no root)
+
+- **`OPEN_AT` resolves one name inside a directory the caller holds**, and that is the only way to
+  reach a file. No method takes a path. No capability names a root. What a program can reach is the
+  transitive closure of what it was given, decided by whoever gave it rather than by a check at the
+  moment of use.
+- **The shell is handed `sub`, deliberately not the directory above it.** It opens `inner`. It
+  cannot open `greeting` — same filesystem, one level up, a file the kernel itself reads at boot —
+  and there is no check to forget, because it holds nothing that names the directory `greeting` is
+  in. The refusal is the same one a name that exists nowhere gets.
+- **A correction to the RFC's own text.** It said containment needs no check on `..`. Half right:
+  the containment doesn't, but `..` still has to be *refused*, and refusing it with "no such name"
+  is indistinguishable from not refusing it at all — `..` is not an entry in any directory this
+  format writes, so a lookup would fail to find it and say the same thing. So there are two
+  refusals: `BAD_NAME` for a name this system does not resolve, `NO_SUCH_NAME` for one that is not
+  here. The distinction is safe because it describes the caller's own syntax; a name that exists
+  *elsewhere* stays indistinguishable from one that exists nowhere.
+- **A capability names an inode and a generation.** Nothing writes to this image, so nothing can go
+  stale on its own — and the check would have gone untested until the step that introduces reuse,
+  which is the step least able to afford finding out it does not work. The kernel manufactures one
+  and the shell reports it resolving to nothing.
+- **Watched failing four ways**, each on its own: the separator check deleted (a path becomes merely
+  a missing name), the `..` check deleted (the same), the generation check deleted (`10 stale dir
+  resolved — the generation was not checked`), and the shell handed the root instead of `sub` —
+  where two gates fail by **succeeding**: `greeting: a file of 43 bytes, at slot 9`.
+- **Two gates were vacuous when first written** and were rewritten before being believed. `open
+  sub/inner` and `open ..` both printed "no such name" whether or not the guard existed. That is the
+  fifth time in this project a test has been defeated by a redundant path.
 
 ### 2026-08-06 (RFC 0015 step 3 — a filesystem this kernel defined, in a machine)
 

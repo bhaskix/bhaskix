@@ -142,7 +142,9 @@ $(MKFS): $(wildcard fs/src/*.rs) $(wildcard fs/src/bin/*.rs) fs/Cargo.toml
 $(FS_IMAGE): $(MKFS) $(INITRD_DIR)/etc/hostname
 	@mkdir -p $(dir $@)
 	@printf 'a file in a filesystem this kernel defined\n' > build/fs-greeting.txt
-	@./$(MKFS) $@ 32 greeting=build/fs-greeting.txt hostname=$(INITRD_DIR)/etc/hostname
+	@printf 'only reachable through the subdirectory\n' > build/fs-inner.txt
+	@./$(MKFS) $@ 32 greeting=build/fs-greeting.txt hostname=$(INITRD_DIR)/etc/hostname \
+	    sub/inner=build/fs-inner.txt
 
 $(DOMAIN_DISK):
 	@mkdir -p $(dir $@)

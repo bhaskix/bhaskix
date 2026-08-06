@@ -50,6 +50,21 @@ const DEVICE_WINDOW: u64 = 5;
 const SIGNAL: u64 = 6;
 /// The same notification, with the write right and not the read right.
 const SIGNAL_WRITE_ONLY: u64 = 7;
+/// One directory of the filesystem — `sub`, and not the root.
+///
+/// This program has no capability naming the directory above it, and there is
+/// no method that would take a path to one. What it can reach is what is
+/// *inside* this directory, which is one name.
+const DIRECTORY: u64 = 8;
+/// Where [`open`] puts what it opened. Emptied again afterwards.
+const OPENED: u64 = 9;
+/// The same directory as [`DIRECTORY`], one generation on.
+///
+/// What a capability looks like after the directory it named has been freed
+/// and its inode reused. Nothing on this machine writes to a filesystem yet,
+/// so the kernel manufactures one — the check that catches these should be
+/// working *before* the step that makes them happen for real.
+const STALE_DIRECTORY: u64 = 10;
 
 /// What a system call returned: the status, and the message's four registers.
 struct Reply {
@@ -241,6 +256,7 @@ fn help() {
     write(b"    echo <words>      print the arguments\n");
     write(b"    ls [path]         list a directory\n");
     write(b"    cat <path>        print a file\n");
+    write(b"    open <name>       resolve a name inside the directory held\n");
     write(b"    caps              what this program is allowed to do\n");
     write(
         b"    map               map memory this program holds, and be refused what it does not\n",
@@ -282,6 +298,48 @@ fn capabilities() {
                 write_number(reply.status);
                 write(b"\n");
             }
+        }
+    }
+
+    // The directory, asked differently on purpose. The three above are
+    // endpoints and are probed with a message; this one is not a service, so
+    // it is probed with an invocation of a method it does not answer. A
+    // capability that is there says "no such method" -- which is the kernel
+    // refusing an operation on an object it found. A capability that is not
+    // there says "no such capability", from earlier, without ever looking at
+    // the method. Two refusals that mean opposite things.
+    write(b"  8  directory ");
+    let reply = syscall(syscall::INVOKE, DIRECTORY, u64::MAX, [0; 4]);
+    match reply.status {
+        status::NO_SUCH_METHOD => write(b"reachable, and answers no method it was not given\n"),
+        status::NO_SUCH_CAPABILITY => write(b"no authority\n"),
+        other => {
+            write(b"status ");
+            write_number(other);
+            write(b"\n");
+        }
+    }
+
+    // The stale one, and this probe has to be a real lookup. A capability that
+    // has outlived what it named is indistinguishable from a live one until it
+    // is used -- the generation is checked against the filesystem, not against
+    // anything the CSpace knows -- so asking whether the slot is occupied
+    // would answer yes and prove nothing.
+    write(b"  10 stale dir ");
+    let (chunk, _) = Chunk::take(b"inner");
+    let reply = syscall(
+        syscall::INVOKE,
+        STALE_DIRECTORY,
+        method::OPEN_AT,
+        chunk.pack(OPENED),
+    );
+    match reply.status {
+        status::REVOKED => write(b"the directory it named is gone\n"),
+        status::OK => write(b"resolved -- the generation was not checked\n"),
+        other => {
+            write(b"status ");
+            write_number(other);
+            write(b"\n");
         }
     }
 }
@@ -535,6 +593,91 @@ fn split(line: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+/// Resolves one name inside the directory this program holds.
+///
+/// The point of the command is what it *cannot* do. There is no path to give
+/// it: `sub/inner` is refused, because a name with a separator in it is a name
+/// this system does not resolve. There is no `..`, so the directory above --
+/// which exists, and holds files -- is unreachable from here. And a name that
+/// is on the same filesystem but in that directory above comes back as "no
+/// such name", the same answer as a name that is nowhere at all, because a
+/// program that could tell those apart could map a filesystem it was never
+/// given by asking about it one name at a time.
+///
+/// What comes back is a capability, in a slot named here. Asking its size is a
+/// second invocation on *that* capability -- so the size is proof the thing
+/// resolved, and not a number the kernel volunteered about a name.
+fn open(name: &[u8]) {
+    // Whatever a previous `open` left. Dropping it first is what makes the
+    // command repeatable, and `DELETE` on an empty slot is not an error.
+    syscall(syscall::INVOKE, OPENED, method::DELETE, [0; 4]);
+
+    let (chunk, rest) = Chunk::take(name);
+    if !rest.is_empty() {
+        // Longer than one chunk. Refused here rather than sent, because the
+        // kernel would refuse it too and a name that arrived truncated would
+        // open a different file.
+        write(b"  open: that name is too long to send\n");
+        return;
+    }
+
+    write(b"  ");
+    write(name);
+    write(b": ");
+    let reply = syscall(
+        syscall::INVOKE,
+        DIRECTORY,
+        method::OPEN_AT,
+        chunk.pack(OPENED),
+    );
+    match reply.status {
+        status::OK => {}
+        status::NO_SUCH_NAME => {
+            write(b"no such name in this directory\n");
+            return;
+        }
+        status::BAD_NAME => {
+            write(b"not a name this system resolves\n");
+            return;
+        }
+        status::NO_SUCH_CAPABILITY => {
+            write(b"nothing in that slot -- this program holds no directory\n");
+            return;
+        }
+        status::WRONG_OBJECT => {
+            write(b"not a directory to look in\n");
+            return;
+        }
+        other => {
+            write(b"refused, status ");
+            write_number(other);
+            write(b"\n");
+            return;
+        }
+    }
+
+    if reply.args[0] & method::IS_DIRECTORY != 0 {
+        write(b"a directory, at slot ");
+        write_number(reply.args[0] & 0xffff_ffff);
+        write(b"\n");
+        return;
+    }
+
+    // A file. Its size comes from the capability rather than from the lookup:
+    // asking the thing that was opened is the only way to know that what
+    // landed in the slot is what the name meant.
+    let size = syscall(syscall::INVOKE, OPENED, method::INFO, [0; 4]);
+    if size.status == status::OK {
+        write(b"a file of ");
+        write_number(size.args[0]);
+        write(b" bytes, at slot ");
+        write_number(reply.args[0] & 0xffff_ffff);
+        write(b"\n");
+    } else {
+        write(b"opened, but it will not say how big it is\n");
+    }
+}
+
 fn run(line: &[u8]) {
     let (command, rest) = split(line);
     match command {
@@ -545,6 +688,13 @@ fn run(line: &[u8]) {
             write(b"\n");
         }
         b"ls" => list(rest),
+        b"open" => {
+            if rest.is_empty() {
+                write(b"  open: which name?\n");
+            } else {
+                open(rest);
+            }
+        }
         b"caps" => capabilities(),
         b"map" => map(),
         b"irq" => signals(),
