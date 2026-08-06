@@ -342,6 +342,212 @@ macro_rules! register_block {
     };
 }
 
+/// A device to test a driver against, without a machine.
+///
+/// [`Bus`] dispatches statically, which keeps [`Mmio`] zero-sized and is why
+/// every access goes through associated functions rather than through a
+/// handle. The consequence is that a test double must be a **static**: there
+/// is no `self` to carry one. So this module is one device, and tests take
+/// [`exclusive`] before touching it.
+///
+/// It is a *device* and not a byte array. A register file alone would accept
+/// anything written to it and answer with what was written, which is the one
+/// behaviour a real device does not have: real devices refuse. The refusals
+/// are what a driver gets wrong — a feature set the device will not take, a
+/// vector it cannot give — and a model that could not refuse would test the
+/// happy path and nothing else.
+pub mod testing {
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+    use super::Bus;
+
+    /// How many bytes of registers the model has.
+    pub const SIZE: usize = 256;
+
+    /// How many accesses it remembers.
+    pub const LOGGED: usize = 64;
+
+    #[expect(
+        clippy::declare_interior_mutable_const,
+        reason = "the initialiser for an array of atomics, which is the one \
+                  place this pattern is not a mistake"
+    )]
+    const ZERO: AtomicU8 = AtomicU8::new(0);
+
+    static REGISTERS: [AtomicU8; SIZE] = [ZERO; SIZE];
+
+    /// `(write, width, offset, value)`, flattened so the log needs no lock.
+    static LOG_WRITE: [AtomicBool; LOGGED] = [const { AtomicBool::new(false) }; LOGGED];
+    static LOG_WIDTH: [AtomicUsize; LOGGED] = [const { AtomicUsize::new(0) }; LOGGED];
+    static LOG_AT: [AtomicUsize; LOGGED] = [const { AtomicUsize::new(0) }; LOGGED];
+    static LOG_VALUE: [AtomicUsize; LOGGED] = [const { AtomicUsize::new(0) }; LOGGED];
+    static LOGGED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    static BUSY: AtomicBool = AtomicBool::new(false);
+
+    /// What the model refuses.
+    static REFUSE_FEATURES: AtomicBool = AtomicBool::new(false);
+    static REFUSE_VECTOR: AtomicBool = AtomicBool::new(false);
+
+    /// Offsets the model gives meaning to. They are the virtio 1.0 common
+    /// configuration's, and they have to agree with the block a driver
+    /// declares — the tests construct that block over this model, so a
+    /// disagreement shows up as a driver reading the wrong thing.
+    const DEVICE_STATUS: usize = 0x14;
+    const QUEUE_MSIX_VECTOR: usize = 0x1a;
+
+    /// The bit a device clears to refuse a feature set.
+    const FEATURES_OK: u8 = 8;
+
+    /// Held for the duration of a test. Released on drop.
+    pub struct Exclusive;
+
+    impl Drop for Exclusive {
+        fn drop(&mut self) {
+            BUSY.store(false, Ordering::Release);
+        }
+    }
+
+    /// Takes the model, resets it, and holds it until the guard is dropped.
+    ///
+    /// A lock and not a comment. A test module in this tree once said "one
+    /// test, because the slots are a global" and then acquired a second one
+    /// that raced the first.
+    #[must_use]
+    pub fn exclusive() -> Exclusive {
+        while BUSY
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        for register in &REGISTERS {
+            register.store(0, Ordering::Relaxed);
+        }
+        LOGGED_COUNT.store(0, Ordering::Relaxed);
+        REFUSE_FEATURES.store(false, Ordering::Relaxed);
+        REFUSE_VECTOR.store(false, Ordering::Relaxed);
+        Exclusive
+    }
+
+    /// Makes the model refuse whatever feature set it is offered.
+    pub fn refuse_features() {
+        REFUSE_FEATURES.store(true, Ordering::Relaxed);
+    }
+
+    /// Makes the model refuse to give out an MSI-X vector.
+    ///
+    /// A real device reports `0xffff` — no vector — and a driver that does not
+    /// read the register back waits for an interrupt that will never arrive.
+    pub fn refuse_vector() {
+        REFUSE_VECTOR.store(true, Ordering::Relaxed);
+    }
+
+    /// Puts a value in the register file, as a device would offer it.
+    pub fn offer(at: usize, bytes: &[u8]) {
+        for (index, byte) in bytes.iter().enumerate() {
+            REGISTERS[at + index].store(*byte, Ordering::Relaxed);
+        }
+    }
+
+    /// How many accesses have been recorded.
+    #[must_use]
+    pub fn accesses() -> usize {
+        LOGGED_COUNT.load(Ordering::Relaxed).min(LOGGED)
+    }
+
+    /// One recorded access, as `(write, width, offset, value)`.
+    #[must_use]
+    pub fn access(index: usize) -> (bool, usize, usize, u64) {
+        (
+            LOG_WRITE[index].load(Ordering::Relaxed),
+            LOG_WIDTH[index].load(Ordering::Relaxed),
+            LOG_AT[index].load(Ordering::Relaxed),
+            LOG_VALUE[index].load(Ordering::Relaxed) as u64,
+        )
+    }
+
+    fn record(write: bool, width: usize, at: usize, value: u64) {
+        let index = LOGGED_COUNT.fetch_add(1, Ordering::Relaxed);
+        if index < LOGGED {
+            LOG_WRITE[index].store(write, Ordering::Relaxed);
+            LOG_WIDTH[index].store(width, Ordering::Relaxed);
+            LOG_AT[index].store(at, Ordering::Relaxed);
+            LOG_VALUE[index].store(value as usize, Ordering::Relaxed);
+        }
+    }
+
+    /// What the device does about a write, beyond remembering it.
+    fn react(at: usize, value: u64) {
+        if at == DEVICE_STATUS && REFUSE_FEATURES.load(Ordering::Relaxed) {
+            // Refusing is clearing the bit, which is the only way a device
+            // has to say no to a feature set.
+            REGISTERS[DEVICE_STATUS].store((value as u8) & !FEATURES_OK, Ordering::Relaxed);
+        }
+        if at == QUEUE_MSIX_VECTOR && REFUSE_VECTOR.load(Ordering::Relaxed) {
+            REGISTERS[QUEUE_MSIX_VECTOR].store(0xff, Ordering::Relaxed);
+            REGISTERS[QUEUE_MSIX_VECTOR + 1].store(0xff, Ordering::Relaxed);
+        }
+    }
+
+    /// The model, as a bus a register block can be built over.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Model;
+
+    // SAFETY: not a real bus. Every method performs its access against the
+    // register file at the width its name describes, which is what the tests
+    // using it are about.
+    unsafe impl Bus for Model {
+        unsafe fn load8(at: usize) -> u8 {
+            let value = REGISTERS[at].load(Ordering::Relaxed);
+            record(false, 1, at, u64::from(value));
+            value
+        }
+
+        unsafe fn load16(at: usize) -> u16 {
+            let value = u16::from_le_bytes([
+                REGISTERS[at].load(Ordering::Relaxed),
+                REGISTERS[at + 1].load(Ordering::Relaxed),
+            ]);
+            record(false, 2, at, u64::from(value));
+            value
+        }
+
+        unsafe fn load32(at: usize) -> u32 {
+            let value = u32::from_le_bytes([
+                REGISTERS[at].load(Ordering::Relaxed),
+                REGISTERS[at + 1].load(Ordering::Relaxed),
+                REGISTERS[at + 2].load(Ordering::Relaxed),
+                REGISTERS[at + 3].load(Ordering::Relaxed),
+            ]);
+            record(false, 4, at, u64::from(value));
+            value
+        }
+
+        unsafe fn store8(at: usize, value: u8) {
+            REGISTERS[at].store(value, Ordering::Relaxed);
+            record(true, 1, at, u64::from(value));
+            react(at, u64::from(value));
+        }
+
+        unsafe fn store16(at: usize, value: u16) {
+            for (index, byte) in value.to_le_bytes().iter().enumerate() {
+                REGISTERS[at + index].store(*byte, Ordering::Relaxed);
+            }
+            record(true, 2, at, u64::from(value));
+            react(at, u64::from(value));
+        }
+
+        unsafe fn store32(at: usize, value: u32) {
+            for (index, byte) in value.to_le_bytes().iter().enumerate() {
+                REGISTERS[at + index].store(*byte, Ordering::Relaxed);
+            }
+            record(true, 4, at, u64::from(value));
+            react(at, u64::from(value));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;

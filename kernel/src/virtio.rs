@@ -293,6 +293,65 @@ bhaskix_device::register_block! {
     }
 }
 
+/// Negotiates features with a device that has been told a driver is present.
+///
+/// Split out so it can be run against a device model on the host, which is
+/// where its refusals get tested — RFC 0014 step 3. A device refuses a feature
+/// set by clearing a bit the driver just wrote, and a driver that does not read
+/// it back carries on speaking a protocol the device is not speaking.
+///
+/// # Errors
+///
+/// [`BlockError::NotModern`] if the device does not offer virtio 1.0, and
+/// [`BlockError::FeaturesRefused`] if it will not accept what is offered.
+fn negotiate<B: bhaskix_device::Bus>(common: &CommonCfg<B>) -> Result<(), BlockError> {
+    // Feature word 1 holds VIRTIO_F_VERSION_1. Offering nothing else is
+    // deliberate: every optional feature is a behaviour this driver would
+    // then have to implement, and a device is entitled to assume the driver
+    // meant it.
+    common.device_feature_select.write(1);
+    let offered = common.device_feature.read();
+    if offered & FEATURE_VERSION_1 == 0 {
+        common.device_status.write(STATUS_FAILED);
+        return Err(BlockError::NotModern);
+    }
+    common.driver_feature_select.write(0);
+    common.driver_feature.write(0);
+    common.driver_feature_select.write(1);
+    // Take `ACCESS_PLATFORM` whenever it is offered. It is what subjects this
+    // device's DMA to the IOMMU rather than letting it address memory
+    // directly, and a driver that declined it would be asking to be outside
+    // the protection this kernel is building.
+    let accepted = FEATURE_VERSION_1 | (offered & FEATURE_ACCESS_PLATFORM);
+    common.driver_feature.write(accepted);
+    TRANSLATED.store(offered & FEATURE_ACCESS_PLATFORM != 0, Ordering::Relaxed);
+
+    common
+        .device_status
+        .write(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
+    // Read the status back. The device clears this bit to refuse the feature
+    // set, and a driver that did not check would carry on regardless.
+    if common.device_status.read() & STATUS_FEATURES_OK == 0 {
+        common.device_status.write(STATUS_FAILED);
+        return Err(BlockError::FeaturesRefused);
+    }
+    Ok(())
+}
+
+/// Tells a device which MSI-X entry its queue and configuration changes use,
+/// and says whether it took it.
+///
+/// The read-back is the whole function. A device that cannot give out a vector
+/// reports `0xffff`, and a driver that assumed it worked waits for an
+/// interrupt that is never going to arrive — which looks exactly like a device
+/// that is simply slow.
+fn take_vector<B: bhaskix_device::Bus>(common: &CommonCfg<B>) -> bool {
+    common.queue_select.write(0);
+    common.queue_msix_vector.write(0);
+    common.config_msix_vector.write(0);
+    common.queue_msix_vector.read() == 0
+}
+
 /// Allocates one frame and returns `(physical, virtual)`.
 ///
 /// A whole frame for each ring part, which wastes most of three pages. The
@@ -595,33 +654,7 @@ pub fn init_mapped(hhdm: u64, map: Option<&dyn Fn(u64) -> Option<u64>>) -> Resul
         // deliberate: every optional feature is a behaviour this driver would
         // then have to implement, and a device is entitled to assume the
         // driver meant it.
-        common.device_feature_select.write(1);
-        let offered = common.device_feature.read();
-        if offered & FEATURE_VERSION_1 == 0 {
-            common.device_status.write(STATUS_FAILED);
-            return Err(BlockError::NotModern);
-        }
-        common.driver_feature_select.write(0);
-        common.driver_feature.write(0);
-        common.driver_feature_select.write(1);
-        // Take `ACCESS_PLATFORM` whenever it is offered. It is what subjects
-        // this device's DMA to the IOMMU rather than letting it address memory
-        // directly, and a driver that declined it would be asking to be
-        // outside the protection this kernel is building.
-        let accepted = FEATURE_VERSION_1 | (offered & FEATURE_ACCESS_PLATFORM);
-        common.driver_feature.write(accepted);
-        TRANSLATED.store(offered & FEATURE_ACCESS_PLATFORM != 0, Ordering::Relaxed);
-
-        common
-            .device_status
-            .write(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
-        // Read the status back. The device clears this bit to refuse the
-        // feature set, and a driver that did not check would carry on talking
-        // a protocol the device is not speaking.
-        if common.device_status.read() & STATUS_FEATURES_OK == 0 {
-            common.device_status.write(STATUS_FAILED);
-            return Err(BlockError::FeaturesRefused);
-        }
+        negotiate(&common)?;
 
         // Capacity, in 512-byte sectors, from the device-specific structure.
         device_config.capacity.read()
@@ -928,12 +961,7 @@ pub fn enable_interrupts(
         // changes use. Read back: the device reports `0xffff` if it could not
         // take the vector, and a driver that did not check would wait for an
         // interrupt that was never going to arrive.
-        let accepted = {
-            device.common.queue_select.write(0);
-            device.common.queue_msix_vector.write(0);
-            device.common.config_msix_vector.write(0);
-            device.common.queue_msix_vector.read() == 0
-        };
+        let accepted = take_vector(&device.common);
         if accepted {
             device.notification = Some(notification);
             device.handler = Some(handler);
@@ -1276,4 +1304,102 @@ pub fn read_all(limit: u64) -> Result<alloc::vec::Vec<u8>, BlockError> {
         sector += count;
     }
     Ok(image)
+}
+
+#[cfg(test)]
+mod tests {
+    use bhaskix_device::testing::{self, Model};
+
+    use super::{CommonCfg, FEATURE_ACCESS_PLATFORM, FEATURE_VERSION_1, negotiate, take_vector};
+
+    /// The driver's own bring-up, run against a device model on the host.
+    ///
+    /// RFC 0014 step 3. This is the code the kernel runs — not a copy of it —
+    /// reached through a `Bus` that is a model instead of a machine. Until the
+    /// register accessors made that possible, the only way to find out what
+    /// this function did about a device that said no was to find a device that
+    /// said no.
+    fn block() -> CommonCfg<Model> {
+        // SAFETY: `Model` answers from a register file rather than from
+        // memory, so "this address is a register" is true by construction.
+        unsafe { CommonCfg::<Model>::new(0) }
+    }
+
+    /// Offers a feature word at `device_feature`, as a device would.
+    fn offer_features(bits: u32) {
+        testing::offer(0x04, &bits.to_le_bytes());
+    }
+
+    #[test]
+    fn a_device_that_does_not_offer_virtio_1_is_refused() {
+        let _alone = testing::exclusive();
+        // Everything zero: a device offering nothing.
+        assert!(negotiate(&block()).is_err());
+
+        // And it was told, rather than merely abandoned. A driver that walks
+        // away without writing FAILED leaves a device believing a driver is
+        // still coming.
+        let told = (0..testing::accesses())
+            .map(testing::access)
+            .any(|(write, _, at, value)| write && at == 0x14 && value & 0x80 != 0);
+        assert!(told, "the device is told the driver failed");
+    }
+
+    #[test]
+    fn a_device_that_refuses_the_feature_set_is_believed() {
+        let _alone = testing::exclusive();
+        offer_features(FEATURE_VERSION_1);
+        testing::refuse_features();
+
+        assert!(
+            negotiate(&block()).is_err(),
+            "a device clears FEATURES_OK to say no, and the read-back is the \
+             only way the driver hears it"
+        );
+    }
+
+    #[test]
+    fn access_platform_is_taken_whenever_it_is_offered() {
+        let _alone = testing::exclusive();
+        offer_features(FEATURE_VERSION_1 | FEATURE_ACCESS_PLATFORM);
+        assert!(negotiate(&block()).is_ok());
+
+        // What was written back to `driver_feature` for word 1. Taking
+        // ACCESS_PLATFORM is what subjects the device to the IOMMU, so a
+        // driver that quietly dropped it would be asking to be outside the
+        // protection the kernel is building -- and everything else would still
+        // work, which is why this is asserted rather than assumed.
+        let accepted = (0..testing::accesses())
+            .map(testing::access)
+            .filter(|(write, _, at, _)| *write && *at == 0x0c)
+            .map(|(_, _, _, value)| value)
+            .next_back();
+        assert_eq!(
+            accepted,
+            Some(u64::from(FEATURE_VERSION_1 | FEATURE_ACCESS_PLATFORM)),
+            "both bits accepted"
+        );
+    }
+
+    #[test]
+    fn a_device_that_gives_a_vector_is_believed() {
+        let _alone = testing::exclusive();
+        assert!(take_vector(&block()));
+    }
+
+    #[test]
+    fn a_device_that_will_not_give_a_vector_says_so_and_is_heard() {
+        // Two tests, not one with two guards. The first version took
+        // `exclusive` twice in a single test: the guards are shadowed rather
+        // than dropped, so the second call spun on a lock the first still
+        // held, and the test hung instead of failing. The model is one
+        // device, and one test uses it once.
+        let _alone = testing::exclusive();
+        testing::refuse_vector();
+        assert!(
+            !take_vector(&block()),
+            "0xffff is no vector; a driver that did not read it back would \
+             wait for an interrupt that is never going to arrive"
+        );
+    }
 }

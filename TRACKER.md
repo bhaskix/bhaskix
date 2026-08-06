@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) is complete; the driver framework (M8) is under way |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01, M8-02 (RFC 0014 steps 1–2) · CI green · 395 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 282 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01 … M8-03 (RFC 0014 steps 1–3) · CI green · 395 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 287 host assertions |
 
 ### Division of responsibility between documents
 
@@ -132,6 +132,8 @@ documented.
 | M8-01 | RFC 0014 step 1: `Mmio<T>` and `register_block!` | ✅ `DONE` | **`Bus` has no 64-bit access.** Not one used carefully — it does not have one, so a 64-bit register is two 32-bit accesses because there is nothing else it could be. That is bug 1 made *unrepresentable* rather than fixed. Constructing an `Mmio` is unsafe and using one is not, so a driver spends one `unsafe` per block instead of one per access: `blkd` has forty-two. `register_block!` declares offsets once and checks the layout **at compile time** — two negative fixtures, excluded from the workspace because they must not build, and `make gates` asserts they fail *and say why*. Watched failing: removing the overlap check makes the overlapping block compile and the gate says so. Four host tests, one of which is the test that would have caught the bug this RFC exists for. |
 
 | M8-02 | RFC 0014 step 2: the kernel's driver moves onto them | ✅ `DONE` | Twenty-seven register accesses across two structures, declared once as `CommonCfg` and `BlockCfg` instead of a module of constants plus six hand-rolled accessors. **The success criterion was that nothing changes** and the boot line is identical: 180 sectors, 2 requests, status 0x0f, 1 wait and 0 spins. **The kernel's `unsafe` count fell 1154 → 1112** — forty-two blocks making the same promise over and over became two, made where the blocks are constructed. The budget was lowered to match, which is the direction it is supposed to move and the first time it has. Four accessors were left dead by the change and deleted; `read8` and `write16` survive, because the request status byte and the queue notification are memory and a doorbell rather than registers in a block. |
+
+| M8-03 | RFC 0014 step 3: a device model to test a driver against | ✅ `DONE` | `bhaskix_device::testing` — a fake **device**, not a byte array. A register file alone answers with whatever was written, which is the one behaviour a real device does not have: real devices *refuse*, and the refusals are what a driver gets wrong. The kernel's own bring-up runs against it on the host — `negotiate` and `take_vector` are the code the machine runs, not a copy — and five tests cover what could previously only be tested by finding a device that said no: a device not offering virtio 1.0 is refused **and told**, one clearing `FEATURES_OK` is believed, `ACCESS_PLATFORM` is taken whenever offered, and `0xffff` for a vector is heard as "no vector". **Each was watched failing for its own reason and only its own.** Ring-level tests wait for step 5, where the queue moves into a crate; saying so beats redefining step 3 to fit what was easy. |
 
 ### M7 — Service framework ([RFC 0013](docs/rfc/0013-service-framework.md))
 
@@ -562,7 +564,7 @@ what is actually ahead.
 | Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
-| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — steps 1–2 done | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
+| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — steps 1–3 done | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ⬜ `TODO` | The filesystem service reads a read-only archive it is handed at entry |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
@@ -705,6 +707,31 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0014 step 3 — a model that can say no, and a process of mine that would not stop)
+
+- **The harness models a device, not memory.** A register file answers with whatever was written,
+  which is the one behaviour a real device does not have. Real devices *refuse* — a feature set they
+  will not take, a vector they cannot give — and the refusals are what a driver gets wrong. A model
+  that could not refuse would have tested the happy path and nothing else.
+- **It runs the driver's own code.** `negotiate` and `take_vector` are what the kernel calls, not a
+  copy: the register accessors made a `Bus` substitutable, so the same function reaches a model
+  instead of a machine. Before that, the only way to learn what this driver did about a device that
+  said no was to find a device that said no.
+- **Each of the five tests was watched failing for its own reason.** Removing the feature read-back
+  fails exactly one; removing the vector read-back fails exactly one; silently dropping
+  `ACCESS_PLATFORM` fails exactly one. A test that fails when anything breaks is a test that has not
+  been aimed.
+- **The static harness bit immediately, as designed.** `Bus` dispatches statically, so a test double
+  must be a static, so tests must serialise — and the first test to take the guard twice in one
+  scope hung rather than failed, because the guards are shadowed rather than dropped. Split in two,
+  with the reason written where the next person will hit it.
+- **Two suite runs failed and neither was a flake.** The shell tests lost timing races, and the host
+  turned out to be at load average **12.4 with no QEMU running**: an external CI runner, and — the
+  part that was mine — a test binary from that spin-lock deadlock still burning 184% of a CPU
+  thirty-two minutes later. `pkill cargo` had killed the driver and not the child. Killed it, load
+  fell, suite green at 395. "Flaky" was available as an explanation both times and would have been
+  wrong both times; the number that settled it was `uptime`.
 
 ### 2026-08-06 (RFC 0014 step 2 — the first time the unsafe budget went down)
 
