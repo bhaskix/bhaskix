@@ -1420,6 +1420,35 @@ const CONSOLED_PROGRAM: &[u8] = b"bin/consoled";
 /// difference between a capability system and a permission bit.
 const CONSOLE_OBJECT: u64 = 0;
 
+/// Where configuration space is, physically, once `MCFG` has been read.
+static ECAM_REGION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The first bus that region covers.
+static ECAM_FIRST_BUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The physical page holding one function's configuration space.
+///
+/// `None` before `MCFG` has been read, or on a machine without one — where
+/// configuration is a pair of ports and cannot be handed to anybody, which is
+/// the whole reason RFC 0013 step 6 said the bus stays in the kernel.
+fn configuration_page(address: bhaskix_arch::pci::Address) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+
+    let base = ECAM_REGION.load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    let first = ECAM_FIRST_BUS.load(Ordering::Relaxed);
+    let bus = u64::from(address.bus);
+    if bus < first {
+        return None;
+    }
+    Some(
+        base + ((bus - first) << 20)
+            + ((u64::from(address.device) & 0x1f) << 15)
+            + ((u64::from(address.function) & 0x07) << 12),
+    )
+}
+
 /// Finds memory-mapped configuration space, maps it, and checks it agrees.
 ///
 /// RFC 0014 step 4. `MCFG` says where configuration space is as memory; the
@@ -1472,6 +1501,15 @@ fn ecam_bringup(handoff: &Handoff) -> bool {
     unsafe {
         bhaskix_arch::pci::use_ecam(mapped, region.start_bus, region.end_bus, region.length())
     };
+    // Kept so a function's configuration page can be named later. It is a
+    // page of ordinary memory now, which is what makes it something a
+    // capability can hold — and the reason RFC 0014 had to decide how much of
+    // it a domain may see.
+    ECAM_REGION.store(region.base, core::sync::atomic::Ordering::Release);
+    ECAM_FIRST_BUS.store(
+        u64::from(region.start_bus),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 
     // And now the comparison, which is the whole point of keeping both.
     let mut checked = 0u32;
@@ -1646,6 +1684,40 @@ pub fn start_block_domain(
         println!("    block domain   dma window granted; the device translates through its own");
     }
 
+    // The device's own configuration space, read-only, at slot 7.
+    //
+    // RFC 0014 decided this: **read-only, and the BARs are never writable at
+    // all**. A BAR decides *where in physical address space a device answers*,
+    // and an IOMMU governs what a device reads rather than where it responds,
+    // so no amount of translation makes a writable BAR safe. A read-only page
+    // gives that for nothing — reading a BAR grants no authority, and writing
+    // anything is refused by the capability's rights.
+    //
+    // It also answers the question acceptance left open. The command register
+    // was to be "mediated", meaning a system call per bus-master enable; there
+    // is none, because the kernel already enables bus mastering at the one
+    // moment it is safe to — after the device is reset and when the DMA window
+    // is granted. A syscall whose only effect the kernel performs anyway, at a
+    // better time, is a syscall with nothing to do.
+    let identified = match configuration_page(address) {
+        Some(page) => {
+            let window = cap::with_arena(|arena| {
+                arena
+                    .insert_root(
+                        cap::ObjectRef::new(cap::ObjectKind::Frame, page),
+                        cap::Rights::READ,
+                        0,
+                    )
+                    .ok()
+            })
+            .ok_or("the configuration capability would not be created")?;
+            domain::with(realm, |owner| owner.cspace.install_at(7, window).is_ok()) == Some(true)
+        }
+        // No ECAM: configuration is a pair of ports, which cannot be handed to
+        // anybody. The driver asks the kernel nothing and identifies nothing.
+        None => false,
+    };
+
     // The device's interrupt, claimed by the kernel and handed over as two
     // capabilities: the handler, and the notification it signals.
     //
@@ -1724,6 +1796,12 @@ pub fn start_block_domain(
     // SAFETY: this device is the block domain's; nothing else drives it.
     unsafe { bhaskix_arch::pci::enable(address) };
 
+    if identified {
+        println!(
+            "    block domain   configuration space granted read-only; the driver can say \
+             what it is driving"
+        );
+    }
     if signalled {
         println!(
             "    block domain   interrupt delegated: the kernel programmed the vector, \
@@ -1813,13 +1891,13 @@ fn report_block_domain(hhdm: u64) -> bool {
         return false;
     }
 
-    let mut words = [0u64; 11];
+    let mut words = [0u64; 12];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // eight little-endian words the driver wrote there.
     // The last page. The first three are the descriptor table, the rings and
     // the request the *device* reads and writes -- a report living in any of
     // them would be a report the device could overwrite.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3]) as *const u8, 88) };
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3]) as *const u8, 96) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -1866,6 +1944,7 @@ fn report_block_domain(hhdm: u64) -> bool {
         used_index,
         request_status,
         by_interrupt,
+        identified,
     ] = words;
 
     // With a window, the driver is expected to have *read the disk*: status
@@ -1884,7 +1963,10 @@ fn report_block_domain(hhdm: u64) -> bool {
         println!(
             "    block domain   ring 3 driver: found status {found}, drove it to {drove_to}, \
              rings at {rings_at_device:#x} for the device, queue of {queue_size}, \
-             {sectors} sectors, sector 0 begins {text:?}, woken by the device"
+             {sectors} sectors, sector 0 begins {text:?}, woken by the device, \
+             and says it is {:04x}:{:04x} from its own configuration space",
+            identified >> 16,
+            identified & 0xffff
         );
     } else {
         println!(

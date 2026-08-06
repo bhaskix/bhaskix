@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **Accepted 2026-08-06.** Three of its four open questions are decided by acceptance and recorded below; the fourth — how much of the command register is mediated — stays open and is decided at step 6, where it can be answered against code rather than in the abstract. |
+| **Status** | ✅ **Accepted 2026-08-06, and implemented — all six steps.** Three of its four open questions were decided by acceptance; the fourth was answered at step 6 and the answer was *nothing*, for a reason the RFC could not have known when it asked. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | arch (`pci`), kernel (`virtio`, `mmio`), a new `device` crate, userspace drivers |
 | **Milestone** | Phase 2 in [roadmap.md](../roadmap.md) — the *driver framework* bullet |
@@ -274,12 +274,17 @@ against port-I/O enumeration on the same machine, because "the new one found thr
 evidence it found the right three. The fallback is tested by being the thing ECAM is checked
 against, which is a better reason to keep it than "some machine might need it".
 
-### Still open
+### Answered at step 6, as acceptance said it would be
 
-1. **How much of the command register is mediated.** Mediating it means a system call per
-   bus-master enable; granting it means granting DMA without a window, which RFC 0012 forbids in
-   substance. Decided at step 6, against code, because the cost of the syscall is measurable there
-   and guessable here.
+**Nothing of the command register is mediated, because nothing needs to be.** The question assumed
+a driver would ask to become a bus master and the kernel would decide. It does not: the kernel
+already enables bus mastering at the one moment it is safe to — after the device is reset, and at
+the same point it grants the DMA window that contains it. A system call whose only effect the
+kernel performs anyway, at a better time, has nothing to do.
+
+So the configuration capability is read-only and there is no mediated set at all. That is *less*
+than this RFC proposed, and it is less because the proposal carried an assumption that turned out
+to be false rather than because the work was cut.
 
 ---
 
@@ -297,3 +302,11 @@ against, which is a better reason to keep it than "some machine might need it".
    hand-written copy, and the criterion is again that nothing changes.
 6. **A configuration-space capability**, read-only, with the delegable table and a test per row.
    `bin/blkd` identifies its own device without asking the kernel.
+
+   *Done, 2026-08-06.* The driver holds one page of its device's configuration space, read-only,
+   and reports `1af4:1042` — the virtio vendor and the modern block device — from it. The value is
+   only reported when a **writable** mapping of the same page was refused, so one number covers
+   both halves of the decision: configuration space is readable and never writable, because a
+   writable configuration page is a writable BAR. Watched failing by removing the rights check.
+
+   The mediated set turned out to be empty; see the answered question above.

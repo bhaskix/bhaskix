@@ -44,6 +44,13 @@ const WINDOW: u64 = 4;
 const HANDLER: u64 = 5;
 /// Slot: the notification the handler signals.
 const SIGNAL: u64 = 6;
+/// Slot: this device's configuration space, read-only.
+///
+/// Four kilobytes of ordinary memory, which is what PCIe made it and what the
+/// port pair never could be. Read-only, and the BARs are the reason: a BAR
+/// decides *where in physical address space the device answers*, and an IOMMU
+/// governs what a device reads rather than where it responds.
+const CONFIG: u64 = 7;
 
 /// Where each mapping goes in this program's address space.
 const COMMON_AT: u64 = 0x2000_0000;
@@ -56,6 +63,9 @@ const RINGS_AT: u64 = 0x2010_0000;
 /// A power of two, which is what makes the index wrap correct, and small
 /// because this driver has one request outstanding at a time.
 const QUEUE_ENTRIES: u16 = 4;
+
+/// Where this program maps its own configuration space.
+const CONFIG_AT: u64 = 0x2003_0000;
 
 /// Where each structure sits inside the four pages of rings.
 ///
@@ -260,6 +270,21 @@ extern "C" fn blkd_main() -> ! {
         exit()
     }
 
+    // What this device *is*, from its own configuration space, without asking
+    // the kernel. Vendor and device identify it; reading them grants nothing,
+    // which is why they are the part a domain may have.
+    let (vendor, identity, writable_refused) = if attach(CONFIG, CONFIG_AT, 0) {
+        // SAFETY: the kernel mapped one page of configuration space read-only
+        // at this address. The vendor and device ids are its first four bytes.
+        let (vendor, identity) = unsafe { (read16(CONFIG_AT), read16(CONFIG_AT + 2)) };
+        // And the same page asked for writably, which must be refused: a
+        // writable configuration page is a writable BAR.
+        let refused = !attach(CONFIG, CONFIG_AT + 0x1000, 1);
+        (u64::from(vendor), u64::from(identity), refused)
+    } else {
+        (0, 0, false)
+    };
+
     // The device as this driver found it. Reported and not asserted: the
     // firmware probes disks before a kernel exists, so a device on a real bus
     // is never untouched.
@@ -312,6 +337,11 @@ extern "C" fn blkd_main() -> ! {
 
     let _ = queues;
     let (used_index, request_status) = aftermath();
+    let identified = if writable_refused {
+        (vendor << 16) | identity
+    } else {
+        0
+    };
     let by_interrupt = u64::from(BY_INTERRUPT.load(core::sync::atomic::Ordering::Relaxed));
     report(
         found,
@@ -323,6 +353,7 @@ extern "C" fn blkd_main() -> ! {
         used_index,
         request_status,
         by_interrupt,
+        identified,
     );
     exit()
 }
@@ -561,6 +592,7 @@ fn report(
     used_index: u64,
     request_status: u64,
     by_interrupt: u64,
+    identified: u64,
 ) {
     // A word the kernel looks for, so a zeroed page is not mistaken for a
     // report nobody wrote.
@@ -581,6 +613,7 @@ fn report(
         core::ptr::write_volatile(at.add(8), used_index);
         core::ptr::write_volatile(at.add(9), request_status);
         core::ptr::write_volatile(at.add(10), by_interrupt);
+        core::ptr::write_volatile(at.add(11), identified);
         // The marker last, and with a fence before it, so a kernel that sees
         // the marker sees everything under it.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);

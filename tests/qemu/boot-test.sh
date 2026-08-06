@@ -670,8 +670,14 @@ if [[ "$MODE" == "iommu" ]]; then
     # kernel programmed the MSI-X entry, the driver said which entry its queue
     # uses, and the completion arrived as a notification rather than as
     # something the driver noticed by looking.
-    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*1 sectors, sector 0 begins "BHASKIX-", woken by the device' "$LOG"; then
-        pass "a driver in ring 3 read its disk by DMA and was woken by its own interrupt"
+    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*1 sectors, sector 0 begins "BHASKIX-", woken by the device, and says it is 1af4:1042 from its own configuration space' "$LOG"; then
+        # `1af4:1042` is the virtio vendor and the modern block device, read
+        # by the driver out of its *own* configuration space with no help from
+        # the kernel. It is only reported when the same page was **refused** a
+        # writable mapping, so one value covers both halves of RFC 0014's
+        # decision: configuration space is readable and never writable, because
+        # a writable configuration page is a writable BAR.
+        pass "a driver in ring 3 read its disk, was woken by its interrupt, and named its own device"
     else
         fail "the block driver in a domain did not read its disk"
         grep -E "block domain" "$LOG" || true

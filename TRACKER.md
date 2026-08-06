@@ -7,8 +7,8 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 |---|---|
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
-| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) is complete; the driver framework (M8) is under way |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01 … M8-07 (RFC 0014 steps 1–5) · CI green · 409 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 294 host assertions |
+| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6, M8-01 … M8-09) · CI green · 409 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 294 host assertions |
 
 ### Division of responsibility between documents
 
@@ -140,6 +140,9 @@ documented.
 
 | M8-06 | RFC 0014 step 5: the virtqueue is one implementation, not two | ✅ `DONE` | The split-virtqueue protocol — descriptors, the available ring, the used ring, and **the order the writes happen in** — moved into `bhaskix_device::virtqueue`, which the kernel's driver and `bin/blkd` both compile. Each ring is given twice, as the address the driver writes through and the address the *device* is told, because with an IOMMU those differ and that difference is RFC 0012 from a driver's side. **Nothing changed**: 200 sectors, 2 requests, status 0x0f, and `blkd` still reads `BHASKIX-` and is still woken by its device. Four host tests, each watched failing for its own reason — including the one property no amount of reading the values afterwards can check, that the chain is published **before** the index that makes it visible. **The kernel's `unsafe` fell again, 1112 → 1067.** |
 | M8-07 | A byte that vanished from the console, and had been vanishing silently | ✅ `DONE` | A shell test failed on a string that never appeared. The machine had printed `6  ignal rd` — the `s` was gone. `serial::write_byte` gives up after a spin limit and **drops the byte rather than hang**, which is the right choice and was a silent one: under an emulator on a loaded host the UART is slow to report itself empty. It is counted now, and the boot reports whether every byte reached the wire — **gated, because every other check reads that log and this one decides whether they are reading all of it**. Also removed: a `MARK msix readback` debug line that had been shipping in every boot since RFC 0012 step 6. |
+
+| M8-08 | RFC 0014 step 6 COMPLETE: a configuration-space capability | ✅ `DONE` | The driver holds one page of **its own device's** configuration space, read-only, and reports `1af4:1042` from it — the virtio vendor and the modern block device — without asking the kernel anything. The value is only reported when a **writable** mapping of that page was refused, so one number covers both halves of the decision: readable always, writable never, because a writable configuration page is a writable BAR and no IOMMU governs where a device *answers*. Watched failing by removing the rights check. **RFC 0014 is complete.** |
+| M8-09 | The open question answered, and the answer was *nothing* | ✅ `DONE` | Acceptance left one question: how much of the command register is mediated. The answer is none of it, and the reason is that the question assumed a driver would ask to become a bus master. It does not — the kernel already enables bus mastering at the one moment it is safe to, after the device is reset and at the same point it grants the DMA window that contains it. A system call whose only effect the kernel performs anyway, at a better time, has nothing to do. The delegable set is smaller than the RFC proposed, because the proposal carried an assumption that turned out to be false. |
 
 ### M7 — Service framework ([RFC 0013](docs/rfc/0013-service-framework.md))
 
@@ -570,7 +573,7 @@ what is actually ahead.
 | Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
-| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — steps 1–5 done; step 6 (a configuration-space capability) remains | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
+| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ⬜ `TODO` | The filesystem service reads a read-only archive it is handed at entry |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
@@ -713,6 +716,28 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0014 step 6 — and a question whose answer was that it did not apply)
+
+- **A driver names its own device.** One page of configuration space, read-only, and `1af4:1042`
+  comes out of it with the kernel asked nothing. That page exists to be held only because PCIe made
+  configuration space *memory*; RFC 0013 step 6 said the bus stays in the kernel because it was port
+  I/O, and that sentence was true of the mechanism rather than of the design.
+- **One number carries both halves of the decision.** The identity is reported only when a writable
+  mapping of the same page was refused. Readable always, writable never — because a writable
+  configuration page is a writable BAR, and an IOMMU governs what a device *reads*, not where it
+  *answers*.
+- **The open question was answered `nothing`, and that is the interesting part.** Acceptance left
+  "how much of the command register is mediated" for step 6. The answer is none of it: the question
+  assumed a driver would ask to become a bus master and the kernel would decide. It does not — the
+  kernel already enables bus mastering after the device is reset, at the same point it grants the
+  window that contains it. A system call whose only effect the kernel performs anyway, at a better
+  time, has nothing to do. The delegable set ended up smaller than the RFC proposed, because the
+  proposal carried an assumption rather than because the work was cut.
+- **M8 is complete.** Two drivers, one set of register accessors, one virtqueue, one device model
+  they can both be tested against, and configuration space reachable as memory and checked against
+  the ports on every function of every bus. The kernel's `unsafe` fell twice along the way, which is
+  the first time that number has moved downwards at all.
 
 ### 2026-08-06 (RFC 0014 step 5 — one virtqueue, and a byte that had been vanishing)
 
