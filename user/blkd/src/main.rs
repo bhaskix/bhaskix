@@ -96,10 +96,17 @@ mod ring {
     pub const HEADER: u64 = 0x2000;
     /// One byte, which the device writes when it is finished.
     pub const STATUS: u64 = 0x2010;
-    /// Where the sector lands.
+    /// Where the sectors land. Four kilobytes: eight of them at once.
+    ///
+    /// It held one sector until RFC 0016 step 3, which made every filesystem
+    /// block eight round trips to another domain and eight requests to a
+    /// device. `args[1]` had always said how many sectors were wanted and had
+    /// always been ignored.
     pub const DATA: u64 = 0x2800;
+    /// The most sectors one request may carry.
+    pub const SECTORS: u64 = 8;
     /// Where this program leaves its findings for the kernel.
-    pub const REPORT: u64 = 0x3000;
+    pub const REPORT: u64 = 0x3800;
 }
 
 /// Offsets into the common configuration structure, from the specification.
@@ -403,7 +410,7 @@ extern "C" fn blkd_main() -> ! {
     // One read of sector zero, which is what the kernel checks this driver by.
     let read = match queue.as_mut() {
         Some(queue) => {
-            if read_sector(queue, rings_at_device, 0) {
+            if read_sector(queue, rings_at_device, 0, 1) {
                 finished()
             } else {
                 None
@@ -503,6 +510,42 @@ fn serve(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sectors: u64) ->
             // Where it lands is not this service's to choose. `HAND` puts it
             // in the slot the *caller* declared, and there is no argument here
             // that could say otherwise.
+            // A sector, the other way. The caller names memory it already
+            // holds; this takes the bytes out of it with `DRAIN` -- which the
+            // kernel checks the same three ways it checks `FILL`, and which
+            // needs the caller to hold that memory with `READ`.
+            //
+            // Refused past the end here rather than asked of the hardware, for
+            // the same reason a read is: a device is entitled to do anything
+            // with a sector that does not exist, and on a *write* that
+            // includes doing it to somebody else's sector.
+            block::WRITE => {
+                let sector = args[0];
+                let count = args[1].clamp(1, ring::SECTORS);
+                let slot = args[2];
+                if sector >= sectors || sector + count > sectors {
+                    // Refused here, and said so in a way the device cannot
+                    // imitate: QEMU's disk refuses an out-of-range write as
+                    // well, so answering zero would make this check and its
+                    // absence indistinguishable.
+                    block::REFUSED
+                } else {
+                    let (taken, got) = call_two(
+                        syscall::INVOKE,
+                        BLOCK_ENDPOINT,
+                        method::DRAIN,
+                        [slot, RINGS_AT + ring::DATA, count * 512, 0],
+                    );
+                    if taken == status::OK
+                        && got == count * 512
+                        && write_sector(queue, rings_at_device, sector, count)
+                    {
+                        count * 512
+                    } else {
+                        0
+                    }
+                }
+            }
             block::LEND_CONFIG => {
                 let (status, slot) = call_two(
                     syscall::INVOKE,
@@ -529,13 +572,14 @@ fn serve(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sectors: u64) ->
             }
             block::READ => {
                 let sector = args[0];
+                let count = args[1].clamp(1, ring::SECTORS);
                 let slot = args[2];
-                if sector >= sectors {
+                if sector >= sectors || sector + count > sectors {
                     // Past the end of the device. Refused here rather than
                     // asked of the hardware, because a device is entitled to
                     // do anything with a sector that does not exist.
                     0
-                } else if read_sector(queue, rings_at_device, sector) {
+                } else if read_sector(queue, rings_at_device, sector, count) {
                     // Into the caller's memory, named by a slot in the
                     // caller's own CSpace -- which the kernel re-checks, and
                     // which this service could not have chosen.
@@ -543,7 +587,7 @@ fn serve(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sectors: u64) ->
                         syscall::INVOKE,
                         BLOCK_ENDPOINT,
                         method::FILL,
-                        [slot, RINGS_AT + ring::DATA, 512, 0],
+                        [slot, RINGS_AT + ring::DATA, count * 512, 0],
                     );
                     if filled == status::OK { landed } else { 0 }
                 } else {
@@ -675,7 +719,78 @@ fn bring_up(rings_at_device: u64) -> Option<Virtqueue<Volatile>> {
 /// not by its position.
 ///
 /// `false` if the device reported a failure or never answered.
-fn read_sector(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sector: u64) -> bool {
+/// Writes the sector in [`ring::DATA`] to `sector` of the device.
+///
+/// The mirror of [`read_sector`], and the differences are exactly two: the
+/// header says type 1 rather than 0, and the data descriptor is **not**
+/// `WRITE` — that flag means "the device may write here", so leaving it on a
+/// write would tell the device it could overwrite the bytes being sent to it.
+/// Everything else — the kick, the wait, the status byte — is the same
+/// protocol, which is why the two share it rather than each having their own.
+fn write_sector(
+    queue: &mut Virtqueue<Volatile>,
+    rings_at_device: u64,
+    sector: u64,
+    count: u64,
+) -> bool {
+    let device_address = |offset: u64| rings_at_device + offset;
+
+    // SAFETY: `RINGS_AT` is four pages of memory this program holds and mapped
+    // writable, and every offset below is inside it.
+    unsafe {
+        // Header: type 1 (write), reserved 0, then the sector.
+        let header = (RINGS_AT + ring::HEADER) as *mut u32;
+        core::ptr::write_volatile(header, 1);
+        core::ptr::write_volatile(header.add(1), 0);
+        core::ptr::write_volatile((RINGS_AT + ring::HEADER + 8) as *mut u64, sector);
+        core::ptr::write_volatile((RINGS_AT + ring::STATUS) as *mut u8, 0xff);
+    }
+
+    queue.describe(0, device_address(ring::HEADER), 16, virtqueue::NEXT, 1);
+    // Device-readable: no `WRITE`. This is the whole difference in the ring,
+    // and getting it wrong would hand the device a page it may scribble on.
+    queue.describe(
+        1,
+        device_address(ring::DATA),
+        (count * 512) as u32,
+        virtqueue::NEXT,
+        2,
+    );
+    queue.describe(2, device_address(ring::STATUS), 1, virtqueue::WRITE, 0);
+    queue.publish(0);
+
+    // SAFETY: the notify window this program mapped, at the offset the device
+    // published for this queue.
+    unsafe {
+        let offset = u64::from(read16(COMMON_AT + common::QUEUE_NOTIFY_OFF));
+        write16(NOTIFY_AT + offset * 4, 0);
+    }
+
+    if VECTORED.load(core::sync::atomic::Ordering::Relaxed) {
+        let (status, _badge) = call(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+        let _ = call(syscall::INVOKE, HANDLER, method::ACK, [0; 4]);
+        if status != status::OK {
+            return false;
+        }
+        let _ = queue.completed();
+        return finished().is_some();
+    }
+
+    for _ in 0..2_000_000u64 {
+        if queue.completed().is_some() {
+            return finished().is_some();
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+fn read_sector(
+    queue: &mut Virtqueue<Volatile>,
+    rings_at_device: u64,
+    sector: u64,
+    count: u64,
+) -> bool {
     let device_address = |offset: u64| rings_at_device + offset;
 
     // SAFETY: `RINGS_AT` is four pages of memory this program holds and mapped
@@ -695,7 +810,7 @@ fn read_sector(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sector: u6
     queue.describe(
         1,
         device_address(ring::DATA),
-        512,
+        (count * 512) as u32,
         virtqueue::NEXT | virtqueue::WRITE,
         2,
     );

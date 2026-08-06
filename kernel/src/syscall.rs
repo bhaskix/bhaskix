@@ -132,6 +132,7 @@ const _: () = {
     assert!(method::DERIVE == bhaskix_abi::method::DERIVE);
     assert!(method::HAND == bhaskix_abi::method::HAND);
     assert!(method::EXPECT == bhaskix_abi::method::EXPECT);
+    assert!(method::DRAIN == bhaskix_abi::method::DRAIN);
     assert!(crate::cap::Rights::READ.bits() as u64 == bhaskix_abi::rights::READ);
     assert!(crate::cap::Rights::WRITE.bits() as u64 == bhaskix_abi::rights::WRITE);
     assert!(crate::cap::Rights::DERIVE.bits() as u64 == bhaskix_abi::rights::DERIVE);
@@ -301,6 +302,19 @@ pub mod method {
     /// is an invocation on one (RFC 0008 A2) — not because the endpoint has
     /// anything to do with it.
     pub const EXPECT: u64 = 46;
+    /// Read bytes *out of* memory the caller of this endpoint named.
+    ///
+    /// The mirror of [`FILL`], and the direction a write needs. Only on an
+    /// `Endpoint` capability, and only from the thread answering a message
+    /// taken from it. `arg0` = the *caller's* slot holding the `Memory`
+    /// capability, `arg1` = where in this server's address space to put the
+    /// bytes, `arg2` = how many at most. Returns how many were taken.
+    ///
+    /// The caller must hold that memory with `READ`, where `FILL` needs
+    /// `WRITE`: the right asked for is the one the operation performs on the
+    /// caller's object, and asking for a fixed one would let a capability that
+    /// may only be written to be read out.
+    pub const DRAIN: u64 = 48;
     /// Give the caller being answered a copy of a capability this server holds.
     ///
     /// Only on an `Endpoint` capability, and only from a thread that is
@@ -1074,6 +1088,45 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // caller declared with `EXPECT`, and nothing in this frame can change it.
     if kind == Some(Kind::Invoke) && frame.method == method::HAND {
         return hand(frame);
+    }
+
+    // The same path, the other way. A service that could read a caller's
+    // memory without these three checks could read any domain's memory by
+    // naming a slot, which is why this is not simply `FILL` with a flag.
+    if kind == Some(Kind::Invoke) && frame.method == method::DRAIN {
+        if let Err(status) = resolve_for_ipc(frame.capability, ObjectKind::Endpoint) {
+            return Outcome::err(status);
+        }
+        let Some(caller) = crate::sched::current_thread_id().and_then(crate::sched::reply_target)
+        else {
+            return Outcome::err(Status::WrongObject);
+        };
+        let Some(object) =
+            crate::shared::caller_object_for(caller, frame.arg0, crate::cap::Rights::READ)
+        else {
+            return Outcome::err(Status::NoSuchCapability);
+        };
+
+        let destination = frame.arg1;
+        let limit = frame.arg2 as usize;
+        let taken = crate::shared::drain_into(object, limit, &mut |bytes: &[u8]| {
+            // Into the service's own address space, through the exception
+            // table: a service that named an address it does not own gets a
+            // short transfer, not a kernel fault.
+            let len = bytes.len();
+            // SAFETY: `bytes` is a kernel-visible view of frames the caller's
+            // object owns, of `len` bytes, and `copy_to_user` is the
+            // fault-protected write -- an unmapped or read-only destination is
+            // a failure it reports rather than a fault it takes. `destination`
+            // is not dereferenced anywhere else.
+            let copied =
+                unsafe { bhaskix_arch::uaccess::copy_to_user(destination, bytes.as_ptr(), len) };
+            if copied.is_ok() { len } else { 0 }
+        });
+        return match taken {
+            Some(taken) => Outcome::ok(taken as u64),
+            None => Outcome::err(Status::NoSuchCapability),
+        };
     }
 
     // The domain placement's bulk path. Held to the same three checks the

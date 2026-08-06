@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-10 (RFC 0015 steps 1–6, RFC 0016 steps 1–2) · CI green · 494 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-11 (RFC 0015 steps 1–6, RFC 0016 steps 1–2, step 3 first half) · CI green · 501 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
 
 ### Division of responsibility between documents
 
@@ -142,6 +142,8 @@ fairness within 2% for two equal-weight workloads.
 | M9-09 | RFC 0016 step 1: a badge can no longer be chosen by the program holding it | ✅ `DONE` | A badge is a statement the *granter* made; until this, it was one the holder could make — `derive_owned` took the badge from its argument and `INVOKE`'s `DERIVE` passes that through from ring 3, so any program holding a badged capability with `DERIVE` could call a service as somebody else. Now one-way: a capability with badge zero is a **master** and may set any badge; one that carries a badge may only be derived with the same badge. Rights stay monotone independently, so delegation still works. **Two places in the tree demonstrated the hole as a feature** and had to be rewritten — the capability self-test asserted a re-badged derivation kept the new badge, and `user/probe` forged one from raw ring 3 with a comment calling it "how a derived capability is distinguishable from its parent". Both halves are gated everywhere, because either alone is worthless: delegation under the same badge must work, **and** a chosen badge must be refused. Watched failing in both directions — the rule removed, and the rule made over-strict. |
 
 | M9-10 | RFC 0016 step 2: a reply that carries a capability | ✅ `DONE` | `HAND` on an endpoint, and it is the endpoint because there is **no reply capability to put it on** — `ObjectKind::Reply` exists but a server never holds one, so "not answering anybody" is a check rather than a lookup. Four checks: the endpoint proves this thread is a server, the reply obligation says which caller, the capability is one the server holds with `GRANT` **and** `DERIVE`, and where it lands comes from the caller's new `EXPECT` — one-shot, spent by what arrives and dropped when the call ends. Without that last one a hostile service could fill a slot a program was keeping *empty*, which the shell does and one of its tests depends on. Proved with no throwaway service: the **block driver lends the shell its device's configuration page**, ring 3 to ring 3, and the shell maps it and reads `1af4:1042` — a number no service told it. Needed an IOMMU shell-test mode, because the block service only answers where a unit contains the device. **Two of the three refusals were vacuous** and were rebuilt so the named rule is the only one that can refuse. |
+
+| M9-11 | RFC 0016 step 3 (first half): `block::WRITE`, and a journal on a real device | ✅ `DONE` | The debt RFC 0015 step 1 left: it called for `READ` **and** `WRITE` and only `READ` was built, so the journal — whose entire subject is what reaches a disk — had never reached one. A write needs a new kernel primitive, **`DRAIN`**, the mirror of `FILL`: a caller names memory it holds and a service takes bytes *out* of it, checked the same three ways and asking the caller's capability for `READ` where `FILL` asks for `WRITE`, because the right demanded is the one the operation performs. A filesystem is now laid down on the **virtio disk** through the block service in another domain, a file is created through the log, the machine is stopped one *device* write after its commit, and mounting replays it — read back through a cache created seconds earlier holding nothing. Found on the way: `args[1]` (how many sectors) had always been in the ABI and always ignored, so every block was eight round trips; and the journal put **8 KiB on the stack per transaction**, which overflowed a kernel thread's stack and read as a wild jump. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -739,6 +741,36 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0016 step 3, first half — the journal reaches a disk)
+
+- **`block::WRITE` exists, three milestones after it was promised.** RFC 0015 step 1 called for
+  `READ` and `WRITE`; only `READ` was built, and nothing since needed the other half — so the
+  journal had been proved exhaustively against an array in memory and never once against a device.
+- **`DRAIN`, the mirror of `FILL`.** A caller names memory it holds and a service takes bytes *out*
+  of it. Same three checks in the same order, and one deliberate difference: it asks the caller's
+  capability for `READ` where `FILL` asks for `WRITE`, because the right demanded should be the one
+  the operation performs. A fixed right would let a capability that may only be written to be read.
+- **A filesystem on the virtio disk**, written through the block service in another domain, stopped
+  one *device* write after its commit, recovered by mounting — and read back through a cache created
+  seconds earlier that holds nothing, so what it reads is what the disk holds.
+- **`args[1]` had always meant "how many sectors" and had always been ignored.** Every 4 KiB block
+  was eight round trips and eight device requests. The service now carries eight sectors at once,
+  which is one round trip per block.
+- **The journal put 8 KiB on the stack per transaction** — a `[u8; BLOCK]` to build a commit and
+  another to zero one — and a kernel thread ran off the end of its stack. It surfaced as a page
+  fault with `rip == cr2` at an address inside the stack area, which reads as a wild jump and says
+  nothing until the numbers are read. Both buffers are gone: a commit is built as the 56 bytes that
+  actually say anything, and the log is cleared in the cache page rather than from a buffer.
+- **Two negative tests caught nothing at first, for two different reasons.** `DRAIN` without the
+  `READ` requirement changed nothing, because the only caller held its memory with every right — so
+  the writer now also holds the *same object* write-only, and names that. And a write past the end
+  of the device was refused with the check deleted, because QEMU's disk refuses it too — so the
+  service now answers a range it refused **itself** distinguishably from one the device rejected.
+  Ninth and tenth.
+- The suite failed twice on a fixed 120 s boot timeout under external load (average 8–11, four
+  gitlab-runner processes at 240% CPU). Measured rather than assumed: the new work adds **1.3 s** to
+  a 22 s boot. Reran green at load average 8.
 
 ### 2026-08-06 (RFC 0016 step 2 — a service hands a program a capability)
 

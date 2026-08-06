@@ -220,7 +220,13 @@ impl<'f, S: Store> Volume<'f, S> {
         )?;
         let commit_block =
             u32::try_from(self.superblock.journal_start).map_err(|_| FsError::OutOfRange)?;
-        self.cache.put(commit_block, &head)?;
+        {
+            let page = self.cache.edit(commit_block)?;
+            page.fill(0);
+            page.get_mut(..journal::HEAD)
+                .ok_or(FsError::OutOfRange)?
+                .copy_from_slice(&head);
+        }
         self.cache.flush()?;
 
         // 3. Home. Interrupted here, the commit stands and the next mount

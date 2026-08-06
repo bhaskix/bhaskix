@@ -418,13 +418,37 @@ Five steps. The first is independent of the rest and should not wait for it.
    - *A capability without `GRANT`* was refused — but the capability chosen also lacked `DERIVE`, so
      the derive refused it first. The driver's register windows now carry `DERIVE`, which makes
      `GRANT` the only thing in the way.
-3. **`block::WRITE`, and then the filesystem service in a domain.** Two halves, and the first is
-   owed from RFC 0015 step 1: the block service gains a write over RFC 0009's bulk path, and the
-   journal is exercised against a **device** for the first time — including the interruption harness,
-   which has until now stopped a store backed by an array. Then the filesystem service's `Store`
-   becomes messages to `bin/blkd`. No namespace yet: the criterion is that it mounts the same image
-   and reads the same bytes the kernel reads today, from the same disk, with the kernel not linking
-   `fs`.
+3. **`block::WRITE`, and then the filesystem service in a domain.** Two halves.
+
+   ✅ **The first half is done**, and it was the debt RFC 0015 step 1 left. The block service gains
+   `WRITE` over RFC 0009's bulk path — which needed a new kernel primitive, `DRAIN`, the mirror of
+   `FILL`: a caller names memory it holds and a service takes bytes *out* of it. Same three checks in
+   the same order, and a fourth difference that matters — it asks the caller's capability for `READ`
+   where `FILL` asks for `WRITE`, because the right demanded is the one the operation performs.
+
+   The journal now runs **on the virtio disk**, through the block service in another domain: a
+   filesystem is laid down block by block, a file is created through the log, the machine is stopped
+   one *device* write after its commit, and mounting replays it. What it reads back it reads off the
+   disk through a cache that has just been created and holds nothing. Until this existed the journal
+   had only ever been exercised against an array in memory — correct, exhaustive, and silent about
+   the one thing a journal is for.
+
+   The exhaustive interruption harness stays on the host, where stopping at every write of every
+   operation costs milliseconds rather than a round trip each. What the machine adds is that the same
+   code does it to a device.
+
+   Two things fell out. `args[1]` — how many sectors — had always been in the ABI and always been
+   ignored, so every 4 KiB block was eight round trips and eight requests; the service now carries
+   eight sectors at once. And a write past the end of the device has to answer **distinguishably**
+   from a write that failed, because QEMU's disk refuses an out-of-range write too: without a
+   distinct answer, the check and its absence look identical from outside, which is exactly what a
+   test of it found.
+
+   **The second half is not done.** The filesystem service's `Store` becoming messages to `bin/blkd`
+   is what remains of this step, and the criterion this RFC wrote for it — "with the kernel not
+   linking `fs`" — is **wrong as stated**: `kernel/src/namespace.rs` uses the crate, and it does not
+   go until step 4. The honest criterion is that the *service* mounts the same image from the same
+   disk and reads the same bytes, with the kernel's copy still there until step 4 deletes it.
 4. **Directory and file handles.** The namespace moves out; the kernel's `namespace.rs`,
    `ObjectKind::Directory`, `ObjectKind::File` and `OPEN_AT` are deleted. The RFC 0015 step 4 shell
    gates must pass **unchanged** — that is the point of them.

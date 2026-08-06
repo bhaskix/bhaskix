@@ -128,6 +128,12 @@ else
     trap 'stop_machine; rm -f "$LOG" "$FIFO"' EXIT
 fi
 
+# The domain's disk is written to now, so it is rebuilt before every run.
+# A fixture a test mutates is a fixture whose next run starts somewhere nobody
+# chose, and this one carries the marker other checks look for in sector zero.
+rm -f "$REPO_ROOT/build/domain-disk.img"
+make -C "$REPO_ROOT" build/domain-disk.img >/dev/null 2>&1 || true
+
 echo "booting and typing at it, up to ${TIMEOUT}s..."
 
 # With a unit, the same flags RFC 0012's boot test uses. The block *service*
@@ -148,7 +154,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
     -M q35 -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
     "${IOMMU_ARGS[@]}" \
     -drive "file=$REPO_ROOT/build/initrd.tar,format=raw,if=none,id=disk0,readonly=on" \
-    -drive "file=$REPO_ROOT/build/domain-disk.img,format=raw,if=none,id=disk1,readonly=on" \
+    -drive "file=$REPO_ROOT/build/domain-disk.img,format=raw,if=none,id=disk1" \
     "${VIRTIO_ARGS[@]}" \
     -no-reboot -cdrom "$ISO" -boot d -serial stdio -display none \
     < "$FIFO" > "$LOG" 2>&1 &

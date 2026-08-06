@@ -104,7 +104,7 @@ fi
 
 QEMU_ARGS=(-M "$MACHINE" -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
            -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on"
-           -drive "file=$DOMAIN_DISK,format=raw,if=none,id=disk1,readonly=on"
+           -drive "file=$DOMAIN_DISK,format=raw,if=none,id=disk1"
            "${VIRTIO_ARGS[@]}"
            "${IOMMU_ARGS[@]}"
            -serial "file:$LOG" -display none)
@@ -164,6 +164,12 @@ if [[ "$MODE" == "uefi" ]]; then
     QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE"
                 -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS")
 fi
+
+# The domain's disk is written to now, so it is rebuilt before every run.
+# A fixture a test mutates is a fixture whose next run starts somewhere nobody
+# chose, and this one carries the marker other checks look for in sector zero.
+rm -f "$REPO_ROOT/build/domain-disk.img"
+make -C "$REPO_ROOT" build/domain-disk.img >/dev/null 2>&1 || true
 
 echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
@@ -712,7 +718,7 @@ if [[ "$MODE" == "iommu" ]]; then
     # kernel programmed the MSI-X entry, the driver said which entry its queue
     # uses, and the completion arrived as a notification rather than as
     # something the driver noticed by looking.
-    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*8 sectors, sector 0 begins "BHASKIX-", woken by the device, and says it is 1af4:1042 from its own configuration space' "$LOG"; then
+    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*512 sectors, sector 0 begins "BHASKIX-", woken by the device, and says it is 1af4:1042 from its own configuration space' "$LOG"; then
         # `1af4:1042` is the virtio vendor and the modern block device, read
         # by the driver out of its *own* configuration space with no help from
         # the kernel. It is only reported when the same page was **refused** a
@@ -725,7 +731,7 @@ if [[ "$MODE" == "iommu" ]]; then
         grep -E "block domain" "$LOG" || true
         status=1
     fi
-elif grep -qE "block domain +ring 3 driver: .*drove it to 3, .*8 sectors" "$LOG"; then
+elif grep -qE "block domain +ring 3 driver: .*drove it to 3, .*512 sectors" "$LOG"; then
     # Without a unit the driver gets registers and no window, so it brings the
     # device up and stops. That is the refusal, not a shortcoming: a domain
     # that could aim a device with physical addresses would be a domain that
@@ -939,6 +945,26 @@ if grep -qE "ring 3 +[0-9]+ syscalls, [1-9][0-9]* interrupts from user mode; [1-
     pass "ring 3 runs a program loaded from disk, by capability, and revokes it"
 else
     fail "ring 3 execution did not pass"
+    status=1
+fi
+
+# RFC 0016 step 3, and the debt RFC 0015 step 1 left. Until `block::WRITE`
+# existed the journal had only ever been exercised against an array in memory:
+# correct, exhaustive, and silent about the one thing a journal is for. This is
+# a filesystem on the virtio disk, written through the block service in another
+# domain, stopped one device write *after* its commit, and recovered by
+# mounting -- and what it reads back it reads off the disk, through a cache
+# that has just been created and holds nothing.
+#
+# The exhaustive harness stays on the host, where stopping at every write of
+# every operation costs milliseconds rather than a round trip each.
+if grep -qE "disk journal +a filesystem on the virtio disk, through the block service: a create takes [1-9][0-9]* device writes to commit, the machine was stopped one write later, and mounting replayed [1-9][0-9]* blocks" "$LOG"; then
+    pass "a journal on a real device survived being interrupted after its commit"
+elif grep -qE "disk journal +no block service on this machine" "$LOG"; then
+    pass "no block service on this machine, so no device to put a filesystem on"
+else
+    fail "the journal did not survive an interruption on a device"
+    grep -E "disk journal " "$LOG" || true
     status=1
 fi
 

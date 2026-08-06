@@ -47,7 +47,7 @@
 //!    here that is not obvious.
 //! 5. The commit block cleared.
 
-use crate::{BLOCK, FsError, Pages, Superblock, put, u32_at, u64_at};
+use crate::{FsError, Pages, Superblock, put, u32_at, u64_at};
 
 /// How many blocks one transaction may change.
 ///
@@ -148,7 +148,21 @@ fn transaction_checksum<P: Pages>(
     Ok(if hash == 0 { 1 } else { hash })
 }
 
+/// How many bytes of a commit block actually say anything.
+///
+/// The header and the table of destinations. Everything after it is zero, and
+/// building only this much is what keeps a transaction off the stack: a
+/// `[u8; BLOCK]` here is four kilobytes per commit, and a kernel thread that
+/// paid it twice per transaction ran off the end of its stack — which is a
+/// page fault at an address in the stack area, and looks like nothing at all
+/// until the numbers are read.
+pub const HEAD: usize = TABLE + MAX_STAGED * 4;
+
 /// Builds the commit block for a transaction whose payload is already in place.
+///
+/// Returns only the bytes that matter — see [`HEAD`]. The caller zeroes the
+/// page and copies these in, which it can do through the cache without a
+/// buffer of its own.
 ///
 /// Called only after every payload block has reached the device, because the
 /// checksum is over them: committing first would commit a transaction whose
@@ -163,7 +177,7 @@ pub fn build_commit<P: Pages>(
     superblock: &Superblock,
     sequence: u64,
     homes: &[u32],
-) -> Result<[u8; BLOCK], FsError> {
+) -> Result<[u8; HEAD], FsError> {
     if homes.is_empty() || homes.len() > MAX_STAGED {
         return Err(FsError::Full);
     }
@@ -171,7 +185,7 @@ pub fn build_commit<P: Pages>(
         return Err(FsError::Full);
     }
 
-    let mut head = [0u8; BLOCK];
+    let mut head = [0u8; HEAD];
     put(&mut head, 0, &crate::JOURNAL_MAGIC.to_le_bytes()).ok_or(FsError::OutOfRange)?;
     put(&mut head, 8, &sequence.to_le_bytes()).ok_or(FsError::OutOfRange)?;
     put(&mut head, 16, &(homes.len() as u32).to_le_bytes()).ok_or(FsError::OutOfRange)?;

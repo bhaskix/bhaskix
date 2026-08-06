@@ -206,6 +206,13 @@ pub mod method {
     /// One-shot: the declaration is consumed by the capability that arrives,
     /// and cleared when the call it was made for returns.
     pub const EXPECT: u64 = 46;
+    /// Read bytes out of memory the caller of this endpoint named.
+    ///
+    /// The mirror of `FILL`, and what a write needs. `arg0` = the *caller's*
+    /// slot holding the `Memory`, `arg1` = where in this program's address
+    /// space to put them, `arg2` = how many at most. The caller must hold that
+    /// memory with `READ`.
+    pub const DRAIN: u64 = 48;
     /// Give the caller being answered a copy of a capability this server holds.
     ///
     /// Only on an `Endpoint` capability, and only while answering a message
@@ -314,6 +321,24 @@ pub mod block {
     /// the **caller's** CSpace holding the `Memory` to fill. Replies with the
     /// bytes that landed, and an outcome.
     pub const READ: u64 = 1;
+    /// Write sectors from memory the caller names.
+    ///
+    /// `args[0]` = first sector, `args[1]` = how many, `args[2]` = the slot in
+    /// the **caller's** CSpace holding the `Memory` to take them from. Replies
+    /// with the bytes that went. The caller must hold that memory with
+    /// `READ` — this is the direction that reads it.
+    pub const WRITE: u64 = 5;
+    /// What [`WRITE`] answers for a range the *service* refused itself.
+    ///
+    /// Distinct from zero, which means the write was attempted and did not
+    /// land. The difference is not cosmetic: a sector past the end of the
+    /// device must be refused **here** rather than asked of the hardware,
+    /// because a device is entitled to do anything with a sector that does not
+    /// exist — and on a write that includes doing it to somebody else's. A
+    /// polite device refuses it too, so without a distinct answer the check
+    /// and its absence look identical from outside, which is what a test of it
+    /// found.
+    pub const REFUSED: u64 = u64::MAX;
     /// How many 512-byte sectors the device has.
     pub const CAPACITY: u64 = 2;
     /// Lend the caller the device's configuration page, read-only.

@@ -2292,6 +2292,117 @@ static BLOCK_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// The caller is a domain with a `Memory` object, because that is what the
 /// protocol requires: sector data never crosses in message registers, and the
 /// caller names memory it already holds.
+/// Runs [`journal_on_disk`] and says what it found.
+fn disk_journal_self_test(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = BLOCK_ENDPOINT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        // No block service, so no disk to put a filesystem on. Said out loud
+        // rather than returned quietly: a test that cannot tell "there was
+        // nothing to do" from "it did nothing" is a test that passes on a
+        // machine where the whole subsystem is missing.
+        println!(
+            "    disk journal   no block service on this machine, so no device to put a \
+             filesystem on"
+        );
+        return true;
+    }
+
+    let Ok(owner) = domain::create("disk-journal", domain::ResourceEnvelope::new()) else {
+        println!("    disk journal   FAILED to create a domain to write from");
+        return false;
+    };
+    let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
+        println!("    disk journal   FAILED to create a memory object");
+        domain::destroy(owner);
+        return false;
+    };
+    // Read *and* write: the service fills it on a read and drains it on a
+    // write, and the kernel checks a different right for each.
+    // Slot 0 holds it with everything; slot 1 holds the **same object** with
+    // `WRITE` and no `READ`. Two capabilities to one thing, so that the
+    // refusal below is about the right and not about the lookup -- a caller
+    // refused because it holds nothing has learned nothing about rights. The
+    // same shape the shell already uses for `map`.
+    let installed = shared::name(object).ok().and_then(|memory| {
+        let write_only = cap::with_arena(|arena| arena.derive(memory, cap::Rights::WRITE, 0).ok())?;
+        domain::with(owner, |d| {
+            d.cspace.install_at(0, memory).is_ok() && d.cspace.install_at(1, write_only).is_ok()
+        })
+    });
+    let Some((frames, count)) = shared::frames_of(object) else {
+        domain::destroy(owner);
+        return false;
+    };
+    if installed != Some(true) || count == 0 {
+        println!("    disk journal   FAILED to give the writer its memory");
+        domain::destroy(owner);
+        return false;
+    }
+
+    DISK_HHDM.store(hhdm, Ordering::Release);
+    DISK_FRAME.store(frames[0], Ordering::Release);
+    DISK_JOURNAL.store(u64::MAX, Ordering::Release);
+
+    let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
+    if sched::spawn_on_with(
+        0,
+        "disk-journal",
+        journal_on_disk,
+        u64::from(raw as u32),
+        hhdm,
+        options,
+    )
+    .is_err()
+    {
+        println!("    disk journal   FAILED to spawn a writer");
+        domain::destroy(owner);
+        return false;
+    }
+
+    // Waited for the answer rather than for a duration. Every block is eight
+    // round trips to another domain and there are a few hundred of them, so
+    // this is the slowest self-test on the machine and a fixed wait would be a
+    // guess that is wrong in one direction or the other.
+    let mut verdict = u64::MAX;
+    for _ in 0..400 {
+        verdict = DISK_JOURNAL.load(Ordering::Acquire);
+        if verdict != u64::MAX {
+            break;
+        }
+        wait_millis(50);
+    }
+    domain::destroy(owner);
+
+    // Checked against the sentinel *first*. `u64::MAX` has the success bit
+    // set, so a version of this that only tested the bit reported success on a
+    // machine where the writer never finished -- and it did, with a replay
+    // count of 16777215.
+    if verdict == u64::MAX {
+        println!(
+            "    disk journal   FAILED: the writer did not finish; every block is eight round \
+             trips to another domain and there was not time for them"
+        );
+        return false;
+    }
+    if verdict & 0x1_0000_0000 == 0 {
+        println!(
+            "    disk journal   FAILED at stage {verdict}: a filesystem on the device did not \
+             survive being interrupted after its commit"
+        );
+        return false;
+    }
+    let replayed = (verdict >> 8) & 0xff_ffff;
+    let commit_at = verdict & 0xff;
+    println!(
+        "    disk journal   a filesystem on the virtio disk, through the block service: a create \
+         takes {commit_at} device writes to commit, the machine was stopped one write later, and \
+         mounting replayed {replayed} blocks -- `recovered` is on the disk and so is `on-a-disk`"
+    );
+    true
+}
+
 fn block_service_self_test(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
 
@@ -2384,6 +2495,105 @@ fn block_service_self_test(hhdm: u64) -> bool {
 }
 
 /// The domain the block self-test asks from, and what came back.
+/// What the journal-on-a-disk test found, or `u64::MAX` while it is running.
+///
+/// Packed rather than a struct because it crosses from a spawned thread to the
+/// boot report and a struct would need a lock on a path that has no reason to
+/// take one.
+static DISK_JOURNAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// A block device reached by asking the block service for one sector at a time.
+///
+/// The `Store` RFC 0015 step 6 introduced, finally over something that is not
+/// memory. Every read and every write here is a **round trip to another
+/// domain**, which is the cost the trait exists to make payable rather than
+/// invisible. One per 4 KiB block: the service carries eight sectors in a
+/// request, which is what `args[1]` always meant and had never done.
+struct DiskStore {
+    endpoint: ipc::EndpointId,
+    /// The slot, in *this* domain's CSpace, holding the memory the service
+    /// fills and drains. The service cannot choose it and the kernel re-checks
+    /// it against what this domain actually holds.
+    slot: u64,
+    /// The frame behind that memory, so the bytes can be moved without a
+    /// second copy through a buffer this thread does not have room for.
+    frame: u64,
+    hhdm: u64,
+    sectors: u64,
+    /// Writes still permitted before this pretends to be a machine that
+    /// stopped. `u32::MAX` for a device that does not stop.
+    budget: u32,
+    /// Writes that went, and which of them reached the commit block.
+    writes: u32,
+}
+
+impl DiskStore {
+    /// The bytes of the shared page, as the kernel sees them.
+    ///
+    /// `&mut self`, because handing out a `&mut [u8]` from a `&self` is a
+    /// shape that is unsound whether or not this particular use of it is —
+    /// two callers could hold the same page mutably and nothing would say so.
+    fn page(&mut self) -> &mut [u8] {
+        // SAFETY: one frame of a `Memory` object this thread's domain holds,
+        // through the direct map. Nothing else touches it while this store
+        // exists: the object was made for this test and installed in one slot
+        // of one domain.
+        unsafe { core::slice::from_raw_parts_mut((self.hhdm + self.frame) as *mut u8, 4096) }
+    }
+}
+
+impl bhaskix_fs::Store for DiskStore {
+    fn blocks(&self) -> u32 {
+        u32::try_from(self.sectors / 8).unwrap_or(0)
+    }
+
+    fn read(&mut self, block: u32, into: &mut [u8]) -> Result<(), bhaskix_fs::FsError> {
+        if u64::from(block) >= self.sectors / 8 {
+            return Err(bhaskix_fs::FsError::OutOfRange);
+        }
+        let reply = ipc::call(
+            self.endpoint,
+            0x00b2_0000,
+            bhaskix_abi::block::READ,
+            [u64::from(block) * 8, 8, self.slot, 0],
+        )
+        .map_err(|_| bhaskix_fs::FsError::OutOfRange)?;
+        if reply.args[0] != 4096 {
+            return Err(bhaskix_fs::FsError::OutOfRange);
+        }
+        into.get_mut(..4096)
+            .ok_or(bhaskix_fs::FsError::OutOfRange)?
+            .copy_from_slice(self.page());
+        Ok(())
+    }
+
+    fn write(&mut self, block: u32, from: &[u8]) -> Result<(), bhaskix_fs::FsError> {
+        if u64::from(block) >= self.sectors / 8 {
+            return Err(bhaskix_fs::FsError::OutOfRange);
+        }
+        if self.writes >= self.budget {
+            // The machine stopped. Nothing is sent, which is what "it did not
+            // happen" means -- and the sectors already sent stay sent, which is
+            // what makes the recovery below have something to do.
+            return Err(bhaskix_fs::FsError::Interrupted);
+        }
+        self.page()
+            .copy_from_slice(from.get(..4096).ok_or(bhaskix_fs::FsError::OutOfRange)?);
+        let reply = ipc::call(
+            self.endpoint,
+            0x00b2_0000,
+            bhaskix_abi::block::WRITE,
+            [u64::from(block) * 8, 8, self.slot, 0],
+        )
+        .map_err(|_| bhaskix_fs::FsError::OutOfRange)?;
+        if reply.args[0] != 4096 {
+            return Err(bhaskix_fs::FsError::OutOfRange);
+        }
+        self.writes += 1;
+        Ok(())
+    }
+}
+
 static BLOCK_CALLER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 static BLOCK_READ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 /// What a read past the end of the device answered.
@@ -2391,6 +2601,191 @@ static BLOCK_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 
 /// Asks the block service for sector zero, from inside a domain that holds the
 /// memory it will land in.
+/// Pages for the cache the disk journal runs through.
+static mut DISK_FRAMES: [u8; 8 * bhaskix_fs::BLOCK] = [0; 8 * bhaskix_fs::BLOCK];
+
+/// A filesystem on the **device**, interrupted after its commit and recovered.
+///
+/// Every write below is a message to a driver in another domain, which puts a
+/// sector on a virtio disk. Until this existed the journal had only ever been
+/// exercised against an array in memory: correct, exhaustive, and silent about
+/// the one thing a journal is for. RFC 0015 step 1 called for `block::WRITE`
+/// and only `READ` was built, so nothing since had needed the other half.
+///
+/// The exhaustive interruption harness stays on the host, where stopping at
+/// every write of every operation costs milliseconds. Here there is one
+/// interruption and it is the decisive one: the machine stops one device write
+/// **after** the commit, which is the only place recovery has work to do.
+extern "C" fn journal_on_disk(endpoint: u64) -> ! {
+    use bhaskix_fs::{Cache, Kind, Store, Volume};
+    use core::sync::atomic::Ordering;
+
+    let endpoint = ipc::EndpointId::from_u32(endpoint as u32);
+    let hhdm = DISK_HHDM.load(Ordering::Acquire);
+    let frame = DISK_FRAME.load(Ordering::Acquire);
+
+    let sectors = match ipc::call(endpoint, 0x00b2_0000, bhaskix_abi::block::CAPACITY, [0; 4]) {
+        Ok(reply) => reply.args[0],
+        Err(_) => 0,
+    };
+
+    // What a write refuses, before anything is written for real.
+    //
+    // A sector past the end, which must be refused *here* rather than asked of
+    // the hardware: a device is entitled to do anything with a sector that
+    // does not exist, and on a write that includes doing it to somebody
+    // else's. And the same write named through slot 1 -- the same memory, held
+    // without `READ` -- which the kernel must refuse to take bytes out of,
+    // because taking them is reading it.
+    let past = ipc::call(
+        endpoint,
+        0x00b2_0000,
+        bhaskix_abi::block::WRITE,
+        [sectors, 8, 0, 0],
+    )
+    .map_or(u64::MAX, |reply| reply.args[0]);
+    let unreadable = ipc::call(
+        endpoint,
+        0x00b2_0000,
+        bhaskix_abi::block::WRITE,
+        [0, 8, 1, 0],
+    )
+    .map_or(u64::MAX, |reply| reply.args[0]);
+    if past != bhaskix_abi::block::REFUSED || unreadable != 0 {
+        DISK_JOURNAL.store(13, Ordering::Release);
+        sched::exit()
+    }
+    let store = |budget: u32| DiskStore {
+        endpoint,
+        slot: 0,
+        frame,
+        hhdm,
+        sectors,
+        budget,
+        writes: 0,
+    };
+
+    // SAFETY: this thread is the only one that reaches these pages, and it is
+    // spawned once.
+    let (image, frames) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(JOURNAL_IMAGE),
+            &mut *core::ptr::addr_of_mut!(DISK_FRAMES),
+        )
+    };
+
+    // Formatted in memory and then *put on the disk block by block*, which is
+    // what `mkfs` does from a developer's machine. Formatting through the
+    // store would work equally well and would prove less: what is wanted here
+    // is a device holding an image this kernel did not make up as it read it.
+    let blocks = 16u32;
+    if bhaskix_fs::format(image, 128).is_err() || u64::from(blocks) > sectors / 8 {
+        DISK_JOURNAL.store(0, Ordering::Release);
+        sched::exit()
+    }
+    {
+        let mut device = store(u32::MAX);
+        for block in 0..blocks {
+            let at = (block as usize) * bhaskix_fs::BLOCK;
+            if device
+                .write(block, &image[at..at + bhaskix_fs::BLOCK])
+                .is_err()
+            {
+                DISK_JOURNAL.store(1, Ordering::Release);
+                sched::exit()
+            }
+        }
+    }
+
+    // A file, on the disk, through the journal. Nothing in memory is consulted
+    // from here on: the cache is empty and every page it wants comes off the
+    // device.
+    let root = {
+        let Ok(cache) = Cache::new(frames, store(u32::MAX)) else {
+            DISK_JOURNAL.store(2, Ordering::Release);
+            sched::exit()
+        };
+        let Ok((mut volume, _)) = Volume::mount(cache) else {
+            DISK_JOURNAL.store(3, Ordering::Release);
+            sched::exit()
+        };
+        let root = volume.superblock().root;
+        if volume.create(root, b"on-a-disk", Kind::File).is_err() {
+            DISK_JOURNAL.store(4, Ordering::Release);
+            sched::exit()
+        }
+        root
+    };
+
+    // How many device writes a create takes, so the interruption lands one
+    // *after* the commit rather than at a number somebody guessed.
+    let commit_at = {
+        let Ok(cache) = Cache::new(frames, store(u32::MAX)) else {
+            DISK_JOURNAL.store(5, Ordering::Release);
+            sched::exit()
+        };
+        let Ok((mut volume, _)) = Volume::mount(cache) else {
+            DISK_JOURNAL.store(6, Ordering::Release);
+            sched::exit()
+        };
+        let _ = volume.create(root, b"counted", Kind::File);
+        let writes = volume.cache().store().writes;
+        let _ = volume.remove(root, b"counted");
+        // A transaction is symmetric: payload, commit, homes, cleared. The
+        // commit is the middle write.
+        writes / 2
+    };
+
+    // The same operation, on a device that stops one write after its commit.
+    let interrupted = {
+        let Ok(cache) = Cache::new(frames, store(commit_at + 1)) else {
+            DISK_JOURNAL.store(7, Ordering::Release);
+            sched::exit()
+        };
+        let Ok((mut volume, _)) = Volume::mount(cache) else {
+            DISK_JOURNAL.store(8, Ordering::Release);
+            sched::exit()
+        };
+        volume.create(root, b"recovered", Kind::File)
+    };
+    if interrupted != Err(bhaskix_fs::FsError::Interrupted) {
+        DISK_JOURNAL.store(9, Ordering::Release);
+        sched::exit()
+    }
+
+    // A fresh cache, so nothing that was only ever in memory can answer. What
+    // this reads is what the disk holds.
+    let (replayed, found, kept) = {
+        let Ok(cache) = Cache::new(frames, store(u32::MAX)) else {
+            DISK_JOURNAL.store(10, Ordering::Release);
+            sched::exit()
+        };
+        let Ok((mut volume, replayed)) = Volume::mount(cache) else {
+            DISK_JOURNAL.store(11, Ordering::Release);
+            sched::exit()
+        };
+        let found = volume.lookup(root, b"recovered").is_ok();
+        let kept = volume.lookup(root, b"on-a-disk").is_ok();
+        (replayed, found, kept)
+    };
+
+    let ok = found && kept && replayed > 0;
+    DISK_JOURNAL.store(
+        if ok {
+            0x1_0000_0000 | (u64::from(replayed) << 8) | u64::from(commit_at)
+        } else {
+            12
+        },
+        Ordering::Release,
+    );
+    sched::exit()
+}
+
+/// Where the direct map is, for the thread above.
+static DISK_HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The frame behind the memory that thread shares with the block service.
+static DISK_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 extern "C" fn block_asks(endpoint: u64) -> ! {
     use core::sync::atomic::Ordering;
 
@@ -2484,7 +2879,10 @@ fn report_block_domain(hhdm: u64) -> bool {
     // The last page. The first three are the descriptor table, the rings and
     // the request the *device* reads and writes -- a report living in any of
     // them would be a report the device could overwrite.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3]) as *const u8, 104) };
+    // Half a page in, since the data area grew to four kilobytes: the report
+    // moved out of its way rather than the transfer being kept small enough to
+    // leave it where it was.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3] + 0x800) as *const u8, 104) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -3131,6 +3529,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
         if !block_service_self_test(hhdm) {
             println!("    block service  FAILED");
+        }
+        if !disk_journal_self_test(hhdm) {
+            println!("    disk journal   FAILED");
         }
     }
 

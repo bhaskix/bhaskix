@@ -564,6 +564,17 @@ pub fn frames_of(id: MemoryId) -> Option<([u64; MAX_FRAMES], usize)> {
 /// names something that is not memory.
 #[must_use]
 pub fn caller_object(caller: u32, slot: u64) -> Option<MemoryId> {
+    caller_object_for(caller, slot, crate::cap::Rights::WRITE)
+}
+
+/// The same, for an operation that needs some other right.
+///
+/// A `FILL` writes into the caller's memory and needs `WRITE`; a `DRAIN` reads
+/// out of it and needs `READ`. Asking for the right the *operation* needs, and
+/// not for a fixed one, is what stops a read-only capability being enough to
+/// have something written through it — or, the way round that matters more
+/// here, a write-only one being enough to have its contents taken.
+pub fn caller_object_for(caller: u32, slot: u64, needs: crate::cap::Rights) -> Option<MemoryId> {
     let domain = crate::sched::domain_of(caller)?;
     let index = usize::try_from(slot).ok()?;
 
@@ -572,10 +583,9 @@ pub fn caller_object(caller: u32, slot: u64) -> Option<MemoryId> {
         let found = cspace.get(index).and_then(|slot| {
             crate::cap::with_arena(|arena| {
                 let (object, rights) = arena.lookup(slot)?;
-                // Writing into it, so the caller must be entitled to write.
-                if object.kind != crate::cap::ObjectKind::Memory
-                    || !rights.contains(crate::cap::Rights::WRITE)
-                {
+                // Whatever the operation needs of it: writing into a caller's
+                // memory needs `WRITE`, taking bytes out of it needs `READ`.
+                if object.kind != crate::cap::ObjectKind::Memory || !rights.contains(needs) {
                     return None;
                 }
                 Some(MemoryId::from_u64(object.id))
@@ -585,6 +595,48 @@ pub fn caller_object(caller: u32, slot: u64) -> Option<MemoryId> {
         found
     })
     .flatten()
+}
+
+/// Reads an object's frames into `sink`, returning how many bytes were taken.
+///
+/// The mirror of [`fill_from`], and the direction a *write* needs: a caller
+/// names memory it holds, and a service takes bytes out of it rather than
+/// putting bytes in. RFC 0016 step 3, which is the half RFC 0015 step 1 owed.
+///
+/// `None` if the object has gone. Never reads past the object, for the same
+/// reason the other direction never writes past it: the length is the
+/// object's, and a caller that could name a length would be naming memory
+/// beyond what it holds — which in *this* direction would be reading it.
+pub fn drain_into(
+    id: MemoryId,
+    limit: usize,
+    mut sink: impl FnMut(&[u8]) -> usize,
+) -> Option<usize> {
+    let (frames, count) = frames_of(id)?;
+    let hhdm = hhdm();
+    let capacity = (count * FRAME_SIZE as usize).min(limit);
+
+    let mut read = 0;
+    for frame in frames.iter().take(count) {
+        if read >= capacity {
+            break;
+        }
+        let room = (capacity - read).min(FRAME_SIZE as usize);
+        // SAFETY: a frame this object owns, reached through the direct map,
+        // and `room` is bounded by the frame size. Read only: this is the
+        // direction that takes a caller's bytes rather than giving it any.
+        let page = unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, room) };
+        let taken = sink(page);
+        read += taken;
+        if taken < room {
+            // The sink has stopped accepting. The rest of the object is not
+            // read, which matters more here than in the other direction: a
+            // caller is entitled to know that what it did not ask to send was
+            // not sent.
+            break;
+        }
+    }
+    Some(read)
 }
 
 /// Fills an object's frames from `source`, returning how many bytes landed.
