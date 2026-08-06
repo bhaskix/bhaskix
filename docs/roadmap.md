@@ -146,7 +146,11 @@ Order within the phase is flexible; dependencies are noted.
   (accepted). VT-d first, because QEMU emulates it and a design CI cannot test will be wrong
   unnoticed; an AMD machine runs degraded and says so. This is what funds `security.md` §1 T3
   and T4, and what unblocks a driver running outside the kernel
-- **Driver framework** — PCIe/ECAM enumeration, `register_block!`, `Mmio<T>`, mock-MMIO test harness
+- **Driver framework** — [RFC 0014](rfc/0014-driver-framework.md) (draft). PCIe/ECAM enumeration,
+  `register_block!`, `Mmio<T>`, mock-MMIO test harness. Its motivation is an invoice rather than a
+  plan: the second driver — `bin/blkd`, in a domain — cost three bugs the first one had already
+  learned and written down in comments, and a framework is the difference between a lesson recorded
+  and a lesson enforced
 - **Networking** — virtio-net, Ethernet, ARP, IPv4/IPv6, UDP, TCP, sockets
 - **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing tool
 - **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
