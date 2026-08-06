@@ -36,9 +36,10 @@
 //! bookkeeping has one writer and one reader with nothing between them, which
 //! is the version worth writing first.
 
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::Ordering;
 
 use bhaskix_arch::pci;
+use bhaskix_device::virtqueue;
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 use crate::heap;
@@ -84,10 +85,6 @@ const FEATURE_VERSION_1: u32 = 1 << 0; // bit 32, selected by feature word 1
 /// it was not offered is telling the device it speaks a protocol that device
 /// may not implement.
 const FEATURE_ACCESS_PLATFORM: u32 = 1 << 1;
-
-/// Descriptor flags.
-const DESC_NEXT: u16 = 1;
-const DESC_WRITE: u16 = 2;
 
 /// Request types.
 const BLK_IN: u32 = 0;
@@ -135,16 +132,6 @@ pub enum BlockError {
     NotPresent,
 }
 
-/// One entry of the descriptor table, as the device reads it.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Descriptor {
-    address: u64,
-    length: u32,
-    flags: u16,
-    next: u16,
-}
-
 /// The header of a block request, as the device reads it.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -179,15 +166,19 @@ struct Device {
     descriptors: (u64, u64, u64),
     available: (u64, u64, u64),
     used: (u64, u64, u64),
+    /// The queue itself, from the crate the domain's driver uses too.
+    ///
+    /// The layout and the ordering live there now: two drivers implemented
+    /// this protocol separately and the second one paid for it.
+    queue: bhaskix_device::virtqueue::Virtqueue,
     /// The buffer requests read into.
     buffer: (u64, u64, u64),
     /// The request header and status byte.
     request: (u64, u64, u64),
 
     /// What the driver has published to the available ring so far.
-    available_index: u16,
+
     /// What it has seen in the used ring so far.
-    used_index: u16,
 
     /// Sectors the device says it has.
     capacity: u64,
@@ -717,8 +708,26 @@ pub fn init_mapped(hhdm: u64, map: Option<&dyn Fn(u64) -> Option<u64>>) -> Resul
         used,
         buffer,
         request,
-        available_index: 0,
-        used_index: 0,
+        // SAFETY: three frames this function allocated and zeroed, each
+        // mapped through the direct map for the machine's life, and the size
+        // is a power of two.
+        queue: unsafe {
+            bhaskix_device::virtqueue::Virtqueue::new(
+                bhaskix_device::virtqueue::Ring {
+                    at: descriptors.1 as usize,
+                    device: descriptors.2,
+                },
+                bhaskix_device::virtqueue::Ring {
+                    at: available.1 as usize,
+                    device: available.2,
+                },
+                bhaskix_device::virtqueue::Ring {
+                    at: used.1 as usize,
+                    device: used.2,
+                },
+                QUEUE_SIZE,
+            )
+        },
         capacity,
         notification: None,
         handler: None,
@@ -1195,52 +1204,23 @@ impl Device {
             // value the device never writes, so "the device answered" and "the
             // device said ok" cannot be confused.
             core::ptr::write_volatile((self.request.1 + 16) as *mut u8, 0xff);
+        }
 
-            let table = self.descriptors.1 as *mut Descriptor;
-            core::ptr::write_volatile(
-                table,
-                Descriptor {
-                    address: self.request.2,
-                    length: 16,
-                    flags: DESC_NEXT,
-                    next: 1,
-                },
-            );
-            core::ptr::write_volatile(
-                table.add(1),
-                Descriptor {
-                    address: buffer,
-                    length,
-                    flags: DESC_NEXT | DESC_WRITE,
-                    next: 2,
-                },
-            );
-            core::ptr::write_volatile(
-                table.add(2),
-                Descriptor {
-                    address: self.request.2 + 16,
-                    length: 1,
-                    flags: DESC_WRITE,
-                    next: 0,
-                },
-            );
+        // The queue's own layout and ordering, from the crate the domain's
+        // driver uses too. The descriptors carry the addresses the *device*
+        // was given -- `.2` of each tuple -- which with an IOMMU in front of
+        // it are not the physical ones.
+        self.queue
+            .describe(0, self.request.2, 16, virtqueue::NEXT, 1);
+        self.queue
+            .describe(1, buffer, length, virtqueue::NEXT | virtqueue::WRITE, 2);
+        self.queue
+            .describe(2, self.request.2 + 16, 1, virtqueue::WRITE, 0);
+        self.queue.publish(0);
 
-            // The available ring: flags, index, then the ring itself.
-            let ring = (self.available.1 + 4) as *mut u16;
-            core::ptr::write_volatile(
-                ring.add((self.available_index % QUEUE_SIZE) as usize),
-                0, // the head of the chain just built
-            );
-
-            // Everything above must be visible to the device before the index
-            // that publishes it. The device is not a thread and does not take
-            // this lock; the fence is what orders the writes as far as it is
-            // concerned.
-            fence(Ordering::SeqCst);
-            self.available_index = self.available_index.wrapping_add(1);
-            core::ptr::write_volatile((self.available.1 + 2) as *mut u16, self.available_index);
-            fence(Ordering::SeqCst);
-
+        // SAFETY: the notification address this driver computed at bring-up
+        // from the offset the device published.
+        unsafe {
             // Ring the bell.
             write16(self.notify, 0);
         }
@@ -1252,15 +1232,7 @@ impl Device {
     /// Takes no lock and never blocks: the caller holds the device lock for
     /// exactly this call and waits outside it.
     fn completed(&mut self) -> Option<u8> {
-        // SAFETY: the used ring's index, in a frame this driver allocated and
-        // the device writes to. Volatile because it changes without this code
-        // writing it, which is the entire question being asked.
-        let published = unsafe { core::ptr::read_volatile((self.used.1 + 2) as *const u16) };
-        if published == self.used_index {
-            return None;
-        }
-        fence(Ordering::SeqCst);
-        self.used_index = published;
+        self.queue.completed()?;
 
         // SAFETY: the status byte the device was told to write, in the
         // driver's own frame.

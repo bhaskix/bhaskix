@@ -615,6 +615,22 @@ else
     status=1
 fi
 
+# Whether this log is complete.
+#
+# The transmitter drops a byte rather than hang on a UART that will not empty,
+# which is the right choice and was a silent one: under an emulator on a loaded
+# host a byte went missing from a line of console output, a shell test failed
+# on a string that never appeared, and nothing anywhere said a byte had been
+# lost. Every other check below reads this log, so this one decides whether
+# they are reading all of it.
+if grep -q "console out    every byte reached the wire" "$LOG"; then
+    pass "no console output was dropped, so the rest of this log is complete"
+else
+    fail "console output was dropped -- the rest of this log is incomplete"
+    grep -E "console out" "$LOG" || true
+    status=1
+fi
+
 # Configuration space as memory, checked against configuration space as ports.
 #
 # RFC 0014 step 4, and the reason the port pair was kept rather than replaced:

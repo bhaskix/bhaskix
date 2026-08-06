@@ -27,4 +27,9 @@ workspace = true
 # uses this crate gets its register accesses from there instead of writing its
 # own, which is the point -- `user/blkd` has forty-two hand-rolled accesses and
 # each one is an `unsafe` somebody had to be trusted to get right.
-unsafe_budget = 30
+unsafe_budget = 50
+# Up from 30 for the virtqueue, whose ring accesses go through `Bus` like
+# everything else here. The number moving is the point: these lines used to
+# exist twice, in two drivers, where nothing checked that they agreed -- and
+# they did not. Counted once now, in a crate with tests that watch the order
+# the writes happen in.

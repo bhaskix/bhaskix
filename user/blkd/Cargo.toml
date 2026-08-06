@@ -28,13 +28,14 @@ path = "src/main.rs"
 
 [dependencies]
 bhaskix-abi = { path = "../../abi" }
+bhaskix-device = { path = "../../device" }
 
 [profile.release]
 panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-unsafe_budget = 200
+unsafe_budget = 180
 # 166 lines, and a driver is mostly `unsafe` because a driver is mostly
 # registers and rings: every access is a volatile read or write of a mapping
 # the kernel made on request, and every descriptor is a store into memory a

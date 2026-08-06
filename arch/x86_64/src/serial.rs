@@ -16,6 +16,8 @@
 //! - No allocation, no locking, no interrupts. It works in any context,
 //!   including a panic with a corrupt heap.
 
+use core::sync::atomic::AtomicU64;
+
 use crate::port::Port;
 
 /// Standard I/O port of the first serial controller on a PC.
@@ -56,6 +58,28 @@ const LSR_DATA_READY: u8 = 0b0000_0001;
 /// than that, so it is never hit on working hardware, and short enough that a
 /// dead UART costs microseconds per character rather than a hung boot.
 const TRANSMIT_SPIN_LIMIT: u32 = 100_000;
+
+/// Bytes the transmitter gave up on.
+///
+/// Counted because the alternative is what happened: a byte vanished from a
+/// line of console output — `signal` became `ignal` — a shell test failed on
+/// a string that never appeared, and the machine said nothing about having
+/// dropped anything. Under an emulator on a loaded host the UART is slow to
+/// report itself empty, and the spin limit above is reached. Dropping is the
+/// right choice, and dropping *silently* is what made it look like flakiness
+/// for three suite runs.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// How many bytes the transmitter has given up on since boot.
+///
+/// Zero on any machine whose UART keeps up. A boot that reports otherwise has
+/// lost output, and anything reading that output is reading something
+/// incomplete — which is worth knowing before concluding anything else from
+/// it.
+#[must_use]
+pub fn dropped() -> u64 {
+    DROPPED.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Byte written and read back by the loopback self-test.
 ///
@@ -165,7 +189,10 @@ impl SerialPort {
             while status.read() & LSR_TRANSMIT_EMPTY == 0 {
                 spins += 1;
                 if spins >= TRANSMIT_SPIN_LIMIT {
-                    return; // Drop the byte rather than hang.
+                    // Drop the byte rather than hang -- and say so, in a
+                    // number somebody can read afterwards.
+                    DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    return;
                 }
                 core::hint::spin_loop();
             }

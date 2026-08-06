@@ -89,9 +89,7 @@ workspace = true
 # and the I/O APIC's remappable redirection: one more accessor apiece, the same
 # shape as the rest of this window. Built and off by default -- see the kernel's
 # note and TRACKER for why.
-unsafe_budget = 1070
-# Raised from 1060 for RFC 0013 step 3: `enter_ring3` now sets the two System V
-# argument registers, so a program can be handed something at entry. Seven
-# lines, in the one `asm!` block that was already there -- the operand list
-# grew, the unsafe surface did not. A domain has to be told where its memory
-# is, because it is the one thing that cannot arrive through a capability.
+unsafe_budget = 1080
+# Raised from 1070 for ECAM -- one volatile read of configuration space as
+# memory -- and for counting the bytes the transmitter gives up on. The second
+# is two lines and bought a silent data loss becoming a visible number.

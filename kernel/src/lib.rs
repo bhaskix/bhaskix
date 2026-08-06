@@ -565,6 +565,19 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                     "    address spaces {} in use at once, each program in its own",
                     vm::installed()
                 );
+                // Whether anything read after this point is complete. The
+                // transmitter drops a byte rather than hang, which is right,
+                // and it did so silently until a shell test failed on a string
+                // that had lost one character.
+                let dropped = bhaskix_arch::serial::dropped();
+                if dropped == 0 {
+                    println!("    console out    every byte reached the wire");
+                } else {
+                    println!(
+                        "    console out    {dropped} bytes DROPPED; anything read from this \
+                         log is incomplete"
+                    );
+                }
                 // The third figure RFC 0013 step 5 asks for: what the isolation
                 // costs to *start*, stated once rather than argued about. From
                 // the same clock the round trips are timed against, and taken
@@ -2723,7 +2736,26 @@ fn measure_placements(console: ipc::EndpointId, filesystem: ipc::EndpointId) -> 
     // all. It cost three shell checks to notice, and the service was behaving
     // exactly as documented: it has no way to know a caller has finished
     // unless the caller says so.
-    let _ = ipc::call(filesystem, BADGE, fs::RESET, [0; 4]);
+    // Verified, and retried, rather than sent and hoped for. A `RESET` whose
+    // reply never came leaves the slot held, and the next caller -- the shell
+    // -- is refused with `BUSY` and has no filesystem at all. That happened,
+    // intermittently, and presented as `cat: could not reach the filesystem`
+    // with nothing anywhere connecting the two.
+    //
+    // Three attempts because the failure is a lost round trip rather than a
+    // refusal: the service always accepts a reset from a badge it knows.
+    let mut released = false;
+    for _ in 0..3 {
+        if let Ok(reply) = ipc::call(filesystem, BADGE, fs::RESET, [0; 4])
+            && bhaskix_abi::outcome_of(reply.args[0]) == bhaskix_abi::outcome::OK
+        {
+            released = true;
+            break;
+        }
+    }
+    if !released {
+        println!("    cost           FAILED to release the session it measured with");
+    }
 
     let ok = delivered == ROUNDS && answered == ROUNDS;
     if ok {

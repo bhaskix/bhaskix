@@ -7,8 +7,13 @@ name = "bhaskix-abi"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-device"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-user-blkd"
 version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
+ "bhaskix-device",
 ]

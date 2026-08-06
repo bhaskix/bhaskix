@@ -26,6 +26,8 @@
 #![no_main]
 
 use bhaskix_abi::{method, status, syscall};
+use bhaskix_device::Volatile;
+use bhaskix_device::virtqueue::{self, Virtqueue};
 
 /// Slot: the common configuration structure.
 const COMMON: u64 = 0;
@@ -49,6 +51,12 @@ const NOTIFY_AT: u64 = 0x2001_0000;
 const DEVICE_AT: u64 = 0x2002_0000;
 const RINGS_AT: u64 = 0x2010_0000;
 
+/// How many entries the queue has, as this driver uses it.
+///
+/// A power of two, which is what makes the index wrap correct, and small
+/// because this driver has one request outstanding at a time.
+const QUEUE_ENTRIES: u16 = 4;
+
 /// Where each structure sits inside the four pages of rings.
 ///
 /// Laid out by hand because the device reads it: the descriptor table must be
@@ -70,14 +78,6 @@ mod ring {
     pub const DATA: u64 = 0x2800;
     /// Where this program leaves its findings for the kernel.
     pub const REPORT: u64 = 0x3000;
-}
-
-/// Descriptor flags, from the specification.
-mod descriptor {
-    /// The next field is meaningful.
-    pub const NEXT: u16 = 1;
-    /// The device writes this one; without it the device reads.
-    pub const WRITE: u16 = 2;
 }
 
 /// Offsets into the common configuration structure, from the specification.
@@ -421,34 +421,45 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
         core::ptr::write_volatile(header.add(1), 0);
         core::ptr::write_volatile((RINGS_AT + ring::HEADER + 8) as *mut u64, 0);
         core::ptr::write_volatile((RINGS_AT + ring::STATUS) as *mut u8, 0xff);
-
-        let descriptor = |index: u64, address: u64, length: u32, flags: u16, next: u16| {
-            let at = (RINGS_AT + ring::DESCRIPTORS + index * 16) as *mut u64;
-            core::ptr::write_volatile(at, address);
-            core::ptr::write_volatile(at.add(1).cast::<u32>(), length);
-            core::ptr::write_volatile((at as *mut u16).add(6), flags);
-            core::ptr::write_volatile((at as *mut u16).add(7), next);
-        };
-        descriptor(0, device_address(ring::HEADER), 16, descriptor::NEXT, 1);
-        descriptor(
-            1,
-            device_address(ring::DATA),
-            512,
-            descriptor::NEXT | descriptor::WRITE,
-            2,
-        );
-        descriptor(2, device_address(ring::STATUS), 1, descriptor::WRITE, 0);
-
-        // Available ring: flags, index, then the ring itself. The head goes in
-        // first and the index after it, with a fence between -- a device that
-        // saw the index before the entry would follow a descriptor nobody had
-        // written.
-        let available = (RINGS_AT + ring::AVAILABLE) as *mut u16;
-        core::ptr::write_volatile(available, 0);
-        core::ptr::write_volatile(available.add(2), 0);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        core::ptr::write_volatile(available.add(1), 1);
     }
+
+    // The queue, from the crate the kernel's driver uses too. What was a
+    // hand-written copy of the split-virtqueue layout is now the same code,
+    // which is the point of RFC 0014 step 5: the second driver stopped being a
+    // second implementation. Each ring is given twice, because the address
+    // this program writes through and the address the *device* is told are not
+    // the same one -- that difference is the IOMMU, from a driver's side.
+    // SAFETY: the three rings are inside the four pages this program holds
+    // and mapped writable, at offsets that do not overlap, and the size is a
+    // power of two.
+    let mut queue = unsafe {
+        Virtqueue::<Volatile>::new(
+            virtqueue::Ring {
+                at: (RINGS_AT + ring::DESCRIPTORS) as usize,
+                device: device_address(ring::DESCRIPTORS),
+            },
+            virtqueue::Ring {
+                at: (RINGS_AT + ring::AVAILABLE) as usize,
+                device: device_address(ring::AVAILABLE),
+            },
+            virtqueue::Ring {
+                at: (RINGS_AT + ring::USED) as usize,
+                device: device_address(ring::USED),
+            },
+            QUEUE_ENTRIES,
+        )
+    };
+
+    queue.describe(0, device_address(ring::HEADER), 16, virtqueue::NEXT, 1);
+    queue.describe(
+        1,
+        device_address(ring::DATA),
+        512,
+        virtqueue::NEXT | virtqueue::WRITE,
+        2,
+    );
+    queue.describe(2, device_address(ring::STATUS), 1, virtqueue::WRITE, 0);
+    queue.publish(0);
 
     // Kick. The offset is the device's, in units it chose.
     //
@@ -475,44 +486,43 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
         let _ = call(syscall::INVOKE, HANDLER, method::ACK, [0; 4]);
         if status == status::OK {
             BY_INTERRUPT.store(true, core::sync::atomic::Ordering::Relaxed);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-            // SAFETY: the status byte and the sector, in memory this program
-            // holds. The device has finished with them: that is what the
-            // notification said.
-            unsafe {
-                if core::ptr::read_volatile((RINGS_AT + ring::STATUS) as *const u8) != 0 {
-                    return None;
-                }
-                return Some(core::ptr::read_volatile(
-                    (RINGS_AT + ring::DATA) as *const u64,
-                ));
-            }
+            // Taken from the queue rather than assumed: the notification says
+            // the device did something, and the used ring says what.
+            let _ = queue.completed();
+            return finished();
         }
         return None;
     }
 
-    // No vector: look instead. A bounded spin is honest about being a spin,
-    // where a wait with no bound would hang a machine on a device that never
-    // answers.
+    // No vector: look instead, through the same queue. A bounded spin is
+    // honest about being a spin, where a wait with no bound would hang a
+    // machine on a device that never answers.
     for _ in 0..2_000_000u64 {
-        // SAFETY: the used ring, in memory this program holds.
-        let used = unsafe { core::ptr::read_volatile((RINGS_AT + ring::USED + 2) as *const u16) };
-        if used != 0 {
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-            // SAFETY: as above -- the status byte the device wrote, and the
-            // first eight bytes of where it put the sector.
-            unsafe {
-                if core::ptr::read_volatile((RINGS_AT + ring::STATUS) as *const u8) != 0 {
-                    return None;
-                }
-                return Some(core::ptr::read_volatile(
-                    (RINGS_AT + ring::DATA) as *const u64,
-                ));
-            }
+        if queue.completed().is_some() {
+            return finished();
         }
         core::hint::spin_loop();
     }
     None
+}
+
+/// Reads what the device left, once it has said it is finished.
+///
+/// `None` if the device reported a failure — a status byte the driver set to a
+/// value the device never writes, so "the device answered" and "the device
+/// said ok" cannot be confused.
+fn finished() -> Option<u64> {
+    // SAFETY: the status byte and the sector, in memory this program holds and
+    // mapped writable. The device has finished with them, which is what the
+    // used ring or the notification just said.
+    unsafe {
+        if core::ptr::read_volatile((RINGS_AT + ring::STATUS) as *const u8) != 0 {
+            return None;
+        }
+        Some(core::ptr::read_volatile(
+            (RINGS_AT + ring::DATA) as *const u64,
+        ))
+    }
 }
 
 /// What the device left in the used ring and the status byte.

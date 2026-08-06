@@ -980,13 +980,6 @@ unsafe fn program_msix(
         }
         // Unmasked last.
         core::ptr::write_volatile((slot + 12) as *mut u32, 0);
-        crate::println!(
-            "  MARK msix readback addr={:#x} upper={:#x} data={:#x} ctrl={:#x}",
-            core::ptr::read_volatile(slot as *const u32),
-            core::ptr::read_volatile((slot + 4) as *const u32),
-            core::ptr::read_volatile((slot + 8) as *const u32),
-            core::ptr::read_volatile((slot + 12) as *const u32)
-        );
     }
 
     // Enable MSI-X, and clear the function mask that would hold every entry.

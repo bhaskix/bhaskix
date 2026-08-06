@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) is complete; the driver framework (M8) is under way |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01 … M8-05 (RFC 0014 steps 1–4) · CI green · 402 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 290 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01 … M8-07 (RFC 0014 steps 1–5) · CI green · 409 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 294 host assertions |
 
 ### Division of responsibility between documents
 
@@ -137,6 +137,9 @@ documented.
 
 | M8-04 | RFC 0014 step 4: ECAM, checked against the ports | ✅ `DONE` | `MCFG` parsed, the region mapped, and configuration space readable as memory. **The port pair was kept because it is the oracle**, which acceptance decided and this step used: every function on every bus is read *both ways* and the answers must match — **65,536 functions, 8 present, none disagreed**. "The new mechanism found three devices" is not evidence it found the right three. Watched failing by shifting the device field one bit: 135 of 65,536 disagree, reported with the first address. That negative test also found a real weakness — the first version bounded the *bus* and not the computed address, so a wrong shift walked out of the mapping and **faulted**, which is a machine that stops booting rather than a mechanism that reports. It is bounded against the mapping now, and an in-range bus that the arithmetic cannot place counts as a disagreement. |
 | M8-05 | Shell tests paced by the machine rather than by a clock | ✅ `DONE` | Three different shell checks had failed under load, each looking like a different bug and all of them being one: commands were typed on a fixed interval that assumed each finished inside it. Every line now waits for **its own echo** before the next is sent. The first line is still resent while unanswered — the prompt is printed before the shell reaches its read — and later lines never are, because the bytes queue in the UART and a resent command would run twice. The suite passed at load average 11.45, which is the load it had been failing at. |
+
+| M8-06 | RFC 0014 step 5: the virtqueue is one implementation, not two | ✅ `DONE` | The split-virtqueue protocol — descriptors, the available ring, the used ring, and **the order the writes happen in** — moved into `bhaskix_device::virtqueue`, which the kernel's driver and `bin/blkd` both compile. Each ring is given twice, as the address the driver writes through and the address the *device* is told, because with an IOMMU those differ and that difference is RFC 0012 from a driver's side. **Nothing changed**: 200 sectors, 2 requests, status 0x0f, and `blkd` still reads `BHASKIX-` and is still woken by its device. Four host tests, each watched failing for its own reason — including the one property no amount of reading the values afterwards can check, that the chain is published **before** the index that makes it visible. **The kernel's `unsafe` fell again, 1112 → 1067.** |
+| M8-07 | A byte that vanished from the console, and had been vanishing silently | ✅ `DONE` | A shell test failed on a string that never appeared. The machine had printed `6  ignal rd` — the `s` was gone. `serial::write_byte` gives up after a spin limit and **drops the byte rather than hang**, which is the right choice and was a silent one: under an emulator on a loaded host the UART is slow to report itself empty. It is counted now, and the boot reports whether every byte reached the wire — **gated, because every other check reads that log and this one decides whether they are reading all of it**. Also removed: a `MARK msix readback` debug line that had been shipping in every boot since RFC 0012 step 6. |
 
 ### M7 — Service framework ([RFC 0013](docs/rfc/0013-service-framework.md))
 
@@ -567,7 +570,7 @@ what is actually ahead.
 | Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
-| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — steps 1–4 done | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
+| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — steps 1–5 done; step 6 (a configuration-space capability) remains | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ⬜ `TODO` | The filesystem service reads a read-only archive it is handed at entry |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
@@ -710,6 +713,34 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0014 step 5 — one virtqueue, and a byte that had been vanishing)
+
+- **The protocol is one implementation now.** Descriptors, the rings, and the order the writes
+  happen in live in a crate the kernel's driver and `bin/blkd` both compile. Nothing changed on
+  either side, which was the criterion: 200 sectors, 2 requests, `BHASKIX-`, woken by the device.
+  The kernel's `unsafe` fell 1112 → 1067, the second reduction in two steps.
+- **Each ring is given twice** — the address the driver writes through, and the address the device
+  is told. They are the same number without an IOMMU and different with one, and a driver that
+  confused them would hand a device a physical address where a translated one was needed. Naming
+  the parameter `address` *the device's* is as far as a type can go towards preventing that.
+- **The ordering test is the one that could not be written before.** That the chain is published
+  before the index which makes it visible is invisible in the finished memory: both writes have
+  landed either way. The model records the order, and reversing the two writes fails exactly that
+  test and no other.
+- **A byte had been vanishing from the console, silently, and it looked like flakiness.** A shell
+  test failed on a string that never appeared; the machine had printed `6  ignal rd`. The `s` was
+  dropped by `serial::write_byte`, which gives up after a spin limit rather than hang — the right
+  choice, made silently, and the emulated UART on a loaded host reaches that limit. It is counted
+  now and reported at boot, and gated: **every other check reads that log, so this one decides
+  whether they are reading all of it.**
+- **A debug line had been shipping since RFC 0012 step 6.** `MARK msix readback` printed on every
+  boot of every machine for days. Removed. Nothing failed because of it, which is why nobody saw it.
+- **Two failures were investigated and only one was real.** A filesystem session was not always
+  released after the placement measurement, and the shell was then refused with `BUSY` — that is
+  fixed by verifying the release rather than sending it and hoping. The other, an IPC self-test
+  reporting `replies 9, correct 8`, appeared once under load and not in four consecutive boot runs
+  or the run after; it is written down here so the next occurrence is the second and not the first.
 
 ### 2026-08-06 (RFC 0014 step 4 — ECAM, and the oracle that earned its keep immediately)
 

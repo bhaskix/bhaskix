@@ -33,6 +33,13 @@
     )
 )]
 
+// For the tests only: the ring tests collect what the model recorded, which
+// wants a growable buffer. Nothing outside `#[cfg(test)]` allocates.
+#[cfg(test)]
+extern crate alloc;
+
+pub mod virtqueue;
+
 use core::marker::PhantomData;
 
 /// How a register block reaches the machine.

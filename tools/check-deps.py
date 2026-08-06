@@ -94,7 +94,7 @@ PLACEMENTS: dict[str, set[str]] = {
     },
     # The block driver shares no code with the kernel's, only the
     # specification, so the ABI is the whole of what it may reach.
-    "bhaskix-user-blkd": {"bhaskix-abi"},
+    "bhaskix-user-blkd": {"bhaskix-abi", "bhaskix-device"},
     "bhaskix-user-consoled": {
         "bhaskix-abi",
         "bhaskix-service",
