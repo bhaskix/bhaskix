@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📝 **Draft** — proposed 2026-08-06 |
+| **Status** | ✅ **Accepted 2026-08-06.** Two of its four open questions are decided by acceptance and recorded below; one is deferred to process management, which owns it; one stays open until step 6, where it needs something `memory.md` cannot yet say. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `services/vfs`, a new block service, a new `fs` on-disk format, ABI (`fs::` methods) |
 | **Milestone** | Phase 2 in [roadmap.md](../roadmap.md) — the *full VFS* bullet |
@@ -238,18 +238,42 @@ the block service is another domain.
 
 ## Unresolved questions
 
-1. **Where does path resolution begin for a program with no `Directory` capability?** Boot has to
-   give the first one out, and "the thing that grants the root" is a supervisor — which RFC 0013
-   explicitly declined to propose and which is also process management's problem.
-2. **Does the block service or the filesystem own the cache?** Caching in the block service is
-   simpler and caches the wrong thing; caching in the filesystem needs the block service to hand
-   over frames rather than copy into them.
-3. **How is a `Directory` capability revoked when the directory is deleted?** RFC 0009's revocation
-   takes a mapping away; a capability naming a deleted inode is a different question and this RFC
-   does not answer it.
-4. **How large may the cache grow?** The resource envelope counts frames a domain owns. A cache that
-   grows to fill it starves the domain of everything else, and nothing currently expresses "this
-   memory is reclaimable".
+### Decided by acceptance
+
+**The filesystem owns the cache, not the block service.** A block service caching blocks caches the
+wrong thing: it does not know which blocks are a file and which are the journal, and it would keep
+the log warm at the expense of data. The filesystem knows, and it is also the side that must hand
+out read-only capabilities to cached frames — which it can only do for memory it owns. The block
+service therefore keeps filling memory the caller names, exactly as step 1 proposes, and the memory
+it is named is the cache.
+
+**A `Directory` capability names an inode *and a generation*, and deleting bumps the generation.**
+A stale capability then resolves to nothing rather than to whatever took the slot. This is not a new
+mechanism: `MemoryId` and `NotificationId` in this tree are both an index and a generation for the
+same reason, and the alternative — refusing to delete a directory somebody still holds — makes
+deletion depend on who is watching.
+
+### Deferred, to the RFC that owns it
+
+**Where path resolution begins for a program holding no `Directory` capability.** Boot grants the
+first one, the way it grants a console and a filesystem endpoint today, and that is enough to build
+every step below. The general answer is "the thing that hands a new program its namespace", which is
+a supervisor — RFC 0013 declined to propose one and process management is where it belongs. Naming
+it here would be this RFC deciding something it does not have to.
+
+### Still open
+
+**How large may the cache grow?** The resource envelope counts frames a domain owns, and a cache
+that grows to fill it starves the domain of everything else. Nothing in this system can currently
+say "this memory is reclaimable", and inventing that at step 6 — where it is needed — is better than
+guessing at it now. It may want a change to `memory.md` rather than to this design.
+
+### The decision most likely to be wrong, and how it will announce itself
+
+A new on-disk format rather than an existing one. If step 2 turns out to be larger than step 5 —
+if writing the *format* costs more than writing the *journal* — then the format was the work after
+all, and this was the wrong call. That comparison is the trigger, it is cheap to notice, and it is
+written down here so that noticing it is not a matter of remembering to.
 
 ---
 

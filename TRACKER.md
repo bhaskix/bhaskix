@@ -574,7 +574,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | 📝 **RFC 0015 draft** | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
+| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **RFC 0015 accepted**, not started | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -716,6 +716,32 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0015 accepted — and one decision that is told how to fail)
+
+Accepted as written, with two of its four open questions decided and one handed to the RFC that
+owns it.
+
+- **The filesystem owns the page cache**, not the block service. A block service caches the wrong
+  thing: it cannot tell a file from the journal, and would keep the log warm at the expense of data.
+  The filesystem can, and it is also the side that hands out read-only capabilities to cached
+  frames — which it can only do for memory it owns.
+- **A `Directory` capability names an inode and a generation**, and deleting bumps the generation, so
+  a stale capability resolves to nothing rather than to whatever took the slot. Not a new mechanism:
+  `MemoryId` and `NotificationId` are both index-plus-generation for exactly this reason. The
+  alternative — refusing to delete a directory somebody still holds — makes deletion depend on who
+  is watching.
+- **Deferred:** where path resolution begins for a program holding no `Directory` capability. Boot
+  grants the first one, which is enough for every step; the general answer is a supervisor's, and
+  process management owns that. Deciding it here would be this RFC ruling on something it does not
+  have to.
+- **Still open:** how large the cache may grow. Nothing in this system can say "this memory is
+  reclaimable", and inventing that at step 6, where it is needed, beats guessing now.
+- **The decision most likely to be wrong is told how to announce itself.** A new on-disk format,
+  rather than ext2 or FAT, is the call this RFC is least sure of. The trigger is written into the
+  document: if step 2 costs more than step 5 — if the *format* is larger than the *journal* — then
+  the format was the work after all and this was wrong. Cheap to notice, and now not dependent on
+  remembering to.
 
 ### 2026-08-06 (RFC 0014 step 6 — and a question whose answer was that it did not apply)
 

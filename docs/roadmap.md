@@ -131,7 +131,7 @@ Order within the phase is flexible; dependencies are noted.
 
 - **Process management** — fork/exec-equivalent (capability-shaped, not POSIX-shaped), process trees,
   reaping, signals-equivalent
-- **Full VFS** — [RFC 0015](rfc/0015-filesystem.md) (draft). Mount points, a writable filesystem
+- **Full VFS** — [RFC 0015](rfc/0015-filesystem.md) (accepted). Mount points, a writable filesystem
   with a journal, page cache. The RFC separates three things usually described as one: a namespace
   that is not ambient (the root is currently the last place in this system where holding one
   capability grants everything of a kind), a journal whose claim is tested by interrupting the
