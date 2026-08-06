@@ -36,9 +36,13 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-unsafe_budget = 40
-# Small, and it should stay small. Everything this program does to a
-# filesystem is safe code in `bhaskix-fs`; the `unsafe` here is the system call
-# convention, the entry point, and the two places that read and write a page
-# the kernel mapped for it. A filesystem service whose `unsafe` count grew
-# would be one that had started doing its own parsing.
+unsafe_budget = 50
+# Small, and it should stay small. Everything this program does to a filesystem
+# is safe code in `bhaskix-fs`; the `unsafe` here is the system call
+# convention, the entry point, and the places that read and write pages the
+# kernel mapped for it. A filesystem service whose `unsafe` count grew would be
+# one that had started doing its own parsing.
+#
+# Up from 40 for the receive side: a second `asm!` block whose operand list is
+# most of its length, and the breadcrumb that says how far a run got. A program
+# that answers has one more way in than one that only asks.

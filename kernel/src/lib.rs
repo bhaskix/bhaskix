@@ -1567,12 +1567,13 @@ fn filesystem_self_test() -> bool {
 
 /// An image the machine formats and writes to, in memory.
 ///
-/// Sixteen blocks: a superblock, a bitmap, two of inode table, the journal's
-/// nine, and room to write into. In `.bss` rather than on a stack, because
+/// Thirty-two blocks: a superblock, a bitmap, two of inode table, the
+/// journal's nine, and room to write into. Sixteen left three data blocks,
+/// which is fewer than a directory with a file in it needs. In `.bss` rather than on a stack, because
 /// sixty-four kilobytes of stack is not a thing this kernel has, and rather
 /// than on the heap because a self-test that can fail for want of memory is a
 /// self-test that reports the wrong thing when it does.
-static mut JOURNAL_IMAGE: [u8; 16 * bhaskix_fs::BLOCK] = [0; 16 * bhaskix_fs::BLOCK];
+static mut JOURNAL_IMAGE: [u8; 32 * bhaskix_fs::BLOCK] = [0; 32 * bhaskix_fs::BLOCK];
 
 /// The pages that filesystem is cached in.
 ///
@@ -1984,7 +1985,10 @@ unsafe fn enter_user(who: &str, entry: u64, rsp: u64, arguments: [u64; 2]) -> ! 
 }
 
 /// Where the filesystem service's stack goes in its own address space.
-const FSD_STACK: u64 = 0x0000_0000_1100_0000;
+/// Deliberately not the address every other program uses, for the reason its
+/// code is not: a fault report gives `rip` and `rsp`, and when every program
+/// has both the same, neither says which one faulted.
+const FSD_STACK: u64 = 0x0000_0000_1300_0000;
 /// How many pages of it.
 const FSD_STACK_PAGES: u64 = 4;
 /// The filesystem service, in the archive.
@@ -2718,7 +2722,11 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
     // what `mkfs` does from a developer's machine. Formatting through the
     // store would work equally well and would prove less: what is wanted here
     // is a device holding an image this kernel did not make up as it read it.
-    let blocks = 16u32;
+    // Thirty-two, not sixteen. Sixteen left three data blocks after the
+    // superblock, the bitmap, the inode table and the journal's nine, and the
+    // tree below needs five. It failed as `Full`, which is the allocator
+    // working; the number was simply wrong.
+    let blocks = 32u32;
     if bhaskix_fs::format(image, 128).is_err() || u64::from(blocks) > sectors / 8 {
         DISK_JOURNAL.store(0, Ordering::Release);
         sched::exit()
@@ -2762,6 +2770,27 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
             .is_err()
         {
             DISK_JOURNAL.store(14, Ordering::Release);
+            sched::exit()
+        }
+
+        // And the tree the shell's own gates describe: `greeting` in the root,
+        // `inner` inside `sub`, with the sizes those gates assert. RFC 0016
+        // step 4 will have the *service* answer for this tree, and the claims
+        // those gates make have to survive that move **unchanged** -- a test
+        // rewritten to match a refactor has stopped guarding what it names.
+        let made = (|| {
+            let greeting = volume.create(root, b"greeting", Kind::File).ok()?;
+            volume
+                .write(greeting, 0, b"a file in a filesystem this kernel defined\n")
+                .ok()?;
+            let sub = volume.create(root, b"sub", Kind::Directory).ok()?;
+            let inner = volume.create(sub, b"inner", Kind::File).ok()?;
+            volume
+                .write(inner, 0, b"only reachable through the subdirectory\n")
+                .ok()
+        })();
+        if made.is_none() {
+            DISK_JOURNAL.store(15, Ordering::Release);
             sched::exit()
         }
         root
@@ -3160,8 +3189,17 @@ fn start_fs_domain(hhdm: u64) -> bool {
         domain::destroy(realm);
         return false;
     };
+    // Its own endpoint, at slot 2, installed **unbadged**. That is the whole of
+    // its authority to name directories: only a capability with no badge may
+    // set one, so this service can mint a handle for any directory on its disk
+    // and nothing a client holds can mint one at all. RFC 0016 step 4.
+    let Ok(serving) = ipc::create() else {
+        println!("    fs domain      FAILED: no endpoint for it to answer on");
+        domain::destroy(realm);
+        return false;
+    };
     let installed = shared::name(memory).ok().and_then(|named| {
-        let block = cap::with_arena(|arena| {
+        let (block, own) = cap::with_arena(|arena| {
             let root = arena
                 .insert_root(
                     cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
@@ -3169,10 +3207,20 @@ fn start_fs_domain(hhdm: u64) -> bool {
                     0,
                 )
                 .ok()?;
-            arena.derive(root, cap::Rights::ALL, BADGE_FS_BLOCK).ok()
+            let block = arena.derive(root, cap::Rights::ALL, BADGE_FS_BLOCK).ok()?;
+            let own = arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(serving.as_u32())),
+                    cap::Rights::ALL,
+                    0,
+                )
+                .ok()?;
+            Some((block, own))
         })?;
         domain::with(realm, |owner| {
-            owner.cspace.install_at(0, block).is_ok() && owner.cspace.install_at(1, named).is_ok()
+            owner.cspace.install_at(0, block).is_ok()
+                && owner.cspace.install_at(1, named).is_ok()
+                && owner.cspace.install_at(2, own).is_ok()
         })
     });
     if installed != Some(true) || count < 10 {
@@ -3191,11 +3239,11 @@ fn start_fs_domain(hhdm: u64) -> bool {
     }
 
     // The report page is the object's last frame, read through the direct map.
-    let mut words = [0u64; 7];
+    let mut words = [0u64; 9];
     for _ in 0..200 {
         // SAFETY: a frame this object owns, through the direct map, read as
         // the six little-endian words the service writes there.
-        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[9]) as *const u8, 56) };
+        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[9]) as *const u8, 72) };
         for (index, word) in words.iter_mut().enumerate() {
             let mut buffer = [0u8; 8];
             buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -3215,7 +3263,22 @@ fn start_fs_domain(hhdm: u64) -> bool {
     // `exit` -- after which the shell never started. A service that has
     // finished saying something is not a service that has finished, and this
     // one is going to be asked things in the next step anyway.
-    let [_, blocks, entries, read, matched, sectors, stage] = words;
+    let [
+        _,
+        blocks,
+        entries,
+        read,
+        matched,
+        sectors,
+        stage,
+        directory,
+        stale,
+    ] = words;
+    // What the service says names `sub`, and what names a directory that is
+    // gone. The kernel is the only thing that can mint a capability, so the
+    // service supplies the badges and the kernel would stamp them -- which is
+    // RFC 0016 step 4, and is not finished.
+    let _ = (directory, stale);
     let ok = matched == 1 && read == EXPECTED.len() as u64 && blocks > 0 && entries > 0;
     if ok {
         println!(

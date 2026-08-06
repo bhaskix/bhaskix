@@ -308,6 +308,62 @@ pub mod console {
 /// accumulated across as many [`Chunk`]s as it takes, and the operation that
 /// follows consumes it — so a caller cannot open a path it did not finish
 /// sending, and the service never has to guess where a name ends.
+/// What a *directory* answers, in the filesystem service.
+///
+/// RFC 0016 step 4. A directory a program holds is a **badged endpoint
+/// capability** to the filesystem service: the badge says which directory, the
+/// kernel stamps it on arrival so it cannot be forged, and the service is the
+/// only thing that knows what it means. There is no kernel object kind for a
+/// directory any more, and nothing in the kernel knows what an inode is.
+pub mod dir {
+    /// Resolve one name inside the directory this capability names.
+    ///
+    /// The name is a [`Chunk`] in `arg0..3` — one component, no separators, no
+    /// `.` or `..`. The caller must have said where a capability may land,
+    /// with [`method::EXPECT`], before calling.
+    ///
+    /// Replies with `args[0]` an outcome below, `args[1]` the size in bytes,
+    /// and `args[2]` non-zero if what was opened is itself a directory. On
+    /// [`OK`] a capability to it has been handed to the caller.
+    pub const OPEN_AT: u64 = 1;
+
+    /// It resolved, and a capability was handed over.
+    pub const OK: u64 = 0;
+    /// Nothing of that name is in this directory.
+    ///
+    /// Deliberately not distinguished from a name that exists *elsewhere* on
+    /// the same filesystem: a program that could tell those apart could map a
+    /// filesystem it holds one directory of, one question at a time.
+    pub const NO_SUCH_NAME: u64 = 1;
+    /// That is not a name this system resolves: a separator, `.`, `..`, empty.
+    ///
+    /// Distinct from [`NO_SUCH_NAME`] because it describes the syntax the
+    /// caller used, which the caller already knows — and because a refusal
+    /// indistinguishable from "no such name" would be indistinguishable from
+    /// no refusal at all: `..` is in no directory this format writes.
+    pub const BAD_NAME: u64 = 2;
+    /// The directory this capability named is gone.
+    ///
+    /// The badge carries an inode *and* a generation. A filesystem that reuses
+    /// an inode bumps the generation, so a capability that outlived what it
+    /// named resolves to nothing rather than to whatever took the slot.
+    pub const GONE: u64 = 3;
+    /// There was nowhere to put the answer: the caller declared no slot.
+    pub const NOWHERE: u64 = 4;
+
+    /// Packs an inode and a generation into the badge that names them.
+    #[must_use]
+    pub const fn handle(inode: u32, generation: u32) -> u64 {
+        (inode as u64) | ((generation as u64) << 32)
+    }
+
+    /// The inode and generation a badge names.
+    #[must_use]
+    pub const fn parts(badge: u64) -> (u32, u32) {
+        (badge as u32, (badge >> 32) as u32)
+    }
+}
+
 /// Methods a block service answers.
 ///
 /// Sector data never crosses in message registers. The caller names memory it

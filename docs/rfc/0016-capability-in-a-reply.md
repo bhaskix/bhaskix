@@ -478,5 +478,18 @@ Five steps. The first is independent of the rest and should not wait for it.
 4. **Directory and file handles.** The namespace moves out; the kernel's `namespace.rs`,
    `ObjectKind::Directory`, `ObjectKind::File` and `OPEN_AT` are deleted. The RFC 0015 step 4 shell
    gates must pass **unchanged** — that is the point of them.
+
+   🔨 **Started, and stopped on a defect this RFC did not anticipate.** The `dir::` protocol, the
+   service answering it, and directory handles as badged endpoint capabilities all work — two of the
+   six shell gates already pass through the service. What does not work is the thing the design
+   requires: **a server that calls another service while it already owes a reply faults its caller.**
+   Answering a directory lookup means reading a block, which means calling the block service, which
+   means exactly that. Isolated by warming the cache so no device read was needed — with no nested
+   call, the same request answers correctly.
+
+   This is prior to the namespace and prior to `HAND`. Until a service can call while owing a reply,
+   no service that depends on another can answer anything, which is most of what this RFC is for.
+   It is the next thing to fix and it may need a line in RFC 0008: a reply obligation is one slot per
+   thread, and a nested call is a second one.
 5. **Lending a cached frame**, with pinning and the eviction gate. Last, because it is the only step
    whose failure is silent, and it should be built when everything under it is already trusted.

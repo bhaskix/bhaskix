@@ -149,6 +149,8 @@ fairness within 2% for two equal-weight workloads.
 
 | M9-12 | RFC 0016 step 3 (second half): the filesystem, in a domain, reading a real disk | ✅ `DONE` | `bin/fsd` mounts the disk through the block service and reads a file the kernel wrote into that same filesystem through **its** copy of the same crate — two copies of one parser, one disk, the same answer. The program contains **no filesystem code**: it links `bhaskix-fs` and supplies a `Store` made of system calls, which is the whole return on RFC 0015 step 6. It holds two capabilities — the block service's endpoint and one memory object it maps — and has no registers, no interrupt, no DMA window and no way to name a disk. It starts by default: the defect that made it opt-in was **a ring 3 thread that was not pinned**, and that is now refused at the door rather than avoided. |
 
+| M9-14 | RFC 0016 step 4: the namespace out of the kernel | 🔨 `IN PROGRESS` | Built and working: a `dir::` protocol in the ABI; `bin/fsd` answering `OPEN_AT` with the namespace rules moved out of `kernel/src/namespace.rs` unchanged — one component, no separators, no `..`, a generation checked, and a name outside the directory held answering exactly as one that exists nowhere; badged endpoint capabilities as directory handles, which the kernel stamps and cannot forge; the disk carrying the same tree the shell's gates describe. Watched working from the shell: `8 directory reachable` and `10 stale dir the directory it named is gone`, both through the service. **Blocked** on the defect below: answering a lookup means calling the block service, and a server that calls while it already owes a reply faults its own caller. The shell still uses the kernel's namespace, so nothing regressed and nothing is claimed that is not true. |
+
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
 **What it set out to prove:** that the *third* driver will not repeat the first two. RFC 0014's case
@@ -745,6 +747,29 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0016 step 4 — stopped, on a defect worth more than the step)
+
+- **A server that calls another service while it already owes a reply faults its caller.** The
+  filesystem service must call the block service to answer a directory lookup — that is what a
+  filesystem *is* once its disk is behind a service — and doing so kills the program that asked.
+  Isolated by warming the cache so the lookup needed no device read: with no nested call, the same
+  request answers correctly. It is not `HAND` (removed it, still faults) and not `EXPECT` (the stale
+  handle takes the same path and answers).
+- **What is built and working**: the `dir::` protocol; `bin/fsd` answering with the namespace rules
+  moved out of the kernel unchanged; directory handles as badged endpoint capabilities, which only
+  the kernel can mint and a client cannot forge; the disk carrying the tree the shell's gates
+  describe. Two of the six gates already pass through the service.
+- **The shell still uses the kernel's namespace.** Nothing regressed, and nothing is claimed that is
+  not true — the step is not done and is not marked done.
+- **Three diagnostic obstacles, two now fixed.** Every program was linked at `0x10000000` *and*
+  stacked at `0x11000000`, so a fault report identified nothing; `bin/fsd` now has its own code and
+  stack addresses. The third is open and cost the most: **the exception report's `rip` is not an
+  instruction boundary** — three times it landed mid-instruction, and each time it sent the
+  investigation into the wrong program or the wrong function.
+- **The Makefile trap caught me a third time.** Building a user program with `cargo` by hand
+  produces a binary at the path `make` checks, without the linker script, and the machine says
+  `bin/fsd is not an ELF this kernel will load`. Only `make` builds these correctly.
 
 ### 2026-08-06 (the shell-start defect — a ring 3 thread that was not pinned)
 
