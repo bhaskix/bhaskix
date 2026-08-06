@@ -246,6 +246,18 @@ pub struct Thread {
     /// question it did not ask. The caller is not a secret, so hiding it was
     /// never the point -- not accepting it is.
     pub reply_to: Option<u32>,
+    /// Where a capability handed back by a server may be put.
+    ///
+    /// Declared by this thread before it calls, and consumed when one arrives.
+    /// A server does **not** choose where its answer lands: a program's CSpace
+    /// is its own to arrange, and a service that could pick a slot could fill
+    /// one a caller was keeping empty on purpose — which the shell does, and
+    /// which one of its own tests depends on.
+    ///
+    /// One-shot, and cleared when the call it was declared for returns. So it
+    /// means "this call may hand me one capability, there", and never "any
+    /// server I ever talk to may put things in me".
+    pub receive_slot: Option<u32>,
 
     /// The domain this thread belongs to, or `u32::MAX` for none.
     ///
@@ -675,6 +687,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         held_locks: 0,
         space_root: 0,
         reply_to: None,
+        receive_slot: None,
         domain: u32::MAX,
         mailbox: None,
         // The thread a CPU registers for itself is already running on the
@@ -870,6 +883,7 @@ pub fn spawn_on_with(
         held_locks: 0,
         space_root: 0,
         reply_to: None,
+        receive_slot: None,
         domain: options.domain,
         mailbox: None,
         kernel_stack_top: guarded.top,
@@ -1046,6 +1060,35 @@ pub fn take_reply_target(thread: u32) -> Option<u32> {
         let mut queue = queue.lock();
         if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
             return target.reply_to.take();
+        }
+    }
+    None
+}
+
+/// Says where `thread` will accept a capability handed back to it.
+///
+/// Returns whether the thread was found.
+pub fn set_receive_slot(thread: u32, slot: Option<u32>) -> bool {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            target.receive_slot = slot;
+            return true;
+        }
+    }
+    false
+}
+
+/// Takes where `thread` will accept a capability, if it said.
+///
+/// Taking, not reading: a declaration admits one capability. A server that
+/// could hand two would be handing the second into a slot the caller no longer
+/// expected to be free.
+pub fn take_receive_slot(thread: u32) -> Option<u32> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            return target.receive_slot.take();
         }
     }
     None
@@ -2324,6 +2367,7 @@ mod tests {
             held_locks: 0,
             space_root: 0,
             reply_to: None,
+            receive_slot: None,
             domain: u32::MAX,
             mailbox: None,
             kernel_stack_top: 0,

@@ -2010,7 +2010,15 @@ pub fn start_block_domain(
                         cap::ObjectKind::Frame,
                         base & !(bhaskix_mm::FRAME_SIZE - 1),
                     ),
-                    cap::Rights::READ.union(cap::Rights::WRITE),
+                    // `DERIVE` too, so the driver may make itself weaker
+                    // copies -- and, more to the point here, so that the one
+                    // thing standing between it and *handing one away* is
+                    // `GRANT`. Without `DERIVE` the refusal would come from
+                    // the derive instead, and the test that watches `GRANT`
+                    // hold would pass with `GRANT` deleted.
+                    cap::Rights::READ
+                        .union(cap::Rights::WRITE)
+                        .union(cap::Rights::DERIVE),
                     0,
                 )
                 .ok()
@@ -2113,7 +2121,22 @@ pub fn start_block_domain(
                 arena
                     .insert_root(
                         cap::ObjectRef::new(cap::ObjectKind::Frame, page),
-                        cap::Rights::READ,
+                        // `GRANT` and `DERIVE` as well as `READ`: this is the
+                        // one thing the driver may pass on, and passing it on
+                        // is a weaker act than reading it -- a page that says
+                        // what device this is.
+                        //
+                        // Both rights, because they are different permissions
+                        // and handing something over needs each: `DERIVE` is
+                        // the right to make a weaker copy at all, `GRANT` is
+                        // the right to give one to somebody else. A capability
+                        // with `GRANT` alone can be given away only as itself,
+                        // which `HAND` never does. Every other capability this
+                        // driver holds has neither, so `HAND` refuses them --
+                        // a refusal the shell asks for and watches.
+                        cap::Rights::READ
+                            .union(cap::Rights::GRANT)
+                            .union(cap::Rights::DERIVE),
                         0,
                     )
                     .ok()
@@ -2249,6 +2272,12 @@ pub fn start_block_domain(
 
 /// The endpoint the block service answers on, once it exists.
 static BLOCK_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The block service's endpoint, if there is a block service.
+fn block_service_endpoint() -> Option<ipc::EndpointId> {
+    let raw = BLOCK_ENDPOINT.load(core::sync::atomic::Ordering::Acquire);
+    (raw != u64::MAX).then(|| ipc::EndpointId::from_u32(raw as u32))
+}
 
 /// The rings the block domain was given, so its report can be read back.
 static BLOCK_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -2449,13 +2478,13 @@ fn report_block_domain(hhdm: u64) -> bool {
         return false;
     }
 
-    let mut words = [0u64; 12];
+    let mut words = [0u64; 13];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // eight little-endian words the driver wrote there.
     // The last page. The first three are the descriptor table, the rings and
     // the request the *device* reads and writes -- a report living in any of
     // them would be a report the device could overwrite.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3]) as *const u8, 96) };
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3]) as *const u8, 104) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -2503,6 +2532,7 @@ fn report_block_domain(hhdm: u64) -> bool {
         request_status,
         by_interrupt,
         identified,
+        hand_refusals,
     ] = words;
 
     // With a window, the driver is expected to have *read the disk*: status
@@ -2510,11 +2540,23 @@ fn report_block_domain(hhdm: u64) -> bool {
     // sector zero. Without one it gets as far as the handshake and stops,
     // because nothing would contain a device it aimed at memory.
     let contained = iommu::present();
-    let ok = if contained {
-        drove_to == 15 && read_ok == 1 && by_interrupt == 1 && queue_size > 0 && sectors > 0
-    } else {
-        drove_to == 3 && queue_size > 0 && sectors > 0
-    };
+    // What `HAND` refused the driver before it was answering anybody. One
+    // rule, checked on its own: the *other* refusal -- passing on a capability
+    // without `GRANT` -- has to be asked from inside a request or it is
+    // refused for having no caller instead, and the two would be
+    // indistinguishable. The shell asks that one.
+    // Exactly `WrongObject`, and not merely "something refused it". A version
+    // of this asked only that the status was non-zero, and passed with the
+    // rule deleted: the driver had declared nothing, so it was refused for
+    // *that* instead. The driver now declares first, so this number is the
+    // only one it can be.
+    let not_answering = hand_refusals as u32;
+    let ok = not_answering == syscall::Status::WrongObject as u32
+        && if contained {
+            drove_to == 15 && read_ok == 1 && by_interrupt == 1 && queue_size > 0 && sectors > 0
+        } else {
+            drove_to == 3 && queue_size > 0 && sectors > 0
+        };
     if ok {
         let text = first_bytes.to_le_bytes();
         let text = core::str::from_utf8(&text).unwrap_or("????????");
@@ -2522,7 +2564,9 @@ fn report_block_domain(hhdm: u64) -> bool {
             "    block domain   ring 3 driver: found status {found}, drove it to {drove_to}, \
              rings at {rings_at_device:#x} for the device, queue of {queue_size}, \
              {sectors} sectors, sector 0 begins {text:?}, woken by the device, \
-             and says it is {:04x}:{:04x} from its own configuration space",
+             and says it is {:04x}:{:04x} from its own configuration space; \
+             handing a capability while answering nobody was refused it \
+             (status {not_answering})",
             identified >> 16,
             identified & 0xffff
         );
@@ -2837,6 +2881,8 @@ const SHELL_RSP0_SLOT: u64 = 3072;
 /// The badges the shell's two capabilities carry.
 const BADGE_CONSOLE: u64 = 0x0000_0000_00c0_0000;
 const BADGE_FILESYSTEM: u64 = 0x0000_0000_00f5_0000;
+/// The badge on the shell's capability to the block service.
+const BADGE_SHELL_BLOCK: u64 = 0x0000_0000_00b1_0000;
 
 /// The shell's domain, for reporting.
 static SHELL_DOMAIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
@@ -3085,6 +3131,30 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
         if !block_service_self_test(hhdm) {
             println!("    block service  FAILED");
+        }
+    }
+
+    // The block service's endpoint, at slot 12, so this program can ask a
+    // *service in another domain* for a capability. RFC 0016 step 2: what
+    // comes back is not bytes but authority, and the shell then reads the
+    // device itself rather than being told what it says.
+    //
+    // Installed only if there is a block domain, because a machine with one
+    // disk delegates nothing.
+    if let Some(endpoint) = block_service_endpoint() {
+        let derived = cap::with_arena(|arena| {
+            let root = arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                    cap::Rights::ALL,
+                    0,
+                )
+                .ok()?;
+            arena.derive(root, cap::Rights::ALL, BADGE_SHELL_BLOCK).ok()
+        })
+        .ok_or("the block endpoint capability would not be created")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(12, derived).is_ok()) != Some(true) {
+            return Err("the block endpoint capability would not install");
         }
     }
 

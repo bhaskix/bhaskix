@@ -94,6 +94,9 @@ else
     # no way to go up.
     commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'open inner\r'$'open greeting\r'
     commands+=$'open sub/inner\r'$'open ..\r'$'ls /\r'$'cat etc/hostname\r'
+    if [[ "$MODE" == "iommu" ]]; then
+        commands+=$'lend\r'
+    fi
     commands+=$'nosuchcommand\r'
 fi
 
@@ -106,20 +109,47 @@ FIFO="$(mktemp -u)"
 mkfifo "$FIFO"
 # The log survives when the caller named it: they asked for it, so removing it
 # on the way out would answer a different question.
+# The machine is stopped on the way out, not left to its own timeout. Without
+# this every run leaks a four-CPU virtual machine for the rest of `$TIMEOUT`,
+# so the suite's shell tests overlap each other -- and once there were four
+# modes they overlapped enough to fail one on a loaded box. A test that is
+# slower because an earlier test is still running is a test measuring the wrong
+# thing, and one that *fails* for it is worse.
+stop_machine() {
+    if [[ -n ${qemu:-} ]]; then
+        kill "$qemu" 2>/dev/null || true
+        wait "$qemu" 2>/dev/null || true
+    fi
+}
+
 if [[ -n ${BHASKIX_SHELL_LOG:-} ]]; then
-    trap 'rm -f "$FIFO"' EXIT
+    trap 'stop_machine; rm -f "$FIFO"' EXIT
 else
-    trap 'rm -f "$LOG" "$FIFO"' EXIT
+    trap 'stop_machine; rm -f "$LOG" "$FIFO"' EXIT
 fi
 
 echo "booting and typing at it, up to ${TIMEOUT}s..."
 
+# With a unit, the same flags RFC 0012's boot test uses. The block *service*
+# only answers where one contains the device -- without it the driver cannot
+# read a sector, so it exits rather than serving, which is the refusal working
+# and is why RFC 0016 step 2's demonstration needs this mode to exist.
+if [[ "$MODE" == "iommu" ]]; then
+    IOMMU_ARGS=(-device intel-iommu,intremap=on)
+    VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on
+                 -device virtio-blk-pci,drive=disk1,disable-legacy=on,iommu_platform=on)
+else
+    IOMMU_ARGS=()
+    VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0
+                 -device virtio-blk-pci,drive=disk1)
+fi
+
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -M q35 -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
+    "${IOMMU_ARGS[@]}" \
     -drive "file=$REPO_ROOT/build/initrd.tar,format=raw,if=none,id=disk0,readonly=on" \
-    -device virtio-blk-pci,drive=disk0 \
     -drive "file=$REPO_ROOT/build/domain-disk.img,format=raw,if=none,id=disk1,readonly=on" \
-    -device virtio-blk-pci,drive=disk1 \
+    "${VIRTIO_ARGS[@]}" \
     -no-reboot -cdrom "$ISO" -boot d -serial stdio -display none \
     < "$FIFO" > "$LOG" 2>&1 &
 qemu=$!
@@ -289,6 +319,35 @@ else
         "cat read a file through IPC:^bhaskix.?$"
         "an unknown command was refused:nosuchcommand: not a command"
     )
+    # RFC 0016 step 2, and it only exists where there is a service to ask: two
+    # programs in ring 3, one handing the other a capability. Four lines,
+    # because each is a different rule and the mechanism is only worth having
+    # if all four hold.
+    if [[ "$MODE" == "iommu" ]]; then
+        lend_checks=(
+            # A server cannot choose where its answer lands. Nothing was
+            # declared, so nothing may arrive -- and the *call still
+            # succeeded*, which is what makes this a refusal of the handing
+            # rather than of the request.
+            "a server cannot put a capability where it was not invited:undeclared +nothing was handed over"
+            # And having been invited: the page arrives, and what is read out
+            # of it is the device's own vendor and identity. No service told
+            # this program that number; it mapped the page and looked.
+            "a service handed a capability to a program in another domain:13 lent +a service handed over a page, and it reads 1af4:1042"
+            # Holding a capability is not being allowed to give it away. Asked
+            # while the service is answering, because outside a request it
+            # would be refused for having no caller instead -- a different
+            # rule, which is what the first version of this accidentally
+            # tested.
+            "a service cannot pass on a capability it may only hold:forbidden +a service cannot pass on what it may only hold"
+            # And what arrived is no stronger than what was held.
+            "a handed capability is no stronger than its original:13 lent +refused a writable mapping"
+        )
+        for check in "${lend_checks[@]}"; do
+            checks+=("$check")
+        done
+    fi
+
     if [[ "$MODE" == "disk" ]]; then
         # Asserted against the whole log, not the session: this one is a line
         # the kernel printed before the shell existed, and it is what makes

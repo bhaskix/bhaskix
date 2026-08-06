@@ -942,6 +942,25 @@ else
     status=1
 fi
 
+# RFC 0016 step 2. A server that is not answering anybody has no caller, so it
+# has nobody to hand a capability to. The driver asks before it starts serving
+# and reports what it was told; the *other* refusal -- passing on a capability
+# it may only hold -- has to be asked from inside a request or it is refused
+# for having no caller instead, so the shell asks that one.
+# Status 4 is `WrongObject`, and the number is asserted rather than "refused":
+# the driver declares a receive slot before it asks, so the reply obligation is
+# the only rule left that can refuse it. Without the declaration it would be
+# refused for not having said where -- which is what an earlier version of this
+# gate accepted, and it accepted it with the rule deleted.
+if grep -qE "handing a capability while answering nobody was refused it \(status 4\)" "$LOG"; then
+    pass "a server with no caller cannot hand a capability to anybody"
+elif grep -qE "block domain +no second device" "$LOG"; then
+    pass "no block domain on this machine, so nothing to hand anything"
+else
+    fail "a server not answering anybody was allowed to hand a capability"
+    status=1
+fi
+
 # RFC 0016 step 1. A badge says who the *granter* said a caller is. Until this
 # was fixed a holder could derive itself a different one and call a service as
 # somebody else, and the probe below demonstrated it as though it were a

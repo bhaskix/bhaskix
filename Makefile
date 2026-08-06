@@ -332,6 +332,7 @@ test-shell: $(ISO)
 	tests/qemu/shell-test.sh user
 	tests/qemu/shell-test.sh kernel
 	tests/qemu/shell-test.sh disk
+	tests/qemu/shell-test.sh iommu
 
 # Rebuilds the image per fault, so it must not run in parallel with the boot
 # tests -- hence its own target rather than a boot-test flag.

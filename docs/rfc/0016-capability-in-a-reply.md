@@ -146,12 +146,30 @@ Three checks, none of which the server can supply for itself:
    a thread that is not mid-request has nobody to hand anything to and is refused. This is what makes
    the authority one-shot and specific — it reaches the one thread that asked, while it is waiting,
    and nothing else.
-3. **The capability is one the server holds**, with `Rights::GRANT`, derived under the monotonicity
-   and badge rules above. A server cannot conjure authority it does not have.
+3. **The capability is one the server holds**, with `Rights::GRANT` *and* `Rights::DERIVE`, derived
+   under the monotonicity and badge rules above. A server cannot conjure authority it does not have.
+   Both rights, because they are different permissions: `DERIVE` is the right to make a weaker copy
+   at all, `GRANT` is the right to give one to somebody else.
 
-The destination slot is named by the *caller*, in its request, not chosen by the server or by the
-kernel — the same rule `DERIVE` and `OPEN_AT` follow, for the same reason: a program's CSpace is its
-own to arrange, and the shell keeps slots empty on purpose.
+The destination slot is named by the *caller*, and the kernel has to be able to see that it was —
+which the request cannot show it, because a request is four registers the server relays. So the
+caller declares it, with a second method:
+
+```
+EXPECT    arg0 = the slot this thread will accept one capability in
+```
+
+Thread state, set through an endpoint capability because every operation here is an invocation on one
+(RFC 0008 A2) and not because the endpoint has anything to do with it. It is **one-shot** in two
+ways: spent by the capability that arrives, and dropped when the call it was made for returns. So it
+means "this call may hand me one capability, there", never "any server I ever talk to may put things
+in me".
+
+Without this the server would name the slot, and `install_at` refusing an occupied slot is not
+enough: a hostile service could still fill a slot a program was keeping *empty* on purpose — which
+the shell does, and which one of its own tests depends on. That is not an escalation, since the
+server could hand the capability anyway, but it is a program's CSpace being arranged by somebody
+else, and this system has spent four RFCs saying that is not allowed.
 
 **Why a reply and not a message.** A server that could hand a capability to any domain it could name
 would need to name domains. A server answering a call names nobody: the kernel already knows who is
@@ -338,11 +356,12 @@ hypothesis, and the crossover is the one this RFC is least sure of.
 
 ## Unresolved questions
 
-- **Does `HAND` belong on the endpoint, or on the reply?** It is written above as a method on the
-  endpoint capability because that is what `FILL` does and the checks are identical. But the
-  authority being exercised is really the *reply's*, and a `Reply` capability is a thing this system
-  already has. Making it a method on the reply would be more honest and would make the "not answering
-  anybody" case a lookup failure rather than a check. Decide before implementing, not after.
+- ~~**Does `HAND` belong on the endpoint, or on the reply?**~~ **Answered by the code: the
+  endpoint, because there is no reply capability to put it on.** `ObjectKind::Reply` exists in the
+  arena but a server never holds one — the reply obligation is thread state (`reply_to`), and
+  `Kind::Reply` ignores its capability argument entirely. So "not answering anybody" is a check and
+  not a lookup failure, and it is the check the tests spend most of their effort on. If a `Reply`
+  capability ever becomes a thing a server holds, this is the first place that should move.
 - **What ends a lending?** Explicit release by the client is simplest and is a promise a client can
   break. Revocation when the handle goes needs the service to observe the handle going, which it
   cannot today. The likely answer is that the service revokes whenever it wants the frame and the
@@ -377,10 +396,28 @@ Five steps. The first is independent of the rest and should not wait for it.
    under the same badge and the call arrives, **and** it asks for one under a badge it invented and is
    refused. A kernel that refused every derivation would pass the second on its own, so the
    over-strict version was watched failing too.
-2. **`HAND`.** The method, its three checks, and the negative tests for each — including a server
-   that is not answering anybody, and a server handing something it holds without `GRANT`. Proved by
-   a throwaway service that hands back a capability to a memory object, before any filesystem depends
-   on it.
+2. ~~**`HAND`.**~~ ✅ **Done.** `EXPECT` and `HAND`, four checks, and a negative test for each.
+
+   Proved without a throwaway service, by using one that was already there: the **block driver**
+   lends the shell its device's configuration page, read-only. Two programs in ring 3, one handing
+   the other a capability — and what comes back is not bytes, because the driver never reads the page
+   on the shell's behalf. The shell maps it and reads `1af4:1042` out of it, which is a number no
+   service told it.
+
+   This needed an IOMMU mode for the shell test, because the block *service* only answers where a
+   unit contains the device: without one the driver cannot read a sector, so it exits rather than
+   serving. That is the refusal working, and it is why the mode had to exist rather than the endpoint
+   being published anyway.
+
+   Two of the three refusals were being tested vacuously and had to be rebuilt:
+
+   - *A server not answering anybody* was refused — but with the check deleted it was still refused,
+     for having declared no receive slot. The driver now declares one first, so the reply obligation
+     is the only rule left that can refuse it, and the gate asserts the exact status rather than
+     "something refused it".
+   - *A capability without `GRANT`* was refused — but the capability chosen also lacked `DERIVE`, so
+     the derive refused it first. The driver's register windows now carry `DERIVE`, which makes
+     `GRANT` the only thing in the way.
 3. **`block::WRITE`, and then the filesystem service in a domain.** Two halves, and the first is
    owed from RFC 0015 step 1: the block service gains a write over RFC 0009's bulk path, and the
    journal is exercised against a **device** for the first time — including the interruption harness,

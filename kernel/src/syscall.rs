@@ -130,6 +130,8 @@ const _: () = {
     assert!(method::INFO == bhaskix_abi::method::INFO);
     assert!(method::DELETE == bhaskix_abi::method::DELETE);
     assert!(method::DERIVE == bhaskix_abi::method::DERIVE);
+    assert!(method::HAND == bhaskix_abi::method::HAND);
+    assert!(method::EXPECT == bhaskix_abi::method::EXPECT);
     assert!(crate::cap::Rights::READ.bits() as u64 == bhaskix_abi::rights::READ);
     assert!(crate::cap::Rights::WRITE.bits() as u64 == bhaskix_abi::rights::WRITE);
     assert!(crate::cap::Rights::DERIVE.bits() as u64 == bhaskix_abi::rights::DERIVE);
@@ -287,6 +289,26 @@ pub mod method {
     pub const OPEN_AT: u64 = 45;
     /// Set in [`OPEN_AT`]'s reply when what it opened is a directory.
     pub const IS_DIRECTORY: u64 = 1 << 32;
+    /// Say where a capability handed back by a server may be put.
+    ///
+    /// Only on an `Endpoint` capability, and it sets *thread* state rather
+    /// than anything about the endpoint: this thread will accept one
+    /// capability, in the slot `arg0` names, on its next call. It is required
+    /// before [`HAND`] can do anything, and it is consumed by the first
+    /// capability that arrives.
+    ///
+    /// A capability is required to ask, because every operation in this system
+    /// is an invocation on one (RFC 0008 A2) — not because the endpoint has
+    /// anything to do with it.
+    pub const EXPECT: u64 = 46;
+    /// Give the caller being answered a copy of a capability this server holds.
+    ///
+    /// Only on an `Endpoint` capability, and only from a thread that is
+    /// answering a message taken from it. `arg0` = the server's own slot
+    /// holding the capability to copy, `arg1` = rights for the copy, `arg2` =
+    /// its badge. Where it lands is **not** in this call: it is the slot the
+    /// caller declared with [`EXPECT`]. RFC 0016.
+    pub const HAND: u64 = 47;
     /// Write bytes into memory the caller of this endpoint named.
     ///
     /// Only on an `Endpoint` capability, and only from the thread that is
@@ -1019,6 +1041,41 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         return Outcome::ok(size);
     }
 
+    // Where this thread will accept a capability. Thread state, set through an
+    // endpoint capability because every operation here is an invocation on
+    // one -- not because the endpoint is what is being changed.
+    if kind == Some(Kind::Invoke) && frame.method == method::EXPECT {
+        if let Err(status) = resolve_for_ipc(frame.capability, ObjectKind::Endpoint) {
+            return Outcome::err(status);
+        }
+        let Some(thread) = crate::sched::current_thread_id() else {
+            return Outcome::err(Status::NoDomain);
+        };
+        let slot = match u32::try_from(frame.arg0) {
+            Ok(slot) => slot,
+            Err(_) => return Outcome::err(Status::SlotUnavailable),
+        };
+        return if crate::sched::set_receive_slot(thread, Some(slot)) {
+            Outcome::ok(frame.arg0)
+        } else {
+            Outcome::err(Status::NoDomain)
+        };
+    }
+
+    // A capability, handed to the caller being answered. Held to the same
+    // three checks `FILL` passes, in the same order and for the same reasons:
+    // the endpoint capability proves this thread is a server, the reply
+    // obligation says which caller, and the capability copied is one the
+    // server already holds -- never a name it chose.
+    //
+    // The fourth is what `FILL` does not need. `FILL` writes into memory the
+    // *caller* pointed at; this installs into the caller's CSpace, so where it
+    // lands must also come from the caller. It does: the slot is the one the
+    // caller declared with `EXPECT`, and nothing in this frame can change it.
+    if kind == Some(Kind::Invoke) && frame.method == method::HAND {
+        return hand(frame);
+    }
+
     // The domain placement's bulk path. Held to the same three checks the
     // nucleus one passes, in the same order: the endpoint capability proves
     // this thread is a server, the reply obligation says which caller, and the
@@ -1113,12 +1170,24 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             let endpoint = crate::ipc::EndpointId::from_u32(resolved.object.id as u32);
             // The badge comes from the capability, never from the frame. A
             // caller that could set it could claim to be anyone.
-            match crate::ipc::call(
+            let outcome = crate::ipc::call(
                 endpoint,
                 resolved.badge,
                 frame.method,
                 [frame.arg0, frame.arg1, frame.arg2, frame.arg3],
-            ) {
+            );
+
+            // Whatever happened, this call is over, so any declaration made
+            // for it is over too. Without this a declaration would outlive its
+            // call and the *next* server this thread spoke to could put
+            // something in a slot the thread had stopped expecting one in --
+            // which is the same fault as letting a server choose the slot,
+            // arrived at by waiting.
+            if let Some(thread) = crate::sched::current_thread_id() {
+                crate::sched::set_receive_slot(thread, None);
+            }
+
+            match outcome {
                 Ok(reply) => {
                     // The whole message comes back, not just its first word.
                     // RFC 0008 says a message is four registers; returning one
@@ -1247,6 +1316,107 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
 }
 
 /// Performs an `Invoke`, including the cross-domain grant.
+/// Gives the caller being answered a copy of a capability the server holds.
+///
+/// Two stages, like [`grant`], and for the same reason: the server's CSpace
+/// and the caller's cannot both be held at once. Derive first from the
+/// server's, then install into the caller's — and if the install fails, the
+/// derived capability is destroyed rather than left in the arena charged to a
+/// domain that cannot name it.
+fn hand(frame: &SyscallFrame) -> Outcome {
+    let Ok(resolved) = resolve_for_ipc(frame.capability, ObjectKind::Endpoint) else {
+        return Outcome::err(Status::WrongObject);
+    };
+    let _ = resolved;
+
+    let Some(server) = crate::sched::current_thread_id() else {
+        return Outcome::err(Status::NoDomain);
+    };
+    // Not answering anybody. A server that could hand a capability outside a
+    // call would be a server that picks its recipient, and picking the
+    // recipient is the whole authority this does not have.
+    let Some(caller) = crate::sched::reply_target(server) else {
+        return Outcome::err(Status::WrongObject);
+    };
+    let Some(recipient) = crate::sched::domain_of(caller) else {
+        return Outcome::err(Status::NoDomain);
+    };
+    let Some(server_domain) = crate::sched::current_domain() else {
+        return Outcome::err(Status::NoDomain);
+    };
+
+    // Where it goes, from the caller and from nowhere else. Taken rather than
+    // read: a declaration admits one capability.
+    let Some(destination) = crate::sched::take_receive_slot(caller) else {
+        return Outcome::err(Status::SlotUnavailable);
+    };
+    let destination = destination as usize;
+
+    // Stage one: derive from the server's own CSpace, charged to the
+    // recipient, because it is the recipient's to keep.
+    let rights = crate::cap::Rights::from_bits(frame.arg1 as u8);
+    let derived = domain::with(server_domain, |owner| {
+        let cspace = core::mem::take(&mut owner.cspace);
+        let result = cap::with_arena(|arena| {
+            let index = usize::try_from(frame.arg0).map_err(|_| Status::NoSuchCapability)?;
+            let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
+            let (_, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            // Holding a capability is not the same as being allowed to pass it
+            // on, and this is passing it on to a domain the server does not
+            // otherwise reach.
+            if !held.contains(crate::cap::Rights::GRANT) {
+                return Err(Status::InsufficientRights);
+            }
+            arena
+                .derive_owned(slot, rights, frame.arg2, recipient.as_u32())
+                .map_err(|error| match error {
+                    crate::cap::CapError::RightsNotMonotone
+                    | crate::cap::CapError::DeriveNotPermitted
+                    | crate::cap::CapError::BadgeNotMonotone => Status::InsufficientRights,
+                    _ => Status::QuotaExceeded,
+                })
+        });
+        owner.cspace = cspace;
+        result
+    });
+    let derived = match derived {
+        Some(Ok(derived)) => derived,
+        Some(Err(status)) => {
+            // The declaration was taken and nothing arrived. Put it back, so a
+            // caller is not left unable to receive because a server asked for
+            // something it could not have.
+            crate::sched::set_receive_slot(caller, Some(destination as u32));
+            return Outcome::err(status);
+        }
+        None => return Outcome::err(Status::NoDomain),
+    };
+
+    // Stage two: install it in the caller, and charge the caller.
+    let installed = domain::with(recipient, |owner| {
+        if owner.charge_capability().is_err() {
+            return Err(Status::QuotaExceeded);
+        }
+        match owner.cspace.install_at(destination, derived) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                owner.release_capability();
+                Err(Status::SlotUnavailable)
+            }
+        }
+    });
+    match installed {
+        Some(Ok(())) => Outcome::ok(destination as u64),
+        other => {
+            cap::with_arena(|arena| arena.revoke_unchecked(derived));
+            crate::sched::set_receive_slot(caller, Some(destination as u32));
+            match other {
+                Some(Err(status)) => Outcome::err(status),
+                _ => Outcome::err(Status::NoDomain),
+            }
+        }
+    }
+}
+
 fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
     // A grant needs two domains' CSpaces and cannot hold both tables at once,
     // so it is resolved in stages rather than done in place.

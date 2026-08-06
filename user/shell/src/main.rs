@@ -29,8 +29,8 @@
 #![no_main]
 
 use bhaskix_abi::{
-    CHUNK_BYTES, Chunk, Edit, LineEditor, console, entry_of, fs, method, outcome, rights, status,
-    syscall,
+    CHUNK_BYTES, Chunk, Edit, LineEditor, block, console, entry_of, fs, method, outcome, rights,
+    status, syscall,
 };
 
 /// The capability slot the console endpoint was installed in.
@@ -59,6 +59,10 @@ const SIGNAL_WRITE_ONLY: u64 = 7;
 const DIRECTORY: u64 = 8;
 /// Where [`open`] puts what it opened. Emptied again afterwards.
 const OPENED: u64 = 9;
+/// The block service's endpoint, in another domain.
+const BLOCK: u64 = 12;
+/// Where a capability the block service hands over is accepted.
+const LENT: u64 = 13;
 /// A slot this program keeps free, to find things out with.
 ///
 /// A probe that had to occupy a slot it cared about would be answering a
@@ -169,6 +173,17 @@ fn write(bytes: &[u8]) {
 }
 
 /// Writes a decimal number.
+/// Writes a number in hexadecimal, four digits, for identities that are read
+/// that way and would be unrecognisable in decimal.
+fn write_hex(value: u64) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 4];
+    for (index, cell) in out.iter_mut().enumerate() {
+        *cell = DIGITS[((value >> (12 - index * 4)) & 0xf) as usize];
+    }
+    write(&out);
+}
+
 fn write_number(mut value: u64) {
     let mut digits = [0u8; 20];
     let mut length = 0;
@@ -270,6 +285,7 @@ fn help() {
     write(b"    ls [path]         list a directory\n");
     write(b"    cat <path>        print a file\n");
     write(b"    open <name>       resolve a name inside the directory held\n");
+    write(b"    lend              ask a service for a capability, and use it\n");
     write(b"    caps              what this program is allowed to do\n");
     write(
         b"    map               map memory this program holds, and be refused what it does not\n",
@@ -729,6 +745,120 @@ fn open(name: &[u8]) {
     }
 }
 
+/// Asks a service in another domain for a capability, and uses it.
+///
+/// RFC 0016 step 2, end to end and with no kernel in the middle deciding
+/// anything: two programs in ring 3, one of which holds a capability to a page
+/// and hands the other a copy no stronger than its own. What comes back is not
+/// bytes — the block service never reads the page on this program's behalf —
+/// it is authority, and this program then reads the device itself.
+///
+/// The declaration is the part worth watching. A server cannot choose where
+/// its answer lands: this program says [`LENT`] first, and a service that said
+/// anything else would be putting a capability in a slot somebody else was
+/// keeping empty. So the refusal below is asked for twice — once having
+/// declared, and once not.
+fn lend() {
+    const AT: u64 = 0x3300_0000;
+
+    // Without declaring first. Nothing may arrive, because nothing said where
+    // it could go.
+    let undeclared = call(BLOCK, block::LEND_CONFIG, [0; 4]);
+    write(b"  undeclared    ");
+    match undeclared.status {
+        status::OK if undeclared.args[0] == 0 => write(b"nothing was handed over\n"),
+        status::OK => write(b"HANDED ANYWAY -- into a slot never asked for\n"),
+        status::NO_SUCH_CAPABILITY => {
+            write(b"no block service on this machine\n");
+            return;
+        }
+        other => {
+            write(b"status ");
+            write_number(other);
+            write(b"\n");
+            return;
+        }
+    }
+
+    // And having declared. `EXPECT` names the slot; the reply says which slot
+    // it landed in, and it must be the one this program asked for.
+    let declared = syscall(syscall::INVOKE, BLOCK, method::EXPECT, [LENT, 0, 0, 0]);
+    if declared.status != status::OK {
+        write(b"  declaring    refused, status ");
+        write_number(declared.status);
+        write(b"\n");
+        return;
+    }
+    let handed = call(BLOCK, block::LEND_CONFIG, [0; 4]);
+    write(b"  13 lent      ");
+    if handed.status != status::OK || handed.args[0] == 0 {
+        write(b"the service would not hand it over\n");
+        return;
+    }
+    if handed.args[0] - 1 != LENT {
+        write(b"landed in a slot this program did not name\n");
+        return;
+    }
+
+    // The capability is real or it is not, and mapping it is the only way to
+    // find out. What is read back is the device's own vendor and identity from
+    // its configuration space -- a number no service told this program.
+    let attached = syscall(syscall::INVOKE, LENT, method::ATTACH, [AT, 0, 0, 0]);
+    if attached.status != status::OK {
+        write(b"mapped nothing, status ");
+        write_number(attached.status);
+        write(b"\n");
+        return;
+    }
+    // SAFETY: the kernel mapped one page read-only at exactly this address,
+    // through a capability this program now holds, and nothing else in this
+    // program uses it. The mapping either happened or the status above was not
+    // `OK`, which is the branch this is inside.
+    let identity = unsafe { core::ptr::read_volatile(AT as *const u32) };
+    write(b"a service handed over a page, and it reads ");
+    write_hex(u64::from(identity & 0xffff));
+    write(b":");
+    write_hex(u64::from(identity >> 16));
+    write(b"\n");
+
+    // A capability the service holds and may not pass on. Asked *while it is
+    // answering*, because outside a request it would be refused for having no
+    // caller -- a different rule, and one that would make this prove nothing.
+    //
+    // Declared again first. A declaration is spent by the capability that
+    // arrives and is dropped when its call ends, so without this the refusal
+    // below would be "you did not say where", which is a third rule and would
+    // prove nothing either. That is what it said the first time this was
+    // written.
+    syscall(syscall::INVOKE, BLOCK, method::EXPECT, [LENT + 1, 0, 0, 0]);
+    let forbidden = call(BLOCK, block::LEND_FORBIDDEN, [0; 4]);
+    write(b"  forbidden     ");
+    match forbidden.args[0] {
+        status::INSUFFICIENT_RIGHTS => {
+            write(b"a service cannot pass on what it may only hold\n");
+        }
+        other => {
+            write(b"handed anyway, or refused for the wrong reason: status ");
+            write_number(other);
+            write(b"\n");
+        }
+    }
+
+    // And a writable mapping of it is refused: what was handed over is no
+    // stronger than what the service held, which was read-only.
+    let writable = syscall(
+        syscall::INVOKE,
+        LENT,
+        method::ATTACH,
+        [AT + 0x10000, 1, 0, 0],
+    );
+    write(b"  13 lent      ");
+    match writable.status {
+        status::INSUFFICIENT_RIGHTS => write(b"refused a writable mapping\n"),
+        _ => write(b"WIDENED -- a copy stronger than the original\n"),
+    }
+}
+
 fn run(line: &[u8]) {
     let (command, rest) = split(line);
     match command {
@@ -739,6 +869,7 @@ fn run(line: &[u8]) {
             write(b"\n");
         }
         b"ls" => list(rest),
+        b"lend" => lend(),
         b"open" => {
             if rest.is_empty() {
                 write(b"  open: which name?\n");

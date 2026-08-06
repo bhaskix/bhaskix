@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-09 (RFC 0015 steps 1–6, RFC 0016 step 1) · CI green · 459 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-10 (RFC 0015 steps 1–6, RFC 0016 steps 1–2) · CI green · 494 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
 
 ### Division of responsibility between documents
 
@@ -140,6 +140,8 @@ fairness within 2% for two equal-weight workloads.
 | M9-08 | RFC 0015 step 6: a page cache, and a filesystem that no longer holds its own bytes | ✅ `DONE` | The cache was the smaller half. The larger half is that until now every structure was read by indexing into one slice, which is only possible because the image happened to be memory — so there is now a **`Store`** (the device: how many blocks, read one, write one) and **`Pages`** (where a block is, right now). An `Image` points into a slice it has; a `Cache` looks, and asks the device when it must. **One** implementation of "what an inode is" sits above that line. Write-back adds one ordering the journal did not need: **the log may not be cleared while a changed page is still dirty**, at the moment everything looks finished — recovery has the same constraint, and without it a survivable crash becomes a lost one on the *second* crash. The interruption moved into the `Store`, so a trace is now what the **disk** saw rather than what the filesystem asked for, and the whole exhaustive harness runs against it. Watched failing four ways, including that missing clear-flush. The *hand a reader a capability to a cached frame* half is **not built**, and the reason is recorded: it cannot be a capability to the cache (that exposes every other block), so it is one frame — which must then be pinned against eviction and revoked when the lending ends, a lifetime only the service owning the cache can see. `fs` is still **zero `unsafe`** across 3,467 lines. |
 
 | M9-09 | RFC 0016 step 1: a badge can no longer be chosen by the program holding it | ✅ `DONE` | A badge is a statement the *granter* made; until this, it was one the holder could make — `derive_owned` took the badge from its argument and `INVOKE`'s `DERIVE` passes that through from ring 3, so any program holding a badged capability with `DERIVE` could call a service as somebody else. Now one-way: a capability with badge zero is a **master** and may set any badge; one that carries a badge may only be derived with the same badge. Rights stay monotone independently, so delegation still works. **Two places in the tree demonstrated the hole as a feature** and had to be rewritten — the capability self-test asserted a re-badged derivation kept the new badge, and `user/probe` forged one from raw ring 3 with a comment calling it "how a derived capability is distinguishable from its parent". Both halves are gated everywhere, because either alone is worthless: delegation under the same badge must work, **and** a chosen badge must be refused. Watched failing in both directions — the rule removed, and the rule made over-strict. |
+
+| M9-10 | RFC 0016 step 2: a reply that carries a capability | ✅ `DONE` | `HAND` on an endpoint, and it is the endpoint because there is **no reply capability to put it on** — `ObjectKind::Reply` exists but a server never holds one, so "not answering anybody" is a check rather than a lookup. Four checks: the endpoint proves this thread is a server, the reply obligation says which caller, the capability is one the server holds with `GRANT` **and** `DERIVE`, and where it lands comes from the caller's new `EXPECT` — one-shot, spent by what arrives and dropped when the call ends. Without that last one a hostile service could fill a slot a program was keeping *empty*, which the shell does and one of its tests depends on. Proved with no throwaway service: the **block driver lends the shell its device's configuration page**, ring 3 to ring 3, and the shell maps it and reads `1af4:1042` — a number no service told it. Needed an IOMMU shell-test mode, because the block service only answers where a unit contains the device. **Two of the three refusals were vacuous** and were rebuilt so the named rule is the only one that can refuse. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -737,6 +739,35 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0016 step 2 — a service hands a program a capability)
+
+- **`HAND` goes on the endpoint, and the RFC's open question is answered by the code**: there is no
+  reply capability to put it on. `ObjectKind::Reply` exists in the arena but a server never holds
+  one — the reply obligation is thread state and `Kind::Reply` ignores its capability argument — so
+  "not answering anybody" is a *check*, and it is the one the tests spend most effort on.
+- **The caller says where, with a new `EXPECT`.** The kernel cannot see the request's contents, so it
+  cannot verify a claim that "the caller asked for slot N" — the server relays four registers. The
+  caller therefore declares it as thread state, one-shot: spent by the capability that arrives and
+  dropped when the call ends. Without it a hostile service could fill a slot a program was keeping
+  **empty on purpose**, which the shell does and one of its own tests depends on.
+- **`GRANT` and `DERIVE` are both required**, because they are different permissions: `DERIVE` is the
+  right to make a weaker copy at all, `GRANT` the right to give one to somebody else.
+- **Proved without a throwaway service.** The block driver lends the shell its device's configuration
+  page, read-only — two programs in ring 3, and what crosses is authority rather than bytes: the
+  driver never reads the page, the shell maps it and reads `1af4:1042` out of it. This needed an
+  **IOMMU mode for the shell test**, because the block service only answers where a unit contains
+  the device; without one the driver exits rather than serving, which is the refusal working.
+- **Two of the three refusals were being tested vacuously**, and both were found by deleting the rule
+  and seeing nothing fail. "A server not answering anybody" was refused with the rule deleted, for
+  having declared no receive slot — so the driver now declares one first and the gate asserts the
+  exact status. "A capability without `GRANT`" was refused by the *derive* first, because the
+  capability chosen also lacked `DERIVE` — so the driver's windows now carry `DERIVE`, leaving
+  `GRANT` as the only thing in the way. Seventh and eighth.
+- **The shell test leaked a virtual machine per run.** It never stopped QEMU, leaving a four-CPU
+  machine alive for the rest of its 240 s timeout, so the suite's shell tests overlapped — and with a
+  fourth mode added they overlapped enough to fail one on a loaded box. Now stopped on the way out.
+  This is the cause of at least two "flaky" failures recorded earlier in this project.
 
 ### 2026-08-06 (RFC 0016 step 1 — a badge is the granter's word, not the holder's)
 

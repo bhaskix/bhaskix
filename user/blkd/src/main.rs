@@ -25,7 +25,7 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{block, method, status, syscall};
+use bhaskix_abi::{block, method, rights, status, syscall};
 use bhaskix_device::Volatile;
 use bhaskix_device::virtqueue::{self, Virtqueue};
 
@@ -50,6 +50,12 @@ const SIGNAL: u64 = 6;
 /// is what says this program is the block service rather than a program
 /// pretending to be.
 const BLOCK_ENDPOINT: u64 = 8;
+/// Slot: kept empty, and declared as a destination that must never be filled.
+///
+/// It exists so that the rule being watched is the *only* thing in the way. A
+/// probe that had declared nothing would be refused for that, and the refusal
+/// it is meant to demonstrate would never be reached.
+const SPARE: u64 = 14;
 /// Slot: this device's configuration space, read-only.
 ///
 /// Four kilobytes of ordinary memory, which is what PCIe made it and what the
@@ -424,6 +430,29 @@ extern "C" fn blkd_main() -> ! {
     } else {
         0
     };
+    // Handing a capability while answering nobody. A server with no caller has
+    // nobody to hand anything to, and a server that could pick its recipient
+    // would hold the one authority this mechanism exists not to give it.
+    //
+    // A receive slot is declared *first*, and that is what makes this a test.
+    // Without it the refusal is "you did not say where" -- and a version of
+    // this without the declaration passed with the reply-obligation check
+    // deleted, because the missing declaration refused it instead. Declared,
+    // the only thing standing between this program and handing itself a
+    // capability is the rule being watched.
+    let _ = call_two(
+        syscall::INVOKE,
+        BLOCK_ENDPOINT,
+        method::EXPECT,
+        [SPARE, 0, 0, 0],
+    );
+    let (not_answering, _) = call_two(
+        syscall::INVOKE,
+        BLOCK_ENDPOINT,
+        method::HAND,
+        [CONFIG, rights::READ, 0, 0],
+    );
+
     report(
         found,
         status_now,
@@ -435,6 +464,7 @@ extern "C" fn blkd_main() -> ! {
         request_status,
         by_interrupt,
         identified,
+        not_answering,
     );
 
     // And now it is a *service*. RFC 0015 step 1: a driver nothing could ask
@@ -464,6 +494,39 @@ fn serve(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sectors: u64) ->
 
         let answer = match method {
             block::CAPACITY => sectors,
+            // The configuration page, lent rather than copied. This service
+            // holds a read-only capability to it and hands the caller a copy
+            // no stronger than its own; the caller maps it and reads the
+            // device itself, which is a thing this service never does on its
+            // behalf.
+            //
+            // Where it lands is not this service's to choose. `HAND` puts it
+            // in the slot the *caller* declared, and there is no argument here
+            // that could say otherwise.
+            block::LEND_CONFIG => {
+                let (status, slot) = call_two(
+                    syscall::INVOKE,
+                    BLOCK_ENDPOINT,
+                    method::HAND,
+                    [CONFIG, rights::READ, 0, 0],
+                );
+                if status == status::OK { slot + 1 } else { 0 }
+            }
+            // The same call, for a capability this service holds and may not
+            // pass on: every register window it was given lacks `GRANT`.
+            // Answered from inside a request on purpose. Asked at start-up it
+            // would be refused for having no caller, and the two refusals
+            // would be indistinguishable -- which is what the first version of
+            // this did, and both came back status 4.
+            block::LEND_FORBIDDEN => {
+                let (status, _) = call_two(
+                    syscall::INVOKE,
+                    BLOCK_ENDPOINT,
+                    method::HAND,
+                    [COMMON, rights::READ, 0, 0],
+                );
+                status
+            }
             block::READ => {
                 let sector = args[0];
                 let slot = args[2];
@@ -729,6 +792,7 @@ fn report(
     request_status: u64,
     by_interrupt: u64,
     identified: u64,
+    hand_refusals: u64,
 ) {
     // A word the kernel looks for, so a zeroed page is not mistaken for a
     // report nobody wrote.
@@ -750,6 +814,7 @@ fn report(
         core::ptr::write_volatile(at.add(9), request_status);
         core::ptr::write_volatile(at.add(10), by_interrupt);
         core::ptr::write_volatile(at.add(11), identified);
+        core::ptr::write_volatile(at.add(12), hand_refusals);
         // The marker last, and with a fence before it, so a kernel that sees
         // the marker sees everything under it.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);

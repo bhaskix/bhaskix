@@ -196,6 +196,23 @@ pub mod method {
     /// Not an error on a slot that is already empty: a program tidying up
     /// should not have to remember whether it has anything to tidy.
     pub const DELETE: u64 = 2;
+    /// Say where a capability handed back by a server may be put.
+    ///
+    /// Only on an `Endpoint` capability. `arg0` = the slot. This thread will
+    /// then accept **one** capability there, and a server cannot put one
+    /// anywhere else — a program's CSpace is its own to arrange, and a service
+    /// that could choose could fill a slot the program was keeping empty.
+    ///
+    /// One-shot: the declaration is consumed by the capability that arrives,
+    /// and cleared when the call it was made for returns.
+    pub const EXPECT: u64 = 46;
+    /// Give the caller being answered a copy of a capability this server holds.
+    ///
+    /// Only on an `Endpoint` capability, and only while answering a message
+    /// taken from it. `arg0` = the server's own slot, `arg1` = rights for the
+    /// copy, `arg2` = its badge. Where it lands comes from the caller's
+    /// [`EXPECT`] and not from here.
+    pub const HAND: u64 = 47;
     /// Set in [`OPEN_AT`]'s reply when what was opened is a directory.
     ///
     /// Above the slot index rather than beside it, so a caller that ignores it
@@ -299,6 +316,21 @@ pub mod block {
     pub const READ: u64 = 1;
     /// How many 512-byte sectors the device has.
     pub const CAPACITY: u64 = 2;
+    /// Lend the caller the device's configuration page, read-only.
+    ///
+    /// The driver holds a capability to it and hands over a **weaker copy**
+    /// rather than reading the page and copying its bytes back: the caller
+    /// maps it and reads the device itself. Where the copy lands is the slot
+    /// the caller declared with [`method::EXPECT`], never one this service
+    /// chose. RFC 0016.
+    pub const LEND_CONFIG: u64 = 3;
+    /// Try to lend a capability this service may **not** pass on.
+    ///
+    /// Replies with the status the kernel gave. It exists so that the refusal
+    /// can be watched from a caller, *while the service is answering* — asked
+    /// outside a request it would be refused for having no caller instead,
+    /// which is a different rule and would prove nothing about this one.
+    pub const LEND_FORBIDDEN: u64 = 4;
 }
 
 /// Methods the filesystem service answers.
