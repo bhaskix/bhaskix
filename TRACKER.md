@@ -593,7 +593,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — RFC 0015's six steps are built. What remains is one piece the RFC now names: move the filesystem out of the nucleus, and lend cached frames as capabilities | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
+| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — RFC 0015's six steps are built; **[RFC 0016](rfc/0016-capability-in-a-reply.md) drafted** for what is left: a reply that carries a capability, the filesystem out of the nucleus, and `block::WRITE`, which was owed from RFC 0015 step 1 and means the journal has never written to a device | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -735,6 +735,24 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0016 drafted — and two things found by writing it)
+
+- **RFC 0016 is drafted**: a reply that can carry a capability, and the filesystem out of the
+  nucleus. The two are one piece of work, which is what RFC 0015 steps 4 and 6 each concluded from
+  opposite directions.
+- **Badges are forgeable, today.** Any holder of a capability with `DERIVE` may derive another with
+  a badge of its choosing — `derive_owned` sets the badge from its argument and checks only that the
+  parent permits deriving, and `INVOKE`'s `DERIVE` passes it straight through from ring 3. Verified
+  by running the derivation, not by reading it. Everything that uses a badge to say *who is calling*
+  is unsound; the filesystem service keys per-caller state on one. The impact today is small because
+  there is one interesting client, and that is luck. **The fix is RFC 0016 step 1 and is independent
+  of the rest of it.**
+- **The block service cannot write.** `bin/blkd` answers `block::READ` and `block::CAPACITY` and
+  nothing else; RFC 0015's step 1 said "`READ` and `WRITE`", and only half was built. Nothing since
+  has needed the other half — which means the **journal has never written to a device**. Every
+  interruption test, host and machine, has stopped a store backed by an array. That is not wrong, and
+  it is not the same claim as the one the journal exists to make.
 
 ### 2026-08-06 (RFC 0015 step 6 — a page cache, and a filesystem that stops holding its own bytes)
 
