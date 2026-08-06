@@ -475,7 +475,10 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
             // The commonest reason is that the caller never said where. That
             // is the caller's mistake and not a missing name, so it is a
             // different answer.
-            answer(dir::NOWHERE, size, is_directory);
+            // The status, not just "it did not work": the commonest reason is
+            // that the caller never said where, and that is a different fault
+            // from the service being refused.
+            answer(dir::NOWHERE, handed, is_directory);
         }
     }
 }

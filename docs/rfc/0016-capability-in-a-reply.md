@@ -479,24 +479,26 @@ Five steps. The first is independent of the rest and should not wait for it.
    `ObjectKind::Directory`, `ObjectKind::File` and `OPEN_AT` are deleted. The RFC 0015 step 4 shell
    gates must pass **unchanged** — that is the point of them.
 
-   🔨 **Started, and stopped on a defect this RFC did not anticipate.** The `dir::` protocol, the
-   service answering it, and directory handles as badged endpoint capabilities all work — two of the
-   six shell gates already pass through the service. What does not work is the thing the design
-   requires: **a server that calls another service while it already owes a reply faults its caller.**
-   Answering a directory lookup means reading a block, which means calling the block service, which
-   means exactly that. Isolated by warming the cache so no device read was needed — with no nested
-   call, the same request answers correctly.
+   ✅ **Done.** `kernel/src/namespace.rs`, `ObjectKind::Directory`, `ObjectKind::File`,
+   `method::OPEN_AT`, `Status::NoSuchName` and `Status::BadName` are deleted. A directory a program
+   holds is a badged endpoint capability to `bin/fsd`, and all six RFC 0015 step 4 shell gates pass
+   **unchanged** — same strings, same numbers, different mechanism, which is how we know it is the
+   same claim.
 
-   This is prior to the namespace and prior to `HAND`. Until a service can call while owing a reply,
-   no service that depends on another can answer anything, which is most of what this RFC is for.
+   **What stopped it for a day was a defect in `EXPECT`, introduced in step 2 of this RFC.** A
+   declaration said *where* a capability could land and not *who was invited*, so it belonged to
+   whichever call happened next. A program that says where, prints a line, and then asks loses its
+   declaration **to the console**, because printing is a call too. A declaration now names the
+   endpoint it was made for, and only a server of that endpoint can consume it — which is also a
+   better property than the "cleared when any call returns" rule it replaces, since that rule existed
+   to stop a stale declaration being used by a later server and addressing does it properly.
 
-   **Sharpened since.** It is not the reply obligation. Moving `bin/blkd`'s stack away from the
-   address every other program uses turned the symptom from silent corruption into a clean page fault
-   at an *unmapped stack address*: the shell was running with **another program's page table
-   loaded**, writing to what it thought was its own stack and hitting blkd's. That is why blkd
-   faulted with a garbage `self`, and why nothing looked wrong until blkd's stack moved out of the
-   way. So the defect is in address-space switching on resume — `finish_switch` → `enter_space` —
-   and not in IPC at all. It belongs to RFC 0008's neighbourhood only in that IPC is what exposes
-   it.
+   Two diagnoses recorded along the way are **withdrawn**. "A server that calls another service while
+   it already owes a reply faults its caller" was wrong — a nested call is fine, and the reproduction
+   that appeared to show otherwise was this same `EXPECT` bug reached another way. The address-space
+   theory built on top of it was wrong for the same reason. The one lasting finding from that
+   investigation is unrelated to both: every program being linked and stacked at the same addresses
+   makes a fault report say nothing about which program faulted.
+
 5. **Lending a cached frame**, with pinning and the eviction gate. Last, because it is the only step
    whose failure is silent, and it should be built when everything under it is already trusted.

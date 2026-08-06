@@ -820,26 +820,12 @@ else
     status=1
 fi
 
-# RFC 0015 step 4. Two directories of that filesystem, named by the kernel and
-# reported as different inodes -- which is what makes the shell's "it holds one
-# of these and not the other" a statement about authority rather than about a
-# filesystem with one directory in it. The shell test carries the rest: what a
-# program can and cannot reach with the one it was handed.
-if grep -qE "the root is inode [0-9]+ and .sub. is inode [0-9]+, and a program is given one of them" "$LOG"; then
-    root=$(grep -oE "the root is inode [0-9]+" "$LOG" | head -1 | grep -oE "[0-9]+")
-    sub=$(grep -oE "\`sub\` is inode [0-9]+" "$LOG" | head -1 | grep -oE "[0-9]+")
-    if [[ -n "$root" && -n "$sub" && "$root" != "$sub" ]]; then
-        pass "the namespace names two different directories of that filesystem"
-    else
-        fail "the root and the directory handed out are the same inode ($root, $sub)"
-        status=1
-    fi
-elif grep -qE "filesystem +no fs.img" "$LOG"; then
-    pass "no image on this machine, so no directories to name"
-else
-    fail "the kernel did not report what its directory capabilities name"
-    status=1
-fi
+# RFC 0016 step 4 removed the kernel's own answer here. The kernel no longer
+# names directories -- it does not know what an inode is -- so there is nothing
+# for it to report. What replaced this gate is in the shell test, where the
+# claims are made about what a *program* can and cannot reach, which is where
+# they always belonged.
+
 
 # RFC 0009 step 6: the filesystem service's bulk path, and the measurement the
 # RFC asks for rather than a claim that it is faster. The register path stays

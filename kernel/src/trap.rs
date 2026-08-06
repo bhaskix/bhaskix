@@ -311,6 +311,27 @@ fn report_exception(frame: &mut TrapFrame) {
         decode_error_code(frame);
     }
 
+    // Whose program this is, and whether it is running in its own memory.
+    //
+    // A fault from ring 3 says `rip` and `rsp`, and both are useless when every
+    // program in the tree is linked and stacked at the same addresses -- which
+    // they are, and which sent one investigation into the wrong program twice.
+    // The thread's name and the two page-table roots say it directly: if `CR3`
+    // is not the space this thread is supposed to be in, that is the fault, and
+    // whatever the address looks like is a consequence.
+    if frame.from_user_mode()
+        && let Some(me) = crate::sched::current_thread_id()
+        && let Some((name, expected)) = crate::sched::describe(me)
+    {
+        // SAFETY: reading CR3 at CPL 0 has no side effects.
+        let loaded = unsafe { bhaskix_arch::paging::active_page_table() };
+        println!();
+        println!("  thread {me} ({name}) expects space {expected:#x}, cr3 holds {loaded:#x}");
+        if expected != 0 && expected != loaded {
+            println!("    IT IS RUNNING IN SOMEBODY ELSE'S ADDRESS SPACE");
+        }
+    }
+
     println!();
     println!("  rip {:#018x}   cs  {:#06x}", frame.rip, frame.cs);
     println!("  rsp {:#018x}   ss  {:#06x}", frame.rsp, frame.ss);

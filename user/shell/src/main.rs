@@ -29,8 +29,8 @@
 #![no_main]
 
 use bhaskix_abi::{
-    CHUNK_BYTES, Chunk, Edit, LineEditor, block, console, entry_of, fs, method, outcome, rights,
-    status, syscall,
+    CHUNK_BYTES, Chunk, Edit, LineEditor, block, console, dir, entry_of, fs, method, outcome,
+    rights, status, syscall,
 };
 
 /// The capability slot the console endpoint was installed in.
@@ -337,10 +337,14 @@ fn capabilities() {
     // refusing an operation on an object it found. A capability that is not
     // there says "no such capability", from earlier, without ever looking at
     // the method. Two refusals that mean opposite things.
+    // The directory is a capability to a *service* now. Probed with a method
+    // it does not answer: a capability that is there is answered at all, and
+    // one that is not says "no authority", from the kernel, before anything is
+    // reached.
     write(b"  8  directory ");
-    let reply = syscall(syscall::INVOKE, DIRECTORY, u64::MAX, [0; 4]);
+    let reply = call(DIRECTORY, u64::MAX, [0; 4]);
     match reply.status {
-        status::NO_SUCH_METHOD => write(b"reachable, and answers no method it was not given\n"),
+        status::OK => write(b"reachable, and answers no method it was not given\n"),
         status::NO_SUCH_CAPABILITY => write(b"no authority\n"),
         other => {
             write(b"status ");
@@ -394,16 +398,22 @@ fn capabilities() {
     // would answer yes and prove nothing.
     write(b"  10 stale dir ");
     let (chunk, _) = Chunk::take(b"inner");
-    let reply = syscall(
+    syscall(
         syscall::INVOKE,
         STALE_DIRECTORY,
-        method::OPEN_AT,
-        chunk.pack(OPENED),
+        method::EXPECT,
+        [OPENED, 0, 0, 0],
     );
-    match reply.status {
-        status::REVOKED => write(b"the directory it named is gone\n"),
-        status::OK => write(b"resolved -- the generation was not checked\n"),
-        other => {
+    let reply = call(STALE_DIRECTORY, dir::OPEN_AT, chunk.pack(0));
+    match (reply.status, reply.args[0]) {
+        (status::OK, dir::GONE) => write(b"the directory it named is gone\n"),
+        (status::OK, dir::OK) => write(b"resolved -- the generation was not checked\n"),
+        (status::OK, other) => {
+            write(b"outcome ");
+            write_number(other);
+            write(b"\n");
+        }
+        (other, _) => {
             write(b"status ");
             write_number(other);
             write(b"\n");
@@ -681,68 +691,67 @@ fn open(name: &[u8]) {
 
     let (chunk, rest) = Chunk::take(name);
     if !rest.is_empty() {
-        // Longer than one chunk. Refused here rather than sent, because the
-        // kernel would refuse it too and a name that arrived truncated would
-        // open a different file.
         write(b"  open: that name is too long to send\n");
+        return;
+    }
+
+    // Where the answer may land, said before asking, and addressed to the
+    // service being asked. Addressing it is what lets the line below be
+    // printed in between: printing is a call too.
+    let declared = syscall(
+        syscall::INVOKE,
+        DIRECTORY,
+        method::EXPECT,
+        [OPENED, 0, 0, 0],
+    );
+    if declared.status != status::OK {
+        write(b"  open: this program holds no directory\n");
         return;
     }
 
     write(b"  ");
     write(name);
     write(b": ");
-    let reply = syscall(
-        syscall::INVOKE,
-        DIRECTORY,
-        method::OPEN_AT,
-        chunk.pack(OPENED),
-    );
-    match reply.status {
-        status::OK => {}
-        status::NO_SUCH_NAME => {
+    let reply = call(DIRECTORY, dir::OPEN_AT, chunk.pack(0));
+    if reply.status != status::OK {
+        write(b"the filesystem service did not answer, status ");
+        write_number(reply.status);
+        write(b"\n");
+        return;
+    }
+    match reply.args[0] {
+        dir::NO_SUCH_NAME => {
             write(b"no such name in this directory\n");
             return;
         }
-        status::BAD_NAME => {
+        dir::BAD_NAME => {
             write(b"not a name this system resolves\n");
             return;
         }
-        status::NO_SUCH_CAPABILITY => {
-            write(b"nothing in that slot -- this program holds no directory\n");
+        dir::GONE => {
+            write(b"the directory it named is gone\n");
             return;
         }
-        status::WRONG_OBJECT => {
-            write(b"not a directory to look in\n");
-            return;
-        }
+        dir::OK => {}
         other => {
-            write(b"refused, status ");
+            write(b"refused, outcome ");
             write_number(other);
             write(b"\n");
             return;
         }
     }
 
-    if reply.args[0] & method::IS_DIRECTORY != 0 {
+    if reply.args[2] != 0 {
         write(b"a directory, at slot ");
-        write_number(reply.args[0] & 0xffff_ffff);
+        write_number(OPENED);
         write(b"\n");
         return;
     }
-
-    // A file. Its size comes from the capability rather than from the lookup:
-    // asking the thing that was opened is the only way to know that what
-    // landed in the slot is what the name meant.
-    let size = syscall(syscall::INVOKE, OPENED, method::INFO, [0; 4]);
-    if size.status == status::OK {
-        write(b"a file of ");
-        write_number(size.args[0]);
-        write(b" bytes, at slot ");
-        write_number(reply.args[0] & 0xffff_ffff);
-        write(b"\n");
-    } else {
-        write(b"opened, but it will not say how big it is\n");
-    }
+    write(b"a file of ");
+    write_number(reply.args[1]);
+    write(b" bytes, at slot ");
+    write_number(OPENED);
+    write(b"\n");
 }
 
 /// Asks a service in another domain for a capability, and uses it.

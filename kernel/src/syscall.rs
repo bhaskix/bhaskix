@@ -126,7 +126,6 @@ const _: () = {
     assert!(method::ACK == bhaskix_abi::method::ACK);
     assert!(method::WAIT == bhaskix_abi::method::WAIT);
     assert!(method::PEEK == bhaskix_abi::method::PEEK);
-    assert!(method::OPEN_AT == bhaskix_abi::method::OPEN_AT);
     assert!(method::INFO == bhaskix_abi::method::INFO);
     assert!(method::DELETE == bhaskix_abi::method::DELETE);
     assert!(method::DERIVE == bhaskix_abi::method::DERIVE);
@@ -137,9 +136,6 @@ const _: () = {
     assert!(crate::cap::Rights::WRITE.bits() as u64 == bhaskix_abi::rights::WRITE);
     assert!(crate::cap::Rights::DERIVE.bits() as u64 == bhaskix_abi::rights::DERIVE);
     assert!(crate::cap::Rights::GRANT.bits() as u64 == bhaskix_abi::rights::GRANT);
-    assert!(method::IS_DIRECTORY == bhaskix_abi::method::IS_DIRECTORY);
-    assert!(Status::NoSuchName as u64 == bhaskix_abi::status::NO_SUCH_NAME);
-    assert!(Status::BadName as u64 == bhaskix_abi::status::BAD_NAME);
     assert!(Status::InsufficientRights as u64 == bhaskix_abi::status::INSUFFICIENT_RIGHTS);
     assert!(Status::SlotUnavailable as u64 == bhaskix_abi::status::SLOT_UNAVAILABLE);
     assert!(method::PUT == bhaskix_abi::method::PUT);
@@ -278,18 +274,6 @@ pub mod method {
     pub const POLL: u64 = 41;
     /// What [`POLL`] returns when nothing was waiting.
     pub const NOTHING: u64 = 0x100;
-    /// Resolve one name inside the directory this capability names.
-    ///
-    /// Only on a `Directory` capability. `arg0..3` = the name as a `Chunk`:
-    /// one component, no separators, no `.` or `..`. Replies with the slot the
-    /// resulting capability landed in, and [`IS_DIRECTORY`] set if it is one.
-    ///
-    /// There is no method that takes a path and no capability naming a root,
-    /// so this is the only way to reach a file — and it starts from something
-    /// the caller was given. RFC 0015 step 4.
-    pub const OPEN_AT: u64 = 45;
-    /// Set in [`OPEN_AT`]'s reply when what it opened is a directory.
-    pub const IS_DIRECTORY: u64 = 1 << 32;
     /// Say where a capability handed back by a server may be put.
     ///
     /// Only on an `Endpoint` capability, and it sets *thread* state rather
@@ -372,21 +356,6 @@ pub enum Status {
     SlotUnavailable = 11,
     /// The domain's capability quota is full.
     QuotaExceeded = 12,
-    /// Nothing of that name is in the directory that was asked.
-    ///
-    /// Not distinguished from a name that exists *elsewhere* on the same
-    /// filesystem: a program that could tell those apart could map a
-    /// filesystem it holds one directory of, one question at a time. RFC 0015.
-    NoSuchName = 13,
-    /// That is not a name this system resolves: a separator, `.`, `..`, empty.
-    ///
-    /// Separate from [`Status::NoSuchName`] for two reasons. It gives nothing
-    /// away — it describes the syntax the caller used, which the caller
-    /// already knows. And a rejection that answered "no such name" would be
-    /// indistinguishable from no rejection at all, because `..` is not an
-    /// entry in any directory this format writes: a lookup that never checked
-    /// would simply fail to find it and say the same thing.
-    BadName = 14,
 }
 
 impl Status {
@@ -1036,32 +1005,18 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         };
     }
 
-    // A name, resolved inside a directory somebody was given. Unlocked for
-    // the same reason as the window's methods: it takes the capability arena
-    // to mint what it produces, which ranks inside the resolution it would
-    // otherwise be holding.
-    if kind == Some(Kind::Invoke) && frame.method == method::OPEN_AT {
-        return crate::namespace::open_at(frame);
-    }
-
-    // `INFO` on a file is its size. Tried before the window's `INFO`, and
-    // falling through rather than refusing when the capability is not a file,
-    // so that one method number can mean two things without either object
-    // having to know about the other.
-    if kind == Some(Kind::Invoke)
-        && frame.method == method::INFO
-        && let Some(size) = crate::namespace::size_of(frame.capability)
-    {
-        return Outcome::ok(size);
-    }
-
     // Where this thread will accept a capability. Thread state, set through an
     // endpoint capability because every operation here is an invocation on
     // one -- not because the endpoint is what is being changed.
     if kind == Some(Kind::Invoke) && frame.method == method::EXPECT {
-        if let Err(status) = resolve_for_ipc(frame.capability, ObjectKind::Endpoint) {
-            return Outcome::err(status);
-        }
+        // The endpoint is recorded with the slot. A declaration is an
+        // invitation to *one* service, and without naming it the declaration
+        // belonged to whichever call happened next -- which, for a program that
+        // says where and then prints a line before asking, is the console.
+        let invited = match resolve_for_ipc(frame.capability, ObjectKind::Endpoint) {
+            Ok(resolved) => resolved.object.id as u32,
+            Err(status) => return Outcome::err(status),
+        };
         let Some(thread) = crate::sched::current_thread_id() else {
             return Outcome::err(Status::NoDomain);
         };
@@ -1069,7 +1024,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             Ok(slot) => slot,
             Err(_) => return Outcome::err(Status::SlotUnavailable),
         };
-        return if crate::sched::set_receive_slot(thread, Some(slot)) {
+        return if crate::sched::set_receive_slot(thread, Some((slot, invited))) {
             Outcome::ok(frame.arg0)
         } else {
             Outcome::err(Status::NoDomain)
@@ -1085,7 +1040,8 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // The fourth is what `FILL` does not need. `FILL` writes into memory the
     // *caller* pointed at; this installs into the caller's CSpace, so where it
     // lands must also come from the caller. It does: the slot is the one the
-    // caller declared with `EXPECT`, and nothing in this frame can change it.
+    // caller declared with `EXPECT`, for this endpoint, and nothing in this
+    // frame can change it.
     if kind == Some(Kind::Invoke) && frame.method == method::HAND {
         return hand(frame);
     }
@@ -1230,16 +1186,6 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 [frame.arg0, frame.arg1, frame.arg2, frame.arg3],
             );
 
-            // Whatever happened, this call is over, so any declaration made
-            // for it is over too. Without this a declaration would outlive its
-            // call and the *next* server this thread spoke to could put
-            // something in a slot the thread had stopped expecting one in --
-            // which is the same fault as letting a server choose the slot,
-            // arrived at by waiting.
-            if let Some(thread) = crate::sched::current_thread_id() {
-                crate::sched::set_receive_slot(thread, None);
-            }
-
             match outcome {
                 Ok(reply) => {
                     // The whole message comes back, not just its first word.
@@ -1380,7 +1326,7 @@ fn hand(frame: &SyscallFrame) -> Outcome {
     let Ok(resolved) = resolve_for_ipc(frame.capability, ObjectKind::Endpoint) else {
         return Outcome::err(Status::WrongObject);
     };
-    let _ = resolved;
+    let endpoint = resolved.object.id as u32;
 
     let Some(server) = crate::sched::current_thread_id() else {
         return Outcome::err(Status::NoDomain);
@@ -1400,7 +1346,9 @@ fn hand(frame: &SyscallFrame) -> Outcome {
 
     // Where it goes, from the caller and from nowhere else. Taken rather than
     // read: a declaration admits one capability.
-    let Some(destination) = crate::sched::take_receive_slot(caller) else {
+    // For *this* endpoint. A caller that invited some other service has not
+    // invited this one, and a declaration is not a standing offer.
+    let Some(destination) = crate::sched::take_receive_slot(caller, endpoint) else {
         return Outcome::err(Status::SlotUnavailable);
     };
     let destination = destination as usize;
@@ -1438,7 +1386,7 @@ fn hand(frame: &SyscallFrame) -> Outcome {
             // The declaration was taken and nothing arrived. Put it back, so a
             // caller is not left unable to receive because a server asked for
             // something it could not have.
-            crate::sched::set_receive_slot(caller, Some(destination as u32));
+            crate::sched::set_receive_slot(caller, Some((destination as u32, endpoint)));
             return Outcome::err(status);
         }
         None => return Outcome::err(Status::NoDomain),
@@ -1461,7 +1409,7 @@ fn hand(frame: &SyscallFrame) -> Outcome {
         Some(Ok(())) => Outcome::ok(destination as u64),
         other => {
             cap::with_arena(|arena| arena.revoke_unchecked(derived));
-            crate::sched::set_receive_slot(caller, Some(destination as u32));
+            crate::sched::set_receive_slot(caller, Some((destination as u32, endpoint)));
             match other {
                 Some(Err(status)) => Outcome::err(status),
                 _ => Outcome::err(Status::NoDomain),

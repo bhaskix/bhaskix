@@ -162,21 +162,6 @@ pub mod method {
     /// a byte that was read.
     pub const NOTHING: u64 = 0x100;
 
-    /// Resolve one name *inside* the directory this capability names.
-    ///
-    /// Only on a `Directory` capability. The name is a [`Chunk`] in `arg0..3`
-    /// — one component, no separators, no `.` or `..`. Replies with the slot
-    /// the new capability landed in, and [`IS_DIRECTORY`] set if it is another
-    /// directory.
-    ///
-    /// This is the whole of the namespace. There is no call that takes a path,
-    /// no root to start one from, and no way to go upwards: a program reaches
-    /// exactly what it was given and whatever is under it. A name that exists
-    /// on the same filesystem but not in this directory is
-    /// [`status::NO_SUCH_NAME`] — the same answer as a name that exists
-    /// nowhere, because a program that could tell those apart could map the
-    /// filesystem it was not given.
-    pub const OPEN_AT: u64 = 45;
     /// How big the object this capability names is.
     ///
     /// Bytes on a `File`. A `DmaWindow` answers the same number with its own
@@ -220,11 +205,6 @@ pub mod method {
     /// copy, `arg2` = its badge. Where it lands comes from the caller's
     /// [`EXPECT`] and not from here.
     pub const HAND: u64 = 47;
-    /// Set in [`OPEN_AT`]'s reply when what was opened is a directory.
-    ///
-    /// Above the slot index rather than beside it, so a caller that ignores it
-    /// gets a slot number and not a slot number plus one.
-    pub const IS_DIRECTORY: u64 = 1 << 32;
 }
 
 /// The bits a capability's rights are made of.
@@ -269,25 +249,6 @@ pub mod status {
     pub const SLOT_UNAVAILABLE: u64 = 11;
     /// The object does not answer that method.
     pub const NO_SUCH_METHOD: u64 = 10;
-    /// Nothing of that name is in the directory that was asked.
-    ///
-    /// Deliberately not distinguished from a name that exists *elsewhere* on
-    /// the same filesystem: telling those apart is how a program holding one
-    /// directory learns the shape of the rest, one question at a time.
-    pub const NO_SUCH_NAME: u64 = 13;
-    /// That is not a name this system resolves.
-    ///
-    /// A separator, `.`, `..`, an embedded zero, or nothing at all. Distinct
-    /// from [`NO_SUCH_NAME`] on purpose, and it is the one distinction here
-    /// that gives nothing away: it is a statement about the *syntax the caller
-    /// used*, which the caller already knows, and not about what is or is not
-    /// on the filesystem.
-    ///
-    /// Distinct for a second reason, which is that a refusal indistinguishable
-    /// from "no such name" would be indistinguishable from *no check at all* —
-    /// `..` is not an entry in any directory this format writes, so a lookup
-    /// that never rejected it would fail to find it and look identical.
-    pub const BAD_NAME: u64 = 14;
 }
 
 /// Methods the console service answers.

@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-12 (RFC 0015 steps 1–6, RFC 0016 steps 1–3) · CI green · 508 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-14 (RFC 0015 steps 1–6, RFC 0016 steps 1–4) · CI green · 489 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 324 host assertions |
 
 ### Division of responsibility between documents
 
@@ -149,7 +149,7 @@ fairness within 2% for two equal-weight workloads.
 
 | M9-12 | RFC 0016 step 3 (second half): the filesystem, in a domain, reading a real disk | ✅ `DONE` | `bin/fsd` mounts the disk through the block service and reads a file the kernel wrote into that same filesystem through **its** copy of the same crate — two copies of one parser, one disk, the same answer. The program contains **no filesystem code**: it links `bhaskix-fs` and supplies a `Store` made of system calls, which is the whole return on RFC 0015 step 6. It holds two capabilities — the block service's endpoint and one memory object it maps — and has no registers, no interrupt, no DMA window and no way to name a disk. It starts by default: the defect that made it opt-in was **a ring 3 thread that was not pinned**, and that is now refused at the door rather than avoided. |
 
-| M9-14 | RFC 0016 step 4: the namespace out of the kernel | 🔨 `IN PROGRESS` | Built and working: a `dir::` protocol in the ABI; `bin/fsd` answering `OPEN_AT` with the namespace rules moved out of `kernel/src/namespace.rs` unchanged — one component, no separators, no `..`, a generation checked, and a name outside the directory held answering exactly as one that exists nowhere; badged endpoint capabilities as directory handles, which the kernel stamps and cannot forge; the disk carrying the same tree the shell's gates describe. Watched working from the shell: `8 directory reachable` and `10 stale dir the directory it named is gone`, both through the service. **Blocked** on the defect below: answering a lookup means calling the block service, and a server that calls while it already owes a reply faults its own caller. The shell still uses the kernel's namespace, so nothing regressed and nothing is claimed that is not true. |
+| M9-14 | RFC 0016 step 4: the namespace out of the kernel | ✅ `DONE` | Built and working: a `dir::` protocol in the ABI; `bin/fsd` answering `OPEN_AT` with the namespace rules moved out of `kernel/src/namespace.rs` unchanged — one component, no separators, no `..`, a generation checked, and a name outside the directory held answering exactly as one that exists nowhere; badged endpoint capabilities as directory handles, which the kernel stamps and cannot forge; the disk carrying the same tree the shell's gates describe. Watched working from the shell: `8 directory reachable` and `10 stale dir the directory it named is gone`, both through the service. `kernel/src/namespace.rs`, `ObjectKind::Directory`, `ObjectKind::File`, `OPEN_AT`, `NoSuchName` and `BadName` are **deleted**. All six RFC 0015 step 4 shell gates pass **unchanged**, through the service. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -747,6 +747,36 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-07 (RFC 0016 step 4 — done, and the defect was not what it looked like)
+
+- **The namespace is out of the kernel.** `kernel/src/namespace.rs`, `ObjectKind::Directory`,
+  `ObjectKind::File`, `method::OPEN_AT`, `Status::NoSuchName` and `Status::BadName` are deleted. A
+  directory a program holds is a **badged endpoint capability to `bin/fsd`**: the badge carries an
+  inode and a generation, the kernel stamps it so it cannot be forged, and the kernel no longer
+  knows what an inode is.
+- **All six RFC 0015 step 4 gates pass unchanged**, which is what they were written for: `inner: a
+  file of 40 bytes`, `greeting: no such name in this directory`, `sub/inner` and `..` refused as
+  names, the directory reachable, and a handle to a directory that is gone resolving to nothing.
+  Same strings, same numbers, different mechanism, and the strings are how we know it is the same
+  claim.
+- **The defect that stopped this was mine, and it was not a nested-call defect.** `EXPECT` recorded
+  *where* a capability could land and not *who was invited*, so it belonged to whichever call
+  happened next — and a program that says where, prints a line, and then asks loses its declaration
+  **to the console**, because printing is a call too. A declaration now names the endpoint it was
+  made for, and nothing else can consume it. The clear-on-any-call-return that caused it is gone; it
+  was there to stop a stale declaration being used by a later server, which addressing does properly.
+- **Two earlier diagnoses are withdrawn.** "A server that calls while owing a reply faults its
+  caller" was wrong: a nested call is fine, and the reproduction that seemed to show otherwise was
+  this same `EXPECT` bug reached by a different route. The address-space theory built on top of it
+  was wrong for the same reason. What was true in that investigation is only the part about
+  identical link and stack addresses making fault reports useless.
+- **A slice-based edit deleted two dispatch branches by accident** — `EXPECT` and `HAND` sat between
+  `OPEN_AT` and the next comment I anchored on — and the machine said `hand refused 10`, which is
+  `NoSuchMethod`, rather than anything about the missing code. Cutting by "from this comment to that
+  one" is not a refactoring tool.
+- **The six directory gates moved into the IOMMU-only group**, because they now need a filesystem
+  service, which needs a block service, which needs a unit to contain the device.
 
 ### 2026-08-06 (the nested-call defect — sharpened, not fixed)
 

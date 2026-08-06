@@ -246,18 +246,21 @@ pub struct Thread {
     /// question it did not ask. The caller is not a secret, so hiding it was
     /// never the point -- not accepting it is.
     pub reply_to: Option<u32>,
-    /// Where a capability handed back by a server may be put.
+    /// Where a capability handed back may be put, and **which service** may.
     ///
     /// Declared by this thread before it calls, and consumed when one arrives.
-    /// A server does **not** choose where its answer lands: a program's CSpace
-    /// is its own to arrange, and a service that could pick a slot could fill
-    /// one a caller was keeping empty on purpose — which the shell does, and
-    /// which one of its own tests depends on.
+    /// A server does not choose where its answer lands: a program's CSpace is
+    /// its own to arrange, and a service that could pick a slot could fill one
+    /// a caller was keeping empty on purpose — which the shell does, and which
+    /// one of its own tests depends on.
     ///
-    /// One-shot, and cleared when the call it was declared for returns. So it
-    /// means "this call may hand me one capability, there", and never "any
-    /// server I ever talk to may put things in me".
-    pub receive_slot: Option<u32>,
+    /// The endpoint is half of it, and the half that was missing. This was one
+    /// slot number, cleared when *any* call returned — so a program that said
+    /// where, printed a line, and then asked, lost its declaration to the
+    /// console: printing is a call too. Naming the endpoint it was made for
+    /// means an unrelated call cannot consume it, and a server still cannot
+    /// receive an invitation addressed to somebody else.
+    pub receive_slot: Option<(u32, u32)>,
 
     /// The domain this thread belongs to, or `u32::MAX` for none.
     ///
@@ -1018,6 +1021,23 @@ fn enter_space(root: u64) {
     }
 }
 
+/// What `thread` is called and which address space it should be running in.
+///
+/// For the fault report. A user-mode fault happens in ring 3, so the faulting
+/// thread holds no kernel lock and taking the runqueue lock here cannot
+/// deadlock — which is why this is only ever asked about a fault from user
+/// mode.
+#[must_use]
+pub fn describe(thread: u32) -> Option<(&'static str, u64)> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        if let Some(found) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return Some((found.name, found.space_root));
+        }
+    }
+    None
+}
+
 /// Whether `thread` may never be moved to another CPU.
 ///
 /// `None` if there is no such thread.
@@ -1082,7 +1102,7 @@ pub fn take_reply_target(thread: u32) -> Option<u32> {
 /// Says where `thread` will accept a capability handed back to it.
 ///
 /// Returns whether the thread was found.
-pub fn set_receive_slot(thread: u32, slot: Option<u32>) -> bool {
+pub fn set_receive_slot(thread: u32, slot: Option<(u32, u32)>) -> bool {
     for queue in QUEUES.iter().take(percpu::online_count() as usize) {
         let mut queue = queue.lock();
         if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
@@ -1093,16 +1113,25 @@ pub fn set_receive_slot(thread: u32, slot: Option<u32>) -> bool {
     false
 }
 
-/// Takes where `thread` will accept a capability, if it said.
+/// Takes where `thread` will accept a capability, if it said so for `endpoint`.
 ///
 /// Taking, not reading: a declaration admits one capability. A server that
 /// could hand two would be handing the second into a slot the caller no longer
 /// expected to be free.
-pub fn take_receive_slot(thread: u32) -> Option<u32> {
+///
+/// The endpoint must match. A declaration is an invitation to one service, and
+/// a different one answering a different call must not be able to accept it.
+pub fn take_receive_slot(thread: u32, endpoint: u32) -> Option<u32> {
     for queue in QUEUES.iter().take(percpu::online_count() as usize) {
         let mut queue = queue.lock();
         if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
-            return target.receive_slot.take();
+            return match target.receive_slot {
+                Some((slot, invited)) if invited == endpoint => {
+                    target.receive_slot = None;
+                    Some(slot)
+                }
+                _ => None,
+            };
         }
     }
     None

@@ -206,29 +206,6 @@ pub enum ObjectKind {
     /// console service is single-threaded and always has been; that limit
     /// moved with it.
     Console,
-    /// One directory of one filesystem: [RFC 0015](../../docs/rfc/0015-filesystem.md).
-    ///
-    /// Holding one is the authority to resolve names *inside* it, and to hold
-    /// what that resolves to. Deliberately not the authority to name a path:
-    /// there is no root in this system to start one from, so a directory
-    /// capability is the only place a lookup can begin and a program reaches
-    /// exactly what it was handed and whatever is under it.
-    ///
-    /// The identity is an inode **and** a generation, packed together. A
-    /// filesystem that reuses an inode bumps the generation, so a capability
-    /// that outlived the directory it named resolves to nothing rather than to
-    /// whatever took the slot — the difference between a stale handle and a
-    /// handle to somebody else's directory, which is the bug every filesystem
-    /// with integer handles has had.
-    Directory,
-    /// One file of one filesystem: [RFC 0015](../../docs/rfc/0015-filesystem.md).
-    ///
-    /// What [`ObjectKind::Directory`]'s lookup produces, with the same
-    /// inode-and-generation identity. It is not reached by naming it; it is
-    /// reached by resolving a name in a directory somebody was given, which is
-    /// the difference between a capability system and a filesystem with
-    /// permissions.
-    File,
 }
 
 /// What a capability names: a kind and an identity within that kind.

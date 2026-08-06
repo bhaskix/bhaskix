@@ -43,7 +43,6 @@ pub mod ipc;
 pub mod irq;
 pub mod memory;
 pub mod mmio;
-pub mod namespace;
 pub mod notify;
 pub mod panic;
 pub mod sched;
@@ -1532,34 +1531,18 @@ fn filesystem_self_test() -> bool {
     // what makes this two filesystems rather than one read twice.
     let separate = vfs::open(b"greeting").is_err();
 
-    // The same bytes, kept for `Directory` capabilities to resolve in. Done
-    // here and not earlier so that nothing hands out a capability into an
-    // image that has not been read successfully once.
-    let mounted_for_capabilities = namespace::mount(image.bytes());
-
-    // What a directory capability would name, at both levels. Printed rather
-    // than merely computed because the shell's own report is about what it
-    // *cannot* reach, and a reader has no way to see that `sub` is a real
-    // directory of this filesystem and the root is a different one -- which is
-    // what makes "it holds one of these and not the other" a statement.
-    let named = namespace::root_identity()
-        .zip(namespace::directory_under_root(b"sub"))
-        .map_or((0, 0), |(root, sub)| (root as u32, sub as u32));
-
-    let ok = matches && separate && names >= 2 && mounted_for_capabilities;
+    let ok = matches && separate && names >= 2;
     if ok {
         let superblock = mounted.superblock();
         println!(
             "    filesystem     bhfs mounted from the archive: {} blocks, {names} entries, \
-             `greeting` is inode {index} and reads {read} bytes that the archive does not have; \
-             the root is inode {} and `sub` is inode {}, and a program is given one of them",
-            superblock.blocks, named.0, named.1
+             `greeting` is inode {index} and reads {read} bytes that the archive does not have",
+            superblock.blocks
         );
     } else {
         println!(
             "    filesystem     FAILED: {read} bytes, contents match {matches}, \
-             separate from the archive {separate}, {names} entries, \
-             mounted for capabilities {mounted_for_capabilities}"
+             separate from the archive {separate}, {names} entries"
         );
     }
     ok
@@ -2860,6 +2843,13 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
     sched::exit()
 }
 
+/// The filesystem service's endpoint, once it is answering.
+static FS_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// The badge that names `sub` to that service.
+static FS_DIRECTORY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The badge that names a directory which is gone.
+static FS_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Where the direct map is, for the thread above.
 static DISK_HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The frame behind the memory that thread shares with the block service.
@@ -3052,7 +3042,7 @@ fn report_block_domain(hhdm: u64) -> bool {
             "    block domain   FAILED: found {found}, drove it to {drove_to}, \
              rings at {rings_at_device:#x}, queue size {queue_size}, sectors {sectors}, \
              read {read_ok}, by interrupt {by_interrupt}, used index {used_index}, \
-             request status {request_status:#x}"
+             request status {request_status:#x}, hand refused {not_answering}"
         );
     }
     ok
@@ -3274,10 +3264,13 @@ fn start_fs_domain(hhdm: u64) -> bool {
         directory,
         stale,
     ] = words;
-    // What the service says names `sub`, and what names a directory that is
-    // gone. The kernel is the only thing that can mint a capability, so the
-    // service supplies the badges and the kernel would stamp them -- which is
-    // RFC 0016 step 4, and is not finished.
+    // What the service says names `sub`. The kernel is the only thing that can
+    // mint a capability, so the service supplies the badge and the kernel
+    // stamps it. RFC 0016 step 4 is not finished; this is enough of it to
+    // reproduce the defect that stopped it.
+    FS_ENDPOINT.store(u64::from(serving.as_u32()), Ordering::Release);
+    FS_DIRECTORY.store(directory, Ordering::Release);
+    FS_STALE.store(stale, Ordering::Release);
     let _ = (directory, stale);
     let ok = matched == 1 && read == EXPECTED.len() as u64 && blocks > 0 && entries > 0;
     if ok {
@@ -3663,60 +3656,6 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
     }
 
-    // One directory, at slot 8: `sub`, and deliberately **not** the root.
-    //
-    // The whole of RFC 0015 step 4 is visible in that choice. The shell can
-    // open `inner`, because `inner` is in the directory it holds. It cannot
-    // open `greeting`, which is on the same filesystem, in the directory
-    // above, and reachable by nothing this program holds -- and it fails with
-    // the same answer it would get for a name that exists nowhere. There is no
-    // `..` to climb and no path to name, so the refusal is not a check that
-    // could be forgotten: there is no expressible request to check.
-    //
-    // Read-only rights, so that when there is something to write the
-    // difference is already carried by the capability rather than added to it.
-    if let Some(identity) = namespace::directory_under_root(b"sub") {
-        let directory = cap::with_arena(|arena| {
-            arena
-                .insert_root(
-                    cap::ObjectRef::new(cap::ObjectKind::Directory, identity),
-                    cap::Rights::READ,
-                    0,
-                )
-                .ok()
-        })
-        .ok_or("the directory capability would not be created")?;
-        if domain::with(realm, |owner| owner.cspace.install_at(8, directory).is_ok()) != Some(true)
-        {
-            return Err("the directory capability would not install");
-        }
-    }
-
-    // And at slot 10, the same directory one generation on: a capability that
-    // outlived the thing it named.
-    //
-    // Manufactured, because nothing writes to this image and so nothing can go
-    // stale on its own. The alternative is to leave the check untested until
-    // the step that introduces reuse, which is the step least able to afford
-    // finding out it does not work -- a stale capability that resolved would
-    // hand a program a directory that now belongs to somebody else, and it
-    // would do it silently.
-    if let Some(identity) = namespace::stale_directory_under_root(b"sub") {
-        let stale = cap::with_arena(|arena| {
-            arena
-                .insert_root(
-                    cap::ObjectRef::new(cap::ObjectKind::Directory, identity),
-                    cap::Rights::READ,
-                    0,
-                )
-                .ok()
-        })
-        .ok_or("the stale directory capability would not be created")?;
-        if domain::with(realm, |owner| owner.cspace.install_at(10, stale).is_ok()) != Some(true) {
-            return Err("the stale directory capability would not install");
-        }
-    }
-
     // A notification, at slot 6, and the same one write-only at slot 7.
     //
     // Signalled here, before the shell exists, so that waiting on it answers
@@ -3814,6 +3753,54 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
         if !start_fs_domain(hhdm) {
             println!("    fs domain      FAILED");
+        }
+    }
+
+    // The directories this program holds, at slots 8 and 10, and they are now
+    // **badged endpoint capabilities to the filesystem service**. The badge
+    // names the directory; the kernel stamps it on arrival so it cannot be
+    // forged; and the kernel does not know what it means. There is no
+    // `Directory` object kind any more and nothing here knows what an inode is
+    // -- the service said which badges name `sub` and a directory that is
+    // gone, and this mints capabilities carrying them.
+    //
+    // Slot 8 is `sub` and deliberately not the root: the shell can open
+    // `inner`, and `greeting` -- same filesystem, one level up -- comes back
+    // as "no such name", with no check to forget, because it holds nothing
+    // that names the directory `greeting` is in.
+    {
+        let raw = FS_ENDPOINT.load(core::sync::atomic::Ordering::Acquire);
+        let handles = [
+            (
+                8usize,
+                FS_DIRECTORY.load(core::sync::atomic::Ordering::Acquire),
+            ),
+            (
+                10usize,
+                FS_STALE.load(core::sync::atomic::Ordering::Acquire),
+            ),
+        ];
+        if raw != u64::MAX {
+            for (slot, badge) in handles {
+                let handle = cap::with_arena(|arena| {
+                    let root = arena
+                        .insert_root(
+                            cap::ObjectRef::new(cap::ObjectKind::Endpoint, raw),
+                            cap::Rights::ALL,
+                            0,
+                        )
+                        .ok()?;
+                    arena
+                        .derive(root, cap::Rights::READ.union(cap::Rights::DERIVE), badge)
+                        .ok()
+                })
+                .ok_or("a directory capability would not be created")?;
+                if domain::with(realm, |owner| owner.cspace.install_at(slot, handle).is_ok())
+                    != Some(true)
+                {
+                    return Err("a directory capability would not install");
+                }
+            }
         }
     }
 
