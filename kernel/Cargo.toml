@@ -18,6 +18,7 @@ bhaskix-boot = { path = "../boot/handoff" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-mm = { path = "../mm" }
 bhaskix-device = { path = "../device" }
+bhaskix-fs = { path = "../fs" }
 # RFC 0013: the framework, and the services placed in the nucleus. The arrow
 # points this way and only this way -- a service crate never depends back.
 bhaskix-service = { path = "../service" }

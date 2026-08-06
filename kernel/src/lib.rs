@@ -443,6 +443,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !ecam_bringup(handoff) {
         println!("    ecam           FAILED");
     }
+    if !filesystem_self_test() {
+        println!("    filesystem     FAILED");
+    }
     if input_ready && !irq_teardown_self_test(handoff) {
         println!("    irq teardown   FAILED");
     }
@@ -1438,6 +1441,68 @@ const CONSOLED_PROGRAM: &[u8] = b"bin/consoled";
 /// that a capability names an object rather than naming nothing, which is the
 /// difference between a capability system and a permission bit.
 const CONSOLE_OBJECT: u64 = 0;
+
+/// Mounts an image in the new on-disk format, read-only, beside the archive.
+///
+/// RFC 0015 step 3, and "beside the archive" is literal: the image is a member
+/// of it. The machine reads a file out of each, which is the smallest thing
+/// that proves the format works *in a machine* rather than in a host test —
+/// and it is read-only in that order deliberately, so that a bug in a writer
+/// cannot be mistaken for a bug in the reader.
+fn filesystem_self_test() -> bool {
+    /// What `mkfs` put in the image, and nothing else on this machine has.
+    const EXPECTED: &[u8] = b"a file in a filesystem this kernel defined\n";
+
+    let Ok(image) = vfs::open(b"fs.img") else {
+        println!("    filesystem     no fs.img in the archive; nothing to mount");
+        return true;
+    };
+
+    let mounted = match bhaskix_fs::Filesystem::mount(image.bytes()) {
+        Ok(mounted) => mounted,
+        Err(error) => {
+            println!("    filesystem     FAILED to mount: {error:?}");
+            return false;
+        }
+    };
+
+    let Ok(root) = mounted.root() else {
+        println!("    filesystem     FAILED: the root is not a directory");
+        return false;
+    };
+
+    let mut names = 0;
+    mounted.list(&root, |_| names += 1);
+
+    let Ok((index, inode)) = mounted.lookup(&root, b"greeting") else {
+        println!("    filesystem     FAILED: no `greeting` in the root");
+        return false;
+    };
+
+    let mut contents = [0u8; 64];
+    let read = mounted.read(&inode, 0, &mut contents);
+    let matches = contents.get(..read) == Some(EXPECTED);
+
+    // And the same bytes are *not* reachable through the archive, which is
+    // what makes this two filesystems rather than one read twice.
+    let separate = vfs::open(b"greeting").is_err();
+
+    let ok = matches && separate && names >= 2;
+    if ok {
+        let superblock = mounted.superblock();
+        println!(
+            "    filesystem     bhfs mounted from the archive: {} blocks, {names} entries, \
+             `greeting` is inode {index} and reads {read} bytes that the archive does not have",
+            superblock.blocks
+        );
+    } else {
+        println!(
+            "    filesystem     FAILED: {read} bytes, contents match {matches}, \
+             separate from the archive {separate}, {names} entries"
+        );
+    }
+    ok
+}
 
 /// Where configuration space is, physically, once `MCFG` has been read.
 static ECAM_REGION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

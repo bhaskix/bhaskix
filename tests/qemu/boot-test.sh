@@ -649,6 +649,26 @@ else
     status=1
 fi
 
+# A filesystem this kernel defined, mounted in a machine.
+#
+# RFC 0015 step 3, and "beside the archive" is literal: the image is a member
+# of it. Read-only, and in that order deliberately -- the format is proved by
+# reading an image built elsewhere before anything is allowed to write one, so
+# a bug in a writer cannot be mistaken for a bug in the reader.
+#
+# The bytes it reads are in no other file on the machine, and the same name is
+# asserted *absent* from the archive: that is what makes this two filesystems
+# rather than one read twice.
+if grep -qE "filesystem +bhfs mounted from the archive: [0-9]+ blocks, [0-9]+ entries, .greeting. is inode [0-9]+ and reads [1-9][0-9]* bytes that the archive does not have" "$LOG"; then
+    pass "an image in this kernel's own format mounts and reads, beside the archive"
+elif grep -qE "filesystem +no fs.img" "$LOG"; then
+    pass "no image in the archive, so nothing to mount"
+else
+    fail "the filesystem in this kernel's own format did not mount and read"
+    grep -E "filesystem " "$LOG" || true
+    status=1
+fi
+
 # The block driver is a service now, and something asked it for a sector.
 #
 # RFC 0015 step 1. The oracle is the image: the Makefile writes

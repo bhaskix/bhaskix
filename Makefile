@@ -27,6 +27,11 @@ INITRD       := build/initrd.tar
 # driver reading the *kernel's* disk would not show that it had read anything
 # the kernel did not hand it.
 DOMAIN_DISK  := build/domain-disk.img
+# An image in the new on-disk format, carried *inside* the archive -- which is
+# what makes RFC 0015 step 3's "beside the archive" literal. The machine mounts
+# both and reads a file from each.
+FS_IMAGE     := build/fs.img
+MKFS         := target/$(HOST_TARGET)/release/mkfs
 INITRD_DIR   := initrd
 INITRD_ROOT  := build/initrd_root
 LIMINE_DIR   := boot/limine/limine
@@ -128,6 +133,17 @@ iso: $(ISO)
 # returned zeroes, or the other disk's bytes, is visible rather than plausible.
 # Eight rather than one because a device with a single sector has no sector a
 # test can be wrong about.
+$(MKFS): $(wildcard fs/src/*.rs) $(wildcard fs/src/bin/*.rs) fs/Cargo.toml
+	$(CARGO) build --release --target $(HOST_TARGET) -p bhaskix-fs --features tool
+	@echo "built $@"
+
+# The image, with one file whose contents nothing else on the machine has. A
+# format that reads back its own zeroes would look identical to one that works.
+$(FS_IMAGE): $(MKFS) $(INITRD_DIR)/etc/hostname
+	@mkdir -p $(dir $@)
+	@printf 'a file in a filesystem this kernel defined\n' > build/fs-greeting.txt
+	@./$(MKFS) $@ 32 greeting=build/fs-greeting.txt hostname=$(INITRD_DIR)/etc/hostname
+
 $(DOMAIN_DISK):
 	@mkdir -p $(dir $@)
 	@printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > $@
@@ -149,7 +165,7 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(FS_IMAGE)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
@@ -158,6 +174,7 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USE
 	cp $(USER_VFSD) $(INITRD_ROOT)/bin/vfsd
 	cp $(USER_CONSOLED) $(INITRD_ROOT)/bin/consoled
 	cp $(USER_BLKD) $(INITRD_ROOT)/bin/blkd
+	cp $(FS_IMAGE) $(INITRD_ROOT)/fs.img
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
 	@echo "built $@ ($$(stat -c%s $@) bytes)"

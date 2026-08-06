@@ -39,6 +39,7 @@ dependencies = [
  "bhaskix-arch-x86-64",
  "bhaskix-boot",
  "bhaskix-device",
+ "bhaskix-fs",
  "bhaskix-mm",
  "bhaskix-service",
  "bhaskix-service-console",

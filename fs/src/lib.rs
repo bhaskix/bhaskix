@@ -608,6 +608,159 @@ pub fn format(bytes: &mut [u8], inodes: u64) -> Result<Superblock, FsError> {
     Ok(superblock)
 }
 
+/// A mounted filesystem, read-only.
+///
+/// RFC 0015 step 3. Read-only on purpose and in that order: the format is
+/// proved by reading an image somebody else built before anything is allowed
+/// to write one, so a bug in the writer cannot be mistaken for a bug in the
+/// reader.
+pub struct Filesystem<'a> {
+    bytes: &'a [u8],
+    superblock: Superblock,
+}
+
+impl<'a> Filesystem<'a> {
+    /// Reads the superblock and takes the image.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Superblock::read`] refused it for.
+    pub fn mount(bytes: &'a [u8]) -> Result<Self, FsError> {
+        let superblock = Superblock::read(bytes)?;
+        Ok(Self { bytes, superblock })
+    }
+
+    /// What the superblock says.
+    #[must_use]
+    pub const fn superblock(&self) -> &Superblock {
+        &self.superblock
+    }
+
+    /// One inode.
+    ///
+    /// # Errors
+    ///
+    /// As [`Inode::read`].
+    pub fn inode(&self, index: u32) -> Result<Inode, FsError> {
+        Inode::read(self.bytes, &self.superblock, index)
+    }
+
+    /// The block `which` of an inode's contents, if it has one.
+    ///
+    /// Follows the indirect block when the direct ones run out. Every number
+    /// read out of an indirect block is checked against the image before it is
+    /// used, because it came off a disk.
+    fn block_of(&self, inode: &Inode, which: usize) -> Option<&'a [u8]> {
+        let number = if which < inode.direct.len() {
+            inode.direct[which]
+        } else {
+            let indirect = inode.indirect;
+            if indirect == 0 {
+                return None;
+            }
+            let at = (indirect as usize).checked_mul(BLOCK)?;
+            let table = self.bytes.get(at..at.checked_add(BLOCK)?)?;
+            u32_at(
+                table,
+                which.checked_sub(inode.direct.len())?.checked_mul(4)?,
+            )?
+        };
+
+        if number == 0 || u64::from(number) >= self.superblock.blocks {
+            return None;
+        }
+        let at = (number as usize).checked_mul(BLOCK)?;
+        self.bytes.get(at..at.checked_add(BLOCK)?)
+    }
+
+    /// Copies `into` from `offset`, and says how many bytes there were.
+    ///
+    /// Never reads past the size the inode declares, whatever its block
+    /// pointers say — a file whose blocks outlast its length would otherwise
+    /// hand back whatever those blocks held before.
+    #[must_use]
+    pub fn read(&self, inode: &Inode, offset: u64, into: &mut [u8]) -> usize {
+        if inode.kind != Kind::File || offset >= inode.size {
+            return 0;
+        }
+        let left = (inode.size - offset) as usize;
+        let want = into.len().min(left);
+
+        let mut done = 0;
+        while done < want {
+            let at = offset as usize + done;
+            let Some(block) = self.block_of(inode, at / BLOCK) else {
+                break;
+            };
+            let within = at % BLOCK;
+            let take = (BLOCK - within).min(want - done);
+            let Some(source) = block.get(within..within + take) else {
+                break;
+            };
+            into[done..done + take].copy_from_slice(source);
+            done += take;
+        }
+        done
+    }
+
+    /// Calls `f` for every entry of a directory.
+    ///
+    /// Stops at the size the inode declares rather than at the end of the
+    /// block, so a directory that grew and shrank does not list what it used
+    /// to hold.
+    pub fn list(&self, inode: &Inode, mut f: impl FnMut(&Entry)) {
+        if inode.kind != Kind::Directory {
+            return;
+        }
+        let entries = (inode.size as usize) / ENTRY;
+        for which in 0..entries {
+            let Some(block) = self.block_of(inode, which * ENTRY / BLOCK) else {
+                break;
+            };
+            let within = (which * ENTRY) % BLOCK;
+            let Ok(entry) = Entry::read(block, within) else {
+                break;
+            };
+            if entry.inode != 0 || entry.length != 0 {
+                f(&entry);
+            }
+        }
+    }
+
+    /// Finds a name in a directory.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::WrongKind`] if the inode is not a directory, and
+    /// [`FsError::NotFound`] if it holds no such name.
+    pub fn lookup(&self, directory: &Inode, name: &[u8]) -> Result<(u32, Inode), FsError> {
+        if directory.kind != Kind::Directory {
+            return Err(FsError::WrongKind);
+        }
+        let mut found = None;
+        self.list(directory, |entry| {
+            if found.is_none() && entry.name() == name {
+                found = Some(entry.inode);
+            }
+        });
+        let index = found.ok_or(FsError::NotFound)?;
+        Ok((index, self.inode(index)?))
+    }
+
+    /// The root directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Inode::read`], and [`FsError::WrongKind`] if the root is not one.
+    pub fn root(&self) -> Result<Inode, FsError> {
+        let root = self.inode(self.superblock.root)?;
+        if root.kind != Kind::Directory {
+            return Err(FsError::WrongKind);
+        }
+        Ok(root)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;
@@ -615,7 +768,9 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{BLOCK, Bitmap, ENTRY, Entry, FsError, Inode, Kind, Superblock, format};
+    use super::{
+        BLOCK, Bitmap, ENTRY, Entry, Filesystem, FsError, Inode, Kind, Superblock, format,
+    };
 
     fn image(blocks: usize) -> Vec<u8> {
         vec![0u8; blocks * BLOCK]
@@ -861,6 +1016,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Builds an image with one file, the way `mkfs` does.
+    fn with_a_file(name: &[u8], contents: &[u8]) -> Vec<u8> {
+        let mut bytes = image(64);
+        let superblock = format(&mut bytes, 128).unwrap();
+
+        let mut direct = [0u32; 10];
+        {
+            let mut bitmap = Bitmap::of(&mut bytes, &superblock).unwrap();
+            for slot in direct
+                .iter_mut()
+                .take(contents.len().div_ceil(BLOCK).max(1))
+            {
+                *slot = bitmap.allocate().unwrap() as u32;
+            }
+        }
+        let mut left = contents;
+        for slot in direct.iter().take_while(|slot| **slot != 0) {
+            let at = *slot as usize * BLOCK;
+            let take = left.len().min(BLOCK);
+            bytes[at..at + take].copy_from_slice(&left[..take]);
+            left = &left[take..];
+        }
+        Inode {
+            kind: Kind::File,
+            links: 1,
+            generation: 1,
+            size: contents.len() as u64,
+            direct,
+            indirect: 0,
+        }
+        .write(&mut bytes, &superblock, 1)
+        .unwrap();
+
+        let block = {
+            let mut bitmap = Bitmap::of(&mut bytes, &superblock).unwrap();
+            bitmap.allocate().unwrap()
+        };
+        let at = block as usize * BLOCK;
+        Entry::new(1, name)
+            .unwrap()
+            .write(&mut bytes[at..at + BLOCK], 0)
+            .unwrap();
+        let mut root_direct = [0u32; 10];
+        root_direct[0] = block as u32;
+        Inode {
+            kind: Kind::Directory,
+            links: 1,
+            generation: 1,
+            size: ENTRY as u64,
+            direct: root_direct,
+            indirect: 0,
+        }
+        .write(&mut bytes, &superblock, superblock.root)
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_file_reads_back_what_was_written_into_it() {
+        let contents: Vec<u8> = (0..9000u32).map(|byte| byte as u8).collect();
+        let bytes = with_a_file(b"greeting", &contents);
+        let fs = Filesystem::mount(&bytes).expect("a filesystem");
+
+        let root = fs.root().expect("a root");
+        let (index, inode) = fs.lookup(&root, b"greeting").expect("the file is there");
+        assert_eq!(index, 1);
+        assert_eq!(inode.size, contents.len() as u64);
+
+        // In one go, and then in pieces from an offset, because a reader that
+        // only ever starts at zero cannot tell a block index from a byte one.
+        let mut read = vec![0u8; contents.len()];
+        assert_eq!(fs.read(&inode, 0, &mut read), contents.len());
+        assert_eq!(read, contents);
+
+        let mut middle = [0u8; 100];
+        assert_eq!(fs.read(&inode, 4090, &mut middle), 100);
+        assert_eq!(
+            &middle[..],
+            &contents[4090..4190],
+            "across a block boundary"
+        );
+    }
+
+    #[test]
+    fn a_read_stops_at_the_size_the_inode_declares() {
+        // The block holds 4096 bytes and the file is 10. A reader that trusted
+        // the block would hand back whatever it held before, which for a
+        // filesystem that reuses blocks is somebody else's data.
+        let bytes = with_a_file(b"short", b"0123456789");
+        let fs = Filesystem::mount(&bytes).unwrap();
+        let root = fs.root().unwrap();
+        let (_, inode) = fs.lookup(&root, b"short").unwrap();
+
+        let mut read = [0xffu8; 64];
+        assert_eq!(fs.read(&inode, 0, &mut read), 10);
+        assert_eq!(&read[..10], b"0123456789");
+        assert_eq!(read[10], 0xff, "and nothing past it was touched");
+
+        assert_eq!(fs.read(&inode, 10, &mut read), 0, "nor from the end");
+        assert_eq!(fs.read(&inode, 1 << 40, &mut read), 0, "nor from beyond it");
+    }
+
+    #[test]
+    fn a_name_that_is_not_there_is_not_found() {
+        let bytes = with_a_file(b"greeting", b"hello");
+        let fs = Filesystem::mount(&bytes).unwrap();
+        let root = fs.root().unwrap();
+
+        assert_eq!(fs.lookup(&root, b"absent").unwrap_err(), FsError::NotFound);
+
+        // And a file is not a directory to look in, which is the check that
+        // stops a path walking *through* a file.
+        let (_, file) = fs.lookup(&root, b"greeting").unwrap();
+        assert_eq!(
+            fs.lookup(&file, b"anything").unwrap_err(),
+            FsError::WrongKind
+        );
+    }
+
+    #[test]
+    fn a_block_pointer_off_the_end_of_the_image_reads_nothing() {
+        // Every block number came off a disk. One that names a block outside
+        // the image must read as absent rather than as whatever is at that
+        // offset in whatever the image is embedded in.
+        let mut bytes = with_a_file(b"greeting", b"hello");
+        let superblock = Superblock::read(&bytes).unwrap();
+        let mut inode = Inode::read(&bytes, &superblock, 1).unwrap();
+        inode.direct[0] = 0xffff_fff0;
+        inode.write(&mut bytes, &superblock, 1).unwrap();
+
+        let fs = Filesystem::mount(&bytes).unwrap();
+        let inode = fs.inode(1).unwrap();
+        let mut read = [0u8; 16];
+        assert_eq!(fs.read(&inode, 0, &mut read), 0);
     }
 
     #[test]

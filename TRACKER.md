@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-04 (RFC 0015 steps 1–2) · CI green · 417 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 303 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-05 (RFC 0015 steps 1–3) · CI green · 424 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 307 host assertions |
 
 ### Division of responsibility between documents
 
@@ -130,6 +130,8 @@ fairness within 2% for two equal-weight workloads.
 
 | M9-03 | RFC 0015 step 2: the on-disk format, on the host | ✅ `DONE` | A superblock, a free-block bitmap, inodes with direct blocks and a generation, and directories as fixed entries — **1,003 lines including the image tool, with no kernel involvement at all**. Nine host tests, one of which flips every bit of every metadata byte and asserts nothing panics. The `mkfs` tool builds an image the format reads back: two files, contents intact. `unsafe` budget zero, which is the standard `ustar` is held to and for the same reason: a disk is bytes somebody else wrote. |
 | M9-04 | Three negative tests that did not bite, and why | ✅ `DONE` | Every one of the first three deliberate breakages **passed**. Not because the properties were false but because each was guarded twice: the entry length is clamped in `read` *and* in `name()`; the allocator's floor is backed by the bitmap `format` marks; and one range clause was covered by whichever of the four ran first. Each test now targets the guard it names — the stored field rather than the accessor, a bitmap cleared through `set` so only the floor stands, and one case per clause. All three now fail for their own reason and only their own. This is the fourth time this milestone that redundancy hid an untested check. |
+
+| M9-05 | RFC 0015 step 3: the format mounts in a machine, beside the archive | ✅ `DONE` | The image is a **member of the archive**, which makes "beside" literal: the machine mounts both and reads a file from each. The bytes it reads are in no other file on the machine, and the same name is asserted **absent** from the archive — that is what makes it two filesystems rather than one read twice. Read-only, and in that order deliberately: the format is proved by reading an image built elsewhere before anything may write one, so a bug in a writer cannot be mistaken for a bug in the reader. Four more host tests, including a block pointer off the end of the image, which must read as absent rather than as whatever is at that offset. Watched failing by letting a read run past the size the inode declares — which fails the host test **and** the boot gate. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -585,7 +587,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — steps 1–2 done: a block service, and a format that reads back | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
+| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — steps 1–3 done: a block service, a format, and a machine that mounts it | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -727,6 +729,25 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0015 step 3 — a filesystem this kernel defined, in a machine)
+
+- **The machine mounts a filesystem of its own format**, and the image is a member of the archive —
+  so "beside the archive" is literal rather than a figure of speech. It reads `greeting` out of it,
+  43 bytes that exist in no other file on the machine.
+- **The same name is asserted absent from the archive.** Without that the test would pass for a
+  mount that had quietly resolved through the old backend, and two filesystems would be
+  indistinguishable from one read twice. It is the cheapest half of the check and the half that
+  makes the other half mean anything.
+- **Read-only, in that order, on purpose.** The format is proved by reading an image built somewhere
+  else before anything is allowed to write one. A reader and a writer developed together agree with
+  each other by construction, and a bug in the writer then looks exactly like a working system.
+- **A block pointer off the end of the image reads as absent**, not as whatever is at that offset in
+  whatever the image is embedded in — every block number came off a disk, and this one is inside a
+  file inside an archive, so the bytes past it are real and belong to somebody else.
+- **The negative test fails in two places**, which is what a step that spans the host and the machine
+  should do: letting a read run past the size the inode declares fails the host test *and* the boot
+  gate.
 
 ### 2026-08-06 (RFC 0015 step 2 — a format, and three negative tests that proved nothing)
 
