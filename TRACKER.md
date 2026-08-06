@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) is complete; the driver framework (M8) is under way |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01 (RFC 0014 step 1) · CI green · 395 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 282 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01, M8-02 (RFC 0014 steps 1–2) · CI green · 395 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 282 host assertions |
 
 ### Division of responsibility between documents
 
@@ -130,6 +130,8 @@ documented.
 | ID | Task | Status | Notes |
 |---|---|---|---|
 | M8-01 | RFC 0014 step 1: `Mmio<T>` and `register_block!` | ✅ `DONE` | **`Bus` has no 64-bit access.** Not one used carefully — it does not have one, so a 64-bit register is two 32-bit accesses because there is nothing else it could be. That is bug 1 made *unrepresentable* rather than fixed. Constructing an `Mmio` is unsafe and using one is not, so a driver spends one `unsafe` per block instead of one per access: `blkd` has forty-two. `register_block!` declares offsets once and checks the layout **at compile time** — two negative fixtures, excluded from the workspace because they must not build, and `make gates` asserts they fail *and say why*. Watched failing: removing the overlap check makes the overlapping block compile and the gate says so. Four host tests, one of which is the test that would have caught the bug this RFC exists for. |
+
+| M8-02 | RFC 0014 step 2: the kernel's driver moves onto them | ✅ `DONE` | Twenty-seven register accesses across two structures, declared once as `CommonCfg` and `BlockCfg` instead of a module of constants plus six hand-rolled accessors. **The success criterion was that nothing changes** and the boot line is identical: 180 sectors, 2 requests, status 0x0f, 1 wait and 0 spins. **The kernel's `unsafe` count fell 1154 → 1112** — forty-two blocks making the same promise over and over became two, made where the blocks are constructed. The budget was lowered to match, which is the direction it is supposed to move and the first time it has. Four accessors were left dead by the change and deleted; `read8` and `write16` survive, because the request status byte and the queue notification are memory and a doorbell rather than registers in a block. |
 
 ### M7 — Service framework ([RFC 0013](docs/rfc/0013-service-framework.md))
 
@@ -560,7 +562,7 @@ what is actually ahead.
 | Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
-| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — step 1 done | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
+| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — steps 1–2 done | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ⬜ `TODO` | The filesystem service reads a read-only archive it is handed at entry |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
@@ -703,6 +705,24 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0014 step 2 — the first time the unsafe budget went down)
+
+- **Nothing changed, which was the criterion.** The boot line is identical: 180 sectors, 2 requests,
+  status 0x0f, one wait and zero spins. A refactor of a working driver has no other honest test.
+- **The kernel's `unsafe` count fell by forty-two lines**, and the budget was lowered to match. That
+  is the first time this number has moved downwards. Forty-two blocks were making the same promise —
+  *this address is a register* — over and over, at every access; there are two now, where the blocks
+  are constructed, and the accesses are ordinary code. The promise did not weaken; it stopped being
+  repeated in places where nobody could check it.
+- **The compiler found the leftovers.** Three `unsafe` blocks became *unnecessary* and said so, and
+  four hand-rolled accessors became dead. `read8` and `write16` survive, and it is worth knowing
+  why: the request status byte is memory the device writes, and the queue notification is a
+  doorbell — neither is a register in a block, and pretending otherwise would have been the refactor
+  reaching past its own argument.
+- **Twenty-seven accesses now go through offsets declared once**, with the layout checked at compile
+  time. Those offsets previously existed in three places — this driver, `bin/blkd`, and RFC 0014's
+  own example — with nothing checking they agreed.
 
 ### 2026-08-06 (RFC 0014 step 1 — a bug made unrepresentable)
 

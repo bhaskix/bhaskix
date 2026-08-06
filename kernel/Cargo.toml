@@ -17,6 +17,7 @@ bhaskix-abi = { path = "../abi" }
 bhaskix-boot = { path = "../boot/handoff" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-mm = { path = "../mm" }
+bhaskix-device = { path = "../device" }
 # RFC 0013: the framework, and the services placed in the nucleus. The arrow
 # points this way and only this way -- a service crate never depends back.
 bhaskix-service = { path = "../service" }
@@ -134,20 +135,10 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1170
-# And again for claiming the delegated device's MSI-X entry: programming a
-# vector stays in the kernel, because an MSI is a memory write of an arbitrary
-# vector to an arbitrary CPU and a domain that could write its own entry would
-# hold an interrupt-injection primitive.
-# Raised again for the block domain's data path: enabling bus mastering on a
-# device the kernel does not drive, and reading the report the driver leaves
-# in memory the kernel granted it.
-# Raised from 1090 for RFC 0013 step 6: mapping a device window into a user
-# address space, and reading back through the direct map what a driver in a
-# domain wrote into memory the kernel granted it. The device pages themselves
-# are never touched by the kernel -- it hands them over and does not look.
-# Raised from 1070 for RFC 0013 step 4: reading and loading `CR3` so that each
-# user thread resumes in its own address space, and the fault handler asking
-# the hardware which space it is in rather than trusting bookkeeping. Two
-# blocks. The kernel kept one installed address space until now, which with a
-# single user program is indistinguishable from keeping the right one.
+unsafe_budget = 1125
+# Lowered from 1170 by RFC 0014 step 2, which is the direction this number is
+# supposed to move and the first time it has. The virtio driver's register
+# accesses were forty-two `unsafe` blocks making the same promise over and
+# over; they are now two, made where the register blocks are constructed, and
+# safe code afterwards. A budget left at its high-water mark after the surface
+# shrinks is permission for growth nobody argued for.

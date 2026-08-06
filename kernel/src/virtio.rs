@@ -161,7 +161,10 @@ struct Device {
     /// device's own view of its state can be read back rather than assumed:
     /// a driver that believes it configured a device is a driver that cannot
     /// tell "not started" from "started and then reset".
-    common: u64,
+    ///
+    /// A register block rather than an address: constructing it was the one
+    /// promise that these are registers, and every access after it is safe.
+    common: CommonCfg,
     /// Where this queue is notified.
     notify: u64,
 
@@ -229,25 +232,6 @@ static TRANSLATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// entirely different facts.
 static UNSIGNALLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Reads a `u32` from a mapped register.
-///
-/// # Safety
-///
-/// `address` must be inside a mapped device window.
-unsafe fn read32(address: u64) -> u32 {
-    // SAFETY: the caller guarantees a mapped register; volatile because the
-    // value is the device's and may change without this code writing it.
-    unsafe { core::ptr::read_volatile(address as *const u32) }
-}
-
-/// # Safety
-///
-/// As [`read32`].
-unsafe fn write32(address: u64, value: u32) {
-    // SAFETY: the caller's obligation.
-    unsafe { core::ptr::write_volatile(address as *mut u32, value) }
-}
-
 /// # Safety
 ///
 /// As [`read32`].
@@ -259,56 +243,54 @@ unsafe fn write16(address: u64, value: u16) {
 /// # Safety
 ///
 /// As [`read32`].
-unsafe fn read16(address: u64) -> u16 {
-    // SAFETY: the caller's obligation.
-    unsafe { core::ptr::read_volatile(address as *const u16) }
-}
-
-/// # Safety
-///
-/// As [`read32`].
-unsafe fn write64(address: u64, value: u64) {
-    // SAFETY: the caller's obligation. Written as two 32-bit stores because
-    // the specification defines these registers that way, and a device model
-    // is entitled to notice the difference.
-    unsafe {
-        write32(address, value as u32);
-        write32(address + 4, (value >> 32) as u32);
-    }
-}
-
-/// # Safety
-///
-/// As [`read32`].
-unsafe fn write8(address: u64, value: u8) {
-    // SAFETY: the caller's obligation.
-    unsafe { core::ptr::write_volatile(address as *mut u8, value) }
-}
-
-/// # Safety
-///
-/// As [`read32`].
 unsafe fn read8(address: u64) -> u8 {
     // SAFETY: the caller's obligation.
     unsafe { core::ptr::read_volatile(address as *const u8) }
 }
 
-/// Offsets within the common configuration structure.
-mod common {
-    pub const DEVICE_FEATURE_SELECT: u64 = 0x00;
-    pub const DEVICE_FEATURE: u64 = 0x04;
-    pub const DRIVER_FEATURE_SELECT: u64 = 0x08;
-    pub const DRIVER_FEATURE: u64 = 0x0c;
-    pub const CONFIG_MSIX_VECTOR: u64 = 0x10;
-    pub const DEVICE_STATUS: u64 = 0x14;
-    pub const QUEUE_SELECT: u64 = 0x16;
-    pub const QUEUE_SIZE: u64 = 0x18;
-    pub const QUEUE_MSIX_VECTOR: u64 = 0x1a;
-    pub const QUEUE_ENABLE: u64 = 0x1c;
-    pub const QUEUE_NOTIFY_OFF: u64 = 0x1e;
-    pub const QUEUE_DESC: u64 = 0x20;
-    pub const QUEUE_DRIVER: u64 = 0x28;
-    pub const QUEUE_DEVICE: u64 = 0x30;
+bhaskix_device::register_block! {
+    /// The virtio 1.0 common configuration structure.
+    ///
+    /// Offsets declared once, widths declared with them, and the layout
+    /// checked at compile time — RFC 0014 step 2. They were a module of
+    /// constants and a set of hand-rolled accessors, which is the arrangement
+    /// that let `queue_desc` be written as one eight-byte store in the driver
+    /// next door.
+    struct CommonCfg(0x38) {
+        0x00 => device_feature_select: u32,
+        0x04 => device_feature: u32,
+        0x08 => driver_feature_select: u32,
+        0x0c => driver_feature: u32,
+        0x10 => config_msix_vector: u16,
+        0x12 => num_queues: u16,
+        0x14 => device_status: u8,
+        0x15 => config_generation: u8,
+        0x16 => queue_select: u16,
+        0x18 => queue_size: u16,
+        0x1a => queue_msix_vector: u16,
+        0x1c => queue_enable: u16,
+        0x1e => queue_notify_off: u16,
+        0x20 => queue_desc: u64,
+        0x28 => queue_driver: u64,
+        0x30 => queue_device: u64,
+    }
+}
+
+/// Where `device_status` is inside the common configuration structure.
+///
+/// Named because one place needs to go the other way — from a register back to
+/// the block's base — and recomputing that from a literal would be the same
+/// offset written twice.
+const COMMON_STATUS_OFFSET: u16 = 0x14;
+
+bhaskix_device::register_block! {
+    /// What a *block* device puts in its device-specific configuration.
+    ///
+    /// The capacity is a 64-bit register, which means two 32-bit reads — and
+    /// that is now the only thing it can mean.
+    struct BlockCfg(0x08) {
+        0x00 => capacity: u64,
+    }
 }
 
 /// Allocates one frame and returns `(physical, virtual)`.
@@ -581,10 +563,18 @@ pub fn init_mapped(hhdm: u64, map: Option<&dyn Fn(u64) -> Option<u64>>) -> Resul
     let (notify_base, notify_length) = notify_at.ok_or(BlockError::NotModern)?;
     let (device_base, device_length) = device_at.ok_or(BlockError::NotModern)?;
 
-    let common = crate::mmio::map(common_base, common_length, hhdm).ok_or(BlockError::MapFailed)?;
+    let common_at =
+        crate::mmio::map(common_base, common_length, hhdm).ok_or(BlockError::MapFailed)?;
+    // SAFETY: `mmio::map` returned a mapping of this device's common
+    // configuration structure, which lives for the machine's life. This is the
+    // one promise; every register access below is safe because of it.
+    let common = unsafe { CommonCfg::<bhaskix_device::Volatile>::new(common_at as usize) };
     let notify = crate::mmio::map(notify_base, notify_length, hhdm).ok_or(BlockError::MapFailed)?;
-    let device_config =
+    let device_config_at =
         crate::mmio::map(device_base, device_length, hhdm).ok_or(BlockError::MapFailed)?;
+    // SAFETY: as above, for the device-specific structure.
+    let device_config =
+        unsafe { BlockCfg::<bhaskix_device::Volatile>::new(device_config_at as usize) };
 
     // The bring-up sequence the specification fixes. Its order is the whole
     // protocol: a status bit written early enough is a promise the driver has
@@ -592,51 +582,49 @@ pub fn init_mapped(hhdm: u64, map: Option<&dyn Fn(u64) -> Option<u64>>) -> Resul
     // SAFETY: `common` is the mapped common configuration structure of the
     // device this function owns.
     let capacity = unsafe {
-        write8(common + common::DEVICE_STATUS, 0); // reset
+        common.device_status.write(0); // reset
         // Reset first, then let it reach memory: from here its only
         // configuration is this driver's.
         pci::enable(address);
-        write8(common + common::DEVICE_STATUS, STATUS_ACKNOWLEDGE);
-        write8(
-            common + common::DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER,
-        );
+        common.device_status.write(STATUS_ACKNOWLEDGE);
+        common
+            .device_status
+            .write(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
         // Feature word 1 holds VIRTIO_F_VERSION_1. Offering nothing else is
         // deliberate: every optional feature is a behaviour this driver would
         // then have to implement, and a device is entitled to assume the
         // driver meant it.
-        write32(common + common::DEVICE_FEATURE_SELECT, 1);
-        let offered = read32(common + common::DEVICE_FEATURE);
+        common.device_feature_select.write(1);
+        let offered = common.device_feature.read();
         if offered & FEATURE_VERSION_1 == 0 {
-            write8(common + common::DEVICE_STATUS, STATUS_FAILED);
+            common.device_status.write(STATUS_FAILED);
             return Err(BlockError::NotModern);
         }
-        write32(common + common::DRIVER_FEATURE_SELECT, 0);
-        write32(common + common::DRIVER_FEATURE, 0);
-        write32(common + common::DRIVER_FEATURE_SELECT, 1);
+        common.driver_feature_select.write(0);
+        common.driver_feature.write(0);
+        common.driver_feature_select.write(1);
         // Take `ACCESS_PLATFORM` whenever it is offered. It is what subjects
         // this device's DMA to the IOMMU rather than letting it address memory
         // directly, and a driver that declined it would be asking to be
         // outside the protection this kernel is building.
         let accepted = FEATURE_VERSION_1 | (offered & FEATURE_ACCESS_PLATFORM);
-        write32(common + common::DRIVER_FEATURE, accepted);
+        common.driver_feature.write(accepted);
         TRANSLATED.store(offered & FEATURE_ACCESS_PLATFORM != 0, Ordering::Relaxed);
 
-        write8(
-            common + common::DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
-        );
+        common
+            .device_status
+            .write(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
         // Read the status back. The device clears this bit to refuse the
         // feature set, and a driver that did not check would carry on talking
         // a protocol the device is not speaking.
-        if read8(common + common::DEVICE_STATUS) & STATUS_FEATURES_OK == 0 {
-            write8(common + common::DEVICE_STATUS, STATUS_FAILED);
+        if common.device_status.read() & STATUS_FEATURES_OK == 0 {
+            common.device_status.write(STATUS_FAILED);
             return Err(BlockError::FeaturesRefused);
         }
 
         // Capacity, in 512-byte sectors, from the device-specific structure.
-        u64::from(read32(device_config)) | (u64::from(read32(device_config + 4)) << 32)
+        device_config.capacity.read()
     };
 
     // Each frame, then the address the device will see for it.
@@ -654,32 +642,35 @@ pub fn init_mapped(hhdm: u64, map: Option<&dyn Fn(u64) -> Option<u64>>) -> Resul
     let buffer = translate(frame(hhdm).ok_or(BlockError::OutOfMemory)?)?;
     let request = translate(frame(hhdm).ok_or(BlockError::OutOfMemory)?)?;
 
-    // SAFETY: as above, and every address written is one of the frames just
-    // allocated -- which is the only reason the device may write to them.
-    let notify_address = unsafe {
-        write16(common + common::QUEUE_SELECT, 0);
+    // No `unsafe` here any more, and that is RFC 0014 step 2's whole result:
+    // the promise that these addresses are registers was made once, where the
+    // block was constructed, so the accesses are ordinary code. Every address
+    // written below is still one of the frames just allocated, which is the
+    // only reason the device may write to them -- but that is an argument
+    // about the *values*, and it always was.
+    let notify_address = {
+        common.queue_select.write(0);
 
         // The device says how deep the queue may be; the driver may ask for
         // less. Asking for less is what keeps the ring inside one frame.
-        let offered = read16(common + common::QUEUE_SIZE);
+        let offered = common.queue_size.read();
         let size = offered.min(QUEUE_SIZE);
-        write16(common + common::QUEUE_SIZE, size);
+        common.queue_size.write(size);
 
         // The device-visible addresses, not the physical ones. The rings are
         // themselves read by DMA, so they are translated exactly like the
         // buffers are -- a driver that mapped its buffers and then handed over
         // a physical ring address would fault on the first request.
-        write64(common + common::QUEUE_DESC, descriptors.2);
-        write64(common + common::QUEUE_DRIVER, available.2);
-        write64(common + common::QUEUE_DEVICE, used.2);
+        common.queue_desc.write(descriptors.2);
+        common.queue_driver.write(available.2);
+        common.queue_device.write(used.2);
 
-        let queue_notify_off = read16(common + common::QUEUE_NOTIFY_OFF);
-        write16(common + common::QUEUE_ENABLE, 1);
+        let queue_notify_off = common.queue_notify_off.read();
+        common.queue_enable.write(1);
 
-        write8(
-            common + common::DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
-        );
+        common
+            .device_status
+            .write(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
         notify + u64::from(queue_notify_off) * u64::from(notify_multiplier)
     };
@@ -723,9 +714,11 @@ pub fn present() -> bool {
 #[must_use]
 pub fn registers(hhdm: u64) -> Option<u64> {
     let device = DEVICE.lock();
-    let common = device.as_ref()?.common;
-    common
-        .checked_sub(hhdm)
+    // The block knows where it is, which is the address `mmio::map` returned
+    // for it -- so the physical page is that minus the direct map base.
+    let common = device.as_ref()?.common.device_status.address() as u64;
+    let base = common - u64::from(COMMON_STATUS_OFFSET);
+    base.checked_sub(hhdm)
         .map(|physical| physical & !(FRAME_SIZE - 1))
 }
 
@@ -840,11 +833,10 @@ pub fn interrupt_driven() -> bool {
 /// or the device reset itself afterwards.
 #[must_use]
 pub fn status() -> u8 {
-    DEVICE.lock().as_ref().map_or(0, |device| {
-        // SAFETY: the mapped common configuration of the device this driver
-        // brought up; reading the status register has no side effects.
-        unsafe { read8(device.common + common::DEVICE_STATUS) }
-    })
+    DEVICE
+        .lock()
+        .as_ref()
+        .map_or(0, |device| device.common.device_status.read())
 }
 
 /// The device's PCI command register.
@@ -936,13 +928,11 @@ pub fn enable_interrupts(
         // changes use. Read back: the device reports `0xffff` if it could not
         // take the vector, and a driver that did not check would wait for an
         // interrupt that was never going to arrive.
-        // SAFETY: the mapped common configuration of the device this driver
-        // owns.
-        let accepted = unsafe {
-            write16(device.common + common::QUEUE_SELECT, 0);
-            write16(device.common + common::QUEUE_MSIX_VECTOR, 0);
-            write16(device.common + common::CONFIG_MSIX_VECTOR, 0);
-            read16(device.common + common::QUEUE_MSIX_VECTOR) == 0
+        let accepted = {
+            device.common.queue_select.write(0);
+            device.common.queue_msix_vector.write(0);
+            device.common.config_msix_vector.write(0);
+            device.common.queue_msix_vector.read() == 0
         };
         if accepted {
             device.notification = Some(notification);

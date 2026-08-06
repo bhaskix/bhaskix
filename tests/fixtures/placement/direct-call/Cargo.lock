@@ -15,12 +15,17 @@ name = "bhaskix-boot"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-device"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-kernel"
 version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
  "bhaskix-arch-x86-64",
  "bhaskix-boot",
+ "bhaskix-device",
  "bhaskix-mm",
  "bhaskix-service",
  "bhaskix-service-console",
