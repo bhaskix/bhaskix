@@ -1,120 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Writing to a filesystem, through the journal: RFC 0015 step 5.
+//! Writing to a filesystem, through the journal and the cache.
 //!
-//! Everything that changes the filesystem goes through [`Volume`], and every
-//! block it writes goes through one function — [`Volume::put`] — which asks a
-//! [`Watch`] first. That is the whole of the interruption harness: a `Watch`
-//! that says "no" after the Nth write leaves the image in exactly the state a
-//! machine losing power at that instant would leave it in, and the test then
-//! mounts it and asks what survived.
+//! RFC 0015 steps 5 and 6, and they are one thing: a journal decides *when* a
+//! change may reach the device, and a write-back cache is what makes "when" a
+//! question at all. With write-through there is nothing to decide — every
+//! change goes immediately, in whatever order it was made, which is the order
+//! a journal exists to stop being the one that matters.
 //!
-//! Routing every write through one place is not tidiness. It is what makes the
-//! harness *complete*: a write that went round it would be a write the harness
-//! cannot stop at, and the interruption it protects against would be the one
-//! nobody tested.
+//! So the transaction below is written in flushes rather than in assignments.
+//! Changing a staged block is not a write; it is a promise. The four moments
+//! that *are* writes are:
 //!
-//! A transaction is prepared **in the journal's own payload blocks**. Staging
-//! copies a block there, the change is made to that copy, and only the commit
-//! block being written makes any of it real. There is no scratch buffer, which
-//! matters in a kernel: eight spare blocks is thirty-two kilobytes of stack
-//! that does not exist.
+//! 1. the payload reaching the device, before it can be committed to,
+//! 2. the commit block — **the acknowledgement**,
+//! 3. the changed blocks reaching their homes,
+//! 4. and only then the log being cleared.
 //!
-//! **One thing goes round `put`, and saying so precisely matters more than the
-//! tidier claim.** Preparing a staged block writes into the payload area
-//! directly, without announcing it. It does not need announcing, because the
-//! payload area means nothing until a commit block points at it — but it does
-//! mean this harness cannot produce a *torn payload under a valid commit*, and
-//! that is the one interruption it cannot reach. That case is covered instead
-//! by `a_log_that_does_not_add_up_is_not_replayed`, which damages a payload
-//! byte directly and requires the commit to be ignored, and it is the reason
-//! the checksum covers the logged blocks rather than the header alone.
+//! Step four is the one the cache introduced and the one that is easy to
+//! leave out: clearing the log while a changed page is still dirty throws away
+//! the only record of a change that has not happened yet. The harness catches
+//! it, because that is an interruption like any other.
 //!
-//! The ordering itself — payload, then commit, then homes, then clear — is
-//! checked by `a_transaction_has_exactly_one_shape`, which asserts the whole
-//! sequence of writes. A weaker version of that test passed while the commit
-//! was moved to the front, because the image came out byte-identical: the
-//! payload is prepared in place, so those writes put no new bytes anywhere and
-//! only the order they are *issued* in distinguishes the two. On a real disk
-//! that order is the entire difference.
+//! The interruption itself lives in the [`Store`] now — the device is the
+//! thing that stops. A trace is therefore the sequence of writes the *device*
+//! saw, which with a cache in the way is no longer the sequence the filesystem
+//! asked for, and that difference is the whole of what a cache is.
 
+use crate::cache::{Cache, Store};
 use crate::{
-    BLOCK, ENTRY, Entry, FsError, INODE, Inode, Kind, Superblock, journal, journal::MAX_STAGED,
+    BLOCK, ENTRY, Entry, Filesystem, FsError, INODE, Inode, Kind, Pages, Superblock, journal,
+    journal::MAX_STAGED,
 };
-
-/// Asked before every block write.
-///
-/// The crash model, and it is deliberately the crudest one that is true:
-/// writes reach the disk in the order they were issued, and at some point they
-/// stop. Weaker models exist and matter — a device may reorder within a
-/// barrier — and the reordering test covers that separately by permuting the
-/// order the writes are *issued* in, which needs no extra machinery here.
-pub trait Watch {
-    /// `false` stops the operation before `block` is written.
-    fn writing(&mut self, block: u32) -> bool;
-}
-
-impl<W: Watch + ?Sized> Watch for &mut W {
-    fn writing(&mut self, block: u32) -> bool {
-        (**self).writing(block)
-    }
-}
-
-/// A `Watch` that never interrupts anything.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Uninterrupted;
-
-impl Watch for Uninterrupted {
-    fn writing(&mut self, _block: u32) -> bool {
-        true
-    }
-}
-
-/// Stops after a given number of writes have gone through.
-///
-/// `StopAfter::new(0)` interrupts before the first write, which is a case
-/// worth having: it is the machine that died having done nothing, and a
-/// recovery that needs at least one write to have happened would pass every
-/// other N and fail this one.
-#[derive(Clone, Copy, Debug)]
-pub struct StopAfter {
-    limit: u32,
-    seen: u32,
-}
-
-impl StopAfter {
-    /// Allows `limit` writes and then stops.
-    #[must_use]
-    pub const fn new(limit: u32) -> Self {
-        Self { limit, seen: 0 }
-    }
-
-    /// How many writes went through.
-    #[must_use]
-    pub const fn writes(&self) -> u32 {
-        self.seen
-    }
-}
-
-impl Watch for StopAfter {
-    fn writing(&mut self, _block: u32) -> bool {
-        if self.seen >= self.limit {
-            return false;
-        }
-        self.seen += 1;
-        true
-    }
-}
-
-/// Counts writes without stopping any, to find out how many there are.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Count(pub u32);
-
-impl Watch for Count {
-    fn writing(&mut self, _block: u32) -> bool {
-        self.0 += 1;
-        true
-    }
-}
 
 /// A filesystem that can be written to.
 ///
@@ -122,16 +38,16 @@ impl Watch for Count {
 /// journal has not been replayed, because every way of getting one goes
 /// through [`Volume::mount`]. A separate `recover()` a caller could forget to
 /// call is the shape of this that has a bug in it.
-pub struct Volume<'a> {
-    bytes: &'a mut [u8],
+pub struct Volume<'f, S: Store> {
+    cache: Cache<'f, S>,
     superblock: Superblock,
     sequence: u64,
     staged: [u32; MAX_STAGED],
     count: usize,
 }
 
-impl<'a> Volume<'a> {
-    /// Mounts `bytes`, replaying any committed transaction first.
+impl<'f, S: Store> Volume<'f, S> {
+    /// Mounts what `cache` holds, replaying any committed transaction first.
     ///
     /// Returns the volume and how many blocks the replay wrote — zero on a
     /// filesystem that was unmounted cleanly, which is the number the tests
@@ -139,21 +55,20 @@ impl<'a> Volume<'a> {
     ///
     /// # Errors
     ///
-    /// As [`Superblock::read`], and [`FsError::Interrupted`] if `watch`
-    /// stopped the replay.
-    pub fn mount(
-        bytes: &'a mut [u8],
-        watch: &mut (impl Watch + ?Sized),
-    ) -> Result<(Self, u32), FsError> {
-        let superblock = Superblock::read(bytes)?;
+    /// As [`Superblock::read_head`], and whatever the store returns —
+    /// including [`FsError::Interrupted`] if it stopped during the replay.
+    pub fn mount(mut cache: Cache<'f, S>) -> Result<(Self, u32), FsError> {
+        let blocks = u64::from(cache.blocks());
+        let head = cache.page(0)?;
+        let superblock = Superblock::read_head(head, blocks)?;
         let mut volume = Self {
-            bytes,
+            cache,
             superblock,
             sequence: 0,
             staged: [0; MAX_STAGED],
             count: 0,
         };
-        let replayed = volume.recover(watch)?;
+        let replayed = volume.recover()?;
         Ok((volume, replayed))
     }
 
@@ -163,15 +78,25 @@ impl<'a> Volume<'a> {
         &self.superblock
     }
 
-    /// The image, for a reader.
+    /// Hits, misses and write-backs the cache has done.
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        self.bytes
+    pub const fn counted(&self) -> (u64, u64, u64) {
+        self.cache.counted()
+    }
+
+    /// The cache, to read through or to give back.
+    pub const fn cache(&mut self) -> &mut Cache<'f, S> {
+        &mut self.cache
+    }
+
+    /// A reader over the same cache.
+    pub const fn reader(&mut self) -> Filesystem<'_, Cache<'f, S>> {
+        Filesystem::using(&mut self.cache, self.superblock)
     }
 
     /// Replays a committed transaction, if there is one, and clears it.
-    fn recover(&mut self, watch: &mut (impl Watch + ?Sized)) -> Result<u32, FsError> {
-        let Some(commit) = journal::committed(self.bytes, &self.superblock) else {
+    fn recover(&mut self) -> Result<u32, FsError> {
+        let Some(commit) = journal::committed(&mut self.cache, &self.superblock)? else {
             // Nothing committed. The payload blocks may hold anything -- a
             // transaction that was being prepared when the machine stopped --
             // and it is all ignored, because what makes a transaction real is
@@ -180,58 +105,30 @@ impl<'a> Volume<'a> {
         };
 
         self.sequence = commit.sequence;
+        let start =
+            u32::try_from(self.superblock.journal_start).map_err(|_| FsError::OutOfRange)?;
         for index in 0..commit.count {
-            let (home, contents) = journal::logged(self.bytes, &self.superblock, index)?;
-            self.put(home, &contents, watch)?;
+            let home = journal::home(&mut self.cache, &self.superblock, index)?;
+            self.cache.copy(start + 1 + index, home)?;
         }
+        // On the device before the log is cleared, for the same reason as in a
+        // live transaction: a recovery that forgot the blocks it had just
+        // replayed, and then destroyed the record of them, would turn a
+        // survivable crash into a lost one on the *second* crash.
+        self.cache.flush()?;
 
-        // Cleared last, and an interruption here costs only another replay:
-        // every write above puts the same bytes in the same places however
-        // many times it runs, which is what lets this be a single ordering
-        // rather than a protocol.
-        self.clear_commit(watch)?;
+        self.clear_commit()?;
         Ok(commit.count)
     }
 
-    /// Writes one block. **The only place this crate writes to the image.**
-    fn put(
-        &mut self,
-        block: u32,
-        from: &[u8],
-        watch: &mut (impl Watch + ?Sized),
-    ) -> Result<(), FsError> {
-        if u64::from(block) >= self.superblock.blocks {
-            return Err(FsError::OutOfRange);
-        }
-        if !watch.writing(block) {
-            return Err(FsError::Interrupted);
-        }
-        let at = (block as usize)
-            .checked_mul(BLOCK)
-            .ok_or(FsError::OutOfRange)?;
-        let end = at.checked_add(BLOCK).ok_or(FsError::OutOfRange)?;
-        let into = self.bytes.get_mut(at..end).ok_or(FsError::OutOfRange)?;
-        let from = from.get(..BLOCK).ok_or(FsError::OutOfRange)?;
-        into.copy_from_slice(from);
-        Ok(())
-    }
-
     /// Zeroes the commit block, so that nothing is pending.
-    fn clear_commit(&mut self, watch: &mut (impl Watch + ?Sized)) -> Result<(), FsError> {
+    fn clear_commit(&mut self) -> Result<(), FsError> {
         let empty = [0u8; BLOCK];
         let block =
             u32::try_from(self.superblock.journal_start).map_err(|_| FsError::OutOfRange)?;
-        self.put(block, &empty, watch)
-    }
-
-    /// One block of the image.
-    fn block(&self, index: u32) -> Result<&[u8], FsError> {
-        let at = (index as usize)
-            .checked_mul(BLOCK)
-            .ok_or(FsError::OutOfRange)?;
-        self.bytes
-            .get(at..at.checked_add(BLOCK).ok_or(FsError::OutOfRange)?)
-            .ok_or(FsError::OutOfRange)
+        self.cache.put(block, &empty)?;
+        self.cache.flush()?;
+        Ok(())
     }
 
     /// Begins a transaction, discarding whatever the last one staged.
@@ -248,17 +145,19 @@ impl<'a> Volume<'a> {
     /// therefore stated rather than argued: this volume never prepares a
     /// transaction while one is committed, and the way to clear one is to
     /// mount, which is the only thing that replays.
-    ///
-    /// # Errors
-    ///
-    /// [`FsError::NeedsRecovery`] if a committed transaction is pending.
     fn begin(&mut self) -> Result<(), FsError> {
-        if journal::committed(self.bytes, &self.superblock).is_some() {
+        if journal::pending(&mut self.cache, &self.superblock)? {
             return Err(FsError::NeedsRecovery);
         }
         self.count = 0;
         self.sequence = self.sequence.wrapping_add(1).max(1);
         Ok(())
+    }
+
+    /// The journal block a staged slot lives in.
+    fn slot_block(&self, slot: usize) -> Result<u32, FsError> {
+        u32::try_from(self.superblock.journal_start + 1 + slot as u64)
+            .map_err(|_| FsError::OutOfRange)
     }
 
     /// Copies `home` into the journal's payload, to be changed there.
@@ -274,19 +173,8 @@ impl<'a> Volume<'a> {
         if self.count == MAX_STAGED {
             return Err(FsError::Full);
         }
-
         let slot = self.count;
-        let source = (home as usize)
-            .checked_mul(BLOCK)
-            .ok_or(FsError::OutOfRange)?;
-        let destination = usize::try_from(self.superblock.journal_start + 1 + slot as u64)
-            .ok()
-            .and_then(|block| block.checked_mul(BLOCK))
-            .ok_or(FsError::OutOfRange)?;
-        if source.max(destination).checked_add(BLOCK) > Some(self.bytes.len()) {
-            return Err(FsError::OutOfRange);
-        }
-        self.bytes.copy_within(source..source + BLOCK, destination);
+        self.cache.copy(home, self.slot_block(slot)?)?;
         self.staged[slot] = home;
         self.count = slot + 1;
         Ok(slot)
@@ -294,101 +182,79 @@ impl<'a> Volume<'a> {
 
     /// The staged copy of a block, to be changed before it is committed.
     fn staged_mut(&mut self, slot: usize) -> Result<&mut [u8], FsError> {
-        let at = usize::try_from(self.superblock.journal_start + 1 + slot as u64)
-            .ok()
-            .and_then(|block| block.checked_mul(BLOCK))
-            .ok_or(FsError::OutOfRange)?;
-        self.bytes
-            .get_mut(at..at.checked_add(BLOCK).ok_or(FsError::OutOfRange)?)
-            .ok_or(FsError::OutOfRange)
+        let block = self.slot_block(slot)?;
+        self.cache.edit(block)
     }
 
-    /// Writes the payload, commits, applies, and clears.
+    /// Puts the payload on the device, commits, applies, and clears.
     ///
-    /// `order` permutes the writes *within* each phase — the payload writes
-    /// among themselves and the home writes among themselves. It does not move
-    /// a write across the commit, because that is the one ordering the journal
-    /// depends on and a device that broke it would break every journal. What a
-    /// device is entitled to reorder, this reorders.
-    fn commit(
-        &mut self,
-        watch: &mut (impl Watch + ?Sized),
-        order: &[usize],
-    ) -> Result<(), FsError> {
+    /// `order` permutes the writes *within* each phase — the payload among
+    /// itself and the homes among themselves. It does not move a write across
+    /// the commit, because that is the one ordering the journal depends on and
+    /// a device that broke it would break every journal. What a device is
+    /// entitled to reorder, this reorders.
+    fn commit(&mut self, order: &[usize]) -> Result<(), FsError> {
         if self.count == 0 {
             return Ok(());
         }
+        let straight: [usize; MAX_STAGED] = [0, 1, 2, 3, 4, 5, 6, 7];
         let order: &[usize] = if order.len() == self.count {
             order
         } else {
-            &[0, 1, 2, 3, 4, 5, 6, 7][..self.count]
+            &straight[..self.count]
         };
 
-        // 1. The payload is already in the journal blocks -- staging put it
-        //    there. These are the writes of it, in whatever order.
-        for slot in order {
-            let block = u32::try_from(self.superblock.journal_start + 1 + *slot as u64)
-                .map_err(|_| FsError::OutOfRange)?;
-            if !watch.writing(block) {
-                return Err(FsError::Interrupted);
-            }
-        }
+        // 1. The payload, onto the device. Until this has happened there is
+        //    nothing to commit *to*: the commit block's checksum is over these
+        //    blocks as the device holds them.
+        self.cache.flush()?;
 
         // 2. The commit. Everything before this instant is provisional and
         //    everything after it is certain, and that is the only claim this
         //    filesystem makes about durability.
-        let head = journal::write_commit(
-            self.bytes,
+        let head = journal::build_commit(
+            &mut self.cache,
             &self.superblock,
             self.sequence,
             &self.staged[..self.count],
         )?;
         let commit_block =
             u32::try_from(self.superblock.journal_start).map_err(|_| FsError::OutOfRange)?;
-        self.put(commit_block, &head, watch)?;
+        self.cache.put(commit_block, &head)?;
+        self.cache.flush()?;
 
         // 3. Home. Interrupted here, the commit stands and the next mount
         //    finishes it.
         for slot in order {
             let home = self.staged[*slot];
-            let mut contents = [0u8; BLOCK];
-            contents.copy_from_slice(self.staged_mut(*slot)?);
-            self.put(home, &contents, watch)?;
+            self.cache.copy(self.slot_block(*slot)?, home)?;
         }
 
-        // 4. Done, so the log is empty again.
-        self.clear_commit(watch)?;
+        // 4. **On the device before the log is cleared.** This is the ordering
+        //    the cache introduced. Clearing the log while a changed page is
+        //    still dirty throws away the only record of a change that has not
+        //    happened -- and it would do so at the moment everything looked
+        //    finished.
+        self.cache.flush()?;
+
+        // 5. Done, so the log is empty again.
+        self.clear_commit()?;
         self.count = 0;
         Ok(())
     }
 
-    /// Where inode `index` lives: its block, and its offset within it.
-    fn inode_at(&self, index: u32) -> Result<(u32, usize), FsError> {
-        if u64::from(index) >= self.superblock.inodes {
-            return Err(FsError::OutOfRange);
-        }
-        let byte = self
-            .superblock
-            .inode_start
-            .checked_mul(BLOCK as u64)
-            .and_then(|start| start.checked_add(u64::from(index) * INODE as u64))
-            .ok_or(FsError::OutOfRange)?;
-        let block = u32::try_from(byte / BLOCK as u64).map_err(|_| FsError::OutOfRange)?;
-        Ok((block, (byte % BLOCK as u64) as usize))
-    }
-
-    /// Reads one inode out of the image as it stands.
+    /// Reads one inode.
     ///
     /// # Errors
     ///
-    /// As [`Inode::read`].
-    pub fn inode(&self, index: u32) -> Result<Inode, FsError> {
-        Inode::read(self.bytes, &self.superblock, index)
+    /// As [`Filesystem::inode`].
+    pub fn inode(&mut self, index: u32) -> Result<Inode, FsError> {
+        self.reader().inode(index)
     }
 
     /// Puts `inode` into the transaction being built.
     fn stage_inode(&mut self, index: u32, inode: &Inode) -> Result<(), FsError> {
-        let (block, offset) = self.inode_at(index)?;
+        let (block, offset) = self.superblock.inode_at(index)?;
         let slot = self.stage(block)?;
         let staged = self.staged_mut(slot)?;
         inode.encode(
@@ -421,16 +287,37 @@ impl<'a> Volume<'a> {
     }
 
     /// The first free block, without taking it.
-    fn free_block(&self) -> Result<u32, FsError> {
-        crate::Free::of(self.bytes, &self.superblock)?
-            .first()
-            .ok_or(FsError::Full)
+    ///
+    /// Reads the bitmap a block at a time, which is what a filesystem on a
+    /// device has to do. The whole-image version could scan a slice; this
+    /// cannot, and the difference is the reason the trait exists.
+    #[cfg(test)]
+    pub(crate) fn free_block_for_test(&mut self) -> Result<u32, FsError> {
+        self.free_block()
+    }
+
+    fn free_block(&mut self) -> Result<u32, FsError> {
+        let first = self.superblock.data_start;
+        for block in first..self.superblock.blocks {
+            let byte = block / 8;
+            let holding = self.superblock.bitmap_start + byte / BLOCK as u64;
+            let holding = u32::try_from(holding).map_err(|_| FsError::OutOfRange)?;
+            let page = self.cache.page(holding)?;
+            let cell = *page
+                .get((byte % BLOCK as u64) as usize)
+                .ok_or(FsError::OutOfRange)?;
+            if cell & (1 << (block % 8)) == 0 {
+                return u32::try_from(block).map_err(|_| FsError::OutOfRange);
+            }
+        }
+        Err(FsError::Full)
     }
 
     /// The first free inode, without taking it.
-    fn free_inode(&self) -> Result<u32, FsError> {
+    fn free_inode(&mut self) -> Result<u32, FsError> {
         for index in 0..u32::try_from(self.superblock.inodes).unwrap_or(u32::MAX) {
-            if Inode::read(self.bytes, &self.superblock, index)
+            if self
+                .inode(index)
                 .is_ok_and(|inode| inode.kind == Kind::Free)
             {
                 return Ok(index);
@@ -439,21 +326,28 @@ impl<'a> Volume<'a> {
         Err(FsError::Full)
     }
 
+    /// Finds `name` in `directory`.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::NotFound`], or [`FsError::WrongKind`] if `directory` is not
+    /// one.
+    pub fn lookup(&mut self, directory: u32, name: &[u8]) -> Result<(u32, Inode), FsError> {
+        let mut reader = self.reader();
+        let inode = reader.inode(directory)?;
+        reader.lookup(&inode, name)
+    }
+
     /// Creates `name` in `directory`, and returns the inode it got.
     ///
     /// # Errors
     ///
     /// [`FsError::WrongKind`] if `directory` is not one, [`FsError::BadName`]
-    /// for a name this format cannot hold, [`FsError::Full`] if there is no
-    /// free inode or block, and [`FsError::Interrupted`] if `watch` stopped it.
-    pub fn create(
-        &mut self,
-        directory: u32,
-        name: &[u8],
-        kind: Kind,
-        watch: &mut (impl Watch + ?Sized),
-    ) -> Result<u32, FsError> {
-        self.create_ordered(directory, name, kind, watch, &[])
+    /// for a name this format cannot hold or one already there,
+    /// [`FsError::Full`] if there is no free inode or block, and whatever the
+    /// store returns.
+    pub fn create(&mut self, directory: u32, name: &[u8], kind: Kind) -> Result<u32, FsError> {
+        self.create_ordered(directory, name, kind, &[])
     }
 
     /// [`Volume::create`], with the writes issued in a given order.
@@ -466,7 +360,6 @@ impl<'a> Volume<'a> {
         directory: u32,
         name: &[u8],
         kind: Kind,
-        watch: &mut (impl Watch + ?Sized),
         order: &[usize],
     ) -> Result<u32, FsError> {
         if name.is_empty() || name.len() > crate::MAX_NAME {
@@ -494,13 +387,17 @@ impl<'a> Volume<'a> {
         if block_index >= parent.direct.len() {
             return Err(FsError::Full);
         }
+        let fresh = if which == 0 {
+            Some(self.free_block()?)
+        } else {
+            None
+        };
 
         self.begin()?;
 
         // A new block for the directory, if this entry starts one.
         let mut parent = parent;
-        if which == 0 {
-            let block = self.free_block()?;
+        if let Some(block) = fresh {
             self.stage_bitmap(block, true)?;
             let slot = self.stage(block)?;
             self.staged_mut(slot)?.fill(0);
@@ -534,20 +431,8 @@ impl<'a> Volume<'a> {
             },
         )?;
 
-        self.commit(watch, order)?;
+        self.commit(order)?;
         Ok(index)
-    }
-
-    /// Finds `name` in `directory`.
-    ///
-    /// # Errors
-    ///
-    /// [`FsError::NotFound`], or [`FsError::WrongKind`] if `directory` is not
-    /// one.
-    pub fn lookup(&self, directory: u32, name: &[u8]) -> Result<(u32, Inode), FsError> {
-        let mounted = crate::Filesystem::mounted(self.bytes, self.superblock);
-        let inode = mounted.inode(directory)?;
-        mounted.lookup(&inode, name)
     }
 
     /// Writes `data` at `offset` in the file `index` names.
@@ -555,16 +440,9 @@ impl<'a> Volume<'a> {
     /// # Errors
     ///
     /// [`FsError::WrongKind`] on a directory, [`FsError::Full`] if a block is
-    /// needed and there is none, and [`FsError::Interrupted`] if `watch`
-    /// stopped it.
-    pub fn write(
-        &mut self,
-        index: u32,
-        offset: u64,
-        data: &[u8],
-        watch: &mut (impl Watch + ?Sized),
-    ) -> Result<usize, FsError> {
-        self.write_ordered(index, offset, data, watch, &[])
+    /// needed and there is none, and whatever the store returns.
+    pub fn write(&mut self, index: u32, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        self.write_ordered(index, offset, data, &[])
     }
 
     /// [`Volume::write`], with the writes issued in a given order.
@@ -577,7 +455,6 @@ impl<'a> Volume<'a> {
         index: u32,
         offset: u64,
         data: &[u8],
-        watch: &mut (impl Watch + ?Sized),
         order: &[usize],
     ) -> Result<usize, FsError> {
         let mut inode = self.inode(index)?;
@@ -597,14 +474,9 @@ impl<'a> Volume<'a> {
             return Err(FsError::Full);
         }
 
-        self.begin()?;
-
         let fresh = inode.direct[block_index] == 0;
         let block = if fresh {
-            let block = self.free_block()?;
-            self.stage_bitmap(block, true)?;
-            inode.direct[block_index] = block;
-            block
+            self.free_block()?
         } else {
             inode.direct[block_index]
         };
@@ -614,48 +486,52 @@ impl<'a> Volume<'a> {
             return Err(FsError::OutOfRange);
         }
 
-        // The data itself, straight to its home and *before* the commit that
-        // will point an inode at it. RFC 0015 does not journal data; writing
-        // it first is what stops a block an inode claims from ever having been
-        // a block still holding somebody else's bytes. The cost is that an
-        // overwrite is not atomic -- a crash mid-write tears the block -- and
-        // that is the trade the RFC named: a crash may lose recent writes and
-        // must not lose the filesystem.
-        let mut contents = [0u8; BLOCK];
-        if !fresh {
-            contents.copy_from_slice(self.block(block)?);
+        self.begin()?;
+        if fresh {
+            self.stage_bitmap(block, true)?;
+            inode.direct[block_index] = block;
         }
-        contents
-            .get_mut(within..within + taking)
-            .ok_or(FsError::OutOfRange)?
-            .copy_from_slice(&data[..taking]);
-        self.put(block, &contents, watch)?;
+
+        // The data itself, straight to its home and *onto the device* before
+        // the commit that will point an inode at it. RFC 0015 does not journal
+        // data; putting it there first is what stops a block an inode claims
+        // from ever having been a block still holding somebody else's bytes.
+        // The cost is that an overwrite is not atomic -- a crash mid-write
+        // tears the block -- and that is the trade the RFC named: a crash may
+        // lose recent writes and must not lose the filesystem.
+        {
+            let page = if fresh {
+                let page = self.cache.edit(block)?;
+                page.fill(0);
+                page
+            } else {
+                self.cache.edit(block)?
+            };
+            page.get_mut(within..within + taking)
+                .ok_or(FsError::OutOfRange)?
+                .copy_from_slice(&data[..taking]);
+        }
+        self.cache.flush()?;
 
         let end = offset + taking as u64;
         if end > inode.size {
             inode.size = end;
         }
         self.stage_inode(index, &inode)?;
-        self.commit(watch, order)?;
+        self.commit(order)?;
         Ok(taking)
     }
 
     /// Removes `name` from `directory`, freeing what it named.
     ///
-    /// The inode's generation is bumped, which is what makes a `Directory` or
-    /// `File` capability naming it stop resolving. Until this existed, that
-    /// check could only be tested against a capability the kernel manufactured.
+    /// The inode's generation is bumped when the slot is next used, which is
+    /// what makes a `Directory` or `File` capability naming it stop resolving.
     ///
     /// # Errors
     ///
     /// [`FsError::NotFound`], [`FsError::WrongKind`] on a directory that is
-    /// not empty, and [`FsError::Interrupted`] if `watch` stopped it.
-    pub fn remove(
-        &mut self,
-        directory: u32,
-        name: &[u8],
-        watch: &mut (impl Watch + ?Sized),
-    ) -> Result<(), FsError> {
+    /// not empty, and whatever the store returns.
+    pub fn remove(&mut self, directory: u32, name: &[u8]) -> Result<(), FsError> {
         let parent = self.inode(directory)?;
         if parent.kind != Kind::Directory {
             return Err(FsError::WrongKind);
@@ -666,12 +542,14 @@ impl<'a> Volume<'a> {
         }
 
         // Which entry, by walking the directory the way a reader does.
-        let mut found = None;
         let entries = (parent.size as usize) / ENTRY;
+        let per = BLOCK / ENTRY;
+        let mut found = None;
         for at in 0..entries {
-            let block = parent.direct[at / (BLOCK / ENTRY)];
-            let offset = (at % (BLOCK / ENTRY)) * ENTRY;
-            if let Ok(entry) = Entry::read(self.block(block)?, offset)
+            let block = parent.direct[at / per];
+            let offset = (at % per) * ENTRY;
+            let page = self.cache.page(block)?;
+            if let Ok(entry) = Entry::read(page, offset)
                 && entry.name() == name
             {
                 found = Some(at);
@@ -681,18 +559,18 @@ impl<'a> Volume<'a> {
         let at = found.ok_or(FsError::NotFound)?;
         let last = entries - 1;
 
-        self.begin()?;
-
         // The last entry is moved into the hole and the directory shrinks, so
         // a directory never has a gap in it. A tombstone would need every
         // reader to know about tombstones, and the reader is the part that
         // already works.
-        let last_block = parent.direct[last / (BLOCK / ENTRY)];
-        let last_offset = (last % (BLOCK / ENTRY)) * ENTRY;
-        let moving = Entry::read(self.block(last_block)?, last_offset)?;
+        let last_block = parent.direct[last / per];
+        let last_offset = (last % per) * ENTRY;
+        let moving = Entry::read(self.cache.page(last_block)?, last_offset)?;
 
-        let block = parent.direct[at / (BLOCK / ENTRY)];
-        let offset = (at % (BLOCK / ENTRY)) * ENTRY;
+        self.begin()?;
+
+        let block = parent.direct[at / per];
+        let offset = (at % per) * ENTRY;
         let slot = self.stage(block)?;
         moving.write(self.staged_mut(slot)?, offset)?;
 
@@ -720,7 +598,7 @@ impl<'a> Volume<'a> {
             self.stage_bitmap(*block, false)?;
         }
 
-        self.commit(watch, &[])
+        self.commit(&[])
     }
 }
 
@@ -734,16 +612,74 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::{BLOCK, Filesystem, Kind};
+    use crate::cache::MIN_FRAMES;
+    use crate::{BLOCK, Image, Kind};
 
-    /// Records every block written, in order, and stops nothing.
-    #[derive(Default)]
-    struct Trace(Vec<u32>);
+    /// How many frames the tests give a cache, unless they are testing that.
+    const FRAMES: usize = 16;
 
-    impl Watch for Trace {
-        fn writing(&mut self, block: u32) -> bool {
-            self.0.push(block);
-            true
+    /// A device that records what it was asked to write, and can stop.
+    ///
+    /// The interruption lives here now, and that is the point of the change:
+    /// a write is interrupted at the device, not on the way to one. What this
+    /// records is therefore what the *disk* saw — which, with a cache in front
+    /// of it, is no longer what the filesystem asked for.
+    struct Device<'a> {
+        bytes: &'a mut [u8],
+        trace: Vec<u32>,
+        limit: Option<u32>,
+    }
+
+    impl<'a> Device<'a> {
+        fn new(bytes: &'a mut [u8]) -> Self {
+            Self {
+                bytes,
+                trace: Vec::new(),
+                limit: None,
+            }
+        }
+
+        fn stopping(bytes: &'a mut [u8], after: u32) -> Self {
+            Self {
+                bytes,
+                trace: Vec::new(),
+                limit: Some(after),
+            }
+        }
+    }
+
+    impl Store for Device<'_> {
+        fn blocks(&self) -> u32 {
+            u32::try_from(self.bytes.len() / BLOCK).unwrap_or(u32::MAX)
+        }
+
+        fn read(&mut self, block: u32, into: &mut [u8]) -> Result<(), FsError> {
+            let at = (block as usize)
+                .checked_mul(BLOCK)
+                .ok_or(FsError::OutOfRange)?;
+            let from = self.bytes.get(at..at + BLOCK).ok_or(FsError::OutOfRange)?;
+            into.get_mut(..BLOCK)
+                .ok_or(FsError::OutOfRange)?
+                .copy_from_slice(from);
+            Ok(())
+        }
+
+        fn write(&mut self, block: u32, from: &[u8]) -> Result<(), FsError> {
+            if self.limit == Some(u32::try_from(self.trace.len()).unwrap_or(u32::MAX)) {
+                // The machine stopped. Nothing is recorded and nothing lands,
+                // which is what "it did not happen" means.
+                return Err(FsError::Interrupted);
+            }
+            let at = (block as usize)
+                .checked_mul(BLOCK)
+                .ok_or(FsError::OutOfRange)?;
+            let into = self
+                .bytes
+                .get_mut(at..at + BLOCK)
+                .ok_or(FsError::OutOfRange)?;
+            into.copy_from_slice(from.get(..BLOCK).ok_or(FsError::OutOfRange)?);
+            self.trace.push(block);
+            Ok(())
         }
     }
 
@@ -753,13 +689,41 @@ mod tests {
         bytes
     }
 
+    /// Runs `f` against `bytes` as a device, and returns what the device saw.
+    fn run(
+        bytes: &mut [u8],
+        frames: usize,
+        stop: Option<u32>,
+        f: impl FnOnce(&mut Volume<'_, Device<'_>>),
+    ) -> Vec<u32> {
+        let mut pages = vec![0u8; frames * BLOCK];
+        let device = match stop {
+            Some(after) => Device::stopping(bytes, after),
+            None => Device::new(bytes),
+        };
+        let cache = Cache::new(&mut pages, device).expect("enough frames");
+        let Ok((mut volume, _)) = Volume::mount(cache) else {
+            return Vec::new();
+        };
+        f(&mut volume);
+        volume.cache().store().trace.clone()
+    }
+
+    /// Mounts for writing, which is what recovers, and says how much it replayed.
+    fn recover(bytes: &mut [u8]) -> Result<u32, FsError> {
+        let mut pages = vec![0u8; FRAMES * BLOCK];
+        let cache = Cache::new(&mut pages, Device::new(bytes)).unwrap();
+        Volume::mount(cache).map(|(_, replayed)| replayed)
+    }
+
     /// Everything a reader can see, so that two images can be compared.
     ///
-    /// Compared as a whole rather than field by field: a recovery that got the
-    /// directory right and the size wrong is not a recovery, and a test that
-    /// checked only what it thought of would say it was.
+    /// Read straight off the device through an [`Image`], with no cache: what
+    /// a cache remembers is exactly what these tests must not be allowed to
+    /// count as durable.
     fn visible(bytes: &[u8]) -> Vec<(Vec<u8>, u32, u64, Vec<u8>)> {
-        let mounted = Filesystem::mount(bytes).expect("it mounts");
+        let mut pages = Image::new(bytes);
+        let mut mounted = Filesystem::mount(&mut pages).expect("it mounts");
         let root = mounted.root().expect("with a root");
         let mut names = Vec::new();
         mounted.list(&root, |entry| names.push(entry.name().to_vec()));
@@ -772,73 +736,57 @@ mod tests {
             let mut contents = vec![0u8; inode.size as usize];
             let read = mounted.read(&inode, 0, &mut contents);
             contents.truncate(read);
-            seen.push((name, index, inode.generation as u64, contents));
+            seen.push((name, index, u64::from(inode.generation), contents));
         }
         seen.sort();
         seen
     }
 
-    /// The image an operation starts from, and the one it should end at.
+    /// One thing a filesystem can be asked to do.
+    type Operation = dyn Fn(&mut Volume<'_, Device<'_>>) + 'static;
+
+    /// The image an operation starts from, the one it ends at, and the trace.
     fn before_and_after(
-        run: &dyn Fn(&mut Volume<'_>, &mut dyn Watch),
+        what: &dyn Fn(&mut Volume<'_, Device<'_>>),
     ) -> (Vec<u8>, Vec<u8>, Vec<u32>) {
         let before = image(64);
 
         let mut after = before.clone();
-        {
-            let (mut volume, replayed) =
-                Volume::mount(&mut after, &mut Uninterrupted).expect("a fresh image mounts");
-            assert_eq!(replayed, 0, "a fresh image has nothing to recover");
-            run(&mut volume, &mut Uninterrupted);
-        }
+        run(&mut after, FRAMES, None, what);
 
-        // The same operation again, on a fresh image, only to record the
-        // writes it makes. Recorded from a *separate* run so that the trace
-        // cannot be an artefact of the image the assertions use -- and
-        // asserted identical, which is also the check that an operation is
-        // deterministic. One that was not would make every N below a
-        // different experiment.
+        // The same operation again, on a fresh image, only to record what the
+        // device saw. Recorded from a *separate* run so that the trace cannot
+        // be an artefact of the image the assertions use -- and asserted
+        // identical, which is also the check that an operation is
+        // deterministic. One that was not would make every N below a different
+        // experiment.
         let mut traced = before.clone();
-        let mut trace = Trace::default();
-        {
-            let (mut volume, _) =
-                Volume::mount(&mut traced, &mut Uninterrupted).expect("it mounts");
-            run(&mut volume, &mut trace);
-        }
+        let trace = run(&mut traced, FRAMES, None, what);
         assert_eq!(
             traced, after,
             "the same operation twice gives the same image"
         );
 
-        (before, after, trace.0)
+        (before, after, trace)
     }
-
-    /// One thing a filesystem can be asked to do, and the watch it does it under.
-    type Operation = dyn Fn(&mut Volume<'_>, &mut dyn Watch) + 'static;
 
     #[test]
     fn a_file_created_and_written_reads_back() {
         let mut bytes = image(64);
-        // The writable mount goes out of scope before the read-only one, which
-        // is the one that has to agree with it.
-        {
-            let (mut volume, _) = Volume::mount(&mut bytes, &mut Uninterrupted).unwrap();
+        run(&mut bytes, FRAMES, None, |volume| {
             let root = volume.superblock().root;
             let index = volume
-                .create(root, b"written", Kind::File, &mut Uninterrupted)
+                .create(root, b"written", Kind::File)
                 .expect("a file is created");
             let put = volume
-                .write(
-                    index,
-                    0,
-                    b"a filesystem this kernel can write to\n",
-                    &mut Uninterrupted,
-                )
+                .write(index, 0, b"a filesystem this kernel can write to\n")
                 .expect("and written to");
             assert_eq!(put, 38);
-        }
+        });
 
-        let mounted = Filesystem::mount(&bytes).expect("and mounts read-only afterwards");
+        // Off the device, through a reader that has never seen the cache.
+        let mut pages = Image::new(&bytes);
+        let mut mounted = Filesystem::mount(&mut pages).expect("and mounts afterwards");
         let root = mounted.root().unwrap();
         let (_, inode) = mounted
             .lookup(&root, b"written")
@@ -854,24 +802,21 @@ mod tests {
     #[test]
     fn a_transaction_has_exactly_one_shape() {
         // The ordering the whole journal rests on, asserted as a sequence
-        // rather than as prose. A transaction of n blocks is: n writes into
-        // the journal, the commit, n writes to the homes, the commit cleared.
-        // Nothing outside the journal is touched before the commit, and the
-        // commit is not written before the payload it checksums.
+        // rather than as prose -- and now as the sequence the *device* saw. A
+        // transaction of n blocks is: n writes into the journal, the commit,
+        // n writes to the homes, the commit cleared. Nothing outside the
+        // journal is touched before the commit, and the commit is not written
+        // before the payload it checksums.
         //
-        // Asserting the *shape* and not just "homes come after the commit" is
+        // Asserting the shape and not just "homes come after the commit" is
         // deliberate. A weaker assertion passed while the payload writes were
-        // moved to after the commit -- the image came out identical, because
-        // the payload is prepared in place and those writes put no new bytes
-        // anywhere. The order they are *issued* in is what a real disk would
-        // see, and this is the only thing that checks it.
-        let (before, _, trace) =
-            before_and_after(&|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
-                let root = volume.superblock().root;
-                volume
-                    .create(root, b"ordered", Kind::File, watch)
-                    .expect("created");
-            });
+        // moved to after the commit.
+        let (before, _, trace) = before_and_after(&|volume: &mut Volume<'_, Device<'_>>| {
+            let root = volume.superblock().root;
+            volume
+                .create(root, b"ordered", Kind::File)
+                .expect("created");
+        });
 
         let superblock = crate::Superblock::read(&before).unwrap();
         let commit = u32::try_from(superblock.journal_start).unwrap();
@@ -911,34 +856,33 @@ mod tests {
 
     #[test]
     fn an_interruption_at_every_write_leaves_a_filesystem() {
-        // The claim, in full: after an interruption at *any* write, the
+        // The claim, in full: after an interruption at *any* device write, the
         // filesystem mounts, and what it holds is exactly the result of the
         // transactions that were committed -- no more and no less.
         //
         // "No more" is the half that is easy to get wrong and easy to skip. An
-        // operation of two transactions interrupted between them must leave
-        // the first and not the second; asserting only "before or after" would
-        // pass a filesystem that had applied half of the second, and would
-        // pass it while looking rigorous.
+        // operation of several transactions interrupted between them must
+        // leave the first and not the second; asserting only "before or after"
+        // would pass a filesystem that had applied half of the second, and
+        // would pass it while looking rigorous.
         for (what, stages) in operations() {
             // What the filesystem looks like after each prefix of the stages,
             // built by running those stages and no others. Independent of the
             // mechanism under test: no interruption, no recovery.
-            let mut references = alloc::vec![image(64)];
+            let mut references = vec![image(64)];
             for upto in 1..=stages.len() {
                 let mut bytes = image(64);
-                {
-                    let (mut volume, _) = Volume::mount(&mut bytes, &mut Uninterrupted).unwrap();
+                run(&mut bytes, FRAMES, None, |volume| {
                     for stage in &stages[..upto] {
-                        stage(&mut volume, &mut Uninterrupted);
+                        stage(volume);
                     }
-                }
+                });
                 references.push(bytes);
             }
 
-            let whole = |volume: &mut Volume<'_>, watch: &mut dyn Watch| {
+            let whole = |volume: &mut Volume<'_, Device<'_>>| {
                 for stage in &stages {
-                    stage(volume, watch);
+                    stage(volume);
                 }
             };
             let (before, after, trace) = before_and_after(&whole);
@@ -952,7 +896,7 @@ mod tests {
                 .filter(|(_, block)| **block == commit)
                 .map(|(at, _)| at)
                 .collect();
-            // Two commits to a commit block per transaction: the one that
+            // Two writes to the commit block per transaction: the one that
             // makes it certain and the one that clears it. Counting the pairs
             // is what says how many transactions there are, and asserting it
             // here means a change to the ordering cannot silently make this
@@ -967,25 +911,19 @@ mod tests {
 
             for stop in 0..=trace.len() {
                 let mut bytes = before.clone();
-                {
-                    let mut watch = StopAfter::new(stop as u32);
-                    if let Ok((mut volume, _)) = Volume::mount(&mut bytes, &mut Uninterrupted) {
-                        whole(&mut volume, &mut watch);
-                    }
-                }
+                run(&mut bytes, FRAMES, Some(stop as u32), whole);
 
                 // Whatever state that left, mounting it must work -- and
                 // mounting it is what recovers it.
-                let (_, replayed) =
-                    Volume::mount(&mut bytes, &mut Uninterrupted).unwrap_or_else(|error| {
-                        panic!("{what}: stopped after {stop} writes, it will not mount: {error:?}")
-                    });
+                let replayed = recover(&mut bytes).unwrap_or_else(|error| {
+                    panic!("{what}: stopped after {stop} writes, it will not mount: {error:?}")
+                });
 
                 let done = commits.chunks(2).filter(|pair| stop > pair[0]).count();
                 assert_eq!(
                     visible(&bytes),
                     visible(&references[done]),
-                    "{what}: stopped after {stop} of {} writes, {done} of {} transactions \
+                    "{what}: stopped after {stop} of {} device writes, {done} of {} transactions \
                      committed, replayed {replayed} blocks",
                     trace.len(),
                     stages.len()
@@ -997,33 +935,30 @@ mod tests {
     #[test]
     fn an_interruption_survives_the_writes_being_reordered() {
         // A device is entitled to reorder writes it has not been asked to
-        // order. Within a phase, this issues them backwards -- which is the
-        // permutation most likely to expose an assumption that the first write
-        // of a phase is special.
-        let reversed: Vec<usize> = (0..MAX_STAGED).rev().collect();
-        let run = move |volume: &mut Volume<'_>, watch: &mut dyn Watch| {
+        // order. Within a phase, this issues them backwards -- the permutation
+        // most likely to expose an assumption that the first write of a phase
+        // is special.
+        let staged = 3;
+        let order: Vec<usize> = (0..staged).rev().collect();
+        let backwards = move |volume: &mut Volume<'_, Device<'_>>| {
             let root = volume.superblock().root;
-            let staged = 3;
-            let order: Vec<usize> = reversed[MAX_STAGED - staged..].to_vec();
-            let _ = volume.create_ordered(root, b"backwards", Kind::File, watch, &order);
+            let _ = volume.create_ordered(root, b"backwards", Kind::File, &order);
         };
-        let (before, after, trace) = before_and_after(&run);
-        let commit_at = commit_position(&before, &trace);
+        let (before, after, trace) = before_and_after(&backwards);
         assert_ne!(
             visible(&before),
             visible(&after),
             "the operation did something"
         );
 
+        let superblock = crate::Superblock::read(&before).unwrap();
+        let commit = u32::try_from(superblock.journal_start).unwrap();
+        let commit_at = trace.iter().position(|block| *block == commit).unwrap();
+
         for stop in 0..=trace.len() {
             let mut bytes = before.clone();
-            {
-                let mut watch = StopAfter::new(stop as u32);
-                if let Ok((mut volume, _)) = Volume::mount(&mut bytes, &mut Uninterrupted) {
-                    run(&mut volume, &mut watch);
-                }
-            }
-            let _ = Volume::mount(&mut bytes, &mut Uninterrupted)
+            run(&mut bytes, FRAMES, Some(stop as u32), &backwards);
+            recover(&mut bytes)
                 .unwrap_or_else(|error| panic!("reordered, stopped after {stop}: {error:?}"));
             let expected = if stop > commit_at { &after } else { &before };
             assert_eq!(
@@ -1042,32 +977,21 @@ mod tests {
         // its own because it is invisible: a replay that were *not* idempotent
         // would pass every test above and fail only on the machine that
         // crashed twice.
-        let (before, after, trace) =
-            before_and_after(&|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
-                let root = volume.superblock().root;
-                volume
-                    .create(root, b"twice", Kind::File, watch)
-                    .expect("created");
-            });
-        let commit_at = commit_position(&before, &trace);
-
-        // An image stopped one write after the commit: committed, and its
-        // homes not yet written.
-        let mut crashed = before.clone();
-        {
-            let mut watch = StopAfter::new(commit_at as u32 + 1);
-            if let Ok((mut volume, _)) = Volume::mount(&mut crashed, &mut Uninterrupted) {
-                let root = volume.superblock().root;
-                let _ = volume.create(root, b"twice", Kind::File, &mut watch);
-            }
-        }
+        let (before, after, _) = before_and_after(&|volume: &mut Volume<'_, Device<'_>>| {
+            let root = volume.superblock().root;
+            volume.create(root, b"twice", Kind::File).expect("created");
+        });
+        let crashed = interrupted_after_commit(&before, b"twice");
 
         for stop in 0..8 {
             let mut bytes = crashed.clone();
-            let mut watch = StopAfter::new(stop);
-            let _ = Volume::mount(&mut bytes, &mut watch);
-            let (_, replayed) = Volume::mount(&mut bytes, &mut Uninterrupted)
-                .unwrap_or_else(|e| panic!("recovery stopped after {stop}: {e:?}"));
+            {
+                let mut pages = vec![0u8; FRAMES * BLOCK];
+                let cache = Cache::new(&mut pages, Device::stopping(&mut bytes, stop)).unwrap();
+                let _ = Volume::mount(cache);
+            }
+            let replayed = recover(&mut bytes)
+                .unwrap_or_else(|e| panic!("recovery stopped after {stop} writes: {e:?}"));
             assert_eq!(
                 visible(&bytes),
                 visible(&after),
@@ -1078,59 +1002,30 @@ mod tests {
 
     #[test]
     fn a_read_only_mount_refuses_an_image_that_needs_recovery() {
-        let (before, _, trace) =
-            before_and_after(&|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
-                let root = volume.superblock().root;
-                volume
-                    .create(root, b"pending", Kind::File, watch)
-                    .expect("created");
-            });
-        let commit_at = commit_position(&before, &trace);
-
-        let mut bytes = before.clone();
-        {
-            let mut watch = StopAfter::new(commit_at as u32 + 1);
-            if let Ok((mut volume, _)) = Volume::mount(&mut bytes, &mut Uninterrupted) {
-                let root = volume.superblock().root;
-                let _ = volume.create(root, b"pending", Kind::File, &mut watch);
-            }
-        }
+        let before = image(64);
+        let mut bytes = interrupted_after_commit(&before, b"pending");
 
         // The read-only mount cannot replay it, so it must not mount it. The
         // state it would otherwise hand back is the one *before* an operation
         // that has already been acknowledged.
+        let mut pages = Image::new(&bytes);
         assert_eq!(
-            Filesystem::mount(&bytes).map(|_| ()).unwrap_err(),
+            Filesystem::mount(&mut pages).map(|_| ()).unwrap_err(),
             FsError::NeedsRecovery
         );
 
         // And after a writable mount has recovered it, the read-only mount
         // works again -- so this is a state and not a verdict on the image.
-        let _ = Volume::mount(&mut bytes, &mut Uninterrupted).expect("recovers");
-        assert!(Filesystem::mount(&bytes).is_ok());
+        recover(&mut bytes).expect("recovers");
+        let mut pages = Image::new(&bytes);
+        assert!(Filesystem::mount(&mut pages).is_ok());
     }
 
     #[test]
     fn a_log_that_does_not_add_up_is_not_replayed() {
-        let (before, _, trace) =
-            before_and_after(&|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
-                let root = volume.superblock().root;
-                volume
-                    .create(root, b"torn", Kind::File, watch)
-                    .expect("created");
-            });
-        let commit_at = commit_position(&before, &trace);
+        let before = image(64);
+        let committed = interrupted_after_commit(&before, b"torn");
         let superblock = crate::Superblock::read(&before).unwrap();
-
-        let mut committed = before.clone();
-        {
-            let mut watch = StopAfter::new(commit_at as u32 + 1);
-            if let Ok((mut volume, _)) = Volume::mount(&mut committed, &mut Uninterrupted) {
-                let root = volume.superblock().root;
-                let _ = volume.create(root, b"torn", Kind::File, &mut watch);
-            }
-        }
-        assert!(journal::committed(&committed, &superblock).is_some());
 
         // A byte of the *payload* changed. The commit block is untouched and
         // still says what it said, which is the point: a checksum over the
@@ -1138,8 +1033,7 @@ mod tests {
         let mut damaged = committed.clone();
         let payload = usize::try_from(superblock.journal_start + 1).unwrap() * BLOCK;
         damaged[payload + 9] ^= 0x40;
-        assert!(journal::committed(&damaged, &superblock).is_none());
-        let _ = Volume::mount(&mut damaged, &mut Uninterrupted).expect("it still mounts");
+        recover(&mut damaged).expect("it still mounts");
         assert_eq!(
             visible(&damaged),
             visible(&before),
@@ -1147,33 +1041,18 @@ mod tests {
         );
 
         // A byte of the commit block changed, which is the torn-commit case.
-        let mut torn = committed.clone();
+        let mut torn = committed;
         let head = usize::try_from(superblock.journal_start).unwrap() * BLOCK;
         torn[head + 9] ^= 0x40;
-        let _ = Volume::mount(&mut torn, &mut Uninterrupted).expect("it still mounts");
+        recover(&mut torn).expect("it still mounts");
         assert_eq!(visible(&torn), visible(&before));
     }
 
     #[test]
     fn a_log_naming_a_block_outside_the_image_refuses_to_mount() {
-        let (before, _, trace) =
-            before_and_after(&|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
-                let root = volume.superblock().root;
-                volume
-                    .create(root, b"forged", Kind::File, watch)
-                    .expect("created");
-            });
-        let commit_at = commit_position(&before, &trace);
+        let before = image(64);
+        let mut bytes = interrupted_after_commit(&before, b"forged");
         let superblock = crate::Superblock::read(&before).unwrap();
-
-        let mut bytes = before.clone();
-        {
-            let mut watch = StopAfter::new(commit_at as u32 + 1);
-            if let Ok((mut volume, _)) = Volume::mount(&mut bytes, &mut Uninterrupted) {
-                let root = volume.superblock().root;
-                let _ = volume.create(root, b"forged", Kind::File, &mut watch);
-            }
-        }
 
         // The destination table says block zero -- the superblock. Every
         // number in a log came off a disk, so a replay that trusted them would
@@ -1181,7 +1060,6 @@ mod tests {
         // would do it *because* the log was valid.
         let head = usize::try_from(superblock.journal_start).unwrap() * BLOCK;
         bytes[head + 24..head + 28].copy_from_slice(&0u32.to_le_bytes());
-        // and the checksum is repaired, so that only the range check can catch it.
         let repaired = {
             let mut hash = crate::checksum_of(0x811c_9dc5, &bytes[head..head + 20]);
             let count = crate::u32_at(&bytes[head..], 16).unwrap() as usize;
@@ -1194,15 +1072,9 @@ mod tests {
             if hash == 0 { 1 } else { hash }
         };
         bytes[head + 20..head + 24].copy_from_slice(&repaired.to_le_bytes());
-        assert!(
-            journal::committed(&bytes, &superblock).is_some(),
-            "the log is valid"
-        );
 
         assert_eq!(
-            Volume::mount(&mut bytes, &mut Uninterrupted)
-                .map(|_| ())
-                .unwrap_err(),
+            recover(&mut bytes).unwrap_err(),
             FsError::OutOfRange,
             "a log naming block zero was replayed over the superblock"
         );
@@ -1211,60 +1083,50 @@ mod tests {
     #[test]
     fn removing_a_file_bumps_the_generation_of_what_reuses_it() {
         let mut bytes = image(64);
-        let (mut volume, _) = Volume::mount(&mut bytes, &mut Uninterrupted).unwrap();
-        let root = volume.superblock().root;
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let first = volume.create(root, b"gone", Kind::File).unwrap();
+            volume.write(first, 0, b"contents").unwrap();
+            let was = volume.inode(first).unwrap().generation;
 
-        let first = volume
-            .create(root, b"gone", Kind::File, &mut Uninterrupted)
-            .unwrap();
-        volume
-            .write(first, 0, b"contents", &mut Uninterrupted)
-            .unwrap();
-        let was = volume.inode(first).unwrap().generation;
+            volume.remove(root, b"gone").expect("removed");
+            assert!(volume.lookup(root, b"gone").is_err(), "and it is gone");
+            assert_eq!(
+                volume.inode(first).unwrap().generation,
+                was,
+                "a dead inode keeps its generation -- a stale capability is checked against it"
+            );
 
-        volume
-            .remove(root, b"gone", &mut Uninterrupted)
-            .expect("removed");
-        assert!(volume.lookup(root, b"gone").is_err(), "and it is gone");
-        assert_eq!(
-            volume.inode(first).unwrap().generation,
-            was,
-            "a dead inode keeps its generation -- it is what a stale capability is checked against"
-        );
-
-        let again = volume
-            .create(root, b"other", Kind::File, &mut Uninterrupted)
-            .unwrap();
-        assert_eq!(again, first, "the slot is reused");
-        assert_ne!(
-            volume.inode(again).unwrap().generation,
-            was,
-            "a capability naming the old file would resolve to the new one"
-        );
+            let again = volume.create(root, b"other", Kind::File).unwrap();
+            assert_eq!(again, first, "the slot is reused");
+            assert_ne!(
+                volume.inode(again).unwrap().generation,
+                was,
+                "a capability naming the old file would resolve to the new one"
+            );
+        });
     }
 
     #[test]
     fn a_full_filesystem_refuses_rather_than_half_writes() {
-        let mut bytes = image(16);
+        let mut bytes = image(24);
         let mut names = Vec::new();
-        {
-            let (mut volume, _) = Volume::mount(&mut bytes, &mut Uninterrupted).unwrap();
+        run(&mut bytes, FRAMES, None, |volume| {
             let root = volume.superblock().root;
-
             let mut made = 0;
             loop {
                 let name = format!("file{made:03}");
-                match volume.create(root, name.as_bytes(), Kind::File, &mut Uninterrupted) {
+                match volume.create(root, name.as_bytes(), Kind::File) {
                     Ok(index) => {
-                        // Recorded the moment it is acknowledged, before the write
-                        // that may fail. Recording it afterwards made this test
-                        // claim the last file had not been created, when it had --
-                        // the test was wrong about which operations were
-                        // acknowledged, which is the one thing it exists to know.
+                        // Recorded the moment it is acknowledged, before the
+                        // write that may fail. Recording it afterwards made
+                        // this test claim the last file had not been created
+                        // when it had -- the test was wrong about which
+                        // operations were acknowledged, which is the one thing
+                        // it exists to know.
                         names.push(name);
                         made += 1;
-                        // Each one gets a block, so the disk runs out.
-                        if volume.write(index, 0, b"x", &mut Uninterrupted).is_err() {
+                        if volume.write(index, 0, b"x").is_err() {
                             break;
                         }
                     }
@@ -1274,7 +1136,7 @@ mod tests {
                 assert!(made < 4096, "it never filled up");
             }
             assert!(made > 0, "nothing was created at all");
-        }
+        });
 
         // Full is a refusal, not a state to be repaired: everything that was
         // acknowledged is still there and the filesystem still mounts.
@@ -1288,56 +1150,179 @@ mod tests {
         }
     }
 
-    /// Where in `trace` the commit block is written.
-    fn commit_position(bytes: &[u8], trace: &[u32]) -> usize {
-        let superblock = crate::Superblock::read(bytes).unwrap();
+    #[test]
+    fn the_two_ways_of_reading_the_bitmap_agree() {
+        // There are two, and there had to be. `Bitmap` holds the whole region
+        // at once, which is what `format` and the image builder need and what
+        // a device cannot give; `Volume::free_block` walks it a page at a
+        // time, which is what a device forces. Two answers to "which block is
+        // free" is one block handed to two files, so they are pinned to each
+        // other here rather than trusted to stay in step.
+        let mut bytes = image(64);
+        let superblock = crate::Superblock::read(&bytes).unwrap();
+
+        for _ in 0..4 {
+            let whole = {
+                let mut bitmap = crate::Bitmap::of(&mut bytes, &superblock).unwrap();
+                let first = bitmap.first_free().expect("a free block");
+                // Taken, so the next round asks a different question.
+                bitmap.allocate().expect("and it can be taken");
+                first
+            };
+
+            let mut pages = vec![0u8; FRAMES * BLOCK];
+            let cache = Cache::new(&mut pages, Device::new(&mut bytes)).unwrap();
+            let (mut volume, _) = Volume::mount(cache).unwrap();
+            assert_eq!(
+                volume.free_block_for_test().unwrap(),
+                whole + 1,
+                "the page-by-page scan and the whole-region one disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cached_block_is_not_read_from_the_device_twice() {
+        // What a cache is for, stated as a number. Without it every structure
+        // this filesystem touches is a device round trip, and reading one
+        // directory entry means reading the superblock, a bitmap block, an
+        // inode block and a data block -- every time.
+        let mut bytes = image(64);
+        let mut pages = vec![0u8; FRAMES * BLOCK];
+        let mut cache = Cache::new(&mut pages, Device::new(&mut bytes)).unwrap();
+
+        let first = cache.page(1).expect("a block").to_vec();
+        let (hits, misses, _) = cache.counted();
+        assert_eq!((hits, misses), (0, 1), "the first read went to the device");
+
+        let again = cache.page(1).expect("the same block");
+        assert_eq!(again, &first[..], "and gave the same bytes");
+        let (hits, misses, _) = cache.counted();
+        assert_eq!((hits, misses), (1, 1), "the second did not");
+
+        // And what it says is what the device says, which a cache that
+        // answered from nowhere would also appear to do.
+        assert_eq!(&first[..], &cache.store().bytes[BLOCK..2 * BLOCK]);
+    }
+
+    #[test]
+    fn an_evicted_page_is_written_rather_than_lost() {
+        // A dirty page evicted to make room is a device write that happens
+        // because somebody read something *else*. If it were dropped instead,
+        // a change that had been made would silently not have been -- and
+        // nothing above would notice, because every test there flushes.
+        let mut bytes = image(64);
+        let marker = [0xa5u8; BLOCK];
+        {
+            let mut pages = vec![0u8; MIN_FRAMES * BLOCK];
+            let mut cache = Cache::new(&mut pages, Device::new(&mut bytes)).unwrap();
+            cache.put(40, &marker).expect("a dirty page");
+            // Two more blocks, on a two-frame cache: the dirty one must go.
+            let _ = cache.page(41).expect("a read");
+            let _ = cache.page(42).expect("another");
+            assert!(!cache.dirty(), "it is still holding the change");
+            let (_, _, written) = cache.counted();
+            assert_eq!(written, 1, "it did not write the page it evicted");
+        }
+        assert_eq!(&bytes[40 * BLOCK..41 * BLOCK], &marker[..]);
+    }
+
+    #[test]
+    fn the_smallest_cache_a_filesystem_can_have_still_works() {
+        // Two frames, which is what copying a block to another block needs and
+        // nothing more. Everything above runs with sixteen; a cache that only
+        // worked when it was big enough not to evict would be hiding every
+        // eviction bug behind its own size.
+        let mut bytes = image(64);
+        let mut pages = vec![0u8; MIN_FRAMES * BLOCK];
+        let cache = Cache::new(&mut pages, Device::new(&mut bytes)).unwrap();
+        let (mut volume, _) = Volume::mount(cache).expect("it mounts");
+        let root = volume.superblock().root;
+        volume
+            .create(root, b"cramped", Kind::File)
+            .expect("created");
+        let index = volume.lookup(root, b"cramped").unwrap().0;
+        volume.write(index, 0, b"on two frames").expect("written");
+        drop(volume);
+
+        assert_eq!(
+            visible(&bytes)
+                .into_iter()
+                .map(|(name, _, _, contents)| (name, contents))
+                .collect::<Vec<_>>(),
+            vec![(b"cramped".to_vec(), b"on two frames".to_vec())]
+        );
+
+        // And one frame is refused rather than made to work: a copy needs two
+        // resident at once, and a cache that pretended otherwise would read
+        // its own source back from the device on every block it moved.
+        let mut one = vec![0u8; BLOCK];
+        let mut more = image(64);
+        assert_eq!(
+            Cache::new(&mut one, Device::new(&mut more))
+                .map(|_| ())
+                .unwrap_err(),
+            FsError::OutOfRange
+        );
+    }
+
+    /// An image with a transaction committed and nothing applied.
+    fn interrupted_after_commit(before: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut bytes = before.to_vec();
+        let make = |volume: &mut Volume<'_, Device<'_>>| {
+            let root = volume.superblock().root;
+            let _ = volume.create(root, name, Kind::File);
+        };
+        let trace = {
+            let mut probe = before.to_vec();
+            run(&mut probe, FRAMES, None, make)
+        };
+        let superblock = crate::Superblock::read(before).unwrap();
         let commit = u32::try_from(superblock.journal_start).unwrap();
-        trace
-            .iter()
-            .position(|block| *block == commit)
-            .expect("every transaction writes a commit block")
+        let at = trace.iter().position(|block| *block == commit).unwrap();
+        run(&mut bytes, FRAMES, Some(at as u32 + 1), make);
+        bytes
     }
 
     /// The operations the harness runs, each on a fresh image.
-    #[allow(clippy::type_complexity)]
     fn operations() -> Vec<(&'static str, Vec<Box<Operation>>)> {
         vec![
             (
                 "create",
-                alloc::vec![Box::new(|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
+                vec![Box::new(|volume: &mut Volume<'_, Device<'_>>| {
                     let root = volume.superblock().root;
-                    let _ = volume.create(root, b"made", Kind::File, watch);
+                    let _ = volume.create(root, b"made", Kind::File);
                 }) as Box<Operation>],
             ),
             (
                 "create, then write, then create again",
-                alloc::vec![
-                    Box::new(|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
+                vec![
+                    Box::new(|volume: &mut Volume<'_, Device<'_>>| {
                         let root = volume.superblock().root;
-                        let _ = volume.create(root, b"filled", Kind::File, watch);
+                        let _ = volume.create(root, b"filled", Kind::File);
                     }) as Box<Operation>,
-                    Box::new(|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
+                    Box::new(|volume: &mut Volume<'_, Device<'_>>| {
                         let root = volume.superblock().root;
                         if let Ok((index, _)) = volume.lookup(root, b"filled") {
-                            let _ = volume.write(index, 0, b"forty-two bytes of it", watch);
+                            let _ = volume.write(index, 0, b"forty-two bytes of it");
                         }
                     }),
-                    Box::new(|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
+                    Box::new(|volume: &mut Volume<'_, Device<'_>>| {
                         let root = volume.superblock().root;
-                        let _ = volume.create(root, b"second", Kind::File, watch);
+                        let _ = volume.create(root, b"second", Kind::File);
                     }),
                 ],
             ),
             (
                 "create and remove",
-                alloc::vec![
-                    Box::new(|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
+                vec![
+                    Box::new(|volume: &mut Volume<'_, Device<'_>>| {
                         let root = volume.superblock().root;
-                        let _ = volume.create(root, b"brief", Kind::File, watch);
+                        let _ = volume.create(root, b"brief", Kind::File);
                     }) as Box<Operation>,
-                    Box::new(|volume: &mut Volume<'_>, watch: &mut dyn Watch| {
+                    Box::new(|volume: &mut Volume<'_, Device<'_>>| {
                         let root = volume.superblock().root;
-                        let _ = volume.remove(root, b"brief", watch);
+                        let _ = volume.remove(root, b"brief");
                     }),
                 ],
             ),

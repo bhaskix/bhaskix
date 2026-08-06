@@ -14,8 +14,8 @@
 //! **Where the claim lives** is one instant: the write of the commit block.
 //! Before it, the transaction does not exist and the filesystem is exactly
 //! what it was. After it, the transaction is certain and replay will finish
-//! it, however many times it takes. So "acknowledged" has a precise
-//! definition here — the commit block was written — rather than the vague one
+//! it, however many times it takes. So "acknowledged" has a precise definition
+//! here — the commit block reached the device — rather than the vague one
 //! ("the call returned") that lets a filesystem be wrong and pass its tests.
 //!
 //! **What it rests on.** That a block write either happens or does not. Real
@@ -33,29 +33,25 @@
 //! naming because a journal whose replay were not idempotent would need a
 //! second mechanism to protect the first.
 //!
-//! The order, then:
+//! The order — and since step 6 put a cache in the way, "written" below means
+//! *reached the device*, which is a flush and not an assignment:
 //!
 //! 1. File data to its home, for a block being allocated. Not journalled —
-//!    RFC 0015 says data is not — but written *before* the commit that
-//!    references it, so a block that an inode claims has never been a block
-//!    holding somebody else's bytes.
-//! 2. Every changed metadata block into the log.
+//!    RFC 0015 says data is not — but on the device before the commit that
+//!    references it, so a block an inode claims has never been a block holding
+//!    somebody else\'s bytes.
+//! 2. Every changed metadata block into the log, and flushed.
 //! 3. The commit block. **This is the acknowledgement.**
-//! 4. Each logged block to its home.
+//! 4. Each logged block to its home, and flushed — *before* the log is
+//!    cleared, which is the ordering the cache introduced and the only one
+//!    here that is not obvious.
 //! 5. The commit block cleared.
-//!
-//! An interruption in 1 or 2 leaves nothing committed. In 3, the checksum
-//! fails and nothing is committed. In 4 or 5, the commit stands and replay
-//! finishes the job. There is no sixth case, and the harness in
-//! [`crate::volume`] proves it by stopping at every write in turn rather than
-//! at one chosen point — a journal whose recovery has been tested at one
-//! arbitrary place has been tested nowhere.
 
-use crate::{BLOCK, FsError, Superblock, checksum, put, u32_at, u64_at};
+use crate::{BLOCK, FsError, Pages, Superblock, put, u32_at, u64_at};
 
 /// How many blocks one transaction may change.
 ///
-/// The journal's payload area, one block each. An operation that would need
+/// The journal\'s payload area, one block each. An operation that would need
 /// more is refused before it starts: half of a change that does not fit is
 /// worse than none of it.
 pub const MAX_STAGED: usize = 8;
@@ -80,71 +76,90 @@ pub struct Commit {
 /// applied — and a caller that could distinguish them would be tempted to
 /// treat "damaged" differently from "absent", which is how a torn commit gets
 /// replayed.
-#[must_use]
-pub fn committed(bytes: &[u8], superblock: &Superblock) -> Option<Commit> {
-    let head = block_of(bytes, superblock.journal_start)?;
-    if u64_at(head, 0)? != crate::JOURNAL_MAGIC {
-        return None;
-    }
-    let sequence = u64_at(head, 8)?;
-    let count = u32_at(head, 16)?;
-    let stored = u32_at(head, 20)?;
-    if sequence == 0 || count == 0 || count as usize > MAX_STAGED {
-        return None;
-    }
-    if u64::from(count) >= superblock.journal_blocks {
-        return None;
+///
+/// # Errors
+///
+/// As [`Pages::page`].
+pub fn committed<P: Pages>(
+    pages: &mut P,
+    superblock: &Superblock,
+) -> Result<Option<Commit>, FsError> {
+    let start = u32::try_from(superblock.journal_start).map_err(|_| FsError::OutOfRange)?;
+    let head = pages.page(start)?;
+    let (Some(magic), Some(sequence), Some(count)) =
+        (u64_at(head, 0), u64_at(head, 8), u32_at(head, 16))
+    else {
+        return Ok(None);
+    };
+    if magic != crate::JOURNAL_MAGIC
+        || sequence == 0
+        || count == 0
+        || count as usize > MAX_STAGED
+        || u64::from(count) >= superblock.journal_blocks
+    {
+        return Ok(None);
     }
 
     // The checksum covers the header, the table of destinations, *and* the
     // logged blocks themselves. Covering the header alone would let a
     // transaction commit over payload blocks that were never fully written --
     // which is precisely the interruption this is here to survive.
-    if stored != transaction_checksum(bytes, superblock, count)? {
-        return None;
+    let expected = transaction_checksum(pages, superblock, count)?;
+    let head = pages.page(start)?;
+    if u32_at(head, 20) != Some(expected) {
+        return Ok(None);
     }
-    Some(Commit { sequence, count })
+    Ok(Some(Commit { sequence, count }))
 }
 
-/// Where the `index`th logged block goes.
-fn home(bytes: &[u8], superblock: &Superblock, index: u32) -> Option<u32> {
-    let head = block_of(bytes, superblock.journal_start)?;
-    u32_at(head, TABLE + (index as usize) * 4)
+/// Whether a committed transaction is waiting.
+///
+/// # Errors
+///
+/// As [`Pages::page`].
+pub fn pending<P: Pages>(pages: &mut P, superblock: &Superblock) -> Result<bool, FsError> {
+    Ok(committed(pages, superblock)?.is_some())
 }
 
 /// The checksum a commit block should carry.
-fn transaction_checksum(bytes: &[u8], superblock: &Superblock, count: u32) -> Option<u32> {
-    let head = block_of(bytes, superblock.journal_start)?;
+fn transaction_checksum<P: Pages>(
+    pages: &mut P,
+    superblock: &Superblock,
+    count: u32,
+) -> Result<u32, FsError> {
+    let start = u32::try_from(superblock.journal_start).map_err(|_| FsError::OutOfRange)?;
     // FNV-1a is a running hash, so the pieces are folded one after another
     // rather than copied into one buffer -- there is no buffer to copy into in
-    // a filesystem that must work with no allocator.
-    let mut hash = crate::checksum_of(0x811c_9dc5, head.get(..20)?);
-    hash = crate::checksum_of(hash, head.get(TABLE..TABLE + count as usize * 4)?);
+    // a filesystem that must work with no allocator. With pages that matters
+    // for a second reason: on a small cache the header and the payload are
+    // never resident together, so a hash that needed them at once could not be
+    // computed at all.
+    let head = pages.page(start)?;
+    let mut hash = crate::checksum_of(0x811c_9dc5, head.get(..20).ok_or(FsError::OutOfRange)?);
+    hash = crate::checksum_of(
+        hash,
+        head.get(TABLE..TABLE + count as usize * 4)
+            .ok_or(FsError::OutOfRange)?,
+    );
     for index in 0..count {
-        let logged = block_of(bytes, superblock.journal_start + 1 + u64::from(index))?;
+        let logged = pages.page(start + 1 + index)?;
         hash = crate::checksum_of(hash, logged);
     }
-    Some(if hash == 0 { 1 } else { hash })
+    Ok(if hash == 0 { 1 } else { hash })
 }
 
-/// One block of the image.
-fn block_of(bytes: &[u8], index: u64) -> Option<&[u8]> {
-    let at = usize::try_from(index).ok()?.checked_mul(BLOCK)?;
-    bytes.get(at..at.checked_add(BLOCK)?)
-}
-
-/// Writes the commit block for a transaction whose payload is already in place.
+/// Builds the commit block for a transaction whose payload is already in place.
 ///
-/// Called only after every payload block has been written, because the
-/// checksum is over them: writing this first would commit a transaction whose
+/// Called only after every payload block has reached the device, because the
+/// checksum is over them: committing first would commit a transaction whose
 /// contents were still arriving.
 ///
 /// # Errors
 ///
-/// [`FsError::OutOfRange`] if the image cannot hold the journal the superblock
-/// describes, and [`FsError::Full`] for more blocks than the log has room for.
-pub fn write_commit(
-    bytes: &mut [u8],
+/// [`FsError::Full`] for more blocks than the log has room for, and as
+/// [`Pages::page`].
+pub fn build_commit<P: Pages>(
+    pages: &mut P,
     superblock: &Superblock,
     sequence: u64,
     homes: &[u32],
@@ -164,50 +179,33 @@ pub fn write_commit(
         put(&mut head, TABLE + index * 4, &block.to_le_bytes()).ok_or(FsError::OutOfRange)?;
     }
 
-    // The checksum is computed against the image with this header in place,
-    // which it is not yet -- so the header goes into a scratch block first,
-    // the hash is folded over it and the payload, and the finished block is
-    // what the caller writes. One write, and it is the commit.
-    let at = usize::try_from(superblock.journal_start)
-        .ok()
-        .and_then(|start| start.checked_mul(BLOCK))
-        .ok_or(FsError::OutOfRange)?;
+    let start = u32::try_from(superblock.journal_start).map_err(|_| FsError::OutOfRange)?;
     let mut hash = crate::checksum_of(0x811c_9dc5, &head[..20]);
     hash = crate::checksum_of(hash, &head[TABLE..TABLE + homes.len() * 4]);
     for index in 0..homes.len() {
-        let logged = block_of(bytes, superblock.journal_start + 1 + index as u64)
-            .ok_or(FsError::OutOfRange)?;
+        let logged = pages.page(start + 1 + index as u32)?;
         hash = crate::checksum_of(hash, logged);
     }
     let hash = if hash == 0 { 1 } else { hash };
     put(&mut head, 20, &hash.to_le_bytes()).ok_or(FsError::OutOfRange)?;
-
-    let _ = at;
-    let _ = checksum;
     Ok(head)
 }
 
-/// Where the `index`th logged block is, and where it belongs.
+/// Where the `index`th logged block belongs.
 ///
 /// # Errors
 ///
-/// [`FsError::OutOfRange`] if either is outside the image.
-pub fn logged(
-    bytes: &[u8],
-    superblock: &Superblock,
-    index: u32,
-) -> Result<(u32, [u8; BLOCK]), FsError> {
-    let destination = home(bytes, superblock, index).ok_or(FsError::OutOfRange)?;
+/// [`FsError::OutOfRange`] if the destination is outside the filesystem.
+pub fn home<P: Pages>(pages: &mut P, superblock: &Superblock, index: u32) -> Result<u32, FsError> {
+    let start = u32::try_from(superblock.journal_start).map_err(|_| FsError::OutOfRange)?;
+    let head = pages.page(start)?;
+    let destination = u32_at(head, TABLE + (index as usize) * 4).ok_or(FsError::OutOfRange)?;
     // Every destination came off the disk. A log that named the superblock, or
-    // a block past the end of the image, would be replayed straight over
-    // them -- so the range is checked here, on the way out, rather than
-    // trusted because it was written by this code the last time.
-    if u64::from(destination) == 0 || u64::from(destination) >= superblock.blocks {
+    // a block past the end of the filesystem, would be replayed straight over
+    // them -- so the range is checked here, on the way out, rather than trusted
+    // because it was written by this code the last time.
+    if destination == 0 || u64::from(destination) >= superblock.blocks {
         return Err(FsError::OutOfRange);
     }
-    let source = block_of(bytes, superblock.journal_start + 1 + u64::from(index))
-        .ok_or(FsError::OutOfRange)?;
-    let mut contents = [0u8; BLOCK];
-    contents.copy_from_slice(source);
-    Ok((destination, contents))
+    Ok(destination)
 }

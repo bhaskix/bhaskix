@@ -37,7 +37,7 @@
 //! above.
 
 use bhaskix_abi::Chunk;
-use bhaskix_fs::{Filesystem, Kind};
+use bhaskix_fs::{Filesystem, Image, Kind};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cap::{self, ObjectKind, ObjectRef, Rights};
@@ -110,7 +110,8 @@ const fn unpack(id: u64) -> (u32, u32) {
 /// fail by *succeeding* — the shell reads the file it is supposed to be unable
 /// to reach.
 pub fn root_identity() -> Option<u64> {
-    let mounted = Filesystem::mount(image()?).ok()?;
+    let mut pages = Image::new(image()?);
+    let mut mounted = Filesystem::mount(&mut pages).ok()?;
     let root = mounted.root().ok()?;
     Some(pack(mounted.superblock().root, root.generation))
 }
@@ -121,7 +122,8 @@ pub fn root_identity() -> Option<u64> {
 /// equivalent: it resolves names in what it holds, and this is how what it
 /// holds gets decided.
 pub fn directory_under_root(name: &[u8]) -> Option<u64> {
-    let mounted = Filesystem::mount(image()?).ok()?;
+    let mut pages = Image::new(image()?);
+    let mut mounted = Filesystem::mount(&mut pages).ok()?;
     let root = mounted.root().ok()?;
     let (index, inode) = mounted.lookup(&root, name).ok()?;
     (inode.kind == Kind::Directory).then(|| pack(index, inode.generation))
@@ -137,7 +139,8 @@ pub fn directory_under_root(name: &[u8]) -> Option<u64> {
 /// a capability naming the same inode, one generation later, exactly as a
 /// capability that outlived its directory would.
 pub fn stale_directory_under_root(name: &[u8]) -> Option<u64> {
-    let mounted = Filesystem::mount(image()?).ok()?;
+    let mut pages = Image::new(image()?);
+    let mut mounted = Filesystem::mount(&mut pages).ok()?;
     let root = mounted.root().ok()?;
     let (index, inode) = mounted.lookup(&root, name).ok()?;
     (inode.kind == Kind::Directory).then(|| pack(index, inode.generation.wrapping_add(1)))
@@ -262,7 +265,8 @@ fn resolve_and_install(
         Ok(object.id)
     })?;
 
-    let mounted = Filesystem::mount(bytes).map_err(|_| Status::NotImplemented)?;
+    let mut pages = Image::new(bytes);
+    let mut mounted = Filesystem::mount(&mut pages).map_err(|_| Status::NotImplemented)?;
     let (inode_index, generation) = unpack(directory);
     let inode = mounted
         .inode(inode_index)
@@ -348,7 +352,8 @@ pub fn size_of(capability: u64) -> Option<u64> {
         found
     })??;
 
-    let mounted = Filesystem::mount(bytes).ok()?;
+    let mut pages = Image::new(bytes);
+    let mut mounted = Filesystem::mount(&mut pages).ok()?;
     let (inode_index, generation) = unpack(identity);
     let inode = mounted.inode(inode_index).ok()?;
     // A stale file capability reports nothing rather than the size of whatever

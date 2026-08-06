@@ -797,14 +797,16 @@ fi
 # RFC 0015 step 5. A filesystem written, interrupted after the commit, and
 # recovered by mounting it -- in the machine, on this target, with no std.
 #
-# The exhaustive proof is on the host, where the harness stops at every write
-# of every operation; what this adds is that the same code does the same thing
-# here. Three things in one line, and all three matter: the read-only mount
-# *refused* an image with a pending transaction rather than quietly handing
-# back the state before it, the replay wrote blocks (so there was something to
-# recover and it was recovered), and the file the interrupted operation
-# created is present -- it was acknowledged, so it must be.
-if grep -qE "journal +wrote a filesystem in memory, stopped it one write after the commit, and mounting replayed [1-9][0-9]* blocks: .recovered. is there and so is .survivor." "$LOG"; then
+# The exhaustive proof is on the host, where the harness stops at every *device*
+# write of every operation; what this adds is that the same code does the same
+# thing here, on this target, with its pages in .bss. Four things in one line
+# and all four matter: the cache answered reads without asking the device (a
+# non-zero hit count, which is the whole of RFC 0015 step 6), the read-only
+# mount *refused* an image with a pending transaction rather than quietly
+# handing back the state before it, the replay wrote blocks, and the file the
+# interrupted operation created is present -- it was acknowledged, so it must
+# be.
+if grep -qE "journal +wrote a filesystem through [0-9]+ cached pages \([1-9][0-9]* hits, [0-9]+ misses\), stopped it one device write after the commit, and mounting replayed [1-9][0-9]* blocks: .recovered. is there and so is .survivor." "$LOG"; then
     pass "a filesystem written, interrupted after its commit, and recovered by mounting"
 else
     fail "the journal did not survive an interruption in the machine"

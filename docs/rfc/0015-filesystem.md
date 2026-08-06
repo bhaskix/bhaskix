@@ -202,9 +202,55 @@ block is given a *read-only capability to those frames* rather than a copy: RFC 
 what makes that safe to hand out, and the same machinery already takes a mapping away from a domain
 that is running.
 
+**This paragraph is not built, and the reason is worth more than the paragraph.** Two things it
+glosses over turned out to decide the design:
+
+- *"Those frames" cannot be the cache.* A capability to the whole cache exposes every other block in
+  it — other files' data, and every piece of metadata the filesystem has touched. It has to be a
+  capability to the one frame holding the one block, which this kernel can already express: a
+  `Frame` capability, the same kind a device register window is.
+- *A frame handed out is a frame that must not be evicted.* Otherwise the holder keeps reading it
+  after it has become somebody else's block, which is the worst failure available here — not a
+  crash, a silent disclosure. So the cache must know which of its frames are lent out, refuse to
+  evict them, and **revoke** when the lending ends. "When the lending ends" is the hard part, and
+  the answer is when the client's `File` capability goes: that is a lifetime only the *owner of the
+  cache* can observe, and in this system that owner is a service and not the nucleus.
+
+Which is the same conclusion the step-4 debt reached from the other side. Handing out cached frames
+and moving the filesystem out of the kernel are one piece of work, not two, and it is larger than
+the tail of a step. It is written up in *Still open* below rather than half-built here.
+
+The cache's frames are supplied from outside rather than owned, which is what keeps that door open:
+in a machine they can be the pages of a `Memory` object. They are not one yet — a `Memory` object's
+frames are individually allocated and not contiguous, so the frame table has to become a list of
+pages before it can be one.
+
 **Write-back, not write-through**, with the journal deciding when a dirty page may be written home —
 which is the only ordering constraint the cache has and the reason it cannot be designed before the
 journal.
+
+**Recorded on building it (step 6).** The cache turned out to be the smaller half of this step. The
+larger half was that a filesystem with a cache cannot be handed its own bytes: until step 6, every
+structure was read by indexing into one slice, which is only possible because the image happened to
+be memory. A filesystem on a *disk* has a device it can ask for one block at a time and somewhere to
+keep the answers, and those are two different things — so there is now a `Store` (the device: how
+many blocks, read one, write one) and `Pages` (where a block is, right now). An `Image` answers by
+pointing into a slice it already has; a `Cache` answers by looking, and going to the `Store` when it
+must. There is exactly **one** implementation of "what an inode is" above that boundary. Two readers,
+one for images and one for devices, would be two chances to disagree about the same bytes.
+
+*The ordering the cache adds.* Clearing the log while a changed page is still dirty throws away the
+only record of a change that has not happened — at the moment everything looks finished. So a
+transaction is now written in **flushes**: the payload reaches the device, then the commit, then the
+homes reach the device, and only then is the log cleared. Recovery has the same constraint for the
+same reason, and it is the one an implementation would most plausibly leave out: without it a
+survivable crash becomes a lost one on the *second* crash.
+
+*The interruption moved to the device.* Steps 5's harness announced writes through a separate
+observer, which was one indirection away from the truth — a write is interrupted at the device, not
+on the way to it. The harness is now a `Store` that stops, so a trace is what the disk actually saw.
+With a cache in the way that is no longer the sequence the filesystem asked for, and that difference
+is precisely what a cache is.
 
 ---
 
@@ -355,6 +401,27 @@ it here would be this RFC deciding something it does not have to.
   rights the directory was held with, and never more. There is no way yet to hand out a directory
   that may be *listed* but not *opened through*, which is a distinction a supervisor will want.
 
+### Raised by step 6, and the largest thing left in this RFC
+
+**Move the filesystem out of the nucleus, and hand out cached frames.** These are one piece of work.
+
+The kernel currently resolves `Directory` capabilities itself, in an image it mounted (step 4's
+debt), and it holds the page cache (step 6). Both belong in a service: RFC 0013's whole argument is
+that a service in the nucleus can do anything, and this one now parses a filesystem and caches a
+disk. Two things have to happen together for that to be worth doing:
+
+- Resolution becomes a *message*, not a function call. `OPEN_AT` in the kernel would have to ask the
+  filesystem service and wait, which is a re-entrancy hazard on the syscall path; the alternative is
+  that the *program* asks the service, and the kernel's part shrinks to minting the capability the
+  service asks for. That is a design question and not an implementation detail.
+- Lending a cached frame needs an owner that can see when the lending ends, so that it can pin the
+  frame and revoke it. Only the service holding both the cache and the client's `File` capability
+  can.
+
+Neither is a tail; together they are the shape of the *next* RFC, and the pieces this one built —
+`Store`, `Pages`, a cache whose frames are supplied from outside — are the ones that make it
+possible to write.
+
 ### Still open
 
 **How large may the cache grow?** The resource envelope counts frames a domain owns, and a cache
@@ -388,4 +455,6 @@ whether the order is right.
    where a mistake cannot destroy anything. ✅ Done — see the amendment and the correction above.
 5. **Writes, and the journal.** With the interruption harness, because the journal's claim is the
    only thing here that cannot be checked by looking. ✅ Done — see the notes above.
-6. **The page cache**, last, because the journal decides when a dirty page may go home.
+6. **The page cache**, last, because the journal decides when a dirty page may go home. ✅ Done for
+   the cache and the ordering; the *hand a reader a capability to a cached frame* half is not built,
+   for the reasons recorded above.

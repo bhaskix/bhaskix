@@ -29,10 +29,12 @@
     )
 )]
 
+pub mod cache;
 pub mod journal;
 pub mod volume;
 
-pub use volume::{Uninterrupted, Volume, Watch};
+pub use cache::{Cache, Image, Memory, Pages, Store};
+pub use volume::Volume;
 
 /// How big a block is, everywhere.
 ///
@@ -226,6 +228,24 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Which block holds inode `index`, and where in it.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::OutOfRange`] past the end of the table.
+    pub fn inode_at(&self, index: u32) -> Result<(u32, usize), FsError> {
+        if u64::from(index) >= self.inodes {
+            return Err(FsError::OutOfRange);
+        }
+        let byte = self
+            .inode_start
+            .checked_mul(BLOCK as u64)
+            .and_then(|start| start.checked_add(u64::from(index) * INODE as u64))
+            .ok_or(FsError::OutOfRange)?;
+        let block = u32::try_from(byte / BLOCK as u64).map_err(|_| FsError::OutOfRange)?;
+        Ok((block, (byte % BLOCK as u64) as usize))
+    }
+
     /// Bytes the superblock's checksum covers.
     const COVERED: usize = 76;
 
@@ -238,6 +258,20 @@ impl Superblock {
     /// image or run backwards.
     pub fn read(bytes: &[u8]) -> Result<Self, FsError> {
         let head = bytes.get(..BLOCK).ok_or(FsError::NotAFilesystem)?;
+        Self::read_head(head, (bytes.len() / BLOCK) as u64)
+    }
+
+    /// The same, from the first block alone and a count of the rest.
+    ///
+    /// A reader that fetches one block at a time has no whole image to measure,
+    /// so the size it is checked against comes from the device rather than from
+    /// the length of a slice. Same checks, one of them asked of somebody else.
+    ///
+    /// # Errors
+    ///
+    /// As [`Superblock::read`].
+    pub fn read_head(head: &[u8], blocks: u64) -> Result<Self, FsError> {
+        let head = head.get(..BLOCK).ok_or(FsError::NotAFilesystem)?;
         if u64_at(head, 0) != Some(MAGIC) || u32_at(head, 8) != Some(VERSION) {
             return Err(FsError::NotAFilesystem);
         }
@@ -272,7 +306,7 @@ impl Superblock {
             || found.data_start <= found.journal_start
             || found.data_start.checked_sub(found.journal_start) != Some(found.journal_blocks)
             || found.data_start >= found.blocks
-            || found.blocks > (bytes.len() / BLOCK) as u64
+            || found.blocks > blocks
             || u64::from(found.root) >= found.inodes
         {
             return Err(FsError::OutOfRange);
@@ -779,39 +813,41 @@ pub fn format(bytes: &mut [u8], inodes: u64) -> Result<Superblock, FsError> {
 /// proved by reading an image somebody else built before anything is allowed
 /// to write one, so a bug in the writer cannot be mistaken for a bug in the
 /// reader.
-pub struct Filesystem<'a> {
-    bytes: &'a [u8],
+pub struct Filesystem<'p, P: Pages> {
+    pages: &'p mut P,
     superblock: Superblock,
 }
 
-impl<'a> Filesystem<'a> {
-    /// Reads the superblock and takes the image.
+impl<'p, P: Pages> Filesystem<'p, P> {
+    /// Mounts what `pages` holds.
     ///
     /// # Errors
     ///
-    /// Whatever [`Superblock::read`] refused it for.
-    pub fn mount(bytes: &'a [u8]) -> Result<Self, FsError> {
-        let superblock = Superblock::read(bytes)?;
+    /// As [`Superblock::read`], and [`FsError::NeedsRecovery`] if the log
+    /// holds a committed transaction — which a reader cannot apply.
+    pub fn mount(pages: &'p mut P) -> Result<Self, FsError> {
+        let blocks = u64::from(pages.blocks());
+        let head = pages.page(0)?;
+        let superblock = Superblock::read_head(head, blocks)?;
         // A read-only mount cannot replay a journal, and must not pretend
         // there is nothing to replay. An image with a committed transaction
         // still in its log describes the filesystem as it was *before* an
         // operation that has already been acknowledged; handing that back
         // would be indistinguishable, to every caller, from a filesystem
         // nobody had written to.
-        if journal::committed(bytes, &superblock).is_some() {
+        if journal::pending(pages, &superblock)? {
             return Err(FsError::NeedsRecovery);
         }
-        Ok(Self { bytes, superblock })
+        Ok(Self { pages, superblock })
     }
 
     /// The same, from a superblock already read and a journal already dealt
     /// with.
     ///
-    /// For [`Volume`], which has recovered the image before it gets here and
-    /// would otherwise have to re-read and re-check what it just replayed.
-    #[must_use]
-    pub const fn mounted(bytes: &'a [u8], superblock: Superblock) -> Self {
-        Self { bytes, superblock }
+    /// For [`Volume`], which has recovered before it gets here and would
+    /// otherwise re-read and re-check what it has just replayed.
+    pub const fn using(pages: &'p mut P, superblock: Superblock) -> Self {
+        Self { pages, superblock }
     }
 
     /// What the superblock says.
@@ -820,30 +856,39 @@ impl<'a> Filesystem<'a> {
         &self.superblock
     }
 
-    /// One inode.
+    /// Reads one inode.
     ///
     /// # Errors
     ///
-    /// As [`Inode::read`].
-    pub fn inode(&self, index: u32) -> Result<Inode, FsError> {
-        Inode::read(self.bytes, &self.superblock, index)
+    /// As [`Inode::decode`], and [`FsError::OutOfRange`] past the table.
+    pub fn inode(&mut self, index: u32) -> Result<Inode, FsError> {
+        let (block, offset) = self.superblock.inode_at(index)?;
+        let page = self.pages.page(block)?;
+        Inode::decode(
+            page.get(offset..offset + INODE)
+                .ok_or(FsError::OutOfRange)?,
+        )
     }
 
-    /// The block `which` of an inode's contents, if it has one.
+    /// Which block of the device holds block `which` of an inode's contents.
     ///
     /// Follows the indirect block when the direct ones run out. Every number
-    /// read out of an indirect block is checked against the image before it is
-    /// used, because it came off a disk.
-    fn block_of(&self, inode: &Inode, which: usize) -> Option<&'a [u8]> {
+    /// read out of an indirect block is checked before it is used, because it
+    /// came off a disk.
+    ///
+    /// Returns the *number* rather than the bytes, which the page-based reader
+    /// forces and which is an improvement: the old one returned a slice, so
+    /// the range check and the use of it were in different places and only one
+    /// of them was obviously load-bearing.
+    fn block_of(&mut self, inode: &Inode, which: usize) -> Option<u32> {
         let number = if which < inode.direct.len() {
             inode.direct[which]
         } else {
             let indirect = inode.indirect;
-            if indirect == 0 {
+            if indirect == 0 || u64::from(indirect) >= self.superblock.blocks {
                 return None;
             }
-            let at = (indirect as usize).checked_mul(BLOCK)?;
-            let table = self.bytes.get(at..at.checked_add(BLOCK)?)?;
+            let table = self.pages.page(indirect).ok()?;
             u32_at(
                 table,
                 which.checked_sub(inode.direct.len())?.checked_mul(4)?,
@@ -853,8 +898,7 @@ impl<'a> Filesystem<'a> {
         if number == 0 || u64::from(number) >= self.superblock.blocks {
             return None;
         }
-        let at = (number as usize).checked_mul(BLOCK)?;
-        self.bytes.get(at..at.checked_add(BLOCK)?)
+        Some(number)
     }
 
     /// Copies `into` from `offset`, and says how many bytes there were.
@@ -862,8 +906,7 @@ impl<'a> Filesystem<'a> {
     /// Never reads past the size the inode declares, whatever its block
     /// pointers say — a file whose blocks outlast its length would otherwise
     /// hand back whatever those blocks held before.
-    #[must_use]
-    pub fn read(&self, inode: &Inode, offset: u64, into: &mut [u8]) -> usize {
+    pub fn read(&mut self, inode: &Inode, offset: u64, into: &mut [u8]) -> usize {
         if inode.kind != Kind::File || offset >= inode.size {
             return 0;
         }
@@ -873,7 +916,10 @@ impl<'a> Filesystem<'a> {
         let mut done = 0;
         while done < want {
             let at = offset as usize + done;
-            let Some(block) = self.block_of(inode, at / BLOCK) else {
+            let Some(number) = self.block_of(inode, at / BLOCK) else {
+                break;
+            };
+            let Ok(block) = self.pages.page(number) else {
                 break;
             };
             let within = at % BLOCK;
@@ -892,13 +938,16 @@ impl<'a> Filesystem<'a> {
     /// Stops at the size the inode declares rather than at the end of the
     /// block, so a directory that grew and shrank does not list what it used
     /// to hold.
-    pub fn list(&self, inode: &Inode, mut f: impl FnMut(&Entry)) {
+    pub fn list(&mut self, inode: &Inode, mut f: impl FnMut(&Entry)) {
         if inode.kind != Kind::Directory {
             return;
         }
         let entries = (inode.size as usize) / ENTRY;
         for which in 0..entries {
-            let Some(block) = self.block_of(inode, which * ENTRY / BLOCK) else {
+            let Some(number) = self.block_of(inode, which * ENTRY / BLOCK) else {
+                break;
+            };
+            let Ok(block) = self.pages.page(number) else {
                 break;
             };
             let within = (which * ENTRY) % BLOCK;
@@ -917,7 +966,7 @@ impl<'a> Filesystem<'a> {
     ///
     /// [`FsError::WrongKind`] if the inode is not a directory, and
     /// [`FsError::NotFound`] if it holds no such name.
-    pub fn lookup(&self, directory: &Inode, name: &[u8]) -> Result<(u32, Inode), FsError> {
+    pub fn lookup(&mut self, directory: &Inode, name: &[u8]) -> Result<(u32, Inode), FsError> {
         if directory.kind != Kind::Directory {
             return Err(FsError::WrongKind);
         }
@@ -935,8 +984,9 @@ impl<'a> Filesystem<'a> {
     ///
     /// # Errors
     ///
-    /// As [`Inode::read`], and [`FsError::WrongKind`] if the root is not one.
-    pub fn root(&self) -> Result<Inode, FsError> {
+    /// As [`Filesystem::inode`], and [`FsError::WrongKind`] if the root is not
+    /// one.
+    pub fn root(&mut self) -> Result<Inode, FsError> {
         let root = self.inode(self.superblock.root)?;
         if root.kind != Kind::Directory {
             return Err(FsError::WrongKind);
@@ -953,8 +1003,8 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        BLOCK, Bitmap, ENTRY, Entry, Filesystem, FsError, Inode, JOURNAL_BLOCKS, Kind, Superblock,
-        format,
+        BLOCK, Bitmap, ENTRY, Entry, Filesystem, FsError, Image, Inode, JOURNAL_BLOCKS, Kind,
+        Superblock, format,
     };
 
     fn image(blocks: usize) -> Vec<u8> {
@@ -1288,7 +1338,8 @@ mod tests {
     fn a_file_reads_back_what_was_written_into_it() {
         let contents: Vec<u8> = (0..9000u32).map(|byte| byte as u8).collect();
         let bytes = with_a_file(b"greeting", &contents);
-        let fs = Filesystem::mount(&bytes).expect("a filesystem");
+        let mut pages = Image::new(&bytes);
+        let mut fs = Filesystem::mount(&mut pages).expect("a filesystem");
 
         let root = fs.root().expect("a root");
         let (index, inode) = fs.lookup(&root, b"greeting").expect("the file is there");
@@ -1316,7 +1367,8 @@ mod tests {
         // the block would hand back whatever it held before, which for a
         // filesystem that reuses blocks is somebody else's data.
         let bytes = with_a_file(b"short", b"0123456789");
-        let fs = Filesystem::mount(&bytes).unwrap();
+        let mut pages = Image::new(&bytes);
+        let mut fs = Filesystem::mount(&mut pages).unwrap();
         let root = fs.root().unwrap();
         let (_, inode) = fs.lookup(&root, b"short").unwrap();
 
@@ -1332,7 +1384,8 @@ mod tests {
     #[test]
     fn a_name_that_is_not_there_is_not_found() {
         let bytes = with_a_file(b"greeting", b"hello");
-        let fs = Filesystem::mount(&bytes).unwrap();
+        let mut pages = Image::new(&bytes);
+        let mut fs = Filesystem::mount(&mut pages).unwrap();
         let root = fs.root().unwrap();
 
         assert_eq!(fs.lookup(&root, b"absent").unwrap_err(), FsError::NotFound);
@@ -1357,7 +1410,8 @@ mod tests {
         inode.direct[0] = 0xffff_fff0;
         inode.write(&mut bytes, &superblock, 1).unwrap();
 
-        let fs = Filesystem::mount(&bytes).unwrap();
+        let mut pages = Image::new(&bytes);
+        let mut fs = Filesystem::mount(&mut pages).unwrap();
         let inode = fs.inode(1).unwrap();
         let mut read = [0u8; 16];
         assert_eq!(fs.read(&inode, 0, &mut read), 0);

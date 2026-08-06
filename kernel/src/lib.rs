@@ -1463,7 +1463,8 @@ fn filesystem_self_test() -> bool {
         return true;
     };
 
-    let mounted = match bhaskix_fs::Filesystem::mount(image.bytes()) {
+    let mut pages = bhaskix_fs::Image::new(image.bytes());
+    let mut mounted = match bhaskix_fs::Filesystem::mount(&mut pages) {
         Ok(mounted) => mounted,
         Err(error) => {
             println!("    filesystem     FAILED to mount: {error:?}");
@@ -1527,36 +1528,121 @@ fn filesystem_self_test() -> bool {
 
 /// An image the machine formats and writes to, in memory.
 ///
-/// Thirteen blocks: a superblock, a bitmap, two of inode table, the journal's
+/// Sixteen blocks: a superblock, a bitmap, two of inode table, the journal's
 /// nine, and room to write into. In `.bss` rather than on a stack, because
-/// fifty-two kilobytes of stack is not a thing this kernel has, and rather
+/// sixty-four kilobytes of stack is not a thing this kernel has, and rather
 /// than on the heap because a self-test that can fail for want of memory is a
 /// self-test that reports the wrong thing when it does.
 static mut JOURNAL_IMAGE: [u8; 16 * bhaskix_fs::BLOCK] = [0; 16 * bhaskix_fs::BLOCK];
 
+/// The pages that filesystem is cached in.
+///
+/// Eight, which is more than any one transaction needs and few enough that the
+/// eviction path is exercised rather than merely present.
+static mut JOURNAL_FRAMES: [u8; 8 * bhaskix_fs::BLOCK] = [0; 8 * bhaskix_fs::BLOCK];
+
+/// A device that counts what it was asked to write, and can stop being one.
+///
+/// The interruption belongs at the device, which is why it lives here rather
+/// than in the filesystem: a machine that loses power loses it between two
+/// writes reaching a disk, not between two calls.
+struct Watched<'a> {
+    bytes: &'a mut [u8],
+    seen: u32,
+    limit: u32,
+    commit_block: u32,
+    commit_at: Option<u32>,
+}
+
+impl<'a> Watched<'a> {
+    /// A device over `bytes` that stops after `limit` writes.
+    fn new(bytes: &'a mut [u8], limit: u32, commit_block: u32) -> Self {
+        Self {
+            bytes,
+            seen: 0,
+            limit,
+            commit_block,
+            commit_at: None,
+        }
+    }
+}
+
+impl bhaskix_fs::Store for Watched<'_> {
+    fn blocks(&self) -> u32 {
+        u32::try_from(self.bytes.len() / bhaskix_fs::BLOCK).unwrap_or(u32::MAX)
+    }
+
+    fn read(&mut self, block: u32, into: &mut [u8]) -> Result<(), bhaskix_fs::FsError> {
+        let at = (block as usize) * bhaskix_fs::BLOCK;
+        let from = self
+            .bytes
+            .get(at..at + bhaskix_fs::BLOCK)
+            .ok_or(bhaskix_fs::FsError::OutOfRange)?;
+        into.get_mut(..bhaskix_fs::BLOCK)
+            .ok_or(bhaskix_fs::FsError::OutOfRange)?
+            .copy_from_slice(from);
+        Ok(())
+    }
+
+    fn write(&mut self, block: u32, from: &[u8]) -> Result<(), bhaskix_fs::FsError> {
+        if self.seen >= self.limit {
+            return Err(bhaskix_fs::FsError::Interrupted);
+        }
+        let at = (block as usize) * bhaskix_fs::BLOCK;
+        let into = self
+            .bytes
+            .get_mut(at..at + bhaskix_fs::BLOCK)
+            .ok_or(bhaskix_fs::FsError::OutOfRange)?;
+        into.copy_from_slice(
+            from.get(..bhaskix_fs::BLOCK)
+                .ok_or(bhaskix_fs::FsError::OutOfRange)?,
+        );
+        if block == self.commit_block && self.commit_at.is_none() {
+            self.commit_at = Some(self.seen);
+        }
+        self.seen += 1;
+        Ok(())
+    }
+}
+
 /// A filesystem written, interrupted, and recovered — in the machine.
 ///
-/// The host harness stops at every write of every operation and is the real
-/// proof; this is the part it cannot do, which is to show the same code doing
-/// the same thing on this kernel, compiled for this target, with no `std`
-/// underneath it. The interruption is the one that matters most: the machine
-/// stopped *after* the commit and before anything reached its home, which is
-/// the only interruption where recovery has work to do.
+/// The host harness stops at every device write of every operation and is the
+/// real proof; this is the part it cannot do, which is to show the same code
+/// doing the same thing on this kernel, compiled for this target, with no
+/// `std` underneath it and its pages in `.bss`. The interruption is the one
+/// that matters most: the machine stopped *after* the commit and before
+/// anything reached its home, which is the only interruption where recovery
+/// has work to do.
 fn journal_self_test() -> bool {
-    use bhaskix_fs::{Filesystem, FsError, Kind, Uninterrupted, Volume, volume::StopAfter};
+    use bhaskix_fs::{BLOCK, Cache, Filesystem, FsError, Image, Kind, Volume};
 
     // SAFETY: called once, from the boot CPU, before any other thread exists.
-    // The buffer is not reachable from anywhere else -- nothing else in this
-    // kernel names it -- so this is the only reference to it in existence.
-    let image = unsafe { &mut *core::ptr::addr_of_mut!(JOURNAL_IMAGE) };
+    // Neither buffer is reachable from anywhere else -- nothing else in this
+    // kernel names them -- so these are the only references to them in
+    // existence.
+    let (image, frames) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(JOURNAL_IMAGE),
+            &mut *core::ptr::addr_of_mut!(JOURNAL_FRAMES),
+        )
+    };
     if bhaskix_fs::format(image, 128).is_err() {
         println!("    journal        FAILED to format an image in memory");
         return false;
     }
+    let Ok(superblock) = bhaskix_fs::Superblock::read(image) else {
+        return false;
+    };
+    let commit_block = superblock.journal_start as u32;
 
     // A file, and something in it, uninterrupted.
-    let root = {
-        let Ok((mut volume, replayed)) = Volume::mount(image, &mut Uninterrupted) else {
+    let (root, hits, misses) = {
+        let Ok(cache) = Cache::new(frames, Watched::new(image, u32::MAX, commit_block)) else {
+            println!("    journal        FAILED: not enough frames to cache with");
+            return false;
+        };
+        let Ok((mut volume, replayed)) = Volume::mount(cache) else {
             println!("    journal        FAILED: a freshly formatted image will not mount");
             return false;
         };
@@ -1565,44 +1651,63 @@ fn journal_self_test() -> bool {
             return false;
         }
         let root = volume.superblock().root;
-        let Ok(index) = volume.create(root, b"survivor", Kind::File, &mut Uninterrupted) else {
+        let Ok(index) = volume.create(root, b"survivor", Kind::File) else {
             println!("    journal        FAILED to create a file");
             return false;
         };
-        if volume
-            .write(index, 0, b"written in a machine\n", &mut Uninterrupted)
-            .is_err()
-        {
+        if volume.write(index, 0, b"written in a machine\n").is_err() {
             println!("    journal        FAILED to write to it");
             return false;
         }
-        root
+        // Read it straight back, which is what makes the hit count mean
+        // something: these pages are in frames, and the device is not asked.
+        let mut reader = volume.reader();
+        let Ok(inode) = reader.inode(index) else {
+            return false;
+        };
+        let mut back = [0u8; 32];
+        let read = reader.read(&inode, 0, &mut back);
+        if back.get(..read) != Some(b"written in a machine\n".as_slice()) {
+            println!("    journal        FAILED: it did not read back what was written");
+            return false;
+        }
+        let (hits, misses, _) = volume.counted();
+        (root, hits, misses)
     };
 
-    // How many writes a second create takes, so that the interruption can be
-    // placed *just* after the commit rather than at a number somebody guessed.
-    let mut counting = bhaskix_fs::volume::Count::default();
-    let commit = {
-        let Ok((mut volume, _)) = Volume::mount(image, &mut Uninterrupted) else {
+    // Where the commit is, so that the interruption is placed *just* after it
+    // rather than at a number somebody guessed.
+    let commit_at = {
+        let Ok(cache) = Cache::new(frames, Watched::new(image, u32::MAX, commit_block)) else {
+            return false;
+        };
+        let Ok((mut volume, _)) = Volume::mount(cache) else {
             return false;
         };
         // Counted on a name that is then removed again, so the image is back
         // where it started and the interrupted run below is the only one that
         // leaves anything behind.
-        let _ = volume.create(root, b"counted", Kind::File, &mut counting);
-        let before = counting.0;
-        let _ = volume.remove(root, b"counted", &mut Uninterrupted);
-        // The commit is the middle write of a symmetric transaction.
-        before / 2
+        let _ = volume.create(root, b"counted", Kind::File);
+        let at = volume.cache().store().commit_at;
+        let _ = volume.remove(root, b"counted");
+        match at {
+            Some(at) => at,
+            None => {
+                println!("    journal        FAILED: no commit block was written");
+                return false;
+            }
+        }
     };
 
-    // The same operation, stopped one write after its commit.
-    let mut watch = StopAfter::new(commit + 1);
+    // The same operation, stopped one device write after its commit.
     let interrupted = {
-        let Ok((mut volume, _)) = Volume::mount(image, &mut Uninterrupted) else {
+        let Ok(cache) = Cache::new(frames, Watched::new(image, commit_at + 1, commit_block)) else {
             return false;
         };
-        volume.create(root, b"recovered", Kind::File, &mut watch)
+        let Ok((mut volume, _)) = Volume::mount(cache) else {
+            return false;
+        };
+        volume.create(root, b"recovered", Kind::File)
     };
     if interrupted != Err(FsError::Interrupted) {
         println!("    journal        FAILED: the interruption did not stop it: {interrupted:?}");
@@ -1612,12 +1717,19 @@ fn journal_self_test() -> bool {
     // A read-only mount must refuse this image: it holds a transaction that
     // was acknowledged and not applied, and a reader that ignored it would
     // hand back the filesystem as it was before an operation that already
-    // happened.
-    let refused = Filesystem::mount(image).err() == Some(FsError::NeedsRecovery);
+    // happened. Read through `Image` and not through the cache, because what a
+    // cache remembers is exactly what must not count as durable.
+    let refused = {
+        let mut pages = Image::new(image);
+        Filesystem::mount(&mut pages).err() == Some(FsError::NeedsRecovery)
+    };
 
     // And mounting it for writing recovers it.
     let (replayed, found, kept) = {
-        let Ok((volume, replayed)) = Volume::mount(image, &mut Uninterrupted) else {
+        let Ok(cache) = Cache::new(frames, Watched::new(image, u32::MAX, commit_block)) else {
+            return false;
+        };
+        let Ok((mut volume, replayed)) = Volume::mount(cache) else {
             println!("    journal        FAILED: an interrupted image will not mount");
             return false;
         };
@@ -1626,17 +1738,18 @@ fn journal_self_test() -> bool {
         (replayed, found, kept)
     };
 
-    let ok = refused && found && kept && replayed > 0;
+    let ok = refused && found && kept && replayed > 0 && hits > 0;
     if ok {
         println!(
-            "    journal        wrote a filesystem in memory, stopped it one write after the \
-             commit, and mounting replayed {replayed} blocks: `recovered` is there and so is \
-             `survivor`"
+            "    journal        wrote a filesystem through {} cached pages ({hits} hits, \
+             {misses} misses), stopped it one device write after the commit, and mounting \
+             replayed {replayed} blocks: `recovered` is there and so is `survivor`",
+            frames.len() / BLOCK
         );
     } else {
         println!(
             "    journal        FAILED: read-only refused {refused}, replayed {replayed}, \
-             the interrupted file is present {found}, the earlier one {kept}"
+             the interrupted file is present {found}, the earlier one {kept}, {hits} cache hits"
         );
     }
     ok
