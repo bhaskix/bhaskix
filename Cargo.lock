@@ -28,6 +28,10 @@ name = "bhaskix-device"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-fs"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-kernel"
 version = "0.0.0"
 dependencies = [

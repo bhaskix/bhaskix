@@ -110,7 +110,7 @@ OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
-        test-placements \
+        test-placements mkfs \
         test-shell test-faults fmt clippy gates clean distclean help
 
 all: iso
@@ -349,6 +349,12 @@ clippy:
 # class of mistake that review reliably misses.
 gates:
 	tools/check-containment.sh
+# The image builder still builds. It is behind a feature because the workspace
+# targets a machine with no `std`, and a tool nobody compiles is a tool that
+# has already stopped compiling.
+	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-fs --features tool \
+	    && printf '  \033[1;32mok\033[0m    the filesystem image builder still builds\n' \
+	    || { echo "  FAIL  the filesystem image builder does not build"; exit 1; }
 	tools/check-unsafe-budget.py
 	tools/check-deps.py
 	tools/check-placements.sh
@@ -407,6 +413,11 @@ gates:
 	else \
 	    printf '  \033[1;32mok\033[0m    the placement check reports both faults in a malformed table\n'; \
 	fi
+
+# Builds the filesystem image tool, for a developer who wants an image.
+mkfs:
+	$(CARGO) build --release --target $(HOST_TARGET) -p bhaskix-fs --features tool
+	@echo "built target/$(HOST_TARGET)/release/mkfs"
 
 # --- housekeeping --------------------------------------------------------
 

@@ -50,6 +50,10 @@ LAYERS = {
     # above nothing: it depends on no crate at all, because every driver
     # compiles against it -- in the kernel, in a domain, and in a host test.
     "bhaskix-device": -2,
+    # The on-disk format: arithmetic over a byte slice, reachable from the
+    # kernel, from a service in a domain, and from a host tool. Depends on
+    # nothing, for the same reason the device crate does not.
+    "bhaskix-fs": -2,
     "bhaskix-service": -1,
     "bhaskix-service-domain": 0,
     "bhaskix-service-console": 0,
@@ -60,7 +64,7 @@ LAYERS = {
     "bhaskix-mm": 1,
     "bhaskix-sched": 2,
     "bhaskix-kernel": 3,
-    "bhaskix-fs": 4,
+
     "bhaskix-net": 4,
     "bhaskix-drivers": 4,
     "bhaskix-boot-shim": 5,    # the binary, top of the graph

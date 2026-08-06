@@ -28,7 +28,7 @@ members = [
     # "sched",
 
     # M6
-    # "fs",
+    "fs",
     # "drivers",
 
     # Phase 2 — M7, RFC 0013. The framework, then one crate per service.

@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01, M9-02 (RFC 0015 step 1) · CI green · 416 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 294 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-04 (RFC 0015 steps 1–2) · CI green · 417 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 303 host assertions |
 
 ### Division of responsibility between documents
 
@@ -127,6 +127,9 @@ fairness within 2% for two equal-weight workloads.
 |---|---|---|---|
 | M9-01 | RFC 0015 step 1: the block driver becomes a service | ✅ `DONE` | `bin/blkd` answers `block::READ` on an endpoint the kernel gave it, over **RFC 0009's bulk path** — the caller names memory it already holds and the driver asks the kernel to fill it, so no sector data crosses in message registers. The criterion was an oracle rather than self-consistency: the Makefile writes `BHASKIX-DOMAIN-DISK-SECTOR-0` into sector zero of the disk the *domain* drives, and the kernel checks that is what came back **without being able to read that disk itself** — it drives the other one. A sector past the end is refused. Granted only where a unit contains the device, so a machine without one gets a driver and no service, which is the refusal working. Watched failing by having the service claim 512 bytes it never delivered. |
 | M9-02 | The IPC test that had been wrong twice, and blamed on load both times | ✅ `DONE` | `replies 9, correct 8` had failed twice and been recorded as unexplained. It was the test's own bookkeeping: `REPLIES` was incremented *before* the value was checked and `CORRECT` after, and the waiter woke on `replies >= 8` — the first of the pair — so a client preempted between its own two increments printed `9/8`. The property is **that no reply was wrong**, which is one number; asking it as `correct == replies` asked two counters that were never sampled together. Now the verdict is recorded before the reply is counted, and the gate reads `0 wrong`. |
+
+| M9-03 | RFC 0015 step 2: the on-disk format, on the host | ✅ `DONE` | A superblock, a free-block bitmap, inodes with direct blocks and a generation, and directories as fixed entries — **1,003 lines including the image tool, with no kernel involvement at all**. Nine host tests, one of which flips every bit of every metadata byte and asserts nothing panics. The `mkfs` tool builds an image the format reads back: two files, contents intact. `unsafe` budget zero, which is the standard `ustar` is held to and for the same reason: a disk is bytes somebody else wrote. |
+| M9-04 | Three negative tests that did not bite, and why | ✅ `DONE` | Every one of the first three deliberate breakages **passed**. Not because the properties were false but because each was guarded twice: the entry length is clamped in `read` *and* in `name()`; the allocator's floor is backed by the bitmap `format` marks; and one range clause was covered by whichever of the four ran first. Each test now targets the guard it names — the stored field rather than the accessor, a bitmap cleared through `set` so only the floor stands, and one case per clause. All three now fail for their own reason and only their own. This is the fourth time this milestone that redundancy hid an untested check. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -582,7 +585,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — step 1 done: the block driver is a service | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
+| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — steps 1–2 done: a block service, and a format that reads back | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -724,6 +727,31 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0015 step 2 — a format, and three negative tests that proved nothing)
+
+- **The format is 1,003 lines and touches no kernel.** A superblock, a bitmap, inodes with a
+  generation — RFC 0015's decision that a capability names an inode *and* a generation is in the
+  structure rather than in a comment — and directories as fixed entries. `mkfs` builds an image and
+  the format reads it back with the files intact.
+- **The `unsafe` budget is zero and should stay there.** A disk is bytes somebody else wrote, which
+  is the definition of untrusted input; this parser is what stands between a corrupted one and the
+  rest of the system, and it is held to the standard `ustar` is.
+- **A zeroed inode is free, and that falls out of an invariant rather than a special case.**
+  `checksum` never returns zero, so a stored zero unambiguously means "never written" — which saves
+  writing a valid free inode into every slot at format time, and makes corruption that zeroes the
+  field read as *free* rather than as damaged. That loses a file rather than exposing one, which is
+  the direction to fail in.
+- **All three of the first negative tests passed, and that was the finding.** Removing the entry
+  length clamp, removing the allocator's floor, and removing a range clause each changed nothing —
+  not because the properties were false but because each was guarded twice. A test defeated by
+  redundancy is a test that has never been shown to fail, and this is the fourth time this milestone
+  that pattern has appeared. Each now targets the guard it names: the stored field rather than the
+  accessor, a bitmap cleared through `set` so only the floor stands, and one superblock per clause.
+  All three fail for their own reason now, and only their own.
+- **The RFC's trigger, measured.** RFC 0015 said that if the format costs more than the journal, the
+  decision to define a new one was wrong. Step 2 is 1,003 lines. That number is on the record so
+  step 5 can be compared against it rather than remembered against it.
 
 ### 2026-08-06 (RFC 0015 step 1 — a block service, and a test that had been wrong twice)
 

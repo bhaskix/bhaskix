@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhaskix-fs"
+description = "The on-disk format, and the arithmetic over it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_fs"
+path = "src/lib.rs"
+
+# The image builder. A host program, because building an image is something a
+# developer does and not something the machine does — and it is the only way
+# to have an image at all before the filesystem can write one.
+[[bin]]
+name = "mkfs"
+path = "src/bin/mkfs.rs"
+# Behind a feature, because the workspace builds for `x86_64-unknown-none` and
+# this tool needs `std`. `make mkfs` builds it, and `make gates` checks that it
+# still does -- a tool that only compiles when somebody remembers to try is a
+# tool that has already stopped compiling.
+required-features = ["tool"]
+
+# Nothing. This is arithmetic over a byte slice: it must be reachable from the
+# kernel, from a service in a domain, and from a host test, which means
+# depending on none of them.
+[features]
+# Enables the host-side image builder. Off by default so the freestanding
+# build never sees it.
+tool = []
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, and it should stay zero. Every structure here is read out of bytes
+# somebody else supplied, which is the definition of untrusted input -- the
+# same standard `ustar` is held to, and for the same reason: this parser is
+# what stands between a corrupted disk and the rest of the system.
+unsafe_budget = 0
