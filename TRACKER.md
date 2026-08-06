@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-12 (RFC 0015 steps 1–6, RFC 0016 steps 1–3) · CI green · 564 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-12 (RFC 0015 steps 1–6, RFC 0016 steps 1–3) · CI green · 508 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
 
 ### Division of responsibility between documents
 
@@ -145,7 +145,9 @@ fairness within 2% for two equal-weight workloads.
 
 | M9-11 | RFC 0016 step 3 (first half): `block::WRITE`, and a journal on a real device | ✅ `DONE` | The debt RFC 0015 step 1 left: it called for `READ` **and** `WRITE` and only `READ` was built, so the journal — whose entire subject is what reaches a disk — had never reached one. A write needs a new kernel primitive, **`DRAIN`**, the mirror of `FILL`: a caller names memory it holds and a service takes bytes *out* of it, checked the same three ways and asking the caller's capability for `READ` where `FILL` asks for `WRITE`, because the right demanded is the one the operation performs. A filesystem is now laid down on the **virtio disk** through the block service in another domain, a file is created through the log, the machine is stopped one *device* write after its commit, and mounting replays it — read back through a cache created seconds earlier holding nothing. Found on the way: `args[1]` (how many sectors) had always been in the ABI and always ignored, so every block was eight round trips; and the journal put **8 KiB on the stack per transaction**, which overflowed a kernel thread's stack and read as a wild jump. |
 
-| M9-12 | RFC 0016 step 3 (second half): the filesystem, in a domain, reading a real disk | ⚠️ `DONE, OPT-IN` | `bin/fsd` mounts the disk through the block service and reads a file the kernel wrote into that same filesystem through **its** copy of the same crate — two copies of one parser, one disk, the same answer. The program contains **no filesystem code**: it links `bhaskix-fs` and supplies a `Store` made of system calls, which is the whole return on RFC 0015 step 6. It holds two capabilities — the block service's endpoint and one memory object it maps — and has no registers, no interrupt, no DMA window and no way to name a disk. **It is started only when the command line asks (`fsd=on`), because starting it stops the user-mode shell from starting**, which is an open defect below. `tests/qemu/boot-test.sh fsd` builds an image that asks for it and puts the default back. |
+| M9-13 | A ring 3 thread must be pinned, and now the kernel says so | ✅ `DONE` | Every user program in this system happened to be spawned pinned, and nothing said why. `bin/fsd` was the first that was not, and it corrupted two other domains: the block driver faulted with a null `self` before touching its device, the console service answered one request and stopped, and the shell printed fifteen characters and hung. One cause. `install_kernel_stack` sets `RSP0` from the incoming thread's own kernel stack on every switch — **and returns early when that is zero**, which it is for a ring 3 thread whose privileged stack was installed for a specific CPU. Moved to another CPU, such a thread enters the kernel on **somebody else's stack**. Every entry into ring 3 now goes through `enter_user`, which refuses an unpinned thread and says why; watched failing by unpinning `bin/fsd`, where a day-long silent corruption becomes one line and the shell keeps working. The real fix is a kernel stack that travels with its thread, and that is not this. |
+
+| M9-12 | RFC 0016 step 3 (second half): the filesystem, in a domain, reading a real disk | ✅ `DONE` | `bin/fsd` mounts the disk through the block service and reads a file the kernel wrote into that same filesystem through **its** copy of the same crate — two copies of one parser, one disk, the same answer. The program contains **no filesystem code**: it links `bhaskix-fs` and supplies a `Store` made of system calls, which is the whole return on RFC 0015 step 6. It holds two capabilities — the block service's endpoint and one memory object it maps — and has no registers, no interrupt, no DMA window and no way to name a disk. It starts by default: the defect that made it opt-in was **a ring 3 thread that was not pinned**, and that is now refused at the door rather than avoided. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -743,6 +745,28 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (the shell-start defect — a ring 3 thread that was not pinned)
+
+- **One cause, three symptoms, and none of them looked related.** The block driver faulted with a
+  null `self` inside `Virtqueue::describe` before touching its device; the console service answered
+  one request and stopped; the user-mode shell printed fifteen characters and hung. All of it
+  followed from `bin/fsd` being the first ring 3 thread in this system spawned **unpinned**.
+- **Why that matters, and it was written down nowhere.** `install_kernel_stack` sets `RSP0` from the
+  incoming thread's own kernel stack on every switch — *and returns early when that is zero*, which
+  it is for a ring 3 thread whose privileged stack was installed for a particular CPU. Moved to
+  another CPU, such a thread enters the kernel on **somebody else's stack**.
+- **The rule is now checked at the one door into ring 3.** `enter_user` refuses an unpinned thread
+  and says why. Watched failing by unpinning `bin/fsd` again: what was a day of chasing corruption
+  in three unrelated-looking places becomes one line, and everything else keeps working.
+- **The `unsafe` budget went up by one, and the surface went down by five.** Six loose
+  `unsafe { enter_ring3 }` call sites became one behind a checked door.
+- **Two diagnoses I had recorded as open defects were the same defect**, and both are closed. The
+  "caller on the same CPU as `blkd`" theory was wrong: the caller was not *on* that CPU, it had been
+  *stolen* to it.
+- **What is still true and still unfixed** is the underlying limit: a ring 3 thread cannot migrate,
+  because its kernel stack does not travel with it. Refusing to enter ring 3 unpinned is a guard, not
+  a fix, and the guard says so.
 
 ### 2026-08-06 (RFC 0016 step 3, second half — the filesystem leaves the kernel, with two defects found)
 

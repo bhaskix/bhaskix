@@ -1189,7 +1189,9 @@ extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
     // segment it accepted was mapped above. `rsp` is one past user-writable
     // memory in the same space, and `RSP0` was set before this thread was
     // spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+    // SAFETY: `entry` is inside a user-executable segment of the space
+    // just installed, and `rsp` is one past user-writable memory in it.
+    unsafe { enter_user("ring 3", entry, rsp, [0, 0]) }
 }
 
 /// Runs a program in ring 3 and checks that it really was ring 3.
@@ -1943,6 +1945,43 @@ const BLKD_STACK_PAGES: u64 = 4;
 
 /// Where the block driver's program is.
 const BLKD_PROGRAM: &[u8] = b"bin/blkd";
+
+/// Enters ring 3, refusing to do it from a thread that may migrate.
+///
+/// **A ring 3 thread in this kernel must be pinned**, and until now that was a
+/// convention nobody had written down. Every user program happened to be
+/// spawned pinned; the first one that was not corrupted two other domains and
+/// took a day to find.
+///
+/// The reason is the privileged stack. `install_kernel_stack` sets `RSP0` from
+/// the incoming thread's own `kernel_stack_top` on every switch — but it
+/// returns early when that is zero, which it is for a thread whose kernel
+/// stack was installed for a *specific CPU* rather than carried by the thread.
+/// Such a thread moved to another CPU enters the kernel on **somebody else's
+/// stack**, and what that looks like from outside is a null pointer in a
+/// driver, a service that stops answering, and a shell that never starts.
+///
+/// So the rule is checked here, at the one door into ring 3, and a thread that
+/// breaks it is stopped rather than allowed to corrupt whatever it lands on.
+/// Refusing is not a fix for the underlying limit — a kernel stack that
+/// travelled with its thread would be — and the refusal says so.
+///
+/// # Safety
+///
+/// As `enter_ring3`: `entry` must be user-executable and `rsp` user-writable in
+/// the address space currently installed.
+unsafe fn enter_user(who: &str, entry: u64, rsp: u64, arguments: [u64; 2]) -> ! {
+    let pinned = sched::current_thread_id().and_then(sched::is_pinned);
+    if pinned != Some(true) {
+        println!(
+            "    {who}          FAILED: a ring 3 thread must be pinned, and this one is not; \
+             it would enter the kernel on another CPU's stack if it moved"
+        );
+        sched::exit()
+    }
+    // SAFETY: delegated to this function's own contract.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, arguments) }
+}
 
 /// Where the filesystem service's stack goes in its own address space.
 const FSD_STACK: u64 = 0x0000_0000_1100_0000;
@@ -3028,7 +3067,9 @@ extern "C" fn block_domain_entry(hhdm_base: u64) -> ! {
     // SAFETY: `entry` is inside a user-executable segment of the space just
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+    // SAFETY: `entry` is inside a user-executable segment of the space
+    // just installed, and `rsp` is one past user-writable memory in it.
+    unsafe { enter_user("block domain", entry, rsp, [0, 0]) }
 }
 
 /// Loads and enters `bin/fsd`.
@@ -3069,7 +3110,9 @@ extern "C" fn fs_domain_entry(hhdm_base: u64) -> ! {
     // SAFETY: `entry` is inside a user-executable segment of the space just
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+    // SAFETY: `entry` is inside a user-executable segment of the space
+    // just installed, and `rsp` is one past user-writable memory in it.
+    unsafe { enter_user("fs domain", entry, rsp, [0, 0]) }
 }
 
 /// Starts the filesystem in a domain, and checks what it read off the disk.
@@ -3138,7 +3181,9 @@ fn start_fs_domain(hhdm: u64) -> bool {
         return false;
     }
 
-    let options = sched::SpawnOptions::new().in_domain(realm.as_u32());
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
     if sched::spawn_on_with(3, "fsd", fs_domain_entry, hhdm, hhdm, options).is_err() {
         println!("    fs domain      FAILED: it would not spawn");
         domain::destroy(realm);
@@ -3284,7 +3329,9 @@ extern "C" fn console_domain_entry(hhdm_base: u64) -> ! {
     // SAFETY: `entry` is inside a user-executable segment of the space just
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+    // SAFETY: `entry` is inside a user-executable segment of the space
+    // just installed, and `rsp` is one past user-writable memory in it.
+    unsafe { enter_user("console domain", entry, rsp, [0, 0]) }
 }
 
 /// Creates the domain the filesystem service runs in, and starts it.
@@ -3413,7 +3460,9 @@ extern "C" fn vfs_domain_entry(hhdm_base: u64) -> ! {
     // SAFETY: `entry` is inside a user-executable segment of the space just
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [VFSD_IMAGE, root.len() as u64]) }
+    // SAFETY: `entry` is inside a user-executable segment of the space
+    // just installed, and `rsp` is one past user-writable memory in it.
+    unsafe { enter_user("vfs domain", entry, rsp, [VFSD_IMAGE, root.len() as u64]) }
 }
 
 /// Where the user-mode shell's stack goes, and how much of it there is.
@@ -3700,26 +3749,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         if !disk_journal_self_test(hhdm) {
             println!("    disk journal   FAILED");
         }
-        // **Opt-in, and that is a defect being avoided rather than a
-        // preference.** Starting `bin/fsd` makes the user-mode shell fail to
-        // start: the service itself runs and reads the disk correctly, and the
-        // shell's thread is created and reaches its entry, and then nothing --
-        // no fault, no message, no prompt. It reproduces on every CPU tried,
-        // whether the service is started before or after the shell, and
-        // whether or not its domain is destroyed afterwards. It is an open
-        // defect in the tracker, and until it is understood the service is
-        // started only when asked for, by `tests/qemu/boot-test.sh fsd`.
-        //
-        // Off by default is the honest arrangement while it is open: a machine
-        // that runs a filesystem service and no shell is not the machine
-        // anybody wants, and pretending otherwise by leaving it on would mean
-        // the shell tests were the ones that had to be weakened.
-        if handoff
-            .cmdline
-            .split_ascii_whitespace()
-            .any(|word| word == "fsd=on")
-            && !start_fs_domain(hhdm)
-        {
+        if !start_fs_domain(hhdm) {
             println!("    fs domain      FAILED");
         }
     }
@@ -4326,7 +4356,9 @@ extern "C" fn user_shell_entry(hhdm_base: u64) -> ! {
     // installed -- `elf::parse` refuses an entry point that is not -- `rsp` is
     // one past user-writable memory in the same space, and `RSP0` was set
     // before this thread was spawned.
-    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+    // SAFETY: `entry` is inside a user-executable segment of the space
+    // just installed, and `rsp` is one past user-writable memory in it.
+    unsafe { enter_user("shell", entry, rsp, [0, 0]) }
 }
 
 /// Largest filesystem image this will read off a disk.

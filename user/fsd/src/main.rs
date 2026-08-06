@@ -294,9 +294,7 @@ extern "C" fn fsd_main() -> ! {
     // finished, and in RFC 0016 step 4 this becomes a `recv` loop. Parking
     // here rather than leaving is also what a filesystem should do with the
     // capabilities it holds: giving them up means the disk is unmounted.
-    loop {
-        call(syscall::YIELD, 0, 0, [0; 4]);
-    }
+    exit()
 }
 
 core::arch::global_asm!(

@@ -464,12 +464,17 @@ Five steps. The first is independent of the rest and should not wait for it.
    stated**: `kernel/src/namespace.rs` uses the crate and does not go until step 4. What is true now
    is that the filesystem *runs* outside the kernel; deleting the copy inside it is step 4's work.
 
-   **A defect was found and is not fixed.** A caller on the *same CPU* as `bin/blkd` that asks it for
-   a sector makes the driver fault — a null `self` inside `Virtqueue::describe`, before it touches
-   the device. It reproduces every time, pinned or not; it does not happen from any other CPU, where
-   hundreds of identical requests succeed; and the shell, which *is* on the driver's CPU, calls it
-   for something that does not touch the queue and is fine. `bin/fsd` therefore runs on CPU 0, with
-   the reason written at the line that puts it there. This is an open defect, not a design choice.
+   **A defect was found, chased, and fixed, and it was not what it looked like.** Three symptoms —
+   the block driver faulting with a null `self` before touching its device, the console service
+   answering one request and stopping, the shell printing fifteen characters and hanging — turned out
+   to be one cause: `bin/fsd` was the first ring 3 thread in this system spawned **unpinned**.
+   `install_kernel_stack` sets `RSP0` from the incoming thread's own kernel stack on every switch and
+   *returns early when that is zero*, which it is for a ring 3 thread whose privileged stack was
+   installed for one CPU. Stolen to another CPU, it enters the kernel on somebody else's stack.
+
+   Every entry into ring 3 now goes through one checked door that refuses an unpinned thread. The
+   underlying limit — a kernel stack that does not travel with its thread — is unfixed, and the
+   refusal says so rather than implying the problem has gone.
 4. **Directory and file handles.** The namespace moves out; the kernel's `namespace.rs`,
    `ObjectKind::Directory`, `ObjectKind::File` and `OPEN_AT` are deleted. The RFC 0015 step 4 shell
    gates must pass **unchanged** — that is the point of them.

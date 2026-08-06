@@ -118,7 +118,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu test-fs-domain \
+.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
         test-placements mkfs \
         test-shell test-faults fmt clippy gates clean distclean help
 
@@ -290,7 +290,7 @@ run-uefi: $(ISO)
 
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
-test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-fs-domain test-placements \
+test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-placements \
       test-shell test-faults
 	@echo
 	@echo "  all checks passed"
@@ -344,11 +344,6 @@ test-boot-uefi: $(ISO)
 test-boot-iommu: $(ISO)
 	tests/qemu/boot-test.sh iommu
 
-# The filesystem in a domain, which is started only when the command line asks
-# -- see the comment in `boot-test.sh`. It builds its own image and puts the
-# default one back, so it is last among the boot tests.
-test-fs-domain: $(ISO)
-	tests/qemu/boot-test.sh fsd
 
 # Types at the machine over the serial line and asserts on the replies. The
 # only tests here that write to the kernel rather than only reading from it,

@@ -86,20 +86,6 @@ DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
 MACHINE="q35"
 IOMMU_ARGS=()
 VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0 -device virtio-blk-pci,drive=disk1)
-# The filesystem service is started only when asked for, because starting it
-# stops the user-mode shell from starting -- an open defect, recorded in the
-# tracker and at the line in the kernel that reads this word. So this mode
-# builds an image that asks for it, and puts the default image back afterwards.
-# It needs a unit as well, because the block service only answers where one
-# contains the device.
-if [[ "$MODE" == "fsd" ]]; then
-    make -C "$REPO_ROOT" iso CMDLINE="fsd=on" >/dev/null 2>&1 || {
-        printf '\033[1;31mFAIL\033[0m  could not build an image with fsd=on\n' >&2
-        exit 1
-    }
-    trap 'make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true; rm -f "$LOG"' EXIT
-fi
-
 if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # RFC 0012's testing plan turns on what the RFC is about. `intremap=on`
     # needs a split irqchip, and both are QEMU's requirements rather than this
@@ -972,7 +958,7 @@ fi
 # the kernel wrote a file into that filesystem through its own copy of the same
 # crate, and the service found it. Two copies of one parser, one disk, and the
 # same answer.
-if [[ "$MODE" == "fsd" ]]; then
+if true; then
     if grep -qE "fs domain +bin/fsd mounted the disk through the block service: [1-9][0-9]* sectors, [1-9][0-9]* blocks, [1-9][0-9]* entries, and .on-a-disk. reads [1-9][0-9]* bytes" "$LOG"; then
         pass "the filesystem, in a domain, read a real disk through the block service"
     elif grep -qE "fs domain +no block service on this machine" "$LOG"; then

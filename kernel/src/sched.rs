@@ -1018,6 +1018,20 @@ fn enter_space(root: u64) {
     }
 }
 
+/// Whether `thread` may never be moved to another CPU.
+///
+/// `None` if there is no such thread.
+#[must_use]
+pub fn is_pinned(thread: u32) -> Option<bool> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        if let Some(found) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return Some(found.pinned);
+        }
+    }
+    None
+}
+
 /// Records that `thread` owes `caller` an answer.
 ///
 /// Called when a message is taken, so that [`take_reply_target`] can say who a

@@ -136,7 +136,14 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1080
+unsafe_budget = 1081
+# Up one, and it buys a rule that had never been written down. Every entry into
+# ring 3 now goes through `enter_user`, which refuses a thread that is not
+# pinned before it can enter the kernel on another CPU's stack -- so there is
+# one `unsafe { enter_ring3 }` behind six call sites instead of six loose ones,
+# plus the one this adds. The line count is a line worse and the surface is
+# five doors narrower.
+#
 # Down again, from 1125, as the virtqueue moved into a crate at RFC 0014 step
 # 5: the kernel's driver no longer writes descriptors or rings by hand. Two
 # steps, two reductions, and the second is the one that mattered -- those lines
