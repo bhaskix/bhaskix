@@ -615,6 +615,24 @@ else
     status=1
 fi
 
+# Configuration space as memory, checked against configuration space as ports.
+#
+# RFC 0014 step 4, and the reason the port pair was kept rather than replaced:
+# it is the oracle. "The new mechanism found three devices" is not evidence
+# that it found the right three, so every function on every bus is read both
+# ways and the answers must match. `none disagreed` is the assertion; the count
+# of functions is there so a run that checked nothing cannot look like a run
+# that agreed about everything.
+if grep -qE "ecam +0x[0-9a-f]+ for buses [0-9]+\.\.=[0-9]+, [1-9][0-9]* functions read both ways, [0-9]+ present, none disagreed" "$LOG"; then
+    pass "configuration space read as memory agrees with the ports, everywhere"
+elif grep -qE "ecam +no MCFG" "$LOG"; then
+    pass "no MCFG on this machine, so configuration stays on the port pair"
+else
+    fail "ecam did not agree with the port pair"
+    grep -E "ecam" "$LOG" || true
+    status=1
+fi
+
 # RFC 0013 step 6: a block driver in ring 3, driving a device of its own.
 #
 # The kernel enumerates the bus -- PCI configuration space is port I/O, and a

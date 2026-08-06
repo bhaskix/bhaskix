@@ -148,31 +148,31 @@ if await "$started" && await "$prompt"; then
     while IFS= read -r -d $'\r' line; do
         printf '%s\r' "$line" >&3
 
-        # The first line is resent until the shell echoes it.
+        # Paced by the machine, not by a clock.
         #
-        # Awaiting the prompt narrowed this race and did not close it: the
-        # prompt is *printed* before the shell reaches its read, and since RFC
-        # 0013 step 4 printing it is a round trip to a service in another
-        # address space -- so the gap between "the prompt is in the log" and
-        # "the shell is reading" got wider, and the first line started losing
-        # again under full-suite load. Resending is safe: a duplicate runs the
-        # command twice and every check here asks whether a reply appeared.
-        if ((first)); then
-            first=0
-            tries=0
-            until grep -qF -- "$prompt$line" "$LOG" 2>/dev/null; do
-                kill -0 "$qemu" 2>/dev/null || break
-                ((tries += 1))
-                ((tries > 8)) && break
-                sleep 0.25
+        # Every line is sent and then waited for, and the wait is for *this
+        # line's echo*. Sending on a fixed interval assumed each command
+        # finished inside it, which is true on an idle host and not on a busy
+        # one -- three different checks have failed that way, each looking like
+        # a different bug and all of them being this.
+        #
+        # The first line is also resent while it goes unanswered. The prompt is
+        # printed before the shell reaches its read, and since RFC 0013 step 4
+        # printing it is a round trip to another address space, so the gap
+        # between "the prompt is in the log" and "the shell is reading" is
+        # wide. Later lines are never resent: the bytes queue in the UART, and
+        # a resent command would run twice.
+        tries=0
+        until grep -qF -- "$prompt$line" "$LOG" 2>/dev/null; do
+            kill -0 "$qemu" 2>/dev/null || break
+            ((tries += 1))
+            ((tries > 40)) && break
+            sleep 0.25
+            if ((first)) && ((tries % 4 == 0)); then
                 printf '%s\r' "$line" >&3
-            done
-        fi
-
-        # One line at a time, with a pause, so each arrives as its own
-        # interrupt. Sending them as one burst would exercise the FIFO drain
-        # and never the blocking read.
-        sleep 0.3
+            fi
+        done
+        first=0
     done <<< "$commands"
     # The last command's reply is the signal that everything before it landed.
     await "nosuchcommand: not a command"

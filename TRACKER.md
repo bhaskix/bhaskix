@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) is complete; the driver framework (M8) is under way |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01 … M8-03 (RFC 0014 steps 1–3) · CI green · 395 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 287 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · M8-01 … M8-05 (RFC 0014 steps 1–4) · CI green · 402 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 290 host assertions |
 
 ### Division of responsibility between documents
 
@@ -134,6 +134,9 @@ documented.
 | M8-02 | RFC 0014 step 2: the kernel's driver moves onto them | ✅ `DONE` | Twenty-seven register accesses across two structures, declared once as `CommonCfg` and `BlockCfg` instead of a module of constants plus six hand-rolled accessors. **The success criterion was that nothing changes** and the boot line is identical: 180 sectors, 2 requests, status 0x0f, 1 wait and 0 spins. **The kernel's `unsafe` count fell 1154 → 1112** — forty-two blocks making the same promise over and over became two, made where the blocks are constructed. The budget was lowered to match, which is the direction it is supposed to move and the first time it has. Four accessors were left dead by the change and deleted; `read8` and `write16` survive, because the request status byte and the queue notification are memory and a doorbell rather than registers in a block. |
 
 | M8-03 | RFC 0014 step 3: a device model to test a driver against | ✅ `DONE` | `bhaskix_device::testing` — a fake **device**, not a byte array. A register file alone answers with whatever was written, which is the one behaviour a real device does not have: real devices *refuse*, and the refusals are what a driver gets wrong. The kernel's own bring-up runs against it on the host — `negotiate` and `take_vector` are the code the machine runs, not a copy — and five tests cover what could previously only be tested by finding a device that said no: a device not offering virtio 1.0 is refused **and told**, one clearing `FEATURES_OK` is believed, `ACCESS_PLATFORM` is taken whenever offered, and `0xffff` for a vector is heard as "no vector". **Each was watched failing for its own reason and only its own.** Ring-level tests wait for step 5, where the queue moves into a crate; saying so beats redefining step 3 to fit what was easy. |
+
+| M8-04 | RFC 0014 step 4: ECAM, checked against the ports | ✅ `DONE` | `MCFG` parsed, the region mapped, and configuration space readable as memory. **The port pair was kept because it is the oracle**, which acceptance decided and this step used: every function on every bus is read *both ways* and the answers must match — **65,536 functions, 8 present, none disagreed**. "The new mechanism found three devices" is not evidence it found the right three. Watched failing by shifting the device field one bit: 135 of 65,536 disagree, reported with the first address. That negative test also found a real weakness — the first version bounded the *bus* and not the computed address, so a wrong shift walked out of the mapping and **faulted**, which is a machine that stops booting rather than a mechanism that reports. It is bounded against the mapping now, and an in-range bus that the arithmetic cannot place counts as a disagreement. |
+| M8-05 | Shell tests paced by the machine rather than by a clock | ✅ `DONE` | Three different shell checks had failed under load, each looking like a different bug and all of them being one: commands were typed on a fixed interval that assumed each finished inside it. Every line now waits for **its own echo** before the next is sent. The first line is still resent while unanswered — the prompt is printed before the shell reaches its read — and later lines never are, because the bytes queue in the UART and a resent command would run twice. The suite passed at load average 11.45, which is the load it had been failing at. |
 
 ### M7 — Service framework ([RFC 0013](docs/rfc/0013-service-framework.md))
 
@@ -564,7 +567,7 @@ what is actually ahead.
 | Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
-| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — steps 1–3 done | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
+| Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | 🔨 **M8 in progress** — steps 1–4 done | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ⬜ `TODO` | The filesystem service reads a read-only archive it is handed at entry |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
@@ -707,6 +710,29 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0014 step 4 — ECAM, and the oracle that earned its keep immediately)
+
+- **Configuration space is memory now**, and the port pair stayed. Acceptance decided that on the
+  grounds that a fallback nobody exercises is worth nothing but a fallback that is the *oracle* is
+  tested by construction. It was: 65,536 functions read both ways on every boot, 8 present, none
+  disagreeing. "The new mechanism found three devices" is not evidence that it found the right
+  three, and there is no cheaper way to know than asking the old one.
+- **The negative test found a real weakness in the same breath as proving the gate.** Shifting the
+  device field one bit made the machine *stop booting* rather than report a disagreement: the
+  address left the mapped window and faulted, because the accessor bounded the bus number and not
+  the address the arithmetic produced. The bus check is sufficient only when the arithmetic is
+  right, which is exactly the assumption worth not making. Bounded against the mapping now, and an
+  in-range bus the arithmetic cannot place is counted as a disagreement — so the same break reports
+  `135 of 65536 disagree` with the first address instead of hanging.
+- **`MCFG` entries that describe nothing are skipped rather than believed** — buses running
+  backwards, a base of zero — because an entry believed here becomes an address read later. Five
+  host tests, including one that writes the expected addresses out by hand rather than recomputing
+  them with the parser's own formula: a check that repeats the formula cannot catch an error in it.
+- **Three shell checks had been failing under load and it was one bug.** Commands were typed on a
+  fixed interval that assumed each finished inside it — true on an idle host, false on a busy one.
+  Every line waits for its own echo now. The suite passed at load average 11.45, which is the load
+  it had been failing at, so the fix is tested by the thing that was breaking it.
 
 ### 2026-08-06 (RFC 0014 step 3 — a model that can say no, and a process of mine that would not stop)
 

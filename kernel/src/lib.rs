@@ -437,6 +437,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if input_ready && !block_interrupt_self_test(handoff) {
         println!("    virtio-blk irq FAILED");
     }
+    // After the bus has been walked and the drivers are up, because this reads
+    // every function on every bus twice and there is no reason to do that
+    // before anything needs it.
+    if !ecam_bringup(handoff) {
+        println!("    ecam           FAILED");
+    }
     if input_ready && !irq_teardown_self_test(handoff) {
         println!("    irq teardown   FAILED");
     }
@@ -1400,6 +1406,113 @@ const CONSOLED_PROGRAM: &[u8] = b"bin/consoled";
 /// that a capability names an object rather than naming nothing, which is the
 /// difference between a capability system and a permission bit.
 const CONSOLE_OBJECT: u64 = 0;
+
+/// Finds memory-mapped configuration space, maps it, and checks it agrees.
+///
+/// RFC 0014 step 4. `MCFG` says where configuration space is as memory; the
+/// port pair at `0xcf8` says the same thing a word at a time. Both are kept,
+/// and this is why: the port path is the **oracle**. "The new mechanism found
+/// three devices" is not evidence that it found the right three, and the only
+/// cheap way to know is to ask the old one and compare.
+///
+/// Every function on every bus is read both ways and the answers must match.
+/// A single disagreement is reported with the address, because a mechanism
+/// that is right about 255 devices and wrong about one is the worst case to
+/// find later.
+fn ecam_bringup(handoff: &Handoff) -> bool {
+    let hhdm = handoff.hhdm_base.as_u64();
+    let Some(rsdp) = handoff.rsdp else {
+        println!("    ecam           no acpi tables, so the port pair it is");
+        return true;
+    };
+
+    // SAFETY: the handoff's address, and `mmio::map` is the same mapper the
+    // other table walkers here use.
+    let found = unsafe {
+        bhaskix_arch::acpi::mcfg(rsdp.as_u64(), hhdm, &mut |physical, length| {
+            crate::mmio::map(physical, length as u64, hhdm).is_some()
+        })
+    };
+    let Some(mcfg) = found else {
+        // Not a failure. A machine with no MCFG is a machine that uses the
+        // ports, which is every machine this kernel ran on until today.
+        println!("    ecam           no MCFG; configuration stays on the port pair");
+        return true;
+    };
+
+    let Some(region) = mcfg.regions().next() else {
+        println!("    ecam           MCFG lists no usable region");
+        return true;
+    };
+
+    let Some(mapped) = crate::mmio::map(region.base, region.length(), hhdm) else {
+        println!(
+            "    ecam           FAILED to map {} KiB at {:#x}",
+            region.length() / 1024,
+            region.base
+        );
+        return false;
+    };
+
+    // SAFETY: `mmio::map` returned a mapping of exactly the region `MCFG`
+    // described, device-mapped and never unmapped.
+    unsafe {
+        bhaskix_arch::pci::use_ecam(mapped, region.start_bus, region.end_bus, region.length())
+    };
+
+    // And now the comparison, which is the whole point of keeping both.
+    let mut checked = 0u32;
+    let mut present = 0u32;
+    let mut disagreed = 0u32;
+    let mut first_disagreement = None;
+    for bus in region.start_bus..=region.end_bus {
+        for device in 0..32u8 {
+            for function in 0..8u8 {
+                let address = bhaskix_arch::pci::Address::new(bus, device, function);
+                // SAFETY: configuration reads on the bootstrap CPU during
+                // boot; nothing else is driving a configuration cycle.
+                let ports = unsafe { bhaskix_arch::pci::read32(address, 0x00) };
+                checked += 1;
+                let Some(memory) = bhaskix_arch::pci::read32_ecam(address, 0x00) else {
+                    // In range by bus and refused anyway: the address the
+                    // arithmetic produced is outside the mapping, which is a
+                    // disagreement about *where a function is* rather than
+                    // about what it says.
+                    disagreed += 1;
+                    if first_disagreement.is_none() {
+                        first_disagreement = Some((address, ports, 0));
+                    }
+                    continue;
+                };
+                if ports != 0xffff_ffff {
+                    present += 1;
+                }
+                if ports != memory {
+                    disagreed += 1;
+                    if first_disagreement.is_none() {
+                        first_disagreement = Some((address, ports, memory));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((address, ports, memory)) = first_disagreement {
+        println!(
+            "    ecam           FAILED: {:02x}:{:02x}.{} reads {ports:#010x} by port and \
+             {memory:#010x} by memory ({disagreed} of {checked} disagree)",
+            address.bus, address.device, address.function
+        );
+        return false;
+    }
+
+    println!(
+        "    ecam           {:#x} for buses {}..={}, {checked} functions read both ways, \
+         {present} present, none disagreed",
+        region.base, region.start_bus, region.end_bus
+    );
+    true
+}
 
 /// Where the block driver's domain keeps its stack and its rings.
 const BLKD_STACK: u64 = 0x0000_0000_1100_0000;

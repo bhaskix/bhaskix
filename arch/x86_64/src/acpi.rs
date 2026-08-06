@@ -175,6 +175,117 @@ pub const MAX_UNITS: usize = 8;
 /// Firmware-reserved regions recorded, for the same reason.
 pub const MAX_RESERVED: usize = 8;
 
+/// How many ECAM regions this parser will keep.
+///
+/// Four. One segment is what a PC has; a machine with more is a machine with
+/// more root complexes, and refusing to look at the fifth is better than
+/// silently using the first for a device that is not under it.
+pub const MAX_ECAM: usize = 4;
+
+/// One memory-mapped configuration region, from `MCFG`.
+///
+/// With this, a function's configuration space is 4 KiB of ordinary memory at
+/// a computable address — which is what makes it something a capability could
+/// name, and why RFC 0014 asks how much of it a domain may hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ecam {
+    /// Physical address of the region's base.
+    pub base: u64,
+    /// PCI segment group this region covers.
+    pub segment: u16,
+    /// First bus number in it.
+    pub start_bus: u8,
+    /// Last bus number in it, inclusive.
+    pub end_bus: u8,
+}
+
+impl Ecam {
+    /// Where a function's configuration space starts, physically.
+    ///
+    /// `None` if the bus is not in this region — which is the check that stops
+    /// a machine with several regions reading the wrong one, and the reason
+    /// this is a method rather than a formula written at each call site.
+    pub const fn address(&self, bus: u8, device: u8, function: u8) -> Option<u64> {
+        if bus < self.start_bus || bus > self.end_bus {
+            return None;
+        }
+        let bus_offset = (bus - self.start_bus) as u64;
+        Some(
+            self.base
+                + (bus_offset << 20)
+                + (((device & 0x1f) as u64) << 15)
+                + (((function & 0x07) as u64) << 12),
+        )
+    }
+
+    /// How many bytes this region spans.
+    #[must_use]
+    pub const fn length(&self) -> u64 {
+        ((self.end_bus as u64 - self.start_bus as u64) + 1) << 20
+    }
+}
+
+/// What `MCFG` said, if anything did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Mcfg {
+    regions: [Option<Ecam>; MAX_ECAM],
+    count: usize,
+}
+
+impl Mcfg {
+    /// The regions, in the order the firmware listed them.
+    pub fn regions(&self) -> impl Iterator<Item = Ecam> + '_ {
+        self.regions.iter().take(self.count).flatten().copied()
+    }
+
+    /// How many there are.
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// Reads `MCFG`: where configuration space is, as memory.
+///
+/// Returns `None` for a table that is not `MCFG`, fails its checksum, or lists
+/// no regions — a table that says nothing is the same as no table, and a
+/// machine with neither uses the port pair instead.
+#[must_use]
+pub fn parse_mcfg(bytes: &[u8]) -> Option<Mcfg> {
+    if bytes.get(0..4)? != b"MCFG" || !checksum_ok(bytes) {
+        return None;
+    }
+
+    // Header, then eight reserved bytes, then sixteen bytes per region.
+    let mut offset = HEADER_LENGTH + 8;
+    let mut regions = [None; MAX_ECAM];
+    let mut count = 0;
+
+    while offset + 16 <= bytes.len() && count < MAX_ECAM {
+        let base = u64_at(bytes, offset)?;
+        let segment = u16_at(bytes, offset + 8)?;
+        let start_bus = *bytes.get(offset + 10)?;
+        let end_bus = *bytes.get(offset + 11)?;
+        offset += 16;
+
+        // A region whose buses run backwards describes nothing, and a base of
+        // zero is firmware that filled in a template. Both are skipped rather
+        // than believed: an entry believed here becomes an address read later.
+        if end_bus < start_bus || base == 0 {
+            continue;
+        }
+        regions[count] = Some(Ecam {
+            base,
+            segment,
+            start_bus,
+            end_bus,
+        });
+        count += 1;
+    }
+
+    (count > 0).then_some(Mcfg { regions, count })
+}
+
 /// One DMA remapping hardware unit — an IOMMU, and where its registers are.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Unit {
@@ -617,6 +728,16 @@ pub unsafe fn dmar(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Dma
     unsafe { tables(rsdp, hhdm, ensure, parse_dmar) }
 }
 
+/// Finds `MCFG` and reads it.
+///
+/// # Safety
+///
+/// As [`tables`].
+pub unsafe fn mcfg(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Mcfg> {
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { tables(rsdp, hhdm, ensure, parse_mcfg) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1024,89 @@ mod tests {
         let sum = bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
         bytes[9] = sum.wrapping_neg();
         bytes
+    }
+
+    /// Builds an `MCFG` with the given regions, correctly checksummed.
+    fn mcfg_bytes(regions: &[(u64, u16, u8, u8)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MCFG");
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // length, filled in below
+        bytes.push(1); // revision
+        bytes.push(0); // checksum, filled in below
+        bytes.extend_from_slice(b"BHASKXBHASKIX  ");
+        bytes.resize(36, 0);
+        bytes.resize(44, 0); // eight reserved bytes
+        for (base, segment, start, end) in regions {
+            bytes.extend_from_slice(&base.to_le_bytes());
+            bytes.extend_from_slice(&segment.to_le_bytes());
+            bytes.push(*start);
+            bytes.push(*end);
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        }
+
+        let length = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        let sum = bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        bytes[9] = sum.wrapping_neg();
+        bytes
+    }
+
+    #[test]
+    fn an_mcfg_says_where_configuration_space_is() {
+        let bytes = mcfg_bytes(&[(0xb000_0000, 0, 0, 255)]);
+        let mcfg = parse_mcfg(&bytes).expect("a well-formed MCFG");
+        assert_eq!(mcfg.count(), 1);
+
+        let region = mcfg.regions().next().expect("one region");
+        assert_eq!(region.base, 0xb000_0000);
+        assert_eq!(region.length(), 256 << 20);
+
+        // The address of a function is the base plus bus, device and function
+        // in their own fields. Written out here rather than recomputed with
+        // the same expression the parser uses, because a check that repeats
+        // the formula cannot catch an error in it.
+        assert_eq!(region.address(0, 0, 0), Some(0xb000_0000));
+        assert_eq!(region.address(0, 3, 0), Some(0xb000_0000 + 3 * 0x8000));
+        assert_eq!(region.address(1, 0, 0), Some(0xb000_0000 + 0x10_0000));
+        assert_eq!(region.address(0, 0, 7), Some(0xb000_0000 + 7 * 0x1000));
+    }
+
+    #[test]
+    fn a_bus_outside_the_region_has_no_address_in_it() {
+        let bytes = mcfg_bytes(&[(0xb000_0000, 0, 16, 31)]);
+        let mcfg = parse_mcfg(&bytes).expect("a well-formed MCFG");
+        let region = mcfg.regions().next().expect("one region");
+
+        assert_eq!(region.address(15, 0, 0), None, "below the range");
+        assert_eq!(region.address(32, 0, 0), None, "above the range");
+        // And the first bus in the region is at the base, not at bus 16's
+        // worth of offset -- the offset is from the region's start.
+        assert_eq!(region.address(16, 0, 0), Some(0xb000_0000));
+    }
+
+    #[test]
+    fn an_mcfg_that_is_wrong_about_itself_is_refused() {
+        let good = mcfg_bytes(&[(0xb000_0000, 0, 0, 255)]);
+
+        let mut wrong_signature = good.clone();
+        wrong_signature[0] = b'X';
+        assert!(parse_mcfg(&wrong_signature).is_none(), "signature");
+
+        let mut wrong_checksum = good.clone();
+        wrong_checksum[9] = wrong_checksum[9].wrapping_add(1);
+        assert!(parse_mcfg(&wrong_checksum).is_none(), "checksum");
+
+        // Regions that describe nothing are skipped rather than believed: an
+        // entry believed here becomes an address read later.
+        assert!(
+            parse_mcfg(&mcfg_bytes(&[(0xb000_0000, 0, 200, 100)])).is_none(),
+            "buses running backwards"
+        );
+        assert!(
+            parse_mcfg(&mcfg_bytes(&[(0, 0, 0, 255)])).is_none(),
+            "a base of zero is firmware that filled in a template"
+        );
+        assert!(parse_mcfg(&mcfg_bytes(&[])).is_none(), "no regions at all");
     }
 
     fn drhd(segment: u16, base: u64, covers_all: bool) -> Vec<u8> {

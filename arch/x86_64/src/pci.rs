@@ -29,6 +29,8 @@
 //! bridge configuration this code does not understand. At a few hundred
 //! nanoseconds per read it costs milliseconds once, during boot.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::port::Port;
 
 /// Where a configuration address is written.
@@ -106,6 +108,88 @@ pub struct Identity {
     pub subsystem: u16,
     /// Bit 7 of the header type: whether this device has more functions.
     pub multifunction: bool,
+}
+
+/// Where configuration space is as *memory*, once firmware has said.
+///
+/// Zero until [`use_ecam`] is called, and the port pair is used until then —
+/// which is also what a machine with no `MCFG` keeps using. RFC 0014 decided
+/// the port path stays rather than being deleted, because it is what the ECAM
+/// path is checked against: "the new one found three devices" is not evidence
+/// that it found the right three.
+static ECAM_BASE: AtomicU64 = AtomicU64::new(0);
+static ECAM_FIRST_BUS: AtomicU64 = AtomicU64::new(0);
+static ECAM_LAST_BUS: AtomicU64 = AtomicU64::new(0);
+/// How long the mapping is. Nothing outside it is read, whatever the
+/// arithmetic above says it wants.
+static ECAM_LENGTH: AtomicU64 = AtomicU64::new(0);
+
+/// Tells this module where the memory-mapped configuration space is.
+///
+/// `base` is a *virtual* address: mapping is the kernel's job, because this
+/// crate has no page tables. After this, [`read32_ecam`] answers for buses in
+/// range and `None` outside it.
+///
+/// # Safety
+///
+/// `base` must be a mapping of the region `MCFG` described, uncached, covering
+/// every bus from `first` to `last` inclusive, and it must live for as long as
+/// the machine does.
+pub unsafe fn use_ecam(base: u64, first: u8, last: u8, length: u64) {
+    ECAM_FIRST_BUS.store(u64::from(first), Ordering::Relaxed);
+    ECAM_LAST_BUS.store(u64::from(last), Ordering::Relaxed);
+    ECAM_LENGTH.store(length, Ordering::Relaxed);
+    // The base last, and with a release: a reader that sees it must see the
+    // bus range that goes with it, or it computes an address inside a region
+    // it has the wrong bounds for.
+    ECAM_BASE.store(base, Ordering::Release);
+}
+
+/// Whether configuration space is reachable as memory.
+#[must_use]
+pub fn ecam_present() -> bool {
+    ECAM_BASE.load(Ordering::Acquire) != 0
+}
+
+/// Reads a 32-bit configuration register through ECAM.
+///
+/// `None` if no region is installed, or the address is not in it. That is a
+/// refusal and not a fallback: a caller that wanted the ports can ask for
+/// them, and silently answering from a different mechanism would make the
+/// comparison this exists for meaningless.
+#[must_use]
+pub fn read32_ecam(address: Address, offset: u8) -> Option<u32> {
+    let base = ECAM_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    let first = ECAM_FIRST_BUS.load(Ordering::Relaxed);
+    let last = ECAM_LAST_BUS.load(Ordering::Relaxed);
+    let bus = u64::from(address.bus);
+    if bus < first || bus > last {
+        return None;
+    }
+
+    let within = ((bus - first) << 20)
+        + ((u64::from(address.device) & 0x1f) << 15)
+        + ((u64::from(address.function) & 0x07) << 12)
+        + u64::from(offset & 0xfc);
+
+    // Bounded against the mapping and not only against the bus number.
+    //
+    // The bus check alone is enough when the arithmetic above is right, which
+    // is exactly the assumption that is worth not making: a wrong shift walks
+    // out of the window, and the first version of this read whatever was
+    // there. It faulted, and a fault during enumeration is a machine that
+    // stops booting rather than a mechanism that reports a disagreement.
+    if within + 4 > ECAM_LENGTH.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    // SAFETY: `use_ecam`'s obligation, and the offset is inside the length it
+    // promised. A configuration read has no side effects on any device this
+    // kernel talks to.
+    Some(unsafe { core::ptr::read_volatile((base + within) as *const u32) })
 }
 
 /// Reads a 32-bit configuration register.
