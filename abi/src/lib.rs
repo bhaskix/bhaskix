@@ -99,6 +99,13 @@ pub mod method {
     /// memory.
     pub const FILL: u64 = 38;
 
+    /// Unmask this interrupt source, so the next one may be delivered.
+    ///
+    /// Only on an `IrqHandler` capability. The whole of a delegated driver's
+    /// interrupt duty: the kernel masks the source on delivery, and nothing
+    /// arrives again until the holder says it is ready. RFC 0011.
+    pub const ACK: u64 = 36;
+
     /// Map a `Memory` object into this `DmaWindow`, and return a `DevAddr`.
     ///
     /// Only on a `DmaWindow` capability. `arg0` = the caller's slot holding

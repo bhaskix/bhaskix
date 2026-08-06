@@ -1425,7 +1425,12 @@ const BLKD_PROGRAM: &[u8] = b"bin/blkd";
 /// would hold every device on the machine, so the kernel enumerates and the
 /// domain drives. The split is not a convenience — it is where the hardware
 /// puts the line.
-pub fn start_block_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
+pub fn start_block_domain(
+    cpu: u32,
+    hhdm_base: u64,
+    apic_id: u32,
+    rsdp: Option<bhaskix_boot::PhysAddr>,
+) -> Result<(), &'static str> {
     let Some((address, _)) = virtio::find_nth(1) else {
         // One device, so nothing to delegate. Not an error: a machine with a
         // single disk is a machine the kernel drives, and saying so beats
@@ -1513,12 +1518,70 @@ pub fn start_block_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> 
     );
     if contained {
         println!("    block domain   dma window granted; the device translates through its own");
-    } else {
-        println!(
-            "    block domain   no dma window: nothing would contain the device, so the \
-             driver gets registers and no way to make it read"
-        );
     }
+
+    // The device's interrupt, claimed by the kernel and handed over as two
+    // capabilities: the handler, and the notification it signals.
+    //
+    // Programming an MSI-X table entry stays here and is not delegable, for
+    // the reason `ObjectKind::IrqHandler` gives: an MSI is a memory write of
+    // an arbitrary vector to an arbitrary CPU, so a holder that could write
+    // its own entry would hold an interrupt-injection primitive. What the
+    // domain gets is the authority to *wait* for one and to acknowledge it,
+    // which is the whole of a driver's interrupt duty.
+    //
+    // Which table entry the queue uses is the driver's to say, in a register
+    // it holds; what that entry contains is the kernel's. That is the same
+    // split as everything else here: the domain chooses among what it was
+    // given, and cannot widen it.
+    const BLOCK_BADGE: u64 = 1 << 1;
+    let signalled = match crate::notify::create() {
+        Ok(notification) => {
+            // SAFETY: `trap` dispatches claimed vectors to `irq::on_interrupt`,
+            // which acknowledges the local APIC. This device is the block
+            // domain's and nothing else claims its entries.
+            let claimed = unsafe {
+                irq::claim_for(
+                    irq::Source::MessageSignalled {
+                        device: address,
+                        entry: 0,
+                    },
+                    realm.as_u32(),
+                    "blkd",
+                    apic_id,
+                    rsdp,
+                    hhdm_base,
+                )
+            };
+            match claimed {
+                Ok(handler) if irq::bind(handler, notification, BLOCK_BADGE).is_ok() => {
+                    let named = (irq::name(handler), crate::notify::name(notification));
+                    if let (Ok(handler_cap), Ok(notify_cap)) = named
+                        && domain::with(realm, |owner| {
+                            owner.cspace.install_at(5, handler_cap).is_ok()
+                                && owner.cspace.install_at(6, notify_cap).is_ok()
+                        }) == Some(true)
+                    {
+                        true
+                    } else {
+                        irq::release(handler);
+                        crate::notify::destroy(notification);
+                        false
+                    }
+                }
+                Ok(handler) => {
+                    irq::release(handler);
+                    crate::notify::destroy(notification);
+                    false
+                }
+                Err(_) => {
+                    crate::notify::destroy(notification);
+                    false
+                }
+            }
+        }
+        Err(_) => false,
+    };
 
     // Bus mastering, last. A device that is not a bus master cannot write to
     // memory at all: its rings stay empty and every request times out, which
@@ -1534,6 +1597,18 @@ pub fn start_block_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> 
     // granted first and this follows it.
     // SAFETY: this device is the block domain's; nothing else drives it.
     unsafe { bhaskix_arch::pci::enable(address) };
+
+    if signalled {
+        println!(
+            "    block domain   interrupt delegated: the kernel programmed the vector, \
+             the driver waits for it"
+        );
+    } else {
+        println!(
+            "    block domain   no dma window: nothing would contain the device, so the \
+             driver gets registers and no way to make it read"
+        );
+    }
 
     let options = sched::SpawnOptions::new()
         .pinned()
@@ -1612,13 +1687,13 @@ fn report_block_domain(hhdm: u64) -> bool {
         return false;
     }
 
-    let mut words = [0u64; 10];
+    let mut words = [0u64; 11];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // eight little-endian words the driver wrote there.
     // The last page. The first three are the descriptor table, the rings and
     // the request the *device* reads and writes -- a report living in any of
     // them would be a report the device could overwrite.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3]) as *const u8, 80) };
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3]) as *const u8, 88) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -1664,6 +1739,7 @@ fn report_block_domain(hhdm: u64) -> bool {
         read_ok,
         used_index,
         request_status,
+        by_interrupt,
     ] = words;
 
     // With a window, the driver is expected to have *read the disk*: status
@@ -1672,7 +1748,7 @@ fn report_block_domain(hhdm: u64) -> bool {
     // because nothing would contain a device it aimed at memory.
     let contained = iommu::present();
     let ok = if contained {
-        drove_to == 15 && read_ok == 1 && queue_size > 0 && sectors > 0
+        drove_to == 15 && read_ok == 1 && by_interrupt == 1 && queue_size > 0 && sectors > 0
     } else {
         drove_to == 3 && queue_size > 0 && sectors > 0
     };
@@ -1682,13 +1758,14 @@ fn report_block_domain(hhdm: u64) -> bool {
         println!(
             "    block domain   ring 3 driver: found status {found}, drove it to {drove_to}, \
              rings at {rings_at_device:#x} for the device, queue of {queue_size}, \
-             {sectors} sectors, sector 0 begins {text:?}"
+             {sectors} sectors, sector 0 begins {text:?}, woken by the device"
         );
     } else {
         println!(
             "    block domain   FAILED: found {found}, drove it to {drove_to}, \
              rings at {rings_at_device:#x}, queue size {queue_size}, sectors {sectors}, \
-             read {read_ok}, used index {used_index}, request status {request_status:#x}"
+             read {read_ok}, by interrupt {by_interrupt}, used index {used_index}, \
+             request status {request_status:#x}"
         );
     }
     ok
@@ -2165,7 +2242,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     }
 
     // RFC 0013 step 6: the second block device, driven from ring 3.
-    if let Err(reason) = start_block_domain(cpu, hhdm) {
+    if let Err(reason) = start_block_domain(cpu, hhdm, handoff.bsp_lapic_id, handoff.rsdp) {
         println!("    block domain   FAILED: {reason}");
     } else {
         // It has to have run before its report can be read. Waiting on a

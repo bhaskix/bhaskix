@@ -37,6 +37,11 @@ const DEVICE: u64 = 2;
 const RINGS: u64 = 3;
 /// Slot: the authority to say what this device may reach.
 const WINDOW: u64 = 4;
+/// Slot: this device's interrupt — the authority to wait for it and to say
+/// the driver is ready for the next one, and nothing about programming it.
+const HANDLER: u64 = 5;
+/// Slot: the notification the handler signals.
+const SIGNAL: u64 = 6;
 
 /// Where each mapping goes in this program's address space.
 const COMMON_AT: u64 = 0x2000_0000;
@@ -81,8 +86,10 @@ mod common {
     pub const NUM_QUEUES: u64 = 0x12;
     pub const DRIVER_FEATURE_SELECT: u64 = 0x08;
     pub const DRIVER_FEATURE: u64 = 0x0c;
+    pub const CONFIG_MSIX_VECTOR: u64 = 0x10;
     pub const QUEUE_SELECT: u64 = 0x16;
     pub const QUEUE_SIZE: u64 = 0x18;
+    pub const QUEUE_MSIX_VECTOR: u64 = 0x1a;
     pub const QUEUE_ENABLE: u64 = 0x1c;
     pub const QUEUE_NOTIFY_OFF: u64 = 0x1e;
     pub const QUEUE_DESC: u64 = 0x20;
@@ -225,6 +232,20 @@ unsafe fn write64(at: u64, value: u64) {
     }
 }
 
+/// Whether the queue took an MSI-X vector, decided during bring-up and read
+/// after it.
+///
+/// A static because the answer belongs to the device and the question is asked
+/// in two places; this program is single-threaded, so `Relaxed` is the whole
+/// of what it needs.
+static VECTORED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the completion came from the notification rather than from looking.
+///
+/// Reported, because "it read the disk" is true of both paths and the whole
+/// point of the interrupt is that the driver was not looking.
+static BY_INTERRUPT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Where the program actually starts.
 #[unsafe(no_mangle)]
 extern "C" fn blkd_main() -> ! {
@@ -291,6 +312,7 @@ extern "C" fn blkd_main() -> ! {
 
     let _ = queues;
     let (used_index, request_status) = aftermath();
+    let by_interrupt = u64::from(BY_INTERRUPT.load(core::sync::atomic::Ordering::Relaxed));
     report(
         found,
         status_now,
@@ -300,6 +322,7 @@ extern "C" fn blkd_main() -> ! {
         read,
         used_index,
         request_status,
+        by_interrupt,
     );
     exit()
 }
@@ -352,6 +375,17 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
         }
 
         write16(COMMON_AT + common::QUEUE_SELECT, 0);
+
+        // Which MSI-X entry this queue uses. *Which* is the driver's to say,
+        // in a register it holds; what that entry contains -- a vector, and a
+        // CPU to send it to -- is the kernel's, and this program has no way to
+        // write it. The device reports 0xffff if it could not take the vector,
+        // and a driver that did not read it back would wait for an interrupt
+        // that was never going to arrive.
+        write16(COMMON_AT + common::QUEUE_MSIX_VECTOR, 0);
+        write16(COMMON_AT + common::CONFIG_MSIX_VECTOR, 0);
+        let vectored = read16(COMMON_AT + common::QUEUE_MSIX_VECTOR) == 0;
+
         write64(
             COMMON_AT + common::QUEUE_DESC,
             device_address(ring::DESCRIPTORS),
@@ -362,6 +396,7 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
         );
         write64(COMMON_AT + common::QUEUE_DEVICE, device_address(ring::USED));
         write16(COMMON_AT + common::QUEUE_ENABLE, 1);
+        VECTORED.store(vectored, core::sync::atomic::Ordering::Relaxed);
 
         write8(
             COMMON_AT + common::DEVICE_STATUS,
@@ -424,8 +459,39 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
         write16(NOTIFY_AT + offset * 4, 0);
     }
 
-    // Wait for it, by looking. An interrupt would be better and is the next
-    // thing this driver needs; a bounded spin is honest about being a spin,
+    // Wait for the interrupt, if the queue took a vector.
+    //
+    // This is the whole of a driver's interrupt duty and the whole of what
+    // this program was given: block until the notification says the device is
+    // finished, then say the driver is ready for the next one. It holds no
+    // vector, cannot reach an interrupt controller, and could not raise an
+    // interrupt if it wanted to.
+    if VECTORED.load(core::sync::atomic::Ordering::Relaxed) {
+        let (status, _badge) = call(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+        // Unmask, so the source can deliver again. The kernel masks on
+        // delivery and nothing arrives until the holder says it is ready --
+        // which is why acknowledging is an authority a driver needs and not
+        // one it can be spared.
+        let _ = call(syscall::INVOKE, HANDLER, method::ACK, [0; 4]);
+        if status == status::OK {
+            BY_INTERRUPT.store(true, core::sync::atomic::Ordering::Relaxed);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            // SAFETY: the status byte and the sector, in memory this program
+            // holds. The device has finished with them: that is what the
+            // notification said.
+            unsafe {
+                if core::ptr::read_volatile((RINGS_AT + ring::STATUS) as *const u8) != 0 {
+                    return None;
+                }
+                return Some(core::ptr::read_volatile(
+                    (RINGS_AT + ring::DATA) as *const u64,
+                ));
+            }
+        }
+        return None;
+    }
+
+    // No vector: look instead. A bounded spin is honest about being a spin,
     // where a wait with no bound would hang a machine on a device that never
     // answers.
     for _ in 0..2_000_000u64 {
@@ -484,6 +550,7 @@ fn report(
     read: Option<u64>,
     used_index: u64,
     request_status: u64,
+    by_interrupt: u64,
 ) {
     // A word the kernel looks for, so a zeroed page is not mistaken for a
     // report nobody wrote.
@@ -503,6 +570,7 @@ fn report(
         core::ptr::write_volatile(at.add(7), u64::from(read.is_some()));
         core::ptr::write_volatile(at.add(8), used_index);
         core::ptr::write_volatile(at.add(9), request_status);
+        core::ptr::write_volatile(at.add(10), by_interrupt);
         // The marker last, and with a fence before it, so a kernel that sees
         // the marker sees everything under it.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);

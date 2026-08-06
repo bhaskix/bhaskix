@@ -134,7 +134,11 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1150
+unsafe_budget = 1170
+# And again for claiming the delegated device's MSI-X entry: programming a
+# vector stays in the kernel, because an MSI is a memory write of an arbitrary
+# vector to an arbitrary CPU and a domain that could write its own entry would
+# hold an interrupt-injection primitive.
 # Raised again for the block domain's data path: enabling bus mastering on a
 # device the kernel does not drive, and reading the report the driver leaves
 # in memory the kernel granted it.

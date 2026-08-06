@@ -123,6 +123,7 @@ const _: () = {
     assert!(method::FILL == bhaskix_abi::method::FILL);
     assert!(method::ATTACH == bhaskix_abi::method::ATTACH);
     assert!(method::MAP == bhaskix_abi::method::MAP);
+    assert!(method::ACK == bhaskix_abi::method::ACK);
     assert!(method::WAIT == bhaskix_abi::method::WAIT);
     assert!(method::PEEK == bhaskix_abi::method::PEEK);
     assert!(Status::InsufficientRights as u64 == bhaskix_abi::status::INSUFFICIENT_RIGHTS);

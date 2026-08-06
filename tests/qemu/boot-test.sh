@@ -632,8 +632,12 @@ if [[ "$MODE" == "iommu" ]]; then
     # sector zero off its own image. `BHASKIX-` is on that disk and on no
     # other, so a driver reading the kernel's device, or reading nothing and
     # reporting a zeroed page, says so.
-    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*1 sectors, sector 0 begins "BHASKIX-"' "$LOG"; then
-        pass "a driver in ring 3 read its disk, by DMA, through its own translation"
+    # `woken by the device` is the part that took the longest to be true: the
+    # kernel programmed the MSI-X entry, the driver said which entry its queue
+    # uses, and the completion arrived as a notification rather than as
+    # something the driver noticed by looking.
+    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*1 sectors, sector 0 begins "BHASKIX-", woken by the device' "$LOG"; then
+        pass "a driver in ring 3 read its disk by DMA and was woken by its own interrupt"
     else
         fail "the block driver in a domain did not read its disk"
         grep -E "block domain" "$LOG" || true

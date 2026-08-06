@@ -349,9 +349,12 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
    addresses could aim it at the kernel, and a driver in a domain doing untranslated DMA is the same
    trusted base further away rather than a smaller one.
 
-   Completion is polled, not taken from an interrupt. The primitives for that exist —
-   `method::WAIT` on a `Notification`, and RFC 0011's delegated `IrqHandler` — and wiring the
-   device's MSI-X to them is the obvious next thing; a bounded spin is honest about being a spin.
+   *Completion arrives as an interrupt, 2026-08-06.* The kernel claims the device's MSI-X entry and
+   programs it; the driver says which entry its queue uses, waits on the notification, and
+   acknowledges to unmask. Programming a vector is never delegated — an MSI is a memory write of an
+   arbitrary vector to an arbitrary CPU — so the domain chooses among what it was given and cannot
+   widen it. RFC 0011's delegation and RFC 0012's containment are both carrying a real request now,
+   which is what this step was for.
 
 Steps 1–2 are the mechanism. Steps 3–5 are the proof. Step 6 is the first driver outside the
 kernel, and the reason the previous four RFCs exist.

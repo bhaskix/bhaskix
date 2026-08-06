@@ -154,6 +154,7 @@ fairness within 2% for two equal-weight workloads.
 | M7-11 | RFC 0013 step 6c: a domain is woken by a notification | ✅ `DONE` | `method::WAIT` and `method::PEEK` on a `Notification` capability. **The shell, in ring 3, is woken by one and reads the badge** — holding no vector, no interrupt controller and no way to reach either. Taking is once: the second look finds nothing, because a notification is a signal and not a queue. A capability with the write right and not the read right is **refused a take** — same object, weaker capability. The third and last of the things a driver in a domain needs. What the shell is woken by is a kernel signal rather than a device, deliberately: that an *interrupt* reaches a notification is gated where the interrupt is (M5, delegation self-test), and what was missing was only the last link. |
 | M7-12 | RFC 0013 step 6: a block driver in a domain, bringing up a device | ✅ `DONE` (bring-up; the data path is next) | `bin/blkd` drives the **second** virtio block device from ring 3. The kernel enumerates the bus and hands over three `Frame` capabilities and a `Memory` object; everything after that is the driver's — it maps its own windows, resets the device, and drives the handshake to acknowledge|driver. It reports **1 sector**, which is its own disk: the kernel's is 180, so a driver handed the wrong device says so in a number nothing else on this machine produces. Two devices because two drivers on one would race resets and interleave rings. **The bus stays in the kernel** and that is not a convenience: PCI configuration space is port I/O, and a domain holding it would hold every device on the machine. Watched failing by removing the handshake. |
 | M7-13 | RFC 0013 step 6 COMPLETE: a driver in a domain reads its disk by DMA | ✅ `DONE` | `bin/blkd`, in ring 3, programs a virtqueue with **device addresses it could not have invented**, kicks the device, and reads sector 0 of its own disk: `sector 0 begins "BHASKIX-"`, which is on that image and no other. The DMA goes through a **page table of its own** — RFC 0012's `DmaWindow`, granted to the domain, with its own domain id under the same unit. **The window is granted only when there is a unit to contain it**: without one the driver gets registers and no way to make the device read, because a domain that could aim a device with physical addresses could aim it at the kernel. Three bugs found, all of them things the kernel's own driver already knew — see the note. |
+| M7-14 | The delegated device's MSI-X wired to the domain's notification | ✅ `DONE` | The driver in ring 3 is now **woken by its own device**. The kernel claims the MSI-X entry and programs it — an MSI is a memory write of an arbitrary vector to an arbitrary CPU, so that authority is never delegated — and hands over two capabilities: the handler, and the notification it signals. The driver says *which* table entry its queue uses, in a register it holds, and waits; the kernel says what that entry contains. It acknowledges to unmask, which is the whole of a delegated driver's interrupt duty. Gated on `woken by the device`, watched failing by not binding: the read stops working **and** the stray-interrupt detector fires, because the vector is programmed and nobody owns it. |
 
 ### Honest notes on M6 so far
 
@@ -641,6 +642,29 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (the interrupt — RFC 0011 and RFC 0012 both stop being self-tests)
+
+- **A driver with no privilege is woken by its own device.** The last poll is gone: the completion
+  arrives as a notification, and the driver acknowledges to let the next one through. Everything RFC
+  0011 built for delegation and everything RFC 0012 built for containment is now carrying a real
+  request rather than a self-test — which is exactly what step 6 said it was for.
+- **The split is the same one as everywhere else in this milestone.** *Which* MSI-X entry the queue
+  uses is the driver's to say, in a register it holds. *What that entry contains* is the kernel's,
+  because an MSI is a memory write of an arbitrary vector to an arbitrary CPU and a holder that
+  could write its own entry would hold an interrupt-injection primitive. The domain chooses among
+  what it was given and cannot widen it.
+- **The negative test failed in two ways at once**, which is the useful kind. Without the bind, the
+  driver never wakes *and* the stray-interrupt detector fires — the device's vector is programmed
+  and nobody owns it. A delegation that half-happens is louder than one that never did.
+- **`RFC 0011 step 5`'s note is now out of date in a good way.** It says a legacy line was used
+  rather than an MSI-X entry "because MSI-X programming writes a real device's table and there is no
+  spare device to write". There is one now.
+- **One flake, recorded rather than explained away.** The tickless measurement failed once under
+  full-suite load — 187 idle ticks against 278 busy — and passed on three solo runs and the next
+  full run. It is a timing measurement on an emulator with one more domain in the machine than it
+  had yesterday. Not chased, and written down so the next occurrence is the second and not the
+  first.
 
 ### 2026-08-06 (the data path — three bugs, and the kernel's driver knew all three)
 
