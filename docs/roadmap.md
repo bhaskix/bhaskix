@@ -131,7 +131,12 @@ Order within the phase is flexible; dependencies are noted.
 
 - **Process management** — fork/exec-equivalent (capability-shaped, not POSIX-shaped), process trees,
   reaping, signals-equivalent
-- **Full VFS** — mount points, a writable filesystem with a journal, page cache
+- **Full VFS** — [RFC 0015](rfc/0015-filesystem.md) (draft). Mount points, a writable filesystem
+  with a journal, page cache. The RFC separates three things usually described as one: a namespace
+  that is not ambient (the root is currently the last place in this system where holding one
+  capability grants everything of a kind), a journal whose claim is tested by interrupting the
+  machine at every write rather than argued for, and a page cache that must be built after the
+  journal because the journal decides when a dirty page may go home
 - **Shared memory and notifications** — [RFC 0009](rfc/0009-shared-memory.md) (accepted) and
   [RFC 0010](rfc/0010-notifications.md): a `Memory` object a capability names, and a doorbell to go
   with it. Between them they complete RFC 0008's answer to A3, and they precede everything below:
