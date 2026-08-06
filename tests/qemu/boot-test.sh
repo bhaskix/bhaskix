@@ -86,7 +86,21 @@ DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
 MACHINE="q35"
 IOMMU_ARGS=()
 VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0 -device virtio-blk-pci,drive=disk1)
-if [[ "$MODE" == "iommu" ]]; then
+# The filesystem service is started only when asked for, because starting it
+# stops the user-mode shell from starting -- an open defect, recorded in the
+# tracker and at the line in the kernel that reads this word. So this mode
+# builds an image that asks for it, and puts the default image back afterwards.
+# It needs a unit as well, because the block service only answers where one
+# contains the device.
+if [[ "$MODE" == "fsd" ]]; then
+    make -C "$REPO_ROOT" iso CMDLINE="fsd=on" >/dev/null 2>&1 || {
+        printf '\033[1;31mFAIL\033[0m  could not build an image with fsd=on\n' >&2
+        exit 1
+    }
+    trap 'make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true; rm -f "$LOG"' EXIT
+fi
+
+if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # RFC 0012's testing plan turns on what the RFC is about. `intremap=on`
     # needs a split irqchip, and both are QEMU's requirements rather than this
     # kernel's -- nothing here programs the unit yet, so what is under test is
@@ -355,7 +369,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 5 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 6 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -451,7 +465,7 @@ fi
 # describes are found and described. "not enabled" is asserted with them --
 # nothing is programmed at this step, and a line that claimed an IOMMU without
 # saying so would read as protection the machine does not have.
-if [[ "$MODE" == "iommu" ]]; then
+if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     if grep -qE "iommu +[1-9][0-9]* unit(s)? found, not enabled; [0-9]+-bit addresses" "$LOG"; then
         pass "the IOMMU the firmware describes is found and reported"
     else
@@ -708,7 +722,7 @@ fi
 # `1 sectors` is the assertion that matters. That is the domain's own disk; the
 # kernel's is 180. A driver handed the wrong device says so in a number nothing
 # else on this machine produces.
-if [[ "$MODE" == "iommu" ]]; then
+if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # With a unit to contain it, the driver is given a DMA window and is
     # expected to have *read the disk*: status 15, and the first bytes of
     # sector zero off its own image. `BHASKIX-` is on that disk and on no
@@ -946,6 +960,28 @@ if grep -qE "ring 3 +[0-9]+ syscalls, [1-9][0-9]* interrupts from user mode; [1-
 else
     fail "ring 3 execution did not pass"
     status=1
+fi
+
+# RFC 0016 step 3, second half. The filesystem, in a domain, mounting a real
+# disk through the block service -- and `bin/fsd` contains no filesystem code
+# at all. It links `bhaskix-fs`, the same crate the kernel links, and supplies
+# a `Store` made of system calls; that the crate needed nothing else is the
+# return on RFC 0015 step 6, which gave it a trait instead of a slice.
+#
+# What is asserted is not that it mounted but that it read the *right bytes*:
+# the kernel wrote a file into that filesystem through its own copy of the same
+# crate, and the service found it. Two copies of one parser, one disk, and the
+# same answer.
+if [[ "$MODE" == "fsd" ]]; then
+    if grep -qE "fs domain +bin/fsd mounted the disk through the block service: [1-9][0-9]* sectors, [1-9][0-9]* blocks, [1-9][0-9]* entries, and .on-a-disk. reads [1-9][0-9]* bytes" "$LOG"; then
+        pass "the filesystem, in a domain, read a real disk through the block service"
+    elif grep -qE "fs domain +no block service on this machine" "$LOG"; then
+        pass "no block service on this machine, so no disk for the filesystem to mount"
+    else
+        fail "the filesystem in a domain did not read the disk"
+        grep -E "fs domain " "$LOG" || true
+        status=1
+    fi
 fi
 
 # RFC 0016 step 3, and the debt RFC 0015 step 1 left. Until `block::WRITE`

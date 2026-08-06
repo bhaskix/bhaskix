@@ -444,11 +444,32 @@ Five steps. The first is independent of the rest and should not wait for it.
    distinct answer, the check and its absence look identical from outside, which is exactly what a
    test of it found.
 
-   **The second half is not done.** The filesystem service's `Store` becoming messages to `bin/blkd`
-   is what remains of this step, and the criterion this RFC wrote for it — "with the kernel not
-   linking `fs`" — is **wrong as stated**: `kernel/src/namespace.rs` uses the crate, and it does not
-   go until step 4. The honest criterion is that the *service* mounts the same image from the same
-   disk and reads the same bytes, with the kernel's copy still there until step 4 deletes it.
+   ✅ **The second half is done too.** `bin/fsd` mounts the disk through the block service and reads
+   a file off it — a file the kernel wrote into that same filesystem through *its* copy of the same
+   crate. Two copies of one parser, one disk, the same answer.
+
+   **The program contains no filesystem code.** It links `bhaskix-fs` and supplies a `Store` made of
+   system calls, and that is all it took: the crate was written against a `Store` and a `Pages` in
+   RFC 0015 step 6 because a filesystem on a disk cannot be handed its own bytes, and a filesystem
+   written against a slice could not have been placed here at all. Unlike the block driver, this
+   really is the same code the kernel runs, so a change to the format rebuilds both and the two can
+   never be reading different filesystems.
+
+   What it holds is two capabilities: the block service's endpoint, and one memory object it maps —
+   whose first page is the buffer the service fills and drains, named to the service *by slot*, so
+   the service is pointed at authority the caller already holds. It has no registers, no interrupt,
+   no DMA window, and no way to name a disk. It cannot yet be **asked** anything; serving is step 4.
+
+   The criterion this RFC originally wrote — "with the kernel not linking `fs`" — was **wrong as
+   stated**: `kernel/src/namespace.rs` uses the crate and does not go until step 4. What is true now
+   is that the filesystem *runs* outside the kernel; deleting the copy inside it is step 4's work.
+
+   **A defect was found and is not fixed.** A caller on the *same CPU* as `bin/blkd` that asks it for
+   a sector makes the driver fault — a null `self` inside `Virtqueue::describe`, before it touches
+   the device. It reproduces every time, pinned or not; it does not happen from any other CPU, where
+   hundreds of identical requests succeed; and the shell, which *is* on the driver's CPU, calls it
+   for something that does not touch the queue and is fine. `bin/fsd` therefore runs on CPU 0, with
+   the reason written at the line that puts it there. This is an open defect, not a design choice.
 4. **Directory and file handles.** The namespace moves out; the kernel's `namespace.rs`,
    `ObjectKind::Directory`, `ObjectKind::File` and `OPEN_AT` are deleted. The RFC 0015 step 4 shell
    gates must pass **unchanged** — that is the point of them.

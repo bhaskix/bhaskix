@@ -46,10 +46,12 @@ SHELL_DIR    := user/shell
 VFSD_DIR     := user/vfsd
 CONSOLED_DIR := user/consoled
 BLKD_DIR     := user/blkd
+FSD_DIR      := user/fsd
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
 USER_CONSOLED := $(CONSOLED_DIR)/target/$(TARGET)/release/consoled
 USER_BLKD    := $(BLKD_DIR)/target/$(TARGET)/release/blkd
+USER_FSD     := $(FSD_DIR)/target/$(TARGET)/release/fsd
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
 # kernel's PIC/kernel-code-model settings are wrong for a user program linked
@@ -64,6 +66,8 @@ CONSOLED_FLAGS := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(CONSOLED_DIR)/link.ld
 BLKD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(BLKD_DIR)/link.ld
+FSD_FLAGS    := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(FSD_DIR)/link.ld
 
 # 256 MiB is comfortably more than the kernel needs and small enough that the
 # memory-map output stays readable.
@@ -114,7 +118,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
+.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu test-fs-domain \
         test-placements mkfs \
         test-shell test-faults fmt clippy gates clean distclean help
 
@@ -175,7 +179,7 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(FS_IMAGE)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_FSD) $(FS_IMAGE)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
@@ -184,6 +188,7 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USE
 	cp $(USER_VFSD) $(INITRD_ROOT)/bin/vfsd
 	cp $(USER_CONSOLED) $(INITRD_ROOT)/bin/consoled
 	cp $(USER_BLKD) $(INITRD_ROOT)/bin/blkd
+	cp $(USER_FSD) $(INITRD_ROOT)/bin/fsd
 	cp $(FS_IMAGE) $(INITRD_ROOT)/fs.img
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
@@ -232,6 +237,16 @@ $(USER_BLKD): $(BLKD_DIR)/src/main.rs $(BLKD_DIR)/link.ld $(BLKD_DIR)/Cargo.toml
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
+# The filesystem as a program. It depends on `fs/` as well as the ABI, because
+# unlike the block driver this *is* the same code the kernel runs -- so a
+# change to the format rebuilds both, and the two can never be reading
+# different filesystems.
+$(USER_FSD): $(FSD_DIR)/src/main.rs $(FSD_DIR)/link.ld $(FSD_DIR)/Cargo.toml \
+             $(wildcard abi/src/*.rs) $(wildcard fs/src/*.rs)
+	cd $(FSD_DIR) && RUSTFLAGS="$(FSD_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
 $(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) $(INITRD) $(DOMAIN_DISK) | $(LIMINE_DIR)
 	@rm -rf $(ISO_ROOT)
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
@@ -275,7 +290,7 @@ run-uefi: $(ISO)
 
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
-test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-placements \
+test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-fs-domain test-placements \
       test-shell test-faults
 	@echo
 	@echo "  all checks passed"
@@ -329,6 +344,12 @@ test-boot-uefi: $(ISO)
 test-boot-iommu: $(ISO)
 	tests/qemu/boot-test.sh iommu
 
+# The filesystem in a domain, which is started only when the command line asks
+# -- see the comment in `boot-test.sh`. It builds its own image and puts the
+# default one back, so it is last among the boot tests.
+test-fs-domain: $(ISO)
+	tests/qemu/boot-test.sh fsd
+
 # Types at the machine over the serial line and asserts on the replies. The
 # only tests here that write to the kernel rather than only reading from it,
 # which is the only way to test an input path.
@@ -354,6 +375,7 @@ fmt:
 	cd $(VFSD_DIR) && $(CARGO) fmt --all --check
 	cd $(CONSOLED_DIR) && $(CARGO) fmt --all --check
 	cd $(BLKD_DIR) && $(CARGO) fmt --all --check
+	cd $(FSD_DIR) && $(CARGO) fmt --all --check
 
 # Two passes, because they cover different things. `--all-targets` cannot be
 # used on the freestanding target: it would try to build the test harness,
@@ -456,6 +478,7 @@ clean:
 	cd $(VFSD_DIR) && $(CARGO) clean
 	cd $(CONSOLED_DIR) && $(CARGO) clean
 	cd $(BLKD_DIR) && $(CARGO) clean
+	cd $(FSD_DIR) && $(CARGO) clean
 	rm -rf build
 
 distclean: clean

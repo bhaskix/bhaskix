@@ -592,16 +592,8 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                 // at the point every service is answering — a boot time that
                 // stopped before the services were up would flatter whichever
                 // placement started them more slowly.
-                if let Some(nanos) = time::now_nanos() {
-                    println!(
-                        "    boot cost      {}.{:03} ms to services up, console={} vfs={}",
-                        nanos / 1_000_000,
-                        nanos % 1_000_000 / 1_000,
-                        service::CONSOLE_PLACEMENT,
-                        service::VFS_PLACEMENT
-                    );
-                }
-                println!("  M6 in progress. Nothing left to do at this milestone.");
+                // Said inside `user_shell`, before the shell was started, so
+                // that nothing is still being printed when it begins.
             }
             Err(reason) => {
                 println!("  the user-mode shell could not be started: {reason}");
@@ -1952,6 +1944,15 @@ const BLKD_STACK_PAGES: u64 = 4;
 /// Where the block driver's program is.
 const BLKD_PROGRAM: &[u8] = b"bin/blkd";
 
+/// Where the filesystem service's stack goes in its own address space.
+const FSD_STACK: u64 = 0x0000_0000_1100_0000;
+/// How many pages of it.
+const FSD_STACK_PAGES: u64 = 4;
+/// The filesystem service, in the archive.
+const FSD_PROGRAM: &[u8] = b"bin/fsd";
+/// The badge on the filesystem service's capability to the block service.
+const BADGE_FS_BLOCK: u64 = 0x0000_0000_00f5_b100;
+
 /// Hands the *second* block device to a domain, and starts a driver for it.
 ///
 /// The kernel drives the first and never touches this one. Two drivers on one
@@ -2710,8 +2711,18 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
             sched::exit()
         };
         let root = volume.superblock().root;
-        if volume.create(root, b"on-a-disk", Kind::File).is_err() {
+        let Ok(index) = volume.create(root, b"on-a-disk", Kind::File) else {
             DISK_JOURNAL.store(4, Ordering::Release);
+            sched::exit()
+        };
+        // Contents, so that the filesystem service started afterwards has
+        // something to find that only this filesystem holds. An empty file
+        // would prove the name was there and nothing about the bytes.
+        if volume
+            .write(index, 0, b"written through a service\n")
+            .is_err()
+        {
+            DISK_JOURNAL.store(14, Ordering::Release);
             sched::exit()
         }
         root
@@ -3018,6 +3029,162 @@ extern "C" fn block_domain_entry(hhdm_base: u64) -> ! {
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
     unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+}
+
+/// Loads and enters `bin/fsd`.
+extern "C" fn fs_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("    fs domain      FAILED: {why}");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(FSD_PROGRAM) else {
+        stop("bin/fsd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/fsd is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(FSD_STACK), FSD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/fsd would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = FSD_STACK + FSD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, [0, 0]) }
+}
+
+/// Starts the filesystem in a domain, and checks what it read off the disk.
+///
+/// RFC 0016 step 3. The program it loads contains **no filesystem code**: it
+/// links `bhaskix-fs`, the same crate the kernel links, and supplies a `Store`
+/// made of system calls. That the crate needed nothing else is the whole
+/// return on RFC 0015 step 6 — a filesystem written against a slice could not
+/// have been placed here at all.
+///
+/// What it is given is two capabilities: the block service's endpoint, and one
+/// memory object it maps. It has no registers, no interrupt, no DMA window and
+/// no way to name a disk. What it reads it reads by asking.
+fn start_fs_domain(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    /// What `bin/fsd` writes when it has finished, after everything else.
+    const MARKER: u64 = 0x4653_4452_5054_3031;
+    /// What the kernel put in the file, and what the service must find.
+    const EXPECTED: &[u8] = b"written through a service\n";
+
+    let raw = BLOCK_ENDPOINT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        println!("    fs domain      no block service on this machine, so no disk to mount");
+        return true;
+    }
+    let endpoint = ipc::EndpointId::from_u32(raw as u32);
+
+    let Ok(realm) = domain::create("fs", domain::ResourceEnvelope::new()) else {
+        println!("    fs domain      FAILED: the domain would not be created");
+        return false;
+    };
+
+    // Ten pages: one the block service fills and drains, eight of page cache,
+    // and one the service leaves its findings in. One object rather than
+    // three, because a domain that had to be given three would have to be told
+    // which was which -- and this way the *service* decides the layout of its
+    // own memory, which is what holding it means.
+    let Ok(memory) = shared::create(realm, 10 * bhaskix_mm::FRAME_SIZE) else {
+        println!("    fs domain      FAILED: its memory would not be created");
+        domain::destroy(realm);
+        return false;
+    };
+    let Some((frames, count)) = shared::frames_of(memory) else {
+        domain::destroy(realm);
+        return false;
+    };
+    let installed = shared::name(memory).ok().and_then(|named| {
+        let block = cap::with_arena(|arena| {
+            let root = arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                    cap::Rights::ALL,
+                    0,
+                )
+                .ok()?;
+            arena.derive(root, cap::Rights::ALL, BADGE_FS_BLOCK).ok()
+        })?;
+        domain::with(realm, |owner| {
+            owner.cspace.install_at(0, block).is_ok() && owner.cspace.install_at(1, named).is_ok()
+        })
+    });
+    if installed != Some(true) || count < 10 {
+        println!("    fs domain      FAILED: its capabilities would not install");
+        domain::destroy(realm);
+        return false;
+    }
+
+    let options = sched::SpawnOptions::new().in_domain(realm.as_u32());
+    if sched::spawn_on_with(3, "fsd", fs_domain_entry, hhdm, hhdm, options).is_err() {
+        println!("    fs domain      FAILED: it would not spawn");
+        domain::destroy(realm);
+        return false;
+    }
+
+    // The report page is the object's last frame, read through the direct map.
+    let mut words = [0u64; 7];
+    for _ in 0..200 {
+        // SAFETY: a frame this object owns, through the direct map, read as
+        // the six little-endian words the service writes there.
+        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[9]) as *const u8, 56) };
+        for (index, word) in words.iter_mut().enumerate() {
+            let mut buffer = [0u8; 8];
+            buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+            *word = u64::from_le_bytes(buffer);
+        }
+        // The marker, which the service writes last and after a fence. The
+        // stage word is written as it goes and is *not* covered by that
+        // fence -- it is what says how far a run that never got here reached.
+        if words[0] == MARKER {
+            break;
+        }
+        wait_millis(50);
+    }
+
+    // The domain is **not** destroyed. It was, and destroying it tore down a
+    // ring 3 thread that had written its answer and had not yet reached its
+    // `exit` -- after which the shell never started. A service that has
+    // finished saying something is not a service that has finished, and this
+    // one is going to be asked things in the next step anyway.
+    let [_, blocks, entries, read, matched, sectors, stage] = words;
+    let ok = matched == 1 && read == EXPECTED.len() as u64 && blocks > 0 && entries > 0;
+    if ok {
+        println!(
+            "    fs domain      bin/fsd mounted the disk through the block service: \
+             {sectors} sectors, {blocks} blocks, {entries} entries, and `on-a-disk` reads \
+             {read} bytes that the kernel wrote through its own copy of the same crate"
+        );
+    } else {
+        println!(
+            "    fs domain      FAILED: {sectors} sectors, {blocks} blocks, {entries} entries, \
+             {read} bytes read, contents match {matched}, reached stage {stage}"
+        );
+    }
+    ok
 }
 
 /// Creates the domain the console service runs in, and starts it.
@@ -3533,6 +3700,28 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         if !disk_journal_self_test(hhdm) {
             println!("    disk journal   FAILED");
         }
+        // **Opt-in, and that is a defect being avoided rather than a
+        // preference.** Starting `bin/fsd` makes the user-mode shell fail to
+        // start: the service itself runs and reads the disk correctly, and the
+        // shell's thread is created and reaches its entry, and then nothing --
+        // no fault, no message, no prompt. It reproduces on every CPU tried,
+        // whether the service is started before or after the shell, and
+        // whether or not its domain is destroyed afterwards. It is an open
+        // defect in the tracker, and until it is understood the service is
+        // started only when asked for, by `tests/qemu/boot-test.sh fsd`.
+        //
+        // Off by default is the honest arrangement while it is open: a machine
+        // that runs a filesystem service and no shell is not the machine
+        // anybody wants, and pretending otherwise by leaving it on would mean
+        // the shell tests were the ones that had to be weakened.
+        if handoff
+            .cmdline
+            .split_ascii_whitespace()
+            .any(|word| word == "fsd=on")
+            && !start_fs_domain(hhdm)
+        {
+            println!("    fs domain      FAILED");
+        }
     }
 
     // The block service's endpoint, at slot 12, so this program can ask a
@@ -3559,11 +3748,32 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
     }
 
+    // Everything this machine has to say is said before the shell starts.
+    //
+    // It used to be the other way round, and the shell's first line came out
+    // through the middle of the kernel's last ones: `a user-mode s` ... `boot
+    // cost ...` ... `hell. 'help' lists what it can do.` Both were writing to
+    // one console, and neither was wrong -- but a test looking for the banner
+    // could not find it, and only under load, which is the worst way for a
+    // test to be wrong. The console is shared and the interleaving is real, so
+    // the fix is to stop overlapping rather than to make the test cleverer.
+    if let Some(nanos) = time::now_nanos() {
+        println!(
+            "    boot cost      {}.{:03} ms to services up, console={} vfs={}",
+            nanos / 1_000_000,
+            nanos % 1_000_000 / 1_000,
+            service::CONSOLE_PLACEMENT,
+            service::VFS_PLACEMENT
+        );
+    }
+    println!("  M6 in progress. Nothing left to do at this milestone.");
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
     sched::spawn_on_with(cpu, "usershell", user_shell_entry, hhdm, hhdm, options)
         .map_err(|_| "the shell would not spawn")?;
+
     Ok(())
 }
 
@@ -5675,14 +5885,15 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Five programs in /bin: the ring 3 probe, the user-mode shell,
-            // both services as programs, and the block driver (RFC 0013 steps
-            // 3, 4 and 6). Exact rather than "at least", so adding a sixth
-            // without noticing this line is a failure rather than a silently
-            // weaker test -- which it has now been, four times, once per
-            // program added. It is the cheapest assertion in the repository.
+            // Six programs in /bin: the ring 3 probe, the user-mode shell,
+            // both services as programs, the block driver (RFC 0013 steps 3, 4
+            // and 6), and the filesystem (RFC 0016 step 3). Exact rather than
+            // "at least", so adding a seventh without noticing this line is a
+            // failure rather than a silently weaker test -- which it has now
+            // been, five times, once per program added. It is the cheapest
+            // assertion in the repository.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 5,
+            entries >= 3 && bin == 6,
         ),
         (
             "the user program is an ELF the loader accepts",

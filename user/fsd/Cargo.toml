@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The filesystem, placed in its own domain.
+#
+# Not a member of the root workspace, for the reason user/shell/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a
+# workspace member cannot have its own `rustflags`.
+#
+# Unlike the block driver, this **is** the same code the kernel runs.
+# `bhaskix-fs` has never depended on the kernel -- it was written against a
+# `Store` and a `Pages` because RFC 0015 step 6 said a filesystem on a disk
+# cannot be handed its own bytes -- so placing it here needed no filesystem
+# code at all. What this crate supplies is the other half: a `Store` made of
+# system calls.
+[workspace]
+
+[package]
+name = "bhaskix-user-fsd"
+description = "The filesystem in a domain of its own, reading through the block service."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "fsd"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-fs = { path = "../../fs" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+unsafe_budget = 40
+# Small, and it should stay small. Everything this program does to a
+# filesystem is safe code in `bhaskix-fs`; the `unsafe` here is the system call
+# convention, the entry point, and the two places that read and write a page
+# the kernel mapped for it. A filesystem service whose `unsafe` count grew
+# would be one that had started doing its own parsing.

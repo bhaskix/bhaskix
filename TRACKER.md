@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-11 (RFC 0015 steps 1–6, RFC 0016 steps 1–2, step 3 first half) · CI green · 501 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-12 (RFC 0015 steps 1–6, RFC 0016 steps 1–3) · CI green · 564 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
 
 ### Division of responsibility between documents
 
@@ -144,6 +144,8 @@ fairness within 2% for two equal-weight workloads.
 | M9-10 | RFC 0016 step 2: a reply that carries a capability | ✅ `DONE` | `HAND` on an endpoint, and it is the endpoint because there is **no reply capability to put it on** — `ObjectKind::Reply` exists but a server never holds one, so "not answering anybody" is a check rather than a lookup. Four checks: the endpoint proves this thread is a server, the reply obligation says which caller, the capability is one the server holds with `GRANT` **and** `DERIVE`, and where it lands comes from the caller's new `EXPECT` — one-shot, spent by what arrives and dropped when the call ends. Without that last one a hostile service could fill a slot a program was keeping *empty*, which the shell does and one of its tests depends on. Proved with no throwaway service: the **block driver lends the shell its device's configuration page**, ring 3 to ring 3, and the shell maps it and reads `1af4:1042` — a number no service told it. Needed an IOMMU shell-test mode, because the block service only answers where a unit contains the device. **Two of the three refusals were vacuous** and were rebuilt so the named rule is the only one that can refuse. |
 
 | M9-11 | RFC 0016 step 3 (first half): `block::WRITE`, and a journal on a real device | ✅ `DONE` | The debt RFC 0015 step 1 left: it called for `READ` **and** `WRITE` and only `READ` was built, so the journal — whose entire subject is what reaches a disk — had never reached one. A write needs a new kernel primitive, **`DRAIN`**, the mirror of `FILL`: a caller names memory it holds and a service takes bytes *out* of it, checked the same three ways and asking the caller's capability for `READ` where `FILL` asks for `WRITE`, because the right demanded is the one the operation performs. A filesystem is now laid down on the **virtio disk** through the block service in another domain, a file is created through the log, the machine is stopped one *device* write after its commit, and mounting replays it — read back through a cache created seconds earlier holding nothing. Found on the way: `args[1]` (how many sectors) had always been in the ABI and always ignored, so every block was eight round trips; and the journal put **8 KiB on the stack per transaction**, which overflowed a kernel thread's stack and read as a wild jump. |
+
+| M9-12 | RFC 0016 step 3 (second half): the filesystem, in a domain, reading a real disk | ⚠️ `DONE, OPT-IN` | `bin/fsd` mounts the disk through the block service and reads a file the kernel wrote into that same filesystem through **its** copy of the same crate — two copies of one parser, one disk, the same answer. The program contains **no filesystem code**: it links `bhaskix-fs` and supplies a `Store` made of system calls, which is the whole return on RFC 0015 step 6. It holds two capabilities — the block service's endpoint and one memory object it maps — and has no registers, no interrupt, no DMA window and no way to name a disk. **It is started only when the command line asks (`fsd=on`), because starting it stops the user-mode shell from starting**, which is an open defect below. `tests/qemu/boot-test.sh fsd` builds an image that asks for it and puts the default back. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -741,6 +743,38 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0016 step 3, second half — the filesystem leaves the kernel, with two defects found)
+
+- **`bin/fsd` mounts a real disk in a domain**, through the block service, and reads a file the
+  kernel wrote into that filesystem through its own copy of the same crate. Two copies of one
+  parser, one disk, the same answer.
+- **The program contains no filesystem code.** It links `bhaskix-fs` — the same crate the kernel
+  links — and supplies a `Store` made of system calls. That the crate needed nothing else is the
+  return on RFC 0015 step 6: a filesystem written against a slice could not have been placed here.
+- **Two programs were linked at the same address**, and it cost hours. `blkd` and every other user
+  program sit at `0x10000000`, so a fault report saying `rip 0x10000515` resolved to a different
+  function in each — and the wrong one was investigated first. `fsd` is at `0x12000000` now. An
+  address is free; being able to tell which program faulted is not.
+
+**Two open defects, both found here, neither fixed:**
+
+- **A caller on the same CPU as `bin/blkd` that asks it for a sector makes the driver fault** — a
+  null `self` inside `Virtqueue::describe`, before it touches the device. Reproduces every time,
+  pinned or not; does not happen from any other CPU, where hundreds of identical requests succeed;
+  and the shell, which *is* on the driver's CPU, calls it for something that does not touch the
+  queue and is fine.
+- **Starting `bin/fsd` stops the user-mode shell from starting.** The service runs and reads the
+  disk correctly; the shell's thread is created and reaches its entry; and then nothing — no fault,
+  no message, no prompt. Reproduces on every CPU tried, before or after the shell, with or without
+  destroying the service's domain afterwards. The service is therefore **opt-in** (`fsd=on`), which
+  is written at the line that reads the word rather than left to be discovered.
+
+- **A flaky test explained and fixed rather than re-run.** The shell's banner was coming out through
+  the middle of the kernel's last boot lines — `a user-mode s` … `boot cost …` … `hell. 'help'
+  lists…` — because the shell was spawned *before* the boot report finished printing, and both write
+  to one console. Only visible under load. The kernel now says everything it has to say before
+  starting the program that shares the wire.
 
 ### 2026-08-06 (RFC 0016 step 3, first half — the journal reaches a disk)
 

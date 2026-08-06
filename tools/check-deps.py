@@ -99,6 +99,11 @@ PLACEMENTS: dict[str, set[str]] = {
     # The block driver shares no code with the kernel's, only the
     # specification, so the ABI is the whole of what it may reach.
     "bhaskix-user-blkd": {"bhaskix-abi", "bhaskix-device"},
+    # The filesystem, unlike the driver, **is** the kernel's own code: it
+    # depends on `bhaskix-fs`, the same crate the kernel links. That is the
+    # point of it -- one parser, two places -- and it is why this entry names
+    # the crate rather than pretending the service is independent of it.
+    "bhaskix-user-fsd": {"bhaskix-abi", "bhaskix-fs"},
     "bhaskix-user-consoled": {
         "bhaskix-abi",
         "bhaskix-service",
