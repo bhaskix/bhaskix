@@ -489,7 +489,14 @@ Five steps. The first is independent of the rest and should not wait for it.
 
    This is prior to the namespace and prior to `HAND`. Until a service can call while owing a reply,
    no service that depends on another can answer anything, which is most of what this RFC is for.
-   It is the next thing to fix and it may need a line in RFC 0008: a reply obligation is one slot per
-   thread, and a nested call is a second one.
+
+   **Sharpened since.** It is not the reply obligation. Moving `bin/blkd`'s stack away from the
+   address every other program uses turned the symptom from silent corruption into a clean page fault
+   at an *unmapped stack address*: the shell was running with **another program's page table
+   loaded**, writing to what it thought was its own stack and hitting blkd's. That is why blkd
+   faulted with a garbage `self`, and why nothing looked wrong until blkd's stack moved out of the
+   way. So the defect is in address-space switching on resume — `finish_switch` → `enter_space` —
+   and not in IPC at all. It belongs to RFC 0008's neighbourhood only in that IPC is what exposes
+   it.
 5. **Lending a cached frame**, with pinning and the eviction gate. Last, because it is the only step
    whose failure is silent, and it should be built when everything under it is already trusted.

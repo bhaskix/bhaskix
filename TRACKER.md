@@ -748,6 +748,28 @@ Newest first. One entry per meaningful change of project state.
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
 
+### 2026-08-06 (the nested-call defect — sharpened, not fixed)
+
+- **What it actually is, which is worse and more useful than "a nested call faults".** Moving
+  `bin/blkd`'s stack away from `0x11000000` changed the symptom from silent corruption to a clean
+  page fault at `0x11003e70` — a *stack address that is not mapped*. The shell was not corrupting
+  itself; it was **running with another program's page table loaded**, writing to what it thought
+  was its own stack and hitting blkd's, which is why blkd faulted with a garbage `self` and why
+  nothing looked wrong until blkd's stack moved out of the way.
+- **So the question is no longer "what does a nested call corrupt" but "why does a thread resume
+  with the wrong `CR3`".** That narrows it to `finish_switch` → `enter_space`, which every switch
+  path does reach — both `bhaskix_context_switch` sites and the new-thread trampoline. What has not
+  been found is the path that resumes a thread without it, or the reason `enter_space`'s
+  `current == root` short-circuit is wrong.
+- **Ruled out along the way**: the space table being full (it prints when it is, and it never did;
+  five in use of eight), `HAND` (removing it leaves the fault), `EXPECT` (the stale-handle probe
+  takes the same path and answers), and the reply obligation itself (`reply_to` is taken and
+  restored correctly, and a warmed cache with no nested call answers the same request).
+- **A silent no-op edit cost an hour, for the second time in this project.** `cargo fmt` had
+  reformatted a destructuring across several lines, so a scripted `.replace` against the one-line
+  form matched nothing and reported nothing. The machine then behaved as though a store had never
+  been written, because it had not.
+
 ### 2026-08-06 (RFC 0016 step 4 — stopped, on a defect worth more than the step)
 
 - **A server that calls another service while it already owes a reply faults its caller.** The
@@ -762,11 +784,14 @@ Newest first. One entry per meaningful change of project state.
   describe. Two of the six gates already pass through the service.
 - **The shell still uses the kernel's namespace.** Nothing regressed, and nothing is claimed that is
   not true — the step is not done and is not marked done.
-- **Three diagnostic obstacles, two now fixed.** Every program was linked at `0x10000000` *and*
-  stacked at `0x11000000`, so a fault report identified nothing; `bin/fsd` now has its own code and
-  stack addresses. The third is open and cost the most: **the exception report's `rip` is not an
-  instruction boundary** — three times it landed mid-instruction, and each time it sent the
-  investigation into the wrong program or the wrong function.
+- **Two diagnostic obstacles, one fixed.** Every program was linked at `0x10000000` *and* stacked at
+  `0x11000000`, so a fault report identified nothing; `bin/fsd` now has its own code and stack
+  addresses. Giving `bin/blkd` its own broke it in a way there was no budget to chase, and was
+  reverted — the finding it produced is recorded below and did not need the change kept.
+- **A claim I made here was wrong and is withdrawn.** I recorded that "the exception report's `rip`
+  is not an instruction boundary". It is. The disassemblies that said otherwise were taken with
+  `objdump --start-address` from an address that was not one, which desynchronises x86 decoding and
+  produces a plausible-looking window of nonsense. The trap frame is correct.
 - **The Makefile trap caught me a third time.** Building a user program with `cargo` by hand
   produces a binary at the path `make` checks, without the linker script, and the machine says
   `bin/fsd is not an ELF this kernel will load`. Only `make` builds these correctly.
