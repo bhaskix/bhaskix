@@ -649,6 +649,28 @@ else
     status=1
 fi
 
+# The block driver is a service now, and something asked it for a sector.
+#
+# RFC 0015 step 1. The oracle is the image: the Makefile writes
+# `BHASKIX-DOMAIN-DISK-SECTOR-0` into sector zero of the disk the *domain*
+# drives, so the kernel knows what must come back without being able to read
+# that disk itself -- it drives the other one. The refusal is asserted beside
+# it, because a service that answers every question is not answering any.
+if grep -qE "block service +512 bytes of sector 0 through the service, and they are the domain disk's own; a sector past the end is refused" "$LOG"; then
+    pass "a block service in ring 3 answered a request for a sector, and refused one that is not there"
+elif grep -qE "block domain +no second device" "$LOG"; then
+    pass "no second device, so no block service to ask"
+elif grep -qE "block domain +no dma window" "$LOG"; then
+    # No unit to contain the device, so the driver was given registers and no
+    # way to make it read -- and a service that cannot read a sector cannot
+    # answer for one. That is the refusal working, not a service missing.
+    pass "no dma window on this machine, so the block service has nothing to answer with"
+else
+    fail "the block service did not answer for a sector"
+    grep -E "block service" "$LOG" || true
+    status=1
+fi
+
 # RFC 0013 step 6: a block driver in ring 3, driving a device of its own.
 #
 # The kernel enumerates the bus -- PCI configuration space is port I/O, and a
@@ -670,7 +692,7 @@ if [[ "$MODE" == "iommu" ]]; then
     # kernel programmed the MSI-X entry, the driver said which entry its queue
     # uses, and the completion arrived as a notification rather than as
     # something the driver noticed by looking.
-    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*1 sectors, sector 0 begins "BHASKIX-", woken by the device, and says it is 1af4:1042 from its own configuration space' "$LOG"; then
+    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*8 sectors, sector 0 begins "BHASKIX-", woken by the device, and says it is 1af4:1042 from its own configuration space' "$LOG"; then
         # `1af4:1042` is the virtio vendor and the modern block device, read
         # by the driver out of its *own* configuration space with no help from
         # the kernel. It is only reported when the same page was **refused** a
@@ -683,7 +705,7 @@ if [[ "$MODE" == "iommu" ]]; then
         grep -E "block domain" "$LOG" || true
         status=1
     fi
-elif grep -qE "block domain +ring 3 driver: .*drove it to 3, .*1 sectors" "$LOG"; then
+elif grep -qE "block domain +ring 3 driver: .*drove it to 3, .*8 sectors" "$LOG"; then
     # Without a unit the driver gets registers and no window, so it brings the
     # device up and stops. That is the refusal, not a shortcoming: a domain
     # that could aim a device with physical addresses would be a domain that
@@ -835,7 +857,12 @@ fi
 # reply delivered to the wrong caller — possible precisely because two clients
 # are in flight at once. Round counts vary by seventy times between runs on a
 # loaded host, so a fixed count would measure the host.
-if grep -qE "ipc +[0-9]+ rendezvous, [0-9]+ replies, ([0-9]+)/\1 correct; two badges distinguished" "$LOG"; then
+# `0 wrong`, and not `N/N correct`. The back-reference compared two counters
+# the machine had not sampled together: a client preempted between its own two
+# increments printed `9/8` and the gate called a working machine broken, twice,
+# and both times "load" was available as an explanation. The property is that
+# no reply carried a wrong value, and that is one number.
+if grep -qE "ipc +[0-9]+ rendezvous, [0-9]+ replies, [0-9]+ correct and 0 wrong; two badges distinguished" "$LOG"; then
     pass "synchronous IPC: rendezvous, correct replies, badges distinguish callers"
 else
     fail "IPC self test did not pass"

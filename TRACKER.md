@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6, M8-01 … M8-09) · CI green · 409 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 294 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01, M9-02 (RFC 0015 step 1) · CI green · 416 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 294 host assertions |
 
 ### Division of responsibility between documents
 
@@ -119,6 +119,14 @@ fairness within 2% for two equal-weight workloads.
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
 
+
+
+### M9 — Filesystem ([RFC 0015](docs/rfc/0015-filesystem.md))
+
+| ID | Task | Status | Notes |
+|---|---|---|---|
+| M9-01 | RFC 0015 step 1: the block driver becomes a service | ✅ `DONE` | `bin/blkd` answers `block::READ` on an endpoint the kernel gave it, over **RFC 0009's bulk path** — the caller names memory it already holds and the driver asks the kernel to fill it, so no sector data crosses in message registers. The criterion was an oracle rather than self-consistency: the Makefile writes `BHASKIX-DOMAIN-DISK-SECTOR-0` into sector zero of the disk the *domain* drives, and the kernel checks that is what came back **without being able to read that disk itself** — it drives the other one. A sector past the end is refused. Granted only where a unit contains the device, so a machine without one gets a driver and no service, which is the refusal working. Watched failing by having the service claim 512 bytes it never delivered. |
+| M9-02 | The IPC test that had been wrong twice, and blamed on load both times | ✅ `DONE` | `replies 9, correct 8` had failed twice and been recorded as unexplained. It was the test's own bookkeeping: `REPLIES` was incremented *before* the value was checked and `CORRECT` after, and the waiter woke on `replies >= 8` — the first of the pair — so a client preempted between its own two increments printed `9/8`. The property is **that no reply was wrong**, which is one number; asking it as `correct == replies` asked two counters that were never sampled together. Now the verdict is recorded before the reply is counted, and the gate reads `0 wrong`. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -574,7 +582,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **RFC 0015 accepted**, not started | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
+| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — step 1 done: the block driver is a service | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -716,6 +724,30 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0015 step 1 — a block service, and a test that had been wrong twice)
+
+- **Something can ask for a block now.** `bin/blkd` was a driver with no interface, which was right
+  for RFC 0014 and was the first thing in the way of a filesystem. It answers `block::READ` over RFC
+  0009's bulk path: the caller names memory it already holds, and the driver asks the kernel to fill
+  it — the same `FILL` the filesystem's bulk path uses, which is the second thing that mechanism has
+  turned out to be for.
+- **The criterion is an oracle, not self-consistency.** The Makefile writes a string into sector zero
+  of the disk the *domain* drives. The kernel checks that string came back and **cannot read that
+  disk itself** — it drives the other one. A service that answered plausibly with the wrong bytes
+  would fail.
+- **A sector past the end is refused**, and the negative test for it proved nothing: with the
+  driver's bounds check removed the *device* refuses instead, so the answer is the same. That is
+  defence in depth rather than a gap, and it means the check is not independently tested — which is
+  worth saying rather than leaving as an assumed pass. What is independently tested is the fill: a
+  service claiming 512 bytes it never delivered fails the gate.
+- **The IPC self-test had been wrong twice, and both times "load" was available.** `replies 9,
+  correct 8` was recorded a few hours ago as seen once and not reproduced; it happened again, which
+  is what that note existed for. It was the test's own bookkeeping — `REPLIES` incremented before
+  the value was checked, `CORRECT` after, and the waiter woken by the first of the pair. The
+  property is that *no reply was wrong*, which is one number. Asking it as `correct == replies`
+  asked two counters that were never sampled together, and the gate's regular expression made the
+  same mistake with a back-reference. Both now read `0 wrong`.
 
 ### 2026-08-06 (RFC 0015 accepted — and one decision that is told how to fail)
 

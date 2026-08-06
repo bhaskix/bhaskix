@@ -122,13 +122,16 @@ kernel:
 
 iso: $(ISO)
 
-# One sector, with something in it only this disk has. The domain driver reads
-# sector 0 and prints what it found; a driver that returned zeroes, or the
-# other disk's bytes, is visible rather than plausible.
+# Eight sectors, with something in the first that only this disk has. The
+# domain driver reads sector 0 and reports what it found, and the kernel asks
+# the block *service* for the same sector and compares -- so a driver that
+# returned zeroes, or the other disk's bytes, is visible rather than plausible.
+# Eight rather than one because a device with a single sector has no sector a
+# test can be wrong about.
 $(DOMAIN_DISK):
 	@mkdir -p $(dir $@)
 	@printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > $@
-	@dd if=/dev/zero bs=1 count=484 >> $@ 2>/dev/null
+	@dd if=/dev/zero bs=1 count=4068 >> $@ 2>/dev/null
 	@echo "built $@"
 
 # Depends on the phony `kernel` target directly, so the image is rebuilt every

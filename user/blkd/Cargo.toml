@@ -35,7 +35,11 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-unsafe_budget = 180
+unsafe_budget = 220
+# Up from 180 for the service loop: `recv` and the second syscall wrapper that
+# returns both a status and a value, each an `asm!` block whose operand list is
+# most of its length. The driver became a service, and a service has one more
+# way in than a program that only talks to hardware.
 # 166 lines, and a driver is mostly `unsafe` because a driver is mostly
 # registers and rings: every access is a volatile read or write of a mapping
 # the kernel made on request, and every descriptor is a store into memory a

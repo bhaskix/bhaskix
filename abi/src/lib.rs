@@ -202,6 +202,24 @@ pub mod console {
 /// accumulated across as many [`Chunk`]s as it takes, and the operation that
 /// follows consumes it — so a caller cannot open a path it did not finish
 /// sending, and the service never has to guess where a name ends.
+/// Methods a block service answers.
+///
+/// Sector data never crosses in message registers. The caller names memory it
+/// already holds and the service fills it — RFC 0009's bulk path, and the same
+/// shape the filesystem's `READ_INTO` uses, because a block that travelled
+/// sixteen bytes at a time would be slower than the disk.
+pub mod block {
+    /// Read sectors into memory the caller names.
+    ///
+    /// `args[0]` = first sector, `args[1]` = how many, `args[2]` = the slot in
+    /// the **caller's** CSpace holding the `Memory` to fill. Replies with the
+    /// bytes that landed, and an outcome.
+    pub const READ: u64 = 1;
+    /// How many 512-byte sectors the device has.
+    pub const CAPACITY: u64 = 2;
+}
+
+/// Methods the filesystem service answers.
 pub mod fs {
     /// Append a chunk to this caller's path.
     pub const PATH: u64 = 1;

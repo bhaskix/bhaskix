@@ -25,7 +25,7 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{method, status, syscall};
+use bhaskix_abi::{block, method, status, syscall};
 use bhaskix_device::Volatile;
 use bhaskix_device::virtqueue::{self, Virtqueue};
 
@@ -44,6 +44,12 @@ const WINDOW: u64 = 4;
 const HANDLER: u64 = 5;
 /// Slot: the notification the handler signals.
 const SIGNAL: u64 = 6;
+/// Slot: the endpoint this driver answers block requests on.
+///
+/// Also what it hands back to the kernel to fill a caller's memory: holding it
+/// is what says this program is the block service rather than a program
+/// pretending to be.
+const BLOCK_ENDPOINT: u64 = 8;
 /// Slot: this device's configuration space, read-only.
 ///
 /// Four kilobytes of ordinary memory, which is what PCIe made it and what the
@@ -122,6 +128,63 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     // has a device in an unknown state, and stopping where the kernel can see
     // it beats continuing to program one.
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
+}
+
+/// Blocks until a request arrives, and returns `(status, badge, method, args)`.
+///
+/// The caller is not returned, because the kernel remembers it: a service that
+/// could name its own reply target could answer a question nobody asked it.
+fn receive() -> (u64, u64, u64, [u64; 4]) {
+    let status: u64;
+    let mut badge = BLOCK_ENDPOINT;
+    let mut method = 0u64;
+    let (mut a0, mut a1, mut a2, mut a3) = (0u64, 0u64, 0u64, 0u64);
+    // SAFETY: the system call convention from RFC 0008. Every argument
+    // register is an output because the kernel writes the whole frame back.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") syscall::RECV => status,
+            inlateout("rdi") badge,
+            inlateout("rsi") method,
+            inlateout("rdx") a0,
+            inlateout("r10") a1,
+            inlateout("r8") a2,
+            inlateout("r9") a3,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    (status, badge, method, [a0, a1, a2, a3])
+}
+
+/// Answers the caller this thread received from, and nobody else.
+fn reply(method: u64, value: u64) {
+    let _ = call(syscall::REPLY, 0, method, [value, 0, 0, 0]);
+}
+
+/// Issues one system call and returns both the status and the value.
+fn call_two(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> (u64, u64) {
+    let status: u64;
+    let mut value = args[0];
+    // SAFETY: as `call`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") kind => status,
+            inlateout("rdi") capability => _,
+            inlateout("rsi") method => _,
+            inlateout("rdx") value,
+            inlateout("r10") args[1] => _,
+            inlateout("r8") args[2] => _,
+            inlateout("r9") args[3] => _,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    (status, value)
 }
 
 /// Issues one system call, and returns `(status, value)`.
@@ -294,7 +357,7 @@ extern "C" fn blkd_main() -> ! {
     let found = unsafe { read8(COMMON_AT + common::DEVICE_STATUS) };
     // SAFETY: as above -- a register two bytes wide at an offset inside the
     // same window.
-    let queues = unsafe { read16(COMMON_AT + common::NUM_QUEUES) };
+    let _queues = unsafe { read16(COMMON_AT + common::NUM_QUEUES) };
 
     // Where the device will look for the rings. Not a physical address: this
     // program cannot name one, and the number the device is given is whatever
@@ -305,11 +368,19 @@ extern "C" fn blkd_main() -> ! {
     let (mapped, rings_at_device) = call(syscall::INVOKE, WINDOW, method::MAP, [RINGS, 0, 0, 0]);
     let translated = mapped == status::OK;
 
-    let read = if translated {
+    let mut queue = if translated {
         bring_up(rings_at_device)
     } else {
-        // SAFETY: as above; the bring-up handshake as far as it can go
-        // without a queue to enable.
+        None
+    };
+
+    // Without a window there is no device address to give the queue, so the
+    // device is brought as far as the handshake and no further. That is the
+    // refusal, not a shortcoming: a domain that could aim a device with
+    // physical addresses could aim it at the kernel.
+    if queue.is_none() {
+        // SAFETY: the common configuration window this program mapped; the
+        // handshake as far as it goes without a queue to enable.
         unsafe {
             write8(COMMON_AT + common::DEVICE_STATUS, 0);
             write8(
@@ -321,7 +392,18 @@ extern "C" fn blkd_main() -> ! {
                 device_status::ACKNOWLEDGE | device_status::DRIVER,
             );
         }
-        None
+    }
+
+    // One read of sector zero, which is what the kernel checks this driver by.
+    let read = match queue.as_mut() {
+        Some(queue) => {
+            if read_sector(queue, rings_at_device, 0) {
+                finished()
+            } else {
+                None
+            }
+        }
+        None => None,
     };
 
     // SAFETY: as above.
@@ -329,20 +411,19 @@ extern "C" fn blkd_main() -> ! {
     // SAFETY: `DEVICE_AT` is the device configuration window this program
     // mapped read-only, and a block device's capacity is its first field.
     let sectors = unsafe { read32(DEVICE_AT) };
-    // SAFETY: `RINGS_AT` is memory this program holds and mapped writable.
+    // SAFETY: as above.
     let queue_size = unsafe {
         write16(COMMON_AT + common::QUEUE_SELECT, 0);
         read16(COMMON_AT + common::QUEUE_SIZE)
     };
 
-    let _ = queues;
     let (used_index, request_status) = aftermath();
+    let by_interrupt = u64::from(BY_INTERRUPT.load(core::sync::atomic::Ordering::Relaxed));
     let identified = if writable_refused {
         (vendor << 16) | identity
     } else {
         0
     };
-    let by_interrupt = u64::from(BY_INTERRUPT.load(core::sync::atomic::Ordering::Relaxed));
     report(
         found,
         status_now,
@@ -355,10 +436,65 @@ extern "C" fn blkd_main() -> ! {
         by_interrupt,
         identified,
     );
-    exit()
+
+    // And now it is a *service*. RFC 0015 step 1: a driver nothing could ask
+    // for a block was a driver with no interface, which was right for RFC 0014
+    // and is the first thing in the way of a filesystem.
+    match queue {
+        Some(mut queue) => serve(&mut queue, rings_at_device, u64::from(sectors)),
+        // Nothing to serve. Exiting says so, where a loop answering every
+        // request with a refusal would look like a service that is working.
+        None => exit(),
+    }
 }
 
-/// Brings the device up and reads sector zero.
+/// Answers block requests, for ever.
+///
+/// The bulk path is RFC 0009's and the same one the filesystem uses: the caller
+/// names memory it already holds, and this asks the kernel to fill it. No
+/// sector data crosses in message registers, because a block that travelled
+/// sixteen bytes at a time would be slower than the disk.
+fn serve(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sectors: u64) -> ! {
+    loop {
+        let (status, badge, method, args) = receive();
+        if status != status::OK {
+            exit()
+        }
+        let _ = badge;
+
+        let answer = match method {
+            block::CAPACITY => sectors,
+            block::READ => {
+                let sector = args[0];
+                let slot = args[2];
+                if sector >= sectors {
+                    // Past the end of the device. Refused here rather than
+                    // asked of the hardware, because a device is entitled to
+                    // do anything with a sector that does not exist.
+                    0
+                } else if read_sector(queue, rings_at_device, sector) {
+                    // Into the caller's memory, named by a slot in the
+                    // caller's own CSpace -- which the kernel re-checks, and
+                    // which this service could not have chosen.
+                    let (filled, landed) = call_two(
+                        syscall::INVOKE,
+                        BLOCK_ENDPOINT,
+                        method::FILL,
+                        [slot, RINGS_AT + ring::DATA, 512, 0],
+                    );
+                    if filled == status::OK { landed } else { 0 }
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+
+        reply(method, answer);
+    }
+}
+
+/// Brings the device up and readies its queue./// Brings the device up and reads sector zero.
 ///
 /// The bring-up order is the specification's and the order *is* the protocol: a
 /// status bit written early is a promise this driver has not yet kept. The
@@ -368,9 +504,9 @@ extern "C" fn blkd_main() -> ! {
 /// translation entirely and the window this program was given would contain
 /// nothing.
 ///
-/// Returns the first eight bytes of sector zero, or `None` if the device never
-/// finished.
-fn bring_up(rings_at_device: u64) -> Option<u64> {
+/// Returns the queue, ready to carry requests, or `None` if the device never
+/// came up.
+fn bring_up(rings_at_device: u64) -> Option<Virtqueue<Volatile>> {
     // Device addresses are the ring base plus the same offsets this program
     // uses, because the window maps the object's pages in order.
     let device_address = |offset: u64| rings_at_device + offset;
@@ -438,32 +574,17 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
         );
     }
 
-    // The request: a header the device reads, a buffer it writes the sector
-    // into, and a byte it writes when it is done. Three descriptors, chained,
-    // because the device is told what each part is for by its flags and not by
-    // its position.
-    //
-    // SAFETY: `RINGS_AT` is four pages of memory this program holds and mapped
-    // writable, and every offset below is inside it.
-    unsafe {
-        // Header: type 0 (read), reserved 0, sector 0.
-        let header = (RINGS_AT + ring::HEADER) as *mut u32;
-        core::ptr::write_volatile(header, 0);
-        core::ptr::write_volatile(header.add(1), 0);
-        core::ptr::write_volatile((RINGS_AT + ring::HEADER + 8) as *mut u64, 0);
-        core::ptr::write_volatile((RINGS_AT + ring::STATUS) as *mut u8, 0xff);
-    }
-
     // The queue, from the crate the kernel's driver uses too. What was a
-    // hand-written copy of the split-virtqueue layout is now the same code,
-    // which is the point of RFC 0014 step 5: the second driver stopped being a
-    // second implementation. Each ring is given twice, because the address
-    // this program writes through and the address the *device* is told are not
-    // the same one -- that difference is the IOMMU, from a driver's side.
-    // SAFETY: the three rings are inside the four pages this program holds
-    // and mapped writable, at offsets that do not overlap, and the size is a
-    // power of two.
-    let mut queue = unsafe {
+    // hand-written copy of the split-virtqueue layout is now the same code:
+    // the second driver stopped being a second implementation. Each ring is
+    // given twice, because the address this program writes through and the
+    // address the *device* is told are not the same one — that difference is
+    // the IOMMU, from a driver's side.
+    //
+    // SAFETY: the three rings are inside the four pages this program holds and
+    // mapped writable, at offsets that do not overlap, and the size is a power
+    // of two.
+    let queue = unsafe {
         Virtqueue::<Volatile>::new(
             virtqueue::Ring {
                 at: (RINGS_AT + ring::DESCRIPTORS) as usize,
@@ -480,6 +601,32 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
             QUEUE_ENTRIES,
         )
     };
+    Some(queue)
+}
+
+/// Reads one sector into this driver's own buffer.
+///
+/// The whole request cycle: a header the device reads, a buffer it writes the
+/// sector into, and a byte it writes when it is done. Three descriptors,
+/// chained, because the device is told what each part is for by its flags and
+/// not by its position.
+///
+/// `false` if the device reported a failure or never answered.
+fn read_sector(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sector: u64) -> bool {
+    let device_address = |offset: u64| rings_at_device + offset;
+
+    // SAFETY: `RINGS_AT` is four pages of memory this program holds and mapped
+    // writable, and every offset below is inside it.
+    unsafe {
+        // Header: type 0 (read), reserved 0, then the sector.
+        let header = (RINGS_AT + ring::HEADER) as *mut u32;
+        core::ptr::write_volatile(header, 0);
+        core::ptr::write_volatile(header.add(1), 0);
+        core::ptr::write_volatile((RINGS_AT + ring::HEADER + 8) as *mut u64, sector);
+        // A value the device never writes, so "the device answered" and "the
+        // device said ok" cannot be confused.
+        core::ptr::write_volatile((RINGS_AT + ring::STATUS) as *mut u8, 0xff);
+    }
 
     queue.describe(0, device_address(ring::HEADER), 16, virtqueue::NEXT, 1);
     queue.describe(
@@ -501,28 +648,19 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
         write16(NOTIFY_AT + offset * 4, 0);
     }
 
-    // Wait for the interrupt, if the queue took a vector.
-    //
-    // This is the whole of a driver's interrupt duty and the whole of what
-    // this program was given: block until the notification says the device is
-    // finished, then say the driver is ready for the next one. It holds no
-    // vector, cannot reach an interrupt controller, and could not raise an
-    // interrupt if it wanted to.
+    // Wait for the interrupt, if the queue took a vector. This is the whole of
+    // a driver's interrupt duty and the whole of what this program was given:
+    // block until the notification says the device is finished, then say the
+    // driver is ready for the next one.
     if VECTORED.load(core::sync::atomic::Ordering::Relaxed) {
         let (status, _badge) = call(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
-        // Unmask, so the source can deliver again. The kernel masks on
-        // delivery and nothing arrives until the holder says it is ready --
-        // which is why acknowledging is an authority a driver needs and not
-        // one it can be spared.
         let _ = call(syscall::INVOKE, HANDLER, method::ACK, [0; 4]);
-        if status == status::OK {
-            BY_INTERRUPT.store(true, core::sync::atomic::Ordering::Relaxed);
-            // Taken from the queue rather than assumed: the notification says
-            // the device did something, and the used ring says what.
-            let _ = queue.completed();
-            return finished();
+        if status != status::OK {
+            return false;
         }
-        return None;
+        BY_INTERRUPT.store(true, core::sync::atomic::Ordering::Relaxed);
+        let _ = queue.completed();
+        return finished().is_some();
     }
 
     // No vector: look instead, through the same queue. A bounded spin is
@@ -530,18 +668,16 @@ fn bring_up(rings_at_device: u64) -> Option<u64> {
     // machine on a device that never answers.
     for _ in 0..2_000_000u64 {
         if queue.completed().is_some() {
-            return finished();
+            return finished().is_some();
         }
         core::hint::spin_loop();
     }
-    None
+    false
 }
 
 /// Reads what the device left, once it has said it is finished.
 ///
-/// `None` if the device reported a failure — a status byte the driver set to a
-/// value the device never writes, so "the device answered" and "the device
-/// said ok" cannot be confused.
+/// `None` if the device reported a failure.
 fn finished() -> Option<u64> {
     // SAFETY: the status byte and the sector, in memory this program holds and
     // mapped writable. The device has finished with them, which is what the

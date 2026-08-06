@@ -704,6 +704,11 @@ static IPC_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// Replies the client received, and how many carried the right answer.
 static IPC_REPLIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static IPC_CORRECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Replies whose value was *not* what the service computed.
+///
+/// The assertion is that this is zero, which is the property. Comparing
+/// `correct` against `replies` was the same property phrased as a race.
+static IPC_WRONG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Badges the service observed, or-ed together.
 static IPC_BADGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -751,15 +756,25 @@ extern "C" fn ipc_client(which: u64) -> ! {
 
         match outcome.status {
             syscall::Status::Ok => {
-                IPC_REPLIES.fetch_add(1, Ordering::Relaxed);
                 // The service answers with the request doubled. Checking the
                 // *value* rather than merely that a reply arrived is what
                 // makes this a message and not a signal -- and it catches a
                 // reply delivered to the wrong caller, which two clients
                 // running at once makes possible.
+                //
+                // The verdict is recorded *before* the reply is counted, and
+                // that order is the whole point. It used to be the other way,
+                // and the test then compared two counters it had not sampled
+                // together: a client preempted between its own two increments
+                // gave `replies 9, correct 8` and the suite called a working
+                // machine broken. It did that twice, and both times the
+                // available explanation was "load".
                 if outcome.value == request * 2 {
                     IPC_CORRECT.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    IPC_WRONG.fetch_add(1, Ordering::Relaxed);
                 }
+                IPC_REPLIES.fetch_add(1, Ordering::Relaxed);
             }
             _ => sched::exit(),
         }
@@ -869,6 +884,7 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     let replies = IPC_REPLIES.load(Ordering::Relaxed);
     let correct = IPC_CORRECT.load(Ordering::Relaxed);
+    let wrong = IPC_WRONG.load(Ordering::Relaxed);
     let badges = IPC_BADGES.load(Ordering::Relaxed);
     let (delivered, replied) = ipc::statistics();
     let delivered = delivered - delivered_before;
@@ -928,7 +944,10 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // value the service computed for *that* request, which is what catches
         // a reply delivered to the wrong caller -- possible precisely because
         // two clients are in flight at once.
-        ("every reply carried the right value", correct == replies),
+        // Not `correct == replies`: those are two counters and this is one
+        // question, and asking it as a comparison made the answer depend on
+        // when the sample was taken.
+        ("every reply carried the right value", wrong == 0),
         ("the rendezvous made progress", replies >= 4),
         // Both badges seen, and neither client could have supplied its own:
         // the badge is a parameter only the caller of `ipc::call` can set, and
@@ -955,7 +974,7 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    ipc            FAILED: {name} (replies {replies}, correct {correct}, badges {badges:#x}, delivered {delivered}, replied {replied}, dropped {dropped}, wake missed {wake_missed}, mailboxes {pending}, recv returned {received}, reply tried {replies_tried}, no caller {no_caller}, empty checks {empty})"
+                "    ipc            FAILED: {name} (replies {replies}, correct {correct}, wrong {wrong}, badges {badges:#x}, delivered {delivered}, replied {replied}, dropped {dropped}, wake missed {wake_missed}, mailboxes {pending}, recv returned {received}, reply tried {replies_tried}, no caller {no_caller}, empty checks {empty})"
             );
             ok = false;
         }
@@ -980,7 +999,7 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     if ok {
         println!(
-            "    ipc            {delivered} rendezvous, {replied} replies, {correct}/{replies} correct; two badges distinguished, {stranded} stranded on teardown; {forged_note}"
+            "    ipc            {delivered} rendezvous, {replied} replies, {correct} correct and {wrong} wrong; two badges distinguished, {stranded} stranded on teardown; {forged_note}"
         );
     }
     ok
@@ -1684,6 +1703,34 @@ pub fn start_block_domain(
         println!("    block domain   dma window granted; the device translates through its own");
     }
 
+    // The endpoint this driver answers block requests on, at slot 8.
+    //
+    // RFC 0015 step 1: a driver nothing could ask for a block was a driver
+    // with no interface. It is also what the driver hands back to fill a
+    // caller's memory, so holding it is what says this program is the block
+    // service rather than a program pretending to be.
+    let block_endpoint = ipc::create().map_err(|_| "no endpoint for the block service")?;
+    // Recorded only once it is known the driver can *serve*, which needs a DMA
+    // window: without one it cannot read a sector, so an endpoint nobody
+    // answers would make the self-test below wait for something that is never
+    // coming. Stored after the window is granted, below.
+    let served = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(
+                    cap::ObjectKind::Endpoint,
+                    u64::from(block_endpoint.as_u32()),
+                ),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the block endpoint capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(8, served).is_ok()) != Some(true) {
+        return Err("the block endpoint capability would not install");
+    }
+
     // The device's own configuration space, read-only, at slot 7.
     //
     // RFC 0014 decided this: **read-only, and the BARs are never writable at
@@ -1796,6 +1843,14 @@ pub fn start_block_domain(
     // SAFETY: this device is the block domain's; nothing else drives it.
     unsafe { bhaskix_arch::pci::enable(address) };
 
+    if contained {
+        // The service can only answer once it can read, and it can only read
+        // where a unit contains the device.
+        BLOCK_ENDPOINT.store(
+            u64::from(block_endpoint.as_u32()),
+            core::sync::atomic::Ordering::Release,
+        );
+    }
     if identified {
         println!(
             "    block domain   configuration space granted read-only; the driver can say \
@@ -1831,8 +1886,150 @@ pub fn start_block_domain(
     Ok(())
 }
 
+/// The endpoint the block service answers on, once it exists.
+static BLOCK_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// The rings the block domain was given, so its report can be read back.
 static BLOCK_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Asks the block *service* for a sector, and checks what came back.
+///
+/// RFC 0015 step 1's criterion. The oracle is the image itself: the Makefile
+/// writes `BHASKIX-DOMAIN-DISK-SECTOR-0` into sector zero of the disk the
+/// domain drives, so the kernel knows what must come back without being able
+/// to read that disk itself — it drives the other one.
+///
+/// The caller is a domain with a `Memory` object, because that is what the
+/// protocol requires: sector data never crosses in message registers, and the
+/// caller names memory it already holds.
+fn block_service_self_test(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    /// What the Makefile puts in sector zero of the domain's disk.
+    const EXPECTED: &[u8] = b"BHASKIX-DOMAIN-DISK-SECTOR-0";
+    const BADGE: u64 = 0x00b2_0000;
+
+    let raw = BLOCK_ENDPOINT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        // No second device, so no block service. Not a failure.
+        return true;
+    }
+    let endpoint = ipc::EndpointId::from_u32(raw as u32);
+
+    let Ok(owner) = domain::create("block-reader", domain::ResourceEnvelope::new()) else {
+        println!("    block service  FAILED to create a domain to ask from");
+        return false;
+    };
+    let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
+        println!("    block service  FAILED to create a memory object");
+        domain::destroy(owner);
+        return false;
+    };
+    let installed = shared::name(object)
+        .ok()
+        .and_then(|memory| domain::with(owner, |d| d.cspace.install_at(0, memory).is_ok()));
+    if installed != Some(true) {
+        println!("    block service  FAILED to give the caller its memory");
+        domain::destroy(owner);
+        return false;
+    }
+
+    BLOCK_CALLER.store(owner.as_u32(), Ordering::Release);
+    BLOCK_READ.store(u64::MAX, Ordering::Release);
+    let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
+    if sched::spawn_on_with(
+        0,
+        "block-ask",
+        block_asks,
+        u64::from(raw as u32),
+        hhdm,
+        options,
+    )
+    .is_err()
+    {
+        println!("    block service  FAILED to spawn a caller");
+        domain::destroy(owner);
+        return false;
+    }
+    let _ = endpoint;
+    let _ = BADGE;
+
+    // Wait for the answer rather than for a duration.
+    let mut landed = u64::MAX;
+    for _ in 0..80 {
+        landed = BLOCK_READ.load(Ordering::Acquire);
+        if landed != u64::MAX {
+            break;
+        }
+        wait_millis(50);
+    }
+
+    let refused = BLOCK_REFUSED.load(Ordering::Acquire) == 0;
+    let matches = match shared::frames_of(object) {
+        Some((frames, count)) if count > 0 && landed == 512 => {
+            // SAFETY: a frame this object owns, through the direct map.
+            let bytes =
+                unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, 512) };
+            bytes.starts_with(EXPECTED)
+        }
+        _ => false,
+    };
+
+    shared::revoke(object);
+    domain::destroy(owner);
+
+    let ok = matches && refused;
+    if ok {
+        println!(
+            "    block service  {landed} bytes of sector 0 through the service, and they are \
+             the domain disk's own; a sector past the end is refused"
+        );
+    } else {
+        println!(
+            "    block service  FAILED: {landed} bytes, contents match {matches}, \
+             past the end refused {refused}"
+        );
+    }
+    ok
+}
+
+/// The domain the block self-test asks from, and what came back.
+static BLOCK_CALLER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static BLOCK_READ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// What a read past the end of the device answered.
+static BLOCK_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Asks the block service for sector zero, from inside a domain that holds the
+/// memory it will land in.
+extern "C" fn block_asks(endpoint: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    const BADGE: u64 = 0x00b2_0000;
+
+    let endpoint = ipc::EndpointId::from_u32(endpoint as u32);
+    // Slot 0 of *this* domain's CSpace, which is where the memory was
+    // installed. The service cannot choose it and the kernel re-checks it.
+    let landed = match ipc::call(endpoint, BADGE, bhaskix_abi::block::READ, [0, 1, 0, 0]) {
+        Ok(reply) => reply.args[0],
+        Err(_) => 0,
+    };
+
+    // And a sector past the end of the device, which must be refused *here*
+    // rather than asked of the hardware: a device is entitled to do anything
+    // with a sector that does not exist, including answer.
+    let past = match ipc::call(
+        endpoint,
+        BADGE,
+        bhaskix_abi::block::READ,
+        [1 << 40, 1, 0, 0],
+    ) {
+        Ok(reply) => reply.args[0],
+        Err(_) => u64::MAX,
+    };
+    BLOCK_REFUSED.store(past, Ordering::Release);
+    BLOCK_READ.store(landed, Ordering::Release);
+    sched::exit()
+}
 
 /// Whether the driver has left its report yet.
 ///
@@ -2470,6 +2667,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
         if !report_block_domain(hhdm) {
             println!("    block domain   FAILED");
+        }
+        if !block_service_self_test(hhdm) {
+            println!("    block service  FAILED");
         }
     }
 
