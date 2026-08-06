@@ -165,6 +165,36 @@ nowhere to express yet.
 operation that was acknowledged before the interruption is present.* Anything weaker is not worth a
 journal, and anything stronger is not true without ordered data writes.
 
+**Recorded on building it (step 5).** Three things the design above did not say, and one it had
+slightly wrong.
+
+*"Acknowledged" needed a definition, and the obvious one is useless.* "The call returned" cannot be
+tested — a machine that stops does not return from anything. The definition used is **the commit
+block was written**, which is an instant a harness can find in a trace of writes, and it is what
+makes "every acknowledged operation is present" a checkable sentence rather than a hopeful one.
+
+*The claim is not "before or after".* An operation of several transactions, interrupted between two
+of them, leaves the first and not the second — which is correct and is neither the before-state nor
+the after-state. The test asserts the filesystem equals the result of exactly the transactions that
+committed, built by running those transactions and no others. Asserting "before or after" would have
+passed a filesystem that had applied half of the second one.
+
+*A committed transaction must not be prepared over.* Staging writes into the journal's payload
+blocks, so beginning a new transaction while one is committed leaves the commit block describing a
+payload that has changed — the checksum fails and an **acknowledged** transaction quietly stops
+existing. A crash cannot reach this, because nothing runs afterwards. An error path can. `begin`
+therefore refuses with `NeedsRecovery`, and mounting is the only thing that clears one.
+
+*And the thing the RFC had wrong:* it says data is not journalled and a crash may lose recent
+writes. True, but incomplete — a block being **allocated** must have its data written *before* the
+commit that points an inode at it, or the file briefly reads whatever that block held for its
+previous owner. That is not a lost write; it is a disclosure. The order is now data, then commit.
+
+**What the harness cannot reach.** The payload is prepared in place, so no interruption it can
+produce yields a torn payload under a valid commit. That case is covered by damaging a payload byte
+directly and requiring the commit to be ignored — and it is why the commit's checksum covers the
+logged blocks and not just the header.
+
 ### A page cache in shared memory
 
 Blocks are cached in a `Memory` object the filesystem service holds. A reader that wants a cached
@@ -292,6 +322,23 @@ every step below. The general answer is "the thing that hands a new program its 
 a supervisor — RFC 0013 declined to propose one and process management is where it belongs. Naming
 it here would be this RFC deciding something it does not have to.
 
+### Raised by step 5
+
+- **A transaction is capped at eight blocks**, and every operation built so far changes at most
+  four. An operation that would need more is refused before it starts, which is the right failure,
+  but it does put a ceiling on what a future operation may do — a rename across directories, for
+  instance, is close to the limit.
+- **A write is one block.** `write` returns how much it took rather than looping, because a write
+  spanning blocks is several transactions and therefore several acknowledgements; saying so is more
+  honest than implying one. A caller that wants a whole file writes it in a loop and knows what it
+  is doing.
+- **The commit's atomicity rests on sector atomicity.** Magic, sequence, count and checksum are all
+  in the commit block's first 512 bytes so that a commit torn by a device fails its checksum. This
+  is the standard assumption and it is an assumption; nothing here verifies it of the hardware.
+- **The interruption harness models the disk as memory.** It proves the format and the recovery,
+  exhaustively, at every write. It does not prove the *driver* — that writes reach the device in the
+  order issued, or at all. The machine test covers the code path, not the device's promises.
+
 ### Raised by step 4
 
 - **A name is at most one chunk — sixteen bytes.** Longer names are refused rather than truncated,
@@ -340,5 +387,5 @@ whether the order is right.
 4. **`Directory` capabilities and `OPEN_AT`.** The namespace change, on the read-only filesystem
    where a mistake cannot destroy anything. ✅ Done — see the amendment and the correction above.
 5. **Writes, and the journal.** With the interruption harness, because the journal's claim is the
-   only thing here that cannot be checked by looking.
+   only thing here that cannot be checked by looking. ✅ Done — see the notes above.
 6. **The page cache**, last, because the journal decides when a dirty page may go home.

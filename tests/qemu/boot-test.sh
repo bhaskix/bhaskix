@@ -794,6 +794,24 @@ else
     status=1
 fi
 
+# RFC 0015 step 5. A filesystem written, interrupted after the commit, and
+# recovered by mounting it -- in the machine, on this target, with no std.
+#
+# The exhaustive proof is on the host, where the harness stops at every write
+# of every operation; what this adds is that the same code does the same thing
+# here. Three things in one line, and all three matter: the read-only mount
+# *refused* an image with a pending transaction rather than quietly handing
+# back the state before it, the replay wrote blocks (so there was something to
+# recover and it was recovered), and the file the interrupted operation
+# created is present -- it was acknowledged, so it must be.
+if grep -qE "journal +wrote a filesystem in memory, stopped it one write after the commit, and mounting replayed [1-9][0-9]* blocks: .recovered. is there and so is .survivor." "$LOG"; then
+    pass "a filesystem written, interrupted after its commit, and recovered by mounting"
+else
+    fail "the journal did not survive an interruption in the machine"
+    grep -E "journal " "$LOG" || true
+    status=1
+fi
+
 # RFC 0015 step 4. Two directories of that filesystem, named by the kernel and
 # reported as different inodes -- which is what makes the shell's "it holds one
 # of these and not the other" a statement about authority rather than about a

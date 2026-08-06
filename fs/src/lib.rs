@@ -29,6 +29,11 @@
     )
 )]
 
+pub mod journal;
+pub mod volume;
+
+pub use volume::{Uninterrupted, Volume, Watch};
+
 /// How big a block is, everywhere.
 ///
 /// One page. A filesystem block that is not a page means every cached block
@@ -53,7 +58,24 @@ pub const MAX_NAME: usize = 27;
 pub const MAGIC: u64 = u64::from_le_bytes(*b"BHASKIXF");
 
 /// The version this code writes and reads.
-pub const VERSION: u32 = 1;
+///
+/// Two since the journal: the superblock grew two fields, so an image written
+/// by the version before it describes a filesystem with no log — and mounting
+/// one *as if* it had a log would read a region that is somebody's data.
+pub const VERSION: u32 = 2;
+
+/// How many blocks the journal gets: one commit block and eight payload.
+///
+/// Eight bounds the biggest single operation this filesystem can perform,
+/// which is a limit worth having explicitly rather than discovering. Every
+/// operation here changes at most four blocks — a bitmap block, an inode
+/// block, a directory block and a data block — so the room is double what
+/// anything needs, and an operation that would exceed it is refused before it
+/// starts rather than half-done.
+pub const JOURNAL_BLOCKS: u64 = 9;
+
+/// What the first eight bytes of the journal's commit block say.
+pub const JOURNAL_MAGIC: u64 = u64::from_le_bytes(*b"BHASKIXJ");
 
 /// What went wrong.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,6 +92,19 @@ pub enum FsError {
     NotFound,
     /// A file operation on a directory, or the reverse.
     WrongKind,
+    /// The operation was stopped part-way, as a crash would stop it.
+    ///
+    /// Only the interruption harness produces this. It is an error and not a
+    /// panic because the image it leaves behind is the point: the harness
+    /// mounts it afterwards and checks what survived.
+    Interrupted,
+    /// The image has a committed transaction that has not been applied.
+    ///
+    /// Returned by the *read-only* mount, which cannot replay it. A read-only
+    /// mount that ignored a pending journal would hand back the state before
+    /// an operation that had already been acknowledged — silently, and looking
+    /// exactly like a filesystem that was never written to.
+    NeedsRecovery,
 }
 
 /// What an inode is.
@@ -108,7 +143,7 @@ impl Kind {
 }
 
 /// Reads a little-endian `u32` at `at`, or `None` if it does not fit.
-fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
     let slice = bytes.get(at..at.checked_add(4)?)?;
     let mut buffer = [0u8; 4];
     buffer.copy_from_slice(slice);
@@ -116,7 +151,7 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
 }
 
 /// Reads a little-endian `u64` at `at`, or `None` if it does not fit.
-fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
+pub(crate) fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
     let slice = bytes.get(at..at.checked_add(8)?)?;
     let mut buffer = [0u8; 8];
     buffer.copy_from_slice(slice);
@@ -130,7 +165,7 @@ fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
 }
 
 /// Writes `value` at `at`, if it fits.
-fn put(bytes: &mut [u8], at: usize, value: &[u8]) -> Option<()> {
+pub(crate) fn put(bytes: &mut [u8], at: usize, value: &[u8]) -> Option<()> {
     let end = at.checked_add(value.len())?;
     bytes.get_mut(at..end)?.copy_from_slice(value);
     Some(())
@@ -144,14 +179,29 @@ fn put(bytes: &mut [u8], at: usize, value: &[u8]) -> Option<()> {
 /// problem and needs a different answer.
 #[must_use]
 pub fn checksum(bytes: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
+    let hash = checksum_of(0x811c_9dc5, bytes);
+    // Never zero, so that a field somebody forgot to write is not a checksum
+    // that happens to match a run of zeroes.
+    if hash == 0 { 1 } else { hash }
+}
+
+/// The same hash, continued from `hash`.
+///
+/// FNV-1a is a running hash, and the journal needs that: its checksum covers a
+/// header, a table and up to eight blocks that are nowhere near each other in
+/// the image. Folding them one after another costs nothing; copying them into
+/// one buffer first would need an allocator this crate does not have.
+///
+/// The zero-avoiding fixup is *not* applied here — it belongs at the end of a
+/// hash and applying it part-way through would make the result depend on where
+/// the pieces were split.
+#[must_use]
+pub(crate) fn checksum_of(mut hash: u32, bytes: &[u8]) -> u32 {
     for byte in bytes {
         hash ^= u32::from(*byte);
         hash = hash.wrapping_mul(0x0100_0193);
     }
-    // Never zero, so that a field somebody forgot to write is not a checksum
-    // that happens to match a run of zeroes.
-    if hash == 0 { 1 } else { hash }
+    hash
 }
 
 /// Where everything is.
@@ -165,6 +215,10 @@ pub struct Superblock {
     pub bitmap_start: u64,
     /// First block of the inode table.
     pub inode_start: u64,
+    /// First block of the journal.
+    pub journal_start: u64,
+    /// How many blocks the journal has, including its commit block.
+    pub journal_blocks: u64,
     /// First block that holds data.
     pub data_start: u64,
     /// The inode the root directory is.
@@ -173,7 +227,7 @@ pub struct Superblock {
 
 impl Superblock {
     /// Bytes the superblock's checksum covers.
-    const COVERED: usize = 60;
+    const COVERED: usize = 76;
 
     /// Reads it, and refuses anything that does not describe itself.
     ///
@@ -201,8 +255,10 @@ impl Superblock {
             inodes: u64_at(head, 24).ok_or(FsError::NotAFilesystem)?,
             bitmap_start: u64_at(head, 32).ok_or(FsError::NotAFilesystem)?,
             inode_start: u64_at(head, 40).ok_or(FsError::NotAFilesystem)?,
-            data_start: u64_at(head, 48).ok_or(FsError::NotAFilesystem)?,
-            root: u32_at(head, 56).ok_or(FsError::NotAFilesystem)?,
+            journal_start: u64_at(head, 48).ok_or(FsError::NotAFilesystem)?,
+            journal_blocks: u64_at(head, 56).ok_or(FsError::NotAFilesystem)?,
+            data_start: u64_at(head, 64).ok_or(FsError::NotAFilesystem)?,
+            root: u32_at(head, 72).ok_or(FsError::NotAFilesystem)?,
         };
 
         // The checksum says the bytes are the ones that were written. It says
@@ -211,7 +267,10 @@ impl Superblock {
         if found.blocks == 0
             || found.bitmap_start == 0
             || found.inode_start <= found.bitmap_start
-            || found.data_start <= found.inode_start
+            || found.journal_start <= found.inode_start
+            || found.journal_blocks < 2
+            || found.data_start <= found.journal_start
+            || found.data_start.checked_sub(found.journal_start) != Some(found.journal_blocks)
             || found.data_start >= found.blocks
             || found.blocks > (bytes.len() / BLOCK) as u64
             || u64::from(found.root) >= found.inodes
@@ -236,8 +295,10 @@ impl Superblock {
         put(head, 24, &self.inodes.to_le_bytes()).ok_or(FsError::OutOfRange)?;
         put(head, 32, &self.bitmap_start.to_le_bytes()).ok_or(FsError::OutOfRange)?;
         put(head, 40, &self.inode_start.to_le_bytes()).ok_or(FsError::OutOfRange)?;
-        put(head, 48, &self.data_start.to_le_bytes()).ok_or(FsError::OutOfRange)?;
-        put(head, 56, &self.root.to_le_bytes()).ok_or(FsError::OutOfRange)?;
+        put(head, 48, &self.journal_start.to_le_bytes()).ok_or(FsError::OutOfRange)?;
+        put(head, 56, &self.journal_blocks.to_le_bytes()).ok_or(FsError::OutOfRange)?;
+        put(head, 64, &self.data_start.to_le_bytes()).ok_or(FsError::OutOfRange)?;
+        put(head, 72, &self.root.to_le_bytes()).ok_or(FsError::OutOfRange)?;
 
         let sum = checksum(&head[..Self::COVERED]);
         put(head, Self::COVERED, &sum.to_le_bytes()).ok_or(FsError::OutOfRange)?;
@@ -290,7 +351,23 @@ impl Inode {
         let slot = bytes
             .get(at..at.checked_add(INODE).ok_or(FsError::OutOfRange)?)
             .ok_or(FsError::OutOfRange)?;
+        Self::decode(slot)
+    }
 
+    /// Reads one inode out of the sixty-four bytes that hold it.
+    ///
+    /// Split from [`Inode::read`] so that the journal can read and write
+    /// inodes inside a *staged copy* of a block rather than in the image. Two
+    /// decoders would be two chances to disagree about what an inode is, and
+    /// the disagreement would show up as a filesystem that reads differently
+    /// depending on whether it had just been written to.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::OutOfRange`] for fewer than [`INODE`] bytes, and
+    /// [`FsError::NotAFilesystem`] if the checksum does not match.
+    pub fn decode(slot: &[u8]) -> Result<Self, FsError> {
+        let slot = slot.get(..INODE).ok_or(FsError::OutOfRange)?;
         let stored = u32_at(slot, Self::COVERED).ok_or(FsError::OutOfRange)?;
         if stored == 0 {
             // Never written. `checksum` never returns zero, precisely so that
@@ -352,7 +429,18 @@ impl Inode {
             .ok_or(FsError::OutOfRange)?;
         let end = at.checked_add(INODE).ok_or(FsError::OutOfRange)?;
         let slot = bytes.get_mut(at..end).ok_or(FsError::OutOfRange)?;
+        self.encode(slot)
+    }
 
+    /// Writes one inode into the sixty-four bytes that hold it.
+    ///
+    /// The counterpart of [`Inode::decode`], and there for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::OutOfRange`] for fewer than [`INODE`] bytes.
+    pub fn encode(&self, slot: &mut [u8]) -> Result<(), FsError> {
+        let slot = slot.get_mut(..INODE).ok_or(FsError::OutOfRange)?;
         slot.fill(0);
         put(slot, 0, &self.kind.to_bits().to_le_bytes()).ok_or(FsError::OutOfRange)?;
         put(slot, 2, &self.links.to_le_bytes()).ok_or(FsError::OutOfRange)?;
@@ -376,6 +464,63 @@ pub struct Bitmap<'a> {
     bytes: &'a mut [u8],
     blocks: u64,
     first_data: u64,
+}
+
+/// The same bitmap, read but not changed.
+///
+/// The journal needs to *choose* a free block without taking it — taking it
+/// means changing the bitmap, and a change has to be staged and committed
+/// before it may touch the image. Two ways of reading the same bits would be
+/// two chances to disagree about which blocks are free, and disagreeing about
+/// that hands one block to two files, so this holds the same three fields and
+/// answers the same question.
+pub struct Free<'a> {
+    bytes: &'a [u8],
+    blocks: u64,
+    first_data: u64,
+}
+
+impl<'a> Free<'a> {
+    /// Reads the bitmap out of `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Bitmap::of`].
+    pub fn of(bytes: &'a [u8], superblock: &Superblock) -> Result<Self, FsError> {
+        let start = usize::try_from(superblock.bitmap_start * BLOCK as u64)
+            .map_err(|_| FsError::OutOfRange)?;
+        let length =
+            usize::try_from((superblock.inode_start - superblock.bitmap_start) * BLOCK as u64)
+                .map_err(|_| FsError::OutOfRange)?;
+        let end = start.checked_add(length).ok_or(FsError::OutOfRange)?;
+        if (length * 8) < usize::try_from(superblock.blocks).map_err(|_| FsError::OutOfRange)? {
+            return Err(FsError::OutOfRange);
+        }
+        Ok(Self {
+            bytes: bytes.get(start..end).ok_or(FsError::OutOfRange)?,
+            blocks: superblock.blocks,
+            first_data: superblock.data_start,
+        })
+    }
+
+    /// Whether `block` is taken. Out of range reads as taken.
+    #[must_use]
+    pub fn used(&self, block: u64) -> bool {
+        let Ok(index) = usize::try_from(block / 8) else {
+            return true;
+        };
+        self.bytes
+            .get(index)
+            .is_some_and(|byte| byte & (1 << (block % 8)) != 0)
+    }
+
+    /// The first free block, without taking it.
+    #[must_use]
+    pub fn first(&self) -> Option<u32> {
+        (self.first_data..self.blocks)
+            .find(|block| !self.used(*block))
+            .and_then(|block| u32::try_from(block).ok())
+    }
 }
 
 impl<'a> Bitmap<'a> {
@@ -461,6 +606,23 @@ impl<'a> Bitmap<'a> {
         }
         self.set(block, false);
         Ok(())
+    }
+
+    /// The first free block, without taking it.
+    ///
+    /// Separate from [`Bitmap::allocate`] because the journal cannot allocate
+    /// where the bitmap lives: the change has to be staged, committed and only
+    /// then applied. Choosing and taking are two acts here, and a bitmap that
+    /// could only do both at once would have to be written to twice — once
+    /// provisionally, which is exactly what a journal exists to avoid.
+    #[must_use]
+    pub fn first_free(&self) -> Option<u32> {
+        Free {
+            bytes: self.bytes,
+            blocks: self.blocks,
+            first_data: self.first_data,
+        }
+        .first()
     }
 
     /// How many data blocks are in use.
@@ -561,7 +723,7 @@ impl Entry {
 /// bitmap, an inode table and at least one data block.
 pub fn format(bytes: &mut [u8], inodes: u64) -> Result<Superblock, FsError> {
     let blocks = (bytes.len() / BLOCK) as u64;
-    if blocks < 4 || inodes == 0 {
+    if blocks < 4 + JOURNAL_BLOCKS || inodes == 0 {
         return Err(FsError::OutOfRange);
     }
     bytes.fill(0);
@@ -570,12 +732,15 @@ pub fn format(bytes: &mut [u8], inodes: u64) -> Result<Superblock, FsError> {
     let bitmap_blocks = blocks.div_ceil(BLOCK as u64 * 8).max(1);
     let inode_blocks = (inodes * INODE as u64).div_ceil(BLOCK as u64).max(1);
 
+    let journal_start = 1 + bitmap_blocks + inode_blocks;
     let superblock = Superblock {
         blocks,
         inodes,
         bitmap_start: 1,
         inode_start: 1 + bitmap_blocks,
-        data_start: 1 + bitmap_blocks + inode_blocks,
+        journal_start,
+        journal_blocks: JOURNAL_BLOCKS,
+        data_start: journal_start + JOURNAL_BLOCKS,
         root: 0,
     };
     if superblock.data_start >= blocks {
@@ -627,7 +792,26 @@ impl<'a> Filesystem<'a> {
     /// Whatever [`Superblock::read`] refused it for.
     pub fn mount(bytes: &'a [u8]) -> Result<Self, FsError> {
         let superblock = Superblock::read(bytes)?;
+        // A read-only mount cannot replay a journal, and must not pretend
+        // there is nothing to replay. An image with a committed transaction
+        // still in its log describes the filesystem as it was *before* an
+        // operation that has already been acknowledged; handing that back
+        // would be indistinguishable, to every caller, from a filesystem
+        // nobody had written to.
+        if journal::committed(bytes, &superblock).is_some() {
+            return Err(FsError::NeedsRecovery);
+        }
         Ok(Self { bytes, superblock })
+    }
+
+    /// The same, from a superblock already read and a journal already dealt
+    /// with.
+    ///
+    /// For [`Volume`], which has recovered the image before it gets here and
+    /// would otherwise have to re-read and re-check what it just replayed.
+    #[must_use]
+    pub const fn mounted(bytes: &'a [u8], superblock: Superblock) -> Self {
+        Self { bytes, superblock }
     }
 
     /// What the superblock says.
@@ -769,7 +953,8 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        BLOCK, Bitmap, ENTRY, Entry, Filesystem, FsError, Inode, Kind, Superblock, format,
+        BLOCK, Bitmap, ENTRY, Entry, Filesystem, FsError, Inode, JOURNAL_BLOCKS, Kind, Superblock,
+        format,
     };
 
     fn image(blocks: usize) -> Vec<u8> {
@@ -937,7 +1122,9 @@ mod tests {
             inodes: 128,
             bitmap_start: 1,
             inode_start: 2,
-            data_start: 3,
+            journal_start: 3,
+            journal_blocks: JOURNAL_BLOCKS,
+            data_start: 3 + JOURNAL_BLOCKS,
             root: 0,
         };
         for (what, wrong) in [
@@ -957,9 +1144,31 @@ mod tests {
                 },
             ),
             (
-                "data before the inodes",
+                "a journal before the inodes",
+                Superblock {
+                    journal_start: 1,
+                    ..sound
+                },
+            ),
+            (
+                "data before the journal",
                 Superblock {
                     data_start: 2,
+                    ..sound
+                },
+            ),
+            (
+                "a journal the superblock does not agree with itself about",
+                Superblock {
+                    journal_blocks: JOURNAL_BLOCKS + 1,
+                    ..sound
+                },
+            ),
+            (
+                "a journal with no room for a payload",
+                Superblock {
+                    journal_blocks: 1,
+                    data_start: 4,
                     ..sound
                 },
             ),
