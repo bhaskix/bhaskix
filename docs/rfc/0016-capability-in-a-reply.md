@@ -30,10 +30,11 @@ exactly the right authority for this and nothing more: a one-shot reply capabili
 thread that asked, valid only while it waits. Handing something back along it is narrower than any
 alternative, and it is the same shape as `FILL`, which this system already has and already trusts.
 
-It also proposes a fix to something found while writing this: **badges are forgeable today.** Any
-holder of a capability with `DERIVE` can derive another with a badge of its choosing. Every use of a
-badge to say *who is calling* or *which object* is currently unsound, and the design below depends
-on badges entirely — so the fix is not a follow-up, it is step one.
+It also proposes a fix to something found while writing this: **badges were forgeable.** Any holder
+of a capability with `DERIVE` could derive another with a badge of its choosing. Every use of a badge
+to say *who is calling* or *which object* was unsound, and the design below depends on badges
+entirely — so the fix was not a follow-up, it was step one, and it is **already done**: see the
+implementation plan.
 
 ---
 
@@ -79,9 +80,10 @@ The last one is the reason this is the same problem. "When does the lending end"
 lets go of its file handle*, and only the thing that issued the handle can see that. Today nothing
 issues handles, because nothing can.
 
-### Badges are forgeable
+### Badges were forgeable
 
-Found while drafting this, and verified rather than assumed:
+Found while drafting this, verified rather than assumed, and since fixed — step 1 below. The
+derivation that found it:
 
 ```
 insert_root(Endpoint, ALL, badge = 0)      // the kernel's master capability
@@ -89,9 +91,9 @@ insert_root(Endpoint, ALL, badge = 0)      // the kernel's master capability
        └─ derive(rights = ALL, badge = 0xbbbb)   // what the client can do for itself → Ok
 ```
 
-`Arena::derive_owned` sets the badge to whatever it is passed and checks only that the parent has
-`DERIVE`. `INVOKE`'s `DERIVE` passes `arg1` straight through from userspace. The shell holds its
-service endpoints with `Rights::ALL`, so it can do this today.
+`Arena::derive_owned` set the badge to whatever it was passed and checked only that the parent had
+`DERIVE`. `INVOKE`'s `DERIVE` passes `arg1` straight through from userspace, and the shell holds its
+service endpoints with `Rights::ALL`, so any program in ring 3 could do this.
 
 What it currently buys an attacker is small — there is one interesting client — and that is luck
 rather than design. `Rights::NONE`'s own documentation says a capability with no authority is
@@ -359,9 +361,22 @@ hypothesis, and the crossover is the one this RFC is least sure of.
 
 Five steps. The first is independent of the rest and should not wait for it.
 
-1. **Badging becomes one-way.** Three lines in `derive_owned`, a host test for each direction, and
-   the negative test that fails today. Independently valuable and independently shippable: it closes
-   a live hole whatever happens to the rest of this RFC.
+1. ~~**Badging becomes one-way.**~~ ✅ **Done, ahead of the rest of this RFC**, because it closes a
+   live hole and depends on nothing else here. Three lines in `derive_owned`, `CapError::BadgeNotMonotone`
+   (answering userspace with the same status as the other two derive refusals, so a caller cannot
+   probe which rule stopped it), host tests for both directions, and gates from ring 3.
+
+   Two places in the tree **demonstrated the hole as a feature** and had to be rewritten: the kernel's
+   capability self-test asserted that a re-badged derivation kept the new badge, and `user/probe`
+   derived itself a badge of its own choosing from raw ring 3 with the comment "the service sees the
+   *new* badge, which is how a derived capability is distinguishable from its parent". It is not, and
+   it must not be — what distinguishes a derived capability is its rights and its position under the
+   parent, which is what the revocation in that same test already showed.
+
+   Both halves are gated, and neither is worth anything alone: a program delegates its capability
+   under the same badge and the call arrives, **and** it asks for one under a badge it invented and is
+   refused. A kernel that refused every derivation would pass the second on its own, so the
+   over-strict version was watched failing too.
 2. **`HAND`.** The method, its three checks, and the negative tests for each — including a server
    that is not answering anybody, and a server handing something it holds without `GRANT`. Proved by
    a throwaway service that hands back a capability to a memory object, before any filesystem depends

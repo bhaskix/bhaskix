@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-08 (RFC 0015 steps 1–6) · CI green · 450 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 323 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-09 (RFC 0015 steps 1–6, RFC 0016 step 1) · CI green · 459 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 326 host assertions |
 
 ### Division of responsibility between documents
 
@@ -138,6 +138,8 @@ fairness within 2% for two equal-weight workloads.
 | M9-07 | RFC 0015 step 5: writes, and a journal that survives an interruption at every write | ✅ `DONE` | Write-ahead, metadata only: payload into the log, **commit**, then home, then clear — and "acknowledged" is defined as *the commit block was written*, because "the call returned" cannot be tested on a machine that stops. The harness stops at **every write of every operation** and asserts the filesystem mounts and holds exactly the transactions that committed — not "before or after", which would pass a filesystem that had applied half of a second transaction. Also run with the writes **reordered** within each phase, and with the recovery itself interrupted, because replay must be idempotent or the ordering is not sufficient. A read-only mount now **refuses** an image with a pending journal rather than handing back the state before an acknowledged operation. Found while building: beginning a transaction over a committed one destroys it (an error path can reach this; a crash cannot), and a block being *allocated* must have its data written before the commit or the file briefly reads its previous owner's bytes. `fs` is still **zero `unsafe`**. |
 
 | M9-08 | RFC 0015 step 6: a page cache, and a filesystem that no longer holds its own bytes | ✅ `DONE` | The cache was the smaller half. The larger half is that until now every structure was read by indexing into one slice, which is only possible because the image happened to be memory — so there is now a **`Store`** (the device: how many blocks, read one, write one) and **`Pages`** (where a block is, right now). An `Image` points into a slice it has; a `Cache` looks, and asks the device when it must. **One** implementation of "what an inode is" sits above that line. Write-back adds one ordering the journal did not need: **the log may not be cleared while a changed page is still dirty**, at the moment everything looks finished — recovery has the same constraint, and without it a survivable crash becomes a lost one on the *second* crash. The interruption moved into the `Store`, so a trace is now what the **disk** saw rather than what the filesystem asked for, and the whole exhaustive harness runs against it. Watched failing four ways, including that missing clear-flush. The *hand a reader a capability to a cached frame* half is **not built**, and the reason is recorded: it cannot be a capability to the cache (that exposes every other block), so it is one frame — which must then be pinned against eviction and revoked when the lending ends, a lifetime only the service owning the cache can see. `fs` is still **zero `unsafe`** across 3,467 lines. |
+
+| M9-09 | RFC 0016 step 1: a badge can no longer be chosen by the program holding it | ✅ `DONE` | A badge is a statement the *granter* made; until this, it was one the holder could make — `derive_owned` took the badge from its argument and `INVOKE`'s `DERIVE` passes that through from ring 3, so any program holding a badged capability with `DERIVE` could call a service as somebody else. Now one-way: a capability with badge zero is a **master** and may set any badge; one that carries a badge may only be derived with the same badge. Rights stay monotone independently, so delegation still works. **Two places in the tree demonstrated the hole as a feature** and had to be rewritten — the capability self-test asserted a re-badged derivation kept the new badge, and `user/probe` forged one from raw ring 3 with a comment calling it "how a derived capability is distinguishable from its parent". Both halves are gated everywhere, because either alone is worthless: delegation under the same badge must work, **and** a chosen badge must be refused. Watched failing in both directions — the rule removed, and the rule made over-strict. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -735,6 +737,35 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-06 (RFC 0016 step 1 — a badge is the granter's word, not the holder's)
+
+- **Fixed the badge forgery found while drafting RFC 0016.** Badging is one-way now: a capability
+  with badge zero is a master and may set any badge; one that already carries a badge may only be
+  derived with the same badge. Rights stay monotone independently, so a holder can still pass on
+  *less authority* — it just cannot pass on *a different identity*.
+- **Shedding a badge is refused along with changing it.** A caller arriving unbadged at a service
+  that tells its callers apart by badge has escaped being told apart, which is the same escape by a
+  quieter route.
+- **Two places demonstrated the hole as a feature.** The kernel's capability self-test derived a
+  badged capability into a *different* badge and asserted the new one survived. `user/probe` did the
+  same from raw ring 3, with the comment "the service sees the **new** badge, which is how a derived
+  capability is distinguishable from its parent". It is not, and it must not be: what distinguishes
+  a derived capability is its rights and its position under the parent, which the revocation in that
+  very test already showed.
+- **Both halves are gated, everywhere, because either alone is worthless.** Delegation under the
+  same badge must work *and* a badge the holder chose must be refused. A kernel that refused every
+  derivation would pass the second on its own — so that version was watched failing too, alongside
+  the version with the rule deleted. Four levels caught each: a host test, the kernel self-test, the
+  ring-3 boot gate, and the shell.
+- **A check of my own that could not have worked**: the first version asked
+  `badge & BADGE_DERIVED != 0`, and the two badges share bits — `0x1234_0000 & 0x5678_0000` is
+  `0x1230_0000` — so it reported forgery on a machine where none had happened. Two badges cannot be
+  told apart by masking, and there was no reason to think they could.
+- The suite failed once on a UEFI boot timeout at 120 s with load average 8 and four external
+  gitlab-runner processes taking 240% CPU; the same configuration passes standalone and the rerun
+  was green at load average 11.6. Recorded because "it passed the second time" is not an
+  explanation on its own.
 
 ### 2026-08-06 (RFC 0016 drafted — and two things found by writing it)
 

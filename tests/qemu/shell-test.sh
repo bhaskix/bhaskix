@@ -252,6 +252,14 @@ else
         "a program in ring 3 is woken by a notification:6 +signal rd +woke with badge 45324"
         "a notification is a signal and not a queue:6 +signal rd +nothing left after taking it"
         "taking from a notification needs the right to:7 +signal wr +refused a take"
+        # RFC 0016 step 1, from a program in ring 3. Slot 1's badge is what the
+        # filesystem service uses to tell its callers apart, and until this was
+        # fixed the holder could choose it. Both derivations are asked for in
+        # one line because either alone proves nothing: the same badge with
+        # weaker rights must work (delegation), and a different badge must not
+        # (forgery). A kernel that refused both would read identically here to
+        # one that refused neither.
+        "a program cannot rename itself:1 +badge +can be passed on, and cannot be changed by its holder"
         # RFC 0015 step 4. The shell holds a capability to one directory --
         # `sub` -- and nothing naming the directory above it.
         "a directory is a capability:8 +directory +reachable"

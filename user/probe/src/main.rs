@@ -130,21 +130,44 @@ _start:
     syscall
 
     // Delegation, from user mode. Derive a second capability to the same
-    // endpoint, with a different badge, into slot 1 of this domain's own
-    // CSpace. Nothing in the kernel arranged this -- ring 3 asked for it.
+    // endpoint into slot 1 of this domain's own CSpace -- weaker rights, and
+    // the *same badge*. Nothing in the kernel arranged this: ring 3 asked.
+    mov rax, 0                  // Kind::Invoke
+    xor rdi, rdi                // on capability 0
+    xor rsi, rsi                // method::DERIVE
+    mov rdx, 0x21               // rights: READ and DERIVE, less than the parent
+    mov r10, 0x12340000         // the same badge the parent carries
+    mov r8, 1                   // into slot 1
+    syscall
+
+    // Call through the derived capability. The service sees the *same* badge,
+    // because a badge says who the granter said this is and a holder cannot
+    // say otherwise. What the derived capability differs in is its rights and
+    // its position under the parent, which the revocation below shows.
+    mov rax, 1                  // Kind::Call
+    mov rdi, 1                  // capability 1
+    mov rsi, 9
+    mov rdx, 5
+    syscall
+
+    // And the thing a holder must *not* be able to do: derive the same
+    // capability under a badge of its own choosing. Refused, so slot 2 stays
+    // empty and the call through it below reaches nobody.
+    //
+    // Asked from raw ring 3 with no library in the way, because this is a rule
+    // enforced at the system call boundary and that is where it should be
+    // watched holding.
     mov rax, 0                  // Kind::Invoke
     xor rdi, rdi                // on capability 0
     xor rsi, rsi                // method::DERIVE
     mov rdx, 0x3f               // rights: everything the parent had
-    mov r10, 0x56780000         // the badge this copy will carry
-    mov r8, 1                   // into slot 1
+    mov r10, 0x56780000         // a badge this program invented
+    mov r8, 2                   // into slot 2
     syscall
 
-    // Call through the derived capability. The service sees the *new* badge,
-    // which is how a derived capability is distinguishable from its parent.
     mov rax, 1                  // Kind::Call
-    mov rdi, 1                  // capability 1
-    mov rsi, 9
+    mov rdi, 2                  // capability 2, which must not exist
+    mov rsi, 12
     mov rdx, 5
     syscall
 

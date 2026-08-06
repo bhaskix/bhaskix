@@ -942,11 +942,28 @@ else
     status=1
 fi
 
+# RFC 0016 step 1. A badge says who the *granter* said a caller is. Until this
+# was fixed a holder could derive itself a different one and call a service as
+# somebody else, and the probe below demonstrated it as though it were a
+# feature.
+#
+# Both halves are asserted, and neither is worth anything alone: the probe
+# delegates its capability under the same badge and the call arrives, *and* it
+# asks for one under a badge it invented and is refused. A kernel that refused
+# every derivation would pass the second on its own.
+if grep -qE "ring 3 +[0-9]+ syscalls.*ring 3 derived, used and revoked its own capability" "$LOG"; then
+    pass "ring 3 delegated a capability, and could not rename itself doing it"
+else
+    fail "the badge rule did not hold from ring 3"
+    grep -E "ring 3 " "$LOG" || true
+    status=1
+fi
+
 # Capabilities: the load-bearing security mechanism. The rules are proved
 # exhaustively on the host; this asserts they hold against the real global
 # arena, through its lock, and that nothing leaked.
-if grep -qF "derive is monotone, revoke is transitive and immediate" "$LOG"; then
-    pass "capabilities: monotone derivation, immediate transitive revocation"
+if grep -qF "derive is monotone in rights and in badges, revoke is transitive and immediate" "$LOG"; then
+    pass "capabilities: monotone derivation in rights and badges, immediate transitive revocation"
 else
     fail "capability self test did not pass"
     status=1

@@ -129,6 +129,11 @@ const _: () = {
     assert!(method::OPEN_AT == bhaskix_abi::method::OPEN_AT);
     assert!(method::INFO == bhaskix_abi::method::INFO);
     assert!(method::DELETE == bhaskix_abi::method::DELETE);
+    assert!(method::DERIVE == bhaskix_abi::method::DERIVE);
+    assert!(crate::cap::Rights::READ.bits() as u64 == bhaskix_abi::rights::READ);
+    assert!(crate::cap::Rights::WRITE.bits() as u64 == bhaskix_abi::rights::WRITE);
+    assert!(crate::cap::Rights::DERIVE.bits() as u64 == bhaskix_abi::rights::DERIVE);
+    assert!(crate::cap::Rights::GRANT.bits() as u64 == bhaskix_abi::rights::GRANT);
     assert!(method::IS_DIRECTORY == bhaskix_abi::method::IS_DIRECTORY);
     assert!(Status::NoSuchName as u64 == bhaskix_abi::status::NO_SUCH_NAME);
     assert!(Status::BadName as u64 == bhaskix_abi::status::BAD_NAME);
@@ -494,6 +499,13 @@ fn invoke_capability(
                     Outcome::err(Status::InsufficientRights)
                 }
                 Err(crate::cap::CapError::DeriveNotPermitted) => {
+                    Outcome::err(Status::InsufficientRights)
+                }
+                // The same answer as the two above on purpose. A caller that
+                // could tell "you may not derive" from "you may not change the
+                // badge" would learn the shape of a rule it is not allowed to
+                // use, one probe at a time.
+                Err(crate::cap::CapError::BadgeNotMonotone) => {
                     Outcome::err(Status::InsufficientRights)
                 }
                 Err(_) => Outcome::err(Status::QuotaExceeded),
@@ -1306,7 +1318,8 @@ fn grant(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
                 .derive_owned(source_slot, rights, frame.arg2, recipient)
                 .map_err(|error| match error {
                     crate::cap::CapError::RightsNotMonotone
-                    | crate::cap::CapError::DeriveNotPermitted => Status::InsufficientRights,
+                    | crate::cap::CapError::DeriveNotPermitted
+                    | crate::cap::CapError::BadgeNotMonotone => Status::InsufficientRights,
                     _ => Status::QuotaExceeded,
                 })?;
             Ok((recipient, derived))

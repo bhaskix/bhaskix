@@ -288,6 +288,13 @@ pub enum CapError {
     RightsNotMonotone,
     /// The parent does not permit derivation.
     DeriveNotPermitted,
+    /// The derivation would change the badge, and only a master may set one.
+    ///
+    /// Separate from [`CapError::DeriveNotPermitted`] so that the kernel can
+    /// tell which rule refused. Both answer userspace with the same status:
+    /// which rule stopped you is a thing a caller can learn nothing useful
+    /// from and can probe with.
+    BadgeNotMonotone,
     /// The capability does not permit revocation.
     RevokeNotPermitted,
     /// The capability does not permit being granted onwards.
@@ -474,6 +481,28 @@ impl Arena {
         }
         if !parent_node.rights.contains(rights) {
             return Err(CapError::RightsNotMonotone);
+        }
+        // A badge is a statement the *granter* made, and until this check
+        // existed it was a statement the holder could make: the badge came
+        // straight from the argument, and `INVOKE`'s `DERIVE` passes that
+        // through from ring 3. So any program holding a badged capability with
+        // `DERIVE` could mint itself another badge and call a service as
+        // somebody else -- which is the whole of what a badge is for.
+        //
+        // The rule is one-way. A capability with badge zero is a **master**
+        // and may be derived into any badge; a capability that already carries
+        // one may only be derived with the same badge. Rights stay monotone
+        // independently, so delegation still works -- a holder can pass on a
+        // weaker capability, it just cannot pass on a different identity.
+        //
+        // Zero means unbadged, which is already how this kernel uses it: every
+        // root it mints has badge zero and every client capability is a badged
+        // derivation of one. Shedding a badge is refused along with changing
+        // it, because a caller that could arrive anonymously at a service that
+        // tells its callers apart by badge is a caller that has escaped being
+        // told apart.
+        if parent_node.badge != 0 && badge != parent_node.badge {
+            return Err(CapError::BadgeNotMonotone);
         }
 
         let free = self.free_index().ok_or(CapError::Exhausted)?;
@@ -931,5 +960,103 @@ mod tests {
         let rights = Rights::from_bits(0xff);
         assert_eq!(rights, Rights::ALL);
         assert!(Rights::ALL.contains(rights));
+    }
+
+    #[test]
+    fn a_badge_can_be_set_by_a_master_and_by_nobody_else() {
+        // The hole this closes, written as the derivation that found it. A
+        // client is given a badged capability; what it can do for itself with
+        // that capability is the whole question.
+        let mut arena = Arena::new();
+        let master = arena
+            .insert_root(ObjectRef::new(ObjectKind::Endpoint, 7), Rights::ALL, 0)
+            .expect("a root");
+
+        // A master has no badge, so it may set one. This is how every client
+        // capability in this kernel is made.
+        let client = arena
+            .derive(master, Rights::ALL, 0xaaaa)
+            .expect("a badged capability for a client");
+        assert_eq!(arena.badge_of(client), Some(0xaaaa));
+
+        // And the master may hand out a *different* badge to somebody else,
+        // which is what makes badges able to tell callers apart at all.
+        let other = arena
+            .derive(master, Rights::ALL, 0xcccc)
+            .expect("a second client");
+        assert_eq!(arena.badge_of(other), Some(0xcccc));
+
+        // What the client cannot do: call itself something else. This is the
+        // derivation that succeeded before the rule existed.
+        assert_eq!(
+            arena.derive(client, Rights::ALL, 0xbbbb),
+            Err(CapError::BadgeNotMonotone),
+            "a holder minted itself a badge"
+        );
+
+        // Nor shed it. A caller arriving with no badge at a service that tells
+        // its callers apart by badge has escaped being told apart, which is
+        // the same escape by a quieter route.
+        assert_eq!(
+            arena.derive(client, Rights::ALL, 0),
+            Err(CapError::BadgeNotMonotone),
+            "a holder shed its badge"
+        );
+    }
+
+    #[test]
+    fn delegation_still_works_with_the_badge_kept() {
+        // The other half, and the one that makes the test above mean
+        // something: a rule that refused *every* derivation from a badged
+        // capability would pass the forgery test and break the system. A
+        // holder must still be able to pass on less authority under the same
+        // name.
+        let mut arena = Arena::new();
+        let master = arena
+            .insert_root(ObjectRef::new(ObjectKind::Endpoint, 7), Rights::ALL, 0)
+            .expect("a root");
+        let client = arena.derive(master, Rights::ALL, 0xaaaa).expect("badged");
+
+        // `DERIVE` as well as `READ`, because holding a right is not the same
+        // as being allowed to pass it on -- this test asked for `READ` alone
+        // first and was refused, which is the rule working.
+        let passed_on = arena
+            .derive(client, Rights::READ.union(Rights::DERIVE), 0xaaaa)
+            .expect("a weaker capability under the same badge");
+        assert_eq!(arena.badge_of(passed_on), Some(0xaaaa));
+
+        // And one more level down, because a rule that allowed exactly one
+        // generation of delegation would also pass everything above.
+        let further = arena
+            .derive(passed_on, Rights::READ, 0xaaaa)
+            .expect("and weaker again");
+        assert_eq!(arena.badge_of(further), Some(0xaaaa));
+
+        // Rights stay monotone independently of any of this.
+        assert_eq!(
+            arena.derive(passed_on, Rights::WRITE, 0xaaaa),
+            Err(CapError::RightsNotMonotone)
+        );
+    }
+
+    #[test]
+    fn an_unbadged_capability_is_not_a_master_by_accident() {
+        // Badge zero means "no badge", so a derivation of a master that keeps
+        // zero is itself a master. That is a real consequence and worth
+        // pinning: it means the kernel can hand out an unbadged capability
+        // that the recipient may badge, which is how a service would be given
+        // the right to name its own objects -- and it means an unbadged
+        // capability must never be handed to somebody who should not have
+        // that.
+        let mut arena = Arena::new();
+        let master = arena
+            .insert_root(ObjectRef::new(ObjectKind::Endpoint, 7), Rights::ALL, 0)
+            .expect("a root");
+        let still_master = arena.derive(master, Rights::ALL, 0).expect("unbadged");
+        assert_eq!(arena.badge_of(still_master), Some(0));
+        assert!(
+            arena.derive(still_master, Rights::ALL, 0xdddd).is_ok(),
+            "an unbadged derivation is still able to badge"
+        );
     }
 }

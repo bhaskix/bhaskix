@@ -1020,6 +1020,21 @@ static RING3_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 static RING3_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Badges the service saw on those calls, or-ed together.
 static RING3_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Set if any message ever arrived carrying the badge ring 3 tried to invent.
+///
+/// A flag and not a mask. The first version of this check asked
+/// `badge & BADGE_DERIVED != 0`, which is true whenever the *legitimate* badge
+/// is present -- `0x1234_0000 & 0x5678_0000` is `0x1230_0000` -- so it
+/// reported forgery on a machine where none had happened. Two badges that
+/// share bits cannot be told apart by masking, and there was no reason to
+/// believe they did not.
+static RING3_FORGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The badge on the call the probe made through the capability it derived.
+///
+/// Recorded on its own, because the combined record cannot answer the question
+/// this now asks: whether the *same* badge arrived through a different
+/// capability.
+static RING3_DELEGATED_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Set when ring 3 sent back the value it was told, proving it received it.
 static RING3_ECHOED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// What the probe reports about its own segments; see [`SEGMENT_MAGIC`].
@@ -1041,8 +1056,15 @@ const RING3_SEGMENT_METHOD: u64 = 11;
 
 /// The badge on the capability the ring 3 probe holds.
 const BADGE_RING3: u64 = 0x0000_0000_1234_0000;
-/// The badge ring 3 puts on the capability it derives for itself.
+/// The badge ring 3 *tries* to put on a capability it derives for itself.
+///
+/// It must never be seen. A badge is a statement the granter made, and a
+/// holder that could change it could call a service as somebody else; the
+/// probe asks for this one from raw ring 3 and the kernel refuses, so no
+/// message ever arrives carrying it. RFC 0016 step 1.
 const BADGE_DERIVED: u64 = 0x0000_0000_5678_0000;
+/// The method the probe uses on the capability it derived legitimately.
+const RING3_DELEGATED_METHOD: u64 = 9;
 /// What the probe asks for, and what it must be told.
 const RING3_REQUEST: u64 = 6;
 
@@ -1073,6 +1095,19 @@ extern "C" fn ring3_service(_argument: u64) -> ! {
                 // say which of the loader's obligations was not met.
                 if message.method == RING3_SEGMENT_METHOD {
                     RING3_SEGMENTS.store(message.args[0], Ordering::Release);
+                }
+
+                // The badge on the call made through the capability ring 3
+                // derived, recorded on its own rather than or-ed into the
+                // rest. Or-ing was enough while the probe forged a *different*
+                // badge; now that it delegates under the same one, a combined
+                // record could not tell "the same badge arrived" from "only
+                // the parent ever called", which is the whole question.
+                if message.method == RING3_DELEGATED_METHOD {
+                    RING3_DELEGATED_BADGE.store(message.badge, Ordering::Release);
+                }
+                if message.badge == BADGE_DERIVED {
+                    RING3_FORGED.store(true, Ordering::Release);
                 }
 
                 let answer = ipc::Message {
@@ -1267,6 +1302,8 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     let ring3_calls = RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let ring3_badge = RING3_BADGE.load(core::sync::atomic::Ordering::Relaxed);
+    let delegated_badge = RING3_DELEGATED_BADGE.load(core::sync::atomic::Ordering::Acquire);
+    let forged = RING3_FORGED.load(core::sync::atomic::Ordering::Acquire);
     let echoed = RING3_ECHOED.load(core::sync::atomic::Ordering::Acquire);
     let segments = RING3_SEGMENTS.load(core::sync::atomic::Ordering::Acquire);
 
@@ -1302,23 +1339,31 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         ("the probe was interrupted while in ring 3", interrupts > 0),
         // The IPC half. Four calls reach the service: the segment report and
         // two exchanges through the capability the kernel installed, and one
-        // through the capability ring 3 derived for itself. The fifth, after
-        // revocation, must not.
+        // through the capability ring 3 derived for itself. The call through
+        // the badge it *tried to forge* is not among them, and neither is the
+        // one after revocation.
         ("ring 3 reached a service through IPC", ring3_calls == 4),
         (
             "the service saw the badge from the probe's capability",
-            ring3_badge & BADGE_RING3 != 0,
+            ring3_badge == BADGE_RING3,
         ),
         // The decisive one: user mode sent back the value it was told, so the
         // reply reached ring 3 rather than merely being delivered.
         ("the reply reached user mode", echoed),
-        // Delegation, asked for by ring 3 rather than arranged for it. The
-        // derived capability carries a badge the program chose, which the
-        // service sees and the parent's badge does not explain.
+        // Delegation, asked for by ring 3 rather than arranged for it: weaker
+        // rights, and the capability works.
         (
             "ring 3 derived a capability and used it",
-            ring3_badge & BADGE_DERIVED != 0,
+            delegated_badge == BADGE_RING3,
         ),
+        // And the rule that makes a badge worth anything. The probe also asked
+        // for a copy under a badge it invented; the kernel refused, so that
+        // slot stayed empty, the call through it reached nobody, and no
+        // message ever carried the badge. Both halves are asserted because
+        // either alone would pass for the wrong reason -- a kernel that
+        // refused *every* derivation would leave this badge unseen too, and
+        // the check above is what rules that out.
+        ("ring 3 could not choose its own badge", !forged),
         // And revocation, also asked for by ring 3. The slot is still in the
         // CSpace; the authority behind it is gone, so the call fails rather
         // than reaching a service that is still perfectly willing to answer.
@@ -5285,10 +5330,25 @@ fn capability_self_test() -> bool {
             .union(Rights::DERIVE)
             .union(Rights::REVOKE);
         let granted = arena.derive(root, service_rights, 0xa11ce).ok()?;
-        let further = arena.derive(granted, Rights::READ, 0xb0b).ok()?;
+        // Narrower rights, **the same badge**. This used to pass `0xb0b` and
+        // assert the new badge survived, which documented badge forgery as a
+        // feature: a holder could mint itself an identity and call a service
+        // as somebody else. Now a badge can only be set by whoever had none,
+        // and delegation means passing on less authority, not a different name.
+        let further = arena.derive(granted, Rights::READ, 0xa11ce).ok()?;
 
+        // And the badge rule itself, from the holder's side. Asked with rights
+        // the parent *has*, so that only the badge can be what refuses it --
+        // widening and re-badging in one call would be refused by whichever
+        // check ran first, and the test could not say which.
+        let forging_refused = arena
+            .derive(granted, Rights::READ, 0xb0b)
+            .is_err_and(|error| error == cap::CapError::BadgeNotMonotone);
+
+        // Same badge, wider rights: refused by the rights rule and not the
+        // badge one, which is the other half of keeping the two apart.
         let widening_refused = arena
-            .derive(granted, Rights::ALL, 0)
+            .derive(granted, Rights::ALL, 0xa11ce)
             .is_err_and(|error| error == cap::CapError::RightsNotMonotone);
 
         // Two domains, the same index, different authority.
@@ -5298,7 +5358,7 @@ fn capability_self_test() -> bool {
         bob.install(further).ok()?;
         let indices_are_not_authority = alice.get(0) != bob.get(0);
 
-        let badge_survived = arena.badge_of(further) == Some(0xb0b);
+        let badge_survived = arena.badge_of(further) == Some(0xa11ce);
 
         // Revoking the middle capability must take the one below it and leave
         // the one above untouched -- checked before this call returns.
@@ -5309,7 +5369,7 @@ fn capability_self_test() -> bool {
         arena.revoke_unchecked(root);
 
         Some((
-            widening_refused,
+            widening_refused && forging_refused,
             indices_are_not_authority,
             badge_survived,
             transitive,
@@ -5326,9 +5386,15 @@ fn capability_self_test() -> bool {
     };
 
     let checks = [
-        ("derivation refused to widen rights", widening_refused),
+        (
+            "derivation refused to widen rights, and refused to change a badge",
+            widening_refused,
+        ),
         ("an index means nothing outside its cspace", distinct),
-        ("a granter's badge survived derivation", badge_survived),
+        (
+            "a granter's badge survived derivation unchanged",
+            badge_survived,
+        ),
         ("revocation was transitive and immediate", transitive),
         ("revocation spared the parent", parent_survived),
         ("no capabilities leaked", after == before),
@@ -5344,7 +5410,8 @@ fn capability_self_test() -> bool {
 
     if ok {
         println!(
-            "    capabilities   derive is monotone, revoke is transitive and immediate; {after} live"
+            "    capabilities   derive is monotone in rights and in badges, revoke is transitive \
+             and immediate; {after} live"
         );
     }
     ok

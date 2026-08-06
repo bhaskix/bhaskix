@@ -183,6 +183,14 @@ pub mod method {
     /// meaning, which is the one place in this ABI where a method number means
     /// two things — deliberately, because "how big" is the same question.
     pub const INFO: u64 = 34;
+    /// Make a weaker capability from this one.
+    ///
+    /// `arg0` = rights for the copy, `arg1` = its badge, `arg2` = the slot to
+    /// put it in. Rights may only narrow, and the badge may only be **set by a
+    /// capability that has none**: a badge is a statement the granter made,
+    /// and a holder that could change it could call a service as somebody
+    /// else.
+    pub const DERIVE: u64 = 0;
     /// Drop this capability, leaving the slot empty.
     ///
     /// Not an error on a slot that is already empty: a program tidying up
@@ -193,6 +201,27 @@ pub mod method {
     /// Above the slot index rather than beside it, so a caller that ignores it
     /// gets a slot number and not a slot number plus one.
     pub const IS_DIRECTORY: u64 = 1 << 32;
+}
+
+/// The bits a capability's rights are made of.
+///
+/// Mirrored from the kernel so that a program can ask for a *weaker* copy of
+/// something it holds without linking the kernel. Asking for more than the
+/// parent has is refused, so these are safe to name — the numbers are not the
+/// authority, the capability is.
+pub mod rights {
+    /// Read the object's contents.
+    pub const READ: u64 = 1 << 0;
+    /// Modify the object.
+    pub const WRITE: u64 = 1 << 1;
+    /// Execute from it, where that means anything.
+    pub const EXECUTE: u64 = 1 << 2;
+    /// Pass a copy to another domain.
+    pub const GRANT: u64 = 1 << 3;
+    /// Revoke this capability and everything below it.
+    pub const REVOKE: u64 = 1 << 4;
+    /// Create a weaker capability from this one.
+    pub const DERIVE: u64 = 1 << 5;
 }
 
 /// What a system call returned in `rax`.

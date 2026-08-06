@@ -29,7 +29,8 @@
 #![no_main]
 
 use bhaskix_abi::{
-    CHUNK_BYTES, Chunk, Edit, LineEditor, console, entry_of, fs, method, outcome, status, syscall,
+    CHUNK_BYTES, Chunk, Edit, LineEditor, console, entry_of, fs, method, outcome, rights, status,
+    syscall,
 };
 
 /// The capability slot the console endpoint was installed in.
@@ -58,6 +59,18 @@ const SIGNAL_WRITE_ONLY: u64 = 7;
 const DIRECTORY: u64 = 8;
 /// Where [`open`] puts what it opened. Emptied again afterwards.
 const OPENED: u64 = 9;
+/// A slot this program keeps free, to find things out with.
+///
+/// A probe that had to occupy a slot it cared about would be answering a
+/// different question afterwards.
+const SCRATCH: u64 = 11;
+/// The badge the kernel put on this program's filesystem capability.
+///
+/// Known here only so that the probe can ask for the *same* one. A program
+/// cannot read its own badges — there is no system call for it, and there
+/// should not be, because a badge is what a service is told about a caller and
+/// not what the caller is told about itself.
+const BADGE_FILESYSTEM: u64 = 0x0000_0000_00f5_0000;
 /// The same directory as [`DIRECTORY`], one generation on.
 ///
 /// What a capability looks like after the directory it named has been freed
@@ -316,6 +329,44 @@ fn capabilities() {
         other => {
             write(b"status ");
             write_number(other);
+            write(b"\n");
+        }
+    }
+
+    // A badge, and whether this program can choose its own.
+    //
+    // Slot 1's capability carries a badge the kernel put there, and the
+    // filesystem service uses it to tell its callers apart. Two derivations
+    // are asked for and they have to answer differently, or neither means
+    // anything: the same badge with weaker rights is **delegation** and must
+    // work, and a different badge is **forgery** and must not. A rule that
+    // refused both would look identical here to a rule that refused neither,
+    // if only one of them were asked.
+    let derive = |rights: u64, badge: u64, into: u64| {
+        let reply = syscall(
+            syscall::INVOKE,
+            FILESYSTEM,
+            method::DERIVE,
+            [rights, badge, into, 0],
+        );
+        // Nothing is kept: this program is finding out what it may do, not
+        // arranging to do it, and a slot left occupied would change what the
+        // rest of `caps` reports.
+        syscall(syscall::INVOKE, into, method::DELETE, [0; 4]);
+        reply.status
+    };
+
+    write(b"  1  badge     ");
+    let passed_on = derive(rights::READ, BADGE_FILESYSTEM, SCRATCH);
+    let forged = derive(rights::READ, BADGE_FILESYSTEM ^ 0x5eed, SCRATCH);
+    match (passed_on, forged) {
+        (status::OK, status::INSUFFICIENT_RIGHTS) => {
+            write(b"can be passed on, and cannot be changed by its holder\n");
+        }
+        (status::OK, status::OK) => write(b"FORGED -- this program chose its own badge\n"),
+        (_, _) => {
+            write(b"neither derivation worked, status ");
+            write_number(passed_on);
             write(b"\n");
         }
     }
