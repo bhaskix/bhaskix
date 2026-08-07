@@ -277,7 +277,10 @@ fn end_faulting_domain() -> ! {
             }
             println!("==================================================================");
 
-            crate::domain::destroy(id);
+            // `Faulted`, not `Killed`. A supervisor deciding whether to
+            // start this program again wants to know the difference between a
+            // program that was stopped on purpose and one with a bug in it.
+            crate::domain::end(id, crate::domain::Ending::Faulted);
         }
         None => {
             // A ring 3 thread outside any domain should not exist -- entering

@@ -1762,21 +1762,41 @@ pub fn exit() -> ! {
     //
     // Taken under the same lock that marks this thread finished, so there is no
     // window in which the thread is gone and the debt is still recorded.
-    let owed = if cpu < MAX_CPUS {
+    let (owed, mine) = if cpu < MAX_CPUS {
         let mut queue = QUEUES[cpu].lock();
         let current = queue.current;
-        queue.threads[current].as_mut().and_then(|thread| {
-            thread.state = State::Finished;
-            thread.reply_to.take()
-        })
+        queue.threads[current]
+            .as_mut()
+            .map_or((None, None), |thread| {
+                thread.state = State::Finished;
+                let domain = (thread.domain != u32::MAX).then_some(thread.domain);
+                (thread.reply_to.take(), domain)
+            })
     } else {
-        None
+        (None, None)
     };
 
     // Outside the lock: telling the caller takes its CPU's runqueue lock, and
     // two of the same rank held at once have no order between them.
     if let Some(caller) = owed {
         abandon_caller(caller);
+    }
+
+    // Was that the last of its domain?
+    //
+    // Asked of the scheduler rather than of `Domain::threads`, which is a
+    // counter only one self-test ever increments and which therefore reads zero
+    // for every domain in the system. Asked *after* this thread is marked
+    // `Finished`, so it does not count itself.
+    //
+    // A domain that runs out of threads has ended, and `Exited` is what that
+    // is: nobody killed it and nothing faulted. Skipped for a domain that is
+    // already dead, which is the ordinary case when the domain was destroyed
+    // first and its threads are stopping in consequence.
+    if let Some(domain) = mine
+        && threads_in_domain(domain) == 0
+    {
+        crate::domain::ended_by_last_thread(crate::domain::DomainId::from_u32(domain));
     }
     loop {
         preempt();

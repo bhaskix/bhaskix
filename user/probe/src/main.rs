@@ -341,6 +341,20 @@ _start:
     syscall
     mov r15, rax
 
+    // Ask to be told when it ends, *before* it is started. A binding made
+    // afterwards would race the program: a short-lived one can be gone before
+    // its creator gets round to watching, and a watch registered for an event
+    // that has already happened is a wait that never ends. The kernel refuses
+    // that binding rather than accepting it, which is why the order here is
+    // not merely tidy.
+    mov rax, 0                  // Kind::Invoke
+    mov rdi, 6                  // on the child Domain
+    mov rsi, 35                 // method::BIND
+    mov rdx, 9                  // my slot 9: a notification
+    mov r10, 0xd1e              // the badge it will carry
+    syscall
+    mov r14, rax
+
     // And start it. The image is in capability 4, a memory object this program
     // was given; how many bytes is the kernel's business, which clamps to the
     // object. The last argument is one word handed to the program at entry --
@@ -401,6 +415,48 @@ _start:
     mov r10, rbx                // the start
     mov r8, r12                 // starting a program in an endpoint
     mov r9, r13                 // giving away what may only be held
+    syscall
+
+    // --- RFC 0017 step 6: wait for it, ask what happened, reap it ----------
+    //
+    // A supervisor, in ring 3, in five system calls. Nothing here is a special
+    // facility for supervising: it waits on a notification, invokes two methods
+    // on a capability it holds, and that is the whole of it.
+    mov rax, 0                  // Kind::Invoke
+    mov rdi, 9                  // the notification bound to the child
+    mov rsi, 43                 // method::WAIT -- blocks until it is signalled
+    syscall
+
+    // What happened to it. The answer is in `rdx`; `rax` is the status.
+    mov rax, 0
+    mov rdi, 6                  // the child Domain
+    mov rsi, 34                 // method::INFO
+    syscall
+    mov r12, rdx                // 1 exited, 2 faulted, 3 killed, 4 envelope
+
+    // Reap it: the slot goes back, and so does this capability.
+    mov rax, 0
+    mov rdi, 6
+    mov rsi, 37                 // method::RELEASE
+    syscall
+    mov r13, rax
+
+    // And ask again. The capability went with the reaping, so this must not
+    // answer -- a holder that could still ask would be asking about whatever
+    // takes the slot next.
+    mov rax, 0
+    mov rdi, 6
+    mov rsi, 34                 // method::INFO
+    syscall
+    mov r15, rax
+
+    mov rax, 1                  // Kind::Call
+    xor rdi, rdi
+    mov rsi, 17                 // method: "here is what reaping said"
+    mov rdx, r14                // the binding
+    mov r10, r12                // how it ended
+    mov r8, r13                 // the reaping
+    mov r9, r15                 // asking after it was reaped
     syscall
 
 

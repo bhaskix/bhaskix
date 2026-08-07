@@ -836,6 +836,27 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         Some(_) => {}
     }
 
+    // A `Domain` method, before the blocks below claim the numbers.
+    //
+    // `BIND`, `RELEASE` and `INFO` each mean something on more than one kind of
+    // object, and the blocks that follow intercept them **by number**, resolve
+    // the capability their own way, and `return` whatever that produced --
+    // including its failure. So a `Domain` invoked with `INFO` was answered
+    // `WrongObject` by the code for device windows, which had never heard of
+    // domains, and RFC 0017 step 6 could not reach any of its three methods.
+    //
+    // Guarded by method rather than by kind, so the locks below are taken for
+    // three methods and not for every invocation. Asking the kind on every
+    // `Invoke` was the first fix and it was a bad one: it put the domain table
+    // on the hot path of every system call, and the machine spent its time
+    // queueing for it.
+    if kind == Some(Kind::Invoke)
+        && matches!(frame.method, method::BIND | method::INFO | method::RELEASE)
+        && let Some(outcome) = domain_lifecycle(frame)
+    {
+        return outcome;
+    }
+
     // An `IrqHandler` method, unlocked for the same reason as the window's:
     // binding and acknowledging reach the handler table and the controller,
     // both of which rank inside the capability arena it was resolved under.
@@ -1477,16 +1498,31 @@ fn spawn(frame: &SyscallFrame) -> Outcome {
     // Derived from the child's own root, so the creator holds a capability
     // *under* it rather than the root itself: destroying the child revokes the
     // root and this copy with it, which is what makes destruction total.
-    // The same badge the root carries, which is the domain's own id.
+    // A handle to the domain, and **not** derived from the domain's own root.
     //
-    // Not zero. Badging is one-way since RFC 0016 step 1 — a badged capability
-    // may only derive the same badge — and a domain's root is badged with its
-    // id, so asking for zero here is asking to *re-badge*, and the kernel
-    // refuses. It refused this, and the refusal was right: the rule held
-    // against its own author.
-    let badge = u64::from(child.as_u32());
-    let granted = crate::domain::root_capability(child).and_then(|root| {
-        crate::cap::with_arena(|arena| arena.derive(root, crate::cap::Rights::ALL, badge).ok())
+    // It was, until RFC 0017 step 6 showed why it must not be. The root is the
+    // ancestor of everything the domain is *granted*, and ending a domain
+    // revokes it so that no authority outlives the program that held it. A
+    // handle derived from it goes the same way — so a creator that asked what
+    // happened to its child was told the capability had been revoked, and the
+    // slot the kernel had carefully kept for it could not be reached, let alone
+    // reaped.
+    //
+    // The two are different things. Authority *inside* a domain dies with the
+    // domain; a reference *to* a domain has to outlive it, or there is nobody
+    // left to ask and nothing to reap with. So the handle is a root of its own,
+    // and `reap` is what revokes it.
+    let granted = crate::cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                crate::cap::ObjectRef::new(
+                    crate::cap::ObjectKind::Domain,
+                    u64::from(child.as_u32()),
+                ),
+                crate::cap::Rights::ALL,
+                0,
+            )
+            .ok()
     });
     let Some(granted) = granted else {
         crate::domain::destroy(child);
@@ -1502,6 +1538,83 @@ fn spawn(frame: &SyscallFrame) -> Outcome {
     }
 
     Outcome::ok(u64::from(child.as_u32()))
+}
+
+/// Watching a domain, asking after it, and reaping it: RFC 0017 step 6.
+///
+/// `None` when the capability is not a `Domain`, so the blocks that share these
+/// method numbers still answer for the kinds they own.
+fn domain_lifecycle(frame: &SyscallFrame) -> Option<Outcome> {
+    let me = crate::sched::current_domain()?;
+    let (object, _) = domain::with(me, |owner| {
+        let slot = owner.cspace.get(frame.capability as usize)?;
+        cap::with_arena(|arena| arena.lookup(slot))
+    })
+    .flatten()?;
+    if object.kind != ObjectKind::Domain {
+        return None;
+    }
+    let target = domain::DomainId::from_u32(object.id as u32);
+
+    Some(match frame.method {
+        method::BIND => {
+            let notification = domain::with(me, |owner| {
+                let slot = owner.cspace.get(frame.arg0 as usize)?;
+                cap::with_arena(|arena| arena.lookup(slot))
+            })
+            .flatten();
+            let Some((notification, _)) = notification else {
+                return Some(Outcome::err(Status::NoSuchCapability));
+            };
+            if notification.kind != ObjectKind::Notification {
+                return Some(Outcome::err(Status::WrongObject));
+            }
+            // A badge of zero cannot be signalled -- `notify::signal` refuses
+            // it, because a notification carrying no bits is one a waiter
+            // cannot tell from never having been signalled.
+            if frame.arg1 == 0 {
+                return Some(Outcome::err(Status::WrongObject));
+            }
+            let id = crate::notify::NotificationId::from_parts(
+                notification.id as u32,
+                (notification.id >> 32) as u32,
+            );
+            if domain::notify_on_end(target, id, frame.arg1) {
+                Outcome::ok(0)
+            } else {
+                // Already ended. Refused rather than accepted-and-never-fired:
+                // a watch registered for an event that has happened is a wait
+                // that never ends. `INFO` has the answer.
+                Outcome::err(Status::WrongObject)
+            }
+        }
+
+        method::INFO => match domain::state_of(target) {
+            Ok(None) => Outcome::ok(0),
+            Ok(Some(reason)) => Outcome::ok(reason as u64),
+            Err(()) => Outcome::err(Status::Revoked),
+        },
+
+        method::RELEASE => {
+            if domain::reap(target) {
+                // The capability goes with the slot. Leaving it would let a
+                // holder ask about a domain that has been reaped and get an
+                // answer about whatever took the slot next.
+                let removed = domain::with(me, |owner| {
+                    owner.cspace.remove(frame.capability as usize);
+                });
+                let _ = removed;
+                Outcome::ok(0)
+            } else {
+                // Still running, or already reaped. Both mean "there is nothing
+                // here to release", and a holder that could tell them apart
+                // would learn something about a domain that no longer exists.
+                Outcome::err(Status::WrongObject)
+            }
+        }
+
+        _ => return None,
+    })
 }
 
 /// Gives a domain a copy of a capability the caller holds.
@@ -1664,7 +1777,11 @@ fn start_program(frame: &SyscallFrame) -> Outcome {
         return Outcome::err(Status::NoSuchCapability);
     };
 
-    if crate::domain::with(target, |domain| domain.threads()) != Some(0) {
+    // Asked of the scheduler, not of `Domain::threads` -- a counter only one
+    // self-test ever increments, so it reads zero for every domain and this
+    // check never fired. Found while building step 6, which needed the same
+    // question answered properly.
+    if crate::sched::threads_in_domain(target.as_u32()) != 0 {
         return Outcome::err(Status::SlotUnavailable);
     }
 

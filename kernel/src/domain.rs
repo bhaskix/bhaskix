@@ -66,6 +66,26 @@ use crate::sync::{Rank, SpinLock};
 /// most wants to start a replacement.
 pub const MAX_DOMAINS: usize = 32;
 
+/// How a domain ended.
+///
+/// Recorded rather than merely counted, because a supervisor's restart policy
+/// is a different decision for each: a program that exited did what it was
+/// asked, one that faulted has a bug, one that was killed was killed on
+/// purpose, and one that hit its envelope needs a bigger envelope rather than
+/// another go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ending {
+    /// Its last thread called the exit system call.
+    Exited = 1,
+    /// A thread took an exception in ring 3.
+    Faulted = 2,
+    /// A holder of its `Domain` capability said so.
+    Killed = 3,
+    /// It asked for a resource its envelope refuses, where no error could be
+    /// returned.
+    Envelope = 4,
+}
+
 /// How many bytes of a domain's name are kept.
 ///
 /// Enough to tell programs apart in a fault report, and short enough that the
@@ -286,6 +306,20 @@ pub struct Domain {
     parent_generation: u32,
     /// Domains this one has created that still exist.
     children: u32,
+    /// How this domain ended, once it has.
+    ///
+    /// **A dead domain keeps its slot until it is reaped.** Otherwise "what
+    /// happened to it" is a race against whoever asks: the slot would be free,
+    /// something else would take it, and the answer would be about a different
+    /// domain — or would be "no such domain", which is true and useless.
+    ///
+    /// Only domains with a **parent** are kept this way. Those are the ones a
+    /// program created and can be asked about. A domain the kernel made at boot
+    /// has nobody to ask and nobody to reap it, and keeping it would fill a
+    /// table of 32 with the remains of self-tests.
+    ended: Option<Ending>,
+    /// A notification to signal when this domain ends, and with what badge.
+    notify: Option<(crate::notify::NotificationId, u64)>,
     /// An image waiting for this domain's first thread to collect it.
     ///
     /// Set by `START` and taken by the thread it spawns. It lives here because
@@ -318,6 +352,8 @@ impl Domain {
             parent: u32::MAX,
             parent_generation: 0,
             children: 0,
+            ended: None,
+            notify: None,
             pending_start: None,
             cspace: CSpace::new(),
             envelope: ResourceEnvelope::new(),
@@ -564,6 +600,95 @@ pub fn next_start_cpu() -> u32 {
     NEXT_CPU.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % online
 }
 
+/// How a domain is, for a holder of a capability to it.
+///
+/// `Ok(None)` means it is still running. `Ok(Some(reason))` means it has ended
+/// and has not been reaped. `Err(())` means there is no such domain — either it
+/// never existed or it was reaped, and those are deliberately the same answer:
+/// a caller that could tell them apart would be asking about a slot rather than
+/// about a domain.
+#[allow(clippy::result_unit_err)]
+pub fn state_of(id: DomainId) -> Result<Option<Ending>, ()> {
+    let table = TABLE.lock();
+    let domain = table.domains.get(id.0 as usize).ok_or(())?;
+    if domain.live {
+        Ok(None)
+    } else if let Some(reason) = domain.ended {
+        Ok(Some(reason))
+    } else {
+        Err(())
+    }
+}
+
+/// Ends `id` because its last thread finished — but only if a program created
+/// it.
+///
+/// Returns whether it ended anything.
+///
+/// **The restriction is deliberate and is a limitation worth stating.** A
+/// domain a *program* created has an owner who will ask what happened to it, so
+/// running out of threads is the end of it. A domain the *kernel* created at
+/// boot is a container the kernel keeps using: several self-tests run a thread
+/// to completion and then go on granting capabilities to the domain it ran in,
+/// and ending those out from under them replaced a passing test with
+/// `NoDomain`.
+///
+/// So a kernel-made domain is ended by the kernel that made it, and only that.
+/// The alternative — ending every domain whose threads have all gone — is
+/// arguably more consistent and would require the boot code to stop treating a
+/// domain as outliving its threads, which is a larger change than this step.
+pub fn ended_by_last_thread(id: DomainId) -> bool {
+    {
+        let table = TABLE.lock();
+        let Some(domain) = table.domains.get(id.0 as usize) else {
+            return false;
+        };
+        if !domain.live || domain.parent == u32::MAX {
+            return false;
+        }
+    }
+    end(id, Ending::Exited)
+}
+
+/// Releases a dead domain's slot.
+///
+/// Returns whether there was something to reap. Refuses a domain that is still
+/// running: reaping is what *follows* an ending, and a call that could do both
+/// would let a holder destroy a domain by asking about it.
+pub fn reap(id: DomainId) -> bool {
+    let mut table = TABLE.lock();
+    let Some(domain) = table.domains.get_mut(id.0 as usize) else {
+        return false;
+    };
+    if domain.live || domain.ended.is_none() {
+        return false;
+    }
+    domain.ended = None;
+    domain.notify = None;
+    domain.parent = u32::MAX;
+    domain.children = 0;
+    true
+}
+
+/// Asks to be told when `id` ends.
+///
+/// Returns `false` for a domain that has already ended, and that is the useful
+/// answer rather than a courtesy: a binding made after the fact would wait for
+/// an event that has happened, which is the shape of every missed wakeup. A
+/// caller told `false` should ask [`state_of`] instead, which has the answer.
+pub fn notify_on_end(
+    id: DomainId,
+    notification: crate::notify::NotificationId,
+    badge: u64,
+) -> bool {
+    let mut table = TABLE.lock();
+    let Some(domain) = table.domains.get_mut(id.0 as usize).filter(|d| d.live) else {
+        return false;
+    };
+    domain.notify = Some((notification, badge));
+    true
+}
+
 /// The capability naming a domain, from which everything it is granted derives.
 ///
 /// Exposed so a creator can be handed a capability *under* the root rather than
@@ -638,7 +763,7 @@ pub fn create_under(
     let index = table
         .domains
         .iter()
-        .position(|domain| !domain.live)
+        .position(|domain| !domain.live && domain.ended.is_none())
         .ok_or(DomainError::TooManyDomains)?;
 
     let generation = table.domains[index].generation;
@@ -668,6 +793,8 @@ pub fn create_under(
             .and_then(|parent| table.domains.get(parent as usize))
             .map_or(0, |owner| owner.generation),
         children: 0,
+        ended: None,
+        notify: None,
         pending_start: None,
         cspace: CSpace::new(),
         envelope,
@@ -696,6 +823,20 @@ pub fn create_under(
 /// `docs/security.md` §2 rule 3 — so a destroyed domain's grants are dead
 /// everywhere, not scheduled for cleanup.
 pub fn destroy(id: DomainId) -> bool {
+    end(id, Ending::Killed)
+}
+
+/// Ends a domain, recording *why*.
+///
+/// The same teardown as [`destroy`] in every respect but one: a domain that was
+/// created by a program keeps its slot afterwards, holding the reason, until
+/// somebody reaps it. A domain the kernel made at boot is freed at once,
+/// because nobody can ask about it and nothing would ever release the slot.
+///
+/// # Errors
+///
+/// Returns whether the domain existed.
+pub fn end(id: DomainId, reason: Ending) -> bool {
     // Memory objects first, and outside the table lock. A shared region does
     // not outlive the domain that made it (RFC 0009): the frames are charged
     // to this envelope, and leaving them would be a leak the frame gate would
@@ -736,6 +877,19 @@ pub fn destroy(id: DomainId) -> bool {
         }
         let root = domain.root.take();
         let parent = domain.parent;
+        // Kept only if somebody can ask. See `Domain::ended`.
+        // Kept only if somebody can ask, which means a parent that is still
+        // alive. A domain whose creator has gone has nobody to tell and nobody
+        // to reap it, and keeping it would fill a table of 32 with corpses no
+        // living program can name.
+        let watched = parent != u32::MAX
+            && table
+                .domains
+                .get(parent as usize)
+                .is_some_and(|owner| owner.live);
+        let domain = &mut table.domains[id.0 as usize];
+        domain.ended = watched.then_some(reason);
+        let notify = domain.notify.take();
         let parent_generation = domain.parent_generation;
         // Captured before the increment below: the children still recorded
         // against this domain recorded *this* incarnation of it.
@@ -786,9 +940,21 @@ pub fn destroy(id: DomainId) -> bool {
             }
         }
 
-        (root, children, count)
+        (root, children, count, notify)
     };
-    let (root, children, count) = root;
+    let (root, children, count, notify) = root;
+
+    // Outside the table lock, because signalling wakes a waiter and waking
+    // takes runqueue locks.
+    //
+    // After the domain is marked dead and its reason recorded, so a supervisor
+    // woken by this finds the answer already there. Signalled before the
+    // children are ended, which means a supervisor watching a parent hears
+    // about it before it hears about the parent's children -- which is the
+    // order the events happened in.
+    if let Some((notification, badge)) = notify {
+        let _ = crate::notify::signal(notification, badge);
+    }
 
     // Depth is bounded by the table: a domain cannot be its own ancestor, and
     // there are 32 slots. Today it is at most one level, because a child's

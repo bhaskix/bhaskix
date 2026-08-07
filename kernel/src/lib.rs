@@ -1163,6 +1163,11 @@ const RING3_SPAWN_METHOD: u64 = 13;
 const RING3_START_METHOD: u64 = 14;
 /// The method a program *started by* the probe calls, to prove it is running.
 const RING3_STARTED_METHOD: u64 = 15;
+/// The method the probe reports binding, `INFO` and reaping on. RFC 0017 step 6.
+const RING3_REAP_METHOD: u64 = 17;
+/// What the kernel answered the probe's watch, ask and reap.
+static RING3_REAP: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 4];
 /// What the kernel answered the probe's `GRANT` and `START`.
 static RING3_GRANT_START: [core::sync::atomic::AtomicU64; 4] =
     [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 4];
@@ -1172,6 +1177,14 @@ static RING3_STARTED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static RING3_REALM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 /// Threads plus capabilities the probe's child held the moment it was created.
 static RING3_CHILD_HELD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+/// Whether that child was named what ring 3 asked for, and what its creator was
+/// charged. Snapshotted with the above, and for the same reason: by the end of
+/// the test the child has ended and been reaped, and the honest answer to every
+/// question about it is "there is no such domain".
+static RING3_CHILD_NAMED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+static RING3_CHILD_CHARGED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 /// What the kernel answered each of the probe's three `SPAWN` attempts.
 static RING3_SPAWN: [core::sync::atomic::AtomicU64; 3] =
@@ -1228,6 +1241,19 @@ extern "C" fn ring3_service(_argument: u64) -> ! {
                         })
                     {
                         RING3_CHILD_HELD.store(held, Ordering::Release);
+                        RING3_CHILD_NAMED.store(
+                            u64::from(
+                                domain::name_of(child).is_some_and(|name| name.as_str() == "child"),
+                            ),
+                            Ordering::Release,
+                        );
+                        RING3_CHILD_CHARGED.store(
+                            domain::with(domain::DomainId::from_u32(realm as u32), |owner| {
+                                u64::from(owner.children())
+                            })
+                            .unwrap_or(u64::MAX),
+                            Ordering::Release,
+                        );
                     }
                 }
                 if message.method == RING3_START_METHOD {
@@ -1240,6 +1266,11 @@ extern "C" fn ring3_service(_argument: u64) -> ! {
                 // started. It arrives on the same endpoint because that is the
                 // capability it was given -- and it could arrive no other way,
                 // which is the point.
+                if message.method == RING3_REAP_METHOD {
+                    for (slot, answer) in RING3_REAP.iter().zip(message.args) {
+                        slot.store(answer, Ordering::Release);
+                    }
+                }
                 if message.method == RING3_STARTED_METHOD {
                     RING3_STARTED.store(message.args[0], Ordering::Release);
                 }
@@ -1825,11 +1856,17 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("    ring 3         FAILED to install the DomainControl");
         return false;
     }
-    for answer in RING3_SPAWN.iter().chain(RING3_GRANT_START.iter()) {
+    for answer in RING3_SPAWN
+        .iter()
+        .chain(RING3_GRANT_START.iter())
+        .chain(RING3_REAP.iter())
+    {
         answer.store(u64::MAX, core::sync::atomic::Ordering::Release);
     }
     RING3_STARTED.store(u64::MAX, core::sync::atomic::Ordering::Release);
     RING3_CHILD_HELD.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    RING3_CHILD_NAMED.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    RING3_CHILD_CHARGED.store(u64::MAX, core::sync::atomic::Ordering::Release);
     RING3_REALM.store(
         u64::from(realm.as_u32()),
         core::sync::atomic::Ordering::Release,
@@ -1894,6 +1931,28 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
+    // A notification at slot 9, for the probe to watch its child with.
+    //
+    // RFC 0017 step 6 does not invent a way to wait for a domain: a program
+    // already knows how to wait on a notification, and binding one to a domain
+    // is a smaller thing to add than a second blocking primitive with its own
+    // queue, its own wakeup rules and its own way to lose an event.
+    let watching = notify::create()
+        .ok()
+        .and_then(|id| notify::name(id).ok().map(|slot| (id, slot)));
+    let Some((watch_id, watch_slot)) = watching else {
+        println!("    ring 3         FAILED to create a notification");
+        return false;
+    };
+    let _ = watch_id;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(9, watch_slot).is_ok()
+    }) != Some(true)
+    {
+        println!("    ring 3         FAILED to install the notification");
+        return false;
+    }
+
     let (calls_before, refused_before, revoked_before) = syscall::statistics();
     let interrupts_before = bhaskix_arch::trap::interrupts_from_user();
 
@@ -1931,6 +1990,10 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         || RING3_STARTED.load(core::sync::atomic::Ordering::Acquire) != u64::MAX,
         8_000,
     );
+    wait_until(
+        || RING3_REAP[2].load(core::sync::atomic::Ordering::Acquire) != u64::MAX,
+        8_000,
+    );
     let ring3_calls = RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let ring3_badge = RING3_BADGE.load(core::sync::atomic::Ordering::Relaxed);
     let delegated_badge = RING3_DELEGATED_BADGE.load(core::sync::atomic::Ordering::Acquire);
@@ -1957,7 +2020,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // Everything about the child, read *before* the parent is destroyed. After
     // that the answers would all be "gone", which is true and says nothing.
     let child = domain::child_of(realm);
-    let child_name = child.and_then(domain::name_of);
+    let _ = child;
     // What the child *holds*, not what it has been charged for.
     //
     // The first version asked `held_capabilities()`, which is a quota counter
@@ -1974,7 +2037,6 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // replied to. Reading it here instead would read it after the grant and
     // the start, and "holds nothing" would be false for the best of reasons.
     let child_empty = RING3_CHILD_HELD.load(core::sync::atomic::Ordering::Acquire) == 0;
-    let child_charged = domain::with(realm, |owner| owner.children());
 
     RING3_STOP.store(true, core::sync::atomic::Ordering::Release);
     ipc::destroy(endpoint);
@@ -2023,7 +2085,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // through the capability ring 3 derived for itself. The call through
         // the badge it *tried to forge* is not among them, and neither is the
         // one after revocation.
-        ("ring 3 reached a service through IPC", ring3_calls == 7),
+        ("ring 3 reached a service through IPC", ring3_calls == 8),
         // RFC 0017 step 4. A program with a `DomainControl` created a domain,
         // and the two refusals are worth as much as the success: one says the
         // envelope is checked as well as the capability, the other says the
@@ -2046,9 +2108,12 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         ("the domain it created holds nothing", child_empty),
         (
             "it is named what ring 3 asked for",
-            child_name.map(|name| name.as_str() == "child") == Some(true),
+            RING3_CHILD_NAMED.load(core::sync::atomic::Ordering::Acquire) == 1,
         ),
-        ("the creator was charged for it", child_charged == Some(1)),
+        (
+            "the creator was charged for it",
+            RING3_CHILD_CHARGED.load(core::sync::atomic::Ordering::Acquire) == 1,
+        ),
         // RFC 0017 step 5, and the two steps that make step 4 worth anything.
         // A child that cannot be given a capability holds nothing for ever,
         // and a child that cannot be started never uses what it holds.
@@ -2069,6 +2134,29 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "giving away a capability it may only hold was refused",
             RING3_GRANT_START[3].load(core::sync::atomic::Ordering::Acquire)
                 == bhaskix_abi::status::INSUFFICIENT_RIGHTS,
+        ),
+        // RFC 0017 step 6. A supervisor, in ring 3, in five system calls: it
+        // asked to be told, waited on a notification it already knew how to
+        // wait on, asked what happened, and gave the slot back.
+        (
+            "ring 3 asked to be told when its child ended",
+            RING3_REAP[0].load(core::sync::atomic::Ordering::Acquire) == bhaskix_abi::status::OK,
+        ),
+        (
+            "it was told the child had exited, not merely that it had gone",
+            RING3_REAP[1].load(core::sync::atomic::Ordering::Acquire)
+                == domain::Ending::Exited as u64,
+        ),
+        (
+            "it reaped the child",
+            RING3_REAP[2].load(core::sync::atomic::Ordering::Acquire) == bhaskix_abi::status::OK,
+        ),
+        // The reaping took the capability with it. A holder that could still
+        // ask would be asking about whatever takes the slot next.
+        (
+            "asking after the reaping answers nothing",
+            RING3_REAP[3].load(core::sync::atomic::Ordering::Acquire)
+                == bhaskix_abi::status::NO_SUCH_CAPABILITY,
         ),
         // The one that cannot be faked. This message arrived from a program
         // the probe created, granted and started -- on an endpoint it could

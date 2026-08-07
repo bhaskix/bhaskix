@@ -225,7 +225,9 @@ of a service infer things about a domain it does not hold a capability to.
 ### Reaping, without a new mechanism
 
 A `Domain` capability can have a **`Notification` bound to it** ([RFC 0010](0010-notifications.md)),
-signalled once when the domain ends. The holder waits on the notification it already knows how to
+signalled once when the domain ends. Binding is refused for a domain that has *already* ended, and
+that refusal is the useful answer rather than a courtesy: a watch registered for an event that has
+happened is a wait that never ends. A caller told no should ask `INFO`, which has the answer. The holder waits on the notification it already knows how to
 wait on; `INFO` on the `Domain` capability then returns the state and the reason from the table
 above.
 
@@ -465,8 +467,35 @@ crashing.
    run to prove revocation is transitive. It is: the child's copy went with it, and the started
    program found itself holding nothing. A giver that wants what it gave to outlive its own
    housekeeping must keep a capability it does not intend to revoke.
-6. **Reaping.** The notification bound to a `Domain` capability, `INFO` returning state and reason,
-   the slot released on reap, and the fallback when the last capability goes away.
+6. ~~**Reaping.**~~ ✅ **Done.** A supervisor, in ring 3, in five system calls: bind a notification to
+   a `Domain`, wait on it, `INFO` for the reason, `RELEASE` to give the slot back. Nothing in that
+   list is a facility for supervising — it is a notification a program already knew how to wait on,
+   and two methods on a capability it holds.
+
+   **A handle to a domain must not be derived from that domain's root.** Step 4 derived it from the
+   root so that destroying the child would revoke the creator's copy, and that was exactly wrong:
+   ending a domain revokes its root so no authority outlives it, which took the handle with it. A
+   creator asking what happened to its child was told its capability had been revoked, and the slot
+   the kernel had carefully kept could not be reached, let alone reaped. Authority *inside* a domain
+   dies with the domain; a reference *to* one has to outlive it. The handle is now a root of its own
+   and `reap` is what revokes it.
+
+   **Method numbers are shared across object kinds, and dispatch order decides who wins.** `BIND`,
+   `INFO` and `RELEASE` are all claimed by earlier blocks that resolve a capability their own way and
+   `return` whatever that produced — so a `Domain` invoked with `INFO` was answered `WrongObject` by
+   the code for device windows, which had never heard of domains. All three of this step's methods
+   are in that set and none of them was reachable. The first fix asked the kind on *every*
+   invocation, which put the domain table on the hot path of every system call and stalled the
+   machine; the second intercepts only these three methods.
+
+   **A limitation, stated rather than hidden**: a domain ends when its last thread exits only if a
+   *program* created it. Several boot self-tests run a thread to completion and then keep granting
+   capabilities to the domain it ran in, and ending those out from under them turned passing tests
+   into `NoDomain`. A kernel-made domain is ended by the kernel that made it. The consistent
+   alternative needs the boot code to stop treating a domain as outliving its threads.
+
+   Retention is conditional for the same reason a corpse needs an owner: a domain is kept after death
+   only while its parent is alive to ask. Otherwise a table of 32 fills with remains nobody can name.
 
 A supervisor program is deliberately **not** in this list. When steps 1–6 are done, one can be
 written entirely in userspace, and that is the test of whether these are the right mechanisms.
