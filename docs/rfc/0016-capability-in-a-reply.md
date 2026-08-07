@@ -247,6 +247,13 @@ program another program's data with nothing to see. So the test is not "lending 
 frame is never the frame chosen for eviction, at every eviction*, in the same shape as RFC 0015's
 interruption harness.
 
+Which has a consequence for the machine test that took three tries to learn: **a lend nothing is
+competing for proves nothing.** A gate that lends a frame and reads it back passes whether or not
+the pin exists, because an uncontended frame is not reused by anybody. The service must therefore be
+made to churn its own cache — past its own size, since the frame just read is the last one an LRU
+cache gives up — between pinning and handing over. Only then does removing the pin produce the thing
+this step exists to prevent, which is the caller reading somebody else's block.
+
 ---
 
 ## Alternatives considered
@@ -503,15 +510,33 @@ Five steps. The first is independent of the rest and should not wait for it.
 5. **Lending a cached frame**, with pinning and the eviction gate. Last, because it is the only step
    whose failure is silent, and it should be built when everything under it is already trusted.
 
-   🔨 **The rule is done; the hand-over is not.** A frame can be pinned, a pinned frame is never
-   chosen for eviction, a cache with every frame lent refuses rather than taking one back, and
-   forgetting keeps what is lent. Proved on the host, checked after *every* eviction rather than
-   once, and watched failing with the pin removed.
+   ✅ **Done.** A frame can be pinned, a pinned frame is never chosen for eviction, a cache with
+   every frame lent refuses rather than taking one back, and forgetting keeps what is lent. Proved on
+   the host, checked after *every* eviction rather than once, and watched failing with the pin
+   removed.
 
-   The machine hand-over — one `Memory` object per frame, lent read-only through a `MAP` method on a
-   file handle — is written and was reverted while the fault below was open. **That fault is fixed**,
-   and it was never in this RFC's machinery: the syscall entry stub kept the user stack pointer in
-   per-CPU data and restored it from there, so a system call that blocked could return to user mode
-   on another thread's stack. A service calling a service is simply the ordinary way to get two ring
-   3 threads on one CPU with one of them blocked, which is why it looked like an IPC defect for three
-   attempts. Re-applying the hand-over is what remains of this step.
+   The machine hand-over is in: the cache is eight one-page `Memory` objects, `bin/fsd` pins the
+   frame holding a file's data and `HAND`s back a **read-only** derivation of that one object on a
+   `dir::MAP`, and the shell maps it and reads the file's bytes **out of the service's own cache**
+   with nothing copied between them.
+
+   **The gate had to be made to bite, and the first two attempts did not.** The failure this step
+   guards against is silent by nature, so a lend that is never contended proves nothing: with `pin`
+   made a no-op the shell still read the right bytes, because nothing wanted the frame. Nor was
+   churning the cache by exactly its own size enough — the frame just read is the *last* one an LRU
+   cache gives up. Only when `bin/fsd` reads twice as many blocks as it has frames, between pinning
+   and handing over, does a deleted pin show itself: the shell is handed a page holding the
+   **directory** block and both gates fail on the bytes. That is the disclosure, in a machine, from
+   one missing line.
+
+   Two other breakages were tried and caught nothing, and are recorded because they are the shape of
+   a test that looks thorough and is not: lending a frame chosen by index rather than by the pin, and
+   lending the whole cache object instead of one page — the latter caught nothing because the cache
+   *is* eight separate one-page objects, so there is no whole to lend. Lending it writable was
+   caught, by the gate that asks for it to be refused.
+
+   The fault that had blocked this was never in this RFC's machinery: the syscall entry stub kept the
+   user stack pointer in per-CPU data and restored it from there, so a system call that blocked could
+   return to user mode on another thread's stack. A service calling a service is simply the ordinary
+   way to get two ring 3 threads on one CPU with one of them blocked, which is why it looked like an
+   IPC defect for three attempts.

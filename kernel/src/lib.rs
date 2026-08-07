@@ -3165,12 +3165,15 @@ fn start_fs_domain(hhdm: u64) -> bool {
         return false;
     };
 
-    // Ten pages: one the block service fills and drains, eight of page cache,
-    // and one the service leaves its findings in. One object rather than
-    // three, because a domain that had to be given three would have to be told
-    // which was which -- and this way the *service* decides the layout of its
-    // own memory, which is what holding it means.
-    let Ok(memory) = shared::create(realm, 10 * bhaskix_mm::FRAME_SIZE) else {
+    // Two pages: one the block service fills and drains, and one the service
+    // leaves its findings in.
+    //
+    // Its **page cache is eight separate one-page objects**, below, and that is
+    // not tidiness. A cache in one object can only be lent whole, and lending
+    // it whole hands a reader every other block in it -- other files' data, and
+    // every piece of metadata the service has touched. A frame is the unit that
+    // can be lent, so a frame has to be the unit that can be named.
+    let Ok(memory) = shared::create(realm, 2 * bhaskix_mm::FRAME_SIZE) else {
         println!("    fs domain      FAILED: its memory would not be created");
         domain::destroy(realm);
         return false;
@@ -3213,10 +3216,32 @@ fn start_fs_domain(hhdm: u64) -> bool {
                 && owner.cspace.install_at(2, own).is_ok()
         })
     });
-    if installed != Some(true) || count < 10 {
+    if installed != Some(true) || count < 2 {
         println!("    fs domain      FAILED: its capabilities would not install");
         domain::destroy(realm);
         return false;
+    }
+
+    // The page cache, one object per frame, at slots 3 and up. `shared::name`
+    // gives them with every right, which is what lets the service both use
+    // them as memory and hand weaker copies away: holding a thing and being
+    // allowed to give it away are different permissions.
+    for frame in 0..8usize {
+        let Ok(page) = shared::create(realm, bhaskix_mm::FRAME_SIZE) else {
+            println!("    fs domain      FAILED: a cache page would not be created");
+            domain::destroy(realm);
+            return false;
+        };
+        let landed = shared::name(page).ok().and_then(|named| {
+            domain::with(realm, |owner| {
+                owner.cspace.install_at(3 + frame, named).is_ok()
+            })
+        });
+        if landed != Some(true) {
+            println!("    fs domain      FAILED: a cache page would not install");
+            domain::destroy(realm);
+            return false;
+        }
     }
 
     let options = sched::SpawnOptions::new()
@@ -3233,7 +3258,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
     for _ in 0..200 {
         // SAFETY: a frame this object owns, through the direct map, read as
         // the six little-endian words the service writes there.
-        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[9]) as *const u8, 72) };
+        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 72) };
         for (index, word) in words.iter_mut().enumerate() {
             let mut buffer = [0u8; 8];
             buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);

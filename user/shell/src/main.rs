@@ -59,6 +59,10 @@ const SIGNAL_WRITE_ONLY: u64 = 7;
 const DIRECTORY: u64 = 8;
 /// Where [`open`] puts what it opened. Emptied again afterwards.
 const OPENED: u64 = 9;
+/// Where a page the filesystem service lends is accepted.
+const LENT_PAGE: u64 = 11;
+/// Where that page is mapped, read-only.
+const LENT_AT: u64 = 0x3400_0000;
 /// The block service's endpoint, in another domain.
 const BLOCK: u64 = 12;
 /// Where a capability the block service hands over is accepted.
@@ -757,6 +761,61 @@ fn open(name: &[u8]) {
     write(b" bytes, at slot ");
     write_number(OPENED);
     write(b"\n");
+
+    // And the bytes, without a copy. The service lends the page of its **own
+    // cache** that the block is in, read-only, and this program maps it.
+    // Nothing carried the contents here: no round trip moved them, and the
+    // service never read them on this program's behalf.
+    syscall(syscall::INVOKE, LENT_PAGE, method::DELETE, [0; 4]);
+    let declared = syscall(
+        syscall::INVOKE,
+        OPENED,
+        method::EXPECT,
+        [LENT_PAGE, 0, 0, 0],
+    );
+    if declared.status != status::OK {
+        return;
+    }
+    let lent = call(OPENED, dir::MAP, [0; 4]);
+    write(b"  9  lent      ");
+    if lent.status != status::OK || lent.args[0] != dir::OK {
+        write(b"the service would not lend the page\n");
+        return;
+    }
+    let attached = syscall(
+        syscall::INVOKE,
+        LENT_PAGE,
+        method::ATTACH,
+        [LENT_AT, 0, 0, 0],
+    );
+    if attached.status != status::OK {
+        write(b"lent, but it would not map, status ");
+        write_number(attached.status);
+        write(b"\n");
+        return;
+    }
+    // SAFETY: the kernel mapped one page read-only at exactly this address,
+    // through a capability this program now holds, and nothing else in this
+    // program uses it. The mapping either happened or the status above was not
+    // `OK`, which is the branch this is inside.
+    let head = unsafe { core::slice::from_raw_parts(LENT_AT as *const u8, 8) };
+    write(b"the service's own cache page, and it begins \"");
+    write(head);
+    write(b"\"\n");
+
+    // A writable mapping of it is refused: what was lent is no stronger than
+    // read, whatever the service holds it with.
+    let writable = syscall(
+        syscall::INVOKE,
+        LENT_PAGE,
+        method::ATTACH,
+        [LENT_AT + 0x10000, 1, 0, 0],
+    );
+    write(b"  11 lent page ");
+    match writable.status {
+        status::INSUFFICIENT_RIGHTS => write(b"refused a writable mapping\n"),
+        _ => write(b"WIDENED -- a copy stronger than the original\n"),
+    }
 }
 
 /// Asks a service in another domain for a capability, and uses it.
@@ -873,6 +932,24 @@ fn lend() {
     }
 }
 
+/// Reads the lent page again, after the service has answered more requests.
+///
+/// The page was pinned when it was lent, and a pinned frame is never chosen
+/// for eviction. If it had been chosen, this would be reading whatever block
+/// took the frame — somebody else's data, silently, which is the failure this
+/// step exists to prevent. The exhaustive form of this claim is on the host,
+/// where every eviction can be checked; this is the same claim in a machine,
+/// after real work.
+fn held() {
+    // SAFETY: the page the filesystem service lent, mapped read-only at this
+    // address by `open`. If nothing was lent the read below would fault, which
+    // is why the command is only useful after one.
+    let head = unsafe { core::slice::from_raw_parts(LENT_AT as *const u8, 8) };
+    write(b"  held          the lent page still begins \"");
+    write(head);
+    write(b"\"\n");
+}
+
 fn run(line: &[u8]) {
     let (command, rest) = split(line);
     match command {
@@ -884,6 +961,7 @@ fn run(line: &[u8]) {
         }
         b"ls" => list(rest),
         b"lend" => lend(),
+        b"held" => held(),
         b"open" => {
             if rest.is_empty() {
                 write(b"  open: which name?\n");

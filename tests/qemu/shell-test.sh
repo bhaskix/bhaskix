@@ -95,7 +95,7 @@ else
     commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'open inner\r'$'open greeting\r'
     commands+=$'open sub/inner\r'$'open ..\r'$'ls /\r'$'cat etc/hostname\r'
     if [[ "$MODE" == "iommu" ]]; then
-        commands+=$'lend\r'
+        commands+=$'lend\r'$'held\r'
     fi
     commands+=$'nosuchcommand\r'
 fi
@@ -349,6 +349,18 @@ else
             "a service cannot pass on a capability it may only hold:forbidden +a service cannot pass on what it may only hold"
             # And what arrived is no stronger than what was held.
             "a handed capability is no stronger than its original:13 lent +refused a writable mapping"
+            # RFC 0016 step 5. The service lends the page of its **own cache**
+            # that a file's first block is in, read-only -- not its cache,
+            # which holds other files' data and every piece of metadata it has
+            # touched. Nothing copied the bytes here: no round trip carried
+            # them and the service never read them on this program's behalf.
+            "a service lends one page of its own cache:9 +lent +the service's own cache page, and it begins .only rea."
+            "a lent page is no stronger than the service's own:11 lent page +refused a writable mapping"
+            # And it still says what it said, after the service has answered
+            # four more requests. A frame lent and then reused would read as
+            # somebody else's block, with nothing to see -- which is why the
+            # exhaustive form of this is on the host, at every eviction.
+            "a lent page still holds what was lent:held +the lent page still begins .only rea."
         )
         for check in "${lend_checks[@]}"; do
             checks+=("$check")

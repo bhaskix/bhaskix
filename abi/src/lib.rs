@@ -287,6 +287,19 @@ pub mod dir {
     /// and `args[2]` non-zero if what was opened is itself a directory. On
     /// [`OK`] a capability to it has been handed to the caller.
     pub const OPEN_AT: u64 = 1;
+    /// Lend the caller the page holding this file's first block.
+    ///
+    /// Only meaningful on a capability naming a *file*. The service pins the
+    /// frame that block is in and hands over a **read-only capability to that
+    /// one page** — not to its cache, which holds other files' data and every
+    /// piece of metadata it has touched. The caller maps it and reads the
+    /// bytes: nothing is copied, and no round trip carries them.
+    ///
+    /// A pinned frame is never chosen for eviction, so the page goes on
+    /// meaning what it meant. Replies with `args[0]` an outcome and `args[1]`
+    /// the file's size, and as [`OPEN_AT`] the caller must have said where
+    /// with [`method::EXPECT`] first.
+    pub const MAP: u64 = 2;
 
     /// It resolved, and a capability was handed over.
     pub const OK: u64 = 0;

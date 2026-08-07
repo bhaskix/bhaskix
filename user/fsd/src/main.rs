@@ -57,16 +57,25 @@ const BLOCK: u64 = 0;
 /// slot reaches nothing rather than somebody else's memory.
 const MEMORY: u64 = 1;
 
-/// Where that memory is mapped. Ten pages.
+/// Where the two-page object is mapped: the bulk buffer and the report.
 const MEMORY_AT: u64 = 0x2000_0000;
-/// The page the block service fills and drains, at the start of it.
+/// The page the block service fills and drains.
 const BULK_AT: u64 = MEMORY_AT;
-/// The eight pages after it, which are the page cache.
-const CACHE_AT: u64 = MEMORY_AT + 0x1000;
+/// The page this program leaves its findings in.
+const REPORT_AT: u64 = MEMORY_AT + 0x1000;
+
+/// The first slot holding one page of page cache.
+///
+/// **One object per frame**, and that is the whole reason they are separate. A
+/// cache in one object can only be lent whole, and lending it whole hands a
+/// reader every other block in it — other files' data, and every piece of
+/// metadata this service has touched. A frame is the unit that can be lent, so
+/// a frame is the unit that has to be nameable. RFC 0016 step 5.
+const CACHE_SLOT: u64 = 3;
 /// How many pages of cache. Enough that a transaction does not thrash.
 const CACHE_PAGES: usize = 8;
-/// The last page, where this program leaves what it found.
-const REPORT_AT: u64 = CACHE_AT + (CACHE_PAGES as u64) * 0x1000;
+/// Where they are mapped, one after another, so the cache sees one run.
+const CACHE_AT: u64 = 0x2001_0000;
 
 /// The endpoint this program answers on, and derives directory handles from.
 ///
@@ -324,6 +333,21 @@ extern "C" fn fsd_main() -> ! {
     if mapped != status::OK {
         exit()
     }
+    // Each cache frame mapped where the one before it ends, so the cache sees
+    // one run of pages and does not have to know they are eight objects. It
+    // has to be eight for them to be lent one at a time.
+    for frame in 0..CACHE_PAGES as u64 {
+        let (mapped, _) = call(
+            syscall::INVOKE,
+            CACHE_SLOT + frame,
+            method::ATTACH,
+            [CACHE_AT + frame * 0x1000, 1, 0, 0],
+        );
+        if mapped != status::OK {
+            mark(50 + frame);
+            exit()
+        }
+    }
 
     mark(1);
     let store = BlockService::new();
@@ -410,6 +434,85 @@ extern "C" fn fsd_main() -> ! {
     serve(cache)
 }
 
+/// Lends the caller the page holding the first block of the file `badge` names.
+///
+/// The frame is **pinned** before it is lent, and a pinned frame is never
+/// chosen for eviction. Without that the holder would go on reading a page the
+/// cache had since given to another block — somebody else's data, arriving
+/// silently, which is the failure this whole step is arranged around.
+///
+/// Read-only, and **one frame**. A capability to the cache would be a
+/// capability to every block in it.
+fn lend(cache: &mut Cache<'static, BlockService>, badge: u64) {
+    let (inode_index, generation) = dir::parts(badge);
+    let found = {
+        let Ok(mut mounted) = Filesystem::mount(cache) else {
+            answer(dir::GONE, 0, 0);
+            return;
+        };
+        match mounted.inode(inode_index) {
+            Ok(inode)
+                if inode.generation == generation
+                    && inode.kind == Kind::File
+                    && inode.direct[0] != 0 =>
+            {
+                Some((inode.direct[0], inode.size))
+            }
+            _ => None,
+        }
+    };
+    let Some((block, size)) = found else {
+        answer(dir::GONE, 0, 0);
+        return;
+    };
+    let Ok(frame) = cache.pin(block) else {
+        // Every frame is lent already. A refusal, and the honest one: the
+        // alternative is taking back a page somebody is reading.
+        answer(dir::NOWHERE, 0, 0);
+        return;
+    };
+    // Churn the cache before handing anything over. This is not housekeeping;
+    // it is what makes the gates below mean anything, and the amount is not
+    // arbitrary:
+    //
+    // * With no churn at all, deleting the pin is **invisible** -- nothing
+    //   wants the frame, so it still holds this block and the caller still
+    //   reads the right bytes. Measured, not assumed: with `pin` made a no-op
+    //   and this loop empty, every gate passed.
+    // * With exactly as many blocks as there are frames it is *still* almost
+    //   invisible, because the frame holding this block was the most recently
+    //   read and so the last one an LRU cache would choose.
+    // * With twice as many, every frame the cache is *allowed* to reuse is
+    //   reused and reused again, and a deleted pin shows up immediately: the
+    //   caller is handed a page holding the **directory** block instead, and
+    //   both gates fail on the bytes.
+    //
+    // That last line is the whole point of this step. The failure being
+    // guarded against is not a crash, it is one program silently reading
+    // another's data, and it is only visible if something is competing for
+    // the frame. The exhaustive form of the question lives on the host, asked
+    // after every eviction; this asks it once, on a real disk, under pressure.
+    {
+        use bhaskix_fs::Pages;
+        for other in 1..=(CACHE_PAGES as u32) * 2 {
+            let _ = cache.page(other);
+        }
+    }
+
+    let (handed, _) = call(
+        syscall::INVOKE,
+        ENDPOINT,
+        method::HAND,
+        [CACHE_SLOT + frame as u64, rights::READ, 0, 0],
+    );
+    if handed == status::OK {
+        answer(dir::OK, size, 0);
+    } else {
+        cache.unpin(frame);
+        answer(dir::NOWHERE, handed, 0);
+    }
+}
+
 /// Answers directory lookups, for ever.
 ///
 /// The badge on each request says which directory is being asked, and the
@@ -421,6 +524,10 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
         let (status, badge, method, args) = receive();
         if status != status::OK {
             exit()
+        }
+        if method == dir::MAP {
+            lend(&mut cache, badge);
+            continue;
         }
         if method != dir::OPEN_AT {
             answer(dir::NO_SUCH_NAME, 0, 0);

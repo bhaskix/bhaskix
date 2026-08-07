@@ -28,25 +28,30 @@ path = "src/main.rs"
 bhaskix-abi = { path = "../../abi" }
 
 [package.metadata.bhaskix]
-# Two blocks: the `syscall` instruction, whose register clobbers no safe
-# wrapper can express, and the `ud2` a panic ends at. Everything else is safe
-# code -- a program with no authority has no pointer worth dereferencing, and
-# the one dangerous thing it can do is ask the kernel, which is what the
-# syscall block is for.
+# `unsafe` in an unprivileged program is always a promise about something the
+# kernel did, and the promise is only as good as the capability behind it.
+# That is why this number is watched at all: a program with no authority has
+# no pointer worth dereferencing, so every block here should name the
+# capability it is standing on.
 #
-# 26 counts four blocks: the syscall and its operand list, the `ud2` a panic
-# ends at, and two reads of memory the kernel mapped on request -- one of
-# ordinary memory this program holds, one of a page of device registers.
+# Six blocks, and what each one rests on:
 #
-# The last two are the reason the number went up, and they are the reason it
-# should be watched: `unsafe` in an unprivileged program is always a promise
-# about something the kernel did, and the promise is only as good as the
-# capability behind it. A fifth block would need a reason these four have.
-unsafe_budget = 27
+#   1. The `syscall` instruction and its operand list -- register clobbers no
+#      safe wrapper can express. Includes a comment explaining why `rsi` is an
+#      in-out rather than an input; the counter counts lines, not blocks.
+#   2. The `ud2` a panic ends at.
+#   3. A read of ordinary memory this program holds a Memory capability for.
+#   4. A read of a page of device registers, likewise.
+#   5. and 6. Two reads of the page the filesystem service lent -- RFC 0016
+#      step 5. These are the first blocks here that read memory belonging to
+#      *another program*, and so the first whose promise is not simply "the
+#      kernel mapped it" but "the kernel mapped it no stronger than the lender
+#      itself held it". That second half is not a comment; it is watched by
+#      the gate `a lent page is no stronger than the service's own`, which
+#      fails if the mapping ever arrives writable.
 #
-# Up one for the comment on `rsi` inside the system call block: the counter
-# counts lines in an `unsafe` block, and this one explains why a register is
-# an in-out rather than an input.
+# A seventh block would need a reason these six have.
+unsafe_budget = 29
 
 [profile.release]
 panic = "abort"
