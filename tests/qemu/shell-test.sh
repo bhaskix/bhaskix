@@ -92,10 +92,19 @@ else
     # a name inside the directory held resolves; the same filesystem's other
     # names do not; a path is not a thing that can be asked for; and there is
     # no way to go up.
-    commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'open inner\r'$'open greeting\r'
-    commands+=$'open sub/inner\r'$'open ..\r'$'ls /\r'$'cat etc/hostname\r'
+    #
+    # `open inner` comes *last* of the four, and that is not cosmetic. A file
+    # handle lives in one slot, so each `open` takes it from the one before --
+    # and `inner` is the one whose page gets lent, so its handle has to still be
+    # there when the lending is given back at the end.
+    commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'open greeting\r'
+    commands+=$'open sub/inner\r'$'open ..\r'$'open inner\r'$'ls /\r'$'cat etc/hostname\r'
     if [[ "$MODE" == "iommu" ]]; then
-        commands+=$'lend\r'$'held\r'
+        # `held` before `release`, and nothing reading the page after it:
+        # releasing unmaps the page, so a later read would fault -- and since
+        # RFC 0017 step 1 a fault ends the domain, which would end the shell in
+        # the middle of its own test.
+        commands+=$'lend\r'$'held\r'$'release\r'
     fi
     commands+=$'nosuchcommand\r'
 fi
@@ -361,6 +370,22 @@ else
             # somebody else's block, with nothing to see -- which is why the
             # exhaustive form of this is on the host, at every eviction.
             "a lent page still holds what was lent:held +the lent page still begins .only rea."
+            # RFC 0016's last open question: what ends a lending. The caller
+            # says it is done, and the service does two things -- unpins the
+            # frame, and revokes what it handed over.
+            #
+            # The count is the first half made visible: one page was lent, and
+            # after the release none is. A service that answered without
+            # unpinning would say one.
+            "a lent page can be given back:release +given back, 0 pages still lent"
+            # And the second half, which is the one that matters. A caller that
+            # could still map what it has released could still read a frame the
+            # service is now free to fill with another file's block -- the
+            # disclosure the lending was careful about, arriving a moment late.
+            #
+            # Asked by mapping, not by reading: reading it would fault, and a
+            # fault ends this domain.
+            "a released page cannot be mapped again:released page +can no longer be mapped"
         )
         for check in "${lend_checks[@]}"; do
             checks+=("$check")

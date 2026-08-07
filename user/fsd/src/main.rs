@@ -76,6 +76,15 @@ const CACHE_SLOT: u64 = 3;
 const CACHE_PAGES: usize = 8;
 /// Where they are mapped, one after another, so the cache sees one run.
 const CACHE_AT: u64 = 0x2001_0000;
+/// Where the *lending* capability for each frame goes: one per cache page.
+///
+/// A lend does not hand a copy of the service's own capability. It derives a
+/// second one from it — the lending capability — and hands a copy of *that*.
+/// The reason is release: revocation goes down the tree and not up, so
+/// revoking the lending capability destroys the copy the caller holds and
+/// leaves the service's own untouched. Handing straight from the service's own
+/// would mean the only way to take a page back was to give up using it.
+const LEND_SLOT: u64 = 11;
 
 /// The endpoint this program answers on, and derives directory handles from.
 ///
@@ -499,17 +508,120 @@ fn lend(cache: &mut Cache<'static, BlockService>, badge: u64) {
         }
     }
 
+    // A lending capability, derived from this service's own and handed *from*
+    // there. Read-only, because a caller is being lent a page and not given
+    // one — and with `GRANT`, because `HAND` needs it to pass a copy on.
+    //
+    // Any previous lending of this frame is destroyed first. There is nothing
+    // left of it to keep: the frame was unpinned, so whatever the last caller
+    // still had mapped is a page the cache is free to reuse.
+    let lending = LEND_SLOT + frame as u64;
+    call(syscall::INVOKE, lending, method::REVOKE, [0; 4]);
+    let (derived, _) = call(
+        syscall::INVOKE,
+        CACHE_SLOT + frame as u64,
+        method::DERIVE,
+        // Four rights, and each is needed by a different party.
+        //
+        // `READ` is all a borrower gets. `GRANT` and `DERIVE` are what `HAND`
+        // demands of a capability it copies -- one that may be held but not
+        // passed on cannot be lent, which is the rule RFC 0016 step 2 checks
+        // and this is on the other side of. And `REVOKE`, because taking the
+        // page back is this service revoking *this* capability, and revoking
+        // needs the right to: without it the take-back is refused with
+        // `InsufficientRights` and the next lend of the same frame finds the
+        // slot still occupied.
+        [
+            rights::READ | rights::GRANT | rights::DERIVE | rights::REVOKE,
+            0,
+            lending,
+            0,
+        ],
+    );
+    if derived != status::OK {
+        cache.unpin(frame);
+        answer(dir::NOWHERE, derived, 0);
+        return;
+    }
+
     let (handed, _) = call(
         syscall::INVOKE,
         ENDPOINT,
         method::HAND,
-        [CACHE_SLOT + frame as u64, rights::READ, 0, 0],
+        [lending, rights::READ, 0, 0],
     );
     if handed == status::OK {
         answer(dir::OK, size, 0);
     } else {
         cache.unpin(frame);
         answer(dir::NOWHERE, handed, 0);
+    }
+}
+
+/// Gives back a page lent by [`lend`].
+///
+/// Two things, and both are needed. The frame is unpinned, so the cache may
+/// reuse it. And the lending capability is revoked, which destroys the copy the
+/// caller holds and unmaps the page from wherever the caller put it.
+///
+/// Unpinning without revoking would leave a caller reading a frame this service
+/// is free to fill with another file's block — the disclosure `lend` exists to
+/// avoid, arriving a moment later. Revoking without unpinning would give the
+/// frame back to nobody.
+fn release(cache: &mut Cache<'static, BlockService>, badge: u64) {
+    let (inode_index, generation) = dir::parts(badge);
+    let block = {
+        let Ok(mut mounted) = Filesystem::mount(cache) else {
+            answer(dir::GONE, 0, 0);
+            return;
+        };
+        match mounted.inode(inode_index) {
+            Ok(inode)
+                if inode.generation == generation
+                    && inode.kind == Kind::File
+                    && inode.direct[0] != 0 =>
+            {
+                Some(inode.direct[0])
+            }
+            _ => None,
+        }
+    };
+    let Some(block) = block else {
+        answer(dir::GONE, 0, 0);
+        return;
+    };
+
+    // Which frame that block is in, asked of the cache rather than remembered.
+    // A service that kept its own note of where it had lent from would have two
+    // records of one fact, and the interesting bugs live in the gap between
+    // them.
+    let mut released = false;
+    for frame in 0..CACHE_PAGES {
+        if cache.block_in(frame) == Some(block) && cache.pinned(frame) {
+            call(
+                syscall::INVOKE,
+                LEND_SLOT + frame as u64,
+                method::REVOKE,
+                [0; 4],
+            );
+            cache.unpin(frame);
+            released = true;
+            break;
+        }
+    }
+
+    // How many are still lent, so a caller can *see* its release take effect
+    // rather than be told it did.
+    let still = (0..CACHE_PAGES)
+        .filter(|frame| cache.pinned(*frame))
+        .count() as u64;
+    if released {
+        answer(dir::OK, still, 0);
+    } else {
+        // Nothing of this file is lent. Not an error worth distinguishing: a
+        // caller tidying up should not have to remember whether it has
+        // anything to tidy.
+        answer(dir::OK, still, 0);
     }
 }
 
@@ -524,6 +636,10 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
         let (status, badge, method, args) = receive();
         if status != status::OK {
             exit()
+        }
+        if method == dir::RELEASE {
+            release(&mut cache, badge);
+            continue;
         }
         if method == dir::MAP {
             lend(&mut cache, badge);

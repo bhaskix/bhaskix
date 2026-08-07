@@ -176,6 +176,17 @@ pub mod method {
     /// and a holder that could change it could call a service as somebody
     /// else.
     pub const DERIVE: u64 = 0;
+    /// Destroy this capability and everything derived from it.
+    ///
+    /// Revocation goes **down** the tree and not up: the capability named is
+    /// destroyed along with every copy derived from it, and its own parent is
+    /// untouched. That direction is what lets a server lend something and take
+    /// it back — it derives a second capability of its own, hands copies from
+    /// *that*, and revoking it reaches the copies without reaching the one the
+    /// server is still using.
+    ///
+    /// Returns how many capabilities were destroyed. The slot is left empty.
+    pub const REVOKE: u64 = 1;
     /// Drop this capability, leaving the slot empty.
     ///
     /// Not an error on a slot that is already empty: a program tidying up
@@ -338,6 +349,28 @@ pub mod dir {
     /// the file's size, and as [`OPEN_AT`] the caller must have said where
     /// with [`method::EXPECT`] first.
     pub const MAP: u64 = 2;
+    /// Give back a page lent by [`MAP`].
+    ///
+    /// The caller says it is done with the page it was lent for this file. The
+    /// service unpins the frame — so it can be reused — and **revokes what it
+    /// handed over**, which unmaps the page from the caller wherever it put it.
+    ///
+    /// Both halves are needed and neither is a formality. Unpinning without
+    /// revoking would leave the caller reading a frame the service is free to
+    /// fill with somebody else's block, which is the disclosure [`MAP`] exists
+    /// to avoid, arriving a moment later. Revoking without unpinning would give
+    /// the frame back to nobody.
+    ///
+    /// So a caller that says it is done **is** done: the page is gone from its
+    /// address space when this returns, and reading where it used to be is a
+    /// fault. That is the point rather than a hazard — a caller keeping a
+    /// mapping it has released is a caller reading a page the service has
+    /// already reused.
+    ///
+    /// Replies with `args[0]` an outcome and `args[1]` how many of the
+    /// service's frames are still lent, which is how a caller can see that its
+    /// own release took effect rather than being told so.
+    pub const RELEASE: u64 = 3;
 
     /// It resolved, and a capability was handed over.
     pub const OK: u64 = 0;

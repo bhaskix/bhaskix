@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **Accepted 2026-08-07**, with all five steps implemented and gated. Resolves **CR1**. One of its four open questions was answered by the code before acceptance and one turned out to be a gap rather than a question; the remaining two stay open and are named below. Its first step — **badges are one-way** — has since refused two wrong things written by its own author, which is the strongest evidence a rule of this kind can produce. |
+| **Status** | ✅ **Accepted 2026-08-07**, with all five steps implemented and gated. Resolves **CR1**. One of its four open questions was answered by the code before acceptance, one turned out to be a gap rather than a question, and a third — what ends a lending — was answered afterwards and is recorded below. Its first step — **badges are one-way** — has since refused two wrong things written by its own author, which is the strongest evidence a rule of this kind can produce. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/cap`, `kernel/syscall`, ABI, `services/vfs`, a new filesystem service |
 | **Milestone** | Phase 2 in [roadmap.md](../roadmap.md) — closes the *full VFS* bullet |
@@ -366,8 +366,8 @@ hypothesis, and the crossover is the one this RFC is least sure of.
 **Decided by acceptance:** the two struck through below. `HAND` belongs on the endpoint, and the
 block service's missing `WRITE` was a gap rather than a question and was closed in step 3.
 
-**Still open:** what ends a lending, and where `mkfs` lives. Neither blocks anything built here, and
-the first is the more interesting: step 5 lends a frame and nothing ever gives it back.
+**Answered after acceptance:** what ends a lending — see below. **Still open:** where `mkfs` lives,
+which is a documentation debt, and what to do about a caller that never gives a page back.
 
 - ~~**Does `HAND` belong on the endpoint, or on the reply?**~~ **Answered by the code: the
   endpoint, because there is no reply capability to put it on.** `ObjectKind::Reply` exists in the
@@ -375,16 +375,23 @@ the first is the more interesting: step 5 lends a frame and nothing ever gives i
   `Kind::Reply` ignores its capability argument entirely. So "not answering anybody" is a check and
   not a lookup failure, and it is the check the tests spend most of their effort on. If a `Reply`
   capability ever becomes a thing a server holds, this is the first place that should move.
-- **What ends a lending?** **Still open, and acceptance does not close it.** Step 5 shipped with the
-  pin and no release at all: `bin/fsd` pins a frame, hands it over, and nothing gives it back. A
-  cache with every frame lent refuses rather than taking one back, so the failure is bounded and
-  visible — but it is a refusal, not an answer.
+- ~~**What ends a lending?**~~ **Answered after acceptance, and it is both halves at once.** The
+  caller says it is done — `dir::RELEASE` on the file handle — and the service **unpins the frame and
+  revokes what it handed over**. Neither half is optional. Unpinning alone leaves the caller reading
+  a frame the cache is free to fill with another file's block, which is the disclosure this whole
+  step is careful about arriving a moment later; revoking alone gives the frame back to nobody.
 
-  Explicit release by the client is simplest and is a promise a client can break. Revocation when
-  the handle goes needs the service to observe the handle going, which it still cannot. The likely
-  answer is that the service revokes whenever it wants the frame and the client copes — which
-  RFC 0009 already requires of everybody — but that makes every lent mapping a fault waiting to
-  happen, and the cost of that should be measured before it is chosen.
+  The mechanism is revocation's direction. It goes **down** the tree and not up, so the service hands
+  from a *lending* capability derived from its own — one per frame — and revoking that reaches the
+  copy the caller holds without reaching the one the service is still using. Handing straight from
+  its own would have meant the only way to take a page back was to stop using it.
+
+  So a caller that says it is done **is** done: the page is unmapped when the call returns, and
+  reading where it used to be faults. That is the point rather than a hazard, because a caller
+  keeping a mapping it has released is a caller reading a page the service has already reused. What
+  is *not* answered is a caller that never says anything: the service can still only refuse the next
+  lend. Taking a page back unilaterally is possible with the same primitive and would make every lent
+  mapping a fault waiting to happen, and that cost should be measured before it is chosen.
 - **Where does `mkfs` live?** **Still open**, and now purely a documentation debt: it links
   `bhaskix-fs`, runs on a developer's machine, and is built behind a feature so that a tool nobody
   compiles is not a tool that has already stopped compiling. The workspace's story about which

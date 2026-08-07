@@ -296,6 +296,7 @@ fn help() {
     write(b"    open <name>       resolve a name inside the directory held\n");
     write(b"    lend              ask a service for a capability, and use it\n");
     write(b"    caps              what this program is allowed to do\n");
+    write(b"    release           give back the page the filesystem service lent\n");
     write(
         b"    map               map memory this program holds, and be refused what it does not\n",
     );
@@ -779,7 +780,14 @@ fn open(name: &[u8]) {
     let lent = call(OPENED, dir::MAP, [0; 4]);
     write(b"  9  lent      ");
     if lent.status != status::OK || lent.args[0] != dir::OK {
-        write(b"the service would not lend the page\n");
+        // With the reason. "The service would not" is the least useful thing a
+        // report can say, and the service already knows why -- it answers with
+        // the status that stopped it.
+        write(b"the service would not lend the page, outcome ");
+        write_number(lent.args[0]);
+        write(b" status ");
+        write_number(lent.args[1]);
+        write(b"\n");
         return;
     }
     let attached = syscall(
@@ -950,6 +958,47 @@ fn held() {
     write(b"\"\n");
 }
 
+/// Gives back the page the filesystem service lent.
+///
+/// RFC 0016 left "what ends a lending?" open, and this is the answer: the
+/// caller says it is done, and the service unpins the frame **and revokes what
+/// it handed over**. Both halves matter — unpinning alone would leave this
+/// program reading a frame the cache is free to fill with another file's block.
+///
+/// So what is checked here is not that the call succeeded. It is that the page
+/// is *gone*: the capability no longer resolves, and mapping it again is
+/// refused. Deliberately not checked by reading the address it used to be at,
+/// which would fault — and since RFC 0017 step 1 a fault ends this domain,
+/// which would end the shell and the test with it.
+fn release() {
+    let given = call(OPENED, dir::RELEASE, [0; 4]);
+    write(b"  release       ");
+    if given.status != status::OK || given.args[0] != dir::OK {
+        write(b"the service would not take it back, status ");
+        write_number(given.status);
+        write(b"\n");
+        return;
+    }
+    write(b"given back, ");
+    write_number(given.args[1]);
+    write(b" pages still lent\n");
+
+    // And the capability is gone with it. Asked by trying to map it again:
+    // a program that could still map what it has released could still read a
+    // frame the service has reused.
+    let again = syscall(
+        syscall::INVOKE,
+        LENT_PAGE,
+        method::ATTACH,
+        [LENT_AT + 0x20000, 0, 0, 0],
+    );
+    write(b"  released page ");
+    match again.status {
+        status::OK => write(b"MAPPED AGAIN -- the service did not take it back\n"),
+        _ => write(b"can no longer be mapped\n"),
+    }
+}
+
 fn run(line: &[u8]) {
     let (command, rest) = split(line);
     match command {
@@ -962,6 +1011,7 @@ fn run(line: &[u8]) {
         b"ls" => list(rest),
         b"lend" => lend(),
         b"held" => held(),
+        b"release" => release(),
         b"open" => {
             if rest.is_empty() {
                 write(b"  open: which name?\n");
