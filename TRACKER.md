@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-07 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. **Process management is next** — nothing creates a domain except boot code — then networking |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-24 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 495 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 332 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 495 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 332 host assertions |
 
 ### Division of responsibility between documents
 
@@ -164,6 +164,8 @@ fairness within 2% for two equal-weight workloads.
 | M9-22 | RFC 0017 step 5: a program starts a program, and `GRANT` did not exist | ✅ `DONE` | `START` on a `Domain` capability loads an ELF and gives the domain its first thread. The image arrives as a **`Memory` capability the caller holds**, not a filename: the kernel has no business opening files for a program, and a program naming one would be naming authority it does not hold. It is **copied** before being parsed — the object belongs to a program that is still running and may write to it, and parsing headers a third party can change is how a checked bound becomes a stale one. The loading runs on the new thread, so an untrusted image's size is not the caller's syscall latency and a parser is not on the dispatch path. **`GRANT` to a domain answered `NotImplemented`.** The RFC said the creator grants "using the `GRANT` that already exists"; it did not exist, so a created domain could be given nothing and a started program could do nothing at all. Built here, in `HAND`'s two-stage shape because the giver's CSpace and the recipient's cannot be held at once. **What a program gives away, it can take back**, and that cost an afternoon: the gate granted from slot 0, which the probe revokes at the end of its run to prove revocation is transitive — and it is, so the started program found itself holding nothing. A giver that wants what it gave to outlive its own housekeeping must keep a capability it does not intend to revoke. Four breakages. Two caught nothing at first, because the probe never *asked* for the refusals; it now tries to start a program in an endpoint and to give away a capability it may only hold, and both are refused with their own status. |
 | M9-23 | RFC 0017 step 6: a supervisor in ring 3, and two design errors it found | ✅ `DONE` | **RFC 0017 is complete.** A supervisor is now five system calls from ring 3: bind a notification to a `Domain`, wait on it, `INFO` for the reason, `RELEASE` for the slot. None of that is a facility for supervising — it is a notification a program already knew how to wait on, and two methods on a capability it holds. **A handle to a domain must not derive from that domain's root.** Step 4 derived it so destruction would revoke the creator's copy; ending a domain revokes its root so no authority outlives it, which took the handle with it — a creator asking what happened was told its capability was revoked, and the slot the kernel had kept could not be reached. Authority *inside* a domain dies with it; a reference *to* one must outlive it. **Method numbers are shared across kinds, and dispatch order decides the winner.** `BIND`, `INFO` and `RELEASE` were all claimed by earlier blocks that resolve a capability their own way and `return` its failure, so a `Domain` invoked with `INFO` was answered by the code for device windows. All three of this step's methods were unreachable. The first fix asked the kind on every invocation and stalled the machine by putting the domain table on the syscall hot path. **Stated, not hidden**: a domain ends when its last thread exits only if a *program* created it — boot self-tests keep using a domain after its thread finishes, and ending those turned passing tests into `NoDomain`. Retention needs a live parent, or a table of 32 fills with corpses nobody can name. |
 | M9-24 | RFC 0016's last open question: what ends a lending | ✅ `DONE` | Step 5 shipped a lend with no way back: `bin/fsd` pinned a frame, handed it over, and nothing gave it back. Now `dir::RELEASE` does **both halves** — unpin the frame, and revoke what was handed. Neither is optional: unpinning alone leaves a caller reading a frame the cache may refill with another file's block, which is the disclosure the whole step is careful about arriving a moment later; revoking alone gives the frame back to nobody. **The mechanism is revocation's direction.** It goes *down* the tree and not up, so the service hands from a **lending capability** derived from its own — one per frame — and revoking that reaches the caller's copy without reaching the one the service still uses. Handing straight from its own would have meant the only way to take a page back was to stop using it. Two gates, two breakages, each failing only its own: revoke-without-unpin reports `1 pages still lent`, unpin-without-revoke reports `MAPPED AGAIN`. **The first version of both breakages caught nothing** — the second lend was failing for an unrelated reason, so both gates were trivially true. Found on the way: `REVOKE` needs `Rights::REVOKE`, and `HAND` needs `GRANT` **and** `DERIVE` on what it copies, so a lending capability carries four rights and each is needed by a different party. What is **not** answered: a caller that never gives a page back — the service can still only refuse the next lend. |
+| M9-25 | The soak test was unusable, and the regression it reported was not one | ✅ `DONE` | `tests/qemu/soak-test.sh` has existed since M6-08 and is referenced **nowhere**: not in the Makefile, not in CI, not in this file. Its header makes the case for itself — the M6-08 IPC stall *"passed this project's whole suite, every run, for weeks, and then failed fourteen times in forty"* — and nothing ran it. **Its defect: it never stopped a boot.** This kernel does not power off, so every run cost the full timeout whether it booted in fourteen seconds or hung in the first one. That made forty runs seventeen minutes, and made its two failure kinds indistinguishable — with the cap anywhere near the boot time, "did not finish bring-up" counted every boot the *host* had merely slowed down. Now each boot is stopped the moment it reports the milestone: **40 boots in 4m50s instead of 17 minutes**, and the slowest is printed so the cap can be seen not to be near it. `make soak`, not part of `make test`. **And a conclusion of mine that was wrong.** At the old defaults it reported 4 of 40, then 3 of 30, and a pre-RFC-0017 worktree ran 30/30 clean beside it — which I read as a regression from RFC 0017 and said so. It is not: one boot at a time, the current tree booted **20 out of 20, in 14 seconds each, with no self-test failure**. Four concurrent four-processor guests on a loaded host is what failed, not the kernel. |
+| M9-26 | The shell test was not flaky: the kernel was tearing the shell's banner | ✅ `DONE` | Caught in the act. The shell's first line came out as `a user-mode s` … two kernel lines … `hell. 'help' lists what it can do.` The shell was **alive and prompting**; the harness was waiting for a contiguous `a user-mode shell` that had arrived in two pieces, and waited until its timeout. **This had been found and half-fixed before.** The comment beside the shell's spawn describes the exact tear and says *"the fix is to stop overlapping rather than to make the test cleverer"* — and it was applied to two of the four remaining kernel lines. The other two lived in the *caller*, after `user_shell` returned, and went on tearing the banner for three milestones. Every occurrence was written off as a loaded host, including **six times by me in this session**, because that is exactly what it looks like. Both lines are now printed before the shell starts. `make test` passes at its **default** timeouts, which it had not done all session. The console-drop check now covers the kernel's own output and not the shell's, which is narrower and is the price of not overlapping. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -675,6 +677,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | RT latency p99.9 < 50 µs | M4 | scheduler.md §4 |
 | Fuzz targets on every untrusted parser | M6 | coding-style.md §8 |
 | Interactive shell test (types at the machine) | M6 | Milestone exit criteria |
+| Soak: 40 boots of one image (`make soak`, not in `make test`) | M6 | Faults that depend on where a tick lands |
 | Both service placements build | Phase 2 | architecture.md §2 |
 | AI-degradation test (kill `bhaskixd-ai`, suite still passes) | Phase 4 | ai-native.md §4 |
 
@@ -683,6 +686,63 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-08 (the shell test was never flaky — the kernel was tearing the shell's banner)
+
+- **Caught live**, in a run that had been sitting at 492 seconds for a 20-second test:
+
+      a user-mode s    address spaces 6 in use at once, each program in its own
+        console out    every byte reached the wire
+      hell. 'help' lists what it can do.
+      bhaskix$
+
+  The shell is alive and prompting. The harness is waiting for `a user-mode shell` as one string,
+  and it arrived in two pieces, so it waits until its timeout and then reports every check as
+  missing.
+- **It had been found before and half-fixed.** The comment beside the shell's spawn describes this
+  exact tear, and concludes that "the fix is to stop overlapping rather than to make the test
+  cleverer". That fix moved two lines before the spawn. Two more lived in the *caller*, after
+  `user_shell` returned, and kept tearing the banner for three milestones.
+- **Every occurrence was written off as a loaded host — six times by me today alone.** That is what
+  it looks like from outside: a test that passes standalone, fails under `make test`, and passes
+  again when the timeout is raised. Raising the timeout *does* help, because a slower machine
+  interleaves differently. The evidence that finally separated the two was the soak test showing the
+  boot itself is deterministic — 20 boots, 14 seconds each, no variance — which left nothing for
+  "the host was slow" to explain.
+- **`make test` now passes at its default timeouts**, which it had not done once in this session.
+- **A narrowing, stated**: the console-drop check moved before the shell starts, so it covers the
+  kernel's output and not the shell's. The shell's output is checked by the shell test reading it
+  back.
+- **The lesson is about attribution, not about consoles.** A symptom with a plausible environmental
+  explanation gets that explanation every time, and the explanation is unfalsifiable until something
+  else rules it out. The soak test is what ruled it out, on the same night it was fixed.
+
+### 2026-08-08 (the soak test, and a regression I reported that was not there)
+
+- **`tests/qemu/soak-test.sh` has existed since M6-08 and nothing has ever run it.** Not the
+  Makefile, not CI, not this file. Its own header argues for its existence — the M6-08 IPC stall
+  passed the whole suite every run for weeks and then failed fourteen times in forty — and it was
+  left where nobody would find it.
+- **It never stopped a boot, which is why it was unusable.** This kernel does not power off, so every
+  run cost the full timeout: forty runs took seventeen minutes whether they booted in fourteen
+  seconds or hung in the first one. Worse, it made the two failure kinds indistinguishable — with the
+  cap anywhere near the boot time, "did not finish bring-up" counted every boot the host had merely
+  slowed down. Each boot is now stopped the moment it reports the milestone: **40 boots in 4m50s**,
+  and the slowest is printed so the cap can be seen not to be near it. `make soak`, deliberately not
+  part of `make test`.
+- **I reported a regression that does not exist, and the correction matters more than the finding.**
+  At the old defaults the soak said 4 of 40, then 3 of 30, while a pre-RFC-0017 worktree ran 30/30
+  clean beside it. I read that as an intermittent hang introduced by RFC 0017 and said so. Then I
+  measured it properly — one boot at a time, stopping each when it finished — and the current tree
+  booted **20 out of 20 in 14 seconds each, with no self-test failure and no truncated log**. What
+  failed was four concurrent four-processor guests on a host at load 8–15, against a 25-second cap.
+- **Two lessons, and the second is the one I got wrong.** A harness that cannot separate "slow" from
+  "stuck" will eventually report the host as a kernel bug. And a comparison between two trees is only
+  evidence if the thing being compared is the tree — running both under the same contention is not
+  the same as controlling for it, because which one draws the unlucky scheduling is chance.
+- **Still true and still worth having**: nothing in `make test` runs anything twice, and both bugs
+  named in the soak's header — M6-08's stall and RFC 0017 step 6's `sched::exit` ordering — are of
+  the kind only repetition finds. `make soak` now costs five minutes and can be run.
 
 ### 2026-08-07 (what ends a lending — RFC 0016's last open question, answered)
 

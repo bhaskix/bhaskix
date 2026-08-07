@@ -358,6 +358,23 @@ test-shell: $(ISO)
 	tests/qemu/shell-test.sh disk
 	tests/qemu/shell-test.sh iommu
 
+# Boots the same image many times. Not part of `test`: it is minutes rather than
+# seconds, and what it is for is the class of bug a single run cannot see -- one
+# that depends on where a timer tick lands. Every other target here boots once,
+# which is enough for a fault that is always there and useless for one that is
+# not.
+#
+# Two bugs this project shipped would have been caught by running it: the IPC
+# rendezvous stall of M6-08, and the `sched::exit` lock ordering of RFC 0017
+# step 6, which passed every gate in the single run that verified it and hung
+# the shell about three times in ten.
+.PHONY: soak
+soak: $(ISO)
+	tests/qemu/soak-test.sh $(SOAK_RUNS) $(SOAK_JOBS)
+
+SOAK_RUNS ?= 40
+SOAK_JOBS ?= 2
+
 # Rebuilds the image per fault, so it must not run in parallel with the boot
 # tests -- hence its own target rather than a boot-test flag.
 test-faults:

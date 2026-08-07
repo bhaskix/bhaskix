@@ -581,29 +581,16 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     } else {
         match user_shell(handoff) {
             Ok(()) => {
-                // Said out loud because it was one for the whole of M5 and M6
-                // and nothing reported it: with a single user program at a
-                // time, keeping one installed address space is
-                // indistinguishable from keeping the right one. Two services
-                // in domains on one CPU is what told the difference, by
-                // running in each other's page table.
-                println!(
-                    "    address spaces {} in use at once, each program in its own",
-                    vm::installed()
-                );
-                // Whether anything read after this point is complete. The
-                // transmitter drops a byte rather than hang, which is right,
-                // and it did so silently until a shell test failed on a string
-                // that had lost one character.
-                let dropped = bhaskix_arch::serial::dropped();
-                if dropped == 0 {
-                    println!("    console out    every byte reached the wire");
-                } else {
-                    println!(
-                        "    console out    {dropped} bytes DROPPED; anything read from this \
-                         log is incomplete"
-                    );
-                }
+                // The two lines that used to be here -- the address-space count
+                // and the console-drop check -- are printed inside `user_shell`
+                // now, before it starts the shell. They were the last of the
+                // kernel's output still racing the shell's first line, and they
+                // tore it in exactly the way the comment beside that spawn
+                // describes: `a user-mode s` ... two kernel lines ... `hell.`
+                //
+                // That comment says the fix is to stop overlapping rather than
+                // to make the test cleverer. It was right, and it was applied
+                // to two lines out of four.
                 // The third figure RFC 0013 step 5 asks for: what the isolation
                 // costs to *start*, stated once rather than argued about. From
                 // the same clock the round trips are timed against, and taken
@@ -4695,6 +4682,39 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // could not find it, and only under load, which is the worst way for a
     // test to be wrong. The console is shared and the interleaving is real, so
     // the fix is to stop overlapping rather than to make the test cleverer.
+    //
+    // **It was applied to two of the four lines.** The other two lived in the
+    // caller, after this function returned, and went on tearing the banner for
+    // another three milestones -- reported every time as a loaded host, because
+    // that is what it looks like: the shell is alive and prompting, and the
+    // harness is waiting for a string that arrived in two pieces. They are
+    // here now.
+    //
+    // Said out loud because it was a bug for the whole of M5 and M6 and nothing
+    // reported it: with a single user program at a time, keeping one installed
+    // address space is indistinguishable from keeping the right one. Two
+    // services in domains on one CPU is what told the difference, by running in
+    // each other's page table.
+    println!(
+        "    address spaces {} in use at once, each program in its own",
+        vm::installed()
+    );
+    // Whether anything read after this point is complete. The transmitter drops
+    // a byte rather than hang, which is right, and it did so silently until a
+    // shell test failed on a string that had lost one character.
+    //
+    // It covers the kernel's own output and not the shell's, which is narrower
+    // than it was and is the price of not overlapping. The shell's output is
+    // checked by the shell test reading it back.
+    let dropped = bhaskix_arch::serial::dropped();
+    if dropped == 0 {
+        println!("    console out    every byte reached the wire");
+    } else {
+        println!(
+            "    console out    {dropped} bytes DROPPED; anything read from this log is \
+             incomplete"
+        );
+    }
     if let Some(nanos) = time::now_nanos() {
         println!(
             "    boot cost      {}.{:03} ms to services up, console={} vfs={}",
