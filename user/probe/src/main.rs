@@ -47,6 +47,25 @@ core::arch::global_asm!(
 .section .text._start,"ax",@progbits
 .globl _start
 _start:
+    // --- Fault on purpose, if asked ----------------------------------------
+    //
+    // `rdi` is the first of the two values the kernel passes at entry, and it
+    // is read here because everything below clobbers it. A non-zero value
+    // means "write through a null pointer and do not come back": the caller
+    // wants a fault from ring 3, which is the one thing this program cannot
+    // demonstrate by succeeding.
+    //
+    // It lives in `bin/probe` rather than in a program of its own because the
+    // loader path, the domain, the privilege stack and the entry are all
+    // already built and tested here. A second ELF would duplicate that to
+    // execute ten bytes.
+    test rdi, rdi
+    jz 1f
+    xor rax, rax
+    mov qword ptr [rax], 1      // #PF: not present, write, user mode
+    ud2                         // unreachable; a backstop, not a plan
+1:
+
     // --- Evidence that the loader read the file rather than copying it ------
     //
     // Three facts, each obtainable only if a different segment was mapped as

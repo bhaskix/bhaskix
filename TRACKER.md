@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-07 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. **Process management is next** — nothing creates a domain except boot code — then networking |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-17 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 492 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 327 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-18 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 493 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 327 host assertions |
 
 ### Division of responsibility between documents
 
@@ -81,7 +81,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **IR1** | Interrupt authority | ✅ **Accepted** 2026-08-04 | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU (RFC 0012, draft), and the RFC says so rather than implying otherwise — **steps 1–4 are unblocked and worth doing alone.** | [RFC 0011](docs/rfc/0011-irq-handler.md) |
 | **IO1** | IOMMU | ✅ **Accepted** 2026-08-04 | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Roadmap changed on acceptance**: discovery, per-device domains and strict mapping moved from Phase 3 to Phase 2; interrupt remapping and nested translation stay. | [RFC 0012](docs/rfc/0012-iommu.md) |
 | **SF1** | Service framework | ✅ **Accepted** 2026-08-05 | The trait, the two placements, the build selection, and the CI job that builds **both** for every service. `architecture.md` §2 has claimed relocatable services since Phase 0 and **none of it exists** — no trait, no placement selection, no service that has ever run outside the nucleus. Could not have been written before M6-18: until the bulk path used shared memory the two placements were identical *by accident*, because four registers map into nobody. Acceptance decides two of its four open questions — the nucleus placement dispatches **through IPC** rather than by direct call, and the placement table is a **build-time** input with a command-line override for tests only. Two stay open: a caller whose service died blocks for ever (the fix needs an endpoint that reports revocation), and whether the console is honestly relocatable at all. Acceptance also corrected `architecture.md`, which described both of this RFC's safeguards in the present tense when neither existed. | [RFC 0013](docs/rfc/0013-service-framework.md) |
-| **PM1** | Process management | ⬜ Draft | **Create, grant, start, kill, reap** — each an operation on a capability, no new syscall kind. No `fork` (it duplicates a capability space by implication, which is ambient authority through the back door), no pid (the process tree **is** the capability tree, and killing a parent already kills its descendants through machinery that is built and tested), no signals ("stop" is `KILL` on a capability you hold; "something happened" is a `Notification`). `DomainControl` hands out `Domain` capabilities, the same shape as RFC 0011's `IrqControl` and RFC 0012's `IommuControl`. Answers **RFC 0013's unresolved question 1** — a caller whose service died — and extends the envelope to child domains, without which the RFC reopens **T10**. | [RFC 0017](docs/rfc/0017-process-management.md) |
+| **PM1** | Process management | 🔨 Draft, **step 1 built** | **Create, grant, start, kill, reap** — each an operation on a capability, no new syscall kind. No `fork` (it duplicates a capability space by implication, which is ambient authority through the back door), no pid (the process tree **is** the capability tree, and killing a parent already kills its descendants through machinery that is built and tested), no signals ("stop" is `KILL` on a capability you hold; "something happened" is a `Notification`). `DomainControl` hands out `Domain` capabilities, the same shape as RFC 0011's `IrqControl` and RFC 0012's `IommuControl`. Answers **RFC 0013's unresolved question 1** — a caller whose service died — and extends the envelope to child domains, without which the RFC reopens **T10**. | [RFC 0017](docs/rfc/0017-process-management.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
@@ -156,6 +156,7 @@ fairness within 2% for two equal-weight workloads.
 
 | M9-16 | The syscall stub returned to user mode on another thread's stack | ✅ `DONE` | The entry stub parked the user `rsp` in **per-CPU** data and restored it from there — one word shared by every thread on the processor. A system call that *blocks* leaves it there while somebody else runs: another ring 3 thread entering the kernel overwrites it, and the first thread then `sysret`s onto **that thread's stack**, in its own address space. Both user stacks live at the same address in their own spaces, so it is mapped and the fault is not immediate: the program reads its own memory at somebody else's offsets. The frame already carried a per-thread copy and the stub threw it away. Two instructions: take it back and repair the slot. Watched failing by restoring the old exit path — twelve gates fail and `bin/blkd` faults exactly as before. |
 | M9-17 | The tickless gate was reporting a real defect as a near-miss | ✅ `DONE` | It failed about one run in four on a loaded host — 165 ticks idle against 327 busy, three the wrong side of a 2× threshold — and the threshold was not the problem. **One CPU was ticking flat out with nothing to run, on every boot since M4.** Two CPUs' worth of ticks in a window that should have held one is exactly the ratio that was being read as noise. The cause: `scheduling_self_test` ends with `stop_all()` to freeze the world for reporting, and `start_all()` sat **four tests further down**, so the tickless gate ran inside the frozen window. `needs_preemption_tick` reads a stopped queue through the same `started` flag it uses for *early boot* — keep ticking, the timer is not proven yet — so every frozen CPU armed a slice it had nothing to preempt to, indefinitely. `stop_all` skips contended queues, so only some CPUs froze, which is why one ticked and the others did not. The old gate could not have said this: a machine-wide counter has no term for *which* CPU, and a ratio against a busy baseline has room to swallow one broken processor in three. It also means the **busy half was measuring nothing** — the burner threads never ran, because they were spawned into a stopped scheduler. Now counted **per CPU** (`trap::ticks_on`), asserted against a bound derived from `IDLE_BACKSTOP_MS` rather than a ratio, retried rather than settled-for-a-fixed-time so host load cannot decide the answer, and it reports **why** a CPU is awake — arming reason, and the threads it holds. Idle went from 165 ticks to 1. Six consecutive runs at load average 11–14. Watched failing both ways: a CPU that never goes tickless, and a CPU that stops ticking with work to do. |
+| M9-18 | RFC 0017 step 1: a ring 3 fault ends its domain, not its processor | ✅ `DONE` | M5's exit criterion said a user program *"is killed cleanly when it faults"* and the kernel called `halt_forever`. It survived four milestones because **no test in this project had ever faulted from ring 3** — all six injected faults come from kernel mode. The cost was misdescribed twice before it was measured: `halt_forever` halts *the calling CPU*, so a ring 3 fault took that processor permanently — interrupts disabled, so no timer and no IPI could wake it — and leaked the domain, its envelope and its thread. One CPU means the machine; four means a quarter of it per faulting program. Now the report is unchanged and complete, and then the domain is destroyed and the thread exits. Two details that are not optional: interrupts are **re-enabled** before exiting, or `sched::exit` halts a CPU with them off and the fix becomes the bug in different clothes; and every line is printed **before** `destroy`, because destroy is what a waiter watches for and a report finished afterwards arrives shredded through the next three gates — which is what the first version did. Safe to take the domain table and the capability arena in a handler for one reason: the faulting thread was running *user* code, so it holds no kernel lock. Gated as `bhaskix.fault=user`, behind the command line with the other six rather than in the boot sequence — a deliberate exception on every boot would force `shell-test.sh` to stop treating `EXCEPTION` as a failure marker. It runs on **one CPU**, the harder case, where the machine only continues if the dying thread gives the processor back. Watched failing three ways, each with its own signature. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -469,11 +470,14 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
   why the count is reported and not asserted.
 - **`RSP0` and the syscall stack are now per-thread**, installed on every context switch, which is
   what a blocking system call requires. Fixed as the first step of M5-05.
-- **A faulting user thread is not contained, it is fatal.** The probe never faults, so nothing
-  exercises what happens when ring 3 touches memory it does not have. Today an unserviceable fault
-  reports and halts the machine, which for a user-mode fault is exactly wrong: it should kill the
-  thread. Until that changes, "isolation" is a property of the page tables and not yet of the
-  kernel's response.
+- **A faulting user thread is not contained, it is fatal.** ✅ **Fixed 2026-08-07**, by
+  [RFC 0017](docs/rfc/0017-process-management.md) step 1. This note stood from M5 and was right
+  about the substance and imprecise about the cost: `halt_forever` halts *the CPU it runs on*, not
+  the machine, so a ring 3 fault took a processor permanently — with interrupts disabled, so no
+  timer and no IPI could ever wake it — and leaked the domain, its envelope and its thread. On one
+  CPU that is the machine; on four it is a quarter of them per faulting program. It survived because
+  "the probe never faults" stayed true for four milestones: **no test here had ever faulted from
+  ring 3.** Now `bhaskix.fault=user` does, and the assertion is what prints *afterwards*.
 - **There is no `swapgs` protection against an NMI.** The interrupt path decides whether to swap by
   looking at the interrupted `CS`, which is wrong for an NMI arriving inside the syscall stub's
   first instruction — kernel `CS`, user `GS`. Nothing enables an NMI source, so the window is
@@ -624,7 +628,7 @@ what is actually ahead.
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: the ELF loader's 24 hours of fuzzing (M6), and mount points, which nothing has needed yet |
-| Process management — capability-shaped fork/exec, process trees, reaping | 🔨 **RFC 0017 drafted** | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **halts the machine** (M5's unmet criterion, above); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1. Six steps, and **step 1 is worth doing alone** |
+| Process management — capability-shaped fork/exec, process trees, reaping | 🔨 **RFC 0017 drafted** | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
 ---
@@ -673,6 +677,47 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-07 (RFC 0017 step 1 — an unprivileged program can no longer take a processor with it)
+
+- **Done.** A fault in ring 3 ends that domain: the report is printed in full and unchanged, the
+  domain is destroyed, the thread exits, and the boot carries on. M5's exit criterion is met four
+  milestones after it was recorded as met.
+- **The claim it fixes was overstated twice, and the third telling is measured.** `halt_forever` is
+  `loop { disable_interrupts(); halt(); }` — the *calling CPU*, not the machine. A ring 3 fault took
+  that processor permanently (no timer, no IPI can wake it) and leaked the domain, its envelope and
+  its thread. On one CPU that is the machine; on four it is a quarter per faulting program. It read
+  as total because the program used to demonstrate it was the shell, which is the only thing that
+  prints — "nothing printed afterwards" and "the machine stopped" look identical from a console.
+- **Two implementation details that are not optional.** Interrupts must be re-enabled before the
+  thread exits, or `sched::exit` halts the CPU with them off and the fix is the bug wearing
+  different clothes. And every line must be printed *before* `destroy`, because destroy is what a
+  waiter watches for — the first version finished its report afterwards and it arrived shredded
+  through the next three gates.
+- **Why it is safe to take kernel locks in a handler**, which is the load-bearing argument: the
+  faulting thread was executing *user* code, so it holds no kernel lock, so the domain table and the
+  capability arena cannot be held by the thread this interrupted. That is why the path is reached
+  only from the user-mode branch and is not shared with the kernel one.
+- **The gate is `bhaskix.fault=user`**, behind the command line with the other six rather than in
+  the boot sequence: a deliberate exception on every boot would force `shell-test.sh` to stop
+  treating `EXCEPTION` as a failure marker, and a failure marker with an exception list will
+  eventually ignore the wrong thing. It runs on **one CPU** — the harder case, where the machine
+  continues only if the dying thread gives the processor back.
+- **Watched failing three ways, each with its own signature**, which took fixing the harness to
+  achieve. Restoring the halt loses everything *after* the fault. Leaking the domain loses only the
+  gate line. A program that does not fault loses the report itself.
+- **Two defects in `fault-test.sh`, found by needing it to tell those apart.** The missing-expectation
+  list was only computed when the verdict was *success*, so a timeout never said what was absent;
+  and because `timeout` kills QEMU at the deadline, the process was always dead by the time the
+  verdict was decided, so every slow boot was reported as "qemu exited — check the image and disk".
+  The timeout branch was effectively unreachable. Both fixed; the verdict now comes from `timeout`'s
+  own exit status.
+- **`unsafe` 1081 → 1097**, justified in `kernel/Cargo.toml`: one statement of real consequence
+  (`enable_interrupts`) and a privilege stack for the gate, deliberately not shared with
+  `ring3_self_test`'s — a test that borrowed another test's stack would pass on run order.
+- **Not done, and named in the report rather than implied**: sibling threads of a dead domain keep
+  running. `destroy` still zeroes a counter instead of stopping them, and when a domain has more
+  than one thread the fault report now says so out loud. That is step 2.
+
 ### 2026-08-07 (RFC 0017 drafted — and a milestone marked complete on a criterion that was never true)
 
 - **[RFC 0017](docs/rfc/0017-process-management.md) drafted**: process management as create, grant,
@@ -682,7 +727,11 @@ Newest first. One entry per meaningful change of project state.
   user-mode program *"is killed cleanly when it faults"*. It is not: a ring-3 fault calls
   `halt_forever`. Demonstrated by adding a temporary `crashme` to the shell — one null write from an
   unprivileged program with no capabilities stopped the machine, and took the console and filesystem
-  services with it. **No test here has ever faulted from ring 3**; all six injected faults are from
+  services with it. **[Corrected later the same day, when step 1 was built and the claim was
+  measured: `halt_forever` halts the calling CPU, not the machine. A ring 3 fault costs that
+  processor permanently and leaks the domain, which on one CPU is the whole machine and on four is a
+  quarter of it per faulting program. The shell made it look total because the shell is the only
+  thing that prints.]** **No test here has ever faulted from ring 3**; all six injected faults are from
   kernel mode, which is why four milestones passed over it.
 - **Three more gaps, each already documented somewhere and never collected.** `domain::create` takes
   a `&'static str` and all 21 callers are in `kernel/src/lib.rs`, so the set of programs that can

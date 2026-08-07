@@ -15,7 +15,24 @@
 //! bhaskix.fault=gp   general protection   -- error code, selector-shaped
 //! bhaskix.fault=pf   page fault           -- error code, plus CR2
 //! bhaskix.fault=df   double fault         -- via kernel stack overflow
+//! bhaskix.fault=user a page fault **in ring 3** -- survivable by design
 //! ```
+//!
+//! # The last one is different, and deliberately so
+//!
+//! The first six are faults in the kernel's own execution, and every one of
+//! them ends the machine. `user` is a fault in a *program*, which
+//! [RFC 0017](../../docs/rfc/0017-process-management.md) step 1 makes
+//! survivable: it ends one domain and the boot carries on. So its expectation
+//! in the harness is not "the report appeared" — a report appeared before that
+//! change too, and then the CPU halted — but that **output continues
+//! afterwards**.
+//!
+//! It lives behind the command line, with the other six, rather than in the
+//! boot self-tests. A deliberate exception on every boot would mean every
+//! harness that treats `EXCEPTION` as a failure marker — `shell-test.sh` does
+//! — has to learn to ignore one, and a failure marker with an exception list
+//! is a failure marker that will eventually ignore the wrong thing.
 //!
 //! # Why this ships in the kernel rather than living in a test harness
 //!
@@ -42,6 +59,9 @@ pub enum Fault {
     PageFault,
     /// Double fault (#DF, vector 8), reached through an unmapped stack.
     DoubleFault,
+    /// A page fault in ring 3 (#PF, vector 14), which ends a domain and not
+    /// the machine.
+    UserMode,
 }
 
 impl Fault {
@@ -55,6 +75,7 @@ impl Fault {
             "gp" => Self::GeneralProtection,
             "pf" => Self::PageFault,
             "df" => Self::DoubleFault,
+            "user" => Self::UserMode,
             _ => return None,
         })
     }
@@ -73,11 +94,15 @@ pub fn from_cmdline(cmdline: &str) -> Option<Fault> {
         .and_then(Fault::parse)
 }
 
-/// Triggers `fault`. Does not return if the exception path works.
+/// Triggers `fault`.
 ///
-/// If this *does* return, the exception was silently swallowed, which is
-/// itself a failure the test harness reports.
-pub fn trigger(fault: Fault) {
+/// Returns `true` when the fault was **survivable by design** and the machine
+/// should carry on — which is [`Fault::UserMode`] and nothing else.
+///
+/// For the other six, returning at all means the exception was silently
+/// swallowed, and the caller treats that as the failure it is.
+#[must_use]
+pub fn trigger(fault: Fault) -> bool {
     println!();
     println!("  fault injection: deliberately triggering {fault:?}");
     println!("  (requested by bhaskix.fault= on the kernel command line)");
@@ -89,7 +114,11 @@ pub fn trigger(fault: Fault) {
         Fault::GeneralProtection => general_protection(),
         Fault::PageFault => page_fault(),
         Fault::DoubleFault => double_fault(),
+        // Handled by the kernel proper: it needs a domain, a loader and a
+        // scheduler, none of which belong in this module.
+        Fault::UserMode => return true,
     }
+    false
 }
 
 fn divide_error() {

@@ -49,10 +49,28 @@ while writing'
 kernel stack overflow
 guard page
 own IST stack'
+  # The odd one out, and the only one whose point is what happens *next*.
+  #
+  # The first six are kernel faults and every one of them ends the machine, so
+  # their expectations stop at "the report was right". This one is a fault in a
+  # program: it must end that domain and nothing else. A report proves nothing
+  # on its own -- before RFC 0017 step 1 the report was already correct, and
+  # then the CPU halted forever with the domain still live and its memory still
+  # charged.
+  #
+  # So the last two lines are the assertion. `user fault` only prints if the
+  # domain went away and the table took its slot back, and the milestone banner
+  # only prints if the boot ran to completion *after* a ring 3 fault.
+  [user]='EXCEPTION: page fault (#PF)
+from USER mode
+this is a null pointer dereference
+Domain "faulter" is gone
+a ring 3 fault ended its domain and nothing else
+Nothing left to do at this milestone'
 )
 
 FAULTS=("$@")
-[[ ${#FAULTS[@]} -eq 0 ]] && FAULTS=(de ud bp gp pf df)
+[[ ${#FAULTS[@]} -eq 0 ]] && FAULTS=(de ud bp gp pf df user)
 
 # Anything here means the machine did not survive to report cleanly.
 FATAL_MARKERS=(
@@ -107,8 +125,7 @@ run_until() {
     # The machine may have printed everything and exited between two polls, so
     # the log is checked once more before the process's death is called a
     # failure.
-    if [[ $outcome -ne 0 ]] && ! kill -0 "$pid" 2>/dev/null; then
-        outcome=2
+    if [[ $outcome -ne 0 ]]; then
         local line complete=1
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
@@ -117,8 +134,28 @@ run_until() {
         [[ $complete -eq 1 ]] && outcome=0
     fi
 
-    kill "$pid" 2>/dev/null
+    # Who ended the machine decides which failure this is, and the previous
+    # version could not tell: it called any dead process "qemu exited early",
+    # but `timeout` kills qemu at exactly the deadline, so a plain timeout was
+    # *always* reported as an early exit. Every slow boot arrived labelled as a
+    # missing image or disk. `timeout` reports 124 when the deadline is what
+    # killed it, which is the distinction, taken from the process rather than
+    # inferred from the clock.
+    local killed_by_us=0
+    if kill -0 "$pid" 2>/dev/null; then
+        killed_by_us=1
+        kill "$pid" 2>/dev/null
+    fi
     wait "$pid" 2>/dev/null
+    local qemu_status=$?
+
+    if [[ $outcome -ne 0 ]]; then
+        if [[ $killed_by_us -eq 1 || $qemu_status -eq 124 ]]; then
+            outcome=1
+        else
+            outcome=2
+        fi
+    fi
     return $outcome
 }
 
@@ -153,7 +190,7 @@ for fault in "${FAULTS[@]}"; do
   # this describes *what was in the log*, which is only meaningful once the
   # machine got far enough to write it.
   case $verdict in
-    1) failures+=("timed out after ${TIMEOUT}s -- the machine had not reached the fault yet, which on a loaded host is a slow boot rather than a mishandled exception") ;;
+    1) failures+=("timed out after ${TIMEOUT}s -- not all of the expected output appeared. On a loaded host that is often a slow boot; the missing lines below say which part is absent, and for a survivable fault the difference between 'the report never came' and 'everything after it never came' is the whole diagnosis") ;;
     2) failures+=("qemu exited before the fault was reported -- check that the image and the disk were both available") ;;
   esac
 
@@ -163,12 +200,14 @@ for fault in "${FAULTS[@]}"; do
     failures+=("machine TRIPLE FAULTED instead of reporting")
   fi
 
-  if [[ $verdict -eq 0 ]]; then
-    while IFS= read -r expected; do
-      [[ -z "$expected" ]] && continue
-      grep -qF -- "$expected" "$log" || failures+=("missing: '$expected'")
-    done <<< "${EXPECT[$fault]}"
-  fi
+  # Always, not only on a clean verdict. Which expectation is missing is the
+  # most useful thing this test knows, and withholding it on a timeout meant
+  # two entirely different breakages -- a machine that halted, and one that ran
+  # perfectly but never reported a domain gone -- printed the same sentence.
+  while IFS= read -r expected; do
+    [[ -z "$expected" ]] && continue
+    grep -qF -- "$expected" "$log" || failures+=("missing: '$expected'")
+  done <<< "${EXPECT[$fault]}"
 
   for marker in "${FATAL_MARKERS[@]}"; do
     grep -qF -- "$marker" "$log" && failures+=("$marker")

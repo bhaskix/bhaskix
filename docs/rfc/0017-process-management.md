@@ -17,7 +17,8 @@ This system has domains, and it cannot make one, stop one, or find out that one 
 Every domain in the tree is created by boot code — all twenty-one calls to `domain::create` are in
 `kernel/src/lib.rs`, so the set of programs that can ever run is fixed when the kernel is compiled.
 `destroy` releases a domain's memory, its interrupt handlers and its capabilities, and leaves its
-threads running. And a fault in ring 3 does not kill the program; it halts the machine.
+threads running. And a fault in ring 3 does not kill the program; it halts the processor the
+program was on, permanently, and leaks everything the program held.
 
 That last one is not a design position, it is a leftover. `trap.rs` still says *"Every exception is
 fatal at M2 — there is no memory manager to service a fault and no scheduler to kill a task."* Both
@@ -34,7 +35,7 @@ of those is the wrong shape for this system rather than merely unfashionable.
 
 Four things are broken or missing, and they are separate problems that share one solution.
 
-### A fault in ring 3 halts the machine
+### A fault in ring 3 costs a processor and leaks a domain
 
 Demonstrated, not inferred. A temporary `crashme` command was added to the user-mode shell, writing
 through a null pointer from ring 3:
@@ -57,12 +58,31 @@ bhaskix$ crashme
   manager to service a fault and no scheduler to kill a task.
 ```
 
-The machine stopped. A `help` queued behind `crashme` never ran, the console service never answered
-again, and the filesystem service — which had done nothing wrong — died with it.
+The diagnostic itself is good and this RFC keeps all of it. What is wrong is the last line, and it
+is worth being exact about *how* wrong, because the first version of this section overstated it.
 
-The diagnostic itself is good and this RFC keeps all of it. What is wrong is the last line: an
-unprivileged program with no capabilities took down every other domain on the machine, which is the
-opposite of what a domain is for.
+`halt_forever` is `loop { disable_interrupts(); halt(); }` — **it halts the CPU it runs on, not the
+machine.** Measured afterwards, by putting a deliberate ring 3 fault into the boot sequence on a
+four-processor machine: the boot carried on and every later gate printed. So what a fault in ring 3
+actually costs is:
+
+- **The processor, permanently.** It halts with interrupts disabled, so no timer and no IPI can ever
+  wake it. On a one-CPU machine that is the whole machine, which is why the gate for this runs on
+  one CPU. On four, it is a quarter of them per faulting program.
+- **The domain, leaked.** `destroy` is never called: the capabilities stay live, the memory stays
+  charged against an envelope nobody will release, and the domain occupies a slot in a table with
+  32 of them.
+- **The thread, never stopped.** It is still `Running`, on a processor that will never run anything
+  again.
+
+That is a denial of service rather than an instant kill, and it is still unacceptable: an
+unprivileged program holding no capabilities can consume a processor and a domain slot, permanently,
+by dereferencing a null pointer. Four of them end the machine.
+
+The reason it *looked* like an instant kill is that the program used to demonstrate it was the
+shell, which is the only thing producing output — so "nothing printed afterwards" and "the machine
+stopped" are indistinguishable from the console. They are not the same, and this RFC says so rather
+than keeping the more dramatic claim.
 
 **This is [roadmap.md](../roadmap.md)'s M5 exit criterion**, which reads: *"a user-mode program runs,
 invokes capabilities, is denied what it does not hold, and **is killed cleanly when it faults**."*

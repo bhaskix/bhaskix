@@ -136,7 +136,7 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1081
+unsafe_budget = 1097
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -148,3 +148,28 @@ unsafe_budget = 1081
 # 5: the kernel's driver no longer writes descriptors or rings by hand. Two
 # steps, two reductions, and the second is the one that mattered -- those lines
 # existed twice, in two drivers, with nothing checking that they agreed.
+#
+# 1097 at RFC 0017 step 1: a fault in ring 3 ends its domain instead of halting
+# the processor it ran on. Sixteen lines, in two places, and they are worth
+# separating because only one of them is new authority.
+#
+# The first is one statement with a long justification: `enable_interrupts`
+# before the faulting thread exits. The interrupt gate cleared `IF` on entry,
+# and `sched::exit` halts the CPU when it has nothing else to run -- so leaving
+# them off would halt this processor with interrupts disabled, which is exactly
+# the behaviour the step exists to remove. It would have turned a fix into the
+# bug wearing different clothes, and on a one-CPU machine that is indeed what
+# it does.
+#
+# The rest is the gate: a privilege stack allocated for the CPU the faulting
+# program runs on, and installed in the TSS. Both are `unsafe` for the reason
+# every stack allocation here is, and both already appear in `ring3_self_test`
+# a few hundred lines above. They are duplicated rather than shared **on
+# purpose**: a test that borrowed the other test's privilege stack would pass
+# or fail on the order the two happened to run in, which is not a property of
+# the thing being tested.
+#
+# What it buys is the first proof in this project that an unprivileged program
+# cannot take a processor with it. That was never tested before -- all six
+# injected faults came from kernel mode -- and the claim had been false and
+# unnoticed since M5.

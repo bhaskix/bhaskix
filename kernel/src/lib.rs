@@ -480,10 +480,22 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     }
 
     if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
-        faultinject::trigger(fault);
-        println!();
-        println!("  FAULT INJECTION RETURNED: the exception was not delivered.");
-        cpu::halt_forever();
+        if faultinject::trigger(fault) {
+            // Survivable by design: a fault in ring 3 ends one domain. The
+            // machine carrying on from here *is* the assertion -- every line
+            // printed below this point is evidence, and the harness expects
+            // one of them.
+            if !user_fault_self_test(
+                handoff.hhdm_base.as_u64(),
+                bhaskix_arch::percpu::online_count(),
+            ) {
+                println!("    user fault     FAILED");
+            }
+        } else {
+            println!();
+            println!("  FAULT INJECTION RETURNED: the exception was not delivered.");
+            cpu::halt_forever();
+        }
     }
 
     // The lock-order check again, at the end.
@@ -1279,7 +1291,115 @@ extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
     // spawned.
     // SAFETY: `entry` is inside a user-executable segment of the space
     // just installed, and `rsp` is one past user-writable memory in it.
-    unsafe { enter_user("ring 3", entry, rsp, [0, 0]) }
+    unsafe {
+        enter_user(
+            "ring 3",
+            entry,
+            rsp,
+            [
+                FAULT_ON_ENTRY.load(core::sync::atomic::Ordering::Relaxed),
+                0,
+            ],
+        )
+    }
+}
+
+/// Non-zero to ask the next `bin/probe` to fault at entry instead of running.
+///
+/// A static rather than a spawn argument because `ring3_probe` already uses
+/// both of its own, and because exactly one test at a time sets it.
+static FAULT_ON_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A fault in ring 3 ends that domain, and nothing else.
+///
+/// [RFC 0017](../../docs/rfc/0017-process-management.md) step 1, and the M5
+/// exit criterion that said a user program "is killed cleanly when it faults"
+/// while the kernel called `halt_forever`. Nothing caught it because **no test
+/// in this project had ever faulted from ring 3** — every case in
+/// `tests/qemu/fault-test.sh` is injected from kernel mode.
+///
+/// The assertion is deliberately not "a report appeared". A report appeared
+/// before this change too, and then the machine stopped. What is being checked
+/// is that execution *continued*: the domain is gone, the domain table has its
+/// slot back, and this function returns to a boot sequence that keeps printing
+/// gates. Every line after this one is the evidence.
+fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    // Runs on one CPU as happily as on four, and the single-CPU case is the
+    // *harder* one: the faulting thread and the thread waiting for it share a
+    // processor, so the machine only carries on if the dying thread actually
+    // gives the CPU back. A version that needed a spare CPU would skip exactly
+    // the arrangement most likely to hang.
+    let cpu = cpus.saturating_sub(1);
+
+    /// A privilege stack of its own, not the one `ring3_self_test` installed.
+    /// Depending on another test's leftovers would make this pass or fail on
+    /// the order the two happen to run in.
+    const RSP0_SLOT: u64 = 2100;
+
+    // SAFETY: a slot no thread or syscall stack uses.
+    let Ok(privileged) = (unsafe { stack::allocate(hhdm_base, RSP0_SLOT + u64::from(cpu)) }) else {
+        println!("    user fault     FAILED to allocate a privilege stack");
+        return false;
+    };
+    // SAFETY: one past a freshly mapped guarded stack, set before anything
+    // enters ring 3 on that CPU.
+    unsafe { bhaskix_arch::gdt::set_privilege_stack(cpu as usize, privileged.top) };
+
+    let Ok(doomed) = domain::create("faulter", domain::ResourceEnvelope::new()) else {
+        println!("    user fault     FAILED to create a domain");
+        return false;
+    };
+    let live_before = domain::live();
+
+    FAULT_ON_ENTRY.store(1, Ordering::Release);
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(doomed.as_u32());
+    if let Err(error) =
+        sched::spawn_on_with(cpu, "faulter", ring3_probe, hhdm_base, hhdm_base, options)
+    {
+        println!("    user fault     FAILED to spawn the program: {error:?}");
+        FAULT_ON_ENTRY.store(0, Ordering::Release);
+        domain::destroy(doomed);
+        return false;
+    }
+
+    // Wait for the domain to stop existing rather than for a duration: the
+    // fault happens in microseconds on an idle host and in rather longer on a
+    // loaded one, and a fixed sleep would turn the host's mood into a verdict.
+    let gone = wait_until(|| domain::with(doomed, |_| ()).is_none(), 8_000);
+    FAULT_ON_ENTRY.store(0, Ordering::Release);
+
+    let live_after = domain::live();
+    let checks = [
+        ("a ring 3 fault ended its domain", gone),
+        (
+            "the domain table got its slot back",
+            live_after + 1 == live_before,
+        ),
+        // The one that could not have passed before this change, and the
+        // reason the other two are worth reading: if the machine had halted,
+        // nothing would be here to check anything.
+        ("the machine carried on afterwards", true),
+    ];
+
+    let mut ok = true;
+    for (what, passed) in checks {
+        if !passed {
+            println!("    user fault     FAILED: {what}");
+            ok = false;
+        }
+    }
+    if ok {
+        println!(
+            "    user fault     a ring 3 fault ended its domain and nothing else; {live_after} domains live"
+        );
+    } else {
+        domain::destroy(doomed);
+    }
+    ok
 }
 
 /// Runs a program in ring 3 and checks that it really was ring 3.

@@ -150,10 +150,19 @@ pub unsafe fn enable(
 
 /// Handles a trap.
 ///
-/// Currently every trap is fatal: there is no memory manager to service a page
-/// fault, no scheduler to kill a process, and no user mode to fault. Halting
-/// with a full report is the correct behaviour at M2, and this function is
-/// where recoverable cases get added in M3 and M5.
+/// A page fault the region map can service is serviced. Everything else is
+/// reported in full, and then **who dies depends on who faulted**: a fault in
+/// ring 3 ends that domain and the machine keeps running, a fault in the kernel
+/// halts.
+///
+/// That asymmetry is the whole point of a domain, and it took until
+/// [RFC 0017](../../docs/rfc/0017-process-management.md) step 1 to exist. Until
+/// then this function halted for both, on the reasoning — written here, and
+/// true when it was written — that there was "no memory manager to service a
+/// page fault, no scheduler to kill a process, and no user mode to fault". All
+/// three arrived in M3, M4 and M5, and the comment outlived the condition it
+/// described: a null pointer in the shell stopped the console and the
+/// filesystem, which had done nothing wrong.
 fn handle(frame: &mut TrapFrame) {
     // Vectors below 32 are architectural exceptions; everything above is an
     // interrupt. The split matters because exceptions are faults in the
@@ -206,7 +215,89 @@ fn handle(frame: &mut TrapFrame) {
         }
     }
 
-    report_exception(frame)
+    report_exception(frame);
+
+    // A fault in ring 3 is the program's bug, not the machine's.
+    if frame.from_user_mode() {
+        end_faulting_domain();
+    }
+
+    println!("  Halting. A fault in the kernel is the kernel's own bug: there is");
+    println!("  no other domain to blame, and no state left worth trusting.");
+    println!("==================================================================");
+    cpu::halt_forever()
+}
+
+/// Ends the domain whose thread just faulted in ring 3. Never returns.
+///
+/// **Why it is safe to take kernel locks here, in a handler.** The faulting
+/// thread was executing *user* code — that is what `from_user_mode` means — and
+/// there is no path by which ring 3 holds a kernel lock. So the domain table
+/// and the capability arena cannot be held by the thread this interrupted, and
+/// taking them cannot deadlock against it. Every part of that sentence is
+/// load-bearing, which is why this is reached only from the user-mode branch
+/// and not shared with the kernel one.
+fn end_faulting_domain() -> ! {
+    let thread = crate::sched::current_thread_id();
+
+    // Everything is printed *before* the domain is destroyed, and the order is
+    // not cosmetic. Destroying it is what any waiter is watching for, so a
+    // report finished afterwards races the next thing that prints and arrives
+    // shredded through it -- which is what the first version of this did, and
+    // a fault report interleaved with three other gates is not a report.
+    match crate::sched::current_domain() {
+        Some(id) => {
+            let name = crate::domain::with(id, |domain| domain.name()).unwrap_or("?");
+            let others = crate::domain::with(id, |domain| domain.threads()).unwrap_or(0);
+
+            println!("  Domain {name:?} is gone. Its capabilities are revoked, its memory");
+            println!("  released, and this machine is still running.");
+
+            // Honest about what this step does not do. RFC 0017 step 2 is
+            // thread ownership; until it lands, a sibling thread of the dead
+            // domain keeps running with no capabilities at all -- contained,
+            // but not stopped. Saying so beats a report implying the domain is
+            // entirely gone when part of it is still scheduled.
+            if others > 1 {
+                println!(
+                    "  {} other thread(s) of it are still scheduled: RFC 0017 step 2.",
+                    others - 1
+                );
+            }
+            match thread {
+                Some(id) => println!("  Thread {id} stopped."),
+                None => println!("  The faulting thread could not be identified."),
+            }
+            println!("==================================================================");
+
+            crate::domain::destroy(id);
+        }
+        None => {
+            // A ring 3 thread outside any domain should not exist -- entering
+            // user mode goes through `enter_user`, which requires one. Report
+            // it rather than destroying something arbitrary, and still stop
+            // the thread: whatever it is, it has faulted.
+            println!("  This thread is in ring 3 and belongs to no domain, which should");
+            println!("  not be possible. Stopping the thread; nothing else is touched.");
+            match thread {
+                Some(id) => println!("  Thread {id} stopped."),
+                None => println!("  The faulting thread could not be identified."),
+            }
+            println!("==================================================================");
+        }
+    }
+
+    // The interrupt gate cleared IF on entry. `exit` halts this CPU if it has
+    // nothing else to run, and a halt with interrupts disabled is the machine
+    // stopping after all -- which is the behaviour this function exists to
+    // remove. Nothing is held here: the report is printed and every lock taken
+    // above has been released.
+    //
+    // SAFETY: at CPL 0 in a handler that holds no lock, on a thread that is
+    // about to stop. Re-entering this handler is impossible -- the faulting
+    // instruction is never retried, because this never returns.
+    unsafe { cpu::enable_interrupts() };
+    crate::sched::exit()
 }
 
 /// Services a delivered interrupt and returns, so `iretq` resumes the
@@ -316,7 +407,14 @@ fn handle_interrupt(frame: &mut TrapFrame) {
     }
 }
 
-/// Reports a fatal exception and halts.
+/// Reports an exception in full, and returns.
+///
+/// Returns rather than halting because the verdict is no longer the same for
+/// every fault: the caller decides whether this ends a domain or the machine.
+/// Everything above that line is identical for both, and deliberately so — the
+/// report is the most valuable thing this kernel produces when something goes
+/// wrong, and it should not get thinner because the fault turned out to be
+/// survivable.
 fn report_exception(frame: &mut TrapFrame) {
     println!();
     println!("==================================================================");
@@ -396,11 +494,6 @@ fn report_exception(frame: &mut TrapFrame) {
     }
 
     println!("------------------------------------------------------------------");
-    println!("  Halting. Every exception is fatal at M2 -- there is no memory");
-    println!("  manager to service a fault and no scheduler to kill a task.");
-    println!("==================================================================");
-
-    cpu::halt_forever()
 }
 
 /// Decodes the architecture-defined error code into words.
