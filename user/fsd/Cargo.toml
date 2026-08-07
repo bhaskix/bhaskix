@@ -36,7 +36,12 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-unsafe_budget = 50
+unsafe_budget = 53
+#
+# Up three for the comment on `rsi`: the `unsafe` counter counts lines
+# inside an `unsafe` block, and an explanation of why a register is declared
+# the way it is lives inside one. Paying three lines to say why is the right
+# trade -- the thing it explains cost this project a bug once already.
 # Small, and it should stay small. Everything this program does to a filesystem
 # is safe code in `bhaskix-fs`; the `unsafe` here is the system call
 # convention, the entry point, and the places that read and write pages the

@@ -124,7 +124,12 @@ fn syscall(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> Reply {
             "syscall",
             inlateout("rax") kind => status,
             in("rdi") capability,
-            in("rsi") method,
+            // `inlateout`, not `in`. The kernel pops the whole frame back on
+            // the way out -- `rsi` included -- so telling the compiler it is
+            // preserved is telling it something the machine does not promise.
+            // This system has been bitten by exactly that once already, for
+            // the argument registers; `rsi` was the one that was missed.
+            inlateout("rsi") method => _,
             inlateout("rdx") a0,
             inlateout("r10") a1,
             inlateout("r8") a2,

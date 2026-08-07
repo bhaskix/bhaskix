@@ -750,6 +750,30 @@ Newest first. One entry per meaningful change of project state.
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
 
+### 2026-08-07 (the nested-call defect — a real bug fixed, the defect still open)
+
+- **Not fixed.** Second attempt, and it is still open. What changed is that there is now a
+  **ten-line reproduction** instead of a whole lending mechanism: in `bin/fsd`'s `OPEN_AT` handler,
+  after a successful lookup, touch the file's own data block —
+  `if target.kind == Kind::File && target.direct[0] != 0 { let _ = cache.page(target.direct[0]); }`.
+  That block is not cached, so the service calls the block service **while it already owes its
+  caller a reply**, and `bin/blkd` faults. Nothing else is needed.
+- **What the evidence says now.** `thread 37 (blkd) expects space 0xf5a8000, cr3 holds 0xf5a8000` —
+  the right space, so not an address-space defect. blkd faults at `Virtqueue::describe` with
+  `self` = 1, and the whole register file is small integers: `rbx`, `rbp`, `r8`, `r9`, `r12`, `rdi`
+  all 1, `rcx` 0x10, `r10` 8. That is not one corrupted pointer; it is a thread resumed with
+  somebody else's register set — which points at a kernel stack or a `sysret` frame, not at IPC.
+- **Ruled out this round**: the address space (the report says it is right); a missing callee-saved
+  register in the context switch (all six are saved and restored); and the per-CPU privilege stack
+  `user_shell_entry` installs — removing it changes nothing, though it remains redundant with the
+  per-thread one the scheduler installs on every switch.
+- **One real bug was found and fixed on the way.** `user/shell` and `user/fsd` declared the system
+  call's method register as `in("rsi")`. The kernel pops the whole frame back on the way out, `rsi`
+  included, so declaring it preserved tells the compiler something the machine does not promise.
+  This project was bitten by exactly this once before, for the argument registers; `rsi` was the one
+  that was missed. It is not the cause of the fault above — the fault survives the fix — but it is a
+  live trap and it is gone.
+
 ### 2026-08-07 (RFC 0016 step 5 — the rule is proved; the hand-over is not)
 
 - **A pinned frame is never the one reused**, and a cache with every frame lent refuses rather than

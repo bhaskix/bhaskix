@@ -42,7 +42,11 @@ bhaskix-abi = { path = "../../abi" }
 # should be watched: `unsafe` in an unprivileged program is always a promise
 # about something the kernel did, and the promise is only as good as the
 # capability behind it. A fifth block would need a reason these four have.
-unsafe_budget = 26
+unsafe_budget = 27
+#
+# Up one for the comment on `rsi` inside the system call block: the counter
+# counts lines in an `unsafe` block, and this one explains why a register is
+# an in-out rather than an input.
 
 [profile.release]
 panic = "abort"
