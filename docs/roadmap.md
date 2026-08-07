@@ -2,6 +2,10 @@
 
 *Status: living document. Milestones are ordered by dependency, not dated.*
 
+*This file owns **scope** — what each milestone is and how it is judged. It does not own status:
+[TRACKER.md](../TRACKER.md) does, and where the two disagree about what is done, TRACKER wins. The
+status markers here are a summary of it and nothing more.*
+
 We do not publish dates. An unfunded volunteer kernel project that publishes dates publishes
 disappointments. What we publish instead is **ordering** and **exit criteria**: a milestone is done
 when its criteria pass in CI, and not before.
@@ -10,7 +14,7 @@ Every milestone has an exit criterion that a stranger can verify by running a co
 
 ---
 
-## Phase 0 — Design (current)
+## Phase 0 — Design ✅ complete, except its review criterion
 
 **Goal:** every load-bearing decision written down before it is made accidentally in code.
 
@@ -24,21 +28,31 @@ Every milestone has an exit criterion that a stranger can verify by running a co
 | [driver-model.md](driver-model.md) | ✅ draft — needs review |
 | [ai-native.md](ai-native.md) | ✅ draft — needs review |
 | [coding-style.md](coding-style.md) | ✅ adopted for Phase 1 |
-| Open decisions A1–A5 resolved by RFC | ⬜ **blocks M1 exit** |
-| Dev environment reproducible (`tools/setup-dev.sh`) | ⬜ |
-| CI: build, fmt, clippy, host tests, QEMU boot | ⬜ |
+| A1 license | ✅ [RFC 0001](rfc/0001-license-apache-2.0.md) — Apache-2.0 |
+| A2 syscall ABI shape · A3 IPC style · A4 userspace ABI | ✅ [RFC 0008](rfc/0008-syscall-and-ipc-shape.md) |
+| A5 5-level paging (LA57) | ⬜ open |
+| Dev environment reproducible (`tools/setup-dev.sh`) | ✅ |
+| CI: build, fmt, clippy, host tests, QEMU boot | ✅ |
+| Design-document review by two people who did not write them | ⬜ **outstanding** |
 
 **Exit criterion:** a new contributor clones the repo, runs `tools/setup-dev.sh && make run`, and
 gets a QEMU window. Documents reviewed by at least two people who did not write them.
 
-**Note on A1 (license):** this must be settled before the first external contribution is accepted.
-Relicensing a project with contributors is painful; relicensing one without them is free.
+**The first half passes; the second does not.** The documents have one author and no independent
+reviewers, so Phase 0's exit criterion is genuinely unmet — recorded here rather than quietly
+marked complete. It does not block code, and it should be closed before the architecture calcifies.
+
+**Correction, kept because it was wrong here for a long time.** This table listed A1–A5 as one row
+blocking *M1 exit*. They never blocked M1, which is boot and output and touches none of them; A1
+blocked *accepting external contributions*, and was settled before any arrived. A2, A3 and A4 were
+answered together by RFC 0008 — A4 by refusing its premise, since the native ABI *is* the syscall
+interface. A5 is the one still open.
 
 ---
 
-## Phase 1 — Foundation
+## Phase 1 — Foundation ✅ complete
 
-### M1 — Boot and output
+### M1 — Boot and output ✅ *(17/18 — M1-17, booting real hardware, is blocked on a machine)*
 
 *Vision milestone 1: "Boot with UEFI, print Hello from Bhaskix".*
 
@@ -52,7 +66,7 @@ Relicensing a project with contributors is painful; relicensing one without them
 **Exit:** `make run` prints `Hello from Bhaskix` to both serial and framebuffer, on UEFI and BIOS,
 on QEMU, and boots on at least one piece of real hardware.
 
-### M2 — CPU state and interrupts
+### M2 — CPU state and interrupts ✅
 
 *Vision milestone 2.*
 
@@ -66,7 +80,7 @@ on QEMU, and boots on at least one piece of real hardware.
 deliberately triggers a page fault, a GP fault, and a double fault reports all three correctly and
 does not reboot the machine.
 
-### M3 — Memory management
+### M3 — Memory management ✅
 
 *Vision milestone 3.*
 
@@ -80,7 +94,7 @@ does not reboot the machine.
 address spaces, assert free-frame count returns exactly to baseline) passes in QEMU; `alloc` types
 usable throughout the kernel.
 
-### M4 — Threads and scheduling
+### M4 — Threads and scheduling ✅
 
 *Vision milestone 4.*
 
@@ -93,7 +107,7 @@ usable throughout the kernel.
 **Exit:** N threads across M CPUs, 10⁷ ping-pong iterations, no lost wakeups, no stranded threads,
 lock-rank assertions clean. Fairness test: two equal-weight workloads get 50/50 ± 2%.
 
-### M5 — Domains, capabilities, syscalls, user mode
+### M5 — Domains, capabilities, syscalls, user mode ✅
 
 *Vision milestone 5.*
 
@@ -109,7 +123,7 @@ lock-rank assertions clean. Fairness test: two equal-weight workloads get 50/50 
 killed cleanly when it faults. A test asserts transitive revocation completes before the syscall
 returns. Two domains cannot see each other's memory — verified, not assumed.
 
-### M6 — Filesystem, ELF, shell
+### M6 — Filesystem, ELF, shell ✅ *(the ELF loader's 24 hours of fuzzing is still owed)*
 
 *Vision milestone 6.*
 
@@ -121,47 +135,61 @@ returns. Two domains cannot see each other's memory — verified, not assumed.
 **Exit:** boot to a shell, `ls` a real filesystem, load and run an ELF binary from disk. The ELF
 loader survives 24 hours of fuzzing without a crash.
 
-**Phase 1 complete.** Bhaskix is a real, if minimal, operating system.
+**Phase 1 complete.** Bhaskix is a real, if minimal, operating system: it boots, schedules threads
+across four CPUs, runs programs in ring 3 that hold capabilities and nothing else, and answers a
+user-mode shell from services in their own domains.
+
+Two exit criteria are owed rather than met, and are tracked as such: M1-17 has never booted on
+physical hardware, and the ELF loader has not had its 24 hours of fuzzing.
 
 ---
 
-## Phase 2 — Core Operating System
+## Phase 2 — Core Operating System 🔨 current
 
-Order within the phase is flexible; dependencies are noted.
+Order within the phase is flexible; dependencies are noted. Done so far — see
+[TRACKER.md](../TRACKER.md) §4 for the detail: shared memory and notifications, the service
+framework, IOMMU discovery and per-device domains, the driver framework, and the full VFS. What
+remains is process management, networking, the telemetry plane, `bhaskixboot.efi`, package
+management, and libc.
 
-- **Process management** — fork/exec-equivalent (capability-shaped, not POSIX-shaped), process trees,
-  reaping, signals-equivalent
-- **Full VFS** — [RFC 0015](rfc/0015-filesystem.md) (accepted). Mount points, a writable filesystem
-  with a journal, page cache. The RFC separates three things usually described as one: a namespace
-  that is not ambient (the root is currently the last place in this system where holding one
-  capability grants everything of a kind), a journal whose claim is tested by interrupting the
-  machine at every write rather than argued for, and a page cache that must be built after the
-  journal because the journal decides when a dirty page may go home
-- **Shared memory and notifications** — [RFC 0009](rfc/0009-shared-memory.md) (accepted) and
-  [RFC 0010](rfc/0010-notifications.md): a `Memory` object a capability names, and a doorbell to go
-  with it. Between them they complete RFC 0008's answer to A3, and they precede everything below:
-  a service framework whose bulk paths move sixteen bytes per round trip is a framework nobody will
-  measure twice
-- **Service framework** — [RFC 0013](rfc/0013-service-framework.md) (accepted). The `Service` trait,
-  both placements, and the CI job that builds both (this is the milestone that makes
+- ⬜ **Process management** — fork/exec-equivalent (capability-shaped, not POSIX-shaped), process
+  trees, reaping, signals-equivalent. Nothing creates a domain except boot code; RFC 0013 declined
+  to propose a supervisor, and this is where one belongs
+- ✅ **Full VFS** — [RFC 0015](rfc/0015-filesystem.md) and
+  [RFC 0016](rfc/0016-capability-in-a-reply.md), both implemented. A writable filesystem with a
+  journal and a page cache, running as a service in its own domain. The RFCs separate three things
+  usually described as one: a namespace that is not ambient — **the ambient root is gone**, a
+  directory is a badged capability the kernel stamps, and there is no way up out of one; a journal
+  whose claim is tested by interrupting the machine at every write rather than argued for; and a
+  page cache built after the journal, because the journal decides when a dirty page may go home
+- ✅ **Shared memory and notifications** — [RFC 0009](rfc/0009-shared-memory.md) and
+  [RFC 0010](rfc/0010-notifications.md), both implemented: a `Memory` object a capability names, and
+  a doorbell to go with it. Between them they complete RFC 0008's answer to A3, and they precede
+  everything below: a service framework whose bulk paths move sixteen bytes per round trip is a
+  framework nobody will measure twice
+- ✅ **Service framework** — [RFC 0013](rfc/0013-service-framework.md), implemented. The
+  `Service` trait, both placements, and the CI job that builds both (this is the milestone that
+  makes
   [architecture.md](architecture.md) §2 true rather than aspirational). Its precondition is met:
   until the bulk paths used shared memory the two placements were identical *by accident*, because
   four registers map into nobody
-- **IOMMU: discovery, per-device domains, strict mapping** — [RFC 0012](rfc/0012-iommu.md)
-  (accepted). VT-d first, because QEMU emulates it and a design CI cannot test will be wrong
-  unnoticed; an AMD machine runs degraded and says so. This is what funds `security.md` §1 T3
-  and T4, and what unblocks a driver running outside the kernel
-- **Driver framework** — [RFC 0014](rfc/0014-driver-framework.md) (**implemented**). PCIe/ECAM enumeration,
-  `register_block!`, `Mmio<T>`, mock-MMIO test harness. Its motivation is an invoice rather than a
+- ✅ **IOMMU: discovery, per-device domains, strict mapping** — [RFC 0012](rfc/0012-iommu.md),
+  implemented; interrupt remapping is built and **off**. VT-d first, because QEMU emulates it and a
+  design CI cannot test will be wrong unnoticed; an AMD machine runs degraded and says so. This is
+  what funds `security.md` §1 T3 and T4, and what unblocks a driver running outside the kernel
+- ✅ **Driver framework** — [RFC 0014](rfc/0014-driver-framework.md), implemented. PCIe/ECAM
+  enumeration, `register_block!`, `Mmio<T>`, mock-MMIO test harness. Its motivation is an invoice
+  rather than a
   plan: the second driver — `bin/blkd`, in a domain — cost three bugs the first one had already
   learned and written down in comments, and a framework is the difference between a lesson recorded
   and a lesson enforced
-- **Networking** — virtio-net, Ethernet, ARP, IPv4/IPv6, UDP, TCP, sockets
-- **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing tool
-- **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
+- ⬜ **Networking** — virtio-net, Ethernet, ARP, IPv4/IPv6, UDP, TCP, sockets
+- ⬜ **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing
+  tool
+- ⬜ **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
   sovereignty milestone the boot shim was designed to enable)
-- **Package management** and image building
-- **libc** — enough for real userspace software. Belongs to the **Linux personality**
+- ⬜ **Package management** and image building
+- ⬜ **libc** — enough for real userspace software. Belongs to the **Linux personality**
   ([RFC 0005](rfc/0005-linux-abi-compatibility.md)), not to native userspace: RFC 0008
   is accepted, and the native ABI *is* the capability interface, so a native program
   links no libc at all. The user-mode shell at M6-05 is the demonstration — it has no

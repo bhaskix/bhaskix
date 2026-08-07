@@ -16,19 +16,32 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 
 **Created and developed by [Tarun Kumar Kushwaha](AUTHORS.md)** — original author and project lead.
 
-> **Status: M3 — memory management.**
+> **Status: Phase 2 — core operating system.** Phase 1 is complete: M1 through M6, and M7 through
+> M9 on top of them.
 >
-> Boots on UEFI and BIOS. Interrupts and a calibrated timer; every CPU exception produces a decoded
-> diagnostic instead of a triple fault; a buddy physical allocator; a slab heap, so `Box` and `Vec`
-> work; address spaces with W^X enforced by construction; demand paging and copy-on-write serviced
-> from the region map; and a kernel stack with a guard page.
+> Boots on UEFI and BIOS. Every CPU exception produces a decoded diagnostic instead of a triple
+> fault. A buddy physical allocator and a slab heap; address spaces with W^X by construction;
+> demand paging and copy-on-write. Threads across four CPUs with per-CPU runqueues, a fair class
+> and tickless idle. Ring 3, `SYSCALL`/`SYSRET`, and capabilities with transitive revocation.
+> Synchronous IPC with badges, shared memory, notifications, and interrupts delivered to a domain.
+> An IOMMU giving a device its own translations. A journalled, writable filesystem with a page
+> cache. And a **user-mode shell** that reaches all of it through capabilities it holds and nothing
+> else — the block driver, the console, and the filesystem each run as services in their own
+> domains, outside the kernel.
 >
-> **It is still not an operating system.** There is no user mode, no processes, no scheduler, no
-> filesystem, and no networking. Nothing here should run anywhere that matters — see
+> **What is not here.** No networking. No process management: nothing creates a domain except boot
+> code. No package management, no libc, no self-hosting. The ELF loader has not had its 24 hours of
+> fuzzing. **Nothing has ever booted on physical hardware** — every claim above is QEMU, and M1-17
+> is blocked on a machine, not on code. Nothing here should run anywhere that matters — see
 > [SECURITY.md](SECURITY.md).
 >
+> **The design documents still have one author and no independent reviewers.** Phase 0's exit
+> criterion asks for two people who did not write them, and that is genuinely unmet rather than
+> quietly marked done.
+>
 > [TRACKER.md](TRACKER.md) is the single source of truth for what is *proven* versus what merely
-> compiles, and it records the gaps rather than hiding them.
+> compiles, and it records the gaps rather than hiding them. This block is a summary of it; where
+> they disagree, TRACKER wins.
 >
 > The design documents were written first, deliberately: kernel projects that begin with a clear
 > architecture evolve; those that begin with code rewrite.
@@ -96,18 +109,26 @@ tools/setup-dev.sh      # rust toolchain, qemu, limine, xorriso, ovmf
 make                    # build the kernel and a bootable ISO
 make run                # boot it in QEMU (BIOS)
 make run-uefi           # boot it in QEMU (UEFI, via OVMF)
-make test               # everything CI runs -- about 80 seconds
+make test               # everything CI runs -- about six minutes
 ```
 
 Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 (see [docs/nightly-features.md](docs/nightly-features.md)). Verified with Rust
 1.97.1, QEMU 4.2.1, and Limine 8.7.0.
 
-`make test` runs, in order: `rustfmt`, `clippy` on both the freestanding and
-host targets, 17 host unit tests, three project-invariant gates (bootloader
+`make test` runs, cheapest first, so a trivial mistake fails in seconds rather
+than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host
+targets; **327 host assertions**; the project-invariant gates (bootloader
 containment, `unsafe` budgets with mandatory `// SAFETY:` justifications,
-dependency direction), and BIOS + UEFI boot tests that assert on captured
-serial output.
+dependency direction, service placements, no vendor strings, SPDX headers);
+BIOS, UEFI and IOMMU boot tests asserting on captured serial output across four
+service placements; four modes of an **interactive shell test that types at the
+machine** and reads what comes back; and a fault-injection run that triggers six
+CPU exceptions and checks each is reported rather than triple-faulting.
+
+That is **492 checks**. A gate that has never been watched failing is not
+counted as a gate here — see [TRACKER.md](TRACKER.md), which records the ones
+that turned out to prove nothing and what was done about them.
 
 ## Contributing
 

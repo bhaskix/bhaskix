@@ -5,9 +5,9 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 
 | | |
 |---|---|
-| **Last updated** | 2026-08-05 |
+| **Last updated** | 2026-08-07 |
 | **Phase** | Phase 1 — Foundation |
-| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
+| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. **Process management is next** — nothing creates a domain except boot code — then networking |
 | **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-17 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 492 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 327 host assertions |
 
 ### Division of responsibility between documents
@@ -81,7 +81,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **IR1** | Interrupt authority | ✅ **Accepted** 2026-08-04 | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU (RFC 0012, draft), and the RFC says so rather than implying otherwise — **steps 1–4 are unblocked and worth doing alone.** | [RFC 0011](docs/rfc/0011-irq-handler.md) |
 | **IO1** | IOMMU | ✅ **Accepted** 2026-08-04 | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Roadmap changed on acceptance**: discovery, per-device domains and strict mapping moved from Phase 3 to Phase 2; interrupt remapping and nested translation stay. | [RFC 0012](docs/rfc/0012-iommu.md) |
 | **SF1** | Service framework | ✅ **Accepted** 2026-08-05 | The trait, the two placements, the build selection, and the CI job that builds **both** for every service. `architecture.md` §2 has claimed relocatable services since Phase 0 and **none of it exists** — no trait, no placement selection, no service that has ever run outside the nucleus. Could not have been written before M6-18: until the bulk path used shared memory the two placements were identical *by accident*, because four registers map into nobody. Acceptance decides two of its four open questions — the nucleus placement dispatches **through IPC** rather than by direct call, and the placement table is a **build-time** input with a command-line override for tests only. Two stay open: a caller whose service died blocks for ever (the fix needs an endpoint that reports revocation), and whether the console is honestly relocatable at all. Acceptance also corrected `architecture.md`, which described both of this RFC's safeguards in the present tense when neither existed. | [RFC 0013](docs/rfc/0013-service-framework.md) |
-| **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | *Blocks M3* |
+| **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
 > exit. They do not — M1 is boot and output, which none of them touch. The real gates are as shown
@@ -610,7 +610,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | 🔨 **M9 in progress** — RFC 0015's six steps are built; **[RFC 0016](rfc/0016-capability-in-a-reply.md) drafted** for what is left: a reply that carries a capability, the filesystem out of the nucleus, and `block::WRITE`, which was owed from RFC 0015 step 1 and means the journal has never written to a device | Three things, not one. The **root is ambient** — the last place here where holding one capability grants everything of a kind — and closing that is a design decision, not a feature. The journal is the hard part, and its claim is tested by interrupting the machine at *every* write. The cache comes last because the journal decides when a dirty page may go home. First blocker: `bin/blkd` is a driver with no interface, so nothing can ask it for a block |
+| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: the ELF loader's 24 hours of fuzzing (M6), and mount points, which nothing has needed yet |
 | Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -659,6 +659,71 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-07 (the status documents reconciled against this file)
+
+- **README.md said "Status: M3 — memory management"** and, below it, "There is no user mode, no
+  processes, no scheduler, no filesystem". All four exist, run in domains, and are gated. The status
+  block now describes Phase 2 and names what is **not** there — no networking, no process
+  management, no libc, the ELF loader's fuzzing still owed, nothing ever booted on real hardware,
+  and Phase 0's review criterion unmet.
+- **`docs/roadmap.md` labelled Phase 0 "(current)"** and listed A1–A5 as one unresolved row blocking
+  M1 exit. A1 was settled by RFC 0001 and A2–A4 together by RFC 0008; only **A5** is open, and the
+  row never blocked M1 in the first place. Phases and milestones now carry status markers, and the
+  correction is written into the file rather than silently applied.
+- **The roadmap still claimed the root was ambient** — "the last place in this system where holding
+  one capability grants everything of a kind". RFC 0016 step 4 deleted it. A directory is a badged
+  capability the kernel stamps, and there is no way up out of one.
+- **README's build section was wrong about its own test suite**: "about 80 seconds", "17 host unit
+  tests", "three project-invariant gates". Measured: **390 seconds, 327 host assertions, 492
+  checks**, seven gates, four boot placements, four shell-test modes, six injected faults.
+- **Scope kept where it belongs.** The roadmap owns milestone definitions and exit criteria, and not
+  one of them was edited — only the status labels that were false, plus a banner saying this file
+  owns status and roadmap owns scope. That division is rule §1 of this document and it is what
+  stopped the drift being fixed in the wrong place.
+- **Nothing here changes code.** Recorded because a documentation-only commit that also touches
+  behaviour is how a status file starts lying again.
+
+### 2026-08-07 (the tickless gate was reporting a real defect as a near-miss)
+
+- **A gate failing one run in four was not flaky.** 165 ticks idle against 327 busy, three the wrong
+  side of a 2× threshold. One CPU had been ticking flat out with nothing to run on **every boot
+  since M4**, and two CPUs' worth of ticks in a window that should hold one is exactly that ratio.
+- **The cause was ordering.** `scheduling_self_test` ends with `stop_all()` to freeze the world for
+  reporting; `start_all()` sat four tests further down, so the gate ran inside the frozen window.
+  `needs_preemption_tick` reads a stopped queue through the same `started` flag it uses for *early
+  boot* — keep ticking, the timer is not proven yet — so every frozen CPU armed a slice it had
+  nothing to preempt to. `stop_all` skips contended queues, which is why one CPU ticked and its
+  neighbours did not.
+- **The busy half was measuring nothing at all.** The burner threads were spawned into a stopped
+  scheduler and never ran, so both windows counted the same frozen CPUs. A gate that appeared to
+  test two states was testing one.
+- **A machine-wide counter could not have found this**, and that is the lesson worth keeping: it has
+  no term for *which* CPU, and a ratio against a busy baseline has room to swallow one broken
+  processor in three. Now counted per CPU, bounded by a number derived from `IDLE_BACKSTOP_MS`
+  rather than a ratio, retried instead of settled-for-a-fixed-time so host load cannot decide the
+  answer, and it reports **why** a CPU is awake — what it armed for, and the threads it holds.
+- Idle went from 165 ticks to 1. Watched failing both ways, with a distinct message for each.
+
+### 2026-08-07 (RFC 0016 step 5 — the hand-over, and three negative tests that caught nothing)
+
+- **Supersedes the entry below** that recorded the rule as proved and the hand-over as blocked. The
+  hand-over is in: `bin/fsd` pins the frame holding a file's data and `HAND`s back a read-only
+  derivation of that one page; the shell maps it and reads the file's bytes **out of the service's
+  own cache**, with nothing copied.
+- **The cache is eight one-page `Memory` objects**, not one object of eight pages. Forced rather
+  than chosen: frames are not contiguous, so a single object cannot be handed out a page at a time,
+  and handing over the whole object is the disclosure being avoided.
+- **Three of four breakages caught nothing.** Making `pin` a no-op: not caught, because a lend
+  nothing competes for proves nothing. Lending a frame by index rather than by the pin: not caught.
+  Lending the whole cache object: not caught, because there is no whole to lend. Lending it
+  writable: caught.
+- **The fix was pressure, and the amount mattered.** Churning the cache by exactly its own size was
+  still not enough — the frame just read is the last one an LRU cache gives up. At twice its size a
+  deleted pin is immediate: the caller is handed the **directory** block, and both gates fail on the
+  bytes. An intermediate version of this comment claimed a catch it had not made; the claim was
+  wrong and was corrected before commit.
+- **RFC 0016 is complete**, steps 1–5. M9-15 `DONE`.
 
 ### 2026-08-05 (RFC 0012 step 6, third attempt — the leading theory was wrong)
 
