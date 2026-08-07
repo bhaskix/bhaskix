@@ -502,3 +502,15 @@ Five steps. The first is independent of the rest and should not wait for it.
 
 5. **Lending a cached frame**, with pinning and the eviction gate. Last, because it is the only step
    whose failure is silent, and it should be built when everything under it is already trusted.
+
+   🔨 **The rule is done; the hand-over is not.** A frame can be pinned, a pinned frame is never
+   chosen for eviction, a cache with every frame lent refuses rather than taking one back, and
+   forgetting keeps what is lent. Proved on the host, checked after *every* eviction rather than
+   once, and watched failing with the pin removed.
+
+   The machine hand-over — one `Memory` object per frame, lent read-only through a `MAP` method on a
+   file handle — is written and reverted. It reaches a fault in `bin/blkd`, in its own address space,
+   with a corrupted queue pointer, at the moment the filesystem service reads a block **while it
+   already owes its caller a reply**. That is the nested-call hypothesis this RFC withdrew after
+   step 4, and withdrawing it was premature: the evidence against it was a lookup that hit the cache
+   and therefore made no nested call. It is the next thing to find.

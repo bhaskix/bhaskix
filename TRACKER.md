@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-14 (RFC 0015 steps 1–6, RFC 0016 steps 1–4) · CI green · 489 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 324 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-15 (RFC 0015 steps 1–6, RFC 0016 steps 1–4, step 5's rule) · CI green · 489 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 327 host assertions |
 
 ### Division of responsibility between documents
 
@@ -150,6 +150,8 @@ fairness within 2% for two equal-weight workloads.
 | M9-12 | RFC 0016 step 3 (second half): the filesystem, in a domain, reading a real disk | ✅ `DONE` | `bin/fsd` mounts the disk through the block service and reads a file the kernel wrote into that same filesystem through **its** copy of the same crate — two copies of one parser, one disk, the same answer. The program contains **no filesystem code**: it links `bhaskix-fs` and supplies a `Store` made of system calls, which is the whole return on RFC 0015 step 6. It holds two capabilities — the block service's endpoint and one memory object it maps — and has no registers, no interrupt, no DMA window and no way to name a disk. It starts by default: the defect that made it opt-in was **a ring 3 thread that was not pinned**, and that is now refused at the door rather than avoided. |
 
 | M9-14 | RFC 0016 step 4: the namespace out of the kernel | ✅ `DONE` | Built and working: a `dir::` protocol in the ABI; `bin/fsd` answering `OPEN_AT` with the namespace rules moved out of `kernel/src/namespace.rs` unchanged — one component, no separators, no `..`, a generation checked, and a name outside the directory held answering exactly as one that exists nowhere; badged endpoint capabilities as directory handles, which the kernel stamps and cannot forge; the disk carrying the same tree the shell's gates describe. Watched working from the shell: `8 directory reachable` and `10 stale dir the directory it named is gone`, both through the service. `kernel/src/namespace.rs`, `ObjectKind::Directory`, `ObjectKind::File`, `OPEN_AT`, `NoSuchName` and `BadName` are **deleted**. All six RFC 0015 step 4 shell gates pass **unchanged**, through the service. |
+
+| M9-15 | RFC 0016 step 5: a lent frame is never the one reused | 🔨 `RULE DONE, HAND-OVER BLOCKED` | The rule is built and proved: a cache frame can be **pinned**, a pinned frame is never chosen for eviction, a cache with every frame lent **refuses** rather than taking one back, and forgetting keeps what is lent. Three host tests, and the headline one checks the lent frame after **every** eviction — with `block_in`, which does not *want* the frame, because the first version asked through `page` and thereby kept it permanently the most recently used, so it passed with the pin deleted. Watched failing with the pin removed from eviction, and with forgetting made unconditional. The machine hand-over — one `Memory` object per frame, lent read-only on a file handle — is written and **reverted**: it is blocked by the defect below. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -747,6 +749,30 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-07 (RFC 0016 step 5 — the rule is proved; the hand-over is not)
+
+- **A pinned frame is never the one reused**, and a cache with every frame lent refuses rather than
+  taking one back. Three host tests; the headline one checks the lent frame after **every** eviction
+  rather than once, because "eviction respects a pin sometimes" is not the claim.
+- **My first version of that test could not fail.** It checked the pinned frame through `page`,
+  which *wants* it — so the frame stayed permanently the most recently used and nothing would have
+  evicted it, pin or no pin. It passed with the pin deleted. Now checked through `block_in`, which
+  asks without wanting. Eleventh time in this project.
+- **The machine hand-over is written and reverted.** One `Memory` object per frame — forced, because
+  a cache in one object can only be lent whole and lending it whole hands a reader every other block
+  in it — and a `MAP` method that pins and lends read-only. It reaches a fault in `bin/blkd`.
+- **The new fault diagnostic earned itself immediately.** `thread 37 (blkd) expects space 0xf5b3000,
+  cr3 holds 0xf5b3000` — the right space, so **not** an address-space defect. blkd faults in its own
+  memory with a garbage `queue` pointer, reached when the filesystem service reads a block *while it
+  already owes the shell a reply*.
+- **So I withdraw a withdrawal.** I said the nested-call theory was wrong. The evidence for that was
+  a lookup that happened to hit the cache and so made no nested call at all. This one misses, calls
+  the block service mid-reply, and faults. The theory is back on the table and it was retired too
+  early.
+- **Four silent no-op edits in one session.** A scripted `.replace` whose anchor `cargo fmt` had
+  reformatted matches nothing and says nothing, and the machine then behaves as though code that was
+  never written is misbehaving. Every edit in the second half of this work asserts its anchor first.
 
 ### 2026-08-07 (RFC 0016 step 4 — done, and the defect was not what it looked like)
 

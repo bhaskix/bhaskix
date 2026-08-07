@@ -1234,6 +1234,104 @@ mod tests {
     }
 
     #[test]
+    fn a_lent_frame_is_never_the_one_reused() {
+        // RFC 0016 step 5, and the only claim here whose failure is silent: a
+        // frame lent out and then given to another block is a holder reading
+        // somebody else's data, with nothing to see and nothing to log.
+        //
+        // So this is not "eviction respects a pin once". Every read below
+        // forces a choice, and the pinned frame is checked after **every one**
+        // -- both that it still names its block and that its bytes are the
+        // bytes that were lent.
+        let mut bytes = image(64);
+        let marker = [0x5au8; BLOCK];
+        {
+            let mut pages = vec![0u8; 4 * BLOCK];
+            let mut cache = Cache::new(&mut pages, Device::new(&mut bytes)).unwrap();
+            cache.put(40, &marker).expect("a block to lend");
+            cache.flush().expect("on the device");
+
+            let lent = cache.pin(40).expect("held");
+            assert!(cache.pinned(lent));
+
+            // Far more reads than frames, so every unpinned frame is chosen
+            // several times over.
+            //
+            // The lent frame is checked with `block_in`, which does **not**
+            // want it. Checking with `page` was the first version, and it kept
+            // block 40 permanently the most recently used frame -- so nothing
+            // would ever have evicted it, pin or no pin, and the test passed
+            // with the pin deleted.
+            for round in 0..3 {
+                for block in 41..=52u32 {
+                    let seen = cache.page(block).expect("a read").to_vec();
+                    assert_eq!(seen.len(), BLOCK);
+
+                    assert_eq!(
+                        cache.block_in(lent),
+                        Some(40),
+                        "round {round}, after reading {block}: the lent frame was reused"
+                    );
+                    assert!(
+                        cache.pinned(lent),
+                        "round {round}, after reading {block}: the pin was lost"
+                    );
+                }
+            }
+
+            // And its bytes are the bytes that were lent -- read last, once
+            // the choosing is over, so that reading them cannot be what kept
+            // them.
+            assert_eq!(cache.page(40).expect("the lent block"), &marker[..]);
+            assert_eq!(cache.pin(40).expect("still held"), lent);
+        }
+    }
+
+    #[test]
+    fn a_cache_with_every_frame_lent_refuses_rather_than_reusing_one() {
+        // The other half. A rule that is only obeyed while there is something
+        // else to take is not a rule, so this takes everything else away.
+        let mut bytes = image(64);
+        let mut pages = vec![0u8; MIN_FRAMES * BLOCK];
+        let mut cache = Cache::new(&mut pages, Device::new(&mut bytes)).unwrap();
+        for block in 40..40 + MIN_FRAMES as u32 {
+            cache.pin(block).expect("held");
+        }
+        assert_eq!(
+            cache.page(50).map(|_| ()).unwrap_err(),
+            FsError::Full,
+            "a cache with nothing it may reuse took something it had lent"
+        );
+
+        // Letting one go makes room again, which is what says the refusal was
+        // about the pins and not about the cache being broken.
+        cache.unpin(0);
+        assert!(cache.page(50).is_ok());
+    }
+
+    #[test]
+    fn forgetting_keeps_what_is_lent() {
+        // `forget` is about what the cache *remembers*. What somebody else is
+        // holding is not the cache's to forget, and a frame dropped while lent
+        // is the same disclosure by a quieter route.
+        let mut bytes = image(64);
+        let marker = [0x77u8; BLOCK];
+        let mut pages = vec![0u8; 4 * BLOCK];
+        let mut cache = Cache::new(&mut pages, Device::new(&mut bytes)).unwrap();
+        cache.put(41, &marker).unwrap();
+        cache.flush().unwrap();
+        let lent = cache.pin(41).unwrap();
+        let _ = cache.page(42).unwrap();
+
+        cache.forget();
+        assert!(
+            cache.pinned(lent),
+            "forgetting dropped a frame that was lent"
+        );
+        assert_eq!(cache.page(41).unwrap(), &marker[..]);
+    }
+
+    #[test]
     fn the_smallest_cache_a_filesystem_can_have_still_works() {
         // Two frames, which is what copying a block to another block needs and
         // nothing more. Everything above runs with sixteen; a cache that only

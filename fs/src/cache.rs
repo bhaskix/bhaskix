@@ -189,6 +189,14 @@ struct Slot {
     dirty: bool,
     /// When it was last wanted, for choosing what to evict.
     used: u64,
+    /// Whether somebody outside holds a capability to this frame.
+    ///
+    /// A pinned frame is never chosen for eviction. That is not an
+    /// optimisation: a frame lent out and then reused is a holder reading
+    /// somebody else's block, with nothing to see. RFC 0016 step 5 put this
+    /// last for exactly that reason — it is the only step here whose failure
+    /// is silent.
+    pinned: bool,
 }
 
 /// Blocks kept in frames, written back rather than written through.
@@ -277,6 +285,84 @@ impl<'f, S: Store> Cache<'f, S> {
             .position(|slot| slot.block == Some(block))
     }
 
+    /// The frame to use next: an empty one, or the least recently wanted.
+    ///
+    /// **Never a pinned one.** Somebody outside is holding a capability to it,
+    /// and giving that frame to another block would hand them somebody else's
+    /// data — silently, which is why this is the one function in the cache
+    /// that must not be got subtly wrong.
+    ///
+    /// `None` when every frame is pinned. That is a refusal and not a stall: a
+    /// cache with nothing it may reuse cannot admit anything, and saying so
+    /// beats evicting something it promised not to.
+    fn victim(&self) -> Option<usize> {
+        // An empty frame first, because using one costs nothing and evicting
+        // one costs a read later. No pin check here: a pinned frame always
+        // holds a block, since pinning is `admit` followed by marking, so
+        // `block.is_none()` already excludes them. A second condition would be
+        // one no test could ever reach.
+        if let Some(free) = self.slots[..self.count]
+            .iter()
+            .position(|slot| slot.block.is_none())
+        {
+            return Some(free);
+        }
+        let mut oldest = None;
+        for (index, slot) in self.slots[..self.count].iter().enumerate() {
+            if slot.pinned {
+                continue;
+            }
+            match oldest {
+                Some(best) if slot.used >= self.slots[best as usize].used => {}
+                _ => oldest = Some(index as u32),
+            }
+        }
+        oldest.map(|index| index as usize)
+    }
+
+    /// Holds the frame `block` is in, and says which frame that is.
+    ///
+    /// For lending it out. While a frame is pinned the cache will not choose
+    /// it, so a capability to it keeps naming the block it named.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::page`].
+    pub fn pin(&mut self, block: u32) -> Result<usize, FsError> {
+        let slot = self.admit(block)?;
+        self.slots[slot].pinned = true;
+        Ok(slot)
+    }
+
+    /// Lets go of a frame, so it may be reused again.
+    ///
+    /// The caller must have revoked whatever it lent, first. Nothing here can
+    /// check that — the cache does not know what a capability is — which is
+    /// why it is said here rather than assumed.
+    pub fn unpin(&mut self, slot: usize) {
+        if let Some(held) = self.slots.get_mut(slot) {
+            held.pinned = false;
+        }
+    }
+
+    /// Whether `slot` is being held by somebody outside.
+    #[must_use]
+    pub fn pinned(&self, slot: usize) -> bool {
+        self.slots.get(slot).is_some_and(|held| held.pinned)
+    }
+
+    /// Which block is in `slot`, **without wanting it**.
+    ///
+    /// Asking through [`Cache::page`] would answer the same question and
+    /// change the answer to the next one: it marks the frame as recently used,
+    /// which is exactly what decides eviction. A test that checked a pinned
+    /// frame that way kept it the most recently used frame in the cache, and
+    /// so passed with the pin deleted.
+    #[must_use]
+    pub fn block_in(&self, slot: usize) -> Option<u32> {
+        self.slots.get(slot).and_then(|held| held.block)
+    }
+
     /// Writes one frame back, if it needs it.
     fn write_back(&mut self, slot: usize) -> Result<(), FsError> {
         if !self.slots[slot].dirty {
@@ -312,20 +398,7 @@ impl<'f, S: Store> Cache<'f, S> {
             return Ok(slot);
         }
 
-        // The least recently wanted frame. An empty one first, because using
-        // one costs nothing and evicting one costs a read later.
-        let slot = self.slots[..self.count]
-            .iter()
-            .position(|slot| slot.block.is_none())
-            .unwrap_or_else(|| {
-                let mut oldest = 0;
-                for (index, slot) in self.slots[..self.count].iter().enumerate() {
-                    if slot.used < self.slots[oldest].used {
-                        oldest = index;
-                    }
-                }
-                oldest
-            });
+        let slot = self.victim().ok_or(FsError::Full)?;
 
         // Evicting a dirty page writes it. That is a device write happening
         // because somebody read something else, which is worth stating: the
@@ -342,6 +415,9 @@ impl<'f, S: Store> Cache<'f, S> {
             block: Some(block),
             dirty: false,
             used: self.clock,
+            // A frame chosen for reuse was never pinned -- `victim` will not
+            // return one -- so this is a restatement rather than a change.
+            pinned: false,
         };
         Ok(slot)
     }
@@ -366,18 +442,7 @@ impl<'f, S: Store> Cache<'f, S> {
                 slot
             }
             None => {
-                let slot = self.slots[..self.count]
-                    .iter()
-                    .position(|slot| slot.block.is_none())
-                    .unwrap_or_else(|| {
-                        let mut oldest = 0;
-                        for (index, slot) in self.slots[..self.count].iter().enumerate() {
-                            if slot.used < self.slots[oldest].used {
-                                oldest = index;
-                            }
-                        }
-                        oldest
-                    });
+                let slot = self.victim().ok_or(FsError::Full)?;
                 self.write_back(slot)?;
                 slot
             }
@@ -388,6 +453,7 @@ impl<'f, S: Store> Cache<'f, S> {
             block: Some(block),
             dirty: true,
             used: self.clock,
+            pinned: self.slots[slot].pinned,
         };
         Ok(())
     }
@@ -476,7 +542,14 @@ impl<'f, S: Store> Cache<'f, S> {
     /// this cache remembers — which is how a test tells a write that happened
     /// from one that was only promised.
     pub fn forget(&mut self) {
-        self.slots = [Slot::default(); MAX_FRAMES];
+        // Pins survive: forgetting is about what the cache *remembers*, not
+        // about what somebody else is holding. A frame dropped while lent is
+        // the disclosure this is all here to avoid.
+        for slot in &mut self.slots {
+            if !slot.pinned {
+                *slot = Slot::default();
+            }
+        }
     }
 }
 
