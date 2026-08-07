@@ -236,6 +236,66 @@ _start:
     mov rdx, 5
     syscall
 
+    // --- RFC 0017 step 4: a program creates a domain -----------------------
+    //
+    // Capability 3 is a `DomainControl` this domain was given. Nothing else in
+    // this program can do this, and nothing in the kernel arranged it: ring 3
+    // asks, and the kernel decides.
+    //
+    // Three asks, and the two refusals matter as much as the success. The
+    // envelope allows exactly one child, so the second must be refused for a
+    // reason that is about the *budget* and not about the capability -- which
+    // is what stops one capability exhausting a table of 32 for the whole
+    // machine.
+    mov rax, 0                  // Kind::Invoke
+    mov rdi, 3                  // capability 3: DomainControl
+    mov rsi, 49                 // method::SPAWN
+    mov rdx, 6                  // put the new Domain capability in slot 6
+    mov r10, 0x646c696863       // "child", packed little-endian
+    xor r8, r8
+    syscall
+    mov r12, rax                // must be OK
+
+    // The same again, into a different slot. The capability is still good; the
+    // budget is not.
+    mov rax, 0
+    mov rdi, 3
+    mov rsi, 49
+    mov rdx, 7
+    mov r10, 0x646c696863
+    xor r8, r8
+    syscall
+    mov r13, rax                // must be QUOTA_EXCEEDED
+
+    // And on something that is not a `DomainControl` at all. Capability 0 is
+    // the endpoint this program has been calling all along, so this asks
+    // whether the *kind* is checked rather than merely the rights.
+    mov rax, 0
+    xor rdi, rdi
+    mov rsi, 49
+    mov rdx, 8
+    xor r10, r10
+    xor r8, r8
+    syscall
+    mov r14, rax                // must be WRONG_OBJECT
+
+    // Report all three at once. One message rather than three, so the service
+    // cannot see a partial answer and call it a pass.
+    //
+    // Before the revocation below, and that is not an ordering preference: the
+    // report travels on capability 0, and the revocation takes capability 0
+    // away. Placed after it, this call reaches nobody and every check it feeds
+    // fails for a reason that has nothing to do with what it is testing --
+    // which is exactly what the first version of this did.
+    mov rax, 1                  // Kind::Call
+    xor rdi, rdi
+    mov rsi, 13                 // method: "here is what the kernel said"
+    mov rdx, r12
+    mov r10, r13
+    mov r8, r14
+    syscall
+
+
     // Revoke the parent. Transitively, that must take the derived copy too.
     mov rax, 0                  // Kind::Invoke
     xor rdi, rdi

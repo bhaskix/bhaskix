@@ -155,14 +155,17 @@ There is no pid, no parent pointer and no process group. **Whoever holds a `Doma
 that domain's parent**, and a domain may have several parents in the sense that several holders can
 act on it — which is not a defect, it is what a capability means.
 
-The tree already exists and is already transitive. `domain::create` documents its own root
-capability as *"the root of everything it will ever be granted, which is what makes destruction
-total: revoking it revokes the whole derived subtree, in every other domain's CSpace, before
-`destroy` returns."* A child domain's capability is derived from its creator's, so killing a parent
-already kills every descendant, through machinery that is built and negative-tested.
+**Corrected after building step 4.** This section claimed the tree was already transitive, because
+`domain::create` documents its root capability as *"the root of everything it will ever be granted,
+which is what makes destruction total"*. That is true of everything a domain is **granted** and not
+of the domains it **creates**: a child's root is inserted into the arena as a root of its own, not
+derived from its creator's, so revoking the creator reaches the copy it was handed and stops there.
+A program created a domain, its creator was destroyed, and the child was still live.
 
-This is the whole answer to "process trees" in the roadmap bullet. It costs one line of new
-structure: none.
+So `destroy` walks its children explicitly. The parent link carries a **generation** as well as a
+slot index, because slots are reused and a child recording "my parent is slot 5" would otherwise be
+claimed by whatever occupied slot 5 next — and destroying that would take an unrelated domain with
+it, which is the worst available outcome for a mechanism whose job is to stop things deliberately.
 
 ### Death, and the four ways it happens
 
@@ -407,9 +410,33 @@ crashing.
 
    This is also where the syscall-return safe point earns its keep: the woken caller is *in the
    kernel*, and the call it returns from is where it finds out.
-4. **`DomainControl`, and creating a domain from ring 3.** The control object, the inline name, and
-   the envelope charging children to their creator — the last of which is not optional, because
-   without it this step reopens T10.
+4. ~~**`DomainControl`, and creating a domain from ring 3.**~~ ✅ **Done.** The first thing in this
+   system that lets a program bring an object into existence. A `SPAWN` method on a `DomainControl`
+   capability creates a domain and installs a capability to it in a slot the caller names; what comes
+   back holds **nothing**.
+
+   **Two things are required, and neither is sufficient.** The capability says who may ask; the
+   envelope's `max_child_domains` — zero by default — says how often. Either alone would let one
+   holder exhaust a table with 32 entries in it, which is T10 through the door this step opens. Both
+   are watched failing separately.
+
+   **The name comes out of two registers**, not user memory. Sixteen bytes, truncated. That keeps the
+   call free of a user pointer to validate and a fault path to get wrong, and a name is a diagnostic
+   aid that should not be able to fail.
+
+   **A claim in this RFC was wrong and is corrected.** §*The process tree is the capability tree*
+   said killing a parent already kills its descendants "through machinery that is built and
+   negative-tested". It does not: `create` inserts a domain's root into the arena as a *root*, not
+   derived from its creator's, so revoking the creator reaches the copy it was handed and stops.
+   Measured — a program created a domain, its creator was destroyed, and the child was still live.
+   `destroy` now walks its children explicitly, and the parent link carries a **generation** so a
+   reused slot cannot be mistaken for the parent that is gone.
+
+   **The badge rule caught its own author twice.** Deriving the creator's capability with badge zero
+   is refused, because a domain's root is badged with its id and RFC 0016 step 1 made badging
+   one-way. It refused the first working version of `spawn`, and then silently refused a *breakage*
+   written to test the child-is-empty check — which is how that check was found to be reading a
+   quota counter instead of the child's CSpace.
 5. **Starting a program.** Entry point, stack, and the first thread; the ELF loader reachable from a
    domain rather than only from boot code.
 6. **Reaping.** The notification bound to a `Domain` capability, `INFO` returning state and reason,

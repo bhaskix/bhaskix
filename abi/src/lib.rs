@@ -205,6 +205,19 @@ pub mod method {
     /// copy, `arg2` = its badge. Where it lands comes from the caller's
     /// [`EXPECT`] and not from here.
     pub const HAND: u64 = 47;
+    /// Create a domain, and put a capability to it in a slot this program names.
+    ///
+    /// Only on a `DomainControl` capability. `arg0` = the slot in this
+    /// program's own CSpace for the new `Domain` capability, which must be
+    /// empty; `arg1` and `arg2` = up to sixteen bytes of name, packed
+    /// little-endian and truncated at the first zero.
+    ///
+    /// What comes back is **empty**: no threads, no capabilities, no address
+    /// space. Everything it will ever hold is passed to it afterwards, one
+    /// `GRANT` at a time, which is the whole reason this is three steps rather
+    /// than one. Refused if the slot is occupied, if the creator's envelope
+    /// allows no more children, or if the domain table is full.
+    pub const SPAWN: u64 = 49;
 }
 
 /// The bits a capability's rights are made of.
@@ -249,6 +262,15 @@ pub mod status {
     pub const SLOT_UNAVAILABLE: u64 = 11;
     /// The object does not answer that method.
     pub const NO_SUCH_METHOD: u64 = 10;
+    /// This domain's quota for the thing asked for is full.
+    pub const QUOTA_EXCEEDED: u64 = 12;
+    /// A resource the whole machine shares is used up.
+    ///
+    /// Distinct from [`QUOTA_EXCEEDED`]: "you may not have another" and
+    /// "nobody may have another" call for different responses. The first is
+    /// about this program's envelope; the second is about the machine, and
+    /// only asking again later can help.
+    pub const EXHAUSTED: u64 = 13;
 }
 
 /// Methods the console service answers.

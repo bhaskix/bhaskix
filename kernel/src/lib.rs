@@ -1157,6 +1157,11 @@ const BADGE_RING3: u64 = 0x0000_0000_1234_0000;
 const BADGE_DERIVED: u64 = 0x0000_0000_5678_0000;
 /// The method the probe uses on the capability it derived legitimately.
 const RING3_DELEGATED_METHOD: u64 = 9;
+/// The method the probe reports its three `SPAWN` results on. RFC 0017 step 4.
+const RING3_SPAWN_METHOD: u64 = 13;
+/// What the kernel answered each of the probe's three `SPAWN` attempts.
+static RING3_SPAWN: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 3];
 /// What the probe asks for, and what it must be told.
 const RING3_REQUEST: u64 = 6;
 
@@ -1187,6 +1192,15 @@ extern "C" fn ring3_service(_argument: u64) -> ! {
                 // say which of the loader's obligations was not met.
                 if message.method == RING3_SEGMENT_METHOD {
                     RING3_SEGMENTS.store(message.args[0], Ordering::Release);
+                }
+
+                // The three answers to "may I create a domain", recorded
+                // together. One message rather than three, so a partial answer
+                // cannot be read as a pass.
+                if message.method == RING3_SPAWN_METHOD {
+                    for (slot, answer) in RING3_SPAWN.iter().zip(message.args) {
+                        slot.store(answer, Ordering::Release);
+                    }
                 }
 
                 // The badge on the call made through the capability ring 3
@@ -1634,7 +1648,12 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         core::sync::atomic::Ordering::Release,
     );
 
-    let Ok(realm) = domain::create("ring3", domain::ResourceEnvelope::new()) else {
+    // One child, and exactly one. The probe asks twice: the second refusal is
+    // the T10 check, and a budget of two would test nothing.
+    let Ok(realm) = domain::create(
+        "ring3",
+        domain::ResourceEnvelope::new().max_child_domains(1),
+    ) else {
         println!("    ring 3         FAILED to create a domain");
         return false;
     };
@@ -1656,6 +1675,31 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     if domain::with(realm, |owner| owner.cspace.install_at(0, granted).is_ok()) != Some(true) {
         println!("    ring 3         FAILED to install the endpoint capability");
         return false;
+    }
+
+    // A `DomainControl` at index 3. Holding it is the authority to create a
+    // domain and nothing else -- and it is not sufficient on its own, which is
+    // what the second of the probe's three asks demonstrates.
+    let control = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::DomainControl, 0),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, 0).ok()
+    });
+    let Some(control) = control else {
+        println!("    ring 3         FAILED to derive a DomainControl");
+        return false;
+    };
+    if domain::with(realm, |owner| owner.cspace.install_at(3, control).is_ok()) != Some(true) {
+        println!("    ring 3         FAILED to install the DomainControl");
+        return false;
+    }
+    for answer in &RING3_SPAWN {
+        answer.store(u64::MAX, core::sync::atomic::Ordering::Release);
     }
 
     let (calls_before, refused_before, revoked_before) = syscall::statistics();
@@ -1695,10 +1739,37 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let forged = RING3_FORGED.load(core::sync::atomic::Ordering::Acquire);
     let echoed = RING3_ECHOED.load(core::sync::atomic::Ordering::Acquire);
     let segments = RING3_SEGMENTS.load(core::sync::atomic::Ordering::Acquire);
+    let spawned = [
+        RING3_SPAWN[0].load(core::sync::atomic::Ordering::Acquire),
+        RING3_SPAWN[1].load(core::sync::atomic::Ordering::Acquire),
+        RING3_SPAWN[2].load(core::sync::atomic::Ordering::Acquire),
+    ];
+
+    // Everything about the child, read *before* the parent is destroyed. After
+    // that the answers would all be "gone", which is true and says nothing.
+    let child = domain::child_of(realm);
+    let child_name = child.and_then(domain::name_of);
+    // What the child *holds*, not what it has been charged for.
+    //
+    // The first version asked `held_capabilities()`, which is a quota counter
+    // that only the charging paths update — so a capability installed straight
+    // into the child's CSpace left it reading zero. Watched failing by giving
+    // the child a copy of its creator's endpoint, which is what inheriting a
+    // capability space would do: the check passed, because it was measuring
+    // the accounting rather than the contents.
+    let child_empty = child.and_then(|child| {
+        domain::with(child, |domain| {
+            domain.threads() == 0 && domain.cspace.occupied() == 0
+        })
+    });
+    let child_charged = domain::with(realm, |owner| owner.children());
 
     RING3_STOP.store(true, core::sync::atomic::Ordering::Release);
     ipc::destroy(endpoint);
     domain::destroy(realm);
+
+    // And after: destroying the parent must take the child's charge with it.
+    let charge_returned = child.is_none_or(|child| domain::with(child, |_| ()).is_none());
 
     let (calls, refused, revoked) = syscall::statistics();
     let calls = calls - calls_before;
@@ -1731,7 +1802,39 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // through the capability ring 3 derived for itself. The call through
         // the badge it *tried to forge* is not among them, and neither is the
         // one after revocation.
-        ("ring 3 reached a service through IPC", ring3_calls == 4),
+        ("ring 3 reached a service through IPC", ring3_calls == 5),
+        // RFC 0017 step 4. A program with a `DomainControl` created a domain,
+        // and the two refusals are worth as much as the success: one says the
+        // envelope is checked as well as the capability, the other says the
+        // *kind* is checked and not merely the rights.
+        (
+            "a program created a domain",
+            spawned[0] == bhaskix_abi::status::OK,
+        ),
+        (
+            "a second was refused by the creator's envelope",
+            spawned[1] == bhaskix_abi::status::QUOTA_EXCEEDED,
+        ),
+        (
+            "spawning on something that is not a DomainControl was refused",
+            spawned[2] == bhaskix_abi::status::WRONG_OBJECT,
+        ),
+        // What came back is *empty*. This is the whole shape of the design: a
+        // child holds only what it is granted afterwards, so a fresh one holds
+        // nothing at all.
+        (
+            "the domain it created holds nothing",
+            child_empty == Some(true),
+        ),
+        (
+            "it is named what ring 3 asked for",
+            child_name.map(|name| name.as_str() == "child") == Some(true),
+        ),
+        ("the creator was charged for it", child_charged == Some(1)),
+        (
+            "destroying the creator took the child with it",
+            charge_returned,
+        ),
         (
             "the service saw the badge from the probe's capability",
             ring3_badge == BADGE_RING3,

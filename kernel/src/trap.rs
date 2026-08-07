@@ -247,10 +247,17 @@ fn end_faulting_domain() -> ! {
     // a fault report interleaved with three other gates is not a report.
     match crate::sched::current_domain() {
         Some(id) => {
-            let name = crate::domain::with(id, |domain| domain.name()).unwrap_or("?");
+            // Copied out rather than borrowed: a runtime-created domain's
+            // name lives in the table, and this prints after the lock is gone.
+            let name = crate::domain::name_of(id);
             let others = crate::domain::with(id, |domain| domain.threads()).unwrap_or(0);
 
-            println!("  Domain {name:?} is gone. Its capabilities are revoked, its memory");
+            match name {
+                Some(name) => {
+                    println!("  Domain {name:?} is gone. Its capabilities are revoked, its memory")
+                }
+                None => println!("  The domain is gone. Its capabilities are revoked, its memory"),
+            }
             println!("  released, and this machine is still running.");
 
             // Honest about what this step does not do. RFC 0017 step 2 is

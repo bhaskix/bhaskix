@@ -146,6 +146,9 @@ const _: () = {
     assert!(Status::NoSuchCapability as u64 == bhaskix_abi::status::NO_SUCH_CAPABILITY);
     assert!(Status::Revoked as u64 == bhaskix_abi::status::REVOKED);
     assert!(Status::NoSuchMethod as u64 == bhaskix_abi::status::NO_SUCH_METHOD);
+    assert!(Status::QuotaExceeded as u64 == bhaskix_abi::status::QUOTA_EXCEEDED);
+    assert!(Status::Exhausted as u64 == bhaskix_abi::status::EXHAUSTED);
+    assert!(method::SPAWN == bhaskix_abi::method::SPAWN);
 };
 
 impl Kind {
@@ -307,6 +310,13 @@ pub mod method {
     /// its badge. Where it lands is **not** in this call: it is the slot the
     /// caller declared with [`EXPECT`]. RFC 0016.
     pub const HAND: u64 = 47;
+    /// Create a domain, and install a capability to it in a slot the caller
+    /// names.
+    ///
+    /// Only on a `DomainControl` capability. `arg0` = the destination slot in
+    /// the caller's own CSpace, which must be empty; `arg1` and `arg2` = up to
+    /// sixteen bytes of name. RFC 0017 step 4.
+    pub const SPAWN: u64 = 49;
     /// Write bytes into memory the caller of this endpoint named.
     ///
     /// Only on an `Endpoint` capability, and only from the thread that is
@@ -356,6 +366,14 @@ pub enum Status {
     SlotUnavailable = 11,
     /// The domain's capability quota is full.
     QuotaExceeded = 12,
+    /// A resource the whole machine shares is used up.
+    ///
+    /// Distinct from [`Status::QuotaExceeded`] deliberately: "you may not have
+    /// another" and "nobody may have another" call for different responses. A
+    /// supervisor told the first should look at its own envelope; told the
+    /// second it should look at the machine, and asking again later is the only
+    /// thing that can help.
+    Exhausted = 13,
 }
 
 impl Status {
@@ -1050,6 +1068,14 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         return hand(frame);
     }
 
+    // Creating a domain, like handing over a capability, needs the caller's own
+    // CSpace *and* the domain table, and cannot hold either while taking the
+    // other. Handled here rather than in the per-object dispatch below for that
+    // reason and no other.
+    if kind == Some(Kind::Invoke) && frame.method == method::SPAWN {
+        return spawn(frame);
+    }
+
     // The same path, the other way. A service that could read a caller's
     // memory without these three checks could read any domain's memory by
     // naming a slot, which is why this is not simply `FILL` with a flag.
@@ -1345,6 +1371,112 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     if crate::sched::should_die() {
         crate::sched::exit()
     }
+}
+
+/// Creates a domain and gives the caller a capability to it.
+///
+/// RFC 0017 step 4, and the first thing in this system that lets a program
+/// bring an object into existence. Four checks, and each refuses on its own:
+///
+/// 1. The capability invoked is a `DomainControl`. Nothing else may ask.
+/// 2. It carries `DERIVE` — the right to make something new from it. A holder
+///    that may only *see* the authority cannot use it.
+/// 3. The destination slot is empty. Installing over an occupied slot would let
+///    a program lose a capability it was still using, and would make a failed
+///    spawn indistinguishable from a successful one that overwrote something.
+/// 4. The creator's envelope allows another child. This is the T10 check, and
+///    it is the reason this step does not reopen the threat it opens the door
+///    to: `MAX_DOMAINS` is 32 and shared by the whole machine.
+///
+/// What comes back holds **nothing**. Authority reaches it afterwards, one
+/// `GRANT` at a time.
+fn spawn(frame: &SyscallFrame) -> Outcome {
+    let Some(me) = crate::sched::current_domain() else {
+        return Outcome::err(Status::NoDomain);
+    };
+
+    // The control capability, checked before anything is created.
+    let resolved = crate::domain::with(me, |owner| {
+        let slot = owner.cspace.get(frame.capability as usize)?;
+        crate::cap::with_arena(|arena| arena.lookup(slot))
+    })
+    .flatten();
+    let Some((object, rights)) = resolved else {
+        return Outcome::err(Status::NoSuchCapability);
+    };
+    if object.kind != ObjectKind::DomainControl {
+        return Outcome::err(Status::WrongObject);
+    }
+    if !rights.contains(crate::cap::Rights::DERIVE) {
+        return Outcome::err(Status::InsufficientRights);
+    }
+
+    // The destination, checked before anything is created for the same reason:
+    // a spawn that succeeds and then cannot be delivered would leave a domain
+    // nobody can name and nobody can destroy.
+    let destination = frame.arg0 as usize;
+    let free = crate::domain::with(me, |owner| owner.cspace.get(destination).is_none());
+    if free != Some(true) {
+        return Outcome::err(Status::SlotUnavailable);
+    }
+
+    // The name, out of two registers rather than out of user memory. Sixteen
+    // bytes is enough to tell programs apart in a report, and taking it from
+    // registers means this call has no user pointer to validate and no fault
+    // path -- a name is a diagnostic aid, and it should not be able to fail.
+    let mut name = [0u8; crate::domain::MAX_NAME];
+    name[..8].copy_from_slice(&frame.arg1.to_le_bytes());
+    name[8..].copy_from_slice(&frame.arg2.to_le_bytes());
+    let used = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    let name = core::str::from_utf8(&name[..used]).unwrap_or("?");
+
+    // The child's envelope is the creator's, minus the ability to create more.
+    // A child that inherited a child budget would let one capability multiply
+    // without limit through a chain of domains, which is the table exhausted by
+    // a longer route.
+    let envelope = crate::domain::with(me, |owner| owner.envelope)
+        .unwrap_or_default()
+        .max_child_domains(0);
+
+    let child = match crate::domain::create_under(Some(me.as_u32()), name, envelope) {
+        Ok(child) => child,
+        Err(crate::domain::DomainError::ChildEnvelopeExceeded { .. }) => {
+            return Outcome::err(Status::QuotaExceeded);
+        }
+        Err(_) => return Outcome::err(Status::Exhausted),
+    };
+
+    // Derived from the child's own root, so the creator holds a capability
+    // *under* it rather than the root itself: destroying the child revokes the
+    // root and this copy with it, which is what makes destruction total.
+    // The same badge the root carries, which is the domain's own id.
+    //
+    // Not zero. Badging is one-way since RFC 0016 step 1 — a badged capability
+    // may only derive the same badge — and a domain's root is badged with its
+    // id, so asking for zero here is asking to *re-badge*, and the kernel
+    // refuses. It refused this, and the refusal was right: the rule held
+    // against its own author.
+    let badge = u64::from(child.as_u32());
+    let granted = crate::domain::root_capability(child).and_then(|root| {
+        crate::cap::with_arena(|arena| arena.derive(root, crate::cap::Rights::ALL, badge).ok())
+    });
+    let Some(granted) = granted else {
+        crate::domain::destroy(child);
+        return Outcome::err(Status::Exhausted);
+    };
+
+    if crate::domain::with(me, |owner| {
+        owner.cspace.install_at(destination, granted).is_ok()
+    }) != Some(true)
+    {
+        crate::domain::destroy(child);
+        return Outcome::err(Status::SlotUnavailable);
+    }
+
+    Outcome::ok(u64::from(child.as_u32()))
 }
 
 /// Performs an `Invoke`, including the cross-domain grant.

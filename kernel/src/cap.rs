@@ -206,6 +206,24 @@ pub enum ObjectKind {
     /// console service is single-threaded and always has been; that limit
     /// moved with it.
     Console,
+    /// The authority to create domains: [RFC 0017](../../docs/rfc/0017-process-management.md).
+    ///
+    /// Holding one is the authority to bring a domain into existence — and
+    /// nothing else. The domain that comes back is **empty**: no threads, no
+    /// capabilities, no address space. Every power it will ever have is one its
+    /// creator held and chose to pass, through the `GRANT` that already exists
+    /// and already has rules.
+    ///
+    /// That is why there is no `fork` here. Duplicating a domain would give a
+    /// child everything its parent had because of *what it is* rather than
+    /// because anyone granted it, which is ambient authority arriving through
+    /// the back door of a system built to refuse it.
+    ///
+    /// Holding this is **not sufficient**: the creator's envelope must also
+    /// allow another child, and it allows none by default. The capability says
+    /// who may ask; the envelope says how often. Either alone would be a way to
+    /// exhaust a table with 32 entries in it.
+    DomainControl,
 }
 
 /// What a capability names: a kind and an identity within that kind.

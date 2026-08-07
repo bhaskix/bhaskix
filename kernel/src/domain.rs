@@ -66,6 +66,13 @@ use crate::sync::{Rank, SpinLock};
 /// most wants to start a replacement.
 pub const MAX_DOMAINS: usize = 32;
 
+/// How many bytes of a domain's name are kept.
+///
+/// Enough to tell programs apart in a fault report, and short enough that the
+/// table stays a fixed cost. Names longer than this are truncated; see
+/// [`Domain::name`].
+pub const MAX_NAME: usize = 16;
+
 /// The weight of a domain with an ordinary CPU share.
 pub const DEFAULT_CPU_SHARES: u32 = 1024;
 
@@ -112,6 +119,21 @@ pub struct ResourceEnvelope {
     /// domain that derives in a loop denies service to every other domain —
     /// T10 through a door nobody was watching.
     pub max_capabilities: u32,
+    /// Cap on domains this domain may have in existence at once.
+    ///
+    /// [`MAX_DOMAINS`] is a fixed global resource in exactly the way the
+    /// capability arena is, and once a program can create domains it can
+    /// exhaust the table for everyone else. That is the same **T10** the line
+    /// above closes, through the door
+    /// [RFC 0017](../../docs/rfc/0017-process-management.md) step 4 opens — so
+    /// this is a requirement of that step and not a refinement of it.
+    ///
+    /// Charged to the **creator**, not the child, because the resource being
+    /// protected is the shared table and the creator is who consumes it.
+    /// Default zero: a domain may not create domains unless it was given the
+    /// budget to, which makes the capability *and* the envelope both necessary
+    /// and neither sufficient.
+    pub max_child_domains: u32,
 }
 
 impl Default for ResourceEnvelope {
@@ -130,7 +152,15 @@ impl ResourceEnvelope {
             io_weight: 1024,
             latency_class: LatencyClass::Normal,
             max_capabilities: 64,
+            max_child_domains: 0,
         }
+    }
+
+    /// Sets how many domains this one may have in existence at once.
+    #[must_use]
+    pub const fn max_child_domains(mut self, limit: u32) -> Self {
+        self.max_child_domains = limit;
+        self
     }
 
     /// Sets the CPU share.
@@ -189,6 +219,13 @@ pub enum DomainError {
     CapabilityExhausted,
     /// The capability named something other than a domain.
     NotADomain,
+    /// The request would exceed the creator's child-domain envelope.
+    ChildEnvelopeExceeded {
+        /// Children already in existence.
+        held: u32,
+        /// The cap.
+        limit: u32,
+    },
 }
 
 /// A domain's identity. Dense, and reused after destruction.
@@ -217,7 +254,38 @@ pub struct Domain {
     id: u32,
     /// Distinguishes a reused slot from the domain that held it before.
     generation: u32,
-    name: &'static str,
+    /// The name, inline.
+    ///
+    /// A `&'static str` until RFC 0017 step 4, which is by itself a statement
+    /// that every caller is compiled into the kernel — a domain created at
+    /// runtime has nowhere to get one. Sixteen bytes, truncated rather than
+    /// refused: a name is a diagnostic aid, and failing to start a program
+    /// because its name is long would be a worse outcome than a short name in
+    /// a report.
+    name: [u8; MAX_NAME],
+    /// How much of `name` is used.
+    name_len: u8,
+    /// The domain charged for this one's existence, or `u32::MAX` for none.
+    ///
+    /// Boot-created domains have none, which is correct rather than a gap:
+    /// nothing charged for them and nothing will be refunded.
+    parent: u32,
+    /// Which incarnation of `parent`, so a reused slot is not mistaken for it.
+    ///
+    /// A slot index alone is not an identity here. Domains are destroyed and
+    /// their slots reused, so a child recording "my parent is slot 5" would be
+    /// claimed by whatever domain occupied slot 5 next — and destroying *that*
+    /// would take an unrelated domain down with it, which is the worst
+    /// available outcome for a mechanism whose whole job is to stop things
+    /// deliberately.
+    ///
+    /// It cannot happen today, because a child is destroyed with its parent
+    /// and a child may have no children of its own. Both of those are policy
+    /// in `spawn`, and this is the mechanism; the mechanism should not be
+    /// correct only for as long as the policy holds.
+    parent_generation: u32,
+    /// Domains this one has created that still exist.
+    children: u32,
     /// What it may touch.
     pub cspace: CSpace,
     /// What it may consume.
@@ -239,7 +307,11 @@ impl Domain {
         Self {
             id: 0,
             generation: 0,
-            name: "",
+            name: [0; MAX_NAME],
+            name_len: 0,
+            parent: u32::MAX,
+            parent_generation: 0,
+            children: 0,
             cspace: CSpace::new(),
             envelope: ResourceEnvelope::new(),
             charged_frames: 0,
@@ -287,8 +359,27 @@ impl Domain {
 
     /// This domain's name, for diagnostics.
     #[must_use]
-    pub const fn name(&self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &str {
+        // Lossy rather than fallible. The bytes came from a caller that may
+        // have sent anything, and a name that failed to render would take a
+        // diagnostic away at the moment it is being read.
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+
+    /// The domain charged for this one's existence, if any.
+    #[must_use]
+    pub const fn parent(&self) -> Option<u32> {
+        if self.parent == u32::MAX {
+            None
+        } else {
+            Some(self.parent)
+        }
+    }
+
+    /// How many domains this one has created that still exist.
+    #[must_use]
+    pub const fn children(&self) -> u32 {
+        self.children
     }
 
     /// The weight each of this domain's threads should carry.
@@ -382,8 +473,113 @@ static TABLE: SpinLock<Table> = SpinLock::new(Rank::Domains, Table::new());
 /// # Errors
 ///
 /// [`DomainError::TooManyDomains`] or [`DomainError::CapabilityExhausted`].
-pub fn create(name: &'static str, envelope: ResourceEnvelope) -> Result<DomainId, DomainError> {
+pub fn create(name: &str, envelope: ResourceEnvelope) -> Result<DomainId, DomainError> {
+    create_under(None, name, envelope)
+}
+
+/// A domain's name, copied out of the table.
+///
+/// Exists because the name stopped being `&'static str` at RFC 0017 step 4: a
+/// runtime-created domain's name lives in the table, so a borrow of it cannot
+/// outlive the lock, and every caller that wants to *print* a name wants to do
+/// so after releasing it.
+#[derive(Clone, Copy)]
+pub struct Name {
+    bytes: [u8; MAX_NAME],
+    len: u8,
+}
+
+impl Name {
+    /// The name as a string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("?")
+    }
+}
+
+impl core::fmt::Display for Name {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl core::fmt::Debug for Name {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self.as_str(), formatter)
+    }
+}
+
+/// The capability naming a domain, from which everything it is granted derives.
+///
+/// Exposed so a creator can be handed a capability *under* the root rather than
+/// the root itself — which is what makes destroying the domain revoke the
+/// creator's copy along with everything else it ever passed on.
+#[must_use]
+pub fn root_capability(id: DomainId) -> Option<SlotRef> {
+    with(id, |domain| domain.root).flatten()
+}
+
+/// The first live domain created by `parent`, if any.
+///
+/// A test affordance rather than a general facility: nothing in the system
+/// needs to enumerate children, because a creator holds capabilities to the
+/// ones it made and that is how it names them. This exists so a gate can ask
+/// what a program created without the program having to tell it.
+#[must_use]
+pub fn child_of(parent: DomainId) -> Option<DomainId> {
+    let table = TABLE.lock();
+    table
+        .domains
+        .iter()
+        .find(|domain| domain.live && domain.parent == parent.0)
+        .map(|domain| DomainId(domain.id))
+}
+
+/// A live domain's name, copied so it outlives the table lock.
+#[must_use]
+pub fn name_of(id: DomainId) -> Option<Name> {
+    with(id, |domain| Name {
+        bytes: domain.name,
+        len: domain.name_len,
+    })
+}
+
+/// Creates a domain charged to `parent`, if there is one.
+///
+/// The charge is the whole of this function's reason to exist. [`MAX_DOMAINS`]
+/// is a fixed global resource, so a domain that can create domains can exhaust
+/// the table for every other domain on the machine — `security.md` §1 **T10**,
+/// reopened by the feature that lets a program start a program. Charging the
+/// creator closes it, and it must be closed in the same change that opens it.
+///
+/// # Errors
+///
+/// As [`create`], plus [`DomainError::ChildEnvelopeExceeded`] when the parent
+/// already has as many children as its envelope allows, and
+/// [`DomainError::NoSuchDomain`] if the parent has gone.
+pub fn create_under(
+    parent: Option<u32>,
+    name: &str,
+    envelope: ResourceEnvelope,
+) -> Result<DomainId, DomainError> {
     let mut table = TABLE.lock();
+
+    // Charged before anything is allocated, so a refusal changes nothing. The
+    // envelope refuses; it does not warn and it does not succeed and notify.
+    if let Some(parent) = parent {
+        let owner = table
+            .domains
+            .get_mut(parent as usize)
+            .filter(|domain| domain.live)
+            .ok_or(DomainError::NoSuchDomain)?;
+        if owner.children >= owner.envelope.max_child_domains {
+            return Err(DomainError::ChildEnvelopeExceeded {
+                held: owner.children,
+                limit: owner.envelope.max_child_domains,
+            });
+        }
+    }
+
     let index = table
         .domains
         .iter()
@@ -403,10 +599,20 @@ pub fn create(name: &'static str, envelope: ResourceEnvelope) -> Result<DomainId
     })
     .map_err(|_| DomainError::CapabilityExhausted)?;
 
+    let mut stored = [0u8; MAX_NAME];
+    let taken = name.len().min(MAX_NAME);
+    stored[..taken].copy_from_slice(&name.as_bytes()[..taken]);
+
     table.domains[index] = Domain {
         id,
         generation,
-        name,
+        name: stored,
+        name_len: taken as u8,
+        parent: parent.unwrap_or(u32::MAX),
+        parent_generation: parent
+            .and_then(|parent| table.domains.get(parent as usize))
+            .map_or(0, |owner| owner.generation),
+        children: 0,
         cspace: CSpace::new(),
         envelope,
         charged_frames: 0,
@@ -416,6 +622,15 @@ pub fn create(name: &'static str, envelope: ResourceEnvelope) -> Result<DomainId
         live: true,
     };
     table.created += 1;
+
+    // After the child exists, so a failure above leaves nothing charged. The
+    // parent was checked under this same lock, which is why it cannot have gone
+    // away in between.
+    if let Some(parent) = parent
+        && let Some(owner) = table.domains.get_mut(parent as usize)
+    {
+        owner.children = owner.children.saturating_add(1);
+    }
     Ok(DomainId(id))
 }
 
@@ -464,6 +679,12 @@ pub fn destroy(id: DomainId) -> bool {
             return false;
         }
         let root = domain.root.take();
+        let parent = domain.parent;
+        let parent_generation = domain.parent_generation;
+        // Captured before the increment below: the children still recorded
+        // against this domain recorded *this* incarnation of it.
+        let mine = domain.generation;
+        domain.parent = u32::MAX;
         domain.live = false;
         domain.generation = domain.generation.wrapping_add(1);
         domain.charged_frames = 0;
@@ -471,8 +692,55 @@ pub fn destroy(id: DomainId) -> bool {
         domain.threads = 0;
         domain.cspace = CSpace::new();
         table.destroyed += 1;
-        root
+
+        // The creator gets its budget back. Under the same lock that marked
+        // this domain dead, so there is no instant where the child is gone and
+        // the parent is still charged for it -- which is the direction that
+        // leaks, and it leaks a limit rather than memory: the parent quietly
+        // loses the ability to start something later, for no reason anyone
+        // could find.
+        if parent != u32::MAX
+            && let Some(owner) = table.domains.get_mut(parent as usize)
+            && owner.live
+            && owner.generation == parent_generation
+        {
+            owner.children = owner.children.saturating_sub(1);
+        }
+        // Every domain this one created, collected while the table is held.
+        //
+        // **The capability tree does not do this on its own**, and RFC 0017
+        // said it did. A child's root is inserted into the arena as a *root*,
+        // not derived from its creator's, so revoking the creator reaches the
+        // copy it was handed and stops there. Measured: a program created a
+        // domain, its creator was destroyed, and the child was still live.
+        //
+        // Collected rather than destroyed here, because destroying takes this
+        // same lock.
+        let mut children = [0u32; MAX_DOMAINS];
+        let mut count = 0;
+        for domain in &table.domains {
+            if domain.live
+                && domain.parent == id.0
+                && domain.parent_generation == mine
+                && count < children.len()
+            {
+                children[count] = domain.id;
+                count += 1;
+            }
+        }
+
+        (root, children, count)
     };
+    let (root, children, count) = root;
+
+    // Depth is bounded by the table: a domain cannot be its own ancestor, and
+    // there are 32 slots. Today it is at most one level, because a child's
+    // envelope allows it no children of its own -- but that is a policy in
+    // `spawn` and this is the mechanism, and the mechanism should not depend
+    // on the policy staying that way.
+    for child in children.iter().take(count) {
+        destroy(DomainId(*child));
+    }
 
     // Outside the table lock: revocation takes the capability arena, and
     // holding both would order the two locks in a way nothing else does.
