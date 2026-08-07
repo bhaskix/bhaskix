@@ -19,6 +19,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use bhaskix_arch::idt::{exception_name, has_error_code};
+use bhaskix_arch::percpu::{self, MAX_CPUS};
 use bhaskix_arch::trap::TrapFrame;
 use bhaskix_arch::{apic, cpu, msr, paging, pic};
 use bhaskix_boot::{PhysAddr, VirtAddr};
@@ -43,10 +44,33 @@ pub fn init() {
     bhaskix_arch::trap::set_handler(handle);
 }
 
+/// Timer ticks taken by each CPU.
+///
+/// The machine-wide count above cannot answer the question "tickless" is
+/// actually about, which is per-CPU: whether *this* processor stopped taking
+/// interrupts when it had nothing to run. A single counter can only be turned
+/// into a ratio against a baseline, and the baseline -- the CPU doing the
+/// measuring, which is busy by definition -- is exactly the term that moves
+/// when the host is loaded.
+static TICKS_PER_CPU: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
 /// Timer ticks observed so far.
 #[must_use]
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// Timer ticks taken by one CPU.
+///
+/// Zero for a CPU that does not exist, which is the same answer as a CPU that
+/// has never ticked -- a caller that could tell them apart would be asking a
+/// question about topology, not about ticking.
+#[must_use]
+pub fn ticks_on(cpu: u32) -> u64 {
+    usize::try_from(cpu)
+        .ok()
+        .and_then(|cpu| TICKS_PER_CPU.get(cpu))
+        .map_or(0, |count| count.load(Ordering::Relaxed))
 }
 
 /// Why interrupt bring-up failed.
@@ -191,6 +215,12 @@ fn handle_interrupt(frame: &mut TrapFrame) {
     match frame.vector as u8 {
         apic::TIMER_VECTOR => {
             TICKS.fetch_add(1, Ordering::Relaxed);
+            if let Some(count) = usize::try_from(percpu::cpu_id())
+                .ok()
+                .and_then(|cpu| TICKS_PER_CPU.get(cpu))
+            {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
             // SAFETY: the APIC is initialised -- interrupts cannot be enabled
             // before `enable` succeeds -- and this acknowledges exactly the
             // interrupt currently in service.

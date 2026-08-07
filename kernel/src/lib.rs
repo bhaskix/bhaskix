@@ -353,6 +353,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     } else {
         println!("    scheduler      FAILED");
     }
+    // Immediately, and before anything measures this machine. A stopped
+    // scheduler is not a quiet one: `needs_preemption_tick` reads a stopped
+    // queue as "not started yet" — early boot, keep ticking to prove the timer
+    // works — so every frozen CPU arms a slice it has nothing to preempt to,
+    // forever. The restart used to sit four tests further down, which put the
+    // tickless measurement inside the frozen window and had it grading a state
+    // the system is never in once it is running.
+    sched::start_all();
 
     // Retire the class-phase threads before measuring idle CPUs, or the
     // "idle" window measures three spinning threads.
@@ -400,7 +408,6 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !syscall_self_test(handoff.hhdm_base.as_u64()) {
         println!("    syscall        FAILED");
     }
-    sched::start_all();
 
     if !ipc_self_test(
         handoff.hhdm_base.as_u64(),
@@ -621,18 +628,49 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     }
 }
 
+/// Reports what is keeping `cpu` awake, for either way the gate can fail.
+///
+/// A tick is armed on behalf of something, and which something it is decides
+/// where to look: a slice is a scheduler question, a timer is a timer
+/// question, and the backstop is neither. Printing the threads the CPU holds
+/// alongside it is what turns "it still ticks" into a lead.
+fn why_still_ticking(cpu: u32) {
+    let (slice, timer, backstop) = time::arm_reasons(cpu);
+    println!("      armed {slice} for a slice, {timer} for a timer, {backstop} for the backstop");
+    let (reason, runnable) = sched::preemption_tick_reason(cpu as usize);
+    println!("      it wants a preemption tick because {reason} ({runnable} schedulable)");
+    sched::for_each(|on, id, name, state, runs, _migrations, class| {
+        if on == cpu {
+            println!("      cpu {on} holds thread {id} ({name}) {state:?} {class}, {runs} runs");
+        }
+    });
+}
+
 /// Measures the actual claim: an idle CPU stops taking timer interrupts.
 ///
-/// Two windows of equal length, differing only in whether the other CPUs have
-/// anything to run. The tick count across the machine must be substantially
-/// lower in the first — that is what "tickless" means, stated as a number
-/// rather than as a feature.
+/// Asked **per CPU**, which is the form the claim is really in: a processor
+/// with nothing to run takes no timer interrupts, and the same processor given
+/// something to run takes them. Each CPU that is meant to be idle is named and
+/// checked on its own.
 ///
-/// Comparing two windows rather than checking an absolute rate is deliberate:
-/// the absolute number depends on the tick rate, the CPU count and how busy
-/// the host is, none of which the property depends on. The *ratio* between
-/// idle and busy does not.
+/// It was written the other way first — one counter for the whole machine,
+/// compared between an idle window and a busy one, asserting a ratio — and it
+/// failed about one run in four on a loaded host, at 165 idle against 327
+/// busy, three ticks the wrong side of a 2× threshold.
+///
+/// **That was not flakiness, and the threshold was not the problem.** One CPU
+/// was ticking flat out with nothing to run, every single boot; two CPUs'
+/// worth of ticks in a window that should have held one is exactly the ratio
+/// observed. A machine-wide count cannot say that, because it has no term for
+/// *which* CPU — and a ratio against a busy baseline had just enough room to
+/// swallow one broken processor in three and still pass. The gate was not
+/// noisy. It was quietly reporting a real defect as a near-miss.
+///
+/// Counting per CPU removes the baseline, names the offender, and makes the
+/// assertion an absolute bound. See `sched::start_all` for what the defect
+/// turned out to be.
 fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use bhaskix_arch::percpu::MAX_CPUS;
     use core::sync::atomic::Ordering;
 
     if cpus < 2 {
@@ -641,13 +679,54 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
 
     const WINDOW_MS: u64 = 400;
+    /// How many windows to allow a CPU before calling it un-quiet.
+    ///
+    /// The self-tests before this one leave threads finishing, and on a loaded
+    /// host they take longer to drain. Retrying the measurement waits for the
+    /// condition instead of sleeping a fixed time and measuring anyway, which
+    /// is what makes this insensitive to what else the machine is doing.
+    const TRIES: u32 = 5;
+    /// Ticks an idle CPU is allowed in one window.
+    ///
+    /// Not zero, and the reason is design rather than tolerance: an idle CPU
+    /// still arms the backstop, so it wakes once per `IDLE_BACKSTOP_MS`
+    /// however idle it is. Two backstops cannot fall inside a window shorter
+    /// than one, so this is a bound rather than a fudge factor -- and it is
+    /// computed from the constant so that changing the backstop cannot leave a
+    /// number here that used to be right.
+    const ALLOWED: u64 = WINDOW_MS.div_ceil(time::IDLE_BACKSTOP_MS);
 
-    // Window one: every other CPU has only its idle thread, so none of them
-    // needs a tick. This thread keeps running, so its own CPU still ticks --
-    // which is why the assertion below is a ratio and not a zero.
-    let before = trap::ticks();
-    wait_millis(WINDOW_MS);
-    let idle_ticks = trap::ticks() - before;
+    let others = 1..cpus.min(MAX_CPUS as u32);
+    let snapshot = |into: &mut [u64; MAX_CPUS]| {
+        for cpu in others.clone() {
+            into[cpu as usize] = trap::ticks_on(cpu);
+        }
+    };
+    let mut mark = [0u64; MAX_CPUS];
+    let mut now = [0u64; MAX_CPUS];
+    let mut idle = [0u64; MAX_CPUS];
+
+    // Every other CPU has only its idle thread, so none of them needs a tick.
+    for attempt in 0..TRIES {
+        snapshot(&mut mark);
+        wait_millis(WINDOW_MS);
+        snapshot(&mut now);
+        for cpu in others.clone() {
+            idle[cpu as usize] = now[cpu as usize] - mark[cpu as usize];
+        }
+        let Some(ticking) = others.clone().find(|&cpu| idle[cpu as usize] > ALLOWED) else {
+            break;
+        };
+        if attempt + 1 == TRIES {
+            println!(
+                "    tickless       FAILED: cpu {ticking} took {} ticks over {WINDOW_MS} ms with nothing to run, and at most {ALLOWED} is expected",
+                idle[ticking as usize]
+            );
+            why_still_ticking(ticking);
+            return false;
+        }
+    }
+    let idle_ticks: u64 = others.clone().map(|cpu| idle[cpu as usize]).sum();
 
     // Window two: give every other CPU a second runnable thread, so each of
     // them needs a tick to preempt with.
@@ -675,23 +754,33 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
     wait_millis(100);
 
-    let before = trap::ticks();
+    snapshot(&mut mark);
     wait_millis(WINDOW_MS);
-    let busy_ticks = trap::ticks() - before;
+    snapshot(&mut now);
+    let mut busy = [0u64; MAX_CPUS];
+    for cpu in others.clone() {
+        busy[cpu as usize] = now[cpu as usize] - mark[cpu as usize];
+    }
 
     // Retire the spinners: publish, then poke, then let them exit.
     PHASE.store(PHASE_TICKLESS + 1, Ordering::Release);
     wait_millis(100);
 
-    if busy_ticks <= idle_ticks.saturating_mul(2) {
+    // The other half of the claim, and the half that keeps the first half
+    // honest: a CPU that stopped ticking because it was *broken* rather than
+    // idle would sail through the check above. Only the CPUs that got a
+    // spinner are asked -- `spawned` may be short of the full set.
+    let asked = 1..=u32::try_from(spawned).unwrap_or(0);
+    if let Some(silent) = asked.clone().find(|&cpu| busy[cpu as usize] == 0) {
         println!(
-            "    tickless       FAILED: {idle_ticks} ticks idle vs {busy_ticks} busy over {WINDOW_MS} ms -- idle cpus are still ticking"
+            "    tickless       FAILED: cpu {silent} took no ticks over {WINDOW_MS} ms with a thread to preempt"
         );
         return false;
     }
+    let busy_ticks: u64 = asked.clone().map(|cpu| busy[cpu as usize]).sum();
 
     println!(
-        "    tickless       {idle_ticks} ticks with {} cpus idle, {busy_ticks} with them busy, over {WINDOW_MS} ms each",
+        "    tickless       {idle_ticks} ticks on {} idle cpus, {busy_ticks} on {spawned} of them busy, over {WINDOW_MS} ms each",
         cpus - 1
     );
     true

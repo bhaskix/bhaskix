@@ -2276,6 +2276,15 @@ fn notify(cpu: u32) {
 /// Answers `true` before the scheduler has started on that CPU: early boot
 /// counts ticks to prove the timer works at all, and a CPU that stopped
 /// ticking before it had a runqueue would look identical to a broken timer.
+///
+/// **`started` does double duty, and the second job is a sharp edge.**
+/// [`stop_all`] clears the same flag to freeze the world for reporting, and
+/// this reads that as "early boot" — so a frozen CPU arms a slice it has
+/// nothing to preempt to, once per slice, indefinitely. Nothing that runs
+/// while the scheduler is stopped may measure ticks, and nothing should stay
+/// stopped for long; [`start_all`] belongs immediately after the freeze that
+/// needed it. The tickless gate spent several milestones grading a machine in
+/// exactly this state and reporting the result as a near-miss on a ratio.
 #[must_use]
 pub fn needs_preemption_tick(cpu: usize) -> bool {
     if cpu >= MAX_CPUS {
@@ -2303,6 +2312,32 @@ pub fn needs_preemption_tick(cpu: usize) -> bool {
         return true;
     }
     queue.runnable() > 1
+}
+
+/// Why [`needs_preemption_tick`] answered as it did, for diagnostics.
+///
+/// Separate from the decision rather than folded into it: the decision runs in
+/// an interrupt handler on every arm, and it should not carry a string.
+#[must_use]
+pub fn preemption_tick_reason(cpu: usize) -> (&'static str, usize) {
+    if cpu >= MAX_CPUS {
+        return ("cpu out of range", 0);
+    }
+    if deferred_wakes_pending() {
+        return ("a deferred wake is pending", 0);
+    }
+    let Some(queue) = QUEUES[cpu].try_lock() else {
+        return ("its runqueue was contended", 0);
+    };
+    if !queue.started {
+        return ("its scheduler has not started", 0);
+    }
+    let runnable = queue.runnable();
+    if runnable > 1 {
+        ("it has more than one schedulable thread", runnable)
+    } else {
+        ("nothing -- it should be tickless", runnable)
+    }
 }
 
 /// When the running thread's slice next expires on `cpu`, in TSC units.

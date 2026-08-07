@@ -150,6 +150,31 @@ static TICKLESS_IDLES: AtomicU64 = AtomicU64::new(0);
 /// Times the timer was armed for a real deadline rather than a fixed period.
 static ARMED: AtomicU64 = AtomicU64::new(0);
 
+/// Why each CPU last armed its timer, counted per reason.
+///
+/// `[slice, timer, backstop]`. A CPU that will not go tickless is arming for
+/// *something*, and the difference between "a thread to preempt" and "a
+/// registered timer" is the difference between a scheduler question and a
+/// timer question. Without this the only observable is that the CPU still
+/// ticks, which is a symptom shared by every possible cause.
+static ARM_REASONS: [[AtomicU64; 3]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 3] }; MAX_CPUS];
+
+/// Why `cpu` has been arming its timer: `(slice, timer, backstop)`.
+#[must_use]
+pub fn arm_reasons(cpu: u32) -> (u64, u64, u64) {
+    usize::try_from(cpu)
+        .ok()
+        .and_then(|cpu| ARM_REASONS.get(cpu))
+        .map_or((0, 0, 0), |reasons| {
+            (
+                reasons[0].load(Ordering::Relaxed),
+                reasons[1].load(Ordering::Relaxed),
+                reasons[2].load(Ordering::Relaxed),
+            )
+        })
+}
+
 /// Monotonic time since boot, in TSC units.
 #[must_use]
 pub fn now() -> u64 {
@@ -401,6 +426,15 @@ unsafe fn rearm(cpu: usize, now: u64) {
         (None, Some(timer)) => Some(timer),
         (None, None) => None,
     };
+
+    if let Some(reasons) = ARM_REASONS.get(cpu) {
+        let which = match (slice_end, earliest) {
+            (Some(_), _) => 0,
+            (None, Some(_)) => 1,
+            (None, None) => 2,
+        };
+        reasons[which].fetch_add(1, Ordering::Relaxed);
+    }
 
     let Some(deadline) = deadline else {
         // Nothing to wait for. Arm the backstop rather than nothing at all --
