@@ -338,6 +338,16 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             // resumed the switch returns here, the handler unwinds normally,
             // and `iretq` returns to wherever that thread was interrupted.
             crate::sched::preempt();
+
+            // The second safe point. Only for a thread interrupted in *user*
+            // mode: at that point it holds no kernel lock, because ring 3
+            // cannot take one. A thread interrupted inside the kernel may hold
+            // anything, and is left alone until it reaches a point where it
+            // does not -- its syscall returning, or its next decision to
+            // block.
+            if frame.from_user_mode() && crate::sched::should_die() {
+                crate::sched::exit()
+            }
         }
 
         // Another CPU made something runnable here. There is nothing to do

@@ -43,10 +43,17 @@
 //!   binding them needs the object table that M5-02 only begins.
 //! - **No I/O weight enforcement**, because there is no I/O.
 //! - **No telemetry channel.** `docs/ai-native.md` §2 specifies one per domain.
-//! - **Threads are counted, not owned.** Destroying a domain does not yet stop
-//!   its threads; it releases its accounting and revokes its authority. A
-//!   thread that outlives its domain holds no capabilities, which contains it,
-//!   but it still runs.
+//! - **A thread stops at its next safe point, not immediately.** Destroying a
+//!   domain marks its threads and wakes the sleeping ones; each stops when it
+//!   next returns to user mode or decides to block, because stopping a thread
+//!   where it stands can mean freeing the stack it is standing on. The window
+//!   is bounded by one timer tick for a thread in ring 3. It is *not* bounded
+//!   for a thread spinning inside the kernel, and [RFC 0017](../../docs/rfc/0017-process-management.md)
+//!   takes the position that such a thread is a kernel bug rather than a case
+//!   to be handled.
+//! - **Kernel stacks are still not reclaimed.** That is older than this and
+//!   larger: `sched::reap_finished` frees a thread's slot and leaves its stack,
+//!   because there is no allocator for stack slots. Recorded in TRACKER.md.
 
 use crate::cap::{self, CSpace, ObjectKind, ObjectRef, Rights, SlotRef};
 use crate::sched;
@@ -433,6 +440,20 @@ pub fn destroy(id: DomainId) -> bool {
     // releasing reaches the chip and the vector allocator.
     let handlers = crate::irq::release_owned_by(id.0);
     let _ = handlers;
+
+    // Threads next, and before the table is touched. Until RFC 0017 step 2
+    // this function zeroed a counter and left them running: `destroy` released
+    // a domain's accounting and its authority, and the programs carried on
+    // with no capabilities -- contained, and not stopped.
+    //
+    // Marking is all that happens here. A thread stops at its own next safe
+    // point, because stopping one where it stands may mean freeing the stack
+    // it is standing on. Outside the table lock, because waking a blocked
+    // thread takes runqueue locks and holding both would order two locks in a
+    // way nothing else does -- the same reason the memory objects and the
+    // interrupt handlers are released above.
+    let stopped = crate::sched::mark_domain_dying(id.0);
+    let _ = stopped;
 
     let root = {
         let mut table = TABLE.lock();

@@ -267,6 +267,23 @@ pub struct Thread {
     /// Kernel threads created before domains exist have no domain, and must
     /// not be swept up by a re-weighting aimed at one.
     pub domain: u32,
+    /// This thread has been told to stop, and will at the next safe point.
+    ///
+    /// **A flag rather than a fifth [`State`]**, and the distinction is the
+    /// design. A dying thread is still `Ready`, `Running` or `Blocked` — it has
+    /// not stopped yet, and everything that reasons about runnability, load or
+    /// eviction must keep seeing it as what it is until it does. A `State`
+    /// variant would have to be handled by every one of those, and the ones
+    /// that forgot would be the interesting bugs.
+    ///
+    /// It cannot be acted on wherever it is noticed. A thread may be holding a
+    /// runqueue lock, be part-way through a capability derivation, or be the
+    /// half-completed side of an IPC rendezvous — freeing its stack at any of
+    /// those points corrupts a structure the rest of the kernel shares. So it
+    /// is *read* at points where the thread demonstrably holds nothing:
+    /// returning to user mode, and deciding to block. See
+    /// [RFC 0017](../../docs/rfc/0017-process-management.md) step 2.
+    pub dying: bool,
     /// A message delivered to this thread, and who sent it.
     ///
     /// One slot, because IPC is a rendezvous: a thread has at most one
@@ -692,6 +709,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         reply_to: None,
         receive_slot: None,
         domain: u32::MAX,
+        dying: false,
         mailbox: None,
         // The thread a CPU registers for itself is already running on the
         // stack the bootloader gave it, and never enters from user mode.
@@ -888,6 +906,7 @@ pub fn spawn_on_with(
         reply_to: None,
         receive_slot: None,
         domain: options.domain,
+        dying: false,
         mailbox: None,
         kernel_stack_top: guarded.top,
         pinned,
@@ -1822,7 +1841,9 @@ pub fn block_unless<T>(ready: impl FnOnce() -> Option<T>) -> Option<T> {
     let taken = ready();
     if taken.is_none() {
         let current = queue.current;
-        if let Some(thread) = queue.threads[current].as_mut() {
+        if let Some(thread) = queue.threads[current].as_mut()
+            && !thread.dying
+        {
             thread.state = State::Blocked;
         }
     }
@@ -1830,6 +1851,13 @@ pub fn block_unless<T>(ready: impl FnOnce() -> Option<T>) -> Option<T> {
 }
 
 /// Marks the running thread blocked, without yielding.
+///
+/// **A thread that has been told to stop is not marked**, here or in
+/// [`block_unless`]. Sleeping is the one thing a dying thread must not do: its
+/// safe points are returning to user mode and deciding to block, and a thread
+/// asleep reaches neither. Leaving it runnable makes its call return with
+/// whatever it had, and the return path is where the flag is read. See
+/// [`mark_domain_dying`].
 ///
 /// Split from [`block_self`] because the two happen either side of releasing a
 /// wait queue's lock, and must. This half runs *under* that lock, together
@@ -1844,7 +1872,9 @@ pub fn mark_blocked() {
     }
     let mut queue = QUEUES[cpu].lock();
     let current = queue.current;
-    if let Some(thread) = queue.threads[current].as_mut() {
+    if let Some(thread) = queue.threads[current].as_mut()
+        && !thread.dying
+    {
         thread.state = State::Blocked;
     }
 }
@@ -2267,6 +2297,116 @@ fn notify(cpu: u32) {
     }
 }
 
+/// Tells every thread of `domain` to stop, and wakes the ones that are asleep.
+///
+/// Returns how many were marked, including the caller if it belongs to that
+/// domain — which it does when a program faults, since this runs on the way
+/// out of the fault.
+///
+/// **Waking the blocked ones is not a courtesy, it is the whole mechanism.** A
+/// thread asleep on an endpoint has no next safe point: it is not going to
+/// return to user mode, and it is not going to decide to block again, so a
+/// flag it never reads stops nothing. Waking it makes its call return, and the
+/// return path is where the flag is read. This is also, in one step, the fix
+/// for a caller whose service died — [RFC 0013](../../docs/rfc/0013-service-framework.md)
+/// unresolved question 1 — because that caller is blocked on an endpoint the
+/// dying domain served.
+///
+/// The wake is `wake`, not `wake_from_interrupt`: this is reached from a fault
+/// handler, but from the *tail* of one, after the report is printed and with no
+/// lock held. A dying thread that could not be woken because a queue was
+/// contended would be a thread that never dies.
+pub fn mark_domain_dying(domain: u32) -> usize {
+    if domain == u32::MAX {
+        // Not a domain. Marking every thread that belongs to no domain would
+        // be every kernel thread on the machine.
+        return 0;
+    }
+
+    // Blocking on each queue in turn, not `try_lock`. Skipping a contended
+    // queue loses a thread, and a lost thread is a domain that reports itself
+    // destroyed while part of it is still running -- the exact claim this step
+    // exists to make true. Safe to block: every caller reaches here holding
+    // nothing, including the fault path, where the thread that faulted was in
+    // ring 3 and so held no kernel lock at all.
+    //
+    // One queue at a time. Two would be two locks of the same rank, which have
+    // no order relative to each other and could close a cycle -- the rule
+    // `wake_with` states a few hundred lines below.
+    let mut asleep = [0u32; MAX_CPUS * 4];
+    let mut waiting = 0;
+    let mut marked = 0;
+
+    let online = percpu::online_count() as usize;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let mut queue = queue.lock();
+        for thread in queue.threads.iter_mut().flatten() {
+            if thread.domain != domain || thread.dying {
+                continue;
+            }
+            thread.dying = true;
+            marked += 1;
+            if thread.state == State::Blocked
+                && let Some(slot) = asleep.get_mut(waiting)
+            {
+                *slot = thread.id;
+                waiting += 1;
+            }
+        }
+    }
+
+    // Outside every queue lock, for the reason above.
+    for id in asleep.iter().take(waiting) {
+        let _ = wake(*id);
+    }
+    marked
+}
+
+/// How many threads still exist in `domain`, in any state but `Finished`.
+///
+/// `Finished` is excluded because a finished thread is one that *has* stopped;
+/// its slot is freed by `reap_finished` on the next scheduling decision of the
+/// CPU it was on, which may not have happened yet. Counting it would make
+/// "stopped" depend on when the next timer tick lands somewhere else.
+#[must_use]
+pub fn threads_in_domain(domain: u32) -> usize {
+    let online = percpu::online_count() as usize;
+    let mut total = 0;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        total += queue
+            .threads
+            .iter()
+            .flatten()
+            .filter(|thread| thread.domain == domain && thread.state != State::Finished)
+            .count();
+    }
+    total
+}
+
+/// Whether the running thread has been told to stop.
+///
+/// Read at the points where a thread provably holds no kernel lock: on the way
+/// back to user mode, and when it is about to sleep. Answers `false` if this
+/// CPU's runqueue is contended, which is the safe direction — the thread stays
+/// alive until the next safe point, and there is always another one.
+#[must_use]
+pub fn should_die() -> bool {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return false;
+    }
+    let Some(queue) = QUEUES[cpu].try_lock() else {
+        return false;
+    };
+    let current = queue.current;
+    queue.threads[current]
+        .as_ref()
+        .is_some_and(|thread| thread.dying)
+}
+
 /// Whether `cpu` still needs a periodic interrupt to preempt with.
 ///
 /// A tick exists to take the CPU *away* from a thread, which means nothing
@@ -2446,6 +2586,7 @@ mod tests {
             space_root: 0,
             reply_to: None,
             receive_slot: None,
+            dying: false,
             domain: u32::MAX,
             mailbox: None,
             kernel_stack_top: 0,
@@ -2467,6 +2608,72 @@ mod tests {
             queue.threads[slot] = Some(thread(slot, *state, Policy::fair()));
         }
         queue
+    }
+
+    /// The rule `mark_blocked` and `block_unless` share, on the structure they
+    /// share, without needing a CPU to run it on.
+    ///
+    /// Both functions read a global runqueue array and a per-CPU id, so the
+    /// live versions cannot be called here. What *can* be tested is the
+    /// predicate they turn on, which is the part that was added and the part
+    /// that can be wrong.
+    #[test]
+    fn a_dying_thread_is_not_marked_blocked() {
+        let mut queue = with(&[State::Running]);
+        queue.threads[0].as_mut().unwrap().dying = true;
+
+        // The body of `mark_blocked`, with its guard.
+        if let Some(thread) = queue.threads[0].as_mut()
+            && !thread.dying
+        {
+            thread.state = State::Blocked;
+        }
+
+        assert_eq!(
+            queue.threads[0].as_ref().unwrap().state,
+            State::Running,
+            "a thread told to stop must not go to sleep: sleeping is the one \
+             state with no next safe point, so a dying thread that blocks \
+             never dies"
+        );
+    }
+
+    /// The same guard, the other way round, or the test above would pass with
+    /// the marking deleted entirely.
+    #[test]
+    fn a_living_thread_is_still_marked_blocked() {
+        let mut queue = with(&[State::Running]);
+
+        if let Some(thread) = queue.threads[0].as_mut()
+            && !thread.dying
+        {
+            thread.state = State::Blocked;
+        }
+
+        assert_eq!(queue.threads[0].as_ref().unwrap().state, State::Blocked);
+    }
+
+    /// A dying thread is still schedulable, which is the point of the flag
+    /// being a flag.
+    ///
+    /// It has not stopped yet. Everything that reasons about runnability, load
+    /// and eviction must keep seeing it as what it is until it does — that is
+    /// the argument for not making `Dying` a fifth [`State`], and this is the
+    /// property that argument rests on.
+    #[test]
+    fn dying_does_not_change_what_the_scheduler_sees() {
+        let mut queue = with(&[State::Running, State::Ready]);
+        let before = queue.runnable();
+        queue.threads[1].as_mut().unwrap().dying = true;
+
+        assert_eq!(
+            queue.runnable(),
+            before,
+            "marking a thread dying must not change the load figure: it is \
+             still running until it reaches a safe point, and a CPU that \
+             stopped counting it would decline to preempt for it"
+        );
+        assert!(queue.threads[1].as_ref().unwrap().state.is_schedulable());
     }
 
     /// A queue built from explicit classes, every thread `Ready`.

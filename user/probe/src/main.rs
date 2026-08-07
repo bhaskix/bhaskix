@@ -50,20 +50,48 @@ _start:
     // --- Fault on purpose, if asked ----------------------------------------
     //
     // `rdi` is the first of the two values the kernel passes at entry, and it
-    // is read here because everything below clobbers it. A non-zero value
-    // means "write through a null pointer and do not come back": the caller
-    // wants a fault from ring 3, which is the one thing this program cannot
-    // demonstrate by succeeding.
+    // is read here because everything below clobbers it:
     //
-    // It lives in `bin/probe` rather than in a program of its own because the
-    // loader path, the domain, the privilege stack and the entry are all
-    // already built and tested here. A second ELF would duplicate that to
-    // execute ten bytes.
-    test rdi, rdi
-    jz 1f
+    //   0  run the probe, as everything before RFC 0017 did
+    //   1  write through a null pointer and do not come back
+    //   2  spin in ring 3 for ever, making no system call
+    //   3  yield for ever, so the only way out is a system call returning
+    //
+    // Both extra modes live in `bin/probe` rather than in programs of their
+    // own because the loader path, the domain, the privilege stack and the
+    // entry are already built and tested here. A second ELF would duplicate
+    // all of that to execute ten bytes.
+    cmp rdi, 1
+    jne 3f
     xor rax, rax
     mov qword ptr [rax], 1      // #PF: not present, write, user mode
     ud2                         // unreachable; a backstop, not a plan
+3:
+    cmp rdi, 2
+    jne 5f
+    // A thread that cannot end itself. No `syscall`, so it never reaches the
+    // kernel of its own accord and never passes a safe point it chose --
+    // which is what makes it a test of whether something *else* can stop it.
+    // The only way out of this loop is a timer interrupt that does not return.
+4:
+    jmp 4b
+5:
+    cmp rdi, 3
+    jne 1f
+    // The mirror of mode 2, and the other safe point. This thread is *only*
+    // ever in the kernel through a system call, so it can never be stopped by
+    // an interrupt returning to user mode -- if it stops, it stopped on the
+    // way back from `yield`. Between them the two modes cover both doors, and
+    // removing either check leaves exactly one of them running.
+    //
+    // `r15` because `syscall` destroys `rcx` and `r11`, and `rdi` is an
+    // argument to the call below.
+    mov r15, rdi
+6:
+    mov rax, 4                  // Kind::Yield
+    xor rdi, rdi
+    syscall
+    jmp 6b
 1:
 
     // --- Evidence that the loader read the file rather than copying it ------

@@ -364,9 +364,29 @@ crashing.
 1. **A ring-3 fault kills its domain, not the machine.** The `Faulted` reason, the report keeping
    everything it says today plus the domain's identity, and the machine continuing. Needs step 2's
    thread ownership only for the threads of the domain that died, which is the narrow case.
-2. **Threads are owned.** `Dying` as a state, checked on the syscall and interrupt exit paths and at
-   every blocking point; `destroy` stops a domain's threads instead of zeroing a counter; kernel
-   stacks and runqueue slots released. This is the step with the real difficulty in it.
+2. ~~**Threads are owned.**~~ ✅ **Done**, except for the stacks — see below. `destroy` marks every
+   thread of the domain and wakes the sleeping ones; each stops at its next safe point.
+
+   **A flag, not a fifth `State`.** A dying thread is still `Ready`, `Running` or `Blocked` — it has
+   not stopped yet, and everything reasoning about runnability, load and eviction must keep seeing it
+   as what it is. A `State` variant would have to be handled by all of them, and the ones that forgot
+   would be the interesting bugs. Host-tested: marking a thread dying does not change the load figure.
+
+   **Two safe points, and they are not equally provable.** The gate runs a domain with three threads
+   in ring 3 — one that faults, one that spins making no system call, one that does nothing but
+   `yield` — and asserts all three are gone. Deleting the interrupt-return check is caught
+   immediately and names the survivor: `spinner`, which has no other door. Deleting the
+   syscall-return check is **caught by nothing**, because a thread returning from a system call
+   returns to user mode, where the interrupt check catches it a tick later. That check is kept for
+   promptness and because step 3 needs it, and the code says so rather than implying it is gated.
+
+   **Sleeping is refused rather than interrupted.** A dying thread is not marked `Blocked`, because
+   sleeping is the one state with no next safe point. This is also why waking the already-blocked
+   ones is the whole mechanism rather than a courtesy — and it is most of step 3 arriving early.
+
+   **Not done: kernel stacks.** `reap_finished` frees a thread's slot and leaves its stack, because
+   there is no allocator for stack slots. That is older and larger than this step, and it is recorded
+   as outstanding rather than folded in here.
 3. **A blocked caller is woken when its server dies.** RFC 0013's question 1. Small once step 2
    exists, because the wake is the same mechanism as killing a blocked thread.
 4. **`DomainControl`, and creating a domain from ring 3.** The control object, the inline name, and

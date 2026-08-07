@@ -1234,6 +1234,42 @@ const USER_PROGRAM: &[u8] = b"bin/probe";
 /// one-way transition: the thread *becomes* the user thread, and comes back
 /// only through a system call. It leaves by calling `Exit`, which ends it.
 extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
+    ring3_program(hhdm_base, 0)
+}
+
+/// The same program, told to fault at entry. See `user/probe`.
+extern "C" fn ring3_faulter(hhdm_base: u64) -> ! {
+    ring3_program(hhdm_base, 1)
+}
+
+/// The same program, told to spin in ring 3 and never leave.
+///
+/// A thread that cannot end itself, so anything that stops it stopped it from
+/// outside. That is the whole point of it: a sibling that exits on its own
+/// would pass a test of thread ownership that owned nothing. It makes no
+/// system call, so the only door it can be stopped at is an interrupt
+/// returning to user mode.
+extern "C" fn ring3_spinner(hhdm_base: u64) -> ! {
+    ring3_program(hhdm_base, 2)
+}
+
+/// The same program, told to yield for ever.
+///
+/// The mirror of [`ring3_spinner`], and it exists because the two safe points
+/// are two separate pieces of code that can be wrong separately. This thread
+/// is only ever in the kernel through a system call, so if it stops, it
+/// stopped on the way back from one.
+extern "C" fn ring3_yielder(hhdm_base: u64) -> ! {
+    ring3_program(hhdm_base, 3)
+}
+
+/// Loads `bin/probe` into a fresh address space and enters ring 3 at it.
+///
+/// `mode` reaches the program in `rdi`, which is where `enter_ring3` puts the
+/// first of its two entry arguments. A static would have been simpler and
+/// wrong: two threads started moments apart would race to read it, and the
+/// test below starts exactly two.
+fn ring3_program(hhdm_base: u64, mode: u64) -> ! {
     use bhaskix_boot::VirtAddr;
     use bhaskix_mm::{Protection, VirtRange};
     use vm::AddressSpace;
@@ -1291,24 +1327,8 @@ extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
     // spawned.
     // SAFETY: `entry` is inside a user-executable segment of the space
     // just installed, and `rsp` is one past user-writable memory in it.
-    unsafe {
-        enter_user(
-            "ring 3",
-            entry,
-            rsp,
-            [
-                FAULT_ON_ENTRY.load(core::sync::atomic::Ordering::Relaxed),
-                0,
-            ],
-        )
-    }
+    unsafe { enter_user("ring 3", entry, rsp, [mode, 0]) }
 }
-
-/// Non-zero to ask the next `bin/probe` to fault at entry instead of running.
-///
-/// A static rather than a spawn argument because `ring3_probe` already uses
-/// both of its own, and because exactly one test at a time sets it.
-static FAULT_ON_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// A fault in ring 3 ends that domain, and nothing else.
 ///
@@ -1324,8 +1344,6 @@ static FAULT_ON_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// slot back, and this function returns to a boot sequence that keeps printing
 /// gates. Every line after this one is the evidence.
 fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
-    use core::sync::atomic::Ordering;
-
     // Runs on one CPU as happily as on four, and the single-CPU case is the
     // *harder* one: the faulting thread and the thread waiting for it share a
     // processor, so the machine only carries on if the dying thread actually
@@ -1353,15 +1371,38 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     };
     let live_before = domain::live();
 
-    FAULT_ON_ENTRY.store(1, Ordering::Release);
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(doomed.as_u32());
+
+    // A sibling first, and it is the point of RFC 0017 step 2. It spins in
+    // ring 3 for ever: it makes no system call, it never exits, and nothing
+    // it does can end it. If it is still running after its domain is
+    // destroyed, then "destroy" meant the accounting and not the program --
+    // which is exactly what it used to mean.
+    for (name, entry) in [
+        ("spinner", ring3_spinner as extern "C" fn(u64) -> !),
+        ("yielder", ring3_yielder as extern "C" fn(u64) -> !),
+    ] {
+        if let Err(error) = sched::spawn_on_with(cpu, name, entry, hhdm_base, hhdm_base, options) {
+            println!("    user fault     FAILED to spawn {name}: {error:?}");
+            domain::destroy(doomed);
+            return false;
+        }
+    }
+    // Let it reach ring 3 before the other one faults. Spawned and not yet
+    // entered is a thread in kernel code, which is a different case from the
+    // one being tested here.
+    //
+    // Asserted rather than merely waited for: if the sibling never ran, the
+    // check that it stopped would pass by counting a thread that was never
+    // there, which is the shape of a test that proves nothing.
+    let sibling_ran = wait_until(|| sched::threads_in_domain(doomed.as_u32()) >= 2, 4_000);
+
     if let Err(error) =
-        sched::spawn_on_with(cpu, "faulter", ring3_probe, hhdm_base, hhdm_base, options)
+        sched::spawn_on_with(cpu, "faulter", ring3_faulter, hhdm_base, hhdm_base, options)
     {
         println!("    user fault     FAILED to spawn the program: {error:?}");
-        FAULT_ON_ENTRY.store(0, Ordering::Release);
         domain::destroy(doomed);
         return false;
     }
@@ -1370,7 +1411,14 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // fault happens in microseconds on an idle host and in rather longer on a
     // loaded one, and a fixed sleep would turn the host's mood into a verdict.
     let gone = wait_until(|| domain::with(doomed, |_| ()).is_none(), 8_000);
-    FAULT_ON_ENTRY.store(0, Ordering::Release);
+
+    // And then for the sibling, which is a *separate* wait on purpose. It does
+    // not stop when the domain is destroyed; it stops at its next safe point,
+    // which for a thread spinning in ring 3 is the next timer interrupt. One
+    // wait covering both would not be able to tell "the sibling stopped" from
+    // "the sibling was never running".
+    let siblings_gone = wait_until(|| sched::threads_in_domain(doomed.as_u32()) == 0, 8_000);
+    let left = sched::threads_in_domain(doomed.as_u32());
 
     let live_after = domain::live();
     let checks = [
@@ -1379,11 +1427,20 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "the domain table got its slot back",
             live_after + 1 == live_before,
         ),
-        // The one that could not have passed before this change, and the
-        // reason the other two are worth reading: if the machine had halted,
-        // nothing would be here to check anything.
+        // Step 2. Before it, this domain's other thread carried on running
+        // with no capabilities -- contained, and not stopped -- and nothing
+        // in this system could tell you so.
+        ("the domain had two more threads in ring 3", sibling_ran),
+        (
+            "a destroyed domain takes its threads with it",
+            siblings_gone,
+        ),
+        // The one that could not have passed before step 1, and the reason
+        // the others are worth reading: if the machine had halted, nothing
+        // would be here to check anything.
         ("the machine carried on afterwards", true),
     ];
+    let _ = left;
 
     let mut ok = true;
     for (what, passed) in checks {
@@ -1392,9 +1449,26 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
             ok = false;
         }
     }
+    if !siblings_gone {
+        // Which one survived is the diagnosis, not a detail: `spinner` never
+        // makes a system call and `yielder` makes nothing but, so the name of
+        // the one still running says which door is stuck.
+        //
+        // Matched by name rather than by asking `sched::domain_of`, which is
+        // the version that was written first and printed nothing at all:
+        // `for_each` runs its closure *holding* the runqueue lock, and
+        // `domain_of` tries to take it again, fails its `try_lock`, and
+        // answers `None` for every thread. A diagnostic that goes quiet
+        // exactly when it is needed is worse than none.
+        sched::for_each(|cpu, id, name, state, _, _, _| {
+            if matches!(name, "spinner" | "yielder") && state != sched::State::Finished {
+                println!("      still running: cpu {cpu} thread {id} ({name}) {state:?}");
+            }
+        });
+    }
     if ok {
         println!(
-            "    user fault     a ring 3 fault ended its domain and nothing else; {live_after} domains live"
+            "    user fault     a ring 3 fault ended its domain and nothing else, its sibling stopped too; {live_after} domains live"
         );
     } else {
         domain::destroy(doomed);

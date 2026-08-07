@@ -1312,6 +1312,35 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     // the stub pops into `rax` and `rdx`.
     frame.kind = outcome.status.as_u64();
     frame.arg0 = outcome.value;
+
+    // The first of the two safe points where a thread told to stop actually
+    // stops. Here, and not where it was told, because *here* it demonstrably
+    // holds nothing: the dispatch above has returned, so every capability
+    // arena, runqueue and endpoint lock it took has been released, and the
+    // only thing left to do was to put two values in a frame.
+    //
+    // Killing a thread at the moment its domain died would instead catch it
+    // mid-derivation or half-way through a rendezvous, and free the stack it
+    // was standing on. See `sched::mark_domain_dying`.
+    //
+    // **This check is not independently gated, and the reason is worth stating
+    // rather than leaving for someone to rediscover.** A ring 3 thread that
+    // returns from a system call returns to user mode, where the *other* safe
+    // point -- an interrupt returning to ring 3 -- catches it within a tick.
+    // So deleting these four lines fails nothing today: measured, by deleting
+    // them and watching the gate still pass. Deleting the interrupt one is
+    // caught immediately, because a thread that makes no system call has no
+    // other door.
+    //
+    // It is kept for two reasons that are not "it might help". Death becomes
+    // prompt instead of tick-granular, which matters for a domain being torn
+    // down under memory pressure. And it is the door a thread woken *out of a
+    // blocking call* leaves by -- RFC 0017 step 3, where a caller whose
+    // service died is woken with an error and must not go back to user mode at
+    // all. That step is where this gets its own witness.
+    if crate::sched::should_die() {
+        crate::sched::exit()
+    }
 }
 
 /// Performs an `Invoke`, including the cross-domain grant.

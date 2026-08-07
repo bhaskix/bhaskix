@@ -136,7 +136,7 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1097
+unsafe_budget = 1087
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -173,3 +173,13 @@ unsafe_budget = 1097
 # cannot take a processor with it. That was never tested before -- all six
 # injected faults came from kernel mode -- and the claim had been false and
 # unnoticed since M5.
+#
+# 1087 at RFC 0017 step 2, which is *down* ten and adds no `unsafe` of its own.
+# Owning a domain's threads is ordinary code -- a flag, a wake, and two checks
+# on paths that already existed. The ten came back when a static that chose the
+# probe's mode was replaced by an entry argument, which shortened the one
+# `unsafe` block that reads it.
+#
+# Ratcheted to the measured figure rather than left at 1097 with slack. A
+# budget above the count is that many lines of `unsafe` nobody has to justify,
+# which is the opposite of what the number is for.
