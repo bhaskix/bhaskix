@@ -368,12 +368,23 @@ test-shell: $(ISO)
 # rendezvous stall of M6-08, and the `sched::exit` lock ordering of RFC 0017
 # step 6, which passed every gate in the single run that verified it and hung
 # the shell about three times in ten.
-.PHONY: soak
-soak: $(ISO)
+.PHONY: soak soak-boot soak-shell
+soak: soak-boot soak-shell
+
+# Does it come up, repeatedly.
+soak-boot: $(ISO)
 	tests/qemu/soak-test.sh $(SOAK_RUNS) $(SOAK_JOBS)
+
+# Does it *answer*, repeatedly -- which is a different question, and the one
+# that would have caught the kernel tearing the shell's banner in half. One at
+# a time on purpose: the shell test writes to the domain disk.
+soak-shell: $(ISO)
+	tests/qemu/soak-shell.sh $(SOAK_SHELL_RUNS) $(SOAK_SHELL_MODE)
 
 SOAK_RUNS ?= 40
 SOAK_JOBS ?= 2
+SOAK_SHELL_RUNS ?= 10
+SOAK_SHELL_MODE ?= user
 
 # Rebuilds the image per fault, so it must not run in parallel with the boot
 # tests -- hence its own target rather than a boot-test flag.

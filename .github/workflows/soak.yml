@@ -30,7 +30,21 @@
 # regression for most of a night.
 #
 # Run it on a machine with real cores before trusting a green result. The
-# Makefile target is `make soak`.
+# Makefile targets are `make soak-boot`, `make soak-shell`, and `make soak` for
+# both.
+#
+# ## Known to fail here, at about one run in twelve
+#
+# The shell soak finds a **pre-existing** intermittent fault: the filesystem
+# service stops answering, and `ls` and `cat` report that they cannot reach it.
+# Sometimes the kernel's own `bulk path` and `cost` self-tests fail alongside it
+# with `0/200 filesystem replies`. It reproduces at the same rate on
+# `3844ea3`, before any of the process-management work, so it is not new -- it
+# is newly *visible*, because nothing ran this test twice before. See TRACKER.
+#
+# Until that is fixed this job will be red some nights. That is the correct
+# behaviour for a job whose purpose is to find intermittent faults, and turning
+# it off or retrying until green would remove the only thing it does.
 
 name: soak
 
@@ -45,13 +59,17 @@ on:
         description: 'How many boots'
         required: false
         default: '20'
+      shell_runs:
+        description: 'How many shell runs'
+        required: false
+        default: '10'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   soak:
-    name: repeated boots
+    name: repeated boots and shell runs
     runs-on: ubuntu-latest
     # Emulated, so each boot is minutes rather than seconds. The default job
     # limit is six hours; this bounds it at something a human would wait for.
@@ -92,8 +110,18 @@ jobs:
           # One at a time. See the note at the top: on two cores, concurrency
           # produces false failures rather than the interleavings this is for.
           SOAK_JOBS: 1
-          SOAK_LOG_DIR: ${{ github.workspace }}/soak-logs
-        run: make soak SOAK_RUNS="$SOAK_RUNS" SOAK_JOBS="$SOAK_JOBS"
+          SOAK_LOG_DIR: ${{ github.workspace }}/soak-logs/boot
+        # `soak-boot`, not `soak`: the latter is both halves, and the shell half
+        # is the step below with its own count and its own logs.
+        run: make soak-boot SOAK_RUNS="$SOAK_RUNS" SOAK_JOBS="$SOAK_JOBS"
+
+      - name: Type at the shell many times
+        # A different question from the one above, and the one that would have
+        # caught the kernel tearing the shell's banner. Sequential by
+        # construction: the shell test writes to the domain disk.
+        env:
+          SOAK_LOG_DIR: ${{ github.workspace }}/soak-logs/shell
+        run: make soak-shell SOAK_SHELL_RUNS="${{ github.event.inputs.shell_runs || '10' }}"
 
       - name: Upload the logs on failure
         # The whole output of a soak is its logs, and a run that reports "3 of

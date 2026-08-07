@@ -615,6 +615,12 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 - **No lock ranking**, which `docs/coding-style.md` §7 requires and which becomes load-bearing the
   moment there are enough locks to order.
 
+### Open defects
+
+| Defect | Evidence | Owner |
+|---|---|---|
+| **The filesystem service stops answering, about one run in twelve.** `ls` and `cat` report "could not reach the filesystem"; sometimes the kernel's own `bulk path` and `cost` self-tests fail beside it with `refusal 18446744073709551615` and **`0/200 filesystem replies`**. Not a timeout: the failing runs finish in 25–29s against a 240s cap, so a check failed rather than the clock running out. | Found 2026-08-08 by `make soak-shell`, which is the first thing in this project ever to run a test twice. Reproduces at the **same rate on `3844ea3`**, before any process-management work, so it is **pre-existing and newly visible** rather than new. Logs: three failing runs captured, two with the `bulk path` signature and one that hung at `ls /` with no self-test failure at all. | unassigned |
+
 ### Blockers
 
 | Task | Blocked on | Owner |
@@ -677,7 +683,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | RT latency p99.9 < 50 µs | M4 | scheduler.md §4 |
 | Fuzz targets on every untrusted parser | M6 | coding-style.md §8 |
 | Interactive shell test (types at the machine) | M6 | Milestone exit criteria |
-| Soak: repeated boots of one image (`make soak`; CI runs it nightly, not per push) | M6 | Faults that depend on where a tick lands |
+| Soak: repeated boots **and repeated shell runs** (`make soak`; CI nightly, not per push) | M6 | Faults that depend on where a tick lands |
 | Both service placements build | Phase 2 | architecture.md §2 |
 | AI-degradation test (kill `bhaskixd-ai`, suite still passes) | Phase 4 | ai-native.md §4 |
 
@@ -686,6 +692,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-08 (the shell test is soaked too, and it found a real bug on its first run)
+
+- **`make soak-shell`**, beside `make soak-boot`, with `make soak` running both. The boot soak asks
+  "does it come up", repeatedly; this asks "does it *answer*", repeatedly. They are not the same
+  question — last night's bug was in neither the boot nor the shell but *between* them, where the
+  kernel's last output raced the shell's first.
+- **Sequential by construction, and not by oversight**: the shell test writes to
+  `build/domain-disk.img`, and the `disk` mode rebuilds the image outright. Two runs at once would be
+  two machines writing one disk, and the failure would be reported against the kernel.
+- **It failed on its very first run**, and has kept failing at about **one in twelve**. The
+  filesystem service stops answering: `ls` and `cat` report they cannot reach it, and sometimes the
+  kernel's own `bulk path` and `cost` self-tests fail beside it with `0/200 filesystem replies`. The
+  failing runs finish in 25–29 seconds against a 240-second cap, so this is a check failing and not
+  a clock running out — the distinction the harness now reports on purpose.
+- **It is pre-existing.** Built the same soak against `3844ea3`, before any of the process-management
+  work: it fails at the same rate, one in twelve, hanging at `ls /`. So the bug is not new; it is
+  newly *visible*, because nothing in this project had ever run a test twice. Recorded as an open
+  defect rather than fixed in the same change that found it.
+- **The nightly job will be red some nights until it is fixed**, and the workflow says so. That is
+  the correct behaviour for a job whose purpose is to find intermittent faults; retrying until green
+  would remove the only thing it does.
+- **Three distinct failure signatures were seen in about twenty-five runs**, which is worth recording
+  because it suggests one cause with several presentations rather than three bugs: the shell hung
+  mid-`help`; `ls`/`cat` unreachable with the kernel self-tests failing; and `ls /` hanging with no
+  self-test failure at all.
 
 ### 2026-08-08 (the soak runs in CI, nightly, with its limits written down)
 
