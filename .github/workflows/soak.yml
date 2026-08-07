@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Bhaskix soak: boot one image many times.
+#
+# Separate from `ci.yml` because it answers a different question and runs on a
+# different schedule. Every job in `ci.yml` boots once, which settles whether a
+# fault is *there*. This one settles whether a fault is *sometimes* there, and
+# nothing else in this project asks that.
+#
+# Two bugs this project shipped would have been caught by asking it. The IPC
+# rendezvous stall of M6-08 passed the whole suite, every run, for weeks, and
+# then failed fourteen times in forty. RFC 0017 step 6's `sched::exit` lock
+# ordering passed every gate in the single run that verified it and hung the
+# shell about three times in ten.
+#
+# ## What this job can and cannot tell you
+#
+# **It is weaker here than on real hardware, and the reason is worth stating
+# rather than discovering.** A GitHub runner has two cores and no KVM, so the
+# guest's four processors are emulated and time-sliced onto two. The soak's own
+# header explains why that matters: an oversubscribed host serialises exactly
+# the interleavings worth testing. A green run here is evidence that the machine
+# boots repeatedly; it is *not* evidence that it has no timing-dependent fault.
+#
+# So this runs with `SOAK_JOBS=1`. Concurrency on a two-core runner does not buy
+# parallelism the guest can use -- it buys false failures, because a boot that
+# the host has stopped scheduling looks exactly like a boot that hung. That
+# confusion is not hypothetical: it is what the harness reported before it
+# learned to stop a boot when it finished, and it was read as a kernel
+# regression for most of a night.
+#
+# Run it on a machine with real cores before trusting a green result. The
+# Makefile target is `make soak`.
+
+name: soak
+
+on:
+  schedule:
+    # Nightly. Rare faults are found by repetition over time rather than by one
+    # long run, and a nightly cadence costs nothing anybody is waiting on.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'How many boots'
+        required: false
+        default: '20'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: repeated boots
+    runs-on: ubuntu-latest
+    # Emulated, so each boot is minutes rather than seconds. The default job
+    # limit is six hours; this bounds it at something a human would wait for.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+
+      - name: Install QEMU, xorriso
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 xorriso mtools
+
+      - name: Record the environment
+        # Printed because the thing most likely to make this job wrong is the
+        # machine it ran on, not the kernel: how many cores it has, and whether
+        # any of them are real.
+        run: |
+          qemu-system-x86_64 --version
+          echo "--- cores ---"
+          nproc
+          grep -m1 'model name' /proc/cpuinfo || true
+          echo "--- kvm ---"
+          test -e /dev/kvm && echo "present" || echo "absent (emulated, timing is not the guest's)"
+
+      - name: Fetch Limine
+        run: |
+          git clone --branch v8.x-binary --depth 1 \
+            https://github.com/limine-bootloader/limine.git boot/limine/limine
+          make -C boot/limine/limine
+
+      - name: Build bootable image
+        run: make iso
+
+      - name: Boot it many times
+        env:
+          SOAK_RUNS: ${{ github.event.inputs.runs || '20' }}
+          # One at a time. See the note at the top: on two cores, concurrency
+          # produces false failures rather than the interleavings this is for.
+          SOAK_JOBS: 1
+          SOAK_LOG_DIR: ${{ github.workspace }}/soak-logs
+        run: make soak SOAK_RUNS="$SOAK_RUNS" SOAK_JOBS="$SOAK_JOBS"
+
+      - name: Upload the logs on failure
+        # The whole output of a soak is its logs, and a run that reports "3 of
+        # 40 did not finish" without them leaves nothing to look at.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-logs
+          path: soak-logs/
+          retention-days: 14

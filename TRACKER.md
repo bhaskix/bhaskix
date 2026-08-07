@@ -677,7 +677,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | RT latency p99.9 < 50 µs | M4 | scheduler.md §4 |
 | Fuzz targets on every untrusted parser | M6 | coding-style.md §8 |
 | Interactive shell test (types at the machine) | M6 | Milestone exit criteria |
-| Soak: 40 boots of one image (`make soak`, not in `make test`) | M6 | Faults that depend on where a tick lands |
+| Soak: repeated boots of one image (`make soak`; CI runs it nightly, not per push) | M6 | Faults that depend on where a tick lands |
 | Both service placements build | Phase 2 | architecture.md §2 |
 | AI-degradation test (kill `bhaskixd-ai`, suite still passes) | Phase 4 | ai-native.md §4 |
 
@@ -686,6 +686,28 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-08 (the soak runs in CI, nightly, with its limits written down)
+
+- **`.github/workflows/soak.yml`**: a job of its own, on a nightly schedule and on demand, not on
+  every push. It answers a different question from the rest of CI — every other job boots once, which
+  settles whether a fault is *there*; this settles whether one is *sometimes* there.
+- **It is weaker in CI than on real hardware, and the workflow says so rather than leaving it to be
+  discovered.** A GitHub runner has two cores and no KVM, so the guest's four processors are emulated
+  onto two — and an oversubscribed host serialises exactly the interleavings a soak exists to find. A
+  green run there means the machine boots repeatedly. It does not mean there is no timing-dependent
+  fault, and the job's header says that in those words.
+- **`SOAK_JOBS=1` in CI**, for the same reason. Concurrency on two cores does not buy parallelism the
+  guest can use; it buys false failures, because a boot the host has stopped scheduling looks exactly
+  like a boot that hung. That is not hypothetical — it is what this harness reported last night, and
+  it was read as a kernel regression for most of an evening.
+- **Logs survive a failure now.** The harness deleted its work directory unconditionally, so a run
+  reporting "3 of 40 did not finish" left nothing to look at. It now keeps them on failure, prints
+  where, and honours `SOAK_LOG_DIR` so CI can upload them.
+- **Not done, and it is the obvious next step**: the soak boots, and boots alone. Last night's real
+  bug was in the *shell* test, and a boot-only soak would not have caught it directly — it found it
+  by proving the boot was deterministic, which left nothing for "the host was slow" to explain. A
+  repeated shell run would have caught it head-on.
 
 ### 2026-08-08 (the shell test was never flaky — the kernel was tearing the shell's banner)
 

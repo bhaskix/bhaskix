@@ -52,8 +52,13 @@ MARKER="Nothing left to do at this milestone"
 
 [[ -f "$ISO" ]] || { fail "$ISO not found -- run 'make iso' first"; exit 1; }
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# Kept when something fails, because the logs are the only evidence a soak
+# produces and a run that deletes them leaves "3 of 40 failed" and nothing to
+# look at. Overridable so CI can put them somewhere it will upload from.
+WORK="${SOAK_LOG_DIR:-$(mktemp -d)}"
+mkdir -p "$WORK"
+keep=0
+trap '[[ $keep -eq 1 ]] || rm -rf "$WORK"' EXIT
 
 echo "booting $RUNS times, $JOBS at a time, ${TIMEOUT}s each..."
 
@@ -138,4 +143,10 @@ fi
 [[ $failed -gt 0 ]] && fail "$failed of $RUNS boots failed a self-test"
 [[ $truncated -gt 0 ]] && fail "$truncated of $RUNS boots did not finish bring-up"
 echo "  ($passed passed, which is why one run proves nothing)"
+
+# Before believing any of it, read the note at the top about oversubscription:
+# on a host that cannot give each guest its processors, "did not finish
+# bring-up" is the host and not the kernel.
+keep=1
+echo "  logs kept in $WORK"
 exit 1
