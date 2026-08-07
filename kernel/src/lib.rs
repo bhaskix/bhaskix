@@ -1253,6 +1253,41 @@ extern "C" fn ring3_spinner(hhdm_base: u64) -> ! {
     ring3_program(hhdm_base, 2)
 }
 
+/// The same program, told to receive for ever and never answer.
+///
+/// The server side of RFC 0017 step 3. Once it has taken a call the kernel
+/// records that it owes a reply, and it then goes straight back to waiting —
+/// so the obligation is outstanding for as long as it lives, and killing it
+/// strands whoever is waiting for that answer.
+extern "C" fn ring3_server(hhdm_base: u64) -> ! {
+    ring3_program(hhdm_base, 4)
+}
+
+/// Where a stranded caller's verdict is left: 0 nothing, 1 still waiting.
+static STRANDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Calls the doomed domain's server and records what comes back.
+///
+/// It will not come back with an answer: the server receives and never replies.
+/// What it must come back with is the *right refusal*, once that server dies.
+extern "C" fn stranded_caller(endpoint: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    STRANDED.store(1, Ordering::Release);
+    let verdict = match ipc::call(ipc::EndpointId::from_u32(endpoint as u32), 0, 7, [0; 4]) {
+        // The one right answer. The endpoint is still there and still valid --
+        // what has gone is the thread that owed the reply.
+        Err(ipc::IpcError::ServerGone) => 2,
+        // Any other refusal is wrong in an interesting way: it would mean the
+        // caller was told the endpoint had gone, which it has not, and a caller
+        // that believed it would throw away a perfectly good capability.
+        Err(_) => 3,
+        Ok(_) => 4,
+    };
+    STRANDED.store(verdict, Ordering::Release);
+    sched::exit()
+}
+
 /// The same program, told to yield for ever.
 ///
 /// The mirror of [`ring3_spinner`], and it exists because the two safe points
@@ -1380,9 +1415,41 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // it does can end it. If it is still running after its domain is
     // destroyed, then "destroy" meant the accounting and not the program --
     // which is exactly what it used to mean.
+    // An endpoint the doomed domain will serve, and a capability to it in its
+    // CSpace at index 0. Without this its server has nothing to receive on and
+    // the whole of step 3 is untested.
+    let Ok(endpoint) = ipc::create() else {
+        println!("    user fault     FAILED to create an endpoint");
+        domain::destroy(doomed);
+        return false;
+    };
+    let derived = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, 0).ok()
+    });
+    let Some(granted) = derived else {
+        println!("    user fault     FAILED to derive an endpoint capability");
+        ipc::destroy(endpoint);
+        domain::destroy(doomed);
+        return false;
+    };
+    if domain::with(doomed, |owner| owner.cspace.install_at(0, granted).is_ok()) != Some(true) {
+        println!("    user fault     FAILED to install the endpoint capability");
+        ipc::destroy(endpoint);
+        domain::destroy(doomed);
+        return false;
+    }
+
     for (name, entry) in [
         ("spinner", ring3_spinner as extern "C" fn(u64) -> !),
         ("yielder", ring3_yielder as extern "C" fn(u64) -> !),
+        ("server", ring3_server as extern "C" fn(u64) -> !),
     ] {
         if let Err(error) = sched::spawn_on_with(cpu, name, entry, hhdm_base, hhdm_base, options) {
             println!("    user fault     FAILED to spawn {name}: {error:?}");
@@ -1397,7 +1464,35 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // Asserted rather than merely waited for: if the sibling never ran, the
     // check that it stopped would pass by counting a thread that was never
     // there, which is the shape of a test that proves nothing.
-    let sibling_ran = wait_until(|| sched::threads_in_domain(doomed.as_u32()) >= 2, 4_000);
+    let sibling_ran = wait_until(|| sched::threads_in_domain(doomed.as_u32()) >= 3, 4_000);
+
+    // A caller from *outside* the doomed domain, blocked on a reply its server
+    // will never send. A kernel thread on purpose: what is under test is the
+    // obligation, and putting the caller in a third domain would add another
+    // thing that can fail without testing anything more.
+    STRANDED.store(0, core::sync::atomic::Ordering::Release);
+    let caller_options = sched::SpawnOptions::new().pinned();
+    if sched::spawn_on_with(
+        0,
+        "stranded",
+        stranded_caller,
+        u64::from(endpoint.as_u32()),
+        hhdm_base,
+        caller_options,
+    )
+    .is_err()
+    {
+        println!("    user fault     FAILED to spawn the stranded caller");
+        ipc::destroy(endpoint);
+        domain::destroy(doomed);
+        return false;
+    }
+
+    // Wait for the call to have been *taken*, not merely made. Until the server
+    // has received it there is no obligation to lose, and killing the domain
+    // before then would test the endpoint going away instead -- a different
+    // mechanism, which already worked.
+    let taken = wait_until(|| sched::owes_reply_in_domain(doomed.as_u32()), 4_000);
 
     if let Err(error) =
         sched::spawn_on_with(cpu, "faulter", ring3_faulter, hhdm_base, hhdm_base, options)
@@ -1420,6 +1515,15 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let siblings_gone = wait_until(|| sched::threads_in_domain(doomed.as_u32()) == 0, 8_000);
     let left = sched::threads_in_domain(doomed.as_u32());
 
+    // The caller must be told, and told the right thing. A separate wait
+    // because it is released by its server's death rather than by the domain's:
+    // the two happen in that order, and one wait could not tell them apart.
+    let answered = wait_until(
+        || STRANDED.load(core::sync::atomic::Ordering::Acquire) >= 2,
+        8_000,
+    );
+    let verdict = STRANDED.load(core::sync::atomic::Ordering::Acquire);
+
     let live_after = domain::live();
     let checks = [
         ("a ring 3 fault ended its domain", gone),
@@ -1434,6 +1538,14 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
         (
             "a destroyed domain takes its threads with it",
             siblings_gone,
+        ),
+        // Step 3, in three parts: the call was taken, the caller was released
+        // rather than left asleep, and it was told the *right* thing.
+        ("the doomed domain took a call and owed a reply", taken),
+        ("a caller whose server died was released", answered),
+        (
+            "it was told the server had gone, not the endpoint",
+            verdict == 2,
         ),
         // The one that could not have passed before step 1, and the reason
         // the others are worth reading: if the machine had halted, nothing
@@ -1466,9 +1578,10 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
             }
         });
     }
+    ipc::destroy(endpoint);
     if ok {
         println!(
-            "    user fault     a ring 3 fault ended its domain and nothing else, its sibling stopped too; {live_after} domains live"
+            "    user fault     a ring 3 fault ended its domain and nothing else, its siblings stopped and its caller was released; {live_after} domains live"
         );
     } else {
         domain::destroy(doomed);

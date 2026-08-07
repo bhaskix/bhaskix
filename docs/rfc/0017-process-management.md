@@ -387,8 +387,26 @@ crashing.
    **Not done: kernel stacks.** `reap_finished` frees a thread's slot and leaves its stack, because
    there is no allocator for stack slots. That is older and larger than this step, and it is recorded
    as outstanding rather than folded in here.
-3. **A blocked caller is woken when its server dies.** RFC 0013's question 1. Small once step 2
-   exists, because the wake is the same mechanism as killing a blocked thread.
+3. ~~**A blocked caller is woken when its server dies.**~~ ✅ **Done.** RFC 0013's question 1, open
+   since M7, and it was **not** small — step 2 turned out to have a hole that only this step's test
+   could see.
+
+   **The hole.** `take_message_or_block` writes `State::Blocked` directly rather than going through
+   `mark_blocked`, so it never learned step 2's rule. A dying thread asleep on an endpoint was woken,
+   found nothing, and blocked again — for ever. Step 2 therefore stopped every thread *except the
+   ones asleep in IPC*, which is most of the interesting ones, and its gate could not see it because
+   none of its three threads ever blocked. Watched failing: with the check removed, the domain's
+   server survives its own domain's destruction.
+
+   **The obligation is what dies, not the endpoint.** A caller blocked in `Call` cannot work this out
+   for itself: the endpoint is still there, the capability is still good, and something else may
+   serve it tomorrow. So `exit` takes the dying thread's `reply_to` and tells that caller directly.
+   The status is **`Revoked`** and not "no such endpoint", because a caller that believed the latter
+   would throw away a capability that is still perfectly valid — watched failing by reporting the
+   endpoint gone instead, which fails that check and only that one.
+
+   This is also where the syscall-return safe point earns its keep: the woken caller is *in the
+   kernel*, and the call it returns from is where it finds out.
 4. **`DomainControl`, and creating a domain from ring 3.** The control object, the inline name, and
    the envelope charging children to their creator — the last of which is not optional, because
    without it this step reopens T10.

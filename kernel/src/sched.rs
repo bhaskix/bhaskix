@@ -267,6 +267,19 @@ pub struct Thread {
     /// Kernel threads created before domains exist have no domain, and must
     /// not be swept up by a re-weighting aimed at one.
     pub domain: u32,
+    /// The answer this thread is waiting for is never coming.
+    ///
+    /// Set when the thread that owed it dies. A caller blocked in `Call` has no
+    /// way to discover this for itself: the endpoint it called is still there,
+    /// it is still a legitimate capability, and there may even be another
+    /// server on it later — what has gone is the *obligation*, which lived in
+    /// one thread. So it has to be told.
+    ///
+    /// Distinct from an endpoint being destroyed, which the caller can see, and
+    /// distinct from [`Self::dying`], which is about this thread rather than
+    /// the one it was waiting on.
+    pub answer_lost: bool,
+
     /// This thread has been told to stop, and will at the next safe point.
     ///
     /// **A flag rather than a fifth [`State`]**, and the distinction is the
@@ -710,6 +723,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         receive_slot: None,
         domain: u32::MAX,
         dying: false,
+        answer_lost: false,
         mailbox: None,
         // The thread a CPU registers for itself is already running on the
         // stack the bootloader gave it, and never enters from user mode.
@@ -907,6 +921,7 @@ pub fn spawn_on_with(
         receive_slot: None,
         domain: options.domain,
         dying: false,
+        answer_lost: false,
         mailbox: None,
         kernel_stack_top: guarded.top,
         pinned,
@@ -1223,6 +1238,27 @@ pub fn take_message_or_block(
                 target.state = State::Running;
                 return Delivery::Message(message);
             }
+            // The answer is not coming, because whoever owed it has gone. Ahead
+            // of `still_waiting`, which asks about the *endpoint* and would say
+            // yes: the endpoint is fine, and that is exactly why the caller
+            // cannot work this out for itself.
+            if core::mem::take(&mut target.answer_lost) {
+                target.state = State::Running;
+                return Delivery::Revoked;
+            }
+            // A thread told to stop must not go back to sleep here.
+            //
+            // This is the third place that decides to block, and it was missed
+            // when the other two learned the rule: it writes `State::Blocked`
+            // directly rather than going through `mark_blocked`. A dying thread
+            // waiting on an endpoint would be woken, find nothing, block again,
+            // and never reach a safe point -- so RFC 0017 step 2 stopped every
+            // thread except the ones that were asleep in IPC, which is most of
+            // the interesting ones.
+            if target.dying {
+                target.state = State::Running;
+                return Delivery::Abandoned;
+            }
             if still_waiting() {
                 target.state = State::Blocked;
                 return Delivery::Blocked;
@@ -1244,6 +1280,11 @@ pub enum Delivery<T> {
     /// What was being waited on has gone. The thread is running and should give
     /// up rather than sleep for something that will never arrive.
     Abandoned,
+    /// The thread that owed this answer has died. The thread is running and
+    /// should report that, distinctly: "the endpoint you called does not exist"
+    /// and "the program you called has gone" are different facts, and a caller
+    /// that retried the first would be right to and the second would not.
+    Revoked,
 }
 
 /// Takes the message waiting for `thread`, if there is one.
@@ -1710,12 +1751,32 @@ pub fn resched() {
 /// Marks the running thread finished and never returns.
 pub fn exit() -> ! {
     let cpu = percpu::cpu_id() as usize;
-    if cpu < MAX_CPUS {
+
+    // Whatever this thread still owed, taken as it stops.
+    //
+    // A thread that received a call and dies before answering leaves its caller
+    // blocked on a reply that no longer has anyone to send it. The caller
+    // cannot work this out: the endpoint is still there, the capability is
+    // still good, and there may be another server on it later. The obligation
+    // is what died, and it lived here.
+    //
+    // Taken under the same lock that marks this thread finished, so there is no
+    // window in which the thread is gone and the debt is still recorded.
+    let owed = if cpu < MAX_CPUS {
         let mut queue = QUEUES[cpu].lock();
         let current = queue.current;
-        if let Some(thread) = queue.threads[current].as_mut() {
+        queue.threads[current].as_mut().and_then(|thread| {
             thread.state = State::Finished;
-        }
+            thread.reply_to.take()
+        })
+    } else {
+        None
+    };
+
+    // Outside the lock: telling the caller takes its CPU's runqueue lock, and
+    // two of the same rank held at once have no order between them.
+    if let Some(caller) = owed {
+        abandon_caller(caller);
     }
     loop {
         preempt();
@@ -2386,6 +2447,56 @@ pub fn threads_in_domain(domain: u32) -> usize {
     total
 }
 
+/// Tells `caller` that the answer it is waiting for is never coming.
+///
+/// Returns whether a thread was found to tell. `false` is the ordinary case
+/// where the caller has already given up or gone away, not an error.
+///
+/// The wake is what makes the flag mean anything: a caller blocked in `Call` is
+/// asleep, and a flag set on a sleeping thread nobody wakes is a thread that
+/// sleeps for ever holding a slightly more informative reason.
+pub fn abandon_caller(caller: u32) -> bool {
+    let online = percpu::online_count() as usize;
+    let mut found = false;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == caller) {
+            target.answer_lost = true;
+            found = true;
+            break;
+        }
+    }
+    if found {
+        // Outside the loop, so the queue lock taken above is released first.
+        let _ = wake(caller);
+    }
+    found
+}
+
+/// Whether any thread of `domain` currently owes a caller a reply.
+///
+/// Used to wait for a rendezvous to have *happened* rather than for a duration:
+/// until the call has been taken there is no obligation to lose, and killing
+/// the domain before then would test the endpoint disappearing instead.
+#[must_use]
+pub fn owes_reply_in_domain(domain: u32) -> bool {
+    let online = percpu::online_count() as usize;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        if queue
+            .threads
+            .iter()
+            .flatten()
+            .any(|thread| thread.domain == domain && thread.reply_to.is_some())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether the running thread has been told to stop.
 ///
 /// Read at the points where a thread provably holds no kernel lock: on the way
@@ -2587,6 +2698,7 @@ mod tests {
             reply_to: None,
             receive_slot: None,
             dying: false,
+            answer_lost: false,
             domain: u32::MAX,
             mailbox: None,
             kernel_stack_top: 0,
@@ -2674,6 +2786,59 @@ mod tests {
              stopped counting it would decline to preempt for it"
         );
         assert!(queue.threads[1].as_ref().unwrap().state.is_schedulable());
+    }
+
+    /// The order the delivery decision asks its questions in.
+    ///
+    /// `take_message_or_block` reads a global array and a per-CPU id, so the
+    /// live function cannot run here. What is testable is the order, which is
+    /// where the meaning is: a reply that arrived before its sender died is
+    /// still a reply, and must win over the news that the sender has gone.
+    #[test]
+    fn a_delivered_reply_beats_a_lost_answer() {
+        let mut queue = with(&[State::Blocked]);
+        let thread = queue.threads[0].as_mut().unwrap();
+        thread.answer_lost = true;
+        thread.mailbox = Some((crate::ipc::Message::default(), 9));
+
+        // The decision, in the order the live one asks it.
+        let outcome = if thread.mailbox.take().is_some() {
+            "message"
+        } else if core::mem::take(&mut thread.answer_lost) {
+            "revoked"
+        } else {
+            "blocked"
+        };
+
+        assert_eq!(
+            outcome, "message",
+            "a server that replied and then died has still replied: asking \
+             about the loss first would throw away an answer that arrived"
+        );
+    }
+
+    /// And with no reply waiting, the loss is reported rather than slept on.
+    #[test]
+    fn a_lost_answer_is_reported_not_slept_on() {
+        let mut queue = with(&[State::Blocked]);
+        let thread = queue.threads[0].as_mut().unwrap();
+        thread.answer_lost = true;
+
+        let outcome = if thread.mailbox.take().is_some() {
+            "message"
+        } else if core::mem::take(&mut thread.answer_lost) {
+            "revoked"
+        } else {
+            "blocked"
+        };
+
+        assert_eq!(outcome, "revoked");
+        assert!(
+            !thread.answer_lost,
+            "the flag is taken, not read: a caller told once and left marked \
+             would refuse its next call for a reason that had already been \
+             delivered"
+        );
     }
 
     /// A queue built from explicit classes, every thread `Ready`.

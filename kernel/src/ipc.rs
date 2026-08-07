@@ -210,6 +210,12 @@ pub enum IpcError {
     Exhausted,
     /// The reply capability names a caller that is no longer waiting.
     NoSuchCaller,
+    /// The thread that owed this caller a reply has died.
+    ///
+    /// Not the same as the endpoint being gone: the capability is still valid,
+    /// and the endpoint may be served again by something else. What was lost is
+    /// the obligation, which lived in one thread.
+    ServerGone,
 }
 
 /// A rendezvous point.
@@ -482,6 +488,12 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
         // the mark and leave this thread blocked with nothing left to wake it.
         match sched::take_message_or_block(me, || live(id)) {
             sched::Delivery::Message((reply, _)) => return Ok(reply),
+            // The server took this call and then died. Distinct from the
+            // endpoint going away, which is what `Abandoned` means here: the
+            // endpoint is still perfectly good and may have another server on
+            // it tomorrow. What has gone is the obligation, and it lived in one
+            // thread. RFC 0013's unresolved question 1.
+            sched::Delivery::Revoked => return Err(IpcError::ServerGone),
             sched::Delivery::Abandoned => return Err(IpcError::NoSuchEndpoint),
             sched::Delivery::Blocked => sched::block_self(),
         }
@@ -525,7 +537,11 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
                 // The endpoint was destroyed under us. Leaving the queue entry
                 // behind would have a later rendezvous deliver to a thread that
                 // has gone.
-                sched::Delivery::Abandoned => {
+                // Either the endpoint was destroyed under us, or this thread
+                // has been told to stop. Both leave the same duty: take the
+                // queue entry out, or a later rendezvous delivers to a thread
+                // that has gone.
+                sched::Delivery::Abandoned | sched::Delivery::Revoked => {
                     cancel(id, me);
                     return Err(IpcError::NoSuchEndpoint);
                 }

@@ -755,6 +755,10 @@ const fn ipc_status(error: crate::ipc::IpcError) -> Status {
         }
         crate::ipc::IpcError::Congested => Status::Congested,
         crate::ipc::IpcError::NoSuchCaller => Status::NoSuchCaller,
+        // The endpoint is fine; the program behind it is not. `Revoked` is the
+        // status for authority that was good and has been taken away, which is
+        // what a reply obligation becomes the moment its holder dies.
+        crate::ipc::IpcError::ServerGone => Status::Revoked,
     }
 }
 

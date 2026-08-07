@@ -59,15 +59,17 @@ own IST stack'
   # charged.
   #
   # So the last two lines are the assertion. `user fault` only prints if the
-  # domain went away, the table took its slot back, and the domain's *other*
-  # thread stopped as well -- a thread that spins in ring 3 and makes no system
-  # call, so nothing it does can end it and only something outside it can. The
-  # milestone banner only prints if the boot ran to completion after all that.
+  # domain went away, the table took its slot back, the domain's *other* threads
+  # stopped -- one of them spins in ring 3 making no system call, so nothing it
+  # does can end it and only something outside it can -- and a caller in another
+  # thread, blocked on a reply that domain's server owed and will never send,
+  # was released with the right refusal rather than left asleep. The milestone
+  # banner only prints if the boot ran to completion after all of that.
   [user]='EXCEPTION: page fault (#PF)
 from USER mode
 this is a null pointer dereference
 Domain "faulter" is gone
-a ring 3 fault ended its domain and nothing else, its sibling stopped too
+a ring 3 fault ended its domain and nothing else, its siblings stopped and its caller was released
 Nothing left to do at this milestone'
 )
 

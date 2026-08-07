@@ -56,6 +56,7 @@ _start:
     //   1  write through a null pointer and do not come back
     //   2  spin in ring 3 for ever, making no system call
     //   3  yield for ever, so the only way out is a system call returning
+    //   4  receive for ever on capability 0, and never reply
     //
     // Both extra modes live in `bin/probe` rather than in programs of their
     // own because the loader path, the domain, the privilege stack and the
@@ -77,7 +78,7 @@ _start:
     jmp 4b
 5:
     cmp rdi, 3
-    jne 1f
+    jne 7f
     // The mirror of mode 2, and the other safe point. This thread is *only*
     // ever in the kernel through a system call, so it can never be stopped by
     // an interrupt returning to user mode -- if it stops, it stopped on the
@@ -92,6 +93,23 @@ _start:
     xor rdi, rdi
     syscall
     jmp 6b
+7:
+    cmp rdi, 4
+    jne 1f
+    // A server that takes a call and never answers it. Once it has received,
+    // the kernel records that this thread owes its caller a reply -- and then
+    // this thread goes straight back to waiting, so the obligation is
+    // outstanding for as long as the thread lives. Killing it is what a caller
+    // blocked on that reply cannot survive without being told.
+    //
+    // It blocks in the kernel rather than in ring 3, which is the case RFC
+    // 0017 step 2 could not stop: a thread asleep on an endpoint has no next
+    // safe point of its own.
+8:
+    mov rax, 3                  // Kind::Recv
+    xor rdi, rdi                // capability index 0
+    syscall
+    jmp 8b
 1:
 
     // --- Evidence that the loader read the file rather than copying it ------
