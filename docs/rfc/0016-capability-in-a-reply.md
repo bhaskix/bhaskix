@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📝 **Draft.** |
+| **Status** | ✅ **Accepted 2026-08-07**, with all five steps implemented and gated. Resolves **CR1**. One of its four open questions was answered by the code before acceptance and one turned out to be a gap rather than a question; the remaining two stay open and are named below. Its first step — **badges are one-way** — has since refused two wrong things written by its own author, which is the strongest evidence a rule of this kind can produce. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/cap`, `kernel/syscall`, ABI, `services/vfs`, a new filesystem service |
 | **Milestone** | Phase 2 in [roadmap.md](../roadmap.md) — closes the *full VFS* bullet |
@@ -363,20 +363,33 @@ hypothesis, and the crossover is the one this RFC is least sure of.
 
 ## Unresolved questions
 
+**Decided by acceptance:** the two struck through below. `HAND` belongs on the endpoint, and the
+block service's missing `WRITE` was a gap rather than a question and was closed in step 3.
+
+**Still open:** what ends a lending, and where `mkfs` lives. Neither blocks anything built here, and
+the first is the more interesting: step 5 lends a frame and nothing ever gives it back.
+
 - ~~**Does `HAND` belong on the endpoint, or on the reply?**~~ **Answered by the code: the
   endpoint, because there is no reply capability to put it on.** `ObjectKind::Reply` exists in the
   arena but a server never holds one — the reply obligation is thread state (`reply_to`), and
   `Kind::Reply` ignores its capability argument entirely. So "not answering anybody" is a check and
   not a lookup failure, and it is the check the tests spend most of their effort on. If a `Reply`
   capability ever becomes a thing a server holds, this is the first place that should move.
-- **What ends a lending?** Explicit release by the client is simplest and is a promise a client can
-  break. Revocation when the handle goes needs the service to observe the handle going, which it
-  cannot today. The likely answer is that the service revokes whenever it wants the frame and the
-  client must cope — which RFC 0009 already requires of everybody — but that makes every lent
-  mapping a fault waiting to happen and the cost of that should be understood first.
-- **Where does `mkfs` live?** It links `bhaskix-fs` and runs on a developer's machine. Once the crate
-  is not in the kernel, nothing about the arrangement changes, but the workspace's story about which
-  crates are `no_std` and which are tools gets one more entry and should be written down once.
+- **What ends a lending?** **Still open, and acceptance does not close it.** Step 5 shipped with the
+  pin and no release at all: `bin/fsd` pins a frame, hands it over, and nothing gives it back. A
+  cache with every frame lent refuses rather than taking one back, so the failure is bounded and
+  visible — but it is a refusal, not an answer.
+
+  Explicit release by the client is simplest and is a promise a client can break. Revocation when
+  the handle goes needs the service to observe the handle going, which it still cannot. The likely
+  answer is that the service revokes whenever it wants the frame and the client copes — which
+  RFC 0009 already requires of everybody — but that makes every lent mapping a fault waiting to
+  happen, and the cost of that should be measured before it is chosen.
+- **Where does `mkfs` live?** **Still open**, and now purely a documentation debt: it links
+  `bhaskix-fs`, runs on a developer's machine, and is built behind a feature so that a tool nobody
+  compiles is not a tool that has already stopped compiling. The workspace's story about which
+  crates are `no_std` and which are tools needs writing down once, and this is the second entry in
+  it.
 - ~~**Does the block service need `WRITE`?**~~ Answered while writing this, and it is not an open
   question but a gap: `bin/blkd` has no write path, RFC 0015's step 1 said it would, and the journal
   has therefore only ever been exercised against memory. Folded into step 3.
