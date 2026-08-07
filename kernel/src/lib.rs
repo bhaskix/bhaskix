@@ -1159,6 +1159,20 @@ const BADGE_DERIVED: u64 = 0x0000_0000_5678_0000;
 const RING3_DELEGATED_METHOD: u64 = 9;
 /// The method the probe reports its three `SPAWN` results on. RFC 0017 step 4.
 const RING3_SPAWN_METHOD: u64 = 13;
+/// The method it reports `GRANT` and `START` on. RFC 0017 step 5.
+const RING3_START_METHOD: u64 = 14;
+/// The method a program *started by* the probe calls, to prove it is running.
+const RING3_STARTED_METHOD: u64 = 15;
+/// What the kernel answered the probe's `GRANT` and `START`.
+static RING3_GRANT_START: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 4];
+/// What a program the probe started said, if it ran at all.
+static RING3_STARTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// The domain the probe runs in, so the service can find its child.
+static RING3_REALM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// Threads plus capabilities the probe's child held the moment it was created.
+static RING3_CHILD_HELD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
 /// What the kernel answered each of the probe's three `SPAWN` attempts.
 static RING3_SPAWN: [core::sync::atomic::AtomicU64; 3] =
     [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 3];
@@ -1201,6 +1215,33 @@ extern "C" fn ring3_service(_argument: u64) -> ! {
                     for (slot, answer) in RING3_SPAWN.iter().zip(message.args) {
                         slot.store(answer, Ordering::Release);
                     }
+                    // The child, looked at *now*. This is a rendezvous: the
+                    // probe is blocked in this call and cannot have granted or
+                    // started anything yet, because both are the next things it
+                    // does and it has not been replied to.
+                    let realm = RING3_REALM.load(Ordering::Acquire);
+                    if realm != u64::MAX
+                        && let Some(child) =
+                            domain::child_of(domain::DomainId::from_u32(realm as u32))
+                        && let Some(held) = domain::with(child, |domain| {
+                            u64::from(domain.threads()) + domain.cspace.occupied() as u64
+                        })
+                    {
+                        RING3_CHILD_HELD.store(held, Ordering::Release);
+                    }
+                }
+                if message.method == RING3_START_METHOD {
+                    for (slot, answer) in RING3_GRANT_START.iter().zip(message.args) {
+                        slot.store(answer, Ordering::Release);
+                    }
+                }
+
+                // A message from a program the probe created, granted and
+                // started. It arrives on the same endpoint because that is the
+                // capability it was given -- and it could arrive no other way,
+                // which is the point.
+                if message.method == RING3_STARTED_METHOD {
+                    RING3_STARTED.store(message.args[0], Ordering::Release);
                 }
 
                 // The badge on the call made through the capability ring 3
@@ -1249,6 +1290,92 @@ const USER_PROGRAM: &[u8] = b"bin/probe";
 /// only through a system call. It leaves by calling `Exit`, which ends it.
 extern "C" fn ring3_probe(hhdm_base: u64) -> ! {
     ring3_program(hhdm_base, 0)
+}
+
+/// Where a started program's stack goes in its own address space.
+///
+/// The kernel's choice, not the image's. An ELF says where its code and data
+/// belong and nothing about where it should be given room to push, so this is
+/// one of the few addresses the loader picks rather than reads.
+const STARTED_STACK: u64 = 0x0000_0000_1400_0000;
+/// How many pages of it. Enough for a program with a few frames of locals.
+const STARTED_STACK_PAGES: u64 = 4;
+/// The largest image `START` will load.
+///
+/// A bound rather than a limit chosen for a reason: the copy below is a kernel
+/// allocation sized by something a program supplied, and a program that could
+/// name any size could ask the kernel to allocate until it stopped.
+const STARTED_IMAGE_MAX: usize = 256 * 1024;
+
+/// Loads and runs the program a `START` left waiting for this domain.
+///
+/// Runs as the domain's first thread rather than inside the system call, and
+/// that is deliberate: it reads a page at a time, allocates, and parses
+/// something a program supplied. Doing it in the call would make an untrusted
+/// image's size the caller's syscall latency and put a parser on the dispatch
+/// path.
+///
+/// Every failure ends the thread rather than the machine. A program that was
+/// handed a broken image gets a domain with no threads in it, which its holder
+/// can see; that is a better answer than a kernel that reports somebody else's
+/// malformed ELF as its own bug.
+pub extern "C" fn started_program(domain: u64) -> ! {
+    use alloc::vec::Vec;
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let id = domain::DomainId::from_u32(domain as u32);
+    let Some((image, length, argument)) = domain::take_pending_start(id) else {
+        sched::exit()
+    };
+    let length = length.min(STARTED_IMAGE_MAX);
+
+    // Copied out of the caller's memory before anything is built from it.
+    //
+    // A copy rather than a borrow, and the reason is not tidiness: the object
+    // belongs to the program that asked, which is still running and may write
+    // to it. Parsing headers in memory a mutable third party can change is how
+    // a checked bound becomes a stale one -- the loader would validate an
+    // offset, the writer would move it, and the load would use the new value.
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(length).is_err() {
+        sched::exit()
+    }
+    let taken = shared::drain_into(image, length, &mut |chunk: &[u8]| {
+        bytes.extend_from_slice(chunk);
+        chunk.len()
+    });
+    if taken.is_none() || bytes.is_empty() {
+        sched::exit()
+    }
+
+    let Ok(parsed) = elf::parse(&bytes) else {
+        sched::exit()
+    };
+    let Ok(mut space) = AddressSpace::new(shared::hhdm()) else {
+        sched::exit()
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(STARTED_STACK), STARTED_STACK_PAGES) else {
+        sched::exit()
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        sched::exit()
+    }
+    let Ok(entry) = elf::load_into(&parsed, &bytes, &mut space, shared::hhdm()) else {
+        sched::exit()
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = STARTED_STACK + STARTED_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed -- `elf::parse` refuses an entry point that is not, and every
+    // segment it accepted was mapped above. `rsp` is one past user-writable
+    // memory in the same space, and this thread was spawned pinned.
+    unsafe { enter_user("started", entry, rsp, [argument, 0]) }
 }
 
 /// The same program, told to fault at entry. See `user/probe`.
@@ -1698,8 +1825,73 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("    ring 3         FAILED to install the DomainControl");
         return false;
     }
-    for answer in &RING3_SPAWN {
+    for answer in RING3_SPAWN.iter().chain(RING3_GRANT_START.iter()) {
         answer.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    }
+    RING3_STARTED.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    RING3_CHILD_HELD.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    RING3_REALM.store(
+        u64::from(realm.as_u32()),
+        core::sync::atomic::Ordering::Release,
+    );
+
+    // The image the probe will start its child with, in memory the probe
+    // holds. Staged by the kernel because the probe has no filesystem -- but
+    // handed over as a **capability**, so what the probe does with it is the
+    // probe's own affair and the kernel never opens a file on its behalf.
+    let staged = vfs::open(USER_PROGRAM).ok().and_then(|file| {
+        let bytes = file.bytes();
+        let pages = bytes.len().div_ceil(bhaskix_mm::FRAME_SIZE as usize).max(1);
+        let object = shared::create(realm, pages as u64 * bhaskix_mm::FRAME_SIZE).ok()?;
+        let mut written = 0;
+        shared::fill_from(object, bytes.len(), &mut |page: &mut [u8]| {
+            let take = page.len().min(bytes.len() - written);
+            page[..take].copy_from_slice(&bytes[written..written + take]);
+            written += take;
+            take
+        })?;
+        shared::name(object).ok()
+    });
+    let Some(staged) = staged else {
+        println!("    ring 3         FAILED to stage the program image");
+        return false;
+    };
+    if domain::with(realm, |owner| owner.cspace.install_at(4, staged).is_ok()) != Some(true) {
+        println!("    ring 3         FAILED to install the program image");
+        return false;
+    }
+
+    // A second capability to the same endpoint, at slot 5, for the probe to
+    // give away.
+    //
+    // Not slot 0, which the probe revokes at the end of its run to prove
+    // revocation is transitive — and it is: the first version of this granted
+    // from slot 0, and the revocation took the child's copy with it, so the
+    // program the probe had started found itself holding nothing and its call
+    // reached nobody. That is the machinery working, and it is worth stating as
+    // a property rather than as a bug: **what a program gives away, it can take
+    // back**, because a grant is a derivation and revocation is transitive.
+    //
+    // Which also means a giver must keep a capability it does not intend to
+    // revoke, if it wants what it gave to outlive its own housekeeping. Slot 5
+    // is that capability.
+    let giveable = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, BADGE_RING3).ok()
+    });
+    let Some(giveable) = giveable else {
+        println!("    ring 3         FAILED to derive a capability to give away");
+        return false;
+    };
+    if domain::with(realm, |owner| owner.cspace.install_at(5, giveable).is_ok()) != Some(true) {
+        println!("    ring 3         FAILED to install the capability to give away");
+        return false;
     }
 
     let (calls_before, refused_before, revoked_before) = syscall::statistics();
@@ -1733,6 +1925,12 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // the third success and produces no counter of its own to wait on.
     wait_millis(300);
 
+    // After the started program has had its say: it calls the same service,
+    // and counting before it does would count six and expect seven.
+    wait_until(
+        || RING3_STARTED.load(core::sync::atomic::Ordering::Acquire) != u64::MAX,
+        8_000,
+    );
     let ring3_calls = RING3_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let ring3_badge = RING3_BADGE.load(core::sync::atomic::Ordering::Relaxed);
     let delegated_badge = RING3_DELEGATED_BADGE.load(core::sync::atomic::Ordering::Acquire);
@@ -1744,6 +1942,17 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         RING3_SPAWN[1].load(core::sync::atomic::Ordering::Acquire),
         RING3_SPAWN[2].load(core::sync::atomic::Ordering::Acquire),
     ];
+    // The started program runs on another CPU and reports on its own account,
+    // so this waits for it rather than assuming the probe's exit means it is
+    // finished. A program that never started is the failure being tested for;
+    // a program that started slowly is not.
+    wait_until(
+        || RING3_STARTED.load(core::sync::atomic::Ordering::Acquire) != u64::MAX,
+        8_000,
+    );
+    let granted = RING3_GRANT_START[0].load(core::sync::atomic::Ordering::Acquire);
+    let started = RING3_GRANT_START[1].load(core::sync::atomic::Ordering::Acquire);
+    let ran = RING3_STARTED.load(core::sync::atomic::Ordering::Acquire);
 
     // Everything about the child, read *before* the parent is destroyed. After
     // that the answers would all be "gone", which is true and says nothing.
@@ -1757,11 +1966,14 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // the child a copy of its creator's endpoint, which is what inheriting a
     // capability space would do: the check passed, because it was measuring
     // the accounting rather than the contents.
-    let child_empty = child.and_then(|child| {
-        domain::with(child, |domain| {
-            domain.threads() == 0 && domain.cspace.occupied() == 0
-        })
-    });
+    // Taken at the moment the child was created, not now.
+    //
+    // The service reads it while the probe is blocked in the call that reports
+    // its `SPAWN` results — so the probe cannot yet have granted or started
+    // anything, because both are the next things it does and it has not been
+    // replied to. Reading it here instead would read it after the grant and
+    // the start, and "holds nothing" would be false for the best of reasons.
+    let child_empty = RING3_CHILD_HELD.load(core::sync::atomic::Ordering::Acquire) == 0;
     let child_charged = domain::with(realm, |owner| owner.children());
 
     RING3_STOP.store(true, core::sync::atomic::Ordering::Release);
@@ -1787,9 +1999,18 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "the kernel was entered from the user code page",
             (USER_CODE..USER_CODE + bhaskix_mm::FRAME_SIZE).contains(&rip),
         ),
+        // Either user stack. Since RFC 0017 step 5 there are two programs in
+        // ring 3 here -- the probe, and the one it started -- and the last
+        // system call is the started program's. That it arrives from a
+        // *different* user stack is evidence for the step rather than against
+        // the claim: what is being asserted is that the kernel was entered
+        // from user memory, and both of these are addresses the kernel never
+        // uses as a stack.
         (
-            "the caller was on the user stack",
-            rsp > USER_STACK && rsp <= stack_top,
+            "the caller was on a user stack",
+            (rsp > USER_STACK && rsp <= stack_top)
+                || (rsp > STARTED_STACK
+                    && rsp <= STARTED_STACK + STARTED_STACK_PAGES * bhaskix_mm::FRAME_SIZE),
         ),
         // Without this the probe only ever enters the kernel through
         // `SYSCALL`, and the interrupt entry path -- with its own `swapgs`,
@@ -1802,7 +2023,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // through the capability ring 3 derived for itself. The call through
         // the badge it *tried to forge* is not among them, and neither is the
         // one after revocation.
-        ("ring 3 reached a service through IPC", ring3_calls == 5),
+        ("ring 3 reached a service through IPC", ring3_calls == 7),
         // RFC 0017 step 4. A program with a `DomainControl` created a domain,
         // and the two refusals are worth as much as the success: one says the
         // envelope is checked as well as the capability, the other says the
@@ -1822,15 +2043,40 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // What came back is *empty*. This is the whole shape of the design: a
         // child holds only what it is granted afterwards, so a fresh one holds
         // nothing at all.
-        (
-            "the domain it created holds nothing",
-            child_empty == Some(true),
-        ),
+        ("the domain it created holds nothing", child_empty),
         (
             "it is named what ring 3 asked for",
             child_name.map(|name| name.as_str() == "child") == Some(true),
         ),
         ("the creator was charged for it", child_charged == Some(1)),
+        // RFC 0017 step 5, and the two steps that make step 4 worth anything.
+        // A child that cannot be given a capability holds nothing for ever,
+        // and a child that cannot be started never uses what it holds.
+        (
+            "ring 3 gave its child a capability",
+            granted == bhaskix_abi::status::OK,
+        ),
+        (
+            "ring 3 started a program in it",
+            started == bhaskix_abi::status::OK,
+        ),
+        (
+            "starting a program in something that is not a domain was refused",
+            RING3_GRANT_START[2].load(core::sync::atomic::Ordering::Acquire)
+                == bhaskix_abi::status::WRONG_OBJECT,
+        ),
+        (
+            "giving away a capability it may only hold was refused",
+            RING3_GRANT_START[3].load(core::sync::atomic::Ordering::Acquire)
+                == bhaskix_abi::status::INSUFFICIENT_RIGHTS,
+        ),
+        // The one that cannot be faked. This message arrived from a program
+        // the probe created, granted and started -- on an endpoint it could
+        // only reach through the capability it was given.
+        (
+            "the program it started ran and used what it was given",
+            ran == 0x53_5441_5254,
+        ),
         (
             "destroying the creator took the child with it",
             charge_returned,

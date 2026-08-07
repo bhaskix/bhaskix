@@ -57,6 +57,7 @@ _start:
     //   2  spin in ring 3 for ever, making no system call
     //   3  yield for ever, so the only way out is a system call returning
     //   4  receive for ever on capability 0, and never reply
+    //   6  say so on capability 0 and exit -- what a *started* program does
     //
     // Both extra modes live in `bin/probe` rather than in programs of their
     // own because the loader path, the domain, the privilege stack and the
@@ -95,7 +96,7 @@ _start:
     jmp 6b
 7:
     cmp rdi, 4
-    jne 1f
+    jne 9f
     // A server that takes a call and never answers it. Once it has received,
     // the kernel records that this thread owes its caller a reply -- and then
     // this thread goes straight back to waiting, so the obligation is
@@ -110,6 +111,26 @@ _start:
     xor rdi, rdi                // capability index 0
     syscall
     jmp 8b
+9:
+    cmp rdi, 6
+    jne 1f
+    // What a program started by another program does: prove it is running, in
+    // the only way a program with no ambient authority can -- by using a
+    // capability somebody gave it.
+    //
+    // If the grant did not happen this call reaches nobody and the test that
+    // waits for it fails, which is the right coupling: a started program with
+    // no capabilities is indistinguishable from one that never started, and
+    // this makes both show up as the same failure rather than as a pass.
+    mov rax, 1                  // Kind::Call
+    xor rdi, rdi                // capability 0, granted by the program that started this one
+    mov rsi, 15                 // method: "a started program is running"
+    mov rdx, 0x5354415254       // "STA RT" -- recognisable in a memory dump
+    syscall
+
+    mov rax, 5                  // Kind::Exit
+    syscall
+    ud2
 1:
 
     // --- Evidence that the loader read the file rather than copying it ------
@@ -293,6 +314,93 @@ _start:
     mov rdx, r12
     mov r10, r13
     mov r8, r14
+    syscall
+
+    // --- RFC 0017 step 5: grant, then start --------------------------------
+    //
+    // The child exists and holds nothing. These are the other two steps of
+    // create-grant-start, in that order, because they have to be: a program
+    // started before it has been given anything can do nothing, and would be
+    // indistinguishable from one that never ran.
+    //
+    // Capability 6 is the child. Give it a copy of the endpoint under the
+    // *same badge*, which is the only badge a holder may derive.
+    //
+    // From slot 5 and not slot 0, because slot 0 is revoked further down to
+    // show that revocation is transitive -- and it is, which is exactly the
+    // problem: granting from slot 0 hands the child something that is taken
+    // away again a few instructions later. What a program gives, it can take
+    // back.
+    mov rax, 0                  // Kind::Invoke
+    mov rdi, 6                  // on the child Domain
+    mov rsi, 16                 // method::GRANT
+    mov rdx, 5                  // my slot 5: a second capability to the endpoint
+    mov r10, 0                  // its slot 0 in the child
+    mov r8, 0x3f                // rights: everything I hold
+    mov r9, 0x12340000          // the same badge; a holder may not invent one
+    syscall
+    mov r15, rax
+
+    // And start it. The image is in capability 4, a memory object this program
+    // was given; how many bytes is the kernel's business, which clamps to the
+    // object. The last argument is one word handed to the program at entry --
+    // mode 6, which is "say so and exit".
+    mov rax, 0                  // Kind::Invoke
+    mov rdi, 6                  // on the child Domain
+    mov rsi, 50                 // method::START
+    mov rdx, 4                  // my slot 4: the image
+    mov r10, 0x10000            // at most 64 KiB of it
+    mov r8, 6                   // the word it is entered with
+    syscall
+    mov rbx, rax
+
+    // The two refusals. Without these the checks that `START` looks at the
+    // *kind* of capability, and that `GRANT` needs the right to give a thing
+    // away, are never asked -- and a check nobody asks is not a check.
+    //
+    // First: start a program in the endpoint. It is a perfectly good
+    // capability and it is not a domain.
+    mov rax, 0                  // Kind::Invoke
+    xor rdi, rdi                // capability 0: an Endpoint
+    mov rsi, 50                 // method::START
+    mov rdx, 4
+    mov r10, 0x10000
+    mov r8, 6
+    syscall
+    mov r12, rax                // must be WRONG_OBJECT
+
+    // Second: derive a copy with READ and DERIVE but *not* GRANT, then try to
+    // give it away. Holding a capability and being allowed to pass it on are
+    // different permissions, and this is the one that says so.
+    mov rax, 0                  // Kind::Invoke
+    mov rdi, 5                  // from slot 5
+    xor rsi, rsi                // method::DERIVE
+    mov rdx, 0x21               // READ and DERIVE; no GRANT
+    mov r10, 0x12340000         // the same badge
+    mov r8, 8                   // into slot 8
+    syscall
+
+    mov rax, 0                  // Kind::Invoke
+    mov rdi, 6                  // on the child Domain
+    mov rsi, 16                 // method::GRANT
+    mov rdx, 8                  // my slot 8, which may not be passed on
+    mov r10, 1                  // its slot 1
+    mov r8, 0x01                // rights: READ only
+    mov r9, 0x12340000
+    syscall
+    mov r13, rax                // must be INSUFFICIENT_RIGHTS
+
+    // The grant and the start, on their own message -- and *after* the one
+    // above, which is what lets the service look at the child while it is
+    // still untouched. That call is a rendezvous: this program is blocked in
+    // it, so nothing below has happened yet when the service reads.
+    mov rax, 1                  // Kind::Call
+    xor rdi, rdi
+    mov rsi, 14                 // method: "here is what grant and start said"
+    mov rdx, r15                // the grant
+    mov r10, rbx                // the start
+    mov r8, r12                 // starting a program in an endpoint
+    mov r9, r13                 // giving away what may only be held
     syscall
 
 

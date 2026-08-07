@@ -286,6 +286,12 @@ pub struct Domain {
     parent_generation: u32,
     /// Domains this one has created that still exist.
     children: u32,
+    /// An image waiting for this domain's first thread to collect it.
+    ///
+    /// Set by `START` and taken by the thread it spawns. It lives here because
+    /// a thread entry point takes one word and this needs three, and a domain
+    /// is the identity both sides already agree on.
+    pending_start: Option<(crate::shared::MemoryId, usize, u64)>,
     /// What it may touch.
     pub cspace: CSpace,
     /// What it may consume.
@@ -312,6 +318,7 @@ impl Domain {
             parent: u32::MAX,
             parent_generation: 0,
             children: 0,
+            pending_start: None,
             cspace: CSpace::new(),
             envelope: ResourceEnvelope::new(),
             charged_frames: 0,
@@ -509,6 +516,54 @@ impl core::fmt::Debug for Name {
     }
 }
 
+/// Which CPU the next started program is pinned to.
+static NEXT_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Records the image a domain is about to be started with.
+///
+/// Kept in the domain itself, under the table lock that already exists, rather
+/// than in a table of its own. A second lock would need a rank, and a rank
+/// beside `Rank::Domains` would be two locks with no order between them that
+/// every future caller has to remember not to nest.
+///
+/// Returns `false` if one is already recorded, which means two starts raced:
+/// the second is refused rather than overwriting the first, because the first
+/// already has a thread on its way to collect it.
+pub fn record_pending_start(
+    id: DomainId,
+    image: crate::shared::MemoryId,
+    length: usize,
+    argument: u64,
+) -> bool {
+    let mut table = TABLE.lock();
+    let Some(domain) = table.domains.get_mut(id.0 as usize).filter(|d| d.live) else {
+        return false;
+    };
+    if domain.pending_start.is_some() {
+        return false;
+    }
+    domain.pending_start = Some((image, length, argument));
+    true
+}
+
+/// Takes the image a domain was started with, if one is waiting.
+pub fn take_pending_start(id: DomainId) -> Option<(crate::shared::MemoryId, usize, u64)> {
+    let mut table = TABLE.lock();
+    table.domains.get_mut(id.0 as usize)?.pending_start.take()
+}
+
+/// The CPU to pin the next started program to.
+///
+/// Rotated across the online processors. A pinned thread cannot be moved
+/// afterwards, so this is an argument for spreading rather than for choosing
+/// well: getting it wrong once is permanent, and the cheapest way to be wrong
+/// rarely is not to concentrate.
+#[must_use]
+pub fn next_start_cpu() -> u32 {
+    let online = bhaskix_arch::percpu::online_count().max(1);
+    NEXT_CPU.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % online
+}
+
 /// The capability naming a domain, from which everything it is granted derives.
 ///
 /// Exposed so a creator can be handed a capability *under* the root rather than
@@ -613,6 +668,7 @@ pub fn create_under(
             .and_then(|parent| table.domains.get(parent as usize))
             .map_or(0, |owner| owner.generation),
         children: 0,
+        pending_start: None,
         cspace: CSpace::new(),
         envelope,
         charged_frames: 0,
@@ -691,6 +747,7 @@ pub fn destroy(id: DomainId) -> bool {
         domain.held_capabilities = 0;
         domain.threads = 0;
         domain.cspace = CSpace::new();
+        domain.pending_start = None;
         table.destroyed += 1;
 
         // The creator gets its budget back. Under the same lock that marked

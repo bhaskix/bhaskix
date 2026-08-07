@@ -138,7 +138,11 @@ me"*:
 1. **Create.** A holder of a `DomainControl` capability asks for a `Domain`. It comes back empty: no
    threads, no capabilities, no address space, an envelope no larger than the creator's own.
 2. **Grant.** The creator transfers exactly the capabilities the child should have, one at a time,
-   using the `GRANT` that already exists. This is the only way authority enters a domain.
+   with `GRANT` on the child's `Domain` capability. This is the only way authority enters a domain.
+
+   This said "the `GRANT` that already exists" until step 5 was built, and that was wrong: `GRANT` on
+   a domain answered `NotImplemented`. Nothing could be given to a created domain until step 5 built
+   it.
 3. **Start.** The creator names an entry point and a stack, and the domain gets its first thread.
 
 The child's authority is therefore the sum of deliberate acts, each of which is a capability
@@ -437,8 +441,30 @@ crashing.
    one-way. It refused the first working version of `spawn`, and then silently refused a *breakage*
    written to test the child-is-empty check — which is how that check was found to be reading a
    quota counter instead of the child's CSpace.
-5. **Starting a program.** Entry point, stack, and the first thread; the ELF loader reachable from a
-   domain rather than only from boot code.
+5. ~~**Starting a program.**~~ ✅ **Done**, and it turned out to be two steps, because the middle one
+   of create-grant-start did not exist.
+
+   **`GRANT` to a domain was `NotImplemented`.** §*The shape* says the creator "transfers exactly the
+   capabilities the child should have… using the `GRANT` that already exists". It did not: the
+   dispatch answered `NotImplemented` with a comment explaining why it could not be done *there* and
+   nothing doing it anywhere else. So a created domain could be given nothing, and a started program
+   could do nothing at all. Built here, in the same two-stage shape as `HAND`, because the giver's
+   CSpace and the recipient's cannot be held at once.
+
+   **The image arrives as a capability**, not a filename: `START` takes a `Memory` object the caller
+   holds with `READ`. The kernel has no business opening files for a program, and a program that
+   could name one would be naming authority it does not hold. It is **copied** before anything is
+   built from it — the object belongs to a program that is still running and may write to it, and
+   parsing headers a third party can change is how a checked bound becomes a stale one.
+
+   The loading runs on the new thread rather than in the system call, so an untrusted image's size is
+   not the caller's syscall latency and a parser is not on the dispatch path.
+
+   **What a program gives away, it can take back**, and finding that out cost an afternoon. The gate
+   granted the child a copy of the endpoint at slot 0, and the probe revokes slot 0 at the end of its
+   run to prove revocation is transitive. It is: the child's copy went with it, and the started
+   program found itself holding nothing. A giver that wants what it gave to outlive its own
+   housekeeping must keep a capability it does not intend to revoke.
 6. **Reaping.** The notification bound to a `Domain` capability, `INFO` returning state and reason,
    the slot released on reap, and the fallback when the last capability goes away.
 

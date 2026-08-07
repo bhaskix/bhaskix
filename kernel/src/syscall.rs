@@ -149,6 +149,7 @@ const _: () = {
     assert!(Status::QuotaExceeded as u64 == bhaskix_abi::status::QUOTA_EXCEEDED);
     assert!(Status::Exhausted as u64 == bhaskix_abi::status::EXHAUSTED);
     assert!(method::SPAWN == bhaskix_abi::method::SPAWN);
+    assert!(method::START == bhaskix_abi::method::START);
 };
 
 impl Kind {
@@ -317,6 +318,12 @@ pub mod method {
     /// the caller's own CSpace, which must be empty; `arg1` and `arg2` = up to
     /// sixteen bytes of name. RFC 0017 step 4.
     pub const SPAWN: u64 = 49;
+    /// Start a program in a domain this program holds.
+    ///
+    /// Only on a `Domain` capability carrying `WRITE`. `arg0` = the caller's
+    /// slot holding a `Memory` object containing an ELF image, `arg1` = how
+    /// many of its bytes are the image. RFC 0017 step 5.
+    pub const START: u64 = 50;
     /// Write bytes into memory the caller of this endpoint named.
     ///
     /// Only on an `Endpoint` capability, and only from the thread that is
@@ -562,8 +569,8 @@ fn invoke_capability(
         }
 
         method::GRANT if object.kind == crate::cap::ObjectKind::Domain => {
-            // Handled by the caller: it needs the *recipient's* CSpace, and
-            // two domains' tables cannot be held at once.
+            // Handled outside this dispatch: it needs the *recipient's* CSpace
+            // as well as the giver's, and two domains cannot be held at once.
             Outcome::err(Status::NotImplemented)
         }
 
@@ -1076,6 +1083,24 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         return spawn(frame);
     }
 
+    // And starting one, for the same reason: it reads the caller's memory, and
+    // then reaches the domain table and the scheduler.
+    if kind == Some(Kind::Invoke) && frame.method == method::START {
+        return start_program(frame);
+    }
+
+    // Giving a domain a capability, which is the middle of create-grant-start
+    // and the only way authority reaches a child. Here for the same reason as
+    // the two above: the giver's CSpace and the recipient's cannot be held at
+    // once, so it is two stages and neither belongs in a match arm that
+    // already holds one of them.
+    if kind == Some(Kind::Invoke)
+        && frame.method == method::GRANT
+        && let Some(outcome) = grant_to_domain(frame)
+    {
+        return outcome;
+    }
+
     // The same path, the other way. A service that could read a caller's
     // memory without these three checks could read any domain's memory by
     // naming a slot, which is why this is not simply `FILL` with a flag.
@@ -1477,6 +1502,207 @@ fn spawn(frame: &SyscallFrame) -> Outcome {
     }
 
     Outcome::ok(u64::from(child.as_u32()))
+}
+
+/// Gives a domain a copy of a capability the caller holds.
+///
+/// `None` when the capability invoked is not a `Domain`, so the ordinary
+/// dispatch can answer for every other kind — `GRANT` means something else on
+/// those, and this must not swallow them.
+///
+/// The middle step of create-grant-start, and the only way authority reaches a
+/// child. RFC 0017 claimed this "already exists"; it did not — the dispatch
+/// answered `NotImplemented`, with a comment explaining why it could not be
+/// done there and nothing doing it anywhere else. So a created domain could
+/// not be given anything, and a started program could do nothing at all.
+///
+/// Four checks, the same ones `HAND` makes and for the same reasons:
+///
+/// 1. The target is a `Domain`, and the caller holds it with `WRITE`. Putting
+///    a capability into a domain changes it.
+/// 2. The capability being passed is one the caller holds with **`GRANT`**.
+///    Holding a thing and being allowed to give it away are different
+///    permissions, and this gives it to a domain the caller does not otherwise
+///    reach.
+/// 3. The rights asked for are no wider than the caller's, which
+///    `derive_owned` enforces, along with the badge rule.
+/// 4. The destination slot in the recipient is empty.
+fn grant_to_domain(frame: &SyscallFrame) -> Option<Outcome> {
+    let me = crate::sched::current_domain()?;
+
+    let resolved = domain::with(me, |owner| {
+        let slot = owner.cspace.get(frame.capability as usize)?;
+        cap::with_arena(|arena| arena.lookup(slot))
+    })
+    .flatten();
+    let (object, rights) = resolved?;
+    if object.kind != ObjectKind::Domain {
+        return None;
+    }
+    if !rights.contains(crate::cap::Rights::WRITE) {
+        return Some(Outcome::err(Status::InsufficientRights));
+    }
+    let recipient = domain::DomainId::from_u32(object.id as u32);
+    if recipient == me {
+        // Granting to itself is `DERIVE`, which already exists and has its own
+        // rules. Allowing it here would be a second door to the same room with
+        // a different lock on it.
+        return Some(Outcome::err(Status::WrongObject));
+    }
+
+    let destination = frame.arg1 as usize;
+    let wanted = crate::cap::Rights::from_bits(frame.arg2 as u8);
+
+    // Stage one: derive from the giver's own CSpace, charged to the recipient,
+    // because it is the recipient's to keep.
+    let derived = domain::with(me, |owner| {
+        let cspace = core::mem::take(&mut owner.cspace);
+        let result = cap::with_arena(|arena| {
+            let index = usize::try_from(frame.arg0).map_err(|_| Status::NoSuchCapability)?;
+            let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
+            let (_, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            if !held.contains(crate::cap::Rights::GRANT) {
+                return Err(Status::InsufficientRights);
+            }
+            arena
+                .derive_owned(slot, wanted, frame.arg3, recipient.as_u32())
+                .map_err(|error| match error {
+                    crate::cap::CapError::RightsNotMonotone
+                    | crate::cap::CapError::DeriveNotPermitted
+                    | crate::cap::CapError::BadgeNotMonotone => Status::InsufficientRights,
+                    _ => Status::QuotaExceeded,
+                })
+        });
+        owner.cspace = cspace;
+        result
+    });
+    let derived = match derived {
+        Some(Ok(derived)) => derived,
+        Some(Err(status)) => return Some(Outcome::err(status)),
+        None => return Some(Outcome::err(Status::NoDomain)),
+    };
+
+    // Stage two: install it in the recipient, and charge the recipient.
+    let installed = domain::with(recipient, |owner| {
+        if owner.charge_capability().is_err() {
+            return Err(Status::QuotaExceeded);
+        }
+        match owner.cspace.install_at(destination, derived) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                owner.release_capability();
+                Err(Status::SlotUnavailable)
+            }
+        }
+    });
+    Some(match installed {
+        Some(Ok(())) => Outcome::ok(destination as u64),
+        other => {
+            // Nothing half-given. A derivation that could not be delivered is
+            // revoked rather than left in the arena charged to a domain that
+            // cannot name it.
+            cap::with_arena(|arena| arena.revoke_unchecked(derived));
+            match other {
+                Some(Err(status)) => Outcome::err(status),
+                _ => Outcome::err(Status::NoDomain),
+            }
+        }
+    })
+}
+
+/// Starts a program in a domain the caller holds.
+///
+/// RFC 0017 step 5, and the step after which a supervisor can be written
+/// entirely in userspace. Three checks:
+///
+/// 1. The capability is a `Domain`, and carries `WRITE`. Starting a program in
+///    a domain changes it, and a holder that may only *see* a domain — to wait
+///    on it, or to ask what happened — must not be able to run code in it.
+/// 2. The image is a `Memory` object the **caller** holds with `READ`. Not a
+///    filename: the kernel has no business opening files for a program, and a
+///    program naming one would be naming authority it does not hold.
+/// 3. The domain has no threads yet. Starting a second program in a domain
+///    that is already running one is a different operation with different
+///    questions — whose address space, whose stack — and this is not it.
+///
+/// The loading happens on the *new* thread rather than here. It reads a page
+/// at a time, allocates, parses something a program supplied, and builds an
+/// address space; doing that inside a system call would make an untrusted
+/// image's size the caller's syscall latency, and would put a parser on the
+/// dispatch path.
+fn start_program(frame: &SyscallFrame) -> Outcome {
+    let Some(me) = crate::sched::current_domain() else {
+        return Outcome::err(Status::NoDomain);
+    };
+
+    // The domain to start, from the capability invoked.
+    let resolved = crate::domain::with(me, |owner| {
+        let slot = owner.cspace.get(frame.capability as usize)?;
+        crate::cap::with_arena(|arena| arena.lookup(slot))
+    })
+    .flatten();
+    let Some((object, rights)) = resolved else {
+        return Outcome::err(Status::NoSuchCapability);
+    };
+    if object.kind != ObjectKind::Domain {
+        return Outcome::err(Status::WrongObject);
+    }
+    if !rights.contains(crate::cap::Rights::WRITE) {
+        return Outcome::err(Status::InsufficientRights);
+    }
+    let target = crate::domain::DomainId::from_u32(object.id as u32);
+
+    // The image, from memory the caller holds. `caller_object_for` is the same
+    // resolution `DRAIN` uses and asks for the same right, because this reads
+    // the caller's memory in exactly the way a drain does.
+    let Some(thread) = crate::sched::current_thread_id() else {
+        return Outcome::err(Status::NoDomain);
+    };
+    let Some(image) =
+        crate::shared::caller_object_for(thread, frame.arg0, crate::cap::Rights::READ)
+    else {
+        return Outcome::err(Status::NoSuchCapability);
+    };
+
+    if crate::domain::with(target, |domain| domain.threads()) != Some(0) {
+        return Outcome::err(Status::SlotUnavailable);
+    }
+
+    let length = frame.arg1 as usize;
+    if length == 0 {
+        return Outcome::err(Status::WrongObject);
+    }
+    // One word handed to the program at entry, from the caller. The same
+    // affordance `enter_ring3` documents: everything a domain has arrives
+    // through its CSpace, and this is for the one thing that cannot.
+    let argument = frame.arg2;
+    if !crate::domain::record_pending_start(target, image, length, argument) {
+        return Outcome::err(Status::Exhausted);
+    }
+
+    // Pinned, because every entry into ring 3 is (M9-13), and rotated across
+    // the online processors so that starting several programs does not pile
+    // them all onto one. A pinned thread cannot be moved later, so where it
+    // lands is decided once and permanently -- which is an argument for
+    // spreading them rather than for choosing well.
+    let cpu = crate::domain::next_start_cpu();
+    let options = crate::sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(target.as_u32());
+    match crate::sched::spawn_on_with(
+        cpu,
+        "started",
+        crate::started_program,
+        u64::from(target.as_u32()),
+        crate::shared::hhdm(),
+        options,
+    ) {
+        Ok(id) => Outcome::ok(u64::from(id)),
+        Err(_) => {
+            crate::domain::take_pending_start(target);
+            Outcome::err(Status::Exhausted)
+        }
+    }
 }
 
 /// Performs an `Invoke`, including the cross-domain grant.

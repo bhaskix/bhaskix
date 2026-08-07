@@ -218,6 +218,22 @@ pub mod method {
     /// than one. Refused if the slot is occupied, if the creator's envelope
     /// allows no more children, or if the domain table is full.
     pub const SPAWN: u64 = 49;
+    /// Start a program in a domain this program holds.
+    ///
+    /// Only on a `Domain` capability, and only one that carries `WRITE`.
+    /// `arg0` = the caller's own slot holding a `Memory` object containing an
+    /// ELF image; `arg1` = how many of its bytes are the image. Returns the
+    /// identifier of the thread that was started.
+    ///
+    /// The image arrives as a **capability**, not a filename. The kernel has no
+    /// business opening files on a program's behalf, and a program that could
+    /// name one would be naming authority it does not hold — so it hands over
+    /// memory it already has, and what it put there is its own affair.
+    ///
+    /// Where the program lands is decided by the image's own headers. Where its
+    /// stack goes is decided by the kernel: an ELF says where its code and data
+    /// belong and nothing about where it should be given room to push.
+    pub const START: u64 = 50;
 }
 
 /// The bits a capability's rights are made of.

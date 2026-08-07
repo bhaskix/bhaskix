@@ -136,7 +136,7 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1087
+unsafe_budget = 1089
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -183,3 +183,22 @@ unsafe_budget = 1087
 # Ratcheted to the measured figure rather than left at 1097 with slack. A
 # budget above the count is that many lines of `unsafe` nobody has to justify,
 # which is the opposite of what the number is for.
+#
+# 1089 at RFC 0017 step 5, and both lines are ones this file already contains
+# once: installing an address space, and entering ring 3. They appear again
+# because there is now a *second* loader -- `started_program`, which loads an
+# image a program supplied rather than one boot code chose.
+#
+# That difference is the reason the count went up rather than the code being
+# shared. The two loaders answer to different callers: one is boot code with a
+# file it trusts, the other is a system call with bytes a program handed over.
+# The second copies the image before parsing it, refuses one larger than
+# `STARTED_IMAGE_MAX`, and ends the thread rather than the machine on every
+# failure. Folding them together would mean one of those behaviours applying
+# where it does not belong, and the shorter of the two would be the one that
+# lost.
+#
+# Both blocks carry the same `SAFETY:` note as their originals, and it is the
+# same argument: `elf::parse` refuses an entry point outside a user-executable
+# segment, every segment it accepted was mapped, and the stack address is one
+# past user-writable memory in the space just installed.
