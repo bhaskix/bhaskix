@@ -458,6 +458,16 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
         let is_directory = u64::from(target.kind == Kind::Directory);
         let size = target.size;
 
+        // Touch the file's own data block, which is not cached: a call to the
+        // block service made *while this program already owes its caller a
+        // reply*. This is the reproduction the syscall stub's user-stack bug
+        // was found with, and it stays because it is the cheapest thing in
+        // this tree that exercises a service calling a service.
+        if target.kind == Kind::File && target.direct[0] != 0 {
+            use bhaskix_fs::Pages;
+            let _ = cache.page(target.direct[0]);
+        }
+
         // A capability naming what was found, derived from this program's own
         // endpoint and handed to the caller. Where it lands is the caller's to
         // say and this program cannot influence it: `HAND` puts it in the slot

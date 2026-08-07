@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-05 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7) and the driver framework (M8) are complete; the full VFS and process management are what remain |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-15 (RFC 0015 steps 1–6, RFC 0016 steps 1–4, step 5's rule) · CI green · 489 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 327 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 steps 1–5 and 7, step 6 partial) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-16 (RFC 0015 steps 1–6, RFC 0016 steps 1–4, step 5's rule) · CI green · 489 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 327 host assertions |
 
 ### Division of responsibility between documents
 
@@ -152,6 +152,8 @@ fairness within 2% for two equal-weight workloads.
 | M9-14 | RFC 0016 step 4: the namespace out of the kernel | ✅ `DONE` | Built and working: a `dir::` protocol in the ABI; `bin/fsd` answering `OPEN_AT` with the namespace rules moved out of `kernel/src/namespace.rs` unchanged — one component, no separators, no `..`, a generation checked, and a name outside the directory held answering exactly as one that exists nowhere; badged endpoint capabilities as directory handles, which the kernel stamps and cannot forge; the disk carrying the same tree the shell's gates describe. Watched working from the shell: `8 directory reachable` and `10 stale dir the directory it named is gone`, both through the service. `kernel/src/namespace.rs`, `ObjectKind::Directory`, `ObjectKind::File`, `OPEN_AT`, `NoSuchName` and `BadName` are **deleted**. All six RFC 0015 step 4 shell gates pass **unchanged**, through the service. |
 
 | M9-15 | RFC 0016 step 5: a lent frame is never the one reused | 🔨 `RULE DONE, HAND-OVER BLOCKED` | The rule is built and proved: a cache frame can be **pinned**, a pinned frame is never chosen for eviction, a cache with every frame lent **refuses** rather than taking one back, and forgetting keeps what is lent. Three host tests, and the headline one checks the lent frame after **every** eviction — with `block_in`, which does not *want* the frame, because the first version asked through `page` and thereby kept it permanently the most recently used, so it passed with the pin deleted. Watched failing with the pin removed from eviction, and with forgetting made unconditional. The machine hand-over — one `Memory` object per frame, lent read-only on a file handle — is written and **reverted**: it is blocked by the defect below. |
+
+| M9-16 | The syscall stub returned to user mode on another thread's stack | ✅ `DONE` | The entry stub parked the user `rsp` in **per-CPU** data and restored it from there — one word shared by every thread on the processor. A system call that *blocks* leaves it there while somebody else runs: another ring 3 thread entering the kernel overwrites it, and the first thread then `sysret`s onto **that thread's stack**, in its own address space. Both user stacks live at the same address in their own spaces, so it is mapped and the fault is not immediate: the program reads its own memory at somebody else's offsets. The frame already carried a per-thread copy and the stub threw it away. Two instructions: take it back and repair the slot. Watched failing by restoring the old exit path — twelve gates fail and `bin/blkd` faults exactly as before. |
 
 ### M8 — Driver framework ([RFC 0014](docs/rfc/0014-driver-framework.md))
 
@@ -749,6 +751,34 @@ Newest first. One entry per meaningful change of project state.
   `BIND` is precisely the authority to redirect an interrupt — so without `rebind_notification` the
   driver would spend the rest of the boot on the timer, working and slower, which is the quiet
   degradation this milestone keeps finding.
+
+### 2026-08-07 (the nested-call defect — found, and it was in the syscall stub)
+
+- **The user stack pointer was per-CPU, not per-thread.** The entry stub parked `rsp` in
+  `gs:[16]` and the exit path restored it from there. A system call that **blocks** leaves that one
+  shared word in place while another thread runs; the next ring 3 thread on that CPU to enter the
+  kernel overwrites it; and the first thread then returns to user mode on **somebody else's stack**.
+- **Why it hid for so long.** Every user program in this tree has its stack at the same address in
+  its own space, so the wrong pointer is still *mapped*. The program does not fault — it reads its
+  own memory at another thread's offsets, and carries on with plausible-looking garbage until
+  something dereferences it. That is why it presented as a driver with a null `self`, a service that
+  stopped answering, and a shell that printed fifteen characters: three programs, three symptoms,
+  one word.
+- **Why it needed a nested call to show.** Two ring 3 threads must be on one CPU with one of them
+  *blocked inside a syscall*. A service calling another service is the ordinary way to arrange that,
+  which is why it looked like an IPC defect for three attempts.
+- **The frame already had the right value.** `user_rsp` is the first field of `SyscallFrame`, pushed
+  on entry and then skipped with `add rsp, 8` on the way out — the comment beside it said "restored
+  from per-CPU data below". Two instructions fix it: pop the saved value and repair the slot from it.
+- **Watched failing** by putting the old exit path back: twelve gates fail and `bin/blkd` faults in
+  `Virtqueue::describe` exactly as before.
+- **Three wrong theories are now closed**, and they were wrong in an instructive way: a nested call
+  faulting the caller, an address-space switch, and a shared privilege stack. Each explained *some*
+  of the evidence. What broke the deadlock was the fault report naming the thread and its address
+  space — added two commits ago for exactly this — which said "right space", and a register file of
+  small integers that read as *somebody else's registers* rather than one bad pointer.
+- **The reproduction stays in the tree.** Ten lines in the filesystem service that touch an uncached
+  block while answering: the cheapest thing here that makes a service call a service.
 
 ### 2026-08-07 (the nested-call defect — a real bug fixed, the defect still open)
 

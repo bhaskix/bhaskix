@@ -509,8 +509,9 @@ Five steps. The first is independent of the rest and should not wait for it.
    once, and watched failing with the pin removed.
 
    The machine hand-over — one `Memory` object per frame, lent read-only through a `MAP` method on a
-   file handle — is written and reverted. It reaches a fault in `bin/blkd`, in its own address space,
-   with a corrupted queue pointer, at the moment the filesystem service reads a block **while it
-   already owes its caller a reply**. That is the nested-call hypothesis this RFC withdrew after
-   step 4, and withdrawing it was premature: the evidence against it was a lookup that hit the cache
-   and therefore made no nested call. It is the next thing to find.
+   file handle — is written and was reverted while the fault below was open. **That fault is fixed**,
+   and it was never in this RFC's machinery: the syscall entry stub kept the user stack pointer in
+   per-CPU data and restored it from there, so a system call that blocked could return to user mode
+   on another thread's stack. A service calling a service is simply the ordinary way to get two ring
+   3 threads on one CPU with one of them blocked, which is why it looked like an IPC defect for three
+   attempts. Re-applying the hand-over is what remains of this step.

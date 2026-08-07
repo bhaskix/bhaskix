@@ -327,7 +327,21 @@ bhaskix_syscall_entry:
     call bhaskix_syscall_dispatch
 
     // Unwind the frame, taking the results back out.
-    add rsp, 8                  // user_rsp: restored from per-CPU data below
+    //
+    // The user stack pointer comes back from **this thread's frame**, and the
+    // per-CPU slot is repaired from it. That slot is one word shared by every
+    // thread on this processor, and a system call that blocks leaves it there
+    // while somebody else runs: another ring 3 thread entering the kernel
+    // overwrites it, and this thread then returns to user mode on *that
+    // thread's stack*, in its own address space. Both stacks are at the same
+    // address in their own spaces, so it is mapped, and what it reads there is
+    // its own memory at somebody else's offsets -- which is why it looked like
+    // random corruption in whichever program blocked, and why it only ever
+    // happened with two programs on one CPU and one of them waiting.
+    //
+    // `r11` is dead here: it is popped again below, for the flags.
+    pop r11                     // user_rsp, saved per thread
+    mov gs:[16], r11            // the slot may have been somebody else's
     pop r9
     pop r8
     pop r10
