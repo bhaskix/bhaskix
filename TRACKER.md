@@ -81,6 +81,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **IR1** | Interrupt authority | ✅ **Accepted** 2026-08-04 | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU (RFC 0012, draft), and the RFC says so rather than implying otherwise — **steps 1–4 are unblocked and worth doing alone.** | [RFC 0011](docs/rfc/0011-irq-handler.md) |
 | **IO1** | IOMMU | ✅ **Accepted** 2026-08-04 | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Roadmap changed on acceptance**: discovery, per-device domains and strict mapping moved from Phase 3 to Phase 2; interrupt remapping and nested translation stay. | [RFC 0012](docs/rfc/0012-iommu.md) |
 | **SF1** | Service framework | ✅ **Accepted** 2026-08-05 | The trait, the two placements, the build selection, and the CI job that builds **both** for every service. `architecture.md` §2 has claimed relocatable services since Phase 0 and **none of it exists** — no trait, no placement selection, no service that has ever run outside the nucleus. Could not have been written before M6-18: until the bulk path used shared memory the two placements were identical *by accident*, because four registers map into nobody. Acceptance decides two of its four open questions — the nucleus placement dispatches **through IPC** rather than by direct call, and the placement table is a **build-time** input with a command-line override for tests only. Two stay open: a caller whose service died blocks for ever (the fix needs an endpoint that reports revocation), and whether the console is honestly relocatable at all. Acceptance also corrected `architecture.md`, which described both of this RFC's safeguards in the present tense when neither existed. | [RFC 0013](docs/rfc/0013-service-framework.md) |
+| **PM1** | Process management | ⬜ Draft | **Create, grant, start, kill, reap** — each an operation on a capability, no new syscall kind. No `fork` (it duplicates a capability space by implication, which is ambient authority through the back door), no pid (the process tree **is** the capability tree, and killing a parent already kills its descendants through machinery that is built and tested), no signals ("stop" is `KILL` on a capability you hold; "something happened" is a `Notification`). `DomainControl` hands out `Domain` capabilities, the same shape as RFC 0011's `IrqControl` and RFC 0012's `IommuControl`. Answers **RFC 0013's unresolved question 1** — a caller whose service died — and extends the envelope to child domains, without which the RFC reopens **T10**. | [RFC 0017](docs/rfc/0017-process-management.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
@@ -430,6 +431,18 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 ### Honest notes on M5 so far
 
+- **M5 is marked `COMPLETE` and one of its exit criteria has never been true.**
+  [roadmap.md](docs/roadmap.md) M5 reads *"a user-mode program runs, invokes capabilities, is denied
+  what it does not hold, and **is killed cleanly when it faults**."* The first three clauses are
+  gated. The fourth is false: a fault in ring 3 calls `halt_forever` and stops the machine.
+  Demonstrated on 2026-08-07 by adding a temporary `crashme` to the user-mode shell — a null write
+  from ring 3 took down the console and filesystem services, which had done nothing wrong.
+  It was never caught because **no test in this project has ever faulted from ring 3**: all six
+  faults in `tests/qemu/fault-test.sh` are injected from kernel mode. Closed by
+  [RFC 0017](docs/rfc/0017-process-management.md) step 1; recorded here rather than quietly fixed,
+  because a milestone marked complete on an untested criterion is the exact failure this file exists
+  to prevent.
+
 - **`try_lock` on a query is a wrong answer, not a delayed one — three times now.** A read that
   answers "no such thread" for a thread on a busy CPU is indistinguishable from one that does not
   exist. It has caused an intermittent failure in `set_domain_weight`, in `start_all` and in
@@ -611,7 +624,7 @@ what is actually ahead.
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: the ELF loader's 24 hours of fuzzing (M6), and mount points, which nothing has needed yet |
-| Process management — capability-shaped fork/exec, process trees, reaping | ⬜ `TODO` | Nothing creates a domain except boot code. RFC 0013 declined to propose a supervisor; this is where one belongs |
+| Process management — capability-shaped fork/exec, process trees, reaping | 🔨 **RFC 0017 drafted** | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **halts the machine** (M5's unmet criterion, above); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
 ---
@@ -659,6 +672,33 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-07 (RFC 0017 drafted — and a milestone marked complete on a criterion that was never true)
+
+- **[RFC 0017](docs/rfc/0017-process-management.md) drafted**: process management as create, grant,
+  start, kill, reap — each an operation on a capability, none of them a new syscall kind. Six steps,
+  the first independently valuable.
+- **Writing it found that M5 is `COMPLETE` with an unmet exit criterion.** The roadmap says a
+  user-mode program *"is killed cleanly when it faults"*. It is not: a ring-3 fault calls
+  `halt_forever`. Demonstrated by adding a temporary `crashme` to the shell — one null write from an
+  unprivileged program with no capabilities stopped the machine, and took the console and filesystem
+  services with it. **No test here has ever faulted from ring 3**; all six injected faults are from
+  kernel mode, which is why four milestones passed over it.
+- **Three more gaps, each already documented somewhere and never collected.** `domain::create` takes
+  a `&'static str` and all 21 callers are in `kernel/src/lib.rs`, so the set of programs that can
+  run is fixed at compile time. `destroy` releases a domain's memory, interrupts and capabilities
+  and **leaves its threads running** — `domain.rs` says so about itself. And RFC 0013's unresolved
+  question 1, a caller whose service died, has been open since M7.
+- **They are one problem.** Nothing happens when a domain ends, because ending is not an event. Once
+  it is, the blocked caller is woken as part of it and the thread is stopped as part of it.
+- **What the RFC refuses, and why it is written down**: no `fork` (it duplicates a capability space
+  by implication, which is ambient authority arriving through the back door of a system built to
+  refuse it), no pid (the process tree *is* the capability tree — killing a parent already kills its
+  descendants, through machinery that is built and negative-tested), no signals (the two things they
+  are used for are `KILL` on a capability you hold and a `Notification` the domain holds).
+- **The envelope has to cover children or the RFC reopens T10**: `MAX_DOMAINS` is 32, and a domain
+  that can create domains can exhaust the table for everyone else. Recorded in the RFC as a
+  requirement of step 4 rather than a later refinement.
 
 ### 2026-08-07 (the status documents reconciled against this file)
 
