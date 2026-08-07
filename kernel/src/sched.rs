@@ -1762,18 +1762,38 @@ pub fn exit() -> ! {
     //
     // Taken under the same lock that marks this thread finished, so there is no
     // window in which the thread is gone and the debt is still recorded.
-    let (owed, mine) = if cpu < MAX_CPUS {
+    // Ending the domain happens **before** this thread is marked `Finished`,
+    // and that ordering is the whole of a bug that cost an evening.
+    //
+    // `dispatch` handles `Exit` before it takes a single lock, and says why: a
+    // thread holding one cannot be preempted (M4-08), so a thread that reaches
+    // `exit` holding a lock spins here instead of leaving and nothing ever
+    // releases it. Ending a domain takes several -- the memory objects, the
+    // interrupt handlers, every runqueue, the domain table, the capability
+    // arena -- and doing that *after* marking this thread `Finished` put a
+    // thread that can never be scheduled again into the queue for all of them.
+    // It hung the shell intermittently, in a different place each time.
+    //
+    // Done while this thread is still `Running`, it is an ordinary thread doing
+    // ordinary work, and every one of those locks behaves as it does anywhere
+    // else.
+    let me = current_thread_id();
+    if let Some(thread) = me
+        && let Some(domain) = domain_of_raw(thread)
+        && threads_in_domain_except(domain, thread) == 0
+    {
+        crate::domain::ended_by_last_thread(crate::domain::DomainId::from_u32(domain));
+    }
+
+    let owed = if cpu < MAX_CPUS {
         let mut queue = QUEUES[cpu].lock();
         let current = queue.current;
-        queue.threads[current]
-            .as_mut()
-            .map_or((None, None), |thread| {
-                thread.state = State::Finished;
-                let domain = (thread.domain != u32::MAX).then_some(thread.domain);
-                (thread.reply_to.take(), domain)
-            })
+        queue.threads[current].as_mut().and_then(|thread| {
+            thread.state = State::Finished;
+            thread.reply_to.take()
+        })
     } else {
-        (None, None)
+        None
     };
 
     // Outside the lock: telling the caller takes its CPU's runqueue lock, and
@@ -1782,22 +1802,6 @@ pub fn exit() -> ! {
         abandon_caller(caller);
     }
 
-    // Was that the last of its domain?
-    //
-    // Asked of the scheduler rather than of `Domain::threads`, which is a
-    // counter only one self-test ever increments and which therefore reads zero
-    // for every domain in the system. Asked *after* this thread is marked
-    // `Finished`, so it does not count itself.
-    //
-    // A domain that runs out of threads has ended, and `Exited` is what that
-    // is: nobody killed it and nothing faulted. Skipped for a domain that is
-    // already dead, which is the ordinary case when the domain was destroyed
-    // first and its threads are stopping in consequence.
-    if let Some(domain) = mine
-        && threads_in_domain(domain) == 0
-    {
-        crate::domain::ended_by_last_thread(crate::domain::DomainId::from_u32(domain));
-    }
     loop {
         preempt();
 
@@ -2441,6 +2445,45 @@ pub fn mark_domain_dying(domain: u32) -> usize {
         let _ = wake(*id);
     }
     marked
+}
+
+/// The domain a thread belongs to, read straight from the runqueues.
+fn domain_of_raw(thread: u32) -> Option<u32> {
+    let online = percpu::online_count() as usize;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        if let Some(target) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return (target.domain != u32::MAX).then_some(target.domain);
+        }
+    }
+    None
+}
+
+/// How many threads of `domain` there are, not counting `except`.
+///
+/// The exclusion is what lets a thread ask "am I the last?" *before* marking
+/// itself finished — which it must, because what it does with the answer takes
+/// locks, and a finished thread may not queue for one.
+#[must_use]
+pub fn threads_in_domain_except(domain: u32, except: u32) -> usize {
+    let online = percpu::online_count() as usize;
+    let mut total = 0;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        total += queue
+            .threads
+            .iter()
+            .flatten()
+            .filter(|thread| {
+                thread.domain == domain && thread.state != State::Finished && thread.id != except
+            })
+            .count();
+    }
+    total
 }
 
 /// How many threads still exist in `domain`, in any state but `Finished`.

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📝 **Draft.** |
+| **Status** | ✅ **Accepted 2026-08-07**, with all six steps implemented. Resolves **PM1**. One of its four open questions is decided by acceptance; three stay open and are named below, along with a fifth the implementation added. Four claims this document made were **wrong and were corrected by building them** — each correction is recorded in place rather than edited away, because they are the useful part. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/domain`, `kernel/sched`, `kernel/trap`, `kernel/ipc`, ABI, a supervisor |
 | **Milestone** | Phase 2 in [roadmap.md](../roadmap.md) — closes the *process management* bullet, and M5's unmet exit criterion |
@@ -350,17 +350,34 @@ program can no longer stop this machine.**
 
 ## Unresolved questions
 
-1. **What kills a domain whose thread is spinning in the kernel?** Nothing here does, and the
-   position taken is that such a thread is a kernel bug rather than a case to be handled. If
-   experience says otherwise the answer is probably a watchdog, which is its own RFC.
-2. **Does the shell get `DomainControl`?** It would let `elf` start a program in its own domain,
-   which is the obvious next demonstration and also hands the most exposed program in the tree the
-   ability to make more. Deferred to the step that needs it.
-3. **What restarts a service that died?** Not this RFC — the same boundary RFC 0013 drew, for the
-   same reason. This provides the mechanisms a restart policy would be written against.
-4. **Should `MAX_DOMAINS` stay fixed at 32?** It is fixed so that creating a domain cannot fail for
-   want of heap during memory pressure, which is a good reason. Whether 32 is the right number is
-   a separate question from whether the limit should be static.
+**Decided by acceptance:**
+
+- **A thread spinning inside the kernel is a kernel bug, not a case to be handled** (question 1).
+  Nothing here kills one, and nothing will: a `Dying` thread stops at a point where it holds no
+  lock, and a thread that never reaches such a point has not got one to reach. Building a mechanism
+  to interrupt it would make that acceptable, which is the wrong direction. If experience says
+  otherwise the answer is a watchdog, and a watchdog is its own RFC with its own failure modes.
+
+**Still open, and deliberately not answered here:**
+
+1. **Does the shell get `DomainControl`?** No step needed it, so no step granted it. It would let
+   `elf` start a program in its own domain — the obvious next demonstration — and would also hand
+   the most exposed program in the tree the ability to make more. Whoever wants it should say which
+   of those they are buying.
+2. **What restarts a service that died?** The same boundary RFC 0013 drew, for the same reason:
+   restart policy is policy, and it now has mechanisms to be written against. A supervisor is
+   writable entirely in userspace, which was this RFC's own test of whether these were the right
+   six. Nobody has written one yet, so the test is passed on paper and not in a program.
+3. **Should `MAX_DOMAINS` stay fixed at 32?** Fixed so that creating a domain cannot fail for want
+   of heap during memory pressure, which is a good reason and is unaffected by the number. Whether
+   32 is right is a separate question from whether the limit should be static, and both are now
+   answerable by measurement rather than by argument.
+4. **Added by the implementation: should a domain end when its last thread exits, whoever made it?**
+   Today it ends only if a *program* created it. Several boot self-tests run a thread to completion
+   and then go on granting capabilities to the domain it ran in; ending those out from under them
+   turned passing tests into `NoDomain`. The consistent rule is almost certainly the right one, and
+   adopting it means changing the boot sequence rather than this mechanism — which is why it was not
+   done here, and why it is recorded as a question rather than as a limitation to live with.
 
 ---
 

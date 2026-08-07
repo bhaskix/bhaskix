@@ -81,7 +81,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **IR1** | Interrupt authority | ✅ **Accepted** 2026-08-04 | **`IrqControl`** hands out **`IrqHandler`** capabilities, one per source, exclusively. Delivery is mask → signal a notification → acknowledge, with nothing else in interrupt context. Makes `driver-model.md` §2's `IrqCapability` real and gives the kernel a vector allocator instead of five constants in four files. **A domain may claim only MSI-X sources**, because a never-acknowledged shared line wedges other devices. Delegating to a domain remains blocked on an IOMMU (RFC 0012, draft), and the RFC says so rather than implying otherwise — **steps 1–4 are unblocked and worth doing alone.** | [RFC 0011](docs/rfc/0011-irq-handler.md) |
 | **IO1** | IOMMU | ✅ **Accepted** 2026-08-04 | **`IommuControl`** hands out **`DmaWindow`** capabilities; a window maps RFC 0009's `Memory` objects and returns a **`DevAddr`**, a type distinct from `PhysAddr`. Funds **T3** and **T4**, which `security.md` §1 claims and the code does not deliver. VT-d first, because QEMU emulates it and a design CI cannot test will be wrong unnoticed — an AMD machine runs degraded and says so. **Roadmap changed on acceptance**: discovery, per-device domains and strict mapping moved from Phase 3 to Phase 2; interrupt remapping and nested translation stay. | [RFC 0012](docs/rfc/0012-iommu.md) |
 | **SF1** | Service framework | ✅ **Accepted** 2026-08-05 | The trait, the two placements, the build selection, and the CI job that builds **both** for every service. `architecture.md` §2 has claimed relocatable services since Phase 0 and **none of it exists** — no trait, no placement selection, no service that has ever run outside the nucleus. Could not have been written before M6-18: until the bulk path used shared memory the two placements were identical *by accident*, because four registers map into nobody. Acceptance decides two of its four open questions — the nucleus placement dispatches **through IPC** rather than by direct call, and the placement table is a **build-time** input with a command-line override for tests only. Two stay open: a caller whose service died blocks for ever (the fix needs an endpoint that reports revocation), and whether the console is honestly relocatable at all. Acceptance also corrected `architecture.md`, which described both of this RFC's safeguards in the present tense when neither existed. | [RFC 0013](docs/rfc/0013-service-framework.md) |
-| **PM1** | Process management | 🔨 Draft, **steps 1–6 built — COMPLETE**; the RFC itself is still a draft awaiting review | **Create, grant, start, kill, reap** — each an operation on a capability, no new syscall kind. No `fork` (it duplicates a capability space by implication, which is ambient authority through the back door), no pid (the process tree **is** the capability tree, and killing a parent already kills its descendants through machinery that is built and tested), no signals ("stop" is `KILL` on a capability you hold; "something happened" is a `Notification`). `DomainControl` hands out `Domain` capabilities, the same shape as RFC 0011's `IrqControl` and RFC 0012's `IommuControl`. Answers **RFC 0013's unresolved question 1** — a caller whose service died — and extends the envelope to child domains, without which the RFC reopens **T10**. | [RFC 0017](docs/rfc/0017-process-management.md) |
+| **PM1** | Process management | ✅ **Accepted** 2026-08-07 | **Create, grant, start, kill, reap** — each an operation on a capability, none a new syscall kind. No `fork` (it duplicates a capability space by implication, which is ambient authority through the back door), no pid (the process tree is the capability tree), no signals ("stop" is `KILL` on a capability you hold; "something happened" is a `Notification`). `DomainControl` hands out `Domain` capabilities, the shape RFC 0011 and RFC 0012 already use. Accepted with **all six steps implemented and gated**, which is why it is accepted rather than argued: four of its own claims were wrong and were corrected by building them — the process tree was *not* transitive over created domains, `GRANT` to a domain did not exist, a ring 3 fault cost a **processor** rather than the machine, and a domain handle must **not** derive from that domain's root. Each correction is written into the document in place. Acceptance decides one open question — a thread spinning inside the kernel is a kernel bug and no mechanism will be built to interrupt it. Three stay open, plus a fourth the implementation added: whether a domain should end when its last thread exits *whoever made it*, which needs the boot sequence to stop treating a domain as outliving its threads. Answers **RFC 0013's unresolved question 1**, open since M7, and closes **M5's exit criterion**, which had been false and untested since M5. | [RFC 0017](docs/rfc/0017-process-management.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **Correction to an earlier note:** A2–A5 were previously recorded in `roadmap.md` as blocking M1
@@ -681,6 +681,44 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-07 (a bug shipped in step 6, found while accepting the RFC)
+
+- **`sched::exit` was taking heavy locks after marking its thread `Finished`**, and it hung the shell
+  intermittently — three runs in ten, in a different place each time. Shipped in `3bd2845` and fixed
+  here.
+- **The hazard was already written down**, forty lines away from the code that broke it. `dispatch`
+  handles `Exit` before taking a single lock and explains why: a thread holding one cannot be
+  preempted (M4-08), so a thread that reaches `exit` holding a lock spins there instead of leaving
+  and nothing ever releases it. Step 6 made `exit` end the thread's domain — which takes the memory
+  objects, the interrupt handlers, every runqueue, the domain table and the capability arena — and
+  did it *after* marking the thread `Finished`. A thread that can never be scheduled again was put in
+  the queue for all of them.
+- **Fixed by ordering, not by locking differently.** The domain is ended while the thread is still
+  `Running`, where it is an ordinary thread doing ordinary work. Asking "am I the last?" then needs
+  `threads_in_domain_except`, because the thread has not yet marked itself gone.
+- **How it was missed**: the boot gates and the fault gates passed every time, and so did the shell
+  test on the runs used to verify the step. It took a docs-only change and a re-run to see 0, 1 and 3
+  failures in three consecutive runs of the same image. An intermittent hang is not visible in a
+  single green run, and nothing in the process asks for more than one.
+
+### 2026-08-07 (RFC 0017 accepted)
+
+- **Accepted, with all six steps implemented and gated.** That order is the point: this RFC is
+  accepted *because* it was built, not before it. Four of the claims it made were wrong, and each was
+  found by construction rather than by review — the process tree was not transitive over created
+  domains, `GRANT` to a domain did not exist, a ring 3 fault cost a processor rather than the
+  machine, and a domain handle must not derive from that domain's root.
+- **The corrections stay in the document, in place.** An RFC edited until it matches the code is a
+  record of what was built; one that keeps its wrong turns is a record of what was *learned*, and the
+  second is worth more to whoever reads it next.
+- **One open question decided by acceptance**: a thread spinning inside the kernel is a kernel bug,
+  and no mechanism will be built to interrupt it. Building one would make it acceptable.
+- **Three stay open, plus a fourth the implementation added** — whether a domain should end when its
+  last thread exits whoever created it. That one needs the boot sequence to stop treating a domain as
+  outliving its threads, which is a change to the boot code and not to this mechanism.
+- **PM1 resolved.** Two older debts close with it: RFC 0013's unresolved question 1, open since M7,
+  and M5's exit criterion, which had been recorded as met and was never true.
 
 ### 2026-08-07 (RFC 0017 step 6 — a supervisor in ring 3, and RFC 0017 is complete)
 
