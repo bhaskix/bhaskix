@@ -619,7 +619,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Defect | Evidence | Owner |
 |---|---|---|
-| **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. A later 10-run `soak-shell` the same day was clean, which at a rate near 3% is the expected outcome and **is not evidence the defect is gone** — telling it from fixed needs runs in the hundreds. Reproduce with `make soak-shell`. | unassigned |
+| **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. A later 10-run `soak-shell` the same day was clean, which at a rate near 3% is the expected outcome and says nothing either way. **A 50-run soak on an idle host (2026-08-09, ~97% idle, slowest run 20s) was also clean, and that one could have spoken**: at 3% it should have turned up one or two failures, and a clean fifty happens about a fifth of the time. It leans toward the rate being lower than 3% without settling anything — the same night's *boot* soak reproduced its own defect twice in 200 on the same host, so the machine was capable of failing. Still open: telling "fixed" from "rarer than we thought" needs runs in the hundreds. Reproduce with `make soak-shell SOAK_SHELL_RUNS=<n>`. | unassigned |
 | **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. **Caught, twice, on 2026-08-08**: 2 of 200 boots, one at a time on an idle host (mean 79% idle, boots otherwise a steady 16–17s), so this is the kernel and not the contention that spoiled an earlier run. **The stall has a signature now.** Both dumps are the same shape: last line `syscall entry armed`; **one CPU contributes no threads to the walk at all** and its runqueue reads `0 of 20 samples` — held continuously for two seconds, so not a thread waiting for a wake, which would leave the lock free. Both were caught by the watchdog firing on its own deadline rather than a shortened one. **It is not IPC**: `dropped`, `wake_missed` and lost deferred wakes were all zero in both. **It is not a fixed CPU**: cpu 1 in one, cpu 0 in the other — and the holder need not be the CPU named, since `spawn_on` and the wake paths block on a remote runqueue lock. One dump is reproduced in full in §7 under the 2026-08-08 entry that caught it. Reproduce with `make soak SOAK_RUNS=200 SOAK_JOBS=1` on an idle machine, keeping `SOAK_LOG_DIR`. | unassigned |
 
 ### Blockers
@@ -693,6 +693,18 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-09 (the shell half, run on its own, and it stayed up)
+
+The previous entry's soak stopped at its first failing target, so `soak-shell` never started. Run
+separately on an idle host (~97%): **50 runs of the user shell, none failed, slowest 20s.**
+
+Recorded because this one could have said something. At the 3% the `Status::Congested` defect was
+seen at, fifty runs should turn up one or two failures, and a clean fifty happens about a fifth of
+the time — where the 10-run pass the day before was the expected outcome whether or not the defect
+was there. It leans toward the rate being lower than believed and settles nothing. **The machine was
+capable of failing that night**: the same host, hours earlier, reproduced the bring-up stall twice
+in 200 boots. The defect stays open.
 
 ### 2026-08-08 (the stall was caught, and the line that caught it was the one added that morning)
 
