@@ -620,7 +620,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | Defect | Evidence | Owner |
 |---|---|---|
 | **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. A later 10-run `soak-shell` the same day was clean, which at a rate near 3% is the expected outcome and **is not evidence the defect is gone** — telling it from fixed needs runs in the hundreds. Reproduce with `make soak-shell`. | unassigned |
-| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. A 40-boot soak later the same day did not reproduce it and **does not lower the estimate**: at roughly 1 in 70, seeing none in 40 is the likelier outcome either way. **The watchdog has still never fired on a real stall** — every sighting of its output so far has been manufactured by shortening its deadline. Reproduce with repeated boots. | unassigned |
+| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. **Caught, twice, on 2026-08-08**: 2 of 200 boots, one at a time on an idle host (mean 79% idle, boots otherwise a steady 16–17s), so this is the kernel and not the contention that spoiled an earlier run. **The stall has a signature now.** Both dumps are the same shape: last line `syscall entry armed`; **one CPU contributes no threads to the walk at all** and its runqueue reads `0 of 20 samples` — held continuously for two seconds, so not a thread waiting for a wake, which would leave the lock free. Both were caught by the watchdog firing on its own deadline rather than a shortened one. **It is not IPC**: `dropped`, `wake_missed` and lost deferred wakes were all zero in both. **It is not a fixed CPU**: cpu 1 in one, cpu 0 in the other — and the holder need not be the CPU named, since `spawn_on` and the wake paths block on a remote runqueue lock. One dump is reproduced in full in §7 under the 2026-08-08 entry that caught it. Reproduce with `make soak SOAK_RUNS=200 SOAK_JOBS=1` on an idle machine, keeping `SOAK_LOG_DIR`. | unassigned |
 
 ### Blockers
 
@@ -693,6 +693,67 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-08 (the stall was caught, and the line that caught it was the one added that morning)
+
+**200 boots, one at a time, on an idle host: 2 did not finish bring-up.** Mean 79% idle, minimum 57%,
+and the 198 that passed took a steady 16–17 seconds against a 120-second cap — so the two are the
+kernel, not the host. This is the §3 stall reproducing at 1 in 100, against an earlier estimate of
+about 1 in 70.
+
+**The watchdog fired on a real stall for the first time.** Every previous sighting of its output was
+manufactured by shortening its deadline; these two were caught at 45 seconds on a boot that had
+genuinely stopped.
+
+**And the fact that identifies the stall is the one the thread walk could not say.** In both dumps a
+CPU contributes *no threads at all* to the walk — before this morning's change that CPU was
+indistinguishable from one with nothing scheduled on it, and the dump's most important content would
+have been an absence. Instead each says it outright: `runqueue readable 0 of 20 samples over 2
+seconds`. Held throughout, so not a thread waiting for a wake, which leaves the lock free and the
+threads readable.
+
+- **The signature.** Last line `syscall entry armed`; one CPU's runqueue held continuously; every
+  other CPU readable 20 of 20 and listing its threads normally.
+- **Not IPC.** `dropped`, `wake_missed` and lost deferred wakes were zero in both. The counters that
+  would have implicated the mailbox path exonerate it instead.
+- **Not a fixed CPU.** cpu 1 in one run, cpu 0 in the other. The caution printed beside the line
+  matters here rather than being decoration: `spawn_on` and the wake paths block on a *remote*
+  runqueue lock, so the CPU named is where the lock is, not necessarily who holds it.
+
+**The shell half did not run.** `make soak` stops at the first failing target, so `soak-shell` never
+started and the `Status::Congested` defect gained no evidence either way.
+
+**One of the two dumps, in full**, because it is the evidence and a path into a temporary directory
+is not — the run logs did not outlive the session that made them:
+
+```
+  BRING-UP STOPPED. 45 seconds have passed and it has not finished.
+  The last line above is the last thing that completed. Every thread
+  on this machine, and what it was doing:
+    cpu 0  thread 3  boot  fair  Running  3957 runs
+    cpu 0  thread 19  rt-probe  rt  Finished  51 runs
+    cpu 2  thread 2  idle  idle  Ready  3880 runs
+    cpu 2  thread 29  ipc-cli-a  fair  Ready  12 runs
+    cpu 2  thread 30  ipc-cli-b  fair  Running  11 runs
+    cpu 3  thread 1  idle  idle  Ready  3889 runs
+    cpu 3  thread 27  watchdog  fair  Running  2 runs
+  cpu 0: runqueue readable 20 of 20 samples over 2 seconds
+  cpu 1: runqueue readable 0 of 20 samples over 2 seconds
+           -- held for every sample. Nothing on this CPU could be listed
+           above, and nothing on it can run. [...]
+  cpu 2: runqueue readable 20 of 20 samples over 2 seconds
+  cpu 3: runqueue readable 20 of 20 samples over 2 seconds
+  ipc: 20 delivered, 20 replied, 20 receives returned,
+       20 replies tried, 0 found no caller, 11 empty checks.
+  0 messages were DROPPED because a mailbox was already full, and
+  0 wakes went missing. Either is enough to strand a caller for ever.
+  0 deferred wakes were lost.
+```
+
+**Read the thread list against the readability lines**: there is no `cpu 1` row anywhere in the walk,
+and 34 lines of dump would have said nothing about why. The second failure is the same dump with the
+roles of cpu 0 and cpu 1 exchanged. Reproduce with `make soak SOAK_RUNS=200 SOAK_JOBS=1` on an idle
+machine, with `SOAK_LOG_DIR` set so the dumps survive the run.
 
 ### 2026-08-08 (the watchdog's thread walk was silent about the CPU that mattered most)
 
