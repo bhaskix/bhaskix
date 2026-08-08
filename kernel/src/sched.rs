@@ -1055,6 +1055,32 @@ fn enter_space(root: u64) {
     }
 }
 
+/// Whether `cpu`'s runqueue lock can be taken right now.
+///
+/// For the bring-up watchdog, and it exists because [`for_each`] cannot answer
+/// it. That walk uses `try_lock` and *skips* a CPU it cannot read -- correctly,
+/// since it runs from a watchdog that must not block -- but the skip is silent,
+/// so a CPU whose runqueue is held and a CPU that was merely busy for a
+/// microsecond produce the same output: no lines. The first dump this mattered
+/// on had no `cpu 0` rows at all, and the most important fact in it had to be
+/// inferred from an absence.
+///
+/// Sampled repeatedly by the caller, so "held every time over two seconds" can
+/// be told from "held once".
+///
+/// **This says the runqueue is unreadable, not which CPU wedged.** The holder
+/// need not be `cpu` itself: [`spawn_on`] and the wake paths take a *remote*
+/// runqueue lock and block on it, so a CPU stuck in either strands the queue it
+/// reached for rather than its own. Reporting "cpu N is wedged" from a false
+/// return would name the victim and let the culprit go unmentioned.
+#[must_use]
+pub fn runqueue_readable(cpu: usize) -> bool {
+    if cpu >= MAX_CPUS {
+        return false;
+    }
+    QUEUES[cpu].try_lock().is_some()
+}
+
 /// Whether `thread` still exists and could still be handed a message.
 ///
 /// `Finished` counts as gone. A thread that has exited is still in its queue

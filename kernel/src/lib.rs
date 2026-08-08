@@ -1002,6 +1002,52 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
         println!("    cpu {cpu}  thread {id}  {name}  {class}  {state:?}  {runs} runs");
     });
 
+    // Said out loud, because the walk above cannot say it. `for_each` skips a
+    // CPU whose runqueue it cannot read, and says nothing about the skip -- so
+    // an unreadable CPU contributes no lines and looks exactly like a CPU with
+    // no threads. Sampled repeatedly so "held throughout" is distinguished from
+    // "held at the instant we looked".
+    //
+    // Every CPU is sampled in each round rather than one CPU being watched for
+    // two seconds before moving to the next. Per-CPU windows would be two
+    // seconds apart, so a lock released between them would read as never held
+    // and one held in both as held continuously, and neither would be true of
+    // the same instant. One window costs two seconds for the whole machine
+    // instead of two seconds per CPU.
+    const ROUNDS: u32 = 20;
+    const ROUND_MICROS: u64 = 100_000;
+    let online = bhaskix_arch::percpu::online_count() as usize;
+    let mut readable = [0u32; bhaskix_arch::percpu::MAX_CPUS];
+    for _ in 0..ROUNDS {
+        for (cpu, count) in readable.iter_mut().enumerate().take(online) {
+            if sched::runqueue_readable(cpu) {
+                *count += 1;
+            }
+        }
+        time::sleep_micros(ROUND_MICROS);
+    }
+
+    let window_secs = u64::from(ROUNDS) * ROUND_MICROS / 1_000_000;
+    for (cpu, count) in readable.iter().enumerate().take(online) {
+        // Printed for every CPU, including the healthy ones. A line that only
+        // appears on the bad case cannot be told from a line that failed to
+        // print -- and this dump exists because the last one conveyed its most
+        // important fact by saying nothing at all.
+        println!(
+            "  cpu {cpu}: runqueue readable {count} of {ROUNDS} samples over {window_secs} seconds"
+        );
+        if *count == 0 {
+            println!("           -- held for every sample. Nothing on this CPU could be listed");
+            println!("           above, and nothing on it can run. Somebody holds this runqueue");
+            println!("           and is not releasing it; it is not a thread here waiting for a");
+            println!("           wake, because a wait leaves the lock free and the threads");
+            println!("           readable.");
+            println!("           WHICH cpu holds it is not established by this line. `spawn_on`");
+            println!("           and the wake paths take another CPU's runqueue lock and block,");
+            println!("           so the holder may be any CPU, not necessarily cpu {cpu}.");
+        }
+    }
+
     let (dropped, wake_missed, received, replies_tried, no_caller, empty) = ipc::diagnostics();
     let (delivered, replied) = ipc::statistics();
     println!("  ipc: {delivered} delivered, {replied} replied, {received} receives returned,");

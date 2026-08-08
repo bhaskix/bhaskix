@@ -620,7 +620,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | Defect | Evidence | Owner |
 |---|---|---|
 | **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. Reproduce with `make soak-shell`. | unassigned |
-| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. Reproduce with repeated boots. | unassigned |
+| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. Reproduce with repeated boots. | unassigned |
 
 ### Blockers
 
@@ -693,6 +693,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-08 (the watchdog's thread walk was silent about the CPU that mattered most)
+
+The dump added earlier the same day lists every thread by walking the runqueues with `try_lock`, and
+**skips a CPU it cannot read without saying that it skipped one**. The skip is correct — the walk
+runs from a watchdog that must not block — but it is invisible, so a CPU whose runqueue is held
+contributes no lines and looks exactly like a CPU with no threads. The first dump this mattered on
+had no `cpu 0` rows at all, and its most important fact had to be inferred from an absence, which is
+the failure the watchdog was built to end.
+
+- **Every CPU now gets a line, healthy ones included**, reporting how many of 20 samples found its
+  runqueue readable. A line printed only on the bad case cannot be told from a line that failed to
+  print.
+- **Sampled rather than read once**, so "held throughout" is distinguished from "held at the instant
+  we looked" — a single `try_lock` failure means only that someone held the lock for a microsecond.
+- **All CPUs are sampled in each round**, not one CPU watched for two seconds before moving to the
+  next. Per-CPU windows would sit two seconds apart, so a lock released between them would read as
+  never held and one held in both as held continuously — neither true of any single instant. Costs
+  two seconds for the machine instead of two seconds per CPU.
+- **It reports an unreadable runqueue, and does not name a culprit.** The first draft of this line
+  said the CPU was "wedged holding its own lock". That is not established by the measurement and can
+  be false: `spawn_on` and the wake paths take a *remote* runqueue lock and block on it, so a CPU
+  stuck in either strands the queue it reached for rather than its own. The line would then have
+  named the victim and let the culprit go unmentioned. It now says the runqueue is held, says a
+  waiting thread is not the explanation — a wait leaves the lock free and the threads readable — and
+  says outright that which CPU holds it is not answered here.
+- **Verified in both directions.** With the deadline shortened to 3 seconds a healthy machine prints
+  `readable 20 of 20` for all four CPUs; with `runqueue_readable` forced false for one CPU the
+  held-throughout branch prints, and both were read off the serial log rather than reasoned about.
 
 ### 2026-08-08 (a bring-up stall that says nothing now says what it was doing)
 
