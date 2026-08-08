@@ -547,8 +547,6 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("    iommu memory   FAILED");
     }
 
-    println!();
-
     // Which shell the machine boots to. The user-mode one by default, because
     // it is the one that has to ask permission for everything it does;
     // `shell=kernel` on the command line selects the ring 0 one, which is a
@@ -1441,6 +1439,109 @@ static STRANDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 ///
 /// It will not come back with an answer: the server receives and never replies.
 /// What it must come back with is the *right refusal*, once that server dies.
+/// Queues on an endpoint nobody serves, and waits there to be killed.
+///
+/// The call cannot succeed and is not meant to: with no receiver it queues this
+/// thread as a *sender* and blocks, which is the state whose cleanup is under
+/// test.
+extern "C" fn queued_then_killed(endpoint: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    QUEUED_KILLED.store(1, Ordering::Release);
+    let _ = ipc::call(ipc::EndpointId::from_u32(endpoint as u32), 0, 7, [0; 4]);
+    QUEUED_KILLED.store(2, Ordering::Release);
+    sched::exit()
+}
+
+/// How far [`queued_then_killed`] got.
+static QUEUED_KILLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A thread killed while queued on an endpoint leaves no entry behind.
+///
+/// # Why this is a scenario and not a unit test
+///
+/// The mechanism -- taking a thread out of both queues -- was always there and
+/// always correct. What was missing was anybody calling it for a thread that
+/// *died*, and no unit test can find a missing call. Only running a thread into
+/// that state and killing it can.
+///
+/// # Why it has to be built on purpose
+///
+/// Bring-up does not reach it. The `endpoint queues` line below reports the
+/// truth of a quiescent machine -- two services blocked in `recv`, nothing
+/// queued to send -- with or without the sweep, so it is a monitor and not a
+/// gate. Nothing else in this kernel kills a thread while it is queued to send,
+/// which is exactly why the entries could leak for three milestones with every
+/// test passing.
+fn queue_entry_released_on_death(cpu: u32, hhdm_base: u64) -> bool {
+    let Ok(endpoint) = ipc::create() else {
+        println!("    queue cleanup  FAILED to create an endpoint");
+        return false;
+    };
+    let Ok(doomed) = domain::create("queued", domain::ResourceEnvelope::new()) else {
+        println!("    queue cleanup  FAILED to create a domain");
+        ipc::destroy(endpoint);
+        return false;
+    };
+
+    QUEUED_KILLED.store(0, core::sync::atomic::Ordering::Release);
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(doomed.as_u32());
+    if sched::spawn_on_with(
+        cpu,
+        "queued",
+        queued_then_killed,
+        u64::from(endpoint.as_u32()),
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("    queue cleanup  FAILED to spawn the caller");
+        domain::destroy(doomed);
+        ipc::destroy(endpoint);
+        return false;
+    }
+
+    // Queued to send, not merely spawned. Killing it before it reached the
+    // endpoint would leave nothing to clean up and the test would pass without
+    // testing anything -- the failure this whole gate exists to avoid.
+    let queued = wait_until(|| ipc::queued(endpoint) == Some((1, 0)), 4_000);
+    if !queued {
+        println!(
+            "    queue cleanup  FAILED: the caller never queued (got {:?})",
+            ipc::queued(endpoint)
+        );
+        domain::destroy(doomed);
+        ipc::destroy(endpoint);
+        return false;
+    }
+
+    domain::end(doomed, domain::Ending::Killed);
+    let gone = wait_until(
+        || ipc::queued(endpoint).is_none_or(|(senders, _)| senders == 0),
+        8_000,
+    );
+
+    let depth = ipc::queued(endpoint);
+    ipc::destroy(endpoint);
+    domain::destroy(doomed);
+
+    if gone {
+        println!("    queue cleanup  a thread killed while queued to send left no entry behind");
+        true
+    } else {
+        println!(
+            "    queue cleanup  FAILED: the caller died and its entry stayed ({depth:?}); \
+             {} of {} slots in that direction are gone for good",
+            depth.map_or(0, |(senders, _)| senders),
+            ipc::MAX_QUEUED
+        );
+        false
+    }
+}
+
 extern "C" fn stranded_caller(endpoint: u64) -> ! {
     use core::sync::atomic::Ordering;
 
@@ -4766,6 +4867,25 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             service::VFS_PLACEMENT
         );
     }
+    // Endpoint queues, after every domain the tests build and tear down.
+    //
+    // Placed here for the same reason the second lock-order check is placed
+    // late: a gate that runs before the interesting work verifies the code
+    // that ran before it. Two earlier positions for this one reported zero
+    // because they ran before the services existed at all -- the endpoint
+    // table had nothing live in it to look at, and "nothing wrong" and
+    // "nothing there" print the same.
+    // The check prints its own verdict, in detail. `FAILED` anywhere in the log
+    // is what every harness here fails on, so there is nothing to accumulate.
+    let _ = queue_entry_released_on_death(cpu, hhdm);
+
+    let (queued_senders, queued_receivers, dead) = ipc::stranded_entries();
+    println!(
+        "    endpoint queues {queued_senders} senders and {queued_receivers} receivers queued, \
+         {dead} naming a thread that has gone, {} cleared on the way",
+        ipc::stranded_cleared()
+    );
+
     println!("  M6 in progress. Nothing left to do at this milestone.");
 
     let options = sched::SpawnOptions::new()

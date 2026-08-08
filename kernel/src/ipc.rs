@@ -286,22 +286,30 @@ impl Endpoint {
         Ok(())
     }
 
-    /// Removes a thread from both queues.
+    /// Removes a thread from both queues, and says how many entries went.
     ///
     /// For a thread that stopped waiting some other way — it was killed, or
     /// its domain was destroyed. A stale entry would have a later rendezvous
     /// deliver a message to a thread that is not there.
-    fn remove(&mut self, thread: u32) {
+    ///
+    /// That sentence was written when this was, and for three milestones
+    /// nothing called it for either reason: the only caller was `recv`
+    /// cancelling *itself*. See [`cancel_all`].
+    fn remove(&mut self, thread: u32) -> usize {
+        let mut cleared = 0;
         for entry in &mut self.senders {
             if entry.is_some_and(|pending| pending.thread == thread) {
                 *entry = None;
+                cleared += 1;
             }
         }
         for entry in &mut self.receivers {
             if *entry == Some(thread) {
                 *entry = None;
+                cleared += 1;
             }
         }
+        cleared
     }
 
     fn queued(&self) -> (usize, usize) {
@@ -656,6 +664,86 @@ pub fn cancel(id: EndpointId, thread: u32) {
     {
         endpoint.remove(thread);
     }
+}
+
+/// Removes `thread` from **every** endpoint's queues, and says how many entries
+/// went. Called when a thread dies.
+///
+/// # Why this exists, and why its absence was not obvious
+///
+/// [`cancel`] needs to be told which endpoint. A thread blocked in `call` knows
+/// -- it is the one it is calling -- and cancels itself on the way out. A thread
+/// that *dies* knows nothing, because it does not run again: it is killed by
+/// another domain, or it faults, or its domain is destroyed under it. There was
+/// no way to ask "take this thread out of wherever it is waiting", so nothing
+/// did, and `Endpoint::remove` sat there documented for exactly this case with
+/// no caller for it.
+///
+/// The entries do not decay. Each endpoint has [`MAX_QUEUED`] slots in each
+/// direction, so a machine that creates and destroys domains -- which is what a
+/// supervisor does, and what this kernel's own self-tests do on every boot --
+/// loses slots permanently, a few at a time. When the last one goes, every
+/// later caller is answered [`IpcError::Congested`], for ever, and a service
+/// whose *receive* is refused exits. That is not back-pressure, which is what
+/// `Congested` is supposed to mean. It is a countdown.
+///
+/// Swept across all endpoints rather than recorded per thread: a thread waits
+/// on at most one, so the sweep finds nothing almost every time, and the
+/// alternative is a second piece of state that has to be kept true on every
+/// path that queues, dequeues, matches or dies.
+pub fn cancel_all(thread: u32) -> usize {
+    let mut table = TABLE.lock();
+    let mut cleared = 0;
+    for endpoint in &mut table.endpoints {
+        if endpoint.live {
+            cleared += endpoint.remove(thread);
+        }
+    }
+    if cleared > 0 {
+        STRANDED_CLEARED.fetch_add(cleared as u64, Ordering::Relaxed);
+    }
+    cleared
+}
+
+/// Queue entries removed by [`cancel_all`] since boot.
+#[must_use]
+pub fn stranded_cleared() -> u64 {
+    STRANDED_CLEARED.load(Ordering::Relaxed)
+}
+
+static STRANDED_CLEARED: AtomicU64 = AtomicU64::new(0);
+
+/// Queue entries naming a thread that no longer exists.
+///
+/// The gate on [`cancel_all`], and it fails without it: the kernel's own
+/// self-tests create domains, call services from them and destroy them, so a
+/// boot that leaves entries behind leaves them where this can see them.
+///
+/// Takes the endpoint table first and a runqueue second, which is the declared
+/// order (`Endpoints` is 8, `SchedRunqueue` is 10) and so is allowed to block
+/// for both.
+#[must_use]
+pub fn stranded_entries() -> (usize, usize, usize) {
+    let table = TABLE.lock();
+    let (mut senders, mut receivers, mut dead) = (0, 0, 0);
+    for endpoint in &table.endpoints {
+        if !endpoint.live {
+            continue;
+        }
+        for pending in endpoint.senders.iter().flatten() {
+            senders += 1;
+            if !sched::thread_is_live(pending.thread) {
+                dead += 1;
+            }
+        }
+        for receiver in endpoint.receivers.iter().flatten() {
+            receivers += 1;
+            if !sched::thread_is_live(*receiver) {
+                dead += 1;
+            }
+        }
+    }
+    (senders, receivers, dead)
 }
 
 fn rendezvous_send(id: EndpointId, pending: PendingSend) -> Result<Rendezvous, IpcError> {

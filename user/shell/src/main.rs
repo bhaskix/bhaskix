@@ -237,16 +237,25 @@ fn read(buffer: &mut [u8; CHUNK_BYTES]) -> usize {
 /// Returns whether every chunk arrived. A path sent in pieces that stops
 /// half-way would leave the service holding a prefix — which is why the
 /// service resolves nothing until an operation asks it to.
-fn send_path(path: &[u8]) -> bool {
+/// Sends a path to the filesystem service, one chunk per round trip.
+///
+/// Returns the reply that did not arrive, rather than a bare `false`. The
+/// status is the only thing separating "the capability was revoked" from "the
+/// service is gone" from "the kernel refused the call before either" -- and a
+/// caller that answers `could not reach the filesystem` has thrown away the
+/// answer to the question it is asking. That cost a soak run: `cat` failed once
+/// in about seventy, printed exactly that, and left nothing to work from while
+/// every kernel self-test in the same boot passed.
+fn send_path(path: &[u8]) -> Result<(), Reply> {
     let mut rest = path;
     loop {
         let (chunk, tail) = Chunk::take(rest);
         let reply = call(FILESYSTEM, fs::PATH, chunk.pack(0));
         if !reply.delivered() {
-            return false;
+            return Err(reply);
         }
         if tail.is_empty() {
-            return true;
+            return Ok(());
         }
         rest = tail;
     }
@@ -566,9 +575,13 @@ fn signals() {
 }
 
 fn list(path: &[u8]) {
-    let _ = call(FILESYSTEM, fs::RESET, [0; 4]);
-    if !send_path(path) {
-        write(b"  ls: could not reach the filesystem\n");
+    let reset = call(FILESYSTEM, fs::RESET, [0; 4]);
+    if !reset.delivered() {
+        report_refusal(b"ls", &reset);
+        return;
+    }
+    if let Err(reply) = send_path(path) {
+        report_refusal(b"ls", &reply);
         return;
     }
 
@@ -623,9 +636,13 @@ fn list(path: &[u8]) {
 }
 
 fn cat(path: &[u8]) {
-    let _ = call(FILESYSTEM, fs::RESET, [0; 4]);
-    if !send_path(path) {
-        write(b"  cat: could not reach the filesystem\n");
+    let reset = call(FILESYSTEM, fs::RESET, [0; 4]);
+    if !reset.delivered() {
+        report_refusal(b"cat", &reset);
+        return;
+    }
+    if let Err(reply) = send_path(path) {
+        report_refusal(b"cat", &reply);
         return;
     }
 

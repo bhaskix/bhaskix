@@ -1055,6 +1055,22 @@ fn enter_space(root: u64) {
     }
 }
 
+/// Whether `thread` still exists and could still be handed a message.
+///
+/// `Finished` counts as gone. A thread that has exited is still in its queue
+/// slot until it is reaped, and an endpoint entry naming it is exactly as
+/// stranded as one naming a thread that was never there.
+#[must_use]
+pub fn thread_is_live(thread: u32) -> bool {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        if let Some(found) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return found.state != State::Finished;
+        }
+    }
+    false
+}
+
 /// What `thread` is called and which address space it should be running in.
 ///
 /// For the fault report. A user-mode fault happens in ring 3, so the faulting
@@ -1323,13 +1339,40 @@ pub fn domain_of(thread: u32) -> Option<crate::domain::DomainId> {
 /// `None` for a thread created before domains existed, which is the correct
 /// answer rather than an oversight: such a thread has no CSpace and therefore
 /// no authority to name anything.
+///
+/// # Why this blocks for the lock rather than trying for it
+///
+/// It used to be `try_lock()?`, and that one character of punctuation was a
+/// service-killing bug. `None` here becomes [`Status::NoDomain`] in
+/// `resolve_for_ipc`, and a service told its receive was refused **exits** --
+/// deliberately, because there is nothing left for it to serve. So a runqueue
+/// lock that happened to be held by another CPU for the duration of one
+/// `Recv` did not delay that service. It ended it, permanently, along with
+/// every caller that would ever queue behind it.
+///
+/// It presented as the console going silent mid-word, or the filesystem
+/// answering ninety-eight requests and then nothing, once in fifteen to thirty
+/// runs and more often on a loaded host -- with no fault, no panic, and every
+/// self-test in the same boot green.
+///
+/// This is the conflation `wake_with` is careful about and names in its own
+/// documentation: *contended* and *not there* are different answers, and a
+/// caller that cannot tell them apart will do the wrong one of retry and give
+/// up. `wake_with` learned it for wakes; this did not learn it for authority.
+///
+/// Blocking is safe, and by the argument already written down elsewhere:
+/// `current_thread_id` two hundred lines below takes the same lock the same
+/// way and is called beside this one on every path that reaches here, and
+/// `trap::end_faulting_domain` sets out why a handler for a *user-mode* fault
+/// may take kernel locks at all. This takes that one lock and releases it
+/// before any other, so it cannot be the held half of a cycle.
 #[must_use]
 pub fn current_domain() -> Option<crate::domain::DomainId> {
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return None;
     }
-    let queue = QUEUES[cpu].try_lock()?;
+    let queue = QUEUES[cpu].lock();
     let current = queue.current;
     let domain = queue.threads[current].as_ref()?.domain;
     if domain == u32::MAX {
@@ -1785,6 +1828,20 @@ pub fn exit() -> ! {
         crate::domain::ended_by_last_thread(crate::domain::DomainId::from_u32(domain));
     }
 
+    // Taken out of whatever it was waiting on, before the runqueue lock below.
+    //
+    // Ordering, not taste: `Endpoints` is rank 8 and `SchedRunqueue` is 10, so
+    // the endpoint table has to be taken first or not while holding the queue.
+    // This is the same reason the domain work above happens here rather than
+    // further down.
+    //
+    // Without this a dying thread's queue entries stay for the life of the
+    // machine, and there are sixteen per endpoint per direction. See
+    // `ipc::cancel_all`.
+    if let Some(thread) = me {
+        crate::ipc::cancel_all(thread);
+    }
+
     let owed = if cpu < MAX_CPUS {
         let mut queue = QUEUES[cpu].lock();
         let current = queue.current;
@@ -1799,6 +1856,21 @@ pub fn exit() -> ! {
     // Outside the lock: telling the caller takes its CPU's runqueue lock, and
     // two of the same rank held at once have no order between them.
     if let Some(caller) = owed {
+        // Said out loud, because this is the moment a service failure becomes
+        // somebody else's error and the two are hard to connect afterwards.
+        //
+        // The caller sees `Revoked` -- `ServerGone` maps onto it -- which reads
+        // as "your capability was withdrawn" and is nothing of the kind: the
+        // capability is fine and the thread behind it left mid-request. A shell
+        // printing `could not reach the filesystem` once in seventy runs, with
+        // every self-test in the same boot green, is that gap. Naming the
+        // server here turns it into a question with an answer.
+        let server = me.and_then(describe).map_or("?", |(name, _)| name);
+        let client = describe(caller).map_or("?", |(name, _)| name);
+        crate::println!(
+            "  A SERVER EXITED OWING A REPLY: {server} left while {client} \
+             (thread {caller}) was waiting. That call fails as Revoked."
+        );
         abandon_caller(caller);
     }
 
@@ -2260,8 +2332,42 @@ pub fn drain_deferred_wakes() -> bool {
     delivered
 }
 
-/// Records a wake that could not be delivered, if there is room.
+/// Records a wake that could not be delivered.
+///
+/// **A wake lost here is lost for ever, and that is not a slowdown.** A thread
+/// blocked in `notify::wait` has already had its pending bits set by the
+/// signaller — the bits go down before the wake goes out — so it would return
+/// immediately if anything ever scheduled it again. Nothing will: it is
+/// `Blocked`, and the only thing that was going to change that has just been
+/// dropped on the floor.
+///
+/// For the console that is worse than a stuck thread. The serial source is
+/// masked until the reader wakes and acknowledges it, so one lost wake means no
+/// further interrupts, no further signals, and input is dead for the life of
+/// the machine. It presents as a shell that echoes a command, answers it, and
+/// then never reads another — with every other part of the system still running.
+///
+/// Two things made that reachable, and both are fixed here:
+///
+/// * **The table held eight entries.** At most `MAX_CPUS * MAX_THREADS_PER_CPU`
+///   threads exist at once, so eight was not a bound on anything — it was a
+///   guess, and a wake past it was dropped.
+/// * **It did not check whether the thread was already in it.** A thread
+///   deferred twice took two slots, so the eight were spent faster than there
+///   were threads to spend them.
+///
+/// Sized to the live-thread bound and deduplicated, losing one is now
+/// unreachable rather than unlikely: a thread occupies at most one slot and
+/// there are as many slots as threads. The counter stays, and says so out loud
+/// if it is ever wrong.
 fn defer_wake(id: u32) {
+    // Already waiting to be retried. A second entry would wake it twice, which
+    // is harmless, and spend a slot, which is not.
+    for slot in &DEFERRED_WAKES {
+        if slot.load(Ordering::Acquire) == id {
+            return;
+        }
+    }
     for slot in &DEFERRED_WAKES {
         if slot
             .compare_exchange(NO_THREAD, id, Ordering::AcqRel, Ordering::Relaxed)
@@ -2270,11 +2376,15 @@ fn defer_wake(id: u32) {
             return;
         }
     }
-    // Nowhere to record it. Counted rather than ignored: a full table means
-    // wakes are being deferred faster than ticks deliver them, which is a fact
-    // about the system worth seeing, and the alternative -- growing the table
-    // inside an interrupt handler -- is an allocation on the fault path.
+    // Unreachable, unless the bound above is wrong. Said on the serial line
+    // rather than only counted, because the counter was never read by anything
+    // in three milestones and the failure it records is a machine that stops
+    // answering with no other symptom.
     DEFERRED_LOST.fetch_add(1, Ordering::Relaxed);
+    crate::println!(
+        "  A WAKE WAS LOST: thread {id} is blocked and nothing will wake it. \
+         The deferred table is full, which should not be possible."
+    );
 }
 
 /// Whether any wake is waiting for a tick to retry it.
@@ -2295,8 +2405,14 @@ pub fn deferred_wakes_lost() -> u64 {
 const NO_THREAD: u32 = 0;
 
 /// Wakes an interrupt handler could not deliver immediately.
-static DEFERRED_WAKES: [core::sync::atomic::AtomicU32; 8] =
-    [const { core::sync::atomic::AtomicU32::new(NO_THREAD) }; 8];
+///
+/// One slot per thread the machine can have. `defer_wake` records each thread
+/// at most once, so the table cannot fill while there is a thread left to fill
+/// it — which is the property that makes a lost wake unreachable rather than
+/// rare. Two kilobytes of static for a failure mode whose symptom is a machine
+/// that goes quiet.
+static DEFERRED_WAKES: [core::sync::atomic::AtomicU32; MAX_CPUS * MAX_THREADS_PER_CPU] =
+    [const { core::sync::atomic::AtomicU32::new(NO_THREAD) }; MAX_CPUS * MAX_THREADS_PER_CPU];
 static DEFERRED_LOST: AtomicU64 = AtomicU64::new(0);
 
 fn wake_with(id: u32, from_interrupt: bool) -> WakeResult {

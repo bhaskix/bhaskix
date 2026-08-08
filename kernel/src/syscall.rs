@@ -786,8 +786,34 @@ fn resolve_for_ipc(index: u64, expected: ObjectKind) -> Result<Resolved, Status>
 static RECV_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 fn note_recv_refusal(status: Status) {
-    let thread = u64::from(crate::sched::current_thread_id().unwrap_or(0));
-    RECV_REFUSED.store((1 << 32) | (thread << 8) | status as u64, Ordering::Relaxed);
+    let id = crate::sched::current_thread_id().unwrap_or(0);
+    RECV_REFUSED.store(
+        (1 << 32) | (u64::from(id) << 8) | status as u64,
+        Ordering::Relaxed,
+    );
+
+    // Said out loud, on the serial line, at the moment it happens -- but only
+    // for a thread that belongs to a domain.
+    //
+    // Those are the services: `bin/consoled`, `bin/vfsd`, `bin/blkd`, `bin/fsd`.
+    // A refused receive ends one of them, because `serve` has no other way out,
+    // and the consequences are invisible from anywhere else. When the console
+    // service is the one that goes, **nothing can report it** -- the shell's
+    // next write blocks for ever and the machine simply stops saying anything.
+    // The kernel's `println!` goes to the serial port directly rather than
+    // through the console service, so this is the one voice left.
+    //
+    // Deliberately not printed for a thread with no domain: the IPC self-test
+    // tears its endpoint down underneath its own service on every boot, which
+    // is a refusal by design and would put a line in every log.
+    if crate::sched::current_domain().is_some() {
+        let name = crate::sched::describe(id).map_or("?", |(name, _)| name);
+        crate::println!(
+            "  A SERVICE WAS REFUSED A RECEIVE: thread {id} ({name}), status {}. It has \
+             exited, and every later caller will block for ever.",
+            status as u64
+        );
+    }
 }
 
 /// The last refused receive: `(thread, status)`, or `None` if there was none.
@@ -1338,7 +1364,16 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                     // to agree with it rather than carry something else.
                     return Outcome::ok(message.args[0]);
                 }
-                Err(error) => return Outcome::err(ipc_status(error)),
+                Err(error) => {
+                    // Reported here as well as above. `Recv` is refused from
+                    // two places -- resolving the capability, and the
+                    // rendezvous itself -- and only the first said so, which
+                    // made exactly half of every service death invisible to
+                    // the diagnostic built to explain service deaths.
+                    let status = ipc_status(error);
+                    note_recv_refusal(status);
+                    return Outcome::err(status);
+                }
             }
         }
         Some(Kind::Reply) => {

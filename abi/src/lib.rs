@@ -272,6 +272,8 @@ pub mod rights {
 pub mod status {
     /// The call succeeded.
     pub const OK: u64 = 0;
+    /// The system call number is not one the kernel answers.
+    pub const BAD_SYSCALL: u64 = 1;
     /// The capability index named nothing in this domain's CSpace.
     pub const NO_SUCH_CAPABILITY: u64 = 2;
     /// The capability was revoked, or its slot has been reused.
@@ -285,6 +287,20 @@ pub mod status {
     /// and a program that could not tell them apart would not know whether to
     /// ask for the thing or for the right.
     pub const INSUFFICIENT_RIGHTS: u64 = 5;
+    /// The operation is defined but not built yet.
+    pub const NOT_IMPLEMENTED: u64 = 6;
+    /// The calling thread belongs to no domain, so it has no CSpace.
+    pub const NO_DOMAIN: u64 = 7;
+    /// The endpoint's queue is full in the direction this call needs.
+    ///
+    /// **Transient, and the only status here that is.** Everything else says
+    /// the authority is wrong or gone, and asking again will get the same
+    /// answer. This one says the queue was full at that instant, so a caller
+    /// that treats it like the others gives up on a request that would have
+    /// worked. A *service* that treats it like the others exits.
+    pub const CONGESTED: u64 = 8;
+    /// The reply names a caller that is no longer waiting.
+    pub const NO_SUCH_CALLER: u64 = 9;
     /// The address named is unusable: unaligned, occupied, or out of range.
     pub const SLOT_UNAVAILABLE: u64 = 11;
     /// The object does not answer that method.

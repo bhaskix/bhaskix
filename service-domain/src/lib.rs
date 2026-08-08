@@ -75,6 +75,19 @@ pub fn serve<S: Service>(endpoint: u64, context: S::Context) -> ! {
     loop {
         let (status, badge, method, args) = syscall(syscall::RECV, endpoint, 0, [0; 4]);
 
+        // Back-pressure is not a reason to die.
+        //
+        // `Congested` means the endpoint's queue was full at that instant --
+        // the one status here that says nothing about authority and everything
+        // about load. Treating it like the rest killed a service for being
+        // busy, which is the worst possible moment to lose one. Yield first:
+        // the queue drains when the threads ahead are served, and a tight
+        // retry would spend the CPU they need to drain it.
+        if status == status::CONGESTED {
+            syscall(syscall::YIELD, 0, 0, [0; 4]);
+            continue;
+        }
+
         // A domain cannot ask why: an endpoint that stops delivering has been
         // revoked or destroyed, and there is nothing left for this program to
         // serve. Exiting is the honest end -- a loop that spun here would look

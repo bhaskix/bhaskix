@@ -619,7 +619,8 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Defect | Evidence | Owner |
 |---|---|---|
-| **The filesystem service stops answering, and a boot sometimes stalls in the IPC self-test.** Several presentations, all of them an IPC call that goes unanswered: `ls`/`cat` unreachable with `0/200 filesystem replies`; the ring 3 probe's calls not landing; the shell hung mid-`help`; and a silent stall after `syscall entry armed` that never prints again. **`make test` itself hits it**, so this is not a soak artifact. | Caught with diagnostics 2026-08-08: **`vfsd` was `Finished` after 98 requests, with 8 senders queued behind it and 0 receivers.** A service exits when its receive is refused — `serve()` has no other way out — so something refused it, and the refusal is now recorded (`syscall::last_recv_refusal`, `ipc::abandoned_recvs`). Registers from a stalled machine put CPU 0 in `ring3_self_test`'s wait with CPUs 1–3 **halted**, so the probe was not runnable. Pre-existing: same rate on `3844ea3`. Rate varies with load, roughly 1 in 12 to 1 in 70. Reproduce with `make soak-shell` or `make soak-boot`. | unassigned |
+| **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. Reproduce with `make soak-shell`. | unassigned |
+| **A boot sometimes stalls before any service starts.** The log ends after `syscall entry armed` and never prints again — earlier than the console or filesystem domains exist, so it is not the service fault fixed on 2026-08-08. | Seen 2026-08-08, 1 of 72 soak runs (`b3/run-12`). Reproduce with `make soak-shell` or `make soak-boot`. | unassigned |
 
 ### Blockers
 
@@ -692,6 +693,71 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-08 (three more ways a service could be killed, one of them a slow leak)
+
+Found by auditing what else can refuse a `Recv`, since `serve()` exits on any refusal and only one
+of its causes had been examined.
+
+- **A dying thread left its endpoint queue entries behind.** `Endpoint::remove` was written for
+  exactly this -- its own comment says *"for a thread that stopped waiting some other way — it was
+  killed, or its domain was destroyed"* -- and for three milestones the only caller was `recv`
+  cancelling *itself*. Nothing swept a thread that died. The entries do not decay, there are
+  [`MAX_QUEUED`] = 16 per endpoint per direction, and when the last one goes every later caller is
+  answered `Congested` for ever. `ipc::cancel_all` now sweeps from `sched::exit`, which all three
+  death paths funnel through.
+- **Half of every service death was invisible.** `Recv` is refused from two places -- resolving the
+  capability, and the rendezvous -- and only the first called `note_recv_refusal`. The diagnostic
+  built to explain services dying could not see the `ipc::recv` half. Both report now.
+- **`serve()` exited on back-pressure.** `Congested` is the one status that says nothing about
+  authority and everything about load. It now yields and retries; everything else still exits,
+  which is still right.
+- **The ABI did not know half the kernel's statuses.** `abi::status` was missing `BadSyscall`,
+  `NotImplemented`, `NoDomain`, `Congested` and `NoSuchCaller` -- which is why a shell could only
+  ever print `status 8` for the thing that was killing it. Added.
+- **The gate, and what it is not.** `queue cleanup` builds the case on purpose: a thread queued to
+  send on an endpoint nobody serves, then killed. Without the sweep it reports
+  `the caller died and its entry stayed (Some((1, 0))); 1 of 16 slots in that direction are gone
+  for good`; with it, nothing is left behind. The `endpoint queues` line beside it is a **monitor,
+  not a gate** -- it reads the same either way, because bring-up never kills a thread while it is
+  queued, which is why this leaked past every test for three milestones. Two earlier placements of
+  it reported zero for a worse reason: they ran before any service existed, and "nothing wrong" and
+  "nothing there" print identically.
+
+### 2026-08-08 (the service bug, found: a contended lock reported as missing authority)
+
+- **Root cause: `current_domain()` used `try_lock()?` on the runqueue.** One character of
+  punctuation. A `try_lock` that fails because another CPU holds the lock for a moment returns
+  `None`, `resolve_for_ipc` turns `None` into `Status::NoDomain`, and **a service told its receive
+  was refused exits** — by design, because there is nothing left for it to serve. So a lock held
+  briefly during one `Recv` did not slow a service down. It ended it, permanently, along with every
+  caller that would ever queue behind it.
+- **This is a conflation the tree already knows about and had not applied here.** `wake_with`
+  documents it at length for wakes: *contended* and *not there* are different answers, and a caller
+  that cannot tell them apart will pick the wrong one of retry and give up. `current_thread_id()`,
+  called beside `current_domain()` on every path that reaches it, takes the same lock **blocking**.
+  `current_domain` was the odd one out. Fixed by making it block, which is safe by the argument
+  `trap::end_faulting_domain` already sets out.
+- **The evidence**, from 72 runs with the refusal made loud:
+  `A SERVICE WAS REFUSED A RECEIVE: thread 33 (consoled), status 7` — 7 is `NoDomain`. One log cuts
+  off mid-word at `exit    end this s`: the console died while printing, and never spoke or read
+  again.
+- **Two hypotheses were disproved on the way, and both looked right.** A kernel was built with the
+  old 8-slot `defer_wake` table and the drop made loud: 72 runs, two failures, **no lost wake**. A
+  second diagnostic for "a server exited owing a reply" never fired either. Either would have been
+  shipped as the fix on a plausible mechanism.
+- **What actually found it was deleting a `let _ =`.** The shell answered `could not reach the
+  filesystem` and threw away the status it had just been handed. `send_path` now returns the failing
+  reply, `ls`/`cat` route it through `report_refusal`, and the `fs::RESET` status is no longer
+  discarded either. `could not reach the filesystem` became `refused, status 7`, and that was the
+  whole investigation.
+- **`defer_wake` is still changed, as hardening and not as a fix.** Eight slots with no duplicate
+  check, for a machine with up to `MAX_CPUS * MAX_THREADS_PER_CPU` = 512 live threads, is not a
+  bound. It is now one slot per thread and deduplicated, so overflow is unreachable rather than
+  unlikely. It was never observed to overflow.
+- **Two defects remain open and are recorded in §3**: callers give up on `Congested` instead of
+  retrying, and a boot still stalls occasionally *before any service starts* — earlier than
+  anything fixed here.
 
 ### 2026-08-08 (hunting the filesystem-service bug: not fixed, but no longer invisible)
 
