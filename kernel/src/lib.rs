@@ -1042,9 +1042,32 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
             println!("           and is not releasing it; it is not a thread here waiting for a");
             println!("           wake, because a wait leaves the lock free and the threads");
             println!("           readable.");
-            println!("           WHICH cpu holds it is not established by this line. `spawn_on`");
-            println!("           and the wake paths take another CPU's runqueue lock and block,");
-            println!("           so the holder may be any CPU, not necessarily cpu {cpu}.");
+            // The lock records its taker, so this no longer has to be left to
+            // the reader. `spawn_on` and the wake paths block on a remote
+            // runqueue, so the holder genuinely need not be cpu {cpu} -- which
+            // is why the answer is printed rather than assumed either way.
+            match sched::runqueue_owner(cpu) {
+                Some(owner) if owner as usize == cpu => {
+                    println!(
+                        "           HELD BY cpu {owner}, its own CPU. Whatever it is doing, it"
+                    );
+                    println!("           took this lock and stopped before releasing it.");
+                }
+                Some(owner) => {
+                    println!(
+                        "           HELD BY cpu {owner}, which is not this one. cpu {cpu} is the"
+                    );
+                    println!("           victim; look at cpu {owner} in the thread list above.");
+                }
+                // Unheld yet unreadable twenty times running is not a state
+                // the protocol produces, so it is reported as the anomaly it
+                // is rather than printed as "free" beside "never readable".
+                None => {
+                    println!("           BUT IT RECORDS NO OWNER, having just read as held twenty");
+                    println!("           times. Suspect the owner bookkeeping here, not only the");
+                    println!("           stall -- the two claims cannot both be right.");
+                }
+            }
         }
     }
 

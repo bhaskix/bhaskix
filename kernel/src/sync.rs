@@ -41,9 +41,14 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bhaskix_arch::percpu::{self, MAX_CPUS};
+
+/// No CPU holds the lock. Matches the `NO_DOMAIN` convention in `irq.rs`.
+///
+/// `u32::MAX` rather than `0`, because `0` is a CPU.
+const NO_OWNER: u32 = u32::MAX;
 
 /// Every lock in the kernel, ordered by the sequence in which they may be
 /// acquired: a context holding one may only block on a lock declared *below*
@@ -307,6 +312,15 @@ fn record(held: u64, rank: Rank) {
 /// elsewhere, so that a lock cannot be added without declaring where it sits.
 pub struct SpinLock<T> {
     locked: AtomicBool,
+    /// The CPU that took the lock, or [`NO_OWNER`] when it is free.
+    ///
+    /// Diagnostic only — nothing in the locking protocol reads it. It exists
+    /// because a held lock could say *that* it was held and not *by whom*: the
+    /// bring-up watchdog could report a runqueue stuck for two seconds and had
+    /// to state in the same breath that the CPU it named was where the lock
+    /// was, not who took it. `spawn_on` and the wake paths block on a remote
+    /// runqueue, so those are different questions.
+    owner: AtomicU32,
     rank: Rank,
     value: UnsafeCell<T>,
 }
@@ -327,8 +341,28 @@ impl<T> SpinLock<T> {
     pub const fn new(rank: Rank, value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
+            owner: AtomicU32::new(NO_OWNER),
             rank,
             value: UnsafeCell::new(value),
+        }
+    }
+
+    /// The CPU currently holding this lock, or `None` if it is free.
+    ///
+    /// **A snapshot, and only worth reading when the answer cannot change.**
+    /// On a live lock the holder may release before this returns, so a caller
+    /// that acts on it is racing. It is meant for the case where a lock has
+    /// been observed stuck — there the value is as stable as the fault is, and
+    /// it names the CPU to go and look at.
+    ///
+    /// Reports the CPU that *acquired* the lock, which before per-CPU areas
+    /// are installed is `0` for everyone, since [`percpu::cpu_id`] has no
+    /// better answer that early. Every caller so far runs long after that.
+    #[must_use]
+    pub fn owner(&self) -> Option<u32> {
+        match self.owner.load(Ordering::Relaxed) {
+            NO_OWNER => None,
+            cpu => Some(cpu),
         }
     }
 
@@ -347,9 +381,12 @@ impl<T> SpinLock<T> {
         self.locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
-            .map(|_| SpinLockGuard {
-                lock: self,
-                ranked: false,
+            .map(|_| {
+                self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
+                SpinLockGuard {
+                    lock: self,
+                    ranked: false,
+                }
             })
     }
 
@@ -378,6 +415,7 @@ impl<T> SpinLock<T> {
                 core::hint::spin_loop();
             }
         }
+        self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
         SpinLockGuard {
             lock: self,
             ranked: true,
@@ -419,6 +457,12 @@ impl<T> Drop for SpinLockGuard<'_, T> {
         if self.ranked {
             slot().fetch_and(!self.lock.rank.bit(), Ordering::Relaxed);
         }
+        // Cleared *before* the release below, not after. Between the release
+        // and a later clear the lock is free, so another CPU may take it and
+        // record itself -- and this store would then erase a live owner and
+        // leave the lock reading as unheld while somebody holds it. The
+        // diagnostic would be wrong in exactly the case it exists for.
+        self.lock.owner.store(NO_OWNER, Ordering::Relaxed);
         // Release ordering pairs with the Acquire in `lock()`, so everything
         // written under the lock is visible to the next holder.
         self.lock.locked.store(false, Ordering::Release);
@@ -442,6 +486,42 @@ mod tests {
         drop(lock.lock());
         // Would spin forever if the guard had not released it.
         drop(lock.lock());
+    }
+
+    #[test]
+    fn a_lock_records_its_holder_and_forgets_on_release() {
+        let lock = SpinLock::new(Rank::Console, ());
+        assert_eq!(lock.owner(), None, "a free lock has no owner");
+        let guard = lock.lock();
+        assert!(lock.owner().is_some(), "a held lock names its holder");
+        drop(guard);
+        assert_eq!(lock.owner(), None, "release clears the owner");
+    }
+
+    #[test]
+    fn try_lock_records_its_holder_too() {
+        // `try_lock` is exempt from *ranking*, which is a statement about
+        // deadlock cycles. It is not exempt from holding the lock, and a
+        // stuck `try_lock` holder is as worth naming as any other.
+        let lock = SpinLock::new(Rank::Console, ());
+        let guard = lock.try_lock().expect("free");
+        assert!(lock.owner().is_some());
+        drop(guard);
+        assert_eq!(lock.owner(), None);
+    }
+
+    #[test]
+    fn a_failed_try_lock_does_not_disturb_the_recorded_owner() {
+        let lock = SpinLock::new(Rank::Console, ());
+        let held = lock.lock();
+        let owner = lock.owner().expect("held");
+        assert!(lock.try_lock().is_none(), "already held");
+        assert_eq!(
+            lock.owner(),
+            Some(owner),
+            "a losing attempt records nothing"
+        );
+        drop(held);
     }
 
     #[test]

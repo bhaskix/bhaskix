@@ -1081,6 +1081,24 @@ pub fn runqueue_readable(cpu: usize) -> bool {
     QUEUES[cpu].try_lock().is_some()
 }
 
+/// The CPU holding `cpu`'s runqueue lock, or `None` if it is free.
+///
+/// The question [`runqueue_readable`] could not answer. That one reports a
+/// runqueue held and says in the same breath that the CPU it names is where
+/// the lock is rather than who took it — true, and unsatisfying, because
+/// `spawn_on` and the wake paths block on a *remote* runqueue, so a CPU stuck
+/// in either strands the queue it reached for and not its own.
+///
+/// Only worth reading once a lock has been seen stuck. On a live one the
+/// holder may release before the answer arrives.
+#[must_use]
+pub fn runqueue_owner(cpu: usize) -> Option<u32> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    QUEUES[cpu].owner()
+}
+
 /// Whether `thread` still exists and could still be handed a message.
 ///
 /// `Finished` counts as gone. A thread that has exited is still in its queue

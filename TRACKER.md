@@ -620,7 +620,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | Defect | Evidence | Owner |
 |---|---|---|
 | **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. A later 10-run `soak-shell` the same day was clean, which at a rate near 3% is the expected outcome and says nothing either way. **A 50-run soak on an idle host (2026-08-09, ~97% idle, slowest run 20s) was also clean, and that one could have spoken**: at 3% it should have turned up one or two failures, and a clean fifty happens about a fifth of the time. It leans toward the rate being lower than 3% without settling anything — the same night's *boot* soak reproduced its own defect twice in 200 on the same host, so the machine was capable of failing. Still open: telling "fixed" from "rarer than we thought" needs runs in the hundreds. Reproduce with `make soak-shell SOAK_SHELL_RUNS=<n>`. | unassigned |
-| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. **Caught, twice, on 2026-08-08**: 2 of 200 boots, one at a time on an idle host (mean 79% idle, boots otherwise a steady 16–17s), so this is the kernel and not the contention that spoiled an earlier run. **The stall has a signature now.** Both dumps are the same shape: last line `syscall entry armed`; **one CPU contributes no threads to the walk at all** and its runqueue reads `0 of 20 samples` — held continuously for two seconds, so not a thread waiting for a wake, which would leave the lock free. Both were caught by the watchdog firing on its own deadline rather than a shortened one. **It is not IPC**: `dropped`, `wake_missed` and lost deferred wakes were all zero in both. **It is not a fixed CPU**: cpu 1 in one, cpu 0 in the other — and the holder need not be the CPU named, since `spawn_on` and the wake paths block on a remote runqueue lock. One dump is reproduced in full in §7 under the 2026-08-08 entry that caught it. Reproduce with `make soak SOAK_RUNS=200 SOAK_JOBS=1` on an idle machine, keeping `SOAK_LOG_DIR`. | unassigned |
+| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. **Caught, twice, on 2026-08-08**: 2 of 200 boots, one at a time on an idle host (mean 79% idle, boots otherwise a steady 16–17s), so this is the kernel and not the contention that spoiled an earlier run. **The stall has a signature now.** Both dumps are the same shape: last line `syscall entry armed`; **one CPU contributes no threads to the walk at all** and its runqueue reads `0 of 20 samples` — held continuously for two seconds, so not a thread waiting for a wake, which would leave the lock free. Both were caught by the watchdog firing on its own deadline rather than a shortened one. **It is not IPC**: `dropped`, `wake_missed` and lost deferred wakes were all zero in both. **It is not a fixed CPU**: cpu 1 in one, cpu 0 in the other — and the holder need not be the CPU named, since `spawn_on` and the wake paths block on a remote runqueue lock. **Since 2026-08-09 the lock records its taker**, so the next capture will name the holder outright rather than leaving it to be ruled out; the two dumps below predate that and do not. One dump is reproduced in full in §7 under the 2026-08-08 entry that caught it. Reproduce with `make soak SOAK_RUNS=200 SOAK_JOBS=1` on an idle machine, keeping `SOAK_LOG_DIR`. | unassigned |
 
 ### Blockers
 
@@ -693,6 +693,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-09 (the lock records who took it, so the dump stops naming the victim)
+
+Yesterday's stall capture could say a runqueue had been held for two seconds and could not say by
+whom — it printed that the CPU it named was *where the lock was, not who took it*, because `spawn_on`
+and the wake paths block on a remote runqueue. Honest, and it left the reader with the one question
+that matters.
+
+**`SpinLock` now carries an owner.** The acquiring CPU is recorded on both `lock()` and `try_lock()`,
+and `SpinLock::owner()` reads it back. `sched::runqueue_owner` exposes it for the watchdog, which now
+prints one of three lines instead of a disclaimer: held by its own CPU, held by another (naming which,
+and calling the reported CPU the victim), or — held twenty times running yet recording no owner —
+that the two claims cannot both be right and the bookkeeping is as suspect as the stall.
+
+- **Diagnostic only.** Nothing in the locking protocol reads the field. It is four bytes per lock and
+  two relaxed stores per acquisition, on a path that already does a compare-exchange.
+- **`try_lock` records an owner, though it is exempt from ranking.** The exemption is a statement
+  about deadlock *cycles* — a non-blocking acquisition can never be an edge in one. It says nothing
+  about holding: a stuck `try_lock` holder wedges a runqueue exactly as thoroughly.
+- **The owner is cleared before the release, not after.** In between the two the lock is free, so
+  another CPU may take it and record itself, and a later clear would erase a live owner — leaving the
+  lock reading as unheld while somebody holds it, wrong in precisely the case the field exists for.
+- **`percpu::cpu_id()` answers `0` before per-CPU areas exist**, so an owner recorded that early names
+  cpu 0 for everyone. Said in the doc comment rather than left to be discovered; every caller so far
+  runs long after.
+
+**Verified in both directions, and against the real shape.** Three host tests cover record, clear, and
+that a losing `try_lock` disturbs nothing. Then a boot with cpu 0 made to hold *cpu 1's* runqueue —
+the defect's actual shape — printed `HELD BY cpu 0, which is not this one. cpu 1 is the victim`; and a
+boot holding its own printed `HELD BY cpu 0, its own CPU`. Both read off the serial log. The
+anomaly branch has not been seen fire and is not claimed to have been.
+
+**This does not fix the stall**, and nothing here should be read as progress on it. It makes the next
+capture name a CPU to go and look at instead of one to rule out.
 
 ### 2026-08-09 (the shell half, run on its own, and it stayed up)
 
