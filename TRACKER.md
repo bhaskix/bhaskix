@@ -619,8 +619,8 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Defect | Evidence | Owner |
 |---|---|---|
-| **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. Reproduce with `make soak-shell`. | unassigned |
-| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. Reproduce with repeated boots. | unassigned |
+| **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. A later 10-run `soak-shell` the same day was clean, which at a rate near 3% is the expected outcome and **is not evidence the defect is gone** — telling it from fixed needs runs in the hundreds. Reproduce with `make soak-shell`. | unassigned |
+| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. A 40-boot soak later the same day did not reproduce it and **does not lower the estimate**: at roughly 1 in 70, seeing none in 40 is the likelier outcome either way. **The watchdog has still never fired on a real stall** — every sighting of its output so far has been manufactured by shortening its deadline. Reproduce with repeated boots. | unassigned |
 
 ### Blockers
 
@@ -722,6 +722,23 @@ the failure the watchdog was built to end.
 - **Verified in both directions.** With the deadline shortened to 3 seconds a healthy machine prints
   `readable 20 of 20` for all four CPUs; with `runqueue_readable` forced false for one CPU the
   held-throughout branch prints, and both were read off the serial log rather than reasoned about.
+
+**Soaked, and the soak did not exercise the new code.** `make soak` afterwards: **40 boots, none
+failed** (slowest 18s against a 120s cap) and **10 user-shell runs, none failed** (slowest 21s). That
+says the change does no harm on a healthy boot and nothing more — the watchdog arms at 45 seconds
+and the slowest boot was 18, so **the lines added here never printed during the soak**. The evidence
+that they print *correctly* remains the forced two-direction check above, which is a weaker thing
+than a soak and is not worth confusing with one.
+
+**A second, larger soak was started and abandoned, and is recorded as unrun.** 200 boots and 50
+shell runs, sized so the two defects in §3 would be expected to appear rather than merely be given a
+chance to. It was killed at 10 completed boots: three CI runner processes on this host were taking
+about two of its eight cores throughout, boots had slowed from 18s to 81s, and the run was tracking
+to 4.6 hours. A failure under that load could not have been attributed to the kernel — which is the
+error this file already records once, where four concurrent guests on a loaded host were read as an
+RFC 0017 regression and were not one. Nothing is claimed from those 10 clean boots. Rerun on an idle
+machine with `make soak SOAK_RUNS=200 SOAK_JOBS=2 SOAK_SHELL_RUNS=50`, checking the host is quiet
+first; `SOAK_LOG_DIR` keeps the per-run serial logs, which is where a watchdog dump would land.
 
 ### 2026-08-08 (a bring-up stall that says nothing now says what it was doing)
 
