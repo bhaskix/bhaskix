@@ -619,7 +619,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Defect | Evidence | Owner |
 |---|---|---|
-| **The filesystem service stops answering, about one run in twelve.** `ls` and `cat` report "could not reach the filesystem"; sometimes the kernel's own `bulk path` and `cost` self-tests fail beside it with `refusal 18446744073709551615` and **`0/200 filesystem replies`**. Not a timeout: the failing runs finish in 25–29s against a 240s cap, so a check failed rather than the clock running out. | Found 2026-08-08 by `make soak-shell`, which is the first thing in this project ever to run a test twice. Reproduces at the **same rate on `3844ea3`**, before any process-management work, so it is **pre-existing and newly visible** rather than new. Logs: three failing runs captured, two with the `bulk path` signature and one that hung at `ls /` with no self-test failure at all. | unassigned |
+| **The filesystem service stops answering, and a boot sometimes stalls in the IPC self-test.** Several presentations, all of them an IPC call that goes unanswered: `ls`/`cat` unreachable with `0/200 filesystem replies`; the ring 3 probe's calls not landing; the shell hung mid-`help`; and a silent stall after `syscall entry armed` that never prints again. **`make test` itself hits it**, so this is not a soak artifact. | Caught with diagnostics 2026-08-08: **`vfsd` was `Finished` after 98 requests, with 8 senders queued behind it and 0 receivers.** A service exits when its receive is refused — `serve()` has no other way out — so something refused it, and the refusal is now recorded (`syscall::last_recv_refusal`, `ipc::abandoned_recvs`). Registers from a stalled machine put CPU 0 in `ring3_self_test`'s wait with CPUs 1–3 **halted**, so the probe was not runnable. Pre-existing: same rate on `3844ea3`. Rate varies with load, roughly 1 in 12 to 1 in 70. Reproduce with `make soak-shell` or `make soak-boot`. | unassigned |
 
 ### Blockers
 
@@ -692,6 +692,33 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-08 (hunting the filesystem-service bug: not fixed, but no longer invisible)
+
+- **Not fixed.** The root cause is still unknown, and this entry exists so the next attempt starts
+  from what was learned rather than from the beginning.
+- **The soak was boldly testing the wrong machine, and I wrote it that way.** `boot-test.sh` attaches
+  **two** disks — the second is what starts the block driver in its domain, the disk journal and the
+  filesystem service — and my soak attached one. So it booted a machine with none of those and
+  reported forty clean runs while the shell test failed one in twelve. Fixed: the soak now attaches
+  both, with a private copy of the writable disk per concurrent run, and it reproduces the fault.
+- **The hard fact, caught with new diagnostics**: `vfsd` was `Finished` after 98 requests, with
+  **8 senders queued behind it and 0 receivers**. It exited. `serve()` exits when a receive is
+  refused and has no other way out, so something refused it — and until now nothing recorded what.
+- **What now records it**: `syscall::last_recv_refusal()` (which thread, which status),
+  `ipc::abandoned_recvs()`, the endpoint's queue depths, and the service and probe thread states,
+  printed at both the bulk-path and ring 3 failures.
+- **Registers from a stalled machine** (QEMU monitor, KASLR slide subtracted) put CPU 0 in
+  `ring3_self_test`'s wait loop with CPUs 1–3 **halted** — so the probe thread was not runnable at
+  all, rather than running and failing.
+- **It is one fault with several faces.** `ls`/`cat` unreachable; the ring 3 probe's calls not
+  landing; the shell hung mid-`help`; and a silent stall after `syscall entry armed`. Every one is an
+  IPC call that goes unanswered.
+- **`make test` hits it too**, which is worth stating plainly: this is not a soak artifact, and the
+  suite has been intermittently red for this reason for longer than anyone has noticed.
+- **A caution for whoever picks it up**: the rate moves with host load, between about 1 in 12 and 1
+  in 70. Thirty-five clean runs mean very little. Use `make soak-shell`, which has the highest rate,
+  and read the diagnostics rather than the pass count.
 
 ### 2026-08-08 (the shell test is soaked too, and it found a real bug on its first run)
 

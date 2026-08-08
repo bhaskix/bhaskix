@@ -32,6 +32,16 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ISO="$REPO_ROOT/build/bhaskix.iso"
 DISK="$REPO_ROOT/build/initrd.tar"
+# The second disk, and it is not optional.
+#
+# Without it the kernel reports "no second device on the bus; nothing
+# delegated" and simply does not start the block driver in its domain, the disk
+# journal, or the filesystem service -- so a soak that leaves it out is soaking
+# a smaller machine than any other harness here boots, and misses exactly the
+# code most likely to be timing-dependent, because it is the code with the most
+# domains in it. This soak ran forty times clean while the shell test failed one
+# run in twelve, and that was the whole of the difference.
+DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
 
 RUNS="${1:-40}"
 JOBS="${2:-2}"
@@ -51,6 +61,7 @@ fail() { printf '%s  %s\n' "${red}FAIL${plain}" "$1"; }
 MARKER="Nothing left to do at this milestone"
 
 [[ -f "$ISO" ]] || { fail "$ISO not found -- run 'make iso' first"; exit 1; }
+[[ -f "$DOMAIN_DISK" ]] || { fail "$DOMAIN_DISK not found -- run 'make iso' first"; exit 1; }
 
 # Kept when something fails, because the logs are the only evidence a soak
 # produces and a run that deletes them leaves "3 of 40 failed" and nothing to
@@ -63,13 +74,21 @@ trap '[[ $keep -eq 1 ]] || rm -rf "$WORK"' EXIT
 echo "booting $RUNS times, $JOBS at a time, ${TIMEOUT}s each..."
 
 boot() {
-    # Read-only, so concurrent boots share one image instead of fighting over
-    # QEMU's exclusive write lock -- which this suite has already once reported
-    # as a kernel fault.
+    # The first disk read-only, so concurrent boots share one image instead of
+    # fighting over QEMU's exclusive write lock -- which this suite has already
+    # once reported as a kernel fault.
+    #
+    # The second is *written* by the driver in its domain, so each run gets its
+    # own copy. A quarter of a megabyte per concurrent run is a cheaper answer
+    # than either serialising the whole soak or letting two machines write one
+    # disk and reporting the result against the kernel.
+    cp "$DOMAIN_DISK" "$WORK/disk-$1.img"
     timeout "$TIMEOUT" qemu-system-x86_64 \
         -M q35 -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
         -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on" \
+        -drive "file=$WORK/disk-$1.img,format=raw,if=none,id=disk1" \
         -device virtio-blk-pci,drive=disk0 \
+        -device virtio-blk-pci,drive=disk1 \
         -no-reboot -cdrom "$ISO" -boot d -serial "file:$WORK/run-$1.log" \
         -display none > /dev/null 2>&1 &
     local pid=$! start

@@ -772,6 +772,31 @@ fn resolve_for_ipc(index: u64, expected: ObjectKind) -> Result<Resolved, Status>
     outcome.unwrap_or(Err(Status::NoDomain))
 }
 
+/// The last refusal a `Recv` was given, and which thread got it.
+///
+/// Packed as `(thread << 8) | status | 1 << 32`, so zero means "no receive has
+/// ever been refused" without a second flag.
+///
+/// **A service that is refused a receive exits**, because there is nothing left
+/// for it to serve and a loop that spun there would look like a working service
+/// using a whole CPU. That is right, and it means the refusal is the only
+/// evidence of why the service is gone -- and until this existed there was
+/// none. A filesystem service disappearing after ninety-eight requests left
+/// eight callers queued behind it and no record at all of what it was told.
+static RECV_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+fn note_recv_refusal(status: Status) {
+    let thread = u64::from(crate::sched::current_thread_id().unwrap_or(0));
+    RECV_REFUSED.store((1 << 32) | (thread << 8) | status as u64, Ordering::Relaxed);
+}
+
+/// The last refused receive: `(thread, status)`, or `None` if there was none.
+#[must_use]
+pub fn last_recv_refusal() -> Option<(u32, u64)> {
+    let packed = RECV_REFUSED.load(Ordering::Relaxed);
+    (packed != 0).then_some((((packed >> 8) & 0xff_ffff) as u32, packed & 0xff))
+}
+
 /// Maps an IPC failure onto a status code.
 const fn ipc_status(error: crate::ipc::IpcError) -> Status {
     match error {
@@ -1282,7 +1307,10 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         Some(Kind::Recv) => {
             let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Endpoint) {
                 Ok(resolved) => resolved,
-                Err(status) => return Outcome::err(status),
+                Err(status) => {
+                    note_recv_refusal(status);
+                    return Outcome::err(status);
+                }
             };
             let endpoint = crate::ipc::EndpointId::from_u32(resolved.object.id as u32);
             match crate::ipc::recv(endpoint) {

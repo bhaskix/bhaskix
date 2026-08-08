@@ -890,7 +890,15 @@ extern "C" fn ipc_service(_argument: u64) -> ! {
                 };
                 let _ = ipc::reply(caller, answer);
             }
-            Err(_) => sched::exit(),
+            // A service that stops receiving stops for a reason, and the
+            // reason is the whole diagnosis. Recorded before leaving, because
+            // from outside this is indistinguishable from a service that is
+            // merely slow: the caller blocks, the counters stay put, and the
+            // test says "reached a service" without saying what stopped it.
+            Err(error) => {
+                RING3_RECV_ERROR.store(error as u64 + 1, Ordering::Release);
+                sched::exit()
+            }
         }
     }
 }
@@ -1286,6 +1294,10 @@ extern "C" fn ring3_service(_argument: u64) -> ! {
         }
     }
 }
+
+/// Why the ring 3 service stopped receiving, plus one so zero means "it did
+/// not".
+static RING3_RECV_ERROR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Where the ring 3 probe's code and stack live in its address space.
 ///
@@ -2199,6 +2211,36 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
                 "    ring 3         FAILED: {name} (calls {calls}, refused {refused}, rip {rip:#x}, rsp {rsp:#x}, segments {segments:#x})"
             );
             ok = false;
+            // What the service did, and what the endpoint looked like when it
+            // did it. Every one of these failures is a call that went
+            // unanswered, and the three ways that happens -- the service left,
+            // the message was never handed over, the wake found nobody -- are
+            // told apart here and nowhere else.
+            let left = RING3_RECV_ERROR.load(core::sync::atomic::Ordering::Acquire);
+            if left != 0 {
+                println!("      the service stopped receiving: error {}", left - 1);
+            }
+            let (dropped, wake_missed, received, tried, no_caller, empty) = ipc::diagnostics();
+            println!(
+                "      ipc: dropped {dropped}, wake missed {wake_missed}, recv returned \
+                 {received}, reply tried {tried}, no caller {no_caller}, empty {empty}"
+            );
+            match syscall::last_recv_refusal() {
+                Some((thread, status)) => {
+                    println!("      the last refused receive was thread {thread}, status {status}");
+                }
+                None => println!("      no receive has been refused"),
+            }
+            // Where the two threads actually are. A probe that is `Blocked` is
+            // waiting for an answer; one that is `Finished` gave up or was
+            // stopped; and a service that is `Finished` is a service that will
+            // never answer anybody again. Those are three different bugs and
+            // they look identical in the counters.
+            sched::for_each(|cpu, id, name, state, runs, _migrations, _class| {
+                if matches!(name, "ring3" | "r3-svc") {
+                    println!("      cpu {cpu} thread {id} ({name}) {state:?}, {runs} runs");
+                }
+            });
         }
     }
 
@@ -4981,6 +5023,34 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
              refusal {refused}, shared {shared_cycles} cycles against {message_cycles} \
              by message"
         );
+        // What the service is doing, at the moment it stopped answering.
+        //
+        // The failure that made this necessary looks the same from outside
+        // whatever caused it: the client blocks in `call` and the numbers stay
+        // at their initial values. Whether the service *exited*, is still
+        // waiting on its endpoint, or is queued behind something is three
+        // different bugs, and the counts below tell them apart.
+        match syscall::last_recv_refusal() {
+            Some((thread, status)) => {
+                println!("      the last refused receive was thread {thread}, status {status}")
+            }
+            None => println!("      no receive has been refused"),
+        }
+        println!(
+            "      {} receives gave up on a gone endpoint",
+            ipc::abandoned_recvs()
+        );
+        match ipc::queued(filesystem) {
+            Some((senders, receivers)) => println!(
+                "      the endpoint has {senders} senders and {receivers} receivers queued"
+            ),
+            None => println!("      the endpoint is gone"),
+        }
+        sched::for_each(|cpu, id, name, state, runs, _migrations, _class| {
+            if name.contains("vfs") || name.contains("bulk") {
+                println!("      cpu {cpu} thread {id} ({name}) {state:?}, {runs} runs");
+            }
+        });
     }
     ok
 }

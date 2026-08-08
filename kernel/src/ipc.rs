@@ -87,6 +87,19 @@ static RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Calls to [`reply`] that were attempted, whatever came of them.
 static REPLY_TRIED: AtomicU64 = AtomicU64::new(0);
 
+/// Receives that gave up because what they were waiting on had gone.
+///
+/// Counted apart from the other refusals because it is the one a *service*
+/// cannot survive: `serve` exits when a receive is refused, so one of these
+/// ends a service permanently and every later caller queues behind nothing.
+static ABANDONED_RECVS: AtomicU64 = AtomicU64::new(0);
+
+/// How many receives gave up on an endpoint that had gone.
+#[must_use]
+pub fn abandoned_recvs() -> u64 {
+    ABANDONED_RECVS.load(Ordering::Relaxed)
+}
+
 /// Replies whose caller was no longer waiting to receive one.
 static REPLY_NO_CALLER: AtomicU64 = AtomicU64::new(0);
 
@@ -543,6 +556,7 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
                 // that has gone.
                 sched::Delivery::Abandoned | sched::Delivery::Revoked => {
                     cancel(id, me);
+                    ABANDONED_RECVS.fetch_add(1, Ordering::Relaxed);
                     return Err(IpcError::NoSuchEndpoint);
                 }
                 sched::Delivery::Blocked => {
