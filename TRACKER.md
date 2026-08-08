@@ -620,7 +620,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | Defect | Evidence | Owner |
 |---|---|---|
 | **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. Reproduce with `make soak-shell`. | unassigned |
-| **A boot sometimes stalls before any service starts.** The log ends after `syscall entry armed` and never prints again — earlier than the console or filesystem domains exist, so it is not the service fault fixed on 2026-08-08. | Seen 2026-08-08, 1 of 72 soak runs (`b3/run-12`). Reproduce with `make soak-shell` or `make soak-boot`. | unassigned |
+| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. Reproduce with repeated boots. | unassigned |
 
 ### Blockers
 
@@ -693,6 +693,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-08 (a bring-up stall that says nothing now says what it was doing)
+
+About one boot in seventy stops during bring-up and never prints again. Nothing in the tree could
+report it, because every self-test bounds its own wait and reports its own failure — so a boot that
+hangs has hung *below* the place that would notice, inside a blocking call with no deadline. And the
+reporter cannot be another step in the bring-up sequence, because the bring-up sequence is what
+stopped.
+
+- **A watchdog thread asleep on the timer**, which is the one thing that still runs: the timer
+  interrupt is independent of every lock and rendezvous in bring-up, and the idle backstop keeps
+  CPUs alive to service it. If bring-up has not finished in 45 seconds it prints every thread — cpu,
+  name, class, state, runs — and the IPC counters, including `dropped` messages and missing wakes,
+  which until now were printed only on a failure path a hang never reaches.
+- **It does not repair anything.** A watchdog that nudged the machine back into life would turn a
+  reproducible fault into an unreproducible one, and the fault is the thing worth having.
+- **Two placements were wrong, and each was found by a stall it failed to report.** Pinned to CPU 0
+  it sat behind the boot thread: a thread spinning on a lock, or halted with interrupts off, never
+  reschedules, so the watchdog never ran. It could only report the stalls that leave its own CPU
+  free, which are the ones that need it least. Now on `online_count() - 1`. Spawned just before the
+  IPC test, it could not see anything that stalled earlier; now armed straight after the tickless
+  measurement.
+- **Where it cannot be armed, and why.** Not before `sched::start_all` — a thread spawned into a
+  stopped scheduler is runnable and never chosen. Not before `tickless_self_test` — that test
+  measures how few interrupts idle CPUs take, and a watchdog asleep on a timer is an outstanding
+  deadline on its CPU, so it would be grading the watchdog rather than the kernel. Verified that it
+  is not: `1 ticks on 3 idle cpus`, unchanged.
+- **Verified in both directions**, because an instrument that cannot be seen to fire is worth
+  nothing: shortened to 3 seconds it prints the full dump mid-bring-up and the boot carries on; at
+  45 seconds a healthy boot never triggers it.
+
+**Two stall points, not one, and the second is out of reach.** `demand paging` stalls *before*
+`sched::start_all`, so no watchdog built as a thread can ever see it — recorded in §3 rather than
+papered over. `syscall entry armed` stalls after, and is what this covers.
 
 ### 2026-08-08 (three more ways a service could be killed, one of them a slow leak)
 

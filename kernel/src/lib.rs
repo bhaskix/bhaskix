@@ -373,6 +373,46 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("    tickless       FAILED");
     }
+    // Armed as early as it safely can be, which is not as early as one would
+    // like. Two things bound it:
+    //
+    // * **Not before `sched::start_all`.** It is a thread, and a thread spawned
+    //   into a stopped scheduler is runnable and never chosen. Everything above
+    //   that line -- including `demand paging`, where one stall has been seen
+    //   -- is therefore outside the reach of any watchdog built this way. That
+    //   is a real gap and catching it needs a mechanism that does not depend on
+    //   the scheduler at all.
+    // * **Not before `tickless_self_test`.** That test measures how few
+    //   interrupts idle CPUs take, and a watchdog asleep on a timer is an
+    //   outstanding deadline on whichever CPU it sits on. It would be grading
+    //   this watchdog rather than the kernel.
+    //
+    // So: after the tickless measurement, before the first test that blocks on
+    // a rendezvous with no deadline of its own.
+    if bhaskix_arch::percpu::online_count() > 1 {
+        // Not on the CPU running bring-up, and that is the whole point.
+        //
+        // The first version pinned it to CPU 0 beside the boot thread, and the
+        // first stall it met went unreported: a boot thread spinning on a lock
+        // -- or halted with interrupts off -- never reschedules, so a watchdog
+        // pinned behind it never runs. It could only report the stalls that
+        // left its own CPU free, which are the ones that need it least.
+        let watcher_cpu = bhaskix_arch::percpu::online_count() - 1;
+        let options = sched::SpawnOptions::new().pinned();
+        if sched::spawn_on_with(
+            watcher_cpu,
+            "watchdog",
+            bringup_watchdog,
+            0,
+            handoff.hhdm_base.as_u64(),
+            options,
+        )
+        .is_err()
+        {
+            println!("    watchdog       FAILED to spawn; a bring-up stall will be silent");
+        }
+    }
+
     if !initrd_self_test(handoff) {
         println!("    initrd         FAILED");
     }
@@ -559,6 +599,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !input_ready {
         // Say so rather than spawning a shell that would block for ever on a
         // console nothing can write to.
+        BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
         println!("  M6 in progress. Nothing left to do at this milestone.");
         println!("  no console input on this machine, so no shell.");
     } else if kernel_shell {
@@ -903,6 +944,80 @@ extern "C" fn ipc_service(_argument: u64) -> ! {
 
 /// Checks that two threads can rendezvous, exchange a message, and that the
 /// service can tell its callers apart without asking them.
+/// Whether bring-up reached its end.
+static BRINGUP_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// How long bring-up gets before the watchdog decides it is not coming back.
+///
+/// Bring-up takes about eight seconds on an idle emulated machine and rather
+/// longer on a loaded one, so this is generous: what it has to separate is
+/// "slow" from "stopped", and stopped is for ever.
+const BRINGUP_WATCHDOG_MICROS: u64 = 45_000_000;
+
+/// Says where bring-up got to, if it stops getting anywhere.
+///
+/// # Why a thread on a timer, and not a check somewhere
+///
+/// About one boot in seventy stops during bring-up and never prints again. The
+/// machine is not spinning: every CPU is in `hlt` with interrupts enabled, and
+/// the registers say so. Something was waiting for a wake that never arrived,
+/// and every other thread eventually piled up behind it.
+///
+/// Nothing already in the tree can report that. Each self-test bounds its own
+/// wait and reports its own failure, so a test that hangs has hung *below* the
+/// place that would notice -- inside a blocking call that has no deadline,
+/// which is most of them. And the reporter cannot be another check in the
+/// bring-up sequence, because the bring-up sequence is the thing that stopped.
+///
+/// A thread asleep on a timer is the one thing that still runs. The timer
+/// interrupt is independent of every lock and every rendezvous here, and the
+/// idle backstop keeps the CPUs alive to service it, so this wakes whatever
+/// else is stuck.
+///
+/// It prints and stops. It does not try to repair anything: a watchdog that
+/// nudged the machine back into life would turn a reproducible fault into an
+/// unreproducible one, and the fault is the thing worth having.
+extern "C" fn bringup_watchdog(_: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    time::sleep_micros(BRINGUP_WATCHDOG_MICROS);
+    if BRINGUP_DONE.load(Ordering::Acquire) {
+        sched::exit()
+    }
+
+    println!();
+    println!("==================================================================");
+    println!(
+        "  BRING-UP STOPPED. {} seconds have passed and it has not finished.",
+        BRINGUP_WATCHDOG_MICROS / 1_000_000
+    );
+    println!("  The last line above is the last thing that completed. Every thread");
+    println!("  on this machine, and what it was doing:");
+
+    // Printed from the walk, which holds a runqueue lock while it runs this.
+    // Console is rank 16 and the runqueue is 10, so printing here is in
+    // declared order -- but nothing that takes a runqueue lock may be asked
+    // anything from inside it, which is why this only prints what it is given.
+    sched::for_each(|cpu, id, name, state, runs, _migrations, class| {
+        println!("    cpu {cpu}  thread {id}  {name}  {class}  {state:?}  {runs} runs");
+    });
+
+    let (dropped, wake_missed, received, replies_tried, no_caller, empty) = ipc::diagnostics();
+    let (delivered, replied) = ipc::statistics();
+    println!("  ipc: {delivered} delivered, {replied} replied, {received} receives returned,");
+    println!(
+        "       {replies_tried} replies tried, {no_caller} found no caller, {empty} empty checks."
+    );
+    println!("  {dropped} messages were DROPPED because a mailbox was already full, and");
+    println!("  {wake_missed} wakes went missing. Either is enough to strand a caller for ever.");
+    println!(
+        "  {} deferred wakes were lost.",
+        sched::deferred_wakes_lost()
+    );
+    println!("==================================================================");
+    sched::exit()
+}
+
 fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
     use core::sync::atomic::Ordering;
 
@@ -4886,6 +5001,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         ipc::stranded_cleared()
     );
 
+    BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
     println!("  M6 in progress. Nothing left to do at this milestone.");
 
     let options = sched::SpawnOptions::new()
