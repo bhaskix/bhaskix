@@ -18,22 +18,101 @@ and bootstrap simplicity, and can be moved into isolated userspace domains witho
 Containers and virtual machines are not separate subsystems; both are *domains*, differing only in
 whether their instruction stream traps to a syscall or to a VMEXIT.
 
+### The same paragraph, as a picture
+
+Every diagram in these documents is text — Mermaid where a graph carries the meaning, ASCII where a
+layout does. Not a stylistic preference: a diagram that is text diffs in a pull request, greps
+alongside the code, and fails review when it stops matching the prose beside it. A checked-in PNG
+rots silently, and the first person to notice is the one it misled.
+
+```mermaid
+flowchart TB
+    subgraph R3["ring 3 — unprivileged, one domain each"]
+        direction LR
+        SH["shell<br/><i>console ep, vfs ep</i>"]
+        CON["consoled<br/><i>Console cap</i>"]
+        VFS["vfsd<br/><i>vfs ep, blk ep</i>"]
+        BLK["blkd<br/><i>MMIO, IRQ, DMA window</i>"]
+    end
+
+    subgraph NUC["ring 0 — the nucleus, ~15k lines and that is a budget"]
+        direction LR
+        CAP["capabilities"]
+        IPC["IPC"]
+        THR["threads<br/>scheduling"]
+        MEM["address spaces<br/>physical memory"]
+        IRQ["interrupts<br/>and time"]
+    end
+
+    HW["hardware — CPUs, APIC, virtio-blk, serial"]
+
+    SH  -- "Call" --> IPC
+    CON -- "Invoke" --> IPC
+    VFS -- "Call / Recv" --> IPC
+    BLK -- "Invoke / Recv" --> IPC
+
+    IPC --- CAP
+    CAP --- THR
+    THR --- MEM
+    MEM --- IRQ
+
+    NUC --> HW
+    BLK -. "DMA, only inside its window" .-> HW
+```
+
+The picture makes two claims, and both are checkable in the tree rather than taken on trust:
+
+- **Nothing crosses the ring boundary except a capability invocation.** There is no numbered syscall
+  table, because a call naming *what to do* without naming *what to do it to* is ambient authority
+  and discards the thesis on the first syscall (§3).
+- **Each ring 3 box lists everything it can reach.** `consoled` holds a `Console` capability, so a
+  console service talked into misbehaving can put characters and take bytes. That is its authority
+  in full, not an abbreviation of it.
+
+The dashed arrow is the honest one. A driver's DMA reaches memory without asking the nucleus, so on
+a machine with no IOMMU it reaches *all* of it — [memory.md](memory.md) §5 states the consequence
+rather than the intent, and the boot log prints `NO IOMMU` on such a machine instead of staying
+quiet about it.
+
 ---
 
 ## 1. Boot architecture
 
+```mermaid
+flowchart TB
+    FW["UEFI firmware<br/><i>verifies the signature — see security.md</i>"]
+    LIM["Limine<br/><i>loads the ELF, enters long mode, builds page tables,<br/>collects memory map / framebuffer / RSDP / SMBIOS</i>"]
+    SHIM["boot/shim<br/><i>the only code allowed to name Limine</i>"]
+    HO["bhaskix_boot::Handoff<br/><b>our struct, versioned, not the bootloader's</b>"]
+    MAIN["kernel::main()"]
+
+    FW --> LIM --> SHIM --> HO --> MAIN
+
+    subgraph BRINGUP["what main() does, in the order the serial log prints it"]
+        direction TB
+        S1["CPU: gdt, idt, features, local apic, interrupts, timer"]
+        S2["memory: frame database, buddy pmm, heap,<br/>address spaces, kernel stack + guard page, demand paging"]
+        S3["SMP: cpus online, tlb shootdown"]
+        S4["scheduler: threads, migration, wait queues,<br/>classes, rt latency, tickless"]
+        S5["domains, memory objects, capabilities"]
+        S6["storage: initrd, virtio, dma"]
+        S7["ring 3: syscall entry armed, IPC, services, shell"]
+        S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7
+    end
+
+    MAIN --> BRINGUP
+    S7 --> DONE["milestone reached — the boot test greps for this line"]
 ```
-UEFI firmware
-   │  (verifies signature — see security.md)
-   ▼
-Limine  ──── loads ELF, enters long mode, builds page tables,
-   │         collects memory map / framebuffer / RSDP / SMBIOS
-   ▼
-bhaskix_boot::Handoff   ◄── OUR struct, not Limine's
-   │
-   ▼
-kernel::main()
-```
+
+Every stage above prints a line and, where it can, a *measurement* rather than an assertion: how
+many frames the reserve holds, how many ticks three idle CPUs took, which placement each service
+got. A stage that only ever prints `ok` is a stage that cannot fail informatively, and this kernel
+has been bitten by exactly that — see the M9-25 entry in `TRACKER.md`, where a line printed
+unconditionally let a boot gate pass while the check under it failed.
+
+Two stall points are known and recorded as open defects in `TRACKER.md` §3: one after `syscall entry
+armed`, one earlier at `demand paging`. The second is out of reach of the bring-up watchdog, because
+a watchdog that is a thread cannot report a stall that happens before the scheduler starts.
 
 ### The handoff boundary
 
@@ -183,6 +262,29 @@ Capability {
 }
 ```
 
+Authority is a tree, and revocation is what the tree is for:
+
+```mermaid
+flowchart LR
+    ROOT["root cap<br/>rw + grant + derive<br/>badge 0"]
+    A["vfsd's copy<br/>rw + grant<br/>badge 7"]
+    B["shell's copy<br/>r only<br/>badge 12"]
+    C["a page lent to shell<br/>r only<br/>badge 12"]
+    X["what shell cannot make:<br/>rw from an r parent"]
+
+    ROOT -- derive --> A
+    A -- derive --> B
+    B -- derive --> C
+    B -. refused, monotone .-> X
+
+    classDef gone stroke-dasharray: 4 3
+    class X gone
+```
+
+Revoke `A` and `B` and `C` go with it, before the syscall returns — not on a sweep, not eventually.
+That is why a domain's death cannot leave authority behind: ending a domain revokes its root, and
+everything derived from it stops being nameable in the same instant.
+
 Properties we commit to:
 
 - **Derivation is monotone.** A derived capability never has rights the parent lacked.
@@ -190,6 +292,47 @@ Properties we commit to:
   it, before the revoke syscall returns.
 - **Badges are set by the granter.** A service can therefore identify its callers without trusting
   them, which is what makes RBAC implementable in userspace.
+
+### One request, end to end
+
+`cat /bin/probe` at the shell, drawn in full. Four domains, three capability invocations, one DMA,
+and no ambient authority anywhere in it. Each `Call` names a capability the caller was *given*; a
+slot it was not given is refused by the nucleus before the service on the other side is even woken.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SH as shell (ring 3)
+    participant K as nucleus (ring 0)
+    participant VF as vfsd (ring 3)
+    participant BL as blkd (ring 3)
+    participant HW as virtio-blk
+
+    SH->>K: Call(vfs_ep, "read /bin/probe")
+    Note over K: resolves the capability,<br/>stamps the badge, blocks the shell
+    K->>VF: Recv returns — badge says which caller
+    VF->>K: Call(blk_ep, "read sectors 40..48")
+    K->>BL: Recv returns
+    BL->>HW: descriptor into its DMA window
+    HW-->>BL: IRQ → notification (one word, one waiter)
+    BL->>K: Reply(bytes in shared memory)
+    K-->>VF: reply capability consumed
+    VF->>K: Reply(file contents)
+    K-->>SH: Call returns
+```
+
+Three details worth pulling out, because each is a design commitment rather than an implementation
+accident:
+
+- **The badge at step 3.** `vfsd` learns *which* caller woke it without trusting anything the caller
+  said, because the granter set the badge and the holder cannot forge it. That is what makes RBAC
+  implementable in userspace instead of in the nucleus.
+- **The reply capability is one-shot.** It is created by `Call` and consumed by `Reply`, so a server
+  cannot answer twice, and cannot answer a thread it never heard from — a boot test asserts exactly
+  that.
+- **Bulk data never travels in the message.** A message is four registers; the file contents move as
+  a capability to shared memory ([RFC 0009](rfc/0009-shared-memory.md)), which the caller may map
+  only where it was permitted to.
 
 ### The interface a domain sees
 
@@ -235,6 +378,48 @@ Domain {
 }
 ```
 
+What is actually in one today, and what still is not. The struct above is the design; this is
+`kernel/src/domain.rs`, which is the thing that runs:
+
+```mermaid
+flowchart TB
+    subgraph DOM["Domain — the unit of isolation, accounting and scheduling"]
+        direction TB
+
+        subgraph ID["identity"]
+            I1["id + generation<br/><i>a reused slot is not the domain before it</i>"]
+            I2["name, 16 bytes inline, truncated not refused"]
+            I3["parent + parent_generation<br/>children"]
+            I4["ended: Option&lt;Ending&gt;<br/><i>a dead domain keeps its slot until reaped</i>"]
+        end
+
+        subgraph AUTH["authority"]
+            CS["cspace: CSpace<br/><b>what it may touch</b>"]
+        end
+
+        subgraph ACCT["accounting — ResourceEnvelope"]
+            E1["cpu_shares — divided among its threads,<br/>so the total is constant however many it spawns"]
+            E2["memory_frames — a hard cap; allocation past it fails"]
+            E3["max_child_domains — zero by default"]
+            E4["io_weight — recorded, nothing enforces it yet"]
+            E5["latency_class"]
+        end
+
+        NOT["notify: signal this notification when the domain ends"]
+    end
+
+    MISSING["not yet: address space per domain,<br/>telemetry channel, threads owned rather than counted"]
+
+    DOM -.- MISSING
+    classDef gap stroke-dasharray: 5 4
+    class MISSING,E4 gap
+```
+
+The dashed boxes are the honest part. `io_weight` is recorded and enforced by nothing, because there
+is no I/O scheduler to enforce it against; threads are *counted* rather than owned, so destroying a
+domain does not yet stop them. Both are stated here and in `TRACKER.md` rather than left for a
+reader to discover by trying.
+
 The only difference between a container and a virtual machine:
 
 |  | Container domain | VM domain |
@@ -243,6 +428,43 @@ The only difference between a container and a virtual machine:
 | Entry to kernel | `SYSCALL` → syscall dispatch | `VMEXIT` → exit handler |
 | Services seen | Host VFS / netstack via IPC | Virtual devices via virtio, backed by the same services |
 | Scheduling | Threads on host runqueues | vCPU threads on host runqueues |
+
+Drawn, the claim is that only the shaded boxes differ. Everything below the line is one code path
+serving both:
+
+```mermaid
+flowchart TB
+    subgraph C["container domain"]
+        direction TB
+        CT["threads"] --> CE["SYSCALL"]
+        CA["4-level page table"]
+    end
+
+    subgraph V["VM domain"]
+        direction TB
+        VT["vCPU threads"] --> VE["VMEXIT"]
+        VA["EPT / NPT"]
+    end
+
+    CE --> D{"entry dispatch"}
+    VE --> D
+    D --> CAPS["capability check — holds it, or the call fails"]
+    CAPS --> SVC["services: VFS, block, console, netstack"]
+
+    CA --- MM["one memory manager"]
+    VA --- MM
+    CT --- SC["one scheduler, one set of runqueues"]
+    VT --- SC
+    MM --- ENV["one ResourceEnvelope: cpu share, memory cap, io weight"]
+    SC --- ENV
+
+    classDef differs fill:#00000000,stroke-width:3px,stroke-dasharray: 5 4
+    class CE,VE,CA,VA differs
+```
+
+There is no second hypervisor codebase to keep in step with the first, and a container escape and a
+VM escape arrive at the same place: a domain holding no capabilities. The dashed boxes are the
+entire difference — a page table or an EPT, a `SYSCALL` or a `VMEXIT`.
 
 This is the concrete meaning of "virtualization as a first-class capability". The scheduler,
 accounting, memory reclaim, and telemetry paths do not know or care which kind of domain they are
