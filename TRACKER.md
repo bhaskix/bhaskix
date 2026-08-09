@@ -620,7 +620,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | Defect | Evidence | Owner |
 |---|---|---|
 | **The shell gives up on transient congestion.** `Status::Congested` (8) means the endpoint queue was full at that instant — recoverable. `serve()` now retries it and the queue-entry leak that made it permanent is fixed, but the shell's `ls` and `cat` still print `refused, status 8` and stop, and `write()` still drops output silently and says so in a comment. | Seen 2026-08-08 in 2 of 72 soak runs, once the shell stopped discarding the status. A later 10-run `soak-shell` the same day was clean, which at a rate near 3% is the expected outcome and says nothing either way. **A 50-run soak on an idle host (2026-08-09, ~97% idle, slowest run 20s) was also clean, and that one could have spoken**: at 3% it should have turned up one or two failures, and a clean fifty happens about a fifth of the time. It leans toward the rate being lower than 3% without settling anything — the same night's *boot* soak reproduced its own defect twice in 200 on the same host, so the machine was capable of failing. Still open: telling "fixed" from "rarer than we thought" needs runs in the hundreds. Reproduce with `make soak-shell SOAK_SHELL_RUNS=<n>`. | unassigned |
-| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. **Caught, twice, on 2026-08-08**: 2 of 200 boots, one at a time on an idle host (mean 79% idle, boots otherwise a steady 16–17s), so this is the kernel and not the contention that spoiled an earlier run. **The stall has a signature now.** Both dumps are the same shape: last line `syscall entry armed`; **one CPU contributes no threads to the walk at all** and its runqueue reads `0 of 20 samples` — held continuously for two seconds, so not a thread waiting for a wake, which would leave the lock free. Both were caught by the watchdog firing on its own deadline rather than a shortened one. **It is not IPC**: `dropped`, `wake_missed` and lost deferred wakes were all zero in both. **It is not a fixed CPU**: cpu 1 in one, cpu 0 in the other — and the holder need not be the CPU named, since `spawn_on` and the wake paths block on a remote runqueue lock. **Since 2026-08-09 the lock records its taker**, so the next capture will name the holder outright rather than leaving it to be ruled out; the two dumps below predate that and do not. One dump is reproduced in full in §7 under the 2026-08-08 entry that caught it. Reproduce with `make soak SOAK_RUNS=200 SOAK_JOBS=1` on an idle machine, keeping `SOAK_LOG_DIR`. | unassigned |
+| **A boot sometimes stalls before any service starts, at one of two points.** After `syscall entry armed`, or earlier still at `demand paging`. Not the service fault fixed on 2026-08-08 — both are earlier than the console or filesystem domains exist. | Seen 2026-08-08 at roughly 1 boot in 70. The bring-up watchdog now dumps every thread and the IPC counters for the `syscall entry armed` case, and reports for every CPU how many of 20 samples found its runqueue readable — so a held runqueue is stated rather than showing up as a CPU with no threads listed. That says a runqueue is stuck, **not which CPU is at fault**: `spawn_on` and the wake paths block on a remote runqueue lock, so the holder need not be the CPU reported. **The `demand paging` case is outside its reach**: it stalls before `sched::start_all`, and a watchdog that is a thread cannot report a stall that precedes the scheduler — catching it needs a timer-interrupt or NMI mechanism that does not exist yet. **Caught, twice, on 2026-08-08**: 2 of 200 boots, one at a time on an idle host (mean 79% idle, boots otherwise a steady 16–17s), so this is the kernel and not the contention that spoiled an earlier run. **The stall has a signature now.** Both dumps are the same shape: last line `syscall entry armed`; **one CPU contributes no threads to the walk at all** and its runqueue reads `0 of 20 samples` — held continuously for two seconds, so not a thread waiting for a wake, which would leave the lock free. Both were caught by the watchdog firing on its own deadline rather than a shortened one. **It is not IPC**: `dropped`, `wake_missed` and lost deferred wakes were all zero in both. **It is not a fixed CPU**: cpu 1 in one, cpu 0 in the other — and the holder need not be the CPU named, since `spawn_on` and the wake paths block on a remote runqueue lock. **Since 2026-08-09 the lock records its taker**, and the first two captures under it (300 boots, 2 failures) both name **cpu 2 holding cpu 0's runqueue while cpu 2 itself reads healthy** — so the CPU that goes silent is the victim, not the culprit. Running total **4 stalls in 500 boots, about 1 in 125.** The mechanism is narrowed to the only two paths that take a remote runqueue lock, `wake_with` and `try_steal`, and to one unproven asymmetry: a lock taken by `try_lock` does not join the held set, so its holder is invisible to the check in `preempt` that keeps lock holders on their CPU. See §7. The two dumps below predate the owner field and do not name a holder. One dump is reproduced in full in §7 under the 2026-08-08 entry that caught it. Reproduce with `make soak SOAK_RUNS=200 SOAK_JOBS=1` on an idle machine, keeping `SOAK_LOG_DIR`. | unassigned |
 
 ### Blockers
 
@@ -693,6 +693,45 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-09 (the owner field earned itself: the dump now points at a CPU that looks healthy)
+
+300 boots, two at a time, on an idle host (mean 63%, min 52%): **2 did not finish bring-up**, and both
+were caught with the lock's owner recorded for the first time. With yesterday's 200-boot run that is
+**4 stalls in 500 boots**, converging on about 1 in 125 — rarer than the original 1-in-70 estimate.
+
+**Both dumps name cpu 2 as the holder of cpu 0's runqueue, and cpu 2 looks perfectly well.** Its own
+runqueue reads 20 of 20 readable and its threads are listed normally; the CPU that goes silent is cpu
+0, the victim. Every dump before this pointed at cpu 0 and said in as many words that it could not
+tell you who held the lock — so the search would have started at the one CPU that is innocent. That
+is the entire value of the field, collected on its first real outing.
+
+The two captures agree in every particular: same holder, same victim, `ipc-cli-a` **Running** on cpu
+2, `ipc-svc` **Finished** on cpu 1, and every IPC counter zero.
+
+**Where the lock comes from is now known; why it is never released is not.** Only two paths take a
+*remote* runqueue lock, and reading both narrows the question:
+
+- **`wake_with`** takes a blocking `lock()` on each runqueue in turn, **iterating from cpu 0 upward**.
+  Any thread anywhere waking anyone touches cpu 0's lock first. This is the likeliest reason the
+  victim is always cpu 0, and it is an artefact of iteration order rather than anything about cpu 0.
+- **`try_steal`**, from `preempt`, holds `mine` *and* `theirs` at once — apparently against this file's
+  own "one queue lock at a time" rule, but not so: the second is a `try_lock`, which can never be an
+  edge in a deadlock cycle, and `preempt` masks interrupts across the whole section.
+
+**Checked and cleared**, so nobody reads them again: `preempt` refuses to deschedule a thread holding
+a lock; `block_unless`'s two closures in `notify.rs` touch only atomics as its contract demands; and
+`mark_domain_dying` really does take one queue at a time and wake outside every lock.
+
+**The asymmetry worth pursuing, and it is not yet a finding.** `try_lock` deliberately does not join
+the held set — there is a test asserting exactly that — while `preempt` skips only when that set is
+non-empty. **A thread holding a runqueue lock acquired by `try_lock` is therefore invisible to the
+protection that keeps lock holders on the CPU.** Inside `preempt` the interrupt mask covers it. An
+unmaskable event in that window is covered by neither.
+
+**Two samples are not a pattern.** They cannot distinguish "cpu 2" from "whichever CPU runs
+`ipc-cli-a`", and the victim's identity has the mundane explanation above. Nothing here is a fix, and
+the defect stays open.
 
 ### 2026-08-09 (the lock records who took it, so the dump stops naming the victim)
 
