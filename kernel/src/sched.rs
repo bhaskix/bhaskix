@@ -1081,6 +1081,38 @@ pub fn runqueue_readable(cpu: usize) -> bool {
     QUEUES[cpu].try_lock().is_some()
 }
 
+/// Online CPUs, clamped so it can index [`QUEUES`].
+fn online_cpus() -> usize {
+    (percpu::online_count() as usize).min(MAX_CPUS)
+}
+
+/// Times a thread was descheduled while holding another CPU's runqueue lock.
+///
+/// Instrumentation for the bring-up stall. **Any non-zero value is a defect**:
+/// the CPU whose lock it was cannot schedule anything until the descheduled
+/// thread runs again and releases it, and a thread part-way through `exit` may
+/// never be chosen again at all.
+static PREEMPTED_HOLDING_REMOTE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// The runqueue stranded by the most recent such switch.
+static LAST_REMOTE_HELD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The CPU that was holding it.
+static LAST_REMOTE_HOLDER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `(count, stranded runqueue, holder)` for switches made while holding a
+/// remote runqueue lock. The last two are `None` until the first one happens.
+#[must_use]
+pub fn remote_hold_preemptions() -> (u64, Option<u32>, Option<u32>) {
+    let none = |v: u32| (v != u32::MAX).then_some(v);
+    (
+        PREEMPTED_HOLDING_REMOTE.load(Ordering::Relaxed),
+        none(LAST_REMOTE_HELD.load(Ordering::Relaxed)),
+        none(LAST_REMOTE_HOLDER.load(Ordering::Relaxed)),
+    )
+}
+
 /// The CPU holding `cpu`'s runqueue lock, or `None` if it is free.
 ///
 /// The question [`runqueue_readable`] could not answer. That one reports a
@@ -1616,7 +1648,24 @@ pub fn preempt() {
     //
     // Skipping a preemption is harmless: this runs again on the next tick, and
     // critical sections here are bounded and never sleep.
-    if crate::sync::held_mask() != 0 {
+    // **Both sets, and the second one cost a stall to find.** `held_mask`
+    // covers blocking acquisitions only: `try_lock` stays out of the ranked set
+    // because a non-blocking acquisition can never be an edge in a deadlock
+    // cycle. That is sound, and it is about *ordering*. It was also being read
+    // here as "holds nothing", which does not follow -- a `try_lock` holder
+    // holds the lock, and descheduling one strands every CPU that wants it.
+    //
+    // `exit` reaches `domain_of_raw` and `threads_in_domain_except` with
+    // interrupts enabled, and both `try_lock` every runqueue there is. A tick
+    // landing in that scan could take the exiting thread off its CPU still
+    // holding a *remote* runqueue, which nothing would then release.
+    //
+    // **This was expected to end the bring-up stall and did not**: 3 boots in
+    // 500 with it against 4 in 500 without, and one of those arrived with the
+    // very signature it should have made impossible. Kept because descheduling
+    // a lock holder is wrong regardless, and left uncommented-out so nobody
+    // rediscovers the unsoundness and assumes it was the fault all along.
+    if crate::sync::held_mask() != 0 || crate::sync::holds_unranked() {
         return;
     }
 
@@ -1719,6 +1768,34 @@ pub fn preempt() {
             install_kernel_stack(cpu, stack);
         }
         queue.current = next;
+
+        // INSTRUMENTATION, and it counts rather than prevents.
+        //
+        // Testing whether an exiting thread can be switched out while holding
+        // *another* CPU's runqueue lock. `held_mask` cannot answer it: a
+        // `try_lock` deliberately never joins the held set, so the check above
+        // that keeps lock holders on their CPU cannot see one, and
+        // `domain_of_raw` and `threads_in_domain_except` -- both reached from
+        // `exit`, with interrupts enabled -- `try_lock` every runqueue there
+        // is, remote ones included.
+        //
+        // The owner field answers it directly: if any queue but this one
+        // records this CPU, the thread about to be descheduled is holding it.
+        //
+        // Deliberately does not skip the switch. A fix that made a stall of
+        // one boot in 125 stop reproducing would be indistinguishable from
+        // luck; the count says whether the window is entered at all, and how
+        // often, before anything is changed to close it.
+        {
+            let here = cpu as u32;
+            for (other, queue) in QUEUES.iter().enumerate().take(online_cpus()) {
+                if other != cpu && queue.owner() == Some(here) {
+                    PREEMPTED_HOLDING_REMOTE.fetch_add(1, Ordering::Relaxed);
+                    LAST_REMOTE_HELD.store(other as u32, Ordering::Relaxed);
+                    LAST_REMOTE_HOLDER.store(here, Ordering::Relaxed);
+                }
+            }
+        }
 
         // Held locks travel with the thread, not the CPU. Saved for the
         // outgoing thread and installed for the incoming one, both under this

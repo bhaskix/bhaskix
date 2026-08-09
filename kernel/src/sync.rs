@@ -14,7 +14,7 @@
 //! benign. Nearly every acquisition order in this kernel is currently safe by
 //! accident of which code paths overlap; ranking makes it safe on purpose.
 //!
-//! ## Why `try_lock` is exempt
+//! ## Why `try_lock` is exempt from *ranking*
 //!
 //! [`SpinLock::try_lock`] neither checks the order nor records the
 //! acquisition, and that exemption is load-bearing rather than a convenience.
@@ -28,6 +28,41 @@
 //! is precisely why [`crate::sched::preempt`] and the page-fault handler use
 //! `try_lock` — and it is why ranking them would produce a flood of reports
 //! about orders that cannot deadlock.
+//!
+//! ## And why it is *not* exempt from holding
+//!
+//! The paragraph above is about ordering, and for a long time its conclusion
+//! was quietly read as a second one: that a `try_lock` holder is safe to
+//! deschedule. It does not follow, and the difference cost a stall.
+//!
+//! `preempt` refuses to take the CPU from a thread holding a lock, because a
+//! preempted holder can only release by running again. It decided that by
+//! asking whether the ranked set was empty — and a `try_lock` is not in the
+//! ranked set, so its holder looked like a thread holding nothing at all. It
+//! was holding a lock. `sched::exit` reaches two functions that `try_lock`
+//! *every* runqueue with interrupts enabled, so a tick landing in that scan
+//! could carry the exiting thread off its CPU still holding a **remote**
+//! runqueue, which nothing would then release.
+//!
+//! [`holds_unranked`] answers the question the rank set cannot: not *where in
+//! the order* this CPU is, but *whether it is holding anything at all*. Taking
+//! no rank and holding no lock are different claims, and only the first is
+//! true of `try_lock`.
+//!
+//! ## What this did not do
+//!
+//! **It did not fix the bring-up stall, which is why it was written.** The
+//! hypothesis was that the stall *was* this: a soak had one stalled boot
+//! reporting a switch made while holding a remote runqueue, against 54 healthy
+//! boots reporting none. That is a correlation on a single sample, and it did
+//! not survive. With the guard in place 3 boots in 500 stalled, against 4 in
+//! 500 without it — the same rate — and one of them arrived with the identical
+//! signature the guard was supposed to make impossible.
+//!
+//! Kept anyway, because descheduling a lock holder is wrong whether or not it
+//! is the cause of *this* fault. Written down because a rule whose
+//! justification is a bug it did not fix will otherwise be remembered as
+//! having fixed it.
 //!
 //! ## Why a violation reports rather than panics
 //!
@@ -249,6 +284,36 @@ pub fn held_mask() -> u64 {
     slot().load(Ordering::Relaxed)
 }
 
+/// Locks this CPU holds that are *not* in the ranked set — the `try_lock`s.
+///
+/// A count rather than a mask: `try_lock` takes no position in the order, so
+/// there is nothing to record but how many are outstanding, and they nest.
+static UNRANKED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+fn unranked_slot() -> &'static AtomicU32 {
+    let cpu = percpu::cpu_id() as usize;
+    &UNRANKED[if cpu < MAX_CPUS { cpu } else { 0 }]
+}
+
+/// Whether this CPU holds any lock taken with [`SpinLock::try_lock`].
+///
+/// **Exists because the rank exemption was quietly doing a second job it does
+/// not support.** `try_lock` stays out of the ranked set for a sound reason: a
+/// non-blocking acquisition can never be an edge in a deadlock cycle, so
+/// ranking it would report orders that cannot deadlock. `sched::preempt` then
+/// used that same emptiness to decide a thread was safe to deschedule — and
+/// those are different claims. A `try_lock` cannot *deadlock*, but its holder
+/// still holds the lock, and descheduling one strands every CPU waiting on it.
+///
+/// **Not verified by the stall going away, because it did not.** See the
+/// module header: the guard this feeds was written to end the bring-up stall
+/// and did not, at 3 boots in 500 against 4 in 500 without it. It is kept for
+/// the argument above, which stands on its own.
+#[must_use]
+pub fn holds_unranked() -> bool {
+    unranked_slot().load(Ordering::Relaxed) != 0
+}
+
 /// Replaces the held set for this CPU.
 ///
 /// For the context switch: held locks belong to the *thread*, not the
@@ -377,12 +442,17 @@ impl<T> SpinLock<T> {
     ///
     /// Exempt from rank checking, and does not record the acquisition: see the
     /// module header.
+    ///
+    /// **It does count towards [`holds_unranked`]**, which is a different
+    /// question from ranking and was for a long time answered by accident. The
+    /// order it takes is nothing; the lock it holds is real.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         self.locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
             .map(|_| {
                 self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
+                unranked_slot().fetch_add(1, Ordering::Relaxed);
                 SpinLockGuard {
                     lock: self,
                     ranked: false,
@@ -456,6 +526,11 @@ impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         if self.ranked {
             slot().fetch_and(!self.lock.rank.bit(), Ordering::Relaxed);
+        } else {
+            // Decremented on the CPU that runs the drop, which is the CPU that
+            // took it: a `try_lock` holder cannot now be moved, because that is
+            // exactly what this count prevents.
+            unranked_slot().fetch_sub(1, Ordering::Relaxed);
         }
         // Cleared *before* the release below, not after. Between the release
         // and a later clear the lock is free, so another CPU may take it and
@@ -486,6 +561,49 @@ mod tests {
         drop(lock.lock());
         // Would spin forever if the guard had not released it.
         drop(lock.lock());
+    }
+
+    #[test]
+    fn try_lock_keeps_its_holder_on_the_cpu() {
+        // The fix for the bring-up stall, as a property: `try_lock` takes no
+        // rank -- it cannot be an edge in a deadlock cycle -- but it *is*
+        // holding a lock, and `sched::preempt` must not deschedule its holder.
+        set_held_mask(0);
+        let lock = SpinLock::new(Rank::Console, ());
+        assert!(!holds_unranked(), "nothing held to begin with");
+        let guard = lock.try_lock().expect("free");
+        assert_eq!(held_mask(), 0, "still takes no rank");
+        assert!(holds_unranked(), "but is held, so its holder must not move");
+        drop(guard);
+        assert!(!holds_unranked(), "released");
+    }
+
+    #[test]
+    fn unranked_holds_nest() {
+        set_held_mask(0);
+        let a = SpinLock::new(Rank::Console, ());
+        let b = SpinLock::new(Rank::Heap, ());
+        let first = a.try_lock().expect("free");
+        let second = b.try_lock().expect("free");
+        drop(second);
+        assert!(
+            holds_unranked(),
+            "one is still held after the inner release"
+        );
+        drop(first);
+        assert!(!holds_unranked());
+    }
+
+    #[test]
+    fn a_failed_try_lock_leaves_no_hold_behind() {
+        // A losing attempt must not count, or a CPU that probed a busy lock
+        // would refuse preemption for ever.
+        set_held_mask(0);
+        let lock = SpinLock::new(Rank::Console, ());
+        let held = lock.try_lock().expect("free");
+        assert!(lock.try_lock().is_none(), "already held");
+        drop(held);
+        assert!(!holds_unranked(), "the failed attempt counted nothing");
     }
 
     #[test]

@@ -186,6 +186,19 @@ Restated from [architecture.md](architecture.md) §6 because they are style rule
   It matters because interrupt handlers acquire locks at points the hardware chooses: a timer can
   land while any lock is held, so every lock taken in interrupt context is out of rank with respect
   to *something*. Acquire from interrupt context with `try_lock`, or not at all.
+- **`try_lock` is *not* exempt from holding, and the two were confused for a milestone.** Taking no
+  rank and holding no lock are different claims; only the first is true of `try_lock`. `preempt`
+  refuses to deschedule a lock holder — a preempted holder can only release by running again — and
+  it asked the *ranked* set, so a `try_lock` holder looked like a thread holding nothing. `exit`
+  reaches two functions that `try_lock` every runqueue with interrupts enabled, so a tick in that
+  scan could carry the exiting thread away still holding a **remote** runqueue. A `try_lock` holder
+  now counts towards `sync::holds_unranked` and cannot be preempted, while still taking no position
+  in the order.
+  > **This closes an unsoundness; it did not fix the bring-up stall.** The stall was the reason to
+  > look, and the guard was expected to end it. It did not: 3 boots in 500 stalled with it in place
+  > against 4 in 500 without, which is the same rate. Kept because descheduling a lock holder is
+  > wrong whether or not it is *this* bug, and recorded here so the next reader does not assume the
+  > rule was verified by the stall going away. It was not.
 
 > **Deviation, M4-08.** This rule previously said debug builds *panic* on an out-of-rank
 > acquisition. The implementation reports and continues, for the reason `lockdep` does: the report

@@ -558,6 +558,25 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         );
     }
 
+    // Reported on every boot, not only on the boot that stalls, because the
+    // question is whether the window is entered *at all*. A stall is one boot
+    // in 125; if this is non-zero on healthy boots too, the mechanism is
+    // ordinary and the stall is the rare case where the descheduled thread
+    // never runs again. If it is zero on 300 healthy boots and non-zero on a
+    // stalled one, that is the stall's cause on the record.
+    //
+    // `held_mask` cannot see this: `try_lock` never joins the held set, so the
+    // check in `preempt` that keeps lock holders on their CPU is blind to one,
+    // and `exit` reaches two functions that `try_lock` every runqueue.
+    let (remote_holds, _, _) = sched::remote_hold_preemptions();
+    if remote_holds > 0 {
+        println!(
+            "    remote hold    {remote_holds} switches happened while holding another cpu's runqueue"
+        );
+    } else {
+        println!("    remote hold    no thread was descheduled holding another cpu's runqueue");
+    }
+
     // RFC 0011 step 6: an interrupt a domain holds. Before the DMA tests,
     // because it hands the block device's interrupt to a domain and puts it
     // back — and a device with no interrupt is a driver on the timer.
@@ -1069,6 +1088,20 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
                 }
             }
         }
+    }
+
+    // Printed whichever way it reads. Zero here says the stall above is *not* a
+    // thread descheduled holding somebody else's runqueue, which rules out a
+    // hypothesis; a line that appeared only on the bad case would rule out
+    // nothing, and this dump exists because of a fact once conveyed by silence.
+    let (switches, stranded, holder) = sched::remote_hold_preemptions();
+    println!("  {switches} switches happened while holding another cpu's runqueue.");
+    if let (Some(stranded), Some(holder)) = (stranded, holder) {
+        println!(
+            "       The last stranded cpu {stranded}'s runqueue, held by cpu {holder}. It stays"
+        );
+        println!("       locked until that thread runs again, and a thread part-way through");
+        println!("       `exit` may never be chosen again at all.");
     }
 
     let (dropped, wake_missed, received, replies_tried, no_caller, empty) = ipc::diagnostics();
