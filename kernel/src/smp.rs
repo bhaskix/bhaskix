@@ -132,6 +132,31 @@ pub fn start_secondaries(handoff: &bhaskix_boot::Handoff) -> u32 {
         return 0;
     };
 
+    // Bracketing the loader's own bring-up call, because the stall between
+    // `demand paging` and `cpus N online` has to be on one side of it and the
+    // logs cannot currently say which. The bounded wait below was measured at
+    // 6.4 seconds to exhaust, so a boot that hangs indefinitely is not hanging
+    // there -- which leaves this call, or a secondary that never returns from
+    // `secondary_main`.
+    //
+    // Two lines rather than one: a single "entering" line tells you where it
+    // stopped only if you already know the next line is missing, and this
+    // kernel has been misread that way once today.
+    // Snapshotted *before* the call, and that is the whole of a stall.
+    //
+    // `percpu::install` increments the online count as its first act, so a
+    // secondary counts the instant it starts running. Reading the count after
+    // `start` returns therefore counts every CPU that got there first *twice*
+    // -- once in the count and once in `requested` -- and waits for a total
+    // that can never arrive. On four CPUs it waited for seven.
+    //
+    // It cost one boot in 330: the window is the few instructions between
+    // `start` returning and the count being read, and it only matters when a
+    // secondary wins that race. Putting a `println!` in that gap made it
+    // happen on every boot, which is how it was found -- and with this line
+    // moved above the call, that same print boots cleanly five times out of
+    // five.
+    let before = percpu::online_count();
     let requested = start(secondary_main);
     if requested == 0 {
         return 0;
@@ -140,7 +165,7 @@ pub fn start_secondaries(handoff: &bhaskix_boot::Handoff) -> u32 {
     // Wait for them to report in. Bounded: a CPU that never arrives must not
     // hang the boot, and reporting "3 of 7 came online" is far more useful
     // than a machine that stops with no explanation.
-    let expected = percpu::online_count() + requested;
+    let expected = before + requested;
     let mut spins = 0u64;
     while percpu::online_count() < expected && spins < 2_000_000_000 {
         spins += 1;
