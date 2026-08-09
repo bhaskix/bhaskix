@@ -183,7 +183,7 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
         Err(error) => {
             // Not fatal. A kernel with no clock cannot schedule, but it can
             // still report why -- which is more useful than halting.
-            println!("    interrupts     UNAVAILABLE: {error:?}");
+            println!("\x1b[93m    interrupts     UNAVAILABLE: {error:?}\x1b[0m");
             println!("                   continuing without a timer");
         }
     }
@@ -215,7 +215,7 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
             if memory::self_test(&mut pmm) {
                 println!("    self test      passed, no frames leaked");
             } else {
-                println!("    self test      FAILED");
+                println!("\x1b[91m    self test      FAILED\x1b[0m");
             }
 
             // The heap takes ownership of the physical allocator. After this,
@@ -237,7 +237,7 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
             if unsafe { bhaskix_arch::paging::enable_no_execute() } {
                 println!("    no-execute     enabled (W^X enforceable)");
             } else {
-                println!("    no-execute     UNAVAILABLE -- W^X cannot be enforced");
+                println!("\x1b[93m    no-execute     UNAVAILABLE -- W^X cannot be enforced\x1b[0m");
             }
 
             // SMEP stops the kernel executing user pages; SMAP stops it
@@ -266,7 +266,7 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
                     "    address spaces {LEAK_CYCLES} created and destroyed, no frames leaked"
                 );
             } else {
-                println!("    address spaces FAILED");
+                println!("\x1b[91m    address spaces FAILED\x1b[0m");
             }
         }
         Err(error) => {
@@ -329,7 +329,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if vm::demand_paging_self_test(handoff.hhdm_base.as_u64()) {
         println!("    demand paging  faults serviced from the region map; copy-on-write copies");
     } else {
-        println!("    demand paging  FAILED");
+        println!("\x1b[91m    demand paging  FAILED\x1b[0m");
     }
 
     let secondaries = smp::start_secondaries(handoff);
@@ -351,7 +351,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if scheduling_self_test(handoff.hhdm_base.as_u64()) {
         println!("    scheduler      timer-driven preemption works");
     } else {
-        println!("    scheduler      FAILED");
+        println!("\x1b[91m    scheduler      FAILED\x1b[0m");
     }
     // Immediately, and before anything measures this machine. A stopped
     // scheduler is not a quiet one: `needs_preemption_tick` reads a stopped
@@ -371,7 +371,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
     ) {
-        println!("    tickless       FAILED");
+        println!("\x1b[91m    tickless       FAILED\x1b[0m");
     }
     // Armed as early as it safely can be, which is not as early as one would
     // like. Two things bound it:
@@ -409,12 +409,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         )
         .is_err()
         {
-            println!("    watchdog       FAILED to spawn; a bring-up stall will be silent");
+            println!(
+                "\x1b[91m    watchdog       FAILED to spawn; a bring-up stall will be silent\x1b[0m"
+            );
         }
     }
 
     if !initrd_self_test(handoff) {
-        println!("    initrd         FAILED");
+        println!("\x1b[91m    initrd         FAILED\x1b[0m");
     }
     // RFC 0012 step 4: the unit before the device. A `DmaWindow` names the
     // device it translates for, and the device must be programmed with
@@ -422,7 +424,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // translation has to be on before `DRIVER_OK` lets the device read a ring.
     let iommu_state = iommu_bringup(handoff);
     if !block_self_test(handoff) {
-        println!("    virtio-blk     FAILED");
+        println!("\x1b[91m    virtio-blk     FAILED\x1b[0m");
     }
 
     // What a device can reach, said once it is settled rather than before.
@@ -443,32 +445,32 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     }
     mount_root(handoff);
     if !vfs_self_test(handoff) {
-        println!("    vfs            FAILED");
+        println!("\x1b[91m    vfs            FAILED\x1b[0m");
     }
     if !syscall_self_test(handoff.hhdm_base.as_u64()) {
-        println!("    syscall        FAILED");
+        println!("\x1b[91m    syscall        FAILED\x1b[0m");
     }
 
     if !ipc_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
     ) {
-        println!("    ipc            FAILED");
+        println!("\x1b[91m    ipc            FAILED\x1b[0m");
     }
     if !ring3_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
     ) {
-        println!("    ring 3         FAILED");
+        println!("\x1b[91m    ring 3         FAILED\x1b[0m");
     }
     if !capability_self_test() {
-        println!("    capabilities   FAILED");
+        println!("\x1b[91m    capabilities   FAILED\x1b[0m");
     }
     frames_report();
     tickless_report();
 
     if !lock_ordering_self_test() {
-        println!("    lock order     FAILED");
+        println!("\x1b[91m    lock order     FAILED\x1b[0m");
     }
     // Everything from here to the end of bring-up is code the check above ran
     // too early to see. The count is taken now and compared at the end.
@@ -479,26 +481,26 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // APIC and this is the first thing that does not.
     let input_ready = console_input(handoff);
     if input_ready && !shell_self_test() {
-        println!("    shell          FAILED");
+        println!("\x1b[91m    shell          FAILED\x1b[0m");
     }
     if input_ready && !block_interrupt_self_test(handoff) {
-        println!("    virtio-blk irq FAILED");
+        println!("\x1b[91m    virtio-blk irq FAILED\x1b[0m");
     }
     // After the bus has been walked and the drivers are up, because this reads
     // every function on every bus twice and there is no reason to do that
     // before anything needs it.
     if !ecam_bringup(handoff) {
-        println!("    ecam           FAILED");
+        println!("\x1b[91m    ecam           FAILED\x1b[0m");
     }
     if !journal_self_test() {
-        println!("    journal        FAILED");
+        println!("\x1b[91m    journal        FAILED\x1b[0m");
     }
 
     if !filesystem_self_test() {
-        println!("    filesystem     FAILED");
+        println!("\x1b[91m    filesystem     FAILED\x1b[0m");
     }
     if input_ready && !irq_teardown_self_test(handoff) {
-        println!("    irq teardown   FAILED");
+        println!("\x1b[91m    irq teardown   FAILED\x1b[0m");
     }
     if input_ready {
         // Which notification each signal hit, and what its waiter slot held.
@@ -529,7 +531,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                 handoff.hhdm_base.as_u64(),
                 bhaskix_arch::percpu::online_count(),
             ) {
-                println!("    user fault     FAILED");
+                println!("\x1b[91m    user fault     FAILED\x1b[0m");
             }
         } else {
             println!();
@@ -548,7 +550,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     let late = sync::violations();
     if late > lock_violations_at_start {
         println!(
-            "    lock order     FAILED: {} violations after bring-up",
+            "\x1b[91m    lock order     FAILED: {} violations after bring-up\x1b[0m",
             late - lock_violations_at_start
         );
     } else {
@@ -605,12 +607,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // because it hands the block device's interrupt to a domain and puts it
     // back — and a device with no interrupt is a driver on the timer.
     if !irq_delegation_self_test(handoff) {
-        println!("    irq grant      FAILED");
+        println!("\x1b[91m    irq grant      FAILED\x1b[0m");
     }
 
     // RFC 0012 step 7, before the refusal test leaves the device unusable.
     if iommu::present() && !iommu_delegation_self_test(handoff.hhdm_base.as_u64()) {
-        println!("    iommu grant    FAILED");
+        println!("\x1b[91m    iommu grant    FAILED\x1b[0m");
     }
 
     // RFC 0012 steps 4 and 5 in one demonstration, and it is deliberately one.
@@ -627,7 +629,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if let Some((found, _)) = iommu_state.as_ref()
         && !iommu_memory_self_test(found, handoff, handoff.hhdm_base.as_u64())
     {
-        println!("    iommu memory   FAILED");
+        println!("\x1b[91m    iommu memory   FAILED\x1b[0m");
     }
 
     // Which shell the machine boots to. The user-mode one by default, because
@@ -643,7 +645,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // Say so rather than spawning a shell that would block for ever on a
         // console nothing can write to.
         BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
-        println!("  M6 in progress. Nothing left to do at this milestone.");
+        println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");
         println!("  no console input on this machine, so no shell.");
     } else if kernel_shell {
         // On the CPU the serial interrupt is routed to. That pairing is
@@ -657,7 +659,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             handoff.hhdm_base.as_u64(),
             sched::SpawnOptions::new().pinned(),
         ) {
-            Ok(_) => println!("  M6 in progress. Nothing left to do at this milestone."),
+            Ok(_) => {
+                println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m")
+            }
             Err(error) => println!("  the shell could not be spawned: {error:?}"),
         }
     } else {
@@ -755,7 +759,9 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
     use core::sync::atomic::Ordering;
 
     if cpus < 2 {
-        println!("    tickless       skipped, needs a cpu that is not running the tests");
+        println!(
+            "\x1b[93m    tickless       skipped, needs a cpu that is not running the tests\x1b[0m"
+        );
         return true;
     }
 
@@ -800,7 +806,7 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
         };
         if attempt + 1 == TRIES {
             println!(
-                "    tickless       FAILED: cpu {ticking} took {} ticks over {WINDOW_MS} ms with nothing to run, and at most {ALLOWED} is expected",
+                "\x1b[91m    tickless       FAILED: cpu {ticking} took {} ticks over {WINDOW_MS} ms with nothing to run, and at most {ALLOWED} is expected\x1b[0m",
                 idle[ticking as usize]
             );
             why_still_ticking(ticking);
@@ -830,7 +836,7 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
     }
     if spawned == 0 {
-        println!("    tickless       FAILED: could not make any cpu busy");
+        println!("\x1b[91m    tickless       FAILED: could not make any cpu busy\x1b[0m");
         return false;
     }
     wait_millis(100);
@@ -854,7 +860,7 @@ fn tickless_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let asked = 1..=u32::try_from(spawned).unwrap_or(0);
     if let Some(silent) = asked.clone().find(|&cpu| busy[cpu as usize] == 0) {
         println!(
-            "    tickless       FAILED: cpu {silent} took no ticks over {WINDOW_MS} ms with a thread to preempt"
+            "\x1b[91m    tickless       FAILED: cpu {silent} took no ticks over {WINDOW_MS} ms with a thread to preempt\x1b[0m"
         );
         return false;
     }
@@ -1134,7 +1140,9 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
     println!(
         "       {replies_tried} replies tried, {no_caller} found no caller, {empty} empty checks."
     );
-    println!("  {dropped} messages were DROPPED because a mailbox was already full, and");
+    println!(
+        "\x1b[93m  {dropped} messages were DROPPED because a mailbox was already full, and\x1b[0m"
+    );
     println!("  {wake_missed} wakes went missing. Either is enough to strand a caller for ever.");
     println!(
         "  {} deferred wakes were lost.",
@@ -1148,12 +1156,14 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
     use core::sync::atomic::Ordering;
 
     if cpus < 2 {
-        println!("    ipc            skipped, needs a cpu that is not running the tests");
+        println!(
+            "\x1b[93m    ipc            skipped, needs a cpu that is not running the tests\x1b[0m"
+        );
         return true;
     }
 
     let Ok(endpoint) = ipc::create() else {
-        println!("    ipc            FAILED to create an endpoint");
+        println!("\x1b[91m    ipc            FAILED to create an endpoint\x1b[0m");
         return false;
     };
     IPC_ENDPOINT.store(u64::from(endpoint.as_u32()), Ordering::Release);
@@ -1164,7 +1174,7 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // capability, and thereafter neither can claim to be the other, because
     // neither can read or set its own badge.
     let Ok(clients) = domain::create("ipc-clients", domain::ResourceEnvelope::new()) else {
-        println!("    ipc            FAILED to create a client domain");
+        println!("\x1b[91m    ipc            FAILED to create a client domain\x1b[0m");
         return false;
     };
 
@@ -1181,14 +1191,14 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
         Some((a, b))
     });
     let Some((cap_a, cap_b)) = installed else {
-        println!("    ipc            FAILED to derive endpoint capabilities");
+        println!("\x1b[91m    ipc            FAILED to derive endpoint capabilities\x1b[0m");
         return false;
     };
     let placed = domain::with(clients, |owner| {
         owner.cspace.install_at(0, cap_a).is_ok() && owner.cspace.install_at(1, cap_b).is_ok()
     });
     if placed != Some(true) {
-        println!("    ipc            FAILED to install the endpoint capabilities");
+        println!("\x1b[91m    ipc            FAILED to install the endpoint capabilities\x1b[0m");
         return false;
     }
 
@@ -1205,7 +1215,7 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
         || sched::spawn_on_with(2, "ipc-cli-a", ipc_client, 0, hhdm_base, client).is_err()
         || sched::spawn_on_with(2, "ipc-cli-b", ipc_client, 1, hhdm_base, client).is_err()
     {
-        println!("    ipc            FAILED to spawn the participants");
+        println!("\x1b[91m    ipc            FAILED to spawn the participants\x1b[0m");
         return false;
     }
 
@@ -1308,7 +1318,7 @@ fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    ipc            FAILED: {name} (replies {replies}, correct {correct}, wrong {wrong}, badges {badges:#x}, delivered {delivered}, replied {replied}, dropped {dropped}, wake missed {wake_missed}, mailboxes {pending}, recv returned {received}, reply tried {replies_tried}, no caller {no_caller}, empty checks {empty})"
+                "\x1b[91m    ipc            FAILED: {name} (replies {replies}, correct {correct}, wrong {wrong}, badges {badges:#x}, delivered {delivered}, replied {replied}, dropped {dropped}, wake missed {wake_missed}, mailboxes {pending}, recv returned {received}, reply tried {replies_tried}, no caller {no_caller}, empty checks {empty})\x1b[0m"
             );
             ok = false;
         }
@@ -1716,11 +1726,11 @@ static QUEUED_KILLED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// test passing.
 fn queue_entry_released_on_death(cpu: u32, hhdm_base: u64) -> bool {
     let Ok(endpoint) = ipc::create() else {
-        println!("    queue cleanup  FAILED to create an endpoint");
+        println!("\x1b[91m    queue cleanup  FAILED to create an endpoint\x1b[0m");
         return false;
     };
     let Ok(doomed) = domain::create("queued", domain::ResourceEnvelope::new()) else {
-        println!("    queue cleanup  FAILED to create a domain");
+        println!("\x1b[91m    queue cleanup  FAILED to create a domain\x1b[0m");
         ipc::destroy(endpoint);
         return false;
     };
@@ -1739,7 +1749,7 @@ fn queue_entry_released_on_death(cpu: u32, hhdm_base: u64) -> bool {
     )
     .is_err()
     {
-        println!("    queue cleanup  FAILED to spawn the caller");
+        println!("\x1b[91m    queue cleanup  FAILED to spawn the caller\x1b[0m");
         domain::destroy(doomed);
         ipc::destroy(endpoint);
         return false;
@@ -1751,7 +1761,7 @@ fn queue_entry_released_on_death(cpu: u32, hhdm_base: u64) -> bool {
     let queued = wait_until(|| ipc::queued(endpoint) == Some((1, 0)), 4_000);
     if !queued {
         println!(
-            "    queue cleanup  FAILED: the caller never queued (got {:?})",
+            "\x1b[91m    queue cleanup  FAILED: the caller never queued (got {:?})\x1b[0m",
             ipc::queued(endpoint)
         );
         domain::destroy(doomed);
@@ -1906,7 +1916,7 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     // SAFETY: a slot no thread or syscall stack uses.
     let Ok(privileged) = (unsafe { stack::allocate(hhdm_base, RSP0_SLOT + u64::from(cpu)) }) else {
-        println!("    user fault     FAILED to allocate a privilege stack");
+        println!("\x1b[91m    user fault     FAILED to allocate a privilege stack\x1b[0m");
         return false;
     };
     // SAFETY: one past a freshly mapped guarded stack, set before anything
@@ -1914,7 +1924,7 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     unsafe { bhaskix_arch::gdt::set_privilege_stack(cpu as usize, privileged.top) };
 
     let Ok(doomed) = domain::create("faulter", domain::ResourceEnvelope::new()) else {
-        println!("    user fault     FAILED to create a domain");
+        println!("\x1b[91m    user fault     FAILED to create a domain\x1b[0m");
         return false;
     };
     let live_before = domain::live();
@@ -1932,7 +1942,7 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // CSpace at index 0. Without this its server has nothing to receive on and
     // the whole of step 3 is untested.
     let Ok(endpoint) = ipc::create() else {
-        println!("    user fault     FAILED to create an endpoint");
+        println!("\x1b[91m    user fault     FAILED to create an endpoint\x1b[0m");
         domain::destroy(doomed);
         return false;
     };
@@ -1947,13 +1957,13 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
         arena.derive(root, cap::Rights::ALL, 0).ok()
     });
     let Some(granted) = derived else {
-        println!("    user fault     FAILED to derive an endpoint capability");
+        println!("\x1b[91m    user fault     FAILED to derive an endpoint capability\x1b[0m");
         ipc::destroy(endpoint);
         domain::destroy(doomed);
         return false;
     };
     if domain::with(doomed, |owner| owner.cspace.install_at(0, granted).is_ok()) != Some(true) {
-        println!("    user fault     FAILED to install the endpoint capability");
+        println!("\x1b[91m    user fault     FAILED to install the endpoint capability\x1b[0m");
         ipc::destroy(endpoint);
         domain::destroy(doomed);
         return false;
@@ -1965,7 +1975,7 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
         ("server", ring3_server as extern "C" fn(u64) -> !),
     ] {
         if let Err(error) = sched::spawn_on_with(cpu, name, entry, hhdm_base, hhdm_base, options) {
-            println!("    user fault     FAILED to spawn {name}: {error:?}");
+            println!("\x1b[91m    user fault     FAILED to spawn {name}: {error:?}\x1b[0m");
             domain::destroy(doomed);
             return false;
         }
@@ -1995,7 +2005,7 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     )
     .is_err()
     {
-        println!("    user fault     FAILED to spawn the stranded caller");
+        println!("\x1b[91m    user fault     FAILED to spawn the stranded caller\x1b[0m");
         ipc::destroy(endpoint);
         domain::destroy(doomed);
         return false;
@@ -2010,7 +2020,7 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     if let Err(error) =
         sched::spawn_on_with(cpu, "faulter", ring3_faulter, hhdm_base, hhdm_base, options)
     {
-        println!("    user fault     FAILED to spawn the program: {error:?}");
+        println!("\x1b[91m    user fault     FAILED to spawn the program: {error:?}\x1b[0m");
         domain::destroy(doomed);
         return false;
     }
@@ -2070,7 +2080,7 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let mut ok = true;
     for (what, passed) in checks {
         if !passed {
-            println!("    user fault     FAILED: {what}");
+            println!("\x1b[91m    user fault     FAILED: {what}\x1b[0m");
             ok = false;
         }
     }
@@ -2112,7 +2122,9 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// identical to calling the dispatcher directly.
 fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     if cpus < 2 {
-        println!("    ring 3         skipped, needs a cpu that is not running the tests");
+        println!(
+            "\x1b[93m    ring 3         skipped, needs a cpu that is not running the tests\x1b[0m"
+        );
         return true;
     }
 
@@ -2127,7 +2139,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     //
     // SAFETY: a slot no thread or syscall stack uses.
     let Ok(privileged) = (unsafe { stack::allocate(hhdm_base, RSP0_SLOT + u64::from(CPU)) }) else {
-        println!("    ring 3         FAILED to allocate a privilege stack");
+        println!("\x1b[91m    ring 3         FAILED to allocate a privilege stack\x1b[0m");
         return false;
     };
     // SAFETY: `privileged.top` is one past a freshly mapped guarded stack, and
@@ -2139,7 +2151,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // needs one is refused before it reaches the endpoint -- which is correct,
     // and is why a user thread could not do IPC until now.
     let Ok(endpoint) = ipc::create() else {
-        println!("    ring 3         FAILED to create an endpoint");
+        println!("\x1b[91m    ring 3         FAILED to create an endpoint\x1b[0m");
         return false;
     };
     RING3_ENDPOINT.store(
@@ -2153,7 +2165,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         "ring3",
         domain::ResourceEnvelope::new().max_child_domains(1),
     ) else {
-        println!("    ring 3         FAILED to create a domain");
+        println!("\x1b[91m    ring 3         FAILED to create a domain\x1b[0m");
         return false;
     };
 
@@ -2168,11 +2180,11 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         arena.derive(root, cap::Rights::ALL, BADGE_RING3).ok()
     });
     let Some(granted) = derived else {
-        println!("    ring 3         FAILED to derive an endpoint capability");
+        println!("\x1b[91m    ring 3         FAILED to derive an endpoint capability\x1b[0m");
         return false;
     };
     if domain::with(realm, |owner| owner.cspace.install_at(0, granted).is_ok()) != Some(true) {
-        println!("    ring 3         FAILED to install the endpoint capability");
+        println!("\x1b[91m    ring 3         FAILED to install the endpoint capability\x1b[0m");
         return false;
     }
 
@@ -2190,11 +2202,11 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         arena.derive(root, cap::Rights::ALL, 0).ok()
     });
     let Some(control) = control else {
-        println!("    ring 3         FAILED to derive a DomainControl");
+        println!("\x1b[91m    ring 3         FAILED to derive a DomainControl\x1b[0m");
         return false;
     };
     if domain::with(realm, |owner| owner.cspace.install_at(3, control).is_ok()) != Some(true) {
-        println!("    ring 3         FAILED to install the DomainControl");
+        println!("\x1b[91m    ring 3         FAILED to install the DomainControl\x1b[0m");
         return false;
     }
     for answer in RING3_SPAWN
@@ -2231,11 +2243,11 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         shared::name(object).ok()
     });
     let Some(staged) = staged else {
-        println!("    ring 3         FAILED to stage the program image");
+        println!("\x1b[91m    ring 3         FAILED to stage the program image\x1b[0m");
         return false;
     };
     if domain::with(realm, |owner| owner.cspace.install_at(4, staged).is_ok()) != Some(true) {
-        println!("    ring 3         FAILED to install the program image");
+        println!("\x1b[91m    ring 3         FAILED to install the program image\x1b[0m");
         return false;
     }
 
@@ -2264,11 +2276,11 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         arena.derive(root, cap::Rights::ALL, BADGE_RING3).ok()
     });
     let Some(giveable) = giveable else {
-        println!("    ring 3         FAILED to derive a capability to give away");
+        println!("\x1b[91m    ring 3         FAILED to derive a capability to give away\x1b[0m");
         return false;
     };
     if domain::with(realm, |owner| owner.cspace.install_at(5, giveable).is_ok()) != Some(true) {
-        println!("    ring 3         FAILED to install the capability to give away");
+        println!("\x1b[91m    ring 3         FAILED to install the capability to give away\x1b[0m");
         return false;
     }
 
@@ -2282,7 +2294,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         .ok()
         .and_then(|id| notify::name(id).ok().map(|slot| (id, slot)));
     let Some((watch_id, watch_slot)) = watching else {
-        println!("    ring 3         FAILED to create a notification");
+        println!("\x1b[91m    ring 3         FAILED to create a notification\x1b[0m");
         return false;
     };
     let _ = watch_id;
@@ -2290,7 +2302,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         owner.cspace.install_at(9, watch_slot).is_ok()
     }) != Some(true)
     {
-        println!("    ring 3         FAILED to install the notification");
+        println!("\x1b[91m    ring 3         FAILED to install the notification\x1b[0m");
         return false;
     }
 
@@ -2301,7 +2313,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // is woken across processors rather than handed straight back.
     let service = sched::SpawnOptions::new().pinned();
     if sched::spawn_on_with(1, "r3-svc", ring3_service, 0, hhdm_base, service).is_err() {
-        println!("    ring 3         FAILED to spawn the service");
+        println!("\x1b[91m    ring 3         FAILED to spawn the service\x1b[0m");
         return false;
     }
 
@@ -2311,7 +2323,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     if let Err(error) =
         sched::spawn_on_with(CPU, "ring3", ring3_probe, hhdm_base, hhdm_base, options)
     {
-        println!("    ring 3         FAILED to spawn the probe: {error:?}");
+        println!("\x1b[91m    ring 3         FAILED to spawn the probe: {error:?}\x1b[0m");
         return false;
     }
 
@@ -2550,7 +2562,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    ring 3         FAILED: {name} (calls {calls}, refused {refused}, rip {rip:#x}, rsp {rsp:#x}, segments {segments:#x})"
+                "\x1b[91m    ring 3         FAILED: {name} (calls {calls}, refused {refused}, rip {rip:#x}, rsp {rsp:#x}, segments {segments:#x})\x1b[0m"
             );
             ok = false;
             // What the service did, and what the endpoint looked like when it
@@ -2604,7 +2616,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// that is proved by a million mutated archives on the host, not here.
 fn initrd_self_test(handoff: &Handoff) -> bool {
     let Some(bytes) = handoff.initrd else {
-        println!("    initrd         FAILED: the bootloader loaded no module");
+        println!("\x1b[91m    initrd         FAILED: the bootloader loaded no module\x1b[0m");
         return false;
     };
 
@@ -2630,7 +2642,9 @@ fn initrd_self_test(handoff: &Handoff) -> bool {
     let mut ok = true;
     for (name, passed) in checks {
         if !passed {
-            println!("    initrd         FAILED: {name} ({members} members, {directories} dirs)");
+            println!(
+                "\x1b[91m    initrd         FAILED: {name} ({members} members, {directories} dirs)\x1b[0m"
+            );
             ok = false;
         }
     }
@@ -2709,13 +2723,13 @@ fn filesystem_self_test() -> bool {
     let mut mounted = match bhaskix_fs::Filesystem::mount(&mut pages) {
         Ok(mounted) => mounted,
         Err(error) => {
-            println!("    filesystem     FAILED to mount: {error:?}");
+            println!("\x1b[91m    filesystem     FAILED to mount: {error:?}\x1b[0m");
             return false;
         }
     };
 
     let Ok(root) = mounted.root() else {
-        println!("    filesystem     FAILED: the root is not a directory");
+        println!("\x1b[91m    filesystem     FAILED: the root is not a directory\x1b[0m");
         return false;
     };
 
@@ -2723,7 +2737,7 @@ fn filesystem_self_test() -> bool {
     mounted.list(&root, |_| names += 1);
 
     let Ok((index, inode)) = mounted.lookup(&root, b"greeting") else {
-        println!("    filesystem     FAILED: no `greeting` in the root");
+        println!("\x1b[91m    filesystem     FAILED: no `greeting` in the root\x1b[0m");
         return false;
     };
 
@@ -2855,7 +2869,7 @@ fn journal_self_test() -> bool {
         )
     };
     if bhaskix_fs::format(image, 128).is_err() {
-        println!("    journal        FAILED to format an image in memory");
+        println!("\x1b[91m    journal        FAILED to format an image in memory\x1b[0m");
         return false;
     }
     let Ok(superblock) = bhaskix_fs::Superblock::read(image) else {
@@ -2866,24 +2880,28 @@ fn journal_self_test() -> bool {
     // A file, and something in it, uninterrupted.
     let (root, hits, misses) = {
         let Ok(cache) = Cache::new(frames, Watched::new(image, u32::MAX, commit_block)) else {
-            println!("    journal        FAILED: not enough frames to cache with");
+            println!("\x1b[91m    journal        FAILED: not enough frames to cache with\x1b[0m");
             return false;
         };
         let Ok((mut volume, replayed)) = Volume::mount(cache) else {
-            println!("    journal        FAILED: a freshly formatted image will not mount");
+            println!(
+                "\x1b[91m    journal        FAILED: a freshly formatted image will not mount\x1b[0m"
+            );
             return false;
         };
         if replayed != 0 {
-            println!("    journal        FAILED: a fresh image had {replayed} blocks to replay");
+            println!(
+                "\x1b[91m    journal        FAILED: a fresh image had {replayed} blocks to replay\x1b[0m"
+            );
             return false;
         }
         let root = volume.superblock().root;
         let Ok(index) = volume.create(root, b"survivor", Kind::File) else {
-            println!("    journal        FAILED to create a file");
+            println!("\x1b[91m    journal        FAILED to create a file\x1b[0m");
             return false;
         };
         if volume.write(index, 0, b"written in a machine\n").is_err() {
-            println!("    journal        FAILED to write to it");
+            println!("\x1b[91m    journal        FAILED to write to it\x1b[0m");
             return false;
         }
         // Read it straight back, which is what makes the hit count mean
@@ -2895,7 +2913,9 @@ fn journal_self_test() -> bool {
         let mut back = [0u8; 32];
         let read = reader.read(&inode, 0, &mut back);
         if back.get(..read) != Some(b"written in a machine\n".as_slice()) {
-            println!("    journal        FAILED: it did not read back what was written");
+            println!(
+                "\x1b[91m    journal        FAILED: it did not read back what was written\x1b[0m"
+            );
             return false;
         }
         let (hits, misses, _) = volume.counted();
@@ -2920,7 +2940,7 @@ fn journal_self_test() -> bool {
         match at {
             Some(at) => at,
             None => {
-                println!("    journal        FAILED: no commit block was written");
+                println!("\x1b[91m    journal        FAILED: no commit block was written\x1b[0m");
                 return false;
             }
         }
@@ -2937,7 +2957,9 @@ fn journal_self_test() -> bool {
         volume.create(root, b"recovered", Kind::File)
     };
     if interrupted != Err(FsError::Interrupted) {
-        println!("    journal        FAILED: the interruption did not stop it: {interrupted:?}");
+        println!(
+            "\x1b[91m    journal        FAILED: the interruption did not stop it: {interrupted:?}\x1b[0m"
+        );
         return false;
     }
 
@@ -2957,7 +2979,9 @@ fn journal_self_test() -> bool {
             return false;
         };
         let Ok((mut volume, replayed)) = Volume::mount(cache) else {
-            println!("    journal        FAILED: an interrupted image will not mount");
+            println!(
+                "\x1b[91m    journal        FAILED: an interrupted image will not mount\x1b[0m"
+            );
             return false;
         };
         let found = volume.lookup(root, b"recovered").is_ok();
@@ -3051,7 +3075,7 @@ fn ecam_bringup(handoff: &Handoff) -> bool {
 
     let Some(mapped) = crate::mmio::map(region.base, region.length(), hhdm) else {
         println!(
-            "    ecam           FAILED to map {} KiB at {:#x}",
+            "\x1b[91m    ecam           FAILED to map {} KiB at {:#x}\x1b[0m",
             region.length() / 1024,
             region.base
         );
@@ -3541,11 +3565,11 @@ fn disk_journal_self_test(hhdm: u64) -> bool {
     }
 
     let Ok(owner) = domain::create("disk-journal", domain::ResourceEnvelope::new()) else {
-        println!("    disk journal   FAILED to create a domain to write from");
+        println!("\x1b[91m    disk journal   FAILED to create a domain to write from\x1b[0m");
         return false;
     };
     let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
-        println!("    disk journal   FAILED to create a memory object");
+        println!("\x1b[91m    disk journal   FAILED to create a memory object\x1b[0m");
         domain::destroy(owner);
         return false;
     };
@@ -3567,7 +3591,7 @@ fn disk_journal_self_test(hhdm: u64) -> bool {
         return false;
     };
     if installed != Some(true) || count == 0 {
-        println!("    disk journal   FAILED to give the writer its memory");
+        println!("\x1b[91m    disk journal   FAILED to give the writer its memory\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -3587,7 +3611,7 @@ fn disk_journal_self_test(hhdm: u64) -> bool {
     )
     .is_err()
     {
-        println!("    disk journal   FAILED to spawn a writer");
+        println!("\x1b[91m    disk journal   FAILED to spawn a writer\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -3649,11 +3673,11 @@ fn block_service_self_test(hhdm: u64) -> bool {
     let endpoint = ipc::EndpointId::from_u32(raw as u32);
 
     let Ok(owner) = domain::create("block-reader", domain::ResourceEnvelope::new()) else {
-        println!("    block service  FAILED to create a domain to ask from");
+        println!("\x1b[91m    block service  FAILED to create a domain to ask from\x1b[0m");
         return false;
     };
     let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
-        println!("    block service  FAILED to create a memory object");
+        println!("\x1b[91m    block service  FAILED to create a memory object\x1b[0m");
         domain::destroy(owner);
         return false;
     };
@@ -3661,7 +3685,7 @@ fn block_service_self_test(hhdm: u64) -> bool {
         .ok()
         .and_then(|memory| domain::with(owner, |d| d.cspace.install_at(0, memory).is_ok()));
     if installed != Some(true) {
-        println!("    block service  FAILED to give the caller its memory");
+        println!("\x1b[91m    block service  FAILED to give the caller its memory\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -3679,7 +3703,7 @@ fn block_service_self_test(hhdm: u64) -> bool {
     )
     .is_err()
     {
-        println!("    block service  FAILED to spawn a caller");
+        println!("\x1b[91m    block service  FAILED to spawn a caller\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -4138,11 +4162,13 @@ fn report_block_domain(hhdm: u64) -> bool {
     // writable memory in its own space; the kernel reaches the same frames the
     // way it reaches any object's.
     let Some((frames, count)) = shared::frames_of(rings) else {
-        println!("    block domain   FAILED: the rings are gone");
+        println!("\x1b[91m    block domain   FAILED: the rings are gone\x1b[0m");
         return false;
     };
     if count < 4 {
-        println!("    block domain   FAILED: the rings are too small to hold a report");
+        println!(
+            "\x1b[91m    block domain   FAILED: the rings are too small to hold a report\x1b[0m"
+        );
         return false;
     }
 
@@ -4162,7 +4188,7 @@ fn report_block_domain(hhdm: u64) -> bool {
         *word = u64::from_le_bytes(buffer);
     }
     if words[0] != MARKER {
-        println!("    block domain   FAILED: the driver left no report");
+        println!("\x1b[91m    block domain   FAILED: the driver left no report\x1b[0m");
         return false;
     }
 
@@ -4259,7 +4285,7 @@ extern "C" fn block_domain_entry(hhdm_base: u64) -> ! {
     use vm::AddressSpace;
 
     let stop = |why: &str| -> ! {
-        println!("    block domain   FAILED: {why}");
+        println!("\x1b[91m    block domain   FAILED: {why}\x1b[0m");
         sched::exit()
     };
 
@@ -4302,7 +4328,7 @@ extern "C" fn fs_domain_entry(hhdm_base: u64) -> ! {
     use vm::AddressSpace;
 
     let stop = |why: &str| -> ! {
-        println!("    fs domain      FAILED: {why}");
+        println!("\x1b[91m    fs domain      FAILED: {why}\x1b[0m");
         sched::exit()
     };
 
@@ -4365,7 +4391,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
     let endpoint = ipc::EndpointId::from_u32(raw as u32);
 
     let Ok(realm) = domain::create("fs", domain::ResourceEnvelope::new()) else {
-        println!("    fs domain      FAILED: the domain would not be created");
+        println!("\x1b[91m    fs domain      FAILED: the domain would not be created\x1b[0m");
         return false;
     };
 
@@ -4378,7 +4404,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
     // every piece of metadata the service has touched. A frame is the unit that
     // can be lent, so a frame has to be the unit that can be named.
     let Ok(memory) = shared::create(realm, 2 * bhaskix_mm::FRAME_SIZE) else {
-        println!("    fs domain      FAILED: its memory would not be created");
+        println!("\x1b[91m    fs domain      FAILED: its memory would not be created\x1b[0m");
         domain::destroy(realm);
         return false;
     };
@@ -4391,7 +4417,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
     // set one, so this service can mint a handle for any directory on its disk
     // and nothing a client holds can mint one at all. RFC 0016 step 4.
     let Ok(serving) = ipc::create() else {
-        println!("    fs domain      FAILED: no endpoint for it to answer on");
+        println!("\x1b[91m    fs domain      FAILED: no endpoint for it to answer on\x1b[0m");
         domain::destroy(realm);
         return false;
     };
@@ -4421,7 +4447,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
         })
     });
     if installed != Some(true) || count < 2 {
-        println!("    fs domain      FAILED: its capabilities would not install");
+        println!("\x1b[91m    fs domain      FAILED: its capabilities would not install\x1b[0m");
         domain::destroy(realm);
         return false;
     }
@@ -4432,7 +4458,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
     // allowed to give it away are different permissions.
     for frame in 0..8usize {
         let Ok(page) = shared::create(realm, bhaskix_mm::FRAME_SIZE) else {
-            println!("    fs domain      FAILED: a cache page would not be created");
+            println!("\x1b[91m    fs domain      FAILED: a cache page would not be created\x1b[0m");
             domain::destroy(realm);
             return false;
         };
@@ -4442,7 +4468,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
             })
         });
         if landed != Some(true) {
-            println!("    fs domain      FAILED: a cache page would not install");
+            println!("\x1b[91m    fs domain      FAILED: a cache page would not install\x1b[0m");
             domain::destroy(realm);
             return false;
         }
@@ -4452,7 +4478,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
         .pinned()
         .in_domain(realm.as_u32());
     if sched::spawn_on_with(3, "fsd", fs_domain_entry, hhdm, hhdm, options).is_err() {
-        println!("    fs domain      FAILED: it would not spawn");
+        println!("\x1b[91m    fs domain      FAILED: it would not spawn\x1b[0m");
         domain::destroy(realm);
         return false;
     }
@@ -4578,7 +4604,7 @@ extern "C" fn console_domain_entry(hhdm_base: u64) -> ! {
     use vm::AddressSpace;
 
     let stop = |why: &str| -> ! {
-        println!("    console domain FAILED: {why}");
+        println!("\x1b[91m    console domain FAILED: {why}\x1b[0m");
         sched::exit()
     };
 
@@ -4670,7 +4696,7 @@ extern "C" fn vfs_domain_entry(hhdm_base: u64) -> ! {
     use vm::AddressSpace;
 
     let stop = |why: &str| -> ! {
-        println!("    vfs domain     FAILED: {why}");
+        println!("\x1b[91m    vfs domain     FAILED: {why}\x1b[0m");
         sched::exit()
     };
 
@@ -4939,22 +4965,22 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // is a protocol bug reported as one; the same failure discovered through
     // the shell is a program that prints nothing for a reason nobody can see.
     if !service_self_test(filesystem) {
-        println!("    services       FAILED");
+        println!("\x1b[91m    services       FAILED\x1b[0m");
     }
 
     // RFC 0009 step 6: the same file, by message and by shared memory.
     if !bulk_service_self_test(filesystem, hhdm) {
-        println!("    bulk path      FAILED");
+        println!("\x1b[91m    bulk path      FAILED\x1b[0m");
     }
 
     // RFC 0013 step 5: what the placement costs, said in numbers.
     if !measure_placements(console, filesystem) {
-        println!("    cost           FAILED");
+        println!("\x1b[91m    cost           FAILED\x1b[0m");
     }
 
     // RFC 0013 step 6: the second block device, driven from ring 3.
     if let Err(reason) = start_block_domain(cpu, hhdm, handoff.bsp_lapic_id, handoff.rsdp) {
-        println!("    block domain   FAILED: {reason}");
+        println!("\x1b[91m    block domain   FAILED: {reason}\x1b[0m");
     } else {
         // It has to have run before its report can be read. Waiting on a
         // notification would be better and is what a supervisor would do; RFC
@@ -4972,16 +4998,16 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             wait_millis(50);
         }
         if !report_block_domain(hhdm) {
-            println!("    block domain   FAILED");
+            println!("\x1b[91m    block domain   FAILED\x1b[0m");
         }
         if !block_service_self_test(hhdm) {
-            println!("    block service  FAILED");
+            println!("\x1b[91m    block service  FAILED\x1b[0m");
         }
         if !disk_journal_self_test(hhdm) {
-            println!("    disk journal   FAILED");
+            println!("\x1b[91m    disk journal   FAILED\x1b[0m");
         }
         if !start_fs_domain(hhdm) {
-            println!("    fs domain      FAILED");
+            println!("\x1b[91m    fs domain      FAILED\x1b[0m");
         }
     }
 
@@ -5128,7 +5154,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     );
 
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
-    println!("  M6 in progress. Nothing left to do at this milestone.");
+    println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");
 
     let options = sched::SpawnOptions::new()
         .pinned()
@@ -5283,16 +5309,16 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
 
     let Ok(owner) = domain::create("bulk-reader", domain::ResourceEnvelope::new()) else {
-        println!("    bulk path      FAILED to create a domain");
+        println!("\x1b[91m    bulk path      FAILED to create a domain\x1b[0m");
         return false;
     };
     let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
-        println!("    bulk path      FAILED to create a memory object");
+        println!("\x1b[91m    bulk path      FAILED to create a memory object\x1b[0m");
         domain::destroy(owner);
         return false;
     };
     let Ok(memory_cap) = shared::name(object) else {
-        println!("    bulk path      FAILED to name the object");
+        println!("\x1b[91m    bulk path      FAILED to name the object\x1b[0m");
         domain::destroy(owner);
         return false;
     };
@@ -5304,7 +5330,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     // whether the rights were consulted at all.
     let Some(decoy) = cap::with_arena(|arena| arena.derive(memory_cap, cap::Rights::READ, 0).ok())
     else {
-        println!("    bulk path      FAILED to derive a read-only capability");
+        println!("\x1b[91m    bulk path      FAILED to derive a read-only capability\x1b[0m");
         domain::destroy(owner);
         return false;
     };
@@ -5312,7 +5338,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
         d.cspace.install_at(0, memory_cap).is_ok() && d.cspace.install_at(1, decoy).is_ok()
     }) != Some(true)
     {
-        println!("    bulk path      FAILED to install the capabilities");
+        println!("\x1b[91m    bulk path      FAILED to install the capabilities\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -5324,7 +5350,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
 
     let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
     if sched::spawn_on_with(0, "bulk-reader", bulk_client, 0, hhdm, options).is_err() {
-        println!("    bulk path      FAILED to spawn a thread in the domain");
+        println!("\x1b[91m    bulk path      FAILED to spawn a thread in the domain\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -5522,7 +5548,9 @@ fn measure_placements(console: ipc::EndpointId, filesystem: ipc::EndpointId) -> 
         }
     }
     if !released {
-        println!("    cost           FAILED to release the session it measured with");
+        println!(
+            "\x1b[91m    cost           FAILED to release the session it measured with\x1b[0m"
+        );
     }
 
     let ok = delivered == ROUNDS && answered == ROUNDS;
@@ -5648,7 +5676,9 @@ fn service_self_test(filesystem: ipc::EndpointId) -> bool {
     let mut ok = true;
     for (name, passed) in checks {
         if !passed {
-            println!("    services       FAILED: {name} ({length} bytes, {entries} entries)");
+            println!(
+                "\x1b[91m    services       FAILED: {name} ({length} bytes, {entries} entries)\x1b[0m"
+            );
             ok = false;
         }
     }
@@ -5794,7 +5824,7 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
     let before = heap::available_frames();
 
     let Ok(realm) = domain::create("memtest", domain::ResourceEnvelope::new()) else {
-        println!("    memory objects FAILED: no domain to charge");
+        println!("\x1b[91m    memory objects FAILED: no domain to charge\x1b[0m");
         return false;
     };
 
@@ -6083,7 +6113,9 @@ fn shared_memory_self_test(hhdm: u64) -> bool {
     let mut ok = true;
     for (name, passed) in checks {
         if !passed {
-            println!("    memory objects FAILED: {name} (frames {before} -> {after}, {live} live)");
+            println!(
+                "\x1b[91m    memory objects FAILED: {name} (frames {before} -> {after}, {live} live)\x1b[0m"
+            );
             ok = false;
         }
     }
@@ -6132,7 +6164,7 @@ fn irq_teardown_self_test(handoff: &Handoff) -> bool {
     let (vectors_before, _) = vectors::usage();
 
     let Ok(owner) = domain::create("irq-teardown", domain::ResourceEnvelope::new()) else {
-        println!("    irq teardown   FAILED to create a domain");
+        println!("\x1b[91m    irq teardown   FAILED to create a domain\x1b[0m");
         return false;
     };
 
@@ -6152,7 +6184,7 @@ fn irq_teardown_self_test(handoff: &Handoff) -> bool {
         // Not a failure of the property under test: a machine whose chip has
         // no such input never had a handler to release. Say so rather than
         // reporting a teardown bug.
-        println!("    irq teardown   skipped, gsi {SPARE_GSI} could not be claimed");
+        println!("\x1b[93m    irq teardown   skipped, gsi {SPARE_GSI} could not be claimed\x1b[0m");
         domain::destroy(owner);
         return true;
     };
@@ -6197,7 +6229,7 @@ fn irq_teardown_self_test(handoff: &Handoff) -> bool {
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    irq teardown   FAILED: {name} (vectors {vectors_before} -> {vectors_held} -> {vectors_after} -> {vectors_end})"
+                "\x1b[91m    irq teardown   FAILED: {name} (vectors {vectors_before} -> {vectors_held} -> {vectors_after} -> {vectors_end})\x1b[0m"
             );
             ok = false;
         }
@@ -6276,7 +6308,7 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    virtio-blk irq FAILED: {name} ({waits} waits, {} spins, {} deliveries)",
+                "\x1b[91m    virtio-blk irq FAILED: {name} ({waits} waits, {} spins, {} deliveries)\x1b[0m",
                 spins - spins_before,
                 delivered - delivered_before
             );
@@ -6424,7 +6456,9 @@ fn irq_delegation_self_test(handoff: &Handoff) -> bool {
         // The RFC's own precondition, and `irq::name` refuses here too. A
         // machine with no translation is one where delegating a device is not
         // safe to do, so it is not done and the machine says so.
-        println!("    irq grant      skipped, no IOMMU: a device cannot be delegated safely");
+        println!(
+            "\x1b[93m    irq grant      skipped, no IOMMU: a device cannot be delegated safely\x1b[0m"
+        );
         return true;
     }
     let apic = handoff.bsp_lapic_id;
@@ -6436,7 +6470,7 @@ fn irq_delegation_self_test(handoff: &Handoff) -> bool {
     // SAFETY: `trap` dispatches unclaimed vectors to `irq::on_interrupt`.
     let Ok(line_handler) = (unsafe { irq::claim(line, "irq delegation test", apic, rsdp, hhdm) })
     else {
-        println!("    irq grant      skipped, no spare line to claim");
+        println!("\x1b[93m    irq grant      skipped, no spare line to claim\x1b[0m");
         return true;
     };
     let line_refused = matches!(irq::name(line_handler), Err(irq::ClaimError::NotDelegable));
@@ -6446,20 +6480,22 @@ fn irq_delegation_self_test(handoff: &Handoff) -> bool {
     // that may be delegated. Claiming a second is not possible -- a source is
     // claimed once -- so this names the handler the driver already holds.
     let Some(handler) = virtio::handler() else {
-        println!("    irq grant      skipped, the block driver holds no handler");
+        println!("\x1b[93m    irq grant      skipped, the block driver holds no handler\x1b[0m");
         return line_refused;
     };
     let (Ok(handler_cap), Ok(notification)) = (irq::name(handler), notify::create()) else {
-        println!("    irq grant      FAILED to name the handler or make a notification");
+        println!(
+            "\x1b[91m    irq grant      FAILED to name the handler or make a notification\x1b[0m"
+        );
         return false;
     };
     let Ok(notify_cap) = notify::name(notification) else {
-        println!("    irq grant      FAILED to name the notification");
+        println!("\x1b[91m    irq grant      FAILED to name the notification\x1b[0m");
         return false;
     };
 
     let Ok(owner) = domain::create("irq-holder", domain::ResourceEnvelope::new()) else {
-        println!("    irq grant      FAILED to create a domain");
+        println!("\x1b[91m    irq grant      FAILED to create a domain\x1b[0m");
         return false;
     };
     let placed = domain::with(owner, |domain| {
@@ -6467,7 +6503,7 @@ fn irq_delegation_self_test(handoff: &Handoff) -> bool {
             && domain.cspace.install_at(1, notify_cap).is_ok()
     });
     if placed != Some(true) {
-        println!("    irq grant      FAILED to install the capabilities");
+        println!("\x1b[91m    irq grant      FAILED to install the capabilities\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -6475,7 +6511,7 @@ fn irq_delegation_self_test(handoff: &Handoff) -> bool {
     IRQ_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
     let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
     if sched::spawn_on_with(0, "irq-holder", irq_client, 0, hhdm, options).is_err() {
-        println!("    irq grant      FAILED to spawn a thread in the domain");
+        println!("\x1b[91m    irq grant      FAILED to spawn a thread in the domain\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -6524,11 +6560,11 @@ fn irq_delegation_self_test(handoff: &Handoff) -> bool {
 fn iommu_delegation_self_test(hhdm: u64) -> bool {
     let _ = hhdm;
     let Ok(owner) = domain::create("dma-holder", domain::ResourceEnvelope::new()) else {
-        println!("    iommu grant    FAILED to create a domain");
+        println!("\x1b[91m    iommu grant    FAILED to create a domain\x1b[0m");
         return false;
     };
     let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
-        println!("    iommu grant    FAILED to create a memory object");
+        println!("\x1b[91m    iommu grant    FAILED to create a memory object\x1b[0m");
         domain::destroy(owner);
         return false;
     };
@@ -6537,7 +6573,7 @@ fn iommu_delegation_self_test(hhdm: u64) -> bool {
         return false;
     };
     let (Ok(memory_cap), Ok(window_cap)) = (shared::name(object), iommu::name(device)) else {
-        println!("    iommu grant    FAILED to name the object or the window");
+        println!("\x1b[91m    iommu grant    FAILED to name the object or the window\x1b[0m");
         domain::destroy(owner);
         return false;
     };
@@ -6549,7 +6585,7 @@ fn iommu_delegation_self_test(hhdm: u64) -> bool {
             && domain.cspace.install_at(1, window_cap).is_ok()
     });
     if placed != Some(true) {
-        println!("    iommu grant    FAILED to install the capabilities");
+        println!("\x1b[91m    iommu grant    FAILED to install the capabilities\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -6562,7 +6598,7 @@ fn iommu_delegation_self_test(hhdm: u64) -> bool {
 
     let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
     if sched::spawn_on_with(0, "dma-holder", dma_client, 0, hhdm, options).is_err() {
-        println!("    iommu grant    FAILED to spawn a thread in the domain");
+        println!("\x1b[91m    iommu grant    FAILED to spawn a thread in the domain\x1b[0m");
         domain::destroy(owner);
         return false;
     }
@@ -6621,11 +6657,11 @@ fn iommu_delegation_self_test(hhdm: u64) -> bool {
 /// refused request outstanding.
 fn iommu_memory_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -> bool {
     let Ok(owner) = domain::create("dma-object", domain::ResourceEnvelope::new()) else {
-        println!("    iommu memory   FAILED to create a domain");
+        println!("\x1b[91m    iommu memory   FAILED to create a domain\x1b[0m");
         return false;
     };
     let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
-        println!("    iommu memory   FAILED to create a memory object");
+        println!("\x1b[91m    iommu memory   FAILED to create a memory object\x1b[0m");
         domain::destroy(owner);
         return false;
     };
@@ -6641,7 +6677,9 @@ fn iommu_memory_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -
         false,
         hhdm,
     ) else {
-        println!("    iommu memory   FAILED to map the object into the device window");
+        println!(
+            "\x1b[91m    iommu memory   FAILED to map the object into the device window\x1b[0m"
+        );
         domain::destroy(owner);
         return false;
     };
@@ -6722,7 +6760,7 @@ fn iommu_memory_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -
         // kept reaching the frames anyway.
         (_, _, None) => {
             println!(
-                "    iommu memory   FAILED: THE DEVICE STILL REACHED A REVOKED OBJECT at {:#x}",
+                "\x1b[91m    iommu memory   FAILED: THE DEVICE STILL REACHED A REVOKED OBJECT at {:#x}\x1b[0m",
                 address.as_u64()
             );
             false
@@ -6746,7 +6784,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         // Built and read back wrong is worse than not built: every value would
         // be right and the offsets wrong, which is a device translating
         // through some other device's tables.
-        println!("    iommu window   FAILED: the tables did not read back");
+        println!("\x1b[91m    iommu window   FAILED: the tables did not read back\x1b[0m");
         return None;
     }
 
@@ -6756,7 +6794,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // SAFETY: the window is built and verified, and its tables are never
     // freed. Nothing is doing DMA yet -- the device has not been programmed.
     if let Err(reason) = unsafe { iommu::enable(&found, &window, hhdm) } {
-        println!("    iommu enable   FAILED: {reason}");
+        println!("\x1b[91m    iommu enable   FAILED: {reason}\x1b[0m");
         return None;
     }
 
@@ -6849,9 +6887,15 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
                     // entries: without this it goes on believing this device
                     // has none, and every request it makes is dropped with the
                     // entry sitting correct in memory.
+                    // Hoisted out of the `if` so the unsafe block is the call
+                    // and nothing else. The reporting that follows is ordinary
+                    // safe code and has no business being counted as unsafe.
                     // SAFETY: the unit these windows are programmed into.
-                    if !unsafe { iommu::invalidate_contexts() } {
-                        println!("    iommu window   FAILED: the context cache did not invalidate");
+                    let invalidated = unsafe { iommu::invalidate_contexts() };
+                    if !invalidated {
+                        println!(
+                            "\x1b[91m    iommu window   FAILED: the context cache did not invalidate\x1b[0m"
+                        );
                     }
                     println!(
                         "    iommu window   {:02x}:{:02x}.{} translating too, its own page table \
@@ -6863,11 +6907,13 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
                     );
                 } else {
                     println!(
-                        "    iommu window   FAILED: the second device's tables did not read back"
+                        "\x1b[91m    iommu window   FAILED: the second device's tables did not read back\x1b[0m"
                     );
                 }
             }
-            None => println!("    iommu window   FAILED: no page table for the second device"),
+            None => println!(
+                "\x1b[91m    iommu window   FAILED: no page table for the second device\x1b[0m"
+            ),
         }
     }
     match &remapped {
@@ -6919,7 +6965,7 @@ fn block_self_test(handoff: &Handoff) -> bool {
             return true;
         }
         Err(error) => {
-            println!("    virtio-blk     FAILED to bring up: {error:?}");
+            println!("\x1b[91m    virtio-blk     FAILED to bring up: {error:?}\x1b[0m");
             return false;
         }
     };
@@ -6987,7 +7033,7 @@ fn block_self_test(handoff: &Handoff) -> bool {
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    virtio-blk     FAILED: {name} ({completed} completed, {timeouts} timed out)"
+                "\x1b[91m    virtio-blk     FAILED: {name} ({completed} completed, {timeouts} timed out)\x1b[0m"
             );
             ok = false;
         }
@@ -7040,7 +7086,9 @@ fn console_input(handoff: &Handoff) -> bool {
         (bhaskix_arch::apic::SPURIOUS_VECTOR, "apic spurious"),
     ] {
         if let Err(error) = vectors::reserve(vector, owner) {
-            println!("    vectors        FAILED: {owner} wants {vector:#04x}: {error:?}");
+            println!(
+                "\x1b[91m    vectors        FAILED: {owner} wants {vector:#04x}: {error:?}\x1b[0m"
+            );
             return false;
         }
     }
@@ -7055,7 +7103,7 @@ fn console_input(handoff: &Handoff) -> bool {
     let vector = match unsafe { input::install(COM1, handoff.bsp_lapic_id, handoff.rsdp, hhdm) } {
         Ok(vector) => vector,
         Err(reason) => {
-            println!("    console        FAILED to claim the serial line: {reason}");
+            println!("\x1b[91m    console        FAILED to claim the serial line: {reason}\x1b[0m");
             return false;
         }
     };
@@ -7069,7 +7117,9 @@ fn console_input(handoff: &Handoff) -> bool {
     let vector_ok = entry & 0xff == u32::from(vector);
     let unmasked = entry & (1 << 16) == 0;
     if !vector_ok || !unmasked {
-        println!("    io apic        FAILED: entry for gsi {gsi} reads back {entry:#x}");
+        println!(
+            "\x1b[91m    io apic        FAILED: entry for gsi {gsi} reads back {entry:#x}\x1b[0m"
+        );
         return false;
     }
 
@@ -7207,7 +7257,7 @@ fn shell_self_test() -> bool {
     for (name, passed) in checks {
         if !passed {
             println!(
-                "    shell          FAILED: {name} ({count} of {} bytes, {} interrupts, {wrong} of {commands} commands wrong)",
+                "\x1b[91m    shell          FAILED: {name} ({count} of {} bytes, {} interrupts, {wrong} of {commands} commands wrong)\x1b[0m",
                 TYPED.len(),
                 delivered - delivered_before
             );
@@ -7236,7 +7286,7 @@ fn shell_self_test() -> bool {
 /// rather than as an unexplained ring 3 failure two tests later.
 fn vfs_self_test(handoff: &Handoff) -> bool {
     let Some(_) = handoff.initrd else {
-        println!("    vfs            FAILED: nothing to mount");
+        println!("\x1b[91m    vfs            FAILED: nothing to mount\x1b[0m");
         return false;
     };
 
@@ -7296,7 +7346,7 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
     let mut ok = true;
     for (name, passed) in checks {
         if !passed {
-            println!("    vfs            FAILED: {name}");
+            println!("\x1b[91m    vfs            FAILED: {name}\x1b[0m");
             ok = false;
         }
     }
@@ -7331,7 +7381,7 @@ fn syscall_self_test(hhdm_base: u64) -> bool {
     use bhaskix_arch::gdt;
 
     if !bhaskix_arch::syscall::enabled() {
-        println!("    syscall        FAILED: SYSCALL was never enabled");
+        println!("\x1b[91m    syscall        FAILED: SYSCALL was never enabled\x1b[0m");
         return false;
     }
 
@@ -7364,7 +7414,7 @@ fn syscall_self_test(hhdm_base: u64) -> bool {
     let mut ok = true;
     for (name, passed) in checks {
         if !passed {
-            println!("    syscall        FAILED: {name}");
+            println!("\x1b[91m    syscall        FAILED: {name}\x1b[0m");
             ok = false;
         }
     }
@@ -7455,7 +7505,9 @@ fn capability_self_test() -> bool {
 
     let Some((widening_refused, distinct, badge_survived, transitive, parent_survived)) = outcome
     else {
-        println!("    capabilities   FAILED: the arena refused a capability it should have made");
+        println!(
+            "\x1b[91m    capabilities   FAILED: the arena refused a capability it should have made\x1b[0m"
+        );
         return false;
     };
 
@@ -7477,7 +7529,7 @@ fn capability_self_test() -> bool {
     let mut ok = true;
     for (name, passed) in checks {
         if !passed {
-            println!("    capabilities   FAILED: {name}");
+            println!("\x1b[91m    capabilities   FAILED: {name}\x1b[0m");
             ok = false;
         }
     }
@@ -7522,7 +7574,9 @@ fn tickless_report() {
     let overflowed = time::overflowed();
 
     if overflowed > 0 {
-        println!("    tickless       WARNING: {overflowed} timers refused, queue too small");
+        println!(
+            "\x1b[93m    tickless       WARNING: {overflowed} timers refused, queue too small\x1b[0m"
+        );
     }
 
     println!(
@@ -7568,17 +7622,19 @@ fn lock_ordering_self_test() -> bool {
     sync::reset_violations();
 
     if real != 0 {
-        println!("    lock order     FAILED: {real} real ordering violations before the probe");
+        println!(
+            "\x1b[91m    lock order     FAILED: {real} real ordering violations before the probe\x1b[0m"
+        );
         return false;
     }
     if detected != 1 {
         println!(
-            "    lock order     FAILED: deliberate inversion produced {detected} reports, expected 1"
+            "\x1b[91m    lock order     FAILED: deliberate inversion produced {detected} reports, expected 1\x1b[0m"
         );
         return false;
     }
     if checked == 0 {
-        println!("    lock order     FAILED: no acquisition was ever rank-checked");
+        println!("\x1b[91m    lock order     FAILED: no acquisition was ever rank-checked\x1b[0m");
         return false;
     }
 
@@ -7625,9 +7681,33 @@ fn verify_guard_page(handoff: &Handoff) {
 /// asserted by `tests/qemu/boot-test.sh`. Do not reword it without updating
 /// that test and `docs/roadmap.md`.
 fn banner() {
+    // Colour via ANSI, which both console sinks now understand: the serial
+    // line always did, and `framebuffer::FbConsole` learned the subset this
+    // uses so the screen shows colour rather than the escape codes themselves.
+    //
+    // The name is drawn rather than printed because this is the first thing a
+    // person sees, and on a machine that has just been handed control by the
+    // firmware it is also the first evidence that the framebuffer, the font
+    // blitter and the serial port all work.
+    const SUN: &str = "\x1b[93m";
+    const NAME: &str = "\x1b[96m";
+    const TEXT: &str = "\x1b[97m";
+    const DIM: &str = "\x1b[90m";
+    const OFF: &str = "\x1b[0m";
+
     println!();
-    println!("  Hello from Bhaskix");
-    println!("  version {VERSION} -- x86_64 -- Apache-2.0");
+    println!("{SUN}      ____  _   _    _    ____  _  _____  __{OFF}");
+    println!("{SUN}     | __ )| | | |  / \\  / ___|| |/ /_ _| \\ \\/ /{OFF}");
+    println!("{SUN}     |  _ \\| |_| | / _ \\ \\___ \\| ' / | |   \\  /{OFF}");
+    println!("{SUN}     | |_) |  _  |/ ___ \\ ___) | . \\ | |   /  \\{OFF}");
+    println!("{SUN}     |____/|_| |_/_/   \\_\\____/|_|\\_\\___| /_/\\_\\{OFF}");
+    println!();
+    println!("{NAME}     भास्कर  —  the light-maker{OFF}");
+    println!("{TEXT}     An open-source, AI-native, enterprise operating system,{OFF}");
+    println!("{TEXT}     built from scratch, from India.{OFF}");
+    println!();
+    println!("{DIM}     Original author and developer   {OFF}{TEXT}Tarun Kumar Kushwaha{OFF}");
+    println!("{DIM}     version {VERSION}  ·  x86_64  ·  Apache-2.0{OFF}");
     println!();
 }
 
@@ -7696,7 +7776,7 @@ fn verify_timer() {
     if trap::ticks() > before {
         println!("    timer          hlt wakes on interrupt (idle path works)");
     } else {
-        println!("    timer          WARNING: hlt returned without a tick");
+        println!("\x1b[93m    timer          WARNING: hlt returned without a tick\x1b[0m");
     }
 }
 
@@ -7718,7 +7798,7 @@ fn report_boot_state(handoff: &Handoff, serial: bool, framebuffer: bool) {
     );
 
     if handoff.regions_truncated {
-        println!("    WARNING: the memory map was truncated by the boot shim.");
+        println!("\x1b[93m    WARNING: the memory map was truncated by the boot shim.\x1b[0m");
         println!("             Raise MAX_MEMORY_REGIONS. Memory beyond the cut is");
         println!("             invisible to the kernel and must not be allocated.");
     }
@@ -8086,7 +8166,9 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
     use sched::SpawnOptions;
 
     if cpus < 2 {
-        println!("    domains        skipped, needs a cpu that is not running the tests");
+        println!(
+            "\x1b[93m    domains        skipped, needs a cpu that is not running the tests\x1b[0m"
+        );
         return true;
     }
 
@@ -8100,7 +8182,7 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
         domain::create("lonely", envelope),
         domain::create("crowded", envelope),
     ) else {
-        println!("    domains        FAILED to create domains");
+        println!("\x1b[91m    domains        FAILED to create domains\x1b[0m");
         return false;
     };
 
@@ -8127,7 +8209,9 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
             let _ = domain::add_thread(lonely, id);
         }
         Err(error) => {
-            println!("    domains        FAILED to spawn in the first domain: {error:?}");
+            println!(
+                "\x1b[91m    domains        FAILED to spawn in the first domain: {error:?}\x1b[0m"
+            );
             ok = false;
         }
     }
@@ -8138,7 +8222,9 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
                 let _ = domain::add_thread(crowded, id);
             }
             Err(error) => {
-                println!("    domains        FAILED to spawn in the second domain: {error:?}");
+                println!(
+                    "\x1b[91m    domains        FAILED to spawn in the second domain: {error:?}\x1b[0m"
+                );
                 ok = false;
             }
         }
@@ -8221,7 +8307,7 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     for (name, passed) in checks {
         if !passed {
-            println!("    domains        FAILED: {name}");
+            println!("\x1b[91m    domains        FAILED: {name}\x1b[0m");
             ok = false;
         }
     }
@@ -8231,7 +8317,7 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // out, which is the slowest possible way to learn one number.
     if !shares_divided {
         println!(
-            "    domains        FAILED: shares not divided -- weights {weights:?}, {lonely_weight} vs {crowded_weight} total"
+            "\x1b[91m    domains        FAILED: shares not divided -- weights {weights:?}, {lonely_weight} vs {crowded_weight} total\x1b[0m"
         );
         ok = false;
     }
@@ -8265,7 +8351,9 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
     use sched::{Policy, RtPolicy, SpawnOptions};
 
     if cpus < 2 {
-        println!("    sched classes  skipped, needs a cpu that is not running the tests");
+        println!(
+            "\x1b[93m    sched classes  skipped, needs a cpu that is not running the tests\x1b[0m"
+        );
         return true;
     }
 
@@ -8288,14 +8376,18 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let heavy_id = match sched::spawn_on_with(CPU, "fair-3x", burner, 0, hhdm_base, heavy) {
         Ok(id) => id,
         Err(error) => {
-            println!("    sched classes  FAILED to spawn the heavy thread: {error:?}");
+            println!(
+                "\x1b[91m    sched classes  FAILED to spawn the heavy thread: {error:?}\x1b[0m"
+            );
             return false;
         }
     };
     let light_id = match sched::spawn_on_with(CPU, "fair-1x", burner, 1, hhdm_base, light) {
         Ok(id) => id,
         Err(error) => {
-            println!("    sched classes  FAILED to spawn the light thread: {error:?}");
+            println!(
+                "\x1b[91m    sched classes  FAILED to spawn the light thread: {error:?}\x1b[0m"
+            );
             return false;
         }
     };
@@ -8340,7 +8432,7 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // TRACKER.md says so rather than quoting this looser band as the target.
     if !(15..=60).contains(&ratio_tenths) {
         println!(
-            "    sched classes  FAILED: weight 3:1 gave {}.{}x, outside 1.5-6.0x ({heavy_cycles} vs {light_cycles} ticks)",
+            "\x1b[91m    sched classes  FAILED: weight 3:1 gave {}.{}x, outside 1.5-6.0x ({heavy_cycles} vs {light_cycles} ticks)\x1b[0m",
             ratio_tenths / 10,
             ratio_tenths % 10
         );
@@ -8367,7 +8459,7 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let rt_id = match sched::spawn_on_with(CPU, "rt-50", burner, 2, hhdm_base, rt) {
         Ok(id) => id,
         Err(error) => {
-            println!("    sched classes  FAILED to spawn the rt thread: {error:?}");
+            println!("\x1b[91m    sched classes  FAILED to spawn the rt thread: {error:?}\x1b[0m");
             return false;
         }
     };
@@ -8380,7 +8472,7 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let rt_cycles = sched::cycles_of(rt_id).unwrap_or(0);
 
     if rt_cycles == 0 {
-        println!("    sched classes  FAILED: the real-time thread never ran");
+        println!("\x1b[91m    sched classes  FAILED: the real-time thread never ran\x1b[0m");
         ok = false;
     } else if fair_cycles.saturating_mul(2) > rt_cycles {
         // Not zero, and it should not be: the fair threads are outranked, not
@@ -8390,7 +8482,7 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
         // deliberately -- the property is "strictly preferred", and a tight
         // threshold here would measure the emulator.
         println!(
-            "    sched classes  FAILED: fair threads took {fair_cycles} ticks against the rt thread's {rt_cycles}"
+            "\x1b[91m    sched classes  FAILED: fair threads took {fair_cycles} ticks against the rt thread's {rt_cycles}\x1b[0m"
         );
         ok = false;
     }
@@ -8409,13 +8501,15 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
         Err(sched::SpawnError::RtOverCommitted { .. }) => true,
         Err(other) => {
             println!(
-                "    sched classes  FAILED: over-commit rejected for the wrong reason: {other:?}"
+                "\x1b[91m    sched classes  FAILED: over-commit rejected for the wrong reason: {other:?}\x1b[0m"
             );
             ok = false;
             false
         }
         Ok(_) => {
-            println!("    sched classes  FAILED: an over-committed rt thread was admitted");
+            println!(
+                "\x1b[91m    sched classes  FAILED: an over-committed rt thread was admitted\x1b[0m"
+            );
             ok = false;
             false
         }
@@ -8458,7 +8552,7 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
         .pinned();
 
     if let Err(error) = sched::spawn_on_with(cpu, "rt-probe", rt_probe, 0, hhdm_base, options) {
-        println!("    rt latency     FAILED to spawn the probe: {error:?}");
+        println!("\x1b[91m    rt latency     FAILED to spawn the probe: {error:?}\x1b[0m");
         return false;
     }
 
@@ -8485,7 +8579,9 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let worst_ns = bhaskix_arch::tsc::to_nanos(worst);
 
     if rounds < ROUNDS / 2 {
-        println!("    rt latency     FAILED: only {rounds} of {ROUNDS} wakeups completed");
+        println!(
+            "\x1b[91m    rt latency     FAILED: only {rounds} of {ROUNDS} wakeups completed\x1b[0m"
+        );
         return false;
     }
 
@@ -8520,7 +8616,7 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         // cross-processor. A ring confined to one CPU would never exercise the
         // window this test exists for.
         if let Err(error) = sched::spawn(name, ring_station, id as u64, hhdm_base) {
-            println!("    wait queues    FAILED to spawn {name}: {error:?}");
+            println!("\x1b[91m    wait queues    FAILED to spawn {name}: {error:?}\x1b[0m");
             return false;
         }
     }
@@ -8565,27 +8661,29 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         // a ring that never slept shows no blocks, and a ring that slept but
         // was never woken shows blocks without wakeups.
         println!(
-            "    wait queues    FAILED: a station stalled -- laps {laps:?}, {blocks} sleeps, {wakeups} wakeups, {races} races"
+            "\x1b[91m    wait queues    FAILED: a station stalled -- laps {laps:?}, {blocks} sleeps, {wakeups} wakeups, {races} races\x1b[0m"
         );
         ok = false;
     } else if fastest - slowest > 1 {
         println!(
-            "    wait queues    FAILED: ring uneven -- laps {laps:?}, so the token did not visit every station"
+            "\x1b[91m    wait queues    FAILED: ring uneven -- laps {laps:?}, so the token did not visit every station\x1b[0m"
         );
         ok = false;
     }
 
     if blocks == 0 {
-        println!("    wait queues    FAILED: no thread ever blocked -- the ring spun instead");
+        println!(
+            "\x1b[91m    wait queues    FAILED: no thread ever blocked -- the ring spun instead\x1b[0m"
+        );
         ok = false;
     }
     if wakeups == 0 {
-        println!("    wait queues    FAILED: no thread was ever woken");
+        println!("\x1b[91m    wait queues    FAILED: no thread was ever woken\x1b[0m");
         ok = false;
     }
     if RING.overflowed() > 0 {
         println!(
-            "    wait queues    FAILED: {} sleepers overflowed the queue",
+            "\x1b[91m    wait queues    FAILED: {} sleepers overflowed the queue\x1b[0m",
             RING.overflowed()
         );
         ok = false;
@@ -8676,7 +8774,7 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     use core::sync::atomic::Ordering;
 
     if cpus < 2 {
-        println!("    migration      skipped, only one cpu online");
+        println!("\x1b[93m    migration      skipped, only one cpu online\x1b[0m");
         return true;
     }
 
@@ -8690,7 +8788,7 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     const NAMES: [&str; 3] = ["migrant-0", "migrant-1", "migrant-2"];
     for (id, name) in NAMES.iter().enumerate() {
         if let Err(error) = sched::spawn_on(0, name, migrant, id as u64, hhdm_base) {
-            println!("    migration      FAILED to spawn on cpu 0: {error:?}");
+            println!("\x1b[91m    migration      FAILED to spawn on cpu 0: {error:?}\x1b[0m");
             return false;
         }
     }
@@ -8702,7 +8800,7 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let placed = match sched::spawn("placed", migrant, PLACED_SLOT, hhdm_base) {
         Ok(id) => id,
         Err(error) => {
-            println!("    migration      FAILED to place a thread: {error:?}");
+            println!("\x1b[91m    migration      FAILED to place a thread: {error:?}\x1b[0m");
             return false;
         }
     };
@@ -8714,7 +8812,7 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let mut ok = true;
 
     if steals == 0 {
-        println!("    migration      FAILED: no thread was stolen");
+        println!("\x1b[91m    migration      FAILED: no thread was stolen\x1b[0m");
         ok = false;
     }
 
@@ -8732,7 +8830,7 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     for (id, seen) in MIGRANT_CPUS.iter().enumerate().take(NAMES.len()) {
         let mask = seen.load(Ordering::Relaxed);
         if mask == 0 {
-            println!("    migration      FAILED: migrant {id} never ran");
+            println!("\x1b[91m    migration      FAILED: migrant {id} never ran\x1b[0m");
             ok = false;
         } else if mask & !1 != 0 {
             moved += 1;
@@ -8740,7 +8838,9 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
 
     if moved == 0 {
-        println!("    migration      FAILED: every migrant stayed on cpu 0 ({steals} steals)");
+        println!(
+            "\x1b[91m    migration      FAILED: every migrant stayed on cpu 0 ({steals} steals)\x1b[0m"
+        );
         ok = false;
     }
 
@@ -8749,7 +8849,7 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // two is being updated on a path the other is not.
     if moved > steals {
         println!(
-            "    migration      FAILED: {moved} threads moved but only {steals} steals counted"
+            "\x1b[91m    migration      FAILED: {moved} threads moved but only {steals} steals counted\x1b[0m"
         );
         ok = false;
     }
@@ -8781,7 +8881,7 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
         if let Err(error) =
             sched::spawn_on(id, NAMES[id as usize], worker, u64::from(id), hhdm_base)
         {
-            println!("    threads        FAILED to spawn on cpu {id}: {error:?}");
+            println!("\x1b[91m    threads        FAILED to spawn on cpu {id}: {error:?}\x1b[0m");
             return false;
         }
     }
@@ -8802,18 +8902,20 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
         let observed = OBSERVED_CPU[id].load(Ordering::Relaxed);
 
         if count == 0 {
-            println!("    threads        FAILED: worker {id} never ran");
+            println!("\x1b[91m    threads        FAILED: worker {id} never ran\x1b[0m");
             ok = false;
         } else if observed != id as u64 {
             // The property that distinguishes per-CPU runqueues from a global
             // one: a thread created on CPU n must run on CPU n.
-            println!("    threads        FAILED: worker {id} ran on cpu {observed}, expected {id}");
+            println!(
+                "\x1b[91m    threads        FAILED: worker {id} ran on cpu {observed}, expected {id}\x1b[0m"
+            );
             ok = false;
         }
     }
 
     if switches == 0 {
-        println!("    threads        FAILED: no context switches occurred");
+        println!("\x1b[91m    threads        FAILED: no context switches occurred\x1b[0m");
         ok = false;
     }
 

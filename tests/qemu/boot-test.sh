@@ -30,7 +30,10 @@ fi
 
 # The greeting is the milestone's contract. If you reword it, update
 # docs/roadmap.md M1 and kernel/src/lib.rs::banner in the same change.
-EXPECT_GREETING="Hello from Bhaskix"
+# The banner line that proves the console works. Changed when the boot banner
+# gained the project's name in Devanagari and its author -- a greeting probe
+# has to name a line that actually exists.
+EXPECT_GREETING="the light-maker"
 
 # Strings that mean the boot went wrong even if the greeting appeared.
 FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"

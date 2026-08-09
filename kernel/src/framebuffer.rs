@@ -30,6 +30,28 @@ pub struct FbConsole {
     row: usize,
     foreground: u32,
     background: u32,
+    /// Where the parser is inside an escape sequence, if it is inside one.
+    escape: Escape,
+    /// Digits of the parameter being accumulated inside a CSI sequence.
+    param: u32,
+}
+
+/// Where [`FbConsole::write_byte`] is within an ANSI escape sequence.
+///
+/// **Needed because the two console sinks disagree about escapes.** A serial
+/// terminal interprets them; a framebuffer draws whatever glyph it is handed,
+/// so an unparsed `\x1b[1;33m` appears on screen as literal rubbish next to the
+/// text it was meant to colour. Kernel output carried no escapes at all until
+/// the boot banner wanted them, and the choice was to parse them here or to
+/// give the screen a worse boot than the serial line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Escape {
+    /// Not in a sequence.
+    None,
+    /// Seen `ESC`, waiting for `[`.
+    Seen,
+    /// Inside `ESC [`, accumulating parameters.
+    Csi,
 }
 
 impl FbConsole {
@@ -60,6 +82,8 @@ impl FbConsole {
             rows,
             column: 0,
             row: 0,
+            escape: Escape::None,
+            param: 0,
         };
         console.clear();
         Some(console)
@@ -180,8 +204,80 @@ impl FbConsole {
         }
     }
 
-    /// Writes one byte, handling `\n`, `\r`, `\t`, and backspace.
+    /// Maps an SGR foreground code to a pixel colour.
+    ///
+    /// Only the eight normal and eight bright foregrounds, which is what the
+    /// kernel emits. Anything else leaves the colour alone rather than
+    /// guessing, so an unrecognised sequence is invisible instead of wrong.
+    fn sgr(&mut self, code: u32) {
+        let (r, g, b) = match code {
+            0 => DEFAULT_FG,
+            30 | 90 => (0x6c, 0x66, 0x5c),
+            31 => (0xc8, 0x40, 0x2f),
+            91 => (0xff, 0x6b, 0x52),
+            32 => (0x4f, 0x9d, 0x3a),
+            92 => (0x79, 0xd4, 0x5c),
+            33 => (0xc8, 0x8a, 0x2f),
+            93 => (0xff, 0xc9, 0x5c),
+            34 => (0x3a, 0x7b, 0xd5),
+            94 => (0x6a, 0xa8, 0xff),
+            35 => (0x9d, 0x5c, 0xd4),
+            95 => (0xc9, 0x8c, 0xff),
+            36 => (0x38, 0x9d, 0x9d),
+            96 => (0x5c, 0xd4, 0xd4),
+            37 => (0xc8, 0xc4, 0xbd),
+            97 => (0xff, 0xff, 0xff),
+            _ => return,
+        };
+        self.foreground = self.fb.format.encode(r, g, b);
+    }
+
+    /// Writes one byte, handling `\n`, `\r`, `\t`, backspace, and the subset
+    /// of ANSI escapes the kernel emits.
     pub fn write_byte(&mut self, byte: u8) {
+        // Escapes first: a sequence's bytes are not text and must never reach
+        // the glyph blitter.
+        match self.escape {
+            Escape::None => {
+                if byte == 0x1b {
+                    self.escape = Escape::Seen;
+                    return;
+                }
+            }
+            Escape::Seen => {
+                self.escape = if byte == b'[' {
+                    Escape::Csi
+                } else {
+                    Escape::None
+                };
+                self.param = 0;
+                return;
+            }
+            Escape::Csi => {
+                match byte {
+                    b'0'..=b'9' => {
+                        self.param = self.param.saturating_mul(10) + u32::from(byte - b'0')
+                    }
+                    b';' => {
+                        self.sgr(self.param);
+                        self.param = 0;
+                    }
+                    // Any final byte ends the sequence. `m` is the only one
+                    // that means anything here; the rest are consumed so they
+                    // cannot be drawn.
+                    0x40..=0x7e => {
+                        if byte == b'm' {
+                            self.sgr(self.param);
+                        }
+                        self.escape = Escape::None;
+                        self.param = 0;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
+
         match byte {
             b'\n' => self.newline(),
             b'\r' => self.column = 0,
