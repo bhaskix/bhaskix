@@ -577,6 +577,30 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("    remote hold    no thread was descheduled holding another cpu's runqueue");
     }
 
+    // The voluntary half of the same question. `preempt` refuses to deschedule
+    // a lock holder; `block_self` cannot refuse, so it reports instead — and
+    // each report carries the call site that must release before it blocks.
+    let blocked_holding = sched::blocked_holding();
+    if blocked_holding > 0 {
+        println!("    block holding  {blocked_holding} threads blocked while holding a lock");
+    } else {
+        println!("    block holding  no thread blocked while holding a lock");
+    }
+
+    // The question the other two leave open: whichever path did it, was a
+    // thread ever *stored* carrying ranks? Zero here with a lock-order report
+    // at `finish_switch` would mean the mask restored on resume was never
+    // written by a switch — making it wrong rather than merely inconvenient.
+    let (saved, mask, who) = sched::saved_holding();
+    if saved > 0 {
+        let who = who.unwrap_or(u32::MAX);
+        println!(
+            "    saved holding  {saved} switches carried held ranks; last thread {who}, mask {mask:#08b}"
+        );
+    } else {
+        println!("    saved holding  no thread was switched out holding a rank");
+    }
+
     // RFC 0011 step 6: an interrupt a domain holds. Before the DMA tests,
     // because it hands the block device's interrupt to a domain and puts it
     // back — and a device with no interrupt is a driver on the timer.

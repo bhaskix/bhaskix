@@ -221,6 +221,15 @@ pub struct Thread {
     /// while holding the heap must take that fact with it, or the next thread
     /// to run on that CPU inherits an ordering constraint it had no part in.
     pub held_locks: u64,
+    /// How many locks this thread holds while it is not running.
+    ///
+    /// Travels with the thread for the same reason [`Thread::held_locks`]
+    /// does, and is separate from it because the two are given up at opposite
+    /// ends of a release: the rank mask before the lock is let go, so the next
+    /// acquisition of that rank is not misread as a second one, and this count
+    /// after, so there is no instant where the lock is held and the CPU says
+    /// it holds nothing. `sync::holds_any` is what `preempt` consults.
+    pub held_count: u32,
     /// Whether this thread may never migrate.
     ///
     /// True for the thread each CPU registers for itself: it runs on the stack
@@ -718,6 +727,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         runs: 1,
         migrations: 0,
         held_locks: 0,
+        held_count: 0,
         space_root: 0,
         reply_to: None,
         receive_slot: None,
@@ -916,6 +926,7 @@ pub fn spawn_on_with(
         runs: 0,
         migrations: 0,
         held_locks: 0,
+        held_count: 0,
         space_root: 0,
         reply_to: None,
         receive_slot: None,
@@ -1084,6 +1095,57 @@ pub fn runqueue_readable(cpu: usize) -> bool {
 /// Online CPUs, clamped so it can index [`QUEUES`].
 fn online_cpus() -> usize {
     (percpu::online_count() as usize).min(MAX_CPUS)
+}
+
+/// Times a thread was switched out carrying a non-empty rank mask.
+///
+/// The question both earlier instruments left open. A thread arrives at
+/// `finish_switch` with `SchedRunqueue` already in its mask, and neither
+/// blocking-while-holding nor preemption-while-holding-a-remote-queue accounts
+/// for it. This catches the moment the bit is *written* to a thread, whatever
+/// path produced it — and distinguishes a genuine hold from a mask that is
+/// simply wrong, which the other two cannot.
+static SAVED_HOLDING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The mask most recently saved into a switched-out thread, and who it was.
+static LAST_SAVED_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LAST_SAVED_THREAD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Records a thread being switched out holding ranks, and reports the first.
+fn note_saved_holding(id: u32, name: &'static str, mask: u64, where_: &'static str) {
+    let first = SAVED_HOLDING.fetch_add(1, Ordering::Relaxed) == 0;
+    LAST_SAVED_MASK.store(mask, Ordering::Relaxed);
+    LAST_SAVED_THREAD.store(id, Ordering::Relaxed);
+    // Only the first, because this runs under the runqueue lock on the switch
+    // path: a boot that did it often would spend bring-up printing.
+    if first {
+        crate::println!(
+            "    SAVED HOLDING  thread {id} ({name}) switched out via {where_} holding mask {mask:#08b}"
+        );
+    }
+}
+
+/// `(count, last mask, last thread)` for switches made carrying held ranks.
+#[must_use]
+pub fn saved_holding() -> (u64, u64, Option<u32>) {
+    let id = LAST_SAVED_THREAD.load(Ordering::Relaxed);
+    (
+        SAVED_HOLDING.load(Ordering::Relaxed),
+        LAST_SAVED_MASK.load(Ordering::Relaxed),
+        (id != u32::MAX).then_some(id),
+    )
+}
+
+/// Times a thread blocked voluntarily while holding a lock.
+///
+/// **Any non-zero value is a defect**: the thread is switched out still
+/// holding it, and if it is never chosen again nothing ever releases it.
+static BLOCKED_HOLDING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many threads blocked while holding a lock. Zero on a healthy boot.
+#[must_use]
+pub fn blocked_holding() -> u64 {
+    BLOCKED_HOLDING.load(Ordering::Relaxed)
 }
 
 /// Times a thread was descheduled while holding another CPU's runqueue lock.
@@ -1665,7 +1727,7 @@ pub fn preempt() {
     // very signature it should have made impossible. Kept because descheduling
     // a lock holder is wrong regardless, and left uncommented-out so nobody
     // rediscovers the unsoundness and assumes it was the fault all along.
-    if crate::sync::held_mask() != 0 || crate::sync::holds_unranked() {
+    if crate::sync::holds_any() {
         return;
     }
 
@@ -1697,7 +1759,7 @@ pub fn preempt() {
     // preemption is harmless; spinning for a lock the interrupted code holds
     // is a deadlock against itself.
     let switch = {
-        let Some(mut queue) = QUEUES[cpu].try_lock() else {
+        let Some(mut queue) = QUEUES[cpu].try_lock_for_switch() else {
             restore_interrupts(interrupts_were_enabled);
             return;
         };
@@ -1801,10 +1863,16 @@ pub fn preempt() {
         // outgoing thread and installed for the incoming one, both under this
         // lock so the swap cannot be observed half-done.
         let incoming_locks = queue.threads[next].as_ref().map_or(0, |t| t.held_locks);
+        let incoming_count = queue.threads[next].as_ref().map_or(0, |t| t.held_count);
         if let Some(thread) = queue.threads[current].as_mut() {
             thread.held_locks = crate::sync::held_mask();
+            thread.held_count = crate::sync::holds_count();
+            if thread.held_locks != 0 {
+                note_saved_holding(thread.id, thread.name, thread.held_locks, "preempt");
+            }
         }
         crate::sync::set_held_mask(incoming_locks);
+        crate::sync::set_holds_count(incoming_count);
 
         // Everything from here until `finish_switch` is the window rule 2
         // exists for: `current` is marked `Ready`, the lock is about to be
@@ -2188,10 +2256,39 @@ pub fn cancel_block() {
 /// happens. But without the recheck a thread woken in the gap with nothing
 /// else runnable on its CPU has no exit from the loop and spins here forever,
 /// which is a hang rather than a slowdown.
+#[track_caller]
 pub fn block_self() {
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
+    }
+
+    // INSTRUMENTATION. Reports, and does not refuse.
+    //
+    // This is the last switch path a lock holder can still go through.
+    // `preempt` turns such a thread away, and can: skipping a preemption costs
+    // one tick. `block_self` cannot -- the caller has decided to stop, and a
+    // block that declines to block becomes a spin.
+    //
+    // So a thread that arrives here holding a lock is switched out still
+    // holding it, and if it is never chosen again nothing releases it. That is
+    // the bring-up stall: measured from the other end, `finish_switch` blocks
+    // on a runqueue while the mask restored for the incoming thread already
+    // has that rank set, at one boot in thirty.
+    //
+    // Reporting rather than refusing, because the fix belongs at the call site
+    // -- release before you block -- and refusing here would hide which call
+    // site that is. `#[track_caller]` names it.
+    if crate::sync::held_mask() != 0 || crate::sync::holds_any() {
+        BLOCKED_HOLDING.fetch_add(1, Ordering::Relaxed);
+        let site = core::panic::Location::caller();
+        crate::println!(
+            "    BLOCK HOLDING  a thread blocked holding locks (mask {:#08b}, {} held), at {}:{}",
+            crate::sync::held_mask(),
+            crate::sync::holds_count(),
+            site.file(),
+            site.line()
+        );
     }
 
     // Same reasoning as `preempt`: choosing and switching must be one step
@@ -2212,7 +2309,7 @@ pub fn block_self() {
             // captured a few lines below as the outgoing thread's. The thread
             // would then carry a lock it does not hold to wherever it next
             // runs, and be reported for an inversion on its own runqueue.
-            let Some(mut queue) = QUEUES[cpu].try_lock() else {
+            let Some(mut queue) = QUEUES[cpu].try_lock_for_switch() else {
                 core::hint::spin_loop();
                 continue;
             };
@@ -2263,10 +2360,16 @@ pub fn block_self() {
                 queue.current = next;
 
                 let incoming_locks = queue.threads[next].as_ref().map_or(0, |t| t.held_locks);
+                let incoming_count = queue.threads[next].as_ref().map_or(0, |t| t.held_count);
                 if let Some(thread) = queue.threads[current].as_mut() {
                     thread.held_locks = crate::sync::held_mask();
+                    thread.held_count = crate::sync::holds_count();
+                    if thread.held_locks != 0 {
+                        note_saved_holding(thread.id, thread.name, thread.held_locks, "block_self");
+                    }
                 }
                 crate::sync::set_held_mask(incoming_locks);
+                crate::sync::set_holds_count(incoming_count);
                 queue.switching = true;
 
                 let Some(from) = queue.threads[current]
@@ -2994,6 +3097,7 @@ mod tests {
             runs: 0,
             migrations: 0,
             held_locks: 0,
+            held_count: 0,
             space_root: 0,
             reply_to: None,
             receive_slot: None,

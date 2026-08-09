@@ -694,6 +694,53 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-09 (the stall was a release order, and the two false alarms after it were mine)
+
+**700 boots, no stall**, where about five were expected. The cause was not a missing lock or a bad
+call site: it was the *order* in which a release gives things up.
+
+**One mask was doing two jobs.** `held_mask` answers "where in the declared order is this CPU", and
+`preempt` was reading it as "is this CPU holding anything". Those need opposite timing. The rank bit
+must be cleared **before** the lock is released, or the next acquisition of that rank looks like a
+second one and is reported against blameless code. A hold must be given up **after**, or there is a
+window in which the lock is still held and the CPU reports nothing — and a tick landing there
+carries the holder away with the lock still set, leaving a runqueue no CPU can ever take again. That
+window is the bring-up stall, and it is why the dump said *held by nobody*.
+
+The fix is a second piece of state, `sync::holds_any`, covering ranked and unranked acquisitions
+alike, given up after the release while the rank bit is given up before it. Neither has to
+compromise for the other.
+
+**Two attempts in between were wrong, and both were caught by the soak rather than by review.**
+
+| Attempt | What it did | How it failed |
+|---|---|---|
+| Move *both* to after the release | Correct for preemption | False ordering report, 1 boot in 700 — a wait-queue bit outliving its release |
+| Count per-CPU, not per-thread | Simpler | Leaked across switches; 3 boots in 28, and it wedged the boot outright once `preempt` counted its own switch lock |
+| Count after the rank bit on acquire | Looked symmetric | Two instructions claiming a rank with the count still empty — 1 boot in 30 |
+
+The rule both halves now obey: **claim before you might hold, give up after you certainly do not.**
+Over-claiming costs a skipped preemption; under-claiming costs a CPU.
+
+**Three instruments were added and stay**, each a boot gate reading clean on a healthy boot, because
+every hypothesis in this hunt that was argued rather than measured turned out wrong:
+
+- `remote hold` — a thread descheduled holding *another* CPU's runqueue.
+- `block holding` — a thread blocking voluntarily while holding a lock. `preempt` can refuse such a
+  thread; `block_self` cannot, since a block that declines to block is a spin, so it reports and
+  names the caller.
+- `saved holding` — a thread switched out carrying ranks. This is the one that solved it: it named
+  `ipc-cli-a` and `dom-a-0` being stored with masks they did not hold, which no amount of reading
+  had produced.
+
+Lock-order violations now print `file:line` via `#[track_caller]`. `blocking on SchedRunqueue while
+holding SchedRunqueue` names a shape, not a line, and this kernel takes runqueue locks in some thirty
+places.
+
+**Verification is partial and is recorded as such.** The 700-boot result covers the release-order fix.
+The acquisition-order fix that followed it has 68 clean boots at the time of writing, against a
+violation rate of 1 in 30 — suggestive, not settled. A full run is still owed.
+
 ### 2026-08-09 (a hypothesis for the stall, instrumented, and refuted)
 
 **The stall is not what this thought it was, and the entry exists to stop the next person walking the

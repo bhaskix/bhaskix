@@ -44,25 +44,49 @@
 //! could carry the exiting thread off its CPU still holding a **remote**
 //! runqueue, which nothing would then release.
 //!
-//! [`holds_unranked`] answers the question the rank set cannot: not *where in
+//! [`holds_any`] answers the question the rank set cannot: not *where in
 //! the order* this CPU is, but *whether it is holding anything at all*. Taking
 //! no rank and holding no lock are different claims, and only the first is
 //! true of `try_lock`.
 //!
-//! ## What this did not do
+//! ## Two questions, two pieces of state, and why they cannot be one
 //!
-//! **It did not fix the bring-up stall, which is why it was written.** The
-//! hypothesis was that the stall *was* this: a soak had one stalled boot
-//! reporting a switch made while holding a remote runqueue, against 54 healthy
-//! boots reporting none. That is a correlation on a single sample, and it did
-//! not survive. With the guard in place 3 boots in 500 stalled, against 4 in
-//! 500 without it — the same rate — and one of them arrived with the identical
-//! signature the guard was supposed to make impossible.
+//! [`held_mask`] and [`holds_any`] look redundant and are not. The mask says
+//! *where in the declared order* this CPU sits; the count says *whether it is
+//! holding anything*. They are given up at opposite ends of the release, and
+//! neither order works for both:
 //!
-//! Kept anyway, because descheduling a lock holder is wrong whether or not it
-//! is the cause of *this* fault. Written down because a rule whose
-//! justification is a bug it did not fix will otherwise be remembered as
-//! having fixed it.
+//! - The **rank bit must go before** the lock is released. Held one instant
+//!   longer, the next acquisition of that rank looks like two at once and is
+//!   reported as a violation against blameless code.
+//! - The **count must go after**. Given up first, there is a window in which
+//!   the lock is still held and the CPU reports nothing — and a tick landing
+//!   there carries the holder away with the lock still set.
+//!
+//! For one milestone a single mask did both jobs and was cleared before the
+//! release, which is correct for ranking and wrong for preemption. That was
+//! the bring-up stall: a lock left held by a thread that would never run
+//! again, recorded as held by nobody. Splitting the two, and moving only the
+//! count, took 700 boots from an expected five stalls to none.
+//!
+//! Getting this backwards is not hypothetical: the first attempt moved *both*
+//! to after the release and produced a false ordering report at one boot in
+//! 700 — the wait-queue bit still set from a release that had not finished
+//! being recorded.
+//!
+//! **Acquisition has the same rule and the opposite order**: the count goes up
+//! *before* the rank bit. Set the mask first and there are two instructions in
+//! which this CPU claims a rank while the count still reads empty, so a tick
+//! carries the thread off holding a rank it has not yet acquired — and on
+//! resume `finish_switch` reports an ordering violation against it. That was
+//! the second false report, at one boot in thirty, and it was found by an
+//! instrument rather than by rereading this file: `SAVED HOLDING` named
+//! `ipc-cli-a` and `dom-a-0` being switched out carrying masks they did not
+//! hold.
+//!
+//! The rule both halves obey: **claim before you might hold, give up after you
+//! certainly do not.** Over-claiming costs a skipped preemption. Under-claiming
+//! costs a CPU.
 //!
 //! ## Why a violation reports rather than panics
 //!
@@ -284,15 +308,24 @@ pub fn held_mask() -> u64 {
     slot().load(Ordering::Relaxed)
 }
 
-/// Locks this CPU holds that are *not* in the ranked set — the `try_lock`s.
+/// How many locks this CPU holds, of any kind, ranked or not.
 ///
-/// A count rather than a mask: `try_lock` takes no position in the order, so
-/// there is nothing to record but how many are outstanding, and they nest.
-static UNRANKED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+/// **A second question, deliberately not answered by the rank mask.** The mask
+/// says *where in the declared order* this CPU sits, and it must be exact for
+/// the order check: a bit left set after its lock is released makes the next
+/// acquisition of that rank look like two at once, which is a violation
+/// reported against code that did nothing wrong. It was, and the soak found it
+/// at one boot in 700.
+///
+/// This says only *whether anything at all is held*, which is what deciding to
+/// deschedule a thread depends on. Being a count, it is exact under nesting;
+/// being separate, it can be given up **after** the release while the rank bit
+/// is given up before it, and neither has to compromise for the other.
+static HOLDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
-fn unranked_slot() -> &'static AtomicU32 {
+fn holds_slot() -> &'static AtomicU32 {
     let cpu = percpu::cpu_id() as usize;
-    &UNRANKED[if cpu < MAX_CPUS { cpu } else { 0 }]
+    &HOLDS[if cpu < MAX_CPUS { cpu } else { 0 }]
 }
 
 /// Whether this CPU holds any lock taken with [`SpinLock::try_lock`].
@@ -305,13 +338,41 @@ fn unranked_slot() -> &'static AtomicU32 {
 /// those are different claims. A `try_lock` cannot *deadlock*, but its holder
 /// still holds the lock, and descheduling one strands every CPU waiting on it.
 ///
-/// **Not verified by the stall going away, because it did not.** See the
-/// module header: the guard this feeds was written to end the bring-up stall
-/// and did not, at 3 boots in 500 against 4 in 500 without it. It is kept for
-/// the argument above, which stands on its own.
+/// Whether this CPU holds any lock at all — the question [`held_mask`] cannot
+/// answer, and the one [`crate::sched::preempt`] needs.
+///
+/// Covers `try_lock` as well as `lock`: taking no rank and holding no lock are
+/// different claims, and only the first is true of a `try_lock`.
+///
+/// Stays true until *after* the lock is released, so there is no instant in
+/// which a CPU holds something and reports nothing. The reverse — reporting a
+/// lock for a few instructions after dropping it — costs at most one skipped
+/// preemption.
 #[must_use]
-pub fn holds_unranked() -> bool {
-    unranked_slot().load(Ordering::Relaxed) != 0
+pub fn holds_any() -> bool {
+    holds_slot().load(Ordering::Relaxed) != 0
+}
+
+/// How many locks this CPU holds, for the context switch to save.
+///
+/// The count belongs to the *thread*, exactly as the rank mask does — see
+/// [`set_held_mask`]. Left on the CPU it would pass to whoever ran next: a
+/// thread that took no lock would inherit a count it never earned, and a CPU
+/// whose count never fell back to zero would stop preempting altogether.
+///
+/// This was learned the second way round. The count was added per-CPU with no
+/// saving, on the assumption that a holder could never be switched out — which
+/// is what the guard is *for*, but `block_self` switches without consulting
+/// it. The leak moved enough scheduling around to expose a genuine two-runqueue
+/// inversion that 800 previous boots had never produced.
+#[must_use]
+pub fn holds_count() -> u32 {
+    holds_slot().load(Ordering::Relaxed)
+}
+
+/// Replaces the hold count for this CPU, for the incoming thread.
+pub fn set_holds_count(count: u32) {
+    holds_slot().store(count, Ordering::Relaxed);
 }
 
 /// Replaces the held set for this CPU.
@@ -350,7 +411,7 @@ pub fn set_reporting(on: bool) {
     REPORT.store(on, Ordering::Relaxed);
 }
 
-fn record(held: u64, rank: Rank) {
+fn record(held: u64, rank: Rank, site: &core::panic::Location<'_>) {
     VIOLATIONS.fetch_add(1, Ordering::Relaxed);
     if !REPORT.load(Ordering::Relaxed) {
         return;
@@ -358,11 +419,23 @@ fn record(held: u64, rank: Rank) {
     // Naming both ends matters: "out of order" without saying against what
     // sends the reader to read every lock site, which is the work the rank
     // list exists to avoid.
+    //
+    // And naming *where*, because the two ends are not enough when both are
+    // the same rank. `blocking on SchedRunqueue while holding SchedRunqueue`
+    // identifies a shape, not a line, and this kernel takes runqueue locks in
+    // some thirty places. The caller's location turns a week of reading into
+    // one `grep`.
+    //
+    // The thread is deliberately not named: asking which thread is running
+    // takes a runqueue lock, and this runs *inside* an acquisition that is
+    // already going wrong.
     crate::println!(
-        "    LOCK ORDER     blocking on {} (rank {}) while holding mask {:#08b}",
+        "    LOCK ORDER     blocking on {} (rank {}) while holding mask {:#08b}, at {}:{}",
         rank.name(),
         rank as u8,
-        held
+        held,
+        site.file(),
+        site.line()
     );
 }
 
@@ -443,19 +516,57 @@ impl<T> SpinLock<T> {
     /// Exempt from rank checking, and does not record the acquisition: see the
     /// module header.
     ///
-    /// **It does count towards [`holds_unranked`]**, which is a different
+    /// **It does count towards [`holds_any`]**, which is a different
     /// question from ranking and was for a long time answered by accident. The
     /// order it takes is nothing; the lock it holds is real.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        // Counted *before* the attempt, and given back if it fails. After a
+        // winning exchange there is a window -- however short -- in which this
+        // CPU holds the lock and has not yet said so, and `preempt` reads that
+        // as a thread holding nothing. `lock` has always claimed its rank
+        // before it starts spinning, for the same reason; this is that rule
+        // applied to the count. Over-claiming costs a skipped preemption.
+        holds_slot().fetch_add(1, Ordering::Relaxed);
+        let won = self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok();
+        if !won {
+            holds_slot().fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
+        Some(SpinLockGuard {
+            lock: self,
+            ranked: false,
+            counted: true,
+        })
+    }
+
+    /// [`SpinLock::try_lock`] for the scheduler's own runqueue, during a
+    /// switch, which must **not** count towards [`holds_any`].
+    ///
+    /// Everywhere else the count means "locks the running thread holds", and
+    /// the switch saves it into that thread. This one is held by the CPU
+    /// *performing* the switch rather than by either thread involved, so
+    /// counting it records a lock against whichever thread happens to be going
+    /// out — a phantom hold it never releases. Threads then accumulate holds
+    /// they do not have, `holds_any` never falls back to false, preemption
+    /// stops, and the machine wedges before its first scheduler test. That is
+    /// not a hypothetical; it is what the first attempt at this did.
+    ///
+    /// Safe to leave uncounted because the two callers hold it only with
+    /// interrupts masked, and release it before the switch itself.
+    pub fn try_lock_for_switch(&self) -> Option<SpinLockGuard<'_, T>> {
         self.locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
             .map(|_| {
                 self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
-                unranked_slot().fetch_add(1, Ordering::Relaxed);
                 SpinLockGuard {
                     lock: self,
                     ranked: false,
+                    counted: false,
                 }
             })
     }
@@ -465,12 +576,34 @@ impl<T> SpinLock<T> {
     /// Checks the declared order first. The check happens *before* the spin,
     /// not after: once this blocks on a lock it should not have, the report
     /// would never be printed.
+    ///
+    /// `#[track_caller]` so a violation can name the line that caused it. It
+    /// costs a `Location` argument on a path that already does a
+    /// compare-exchange, and buys the one fact the report was missing.
+    #[track_caller]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         let held = held_mask();
         ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
         if would_violate(held, self.rank) {
-            record(held, self.rank);
+            record(held, self.rank, core::panic::Location::caller());
         }
+        // **The count goes up before the rank bit, and the order is not
+        // arbitrary.** `preempt` asks the count, and the mask is what a switch
+        // saves into the outgoing thread. Set the mask first and there are two
+        // instructions in which this CPU claims a rank while the count still
+        // says it holds nothing — so a tick landing there switches the thread
+        // out carrying a rank it has not even acquired yet, and on resume
+        // `finish_switch` takes a runqueue lock against that phantom bit and
+        // reports an ordering violation against blameless code.
+        //
+        // Measured, not reasoned: `ipc-cli-a` and `dom-a-0` were caught being
+        // switched out holding masks they did not hold, once in thirty boots,
+        // matching the false reports one for one.
+        //
+        // Both go up before the spin, so there is no instant in which the lock
+        // is held and either says otherwise. Claiming while merely waiting
+        // costs a skipped preemption.
+        holds_slot().fetch_add(1, Ordering::Relaxed);
         slot().fetch_or(self.rank.bit(), Ordering::Relaxed);
 
         while self
@@ -489,6 +622,7 @@ impl<T> SpinLock<T> {
         SpinLockGuard {
             lock: self,
             ranked: true,
+            counted: true,
         }
     }
 }
@@ -500,6 +634,9 @@ pub struct SpinLockGuard<'a, T> {
     /// Whether acquisition was recorded in the held set, and so must be
     /// cleared. False for `try_lock`, which does not participate.
     ranked: bool,
+    /// Whether acquisition was counted towards [`holds_any`], and so must be
+    /// given back. False only for [`SpinLock::try_lock_for_switch`].
+    counted: bool,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -524,23 +661,46 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
+        // Four steps whose order is the whole of two bugs. Each says why it is
+        // where it is, because every plausible rearrangement of them is wrong.
+
+        // **The rank bit goes first, before the release.** It answers "where in
+        // the declared order is this CPU", and it must be exact: held one
+        // instant past the release, the next acquisition of the same rank
+        // looks like two at once and is reported as a violation against code
+        // that did nothing. Clearing it late did exactly that, once in 700
+        // boots -- `blocking on wait::WaitQueue while holding` the wait queue
+        // bit, which is the release that had not finished being recorded.
         if self.ranked {
             slot().fetch_and(!self.lock.rank.bit(), Ordering::Relaxed);
-        } else {
-            // Decremented on the CPU that runs the drop, which is the CPU that
-            // took it: a `try_lock` holder cannot now be moved, because that is
-            // exactly what this count prevents.
-            unranked_slot().fetch_sub(1, Ordering::Relaxed);
         }
-        // Cleared *before* the release below, not after. Between the release
-        // and a later clear the lock is free, so another CPU may take it and
-        // record itself -- and this store would then erase a live owner and
-        // leave the lock reading as unheld while somebody holds it. The
-        // diagnostic would be wrong in exactly the case it exists for.
+
+        // **The owner goes before the release too.** After it the lock is free,
+        // another CPU may take it and record itself, and this store would
+        // erase a live owner -- the lock reading unheld while somebody holds
+        // it, wrong in the one case the field exists for.
         self.lock.owner.store(NO_OWNER, Ordering::Relaxed);
-        // Release ordering pairs with the Acquire in `lock()`, so everything
+
+        // Release ordering pairs with the Acquire in `lock`, so everything
         // written under the lock is visible to the next holder.
         self.lock.locked.store(false, Ordering::Release);
+
+        // **The hold count goes last, after the release, and that is the other
+        // bug.** It answers "is this CPU holding anything", which is what
+        // `sched::preempt` asks before descheduling a thread. Given up before
+        // the release -- as the rank bit used to be, doing both jobs at once --
+        // there is a window where the lock is still held and the CPU reports
+        // nothing, and a tick landing in it carries the holder away with
+        // `locked` still set and nothing recorded as holding it. That is a
+        // runqueue no CPU can ever acquire again: the `readable 0 of 20,
+        // records no owner` dump.
+        //
+        // Late is the safe direction. For these few instructions the CPU
+        // claims a lock it has already dropped, and the cost is one skipped
+        // preemption.
+        if self.counted {
+            holds_slot().fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -564,18 +724,79 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_is_never_held_while_the_cpu_claims_nothing() {
+        // The stall this cost: release used to clear the held bookkeeping
+        // before letting go, so a tick in between descheduled a thread that
+        // still held the lock -- `preempt` having been told it held nothing.
+        //
+        // Checked at every point a switch could land, by observing both facts
+        // together rather than trusting the order of the lines.
+        set_held_mask(0);
+        let lock = SpinLock::new(Rank::Console, ());
+
+        let guard = lock.try_lock().expect("free");
+        assert!(
+            lock.locked.load(Ordering::Relaxed) && holds_any(),
+            "held, and said to be held"
+        );
+        drop(guard);
+        assert!(
+            !lock.locked.load(Ordering::Relaxed) && !holds_any(),
+            "free, and said to be free"
+        );
+
+        // The ranked path carries the same obligation.
+        let guard = lock.lock();
+        assert!(
+            lock.locked.load(Ordering::Relaxed) && held_mask() != 0,
+            "held, and said to be held"
+        );
+        drop(guard);
+        assert!(!lock.locked.load(Ordering::Relaxed) && held_mask() == 0);
+    }
+
+    #[test]
+    fn releasing_and_retaking_one_rank_is_not_a_violation() {
+        // The regression the first attempt at the release order caused. Two
+        // wait queues taken one after the other are ordinary; only *both at
+        // once* is a violation. Clearing the rank bit after the release made
+        // the second look like the second of two, and the soak reported it
+        // against blameless code at one boot in 700.
+        set_held_mask(0);
+        reset_violations();
+        let first = SpinLock::new(Rank::WaitQueue, ());
+        let second = SpinLock::new(Rank::WaitQueue, ());
+        drop(first.lock());
+        drop(second.lock());
+        assert_eq!(violations(), 0, "sequential, not nested");
+    }
+
+    #[test]
+    fn holding_a_rank_still_blocks_preemption_after_its_bit_is_cleared() {
+        // The other half: the bit goes early and the count goes late, so
+        // between them the lock is held, the order says nothing, and the
+        // thread still must not be moved.
+        set_held_mask(0);
+        let lock = SpinLock::new(Rank::Console, ());
+        let guard = lock.lock();
+        assert!(holds_any(), "held");
+        drop(guard);
+        assert!(!holds_any(), "and given up only once truly released");
+    }
+
+    #[test]
     fn try_lock_keeps_its_holder_on_the_cpu() {
         // The fix for the bring-up stall, as a property: `try_lock` takes no
         // rank -- it cannot be an edge in a deadlock cycle -- but it *is*
         // holding a lock, and `sched::preempt` must not deschedule its holder.
         set_held_mask(0);
         let lock = SpinLock::new(Rank::Console, ());
-        assert!(!holds_unranked(), "nothing held to begin with");
+        assert!(!holds_any(), "nothing held to begin with");
         let guard = lock.try_lock().expect("free");
         assert_eq!(held_mask(), 0, "still takes no rank");
-        assert!(holds_unranked(), "but is held, so its holder must not move");
+        assert!(holds_any(), "but is held, so its holder must not move");
         drop(guard);
-        assert!(!holds_unranked(), "released");
+        assert!(!holds_any(), "released");
     }
 
     #[test]
@@ -586,12 +807,9 @@ mod tests {
         let first = a.try_lock().expect("free");
         let second = b.try_lock().expect("free");
         drop(second);
-        assert!(
-            holds_unranked(),
-            "one is still held after the inner release"
-        );
+        assert!(holds_any(), "one is still held after the inner release");
         drop(first);
-        assert!(!holds_unranked());
+        assert!(!holds_any());
     }
 
     #[test]
@@ -603,7 +821,7 @@ mod tests {
         let held = lock.try_lock().expect("free");
         assert!(lock.try_lock().is_none(), "already held");
         drop(held);
-        assert!(!holds_unranked(), "the failed attempt counted nothing");
+        assert!(!holds_any(), "the failed attempt counted nothing");
     }
 
     #[test]
