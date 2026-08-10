@@ -73,7 +73,16 @@ unsafe impl GlobalAlloc for KernelAllocator {
 // whole binary, so under `cargo test` this would replace the *host* test
 // harness's allocator with one backed by physical memory that does not exist --
 // and the harness would fail to allocate before running a single test.
-#[cfg(not(test))]
+//
+// `cfg(test)` alone is not enough, because it is only set for *this* crate's
+// own tests. A host binary that merely depends on the kernel -- the `fuzz/`
+// target, which drives `elf::parse` against a byte buffer -- compiles it in
+// non-test mode and inherits this allocator, then aborts on its first
+// allocation with `memory allocation of 16 bytes failed`. That is the exact
+// failure the paragraph above describes, arriving through a door it did not
+// cover. The `host` feature is that door, and nothing in a kernel build enables
+// it.
+#[cfg(all(not(test), not(feature = "host")))]
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 

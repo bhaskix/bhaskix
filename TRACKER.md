@@ -281,10 +281,12 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
   still there — a test that waits for ever reports nothing — but it is now an upper limit rather
   than the measurement.
 
-- **The fuzz requirement is met by a weaker mechanism than §8 intends**, and `docs/coding-style.md`
-  §7's neighbour now records the deviation. A seeded mutation harness explores blindly; coverage
-  guidance is what finds the path needing four specific bytes in the right places. One million
-  archives is a real number and it is not the same assurance.
+- ~~**The fuzz requirement is met by a weaker mechanism than §8 intends.**~~ **Closed 2026-08-10 for
+  the ELF loader**, which now has a libFuzzer target in `fuzz/`. The paragraph's own argument is what
+  the numbers went on to show: coverage guidance found **2,054 inputs reaching new paths** in
+  `elf::parse` in two hours, where **twelve billion blind mutations** over three hours found nothing
+  the harness had not already seen. Blind exploration saturates; guidance does not. **`ustar` and
+  `DMAR` still have only the seeded harness**, so the deviation stands for them.
 - **A `ustar` member with a `prefix` field is reported under its short name.** Joining the two needs
   a buffer and this parser does not allocate. The build never produces one, so it is wrong in a way
   that cannot currently happen — but it is wrong, and silently.
@@ -643,7 +645,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: the ELF loader's 24 hours of fuzzing (M6), and mount points, which nothing has needed yet |
+| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The ELF loader's fuzzing is done** (2026-08-10) — 901 million coverage-guided executions and 12 billion seeded mutations, no crash, no hang, no unbounded loop |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -693,6 +695,43 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-10 (the ELF loader's fuzzing, which this file has owed since M6)
+
+Two campaigns, neither of which found anything, and the pair is the point: one of them could not have.
+
+| | Inputs | Result |
+|---|---|---|
+| Seeded mutation, 12 batches over disjoint seeds `0…12e9` | **12,000,000,000** | no panic, ~2h55m |
+| Coverage-guided (libFuzzer, `fuzz/elf_parse`) | **901,322,222** at 125k/s | no crash, **2,054 new coverage units**, no unit slower than a second, peak RSS 600 MB |
+
+**The seeded harness was re-running the same billion inputs.** It walks `0..iterations`, so a longer
+campaign was not a wider one — twelve batches would have tested one billion images twelve times.
+`BHASKIX_FUZZ_SEED_BASE` fixes that, and the twelve billion above are distinct.
+
+**Coverage guidance is what §8 was asking for, and the difference is measurable.** 2,054 inputs each
+reached code the previous inputs did not; blind mutation produced none the harness had not already
+seen. `slowest_unit_time_sec: 0` is the quietly reassuring one — no input made the parser loop on a
+length its own header chose, which is the failure a loader is most prone to.
+
+**Three gates had to be satisfied, and each was right to object.**
+
+- **The kernel's global allocator aborted the fuzzer on its first allocation.** `heap.rs` already
+  carried a comment predicting exactly this — for `cargo test`. But `cfg(test)` is set only for the
+  crate's *own* tests, and a dependent host binary compiles the kernel in non-test mode and inherits
+  an allocator backed by physical memory that does not exist. The hazard was documented and the
+  guard still did not cover the door the fuzzer came through. A `host` feature closes it; no kernel
+  build sets it.
+- **`bhaskix-fuzz` had no declared unsafe budget.** Zero, and it must stay zero: a fuzz target that
+  needs `unsafe` to reach a parser can manufacture its own crashes.
+- **`libfuzzer-sys` is the repository's first external dependency**, and `ALLOWED_EXTERNAL` was
+  empty. Allowlisted rather than hidden behind a skip path, so the exception is visible to anyone
+  auditing dependencies. The shipped kernel still has none: `fuzz/` is its own workspace, host-only,
+  nightly-only, and never linked into anything that boots.
+
+**What this does not cover.** `ustar` and the `DMAR` parser still have only the seeded harness. The
+argument §8 makes about blind exploration applies to them unchanged, and now with a measured example
+of the gap.
 
 ### 2026-08-09 (the second stall: the bootstrap CPU waited for seven CPUs on a four-CPU machine)
 

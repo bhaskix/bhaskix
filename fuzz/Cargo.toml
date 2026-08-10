@@ -1,0 +1,38 @@
+# Its own workspace on purpose.
+#
+# The parent workspace builds for `x86_64-unknown-none` and its members are the
+# kernel and the things it ships. A fuzz target is a host binary that links
+# libFuzzer, so folding it in would make every ordinary `cargo build` drag in a
+# nightly-only sanitizer runtime. `cargo fuzz` is run explicitly or not at all.
+[package]
+name = "bhaskix-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+authors = ["Tarun Kumar Kushwaha"]
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.bhaskix]
+# Zero, and it must stay zero. A fuzz target that needs `unsafe` to reach the
+# parser is a fuzz target that can produce its own crashes, and then a finding
+# means nothing until you have worked out whose fault it was.
+unsafe_budget = 0
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bhaskix-kernel = { path = "../kernel", features = ["host"] }
+
+[[bin]]
+name = "elf_parse"
+path = "fuzz_targets/elf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
+
+[workspace]

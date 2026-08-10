@@ -678,14 +678,25 @@ mod tests {
         // interesting failures are arithmetic: an offset plus a length that
         // wraps, a page count that overflows, an entry inside a segment whose
         // size is `u64::MAX`.
-        let iterations: usize = std::env::var("BHASKIX_FUZZ_ITERATIONS")
+        let iterations: u64 = std::env::var("BHASKIX_FUZZ_ITERATIONS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(20_000);
 
+        // Where in the seed space to start. Without it a longer campaign is
+        // not a wider one: every run walks `0..iterations` and re-tests the
+        // inputs the last run already cleared. A batch runner sets this to
+        // `batch * iterations` so consecutive batches explore disjoint seeds,
+        // which is the difference between eight billion inputs and one billion
+        // inputs tried eight times.
+        let first: u64 = std::env::var("BHASKIX_FUZZ_SEED_BASE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+
         let base = good();
 
-        for seed in 0..iterations as u64 {
+        for seed in first..first.saturating_add(iterations) {
             let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d).wrapping_add(7));
             let mut bytes = base.clone();
 

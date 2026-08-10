@@ -202,3 +202,9 @@ unsafe_budget = 1089
 # same argument: `elf::parse` refuses an entry point outside a user-executable
 # segment, every segment it accepted was mapped, and the stack address is one
 # past user-writable memory in the space just installed.
+
+[features]
+# Lets a *host* binary link this crate without inheriting the kernel's global
+# allocator, which is backed by physical memory that does not exist off the
+# machine. Enabled only by `fuzz/`; a kernel build must never set it.
+host = []

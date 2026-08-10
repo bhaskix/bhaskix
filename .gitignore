@@ -38,3 +38,9 @@ qemu.pid
 
 # Local tooling context is excluded via .git/info/exclude, not here —
 # .gitignore is a published file and must stay free of tooling references.
+
+# Fuzzing (cargo-fuzz): build output, corpora and crash artefacts.
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/

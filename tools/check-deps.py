@@ -69,6 +69,12 @@ LAYERS = {
     "bhaskix-drivers": 4,
     "bhaskix-boot-shim": 5,    # the binary, top of the graph
 
+    # The fuzz target, above everything because it drives the kernel's parsers
+    # from outside. It is a host binary in its own workspace and no kernel build
+    # links it, so nothing may ever depend on it -- which the layer rule already
+    # enforces by giving it the highest number.
+    "bhaskix-fuzz": 6,
+
     # User programs. Layer -1 because they are not in the kernel's graph at
     # all: they run in ring 3 and reach it only through system calls, so a
     # dependency on any kernel crate would be a category error rather than a
@@ -115,7 +121,24 @@ PLACEMENTS: dict[str, set[str]] = {
 # Third-party crates permitted in the tree. Empty on purpose: Bhaskix has no
 # external dependencies, and adding the first one should require a
 # conversation, which an empty allowlist guarantees.
-ALLOWED_EXTERNAL: set[str] = set()
+# The one exception, and it is scoped as narrowly as an exception can be.
+#
+# `docs/security.md` §1 treats a dependency as attack surface, and the shipped
+# kernel still has none: this crate is reachable only from `fuzz/`, which is its
+# own workspace, builds only for the host, needs a nightly sanitizer runtime,
+# and is never linked into anything that boots. `cargo build` does not pull it
+# in; `cargo fuzz` does, explicitly.
+#
+# It buys what a seeded harness cannot. `coding-style.md` §8 asks for a fuzz
+# target on every untrusted parser, and TRACKER recorded a deviation from M6-03
+# onwards because the requirement was met by blind mutation. Coverage guidance
+# found 2,054 inputs reaching new paths in `elf::parse` in two hours; twelve
+# billion blind images over three hours found none the harness had not already
+# seen.
+#
+# Anything added here needs the same standard: host-only, out of the boot
+# graph, and worth more than the surface it adds.
+ALLOWED_EXTERNAL: set[str] = {"libfuzzer-sys"}
 
 RED, GREEN, RESET = "\033[1;31m", "\033[1;32m", "\033[0m"
 
