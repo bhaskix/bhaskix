@@ -132,16 +132,6 @@ pub fn start_secondaries(handoff: &bhaskix_boot::Handoff) -> u32 {
         return 0;
     };
 
-    // Bracketing the loader's own bring-up call, because the stall between
-    // `demand paging` and `cpus N online` has to be on one side of it and the
-    // logs cannot currently say which. The bounded wait below was measured at
-    // 6.4 seconds to exhaust, so a boot that hangs indefinitely is not hanging
-    // there -- which leaves this call, or a secondary that never returns from
-    // `secondary_main`.
-    //
-    // Two lines rather than one: a single "entering" line tells you where it
-    // stopped only if you already know the next line is missing, and this
-    // kernel has been misread that way once today.
     // Snapshotted *before* the call, and that is the whole of a stall.
     //
     // `percpu::install` increments the online count as its first act, so a
@@ -162,17 +152,56 @@ pub fn start_secondaries(handoff: &bhaskix_boot::Handoff) -> u32 {
         return 0;
     }
 
-    // Wait for them to report in. Bounded: a CPU that never arrives must not
-    // hang the boot, and reporting "3 of 7 came online" is far more useful
-    // than a machine that stops with no explanation.
+    // Wait for them to report in, bounded by a **deadline** rather than by a
+    // spin count. A CPU that never arrives must not hang the boot, and
+    // reporting "3 of 7 came online" is far more useful than a machine that
+    // stops with no explanation.
+    //
+    // The count this replaces was two billion iterations, which is not a
+    // duration: it was measured at 6.4 seconds of *guest* time on a machine
+    // where the same boot took 491 seconds of wall-clock, because an emulated
+    // TSC does not track the host clock. A bound nobody can convert into
+    // seconds cannot be reasoned about, and on a slow or emulated machine it
+    // turns a diagnosable "one CPU is missing" into what looks like a hang.
+    //
+    // Two seconds because bring-up here takes microseconds; a secondary that
+    // has not arrived by then is not late, it is absent.
+    const WAIT_NANOS: u64 = 2_000_000_000;
     let expected = before + requested;
+    let deadline = crate::time::now_nanos().map(|now| now.saturating_add(WAIT_NANOS));
     let mut spins = 0u64;
-    while percpu::online_count() < expected && spins < 2_000_000_000 {
-        spins += 1;
+    while percpu::online_count() < expected {
+        // No clock yet is possible in principle, so the old bound stays as the
+        // fallback rather than becoming an unbounded wait.
+        let expired = match deadline {
+            Some(deadline) => crate::time::now_nanos().is_some_and(|now| now >= deadline),
+            None => {
+                spins += 1;
+                spins >= 2_000_000_000
+            }
+        };
+        if expired {
+            break;
+        }
         core::hint::spin_loop();
     }
 
-    percpu::online_count().saturating_sub(1)
+    // Said out loud, and in the warning colour, because `report` prints
+    // "N online of M reported" and a reader has to know M to see that N is
+    // short. On real hardware a secondary that never checks in is a fault in
+    // firmware, in the APIC, or in this kernel's own entry path -- and it is
+    // the difference between a machine that is slow and a machine that is
+    // missing a processor.
+    let online = percpu::online_count();
+    if online < expected {
+        println!(
+            "\x1b[93m    smp            {} of {requested} secondaries never reported in after {} ms\x1b[0m",
+            expected - online,
+            WAIT_NANOS / 1_000_000
+        );
+    }
+
+    online.saturating_sub(1)
 }
 
 /// Prints what came online.
