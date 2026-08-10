@@ -649,7 +649,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets: 901 million executions over `elf::parse` and 12 billion seeded mutations, 2.45 billion over `DMAR`, 96 million over `ustar`. No crash, no hang, no unbounded loop. The duration §8 asks for is still not met: 24 hours, against two |
+| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets: 901 million executions over `elf::parse` and 12 billion seeded mutations, 2.45 billion over `DMAR`, and 96 million over `ustar` uncapped plus 250 million capped. No crash, no hang, no unbounded loop. The duration §8 asks for is still not met: 24 hours, against two |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -753,6 +753,32 @@ not a like-for-like number: its inputs are archives, its corpus is 25 MB, and a 
 twenty-five times more to execute. Both stopped finding new edges long before the campaign ended,
 but the smaller number is the one to grow next. And the duration in M6's exit criterion is still
 unmet — it says 24 hours, and this says two.
+
+**Addendum, the same evening: `ustar`'s number grown, and the obvious lever was the wrong one.**
+
+| | Executions, two hours at three workers | Result |
+|---|---|---|
+| `ustar`, uncapped | 96,020,255 | 157 edges, 694 features |
+| `ustar`, `-max_len=16384` | **249,838,036** | no crash, no timeout, no OOM; 155 edges, 537 features; corpus 168 → 206 |
+
+The obvious lever was `cargo fuzz cmin`, and it bought **nothing**. It reduced the corpus from 523
+files and 25 MB to 168 and 8.8 MB with coverage preserved exactly — 146 edges and 683 features on
+replay, unchanged — and throughput went from 2,525 to 2,543 executions a second on identical
+copies, which is noise. Both replays had already reported `corp: …/8521Kb`: libFuzzer was
+discarding the 355 redundant files at load on *every* run, so `cmin` only made permanent on disk
+what the fuzzer was doing in memory anyway. It is worth doing for startup and disk, and it is not a
+throughput fix.
+
+**The cost is per-byte, not per-file.** A `tar` payload costs bytes without adding parser logic —
+the walk steps over it and `data()` is a slice — so an archive's size buys very little. Capping
+input length is worth 5.4× the executions for two edges: 13,650 a second against 2,543, at 144
+edges against 146 on load. The campaign above confirms it at scale, reaching 155 of the uncapped
+run's 157 edges while executing 2.6× as many inputs.
+
+**Which leaves features, not edges, as what the big archives were buying** — 537 against 694, and
+that gap is real. Long archives combine states that short ones cannot, so the capped run is the
+better default and not a replacement. The next long campaign should be capped; an occasional
+uncapped one keeps the realistic initrd in the corpus.
 
 ### 2026-08-10 (the ELF loader's fuzzing, which this file has owed since M6)
 
