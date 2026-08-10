@@ -252,6 +252,27 @@ Restated per-subsystem in each design doc. The rules:
 > told where the edges are.** Any new harness in this project seeds the edges explicitly, and a
 > harness is not considered working until a deliberately reintroduced bug of the kind it is meant to
 > catch actually fails it.
+>
+> **Closed 2026-08-10.** All three parsers this deviation was written about — `elf::parse`, the
+> `ustar` reader, and `DMAR` — now have libFuzzer targets in [`fuzz/`](../fuzz), so the seeded
+> harness is the second line of defence the paragraph above anticipated rather than the only one. It
+> stays, and not out of sentiment: it runs on stable, in CI, on every build, in twenty milliseconds,
+> and a libFuzzer campaign does none of those things.
+>
+> The nightly toolchain that made this possible is a *toolchain*, not a language feature.
+> [nightly-features.md](nightly-features.md) is still empty and still correct: there is no
+> `#![feature(...)]` anywhere in the tree, `fuzz/` is its own workspace, host-only, and nothing that
+> boots is linked against it. Anyone can still build Bhaskix with the stable toolchain their
+> distribution ships; they cannot fuzz it.
+>
+> **What guidance was worth, measured.** Over `elf::parse`, coverage guidance found 2,054 inputs
+> reaching code earlier inputs had not, while twelve billion blind mutations found nothing the
+> harness had not already seen. Over `DMAR` it was worth more than that, and for a reason worth
+> keeping: an ACPI table carries a checksum over every one of its bytes, so every mutation of a
+> valid table lands an invalid one and the fuzzer never gets past the header. The target repairs the
+> checksum before the second of its two parses. **A parser guarded by a whole-input checksum is
+> unreachable to a fuzzer that does not repair it**, and a target that does not say so reports a
+> clean campaign over the doorway.
 - **Every bug fix adds a regression test.** No exceptions. If the bug was not testable, say what you
   changed to make it testable.
 - QEMU integration tests run on every PR. The frame-leak test

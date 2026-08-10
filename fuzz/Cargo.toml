@@ -24,6 +24,8 @@ unsafe_budget = 0
 [dependencies]
 libfuzzer-sys = "0.4"
 bhaskix-kernel = { path = "../kernel", features = ["host"] }
+bhaskix-service-vfs = { path = "../services/vfs" }
+bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 
 [[bin]]
 name = "elf_parse"
@@ -36,3 +38,17 @@ bench = false
 debug = true
 
 [workspace]
+
+[[bin]]
+name = "ustar_parse"
+path = "fuzz_targets/ustar_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dmar_parse"
+path = "fuzz_targets/dmar_parse.rs"
+test = false
+doc = false
+bench = false

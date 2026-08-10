@@ -281,12 +281,16 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
   still there — a test that waits for ever reports nothing — but it is now an upper limit rather
   than the measurement.
 
-- ~~**The fuzz requirement is met by a weaker mechanism than §8 intends.**~~ **Closed 2026-08-10 for
-  the ELF loader**, which now has a libFuzzer target in `fuzz/`. The paragraph's own argument is what
-  the numbers went on to show: coverage guidance found **2,054 inputs reaching new paths** in
-  `elf::parse` in two hours, where **twelve billion blind mutations** over three hours found nothing
-  the harness had not already seen. Blind exploration saturates; guidance does not. **`ustar` and
-  `DMAR` still have only the seeded harness**, so the deviation stands for them.
+- ~~**The fuzz requirement is met by a weaker mechanism than §8 intends.**~~ **Closed 2026-08-10, for
+  all three parsers §8 names.** `elf::parse`, the `ustar` reader and `DMAR` each have a libFuzzer
+  target in `fuzz/`. The paragraph's own argument is what the numbers went on to show: coverage
+  guidance found **2,054 inputs reaching new paths** in `elf::parse` in two hours, where **twelve
+  billion blind mutations** over three hours found nothing the harness had not already seen. `DMAR`
+  cost more than that to reach at all — its whole-table checksum hid **a quarter of the parser** from
+  a fuzzer that did not repair it, and doubling the budget bought back none of it. Blind exploration
+  saturates; guidance does not; and a checksum saturates guidance too, unless the target climbs it.
+  **The mechanism is now the one §8 asks for. The duration is not** — M6's criterion says 24 hours,
+  and the longest campaign yet run is two.
 - **A `ustar` member with a `prefix` field is reported under its short name.** Joining the two needs
   a buffer and this parser does not allocate. The build never produces one, so it is wrong in a way
   that cannot currently happen — but it is wrong, and silently.
@@ -645,7 +649,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012; per-device windows landed with M7-13. Interrupt remapping is built and **off** — M6-16 |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The ELF loader's fuzzing is done** (2026-08-10) — 901 million coverage-guided executions and 12 billion seeded mutations, no crash, no hang, no unbounded loop |
+| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets: 901 million executions over `elf::parse` and 12 billion seeded mutations, 2.45 billion over `DMAR`, 96 million over `ustar`. No crash, no hang, no unbounded loop. The duration §8 asks for is still not met: 24 hours, against two |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -695,6 +699,60 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-10 (the other two parsers, and a checksum that was hiding a quarter of one)
+
+`elf::parse` closed its half of §8's fuzz requirement earlier today. `ustar` and `DMAR` close the
+rest — and the second of them was not the routine one it looked like.
+
+| Target | Executions, two hours at three workers | Result |
+|---|---|---|
+| `fuzz/ustar_parse` | **96,020,255** | no crash, no timeout, no OOM; 157 edges, 694 features; corpus 421 → 523 |
+| `fuzz/dmar_parse` | **2,450,756,142** | no crash, no timeout, no OOM; 127 edges, 428 features; corpus 23 → 147 |
+
+Replaying both final corpora reports `slowest_unit_time_sec: 0`, at peak RSS of 118 MB and 36 MB.
+Nothing loops, and nothing grows without bound.
+
+**The `DMAR` target's first campaign was fuzzing the doorway.** It plateaued at 23 corpus units
+within seconds, and only nine of those summed to zero. An ACPI table carries a checksum over *every
+byte of the table* and `parse_dmar` refuses anything that does not sum to zero — correctly, since
+that is what the firmware interface says. For a fuzzer it is a wall: every mutation of a table that
+passes lands one that does not, so guidance keeps rediscovering the header and never gets down the
+corridor. The target now parses each input twice, once as it arrived and once with the signature,
+length and checksum made consistent.
+
+**What the wall cost, measured.** Three variants over `parse_dmar`, differing in exactly one thing,
+each from an empty corpus with no seed inputs, at a fixed execution budget, two libFuzzer seeds
+apiece:
+
+| Variant | Parses per execution | Budget | Edges, seed 1 / 2 | Features |
+|---|---|---|---|---|
+| As it was — no repair | 1 | 30,000,000 | 86 / 80 | 147 / 137 |
+| As it was — double budget | 1 | 60,000,000 | **86 / 80** | 152 / 136 |
+| Repair only | 1 | 30,000,000 | 103 / 103 | 326 / 313 |
+| Both parses — what ships | 2 | 30,000,000 | **116 / 116** | 366 / 368 |
+
+**A quarter of the parser was unreachable, and budget does not buy it back.** Doubling the
+unrepaired budget returned *exactly* the same edge count — 86 and 80, unchanged — so it is
+saturated rather than merely slow. The unrepaired target also executes about 1.6× faster per run,
+which puts 60 million past wall-time parity with the 30 million repaired runs: the comparison is
+generous to it, and it still loses.
+
+**Both parses are kept, and the measurement is why.** Repair alone reaches 103 edges where the pair
+reaches 116. Those 13 are the rejection paths — the short buffer, the wrong signature, the length
+that disagrees with the buffer, the checksum that does not add up — and only an input that fails
+them proves they reject. A target that only repaired would have reported a clean campaign over a
+gate it had never tested.
+
+The general rule this buys, now recorded in [coding-style.md](docs/coding-style.md) §8 beside
+M6-03's: **a parser guarded by a whole-input checksum is unreachable to a fuzzer that does not
+repair it**, and a target that does not say so reports a clean campaign over the doorway.
+
+**Two things this does not cover.** `ustar`'s 96 million executions against `DMAR`'s 2.45 billion is
+not a like-for-like number: its inputs are archives, its corpus is 25 MB, and a unit costs about
+twenty-five times more to execute. Both stopped finding new edges long before the campaign ended,
+but the smaller number is the one to grow next. And the duration in M6's exit criterion is still
+unmet — it says 24 hours, and this says two.
 
 ### 2026-08-10 (the ELF loader's fuzzing, which this file has owed since M6)
 

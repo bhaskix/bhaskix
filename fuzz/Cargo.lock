@@ -32,7 +32,9 @@ version = "0.0.0"
 name = "bhaskix-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bhaskix-arch-x86-64",
  "bhaskix-kernel",
+ "bhaskix-service-vfs",
  "libfuzzer-sys",
 ]
 
