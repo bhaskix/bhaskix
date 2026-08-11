@@ -152,9 +152,14 @@ framework, IOMMU discovery and per-device domains, the driver framework, and the
 remains is process management, networking, the telemetry plane, `bhaskixboot.efi`, package
 management, and libc.
 
-- ⬜ **Process management** — fork/exec-equivalent (capability-shaped, not POSIX-shaped), process
-  trees, reaping, signals-equivalent. Nothing creates a domain except boot code; RFC 0013 declined
-  to propose a supervisor, and this is where one belongs
+- ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
+  M9-18 … M9-23. Capability-shaped rather than POSIX-shaped: no `fork` (it duplicates a capability
+  space by implication, which is ambient authority through the back door), no pid (the process tree
+  *is* the capability tree), no signals ("stop" is `KILL` on a capability you hold). **The
+  supervisor this row said was still owed exists**, in ring 3 — a program creates a domain, grants
+  it authority one piece at a time, starts a program in it, and reaps it. What is *not* done is the
+  fourth question the implementation raised: whether a domain should end when its last thread exits,
+  which needs the boot sequence to stop treating a domain as outliving its threads
 - ✅ **Full VFS** — [RFC 0015](rfc/0015-filesystem.md) and
   [RFC 0016](rfc/0016-capability-in-a-reply.md), both implemented. A writable filesystem with a
   journal and a page cache, running as a service in its own domain. The RFCs separate three things
