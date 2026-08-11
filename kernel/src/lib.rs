@@ -6997,11 +6997,14 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // `iommu=remap-irq` is still accepted and now means nothing, because a
     // command line that used to be the only way to get this is on machines and
     // in scripts that should not break for saying so.
-    let refused = handoff
+    // Not `refused`: that name is taken, five lines up, by the count of
+    // reserved regions this window would not map -- and shadowing it printed a
+    // boolean into the boot line where a number belongs.
+    let opted_out = handoff
         .cmdline
         .split_ascii_whitespace()
         .any(|word| word == "iommu=no-remap-irq");
-    let remapped = if refused {
+    let remapped = if opted_out {
         None
     } else {
         // SAFETY: as above -- the unit is programmed and nothing is routed yet.

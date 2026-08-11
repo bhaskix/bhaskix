@@ -732,6 +732,25 @@ this suite exists to refuse to ship quietly, and this is the only line that sees
 Verified in every configuration: IOMMU with the new default, IOMMU with `iommu=no-remap-irq`, no
 IOMMU at all, UEFI, the `fsd` placement, and the shell tests.
 
+**And it shipped with a bug that every one of those runs passed.** The flag's variable was named
+`refused`, which is already the name — five lines above — of the count of reserved regions the
+window would not map. Shadowing it printed a boolean into the boot line where a number belongs:
+
+```
+iommu window   00:03.0 39-bit, 3 levels, 0 reserved pages mapped, true refused
+```
+
+`clippy` caught it, on the next full-suite run, because the shadowed binding became unused. It was
+not caught before that because the commit was verified with `make gates` and the boot tests and
+**not** with `make clippy`, which is the check that saw it.
+
+**The gate that should have seen it stopped one field short.** Its pattern matched
+`… N-bit, N levels` and no further, so the corruption sat in the tail with every boot test green.
+That is a tenth entry for the table above of checks not looking at what they claim to, and the
+first one in it that this file's own author wrote. The pattern now matches to the end of the line,
+and was negative-tested both ways — it rejects the corrupted line and accepts the correct one.
+**A pattern that stops before a field cannot see that field go wrong.**
+
 ### 2026-08-11, later still (device-address reuse is on, and the proof is a test that fails when it should)
 
 **The second RFC 0012 fault is closed, and unlike the first it was real all along.** Reuse has been

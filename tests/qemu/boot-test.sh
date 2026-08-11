@@ -476,10 +476,15 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # The read-back is what checks the *indices*: an entry written at the wrong
     # offset holds entirely correct values, and is a device translating through
     # some other device's tables.
-    if grep -qE "iommu window +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9]+-bit, [0-9]+ levels" "$LOG"; then
+    # Matched to the end of the line, including the two counts, and that is not
+    # thoroughness for its own sake: this pattern used to stop at "levels", and
+    # a variable shadowing the reserved-region count printed `true refused`
+    # into that tail for a whole commit without a single gate noticing. A
+    # pattern that stops before a field cannot see that field go wrong.
+    if grep -qE "iommu window +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9]+-bit, [0-9]+ levels, [0-9]+ reserved pages mapped, [0-9]+ refused" "$LOG"; then
         pass "the device's translation structures are built and verified"
     else
-        fail "the IOMMU window was not built, or did not read back as written"
+        fail "the IOMMU window was not built, did not read back as written, or reported nonsense"
         status=1
     fi
 
