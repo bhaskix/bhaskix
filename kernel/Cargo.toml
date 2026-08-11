@@ -149,7 +149,13 @@ workspace = true
 # the four above were chasing: a `Unit` built fresh carries a zeroed shadow of
 # a write-only `GCMD`, so the first command written through it cleared the
 # translation-enable bit and turned the IOMMU off.
-unsafe_budget = 1120
+# 1122 at M6-22. One read of an object's frame through the direct map, in the
+# self-test that proves a reused device address translates to the object that
+# owns it now. There is no safe way to look at a page a device just wrote, and
+# looking is the entire test: without it the check would pass on a stale
+# translation, because a stale translation writes to the old page and reports
+# nothing.
+unsafe_budget = 1122
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

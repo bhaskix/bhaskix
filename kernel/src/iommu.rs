@@ -290,21 +290,29 @@ impl DevAddrSpace {
         }
         let bytes = pages.checked_mul(bhaskix_arch::vtd::PAGE_SIZE)?;
 
-        // Freed extents are deliberately **not** reused.
+        // A freed extent of exactly this size is reused, and the proof that
+        // makes that safe is `iommu_reuse_self_test`: a device address is
+        // mapped, written through, unmapped with an invalidation, handed out
+        // again to a *different* object, and written through again — and the
+        // first object's page is checked to be untouched. That last check is
+        // the whole thing, because a stale translation writes to the old page
+        // and reports nothing.
         //
-        // Reuse needs proof that no stale translation for that address
-        // survives, and that proof is missing: after an address was mapped,
-        // unmapped with a global IOTLB invalidation, and mapped again, a
-        // device still reached it — the page-table entry read back as zero and
-        // the access was not refused. Handing an address out again while the
-        // hardware may still translate it is a revocation with a delay fuse,
-        // which is the thing this project refuses everywhere else.
-        //
-        // The cost of not reusing is address space, and a window has 512 GiB
-        // of it. The cost of reusing wrongly is a device reaching memory that
-        // was taken away from it. `free` still records the extent, so the day
-        // invalidation is proven this becomes a lookup again rather than a
-        // redesign.
+        // Reuse was disabled from M6-13 until 2026-08-11 because that proof
+        // was missing and the fault had been seen once. It is exact-size only:
+        // splitting an extent means tracking remainders, and the window has
+        // 512 GiB, so the addresses a partial match would recover are not
+        // worth the bookkeeping.
+        for slot in &mut self.freed {
+            if let Some((address, extent)) = *slot
+                && extent == bytes
+                && (address < Self::LOW_LIMIT) == below_4gib
+            {
+                *slot = None;
+                return Some(DevAddr(address));
+            }
+        }
+
         let next = if below_4gib {
             &mut self.low_next
         } else {
@@ -861,6 +869,11 @@ pub fn unmap_device(device: (u8, u8, u8), address: u64, pages: u64) -> bool {
     drop(guard);
 
     // SAFETY: the unit `enable` programmed and whose registers it cached.
+    //
+    // Load-bearing, and measured: with this invalidation removed,
+    // `iommu_reuse_self_test` fails exactly as M6-13 recorded the fault --
+    // the new object's read never arrives, the *old* object's page is written
+    // through an address it no longer owns, and no fault is raised.
     unsafe { invalidate() }
 }
 
@@ -1607,7 +1620,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reuse is disabled until IOTLB invalidation is proven -- see allocate"]
     fn a_freed_extent_is_reused() {
         let mut space = DevAddrSpace::new(AddressWidth::Bits39);
         let first = space.allocate(4, false).expect("room");
@@ -1619,14 +1631,36 @@ mod tests {
     }
 
     #[test]
-    fn a_freed_extent_is_never_handed_out_again() {
-        // Not an optimisation that was dropped: an address that may still be
-        // translated by hardware must not name new memory. See `allocate`.
+    fn a_freed_extent_is_reused_only_at_its_own_size() {
+        // This asserted the opposite until 2026-08-11, when reuse was enabled:
+        // an address that may still be translated must not name new memory,
+        // and the proof that it cannot is `iommu_reuse_self_test` rather than
+        // a rule in this allocator. What the allocator still owes is that a
+        // reused extent is the size it was freed at -- handing back four pages
+        // of a sixteen-page extent would leave twelve nobody is tracking.
         let mut space = DevAddrSpace::new(AddressWidth::Bits39);
-        let first = space.allocate(4, false).expect("room");
-        space.free(first, 4);
-        let again = space.allocate(4, false).expect("room");
-        assert_ne!(again, first, "a freed address was handed out again");
+        let big = space.allocate(16, false).expect("room");
+        space.free(big, 16);
+
+        let small = space.allocate(4, false).expect("room");
+        assert_ne!(small, big, "a smaller request took a larger freed extent");
+
+        let exact = space.allocate(16, false).expect("room");
+        assert_eq!(exact, big, "the extent is reused by a request of its size");
+    }
+
+    #[test]
+    fn a_freed_low_extent_is_not_handed_to_a_request_above_4_gib() {
+        // The two regions are separate address spaces to the device that has
+        // to fit an address in 32 bits, and a freed extent carries no note of
+        // which it came from beyond its own value.
+        let mut space = DevAddrSpace::new(AddressWidth::Bits39);
+        let low = space.allocate(1, true).expect("room below 4 GiB");
+        space.free(low, 1);
+
+        let high = space.allocate(1, false).expect("room above it");
+        assert_ne!(high, low, "a low extent was handed to a high request");
+        assert!(high >= DevAddr::from_u64(DevAddrSpace::LOW_LIMIT));
     }
 
     #[test]

@@ -304,11 +304,17 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
   four-CPU soak written to catch exactly that class. Before trusting a green run, ask which machine
   it was green on.
 
-- **Two open faults are recorded rather than closed**, both in RFC 0012: the block device's MSI is
-  not delivered under interrupt remapping, and a reused device address keeps its translation. Each
-  has what is known and what was ruled out written beside it. An "open" line in this file is an
-  instruction to go looking, so it is only worth writing when there is something to find — a lesson
-  from recording a *normal* condition as an anomaly earlier in the same session.
+- ~~**Two open faults are recorded rather than closed**, both in RFC 0012: the block device's MSI is
+  not delivered under interrupt remapping, and a reused device address keeps its translation.~~
+  **Both closed on 2026-08-11**, and they were not the same kind of thing. The MSI was never an
+  interrupt fault at all — enabling remapping cleared translation-enable through a zeroed shadow of
+  a write-only register, and every symptom chased for six days was downstream of that. The reused
+  address was exactly what it said it was, and what was missing was a test that could tell the fixed
+  state from the broken one. **What survived is the practice**: each had what was known and what was
+  ruled out written beside it, and both ruled-out lists were what made the last day short. An "open"
+  line in this file is an instruction to go looking, so it is only worth writing when there is
+  something to find — a lesson from recording a *normal* condition as an anomaly earlier in the same
+  session, and re-learned on the last day by recording a **harness** error as a machine fault.
 
 - **Two bugs this milestone were invisible to the harness that was supposed to catch them, in
   opposite directions.** The IPC rendezvous stall needed *real parallelism* — 14 failures in 40 on a
@@ -699,6 +705,46 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-11, later still (device-address reuse is on, and the proof is a test that fails when it should)
+
+**The second RFC 0012 fault is closed, and unlike the first it was real all along.** Reuse has been
+disabled since M6-13 with the reason written into `allocate`: after map → unmap-with-invalidation →
+map of the same address, a device was seen still reaching the old page, unfaulted. The blocker was
+never the allocator; it was that nothing proved invalidation took effect.
+
+`iommu_reuse_self_test` is that proof, and it is built so that it cannot pass by accident:
+
+- **Two objects, both alive**, and the *old* one is the one checked. A test that only confirmed the
+  new object got its sector would pass just as happily against a stale translation — because a
+  stale translation writes to the old page and says nothing.
+- **Two different sectors.** If both reads fetched the same bytes, every frame would hold the right
+  contents either way.
+- **It refuses to claim anything when the address is not reused.** Reuse is a policy `allocate`
+  decides; a green line on a bump-only allocator would be exactly the kind of check this file has
+  nine of in a table above.
+
+**Negative-tested, and it reproduces M6-13 word for word.** With the invalidation in
+`unmap_device` removed:
+
+```
+iommu reuse    FAILED: first read true, unmapped true, second read false,
+               old page untouched false, fault None
+```
+
+The new object's read never arrives, the **old** object's page is written through an address it no
+longer owns, and **no fault is raised** — which is what "a device still reached it, and the access
+was not refused" was describing. The fault was real, the diagnosis was right, and what was missing
+was a way to tell the fixed state from the broken one.
+
+With invalidation in place the same test is green, in all three configurations: no IOMMU, IOMMU, and
+IOMMU with `iommu=remap-irq`.
+
+**What changed in the allocator.** Exact-size reuse only — a partial match would leave a remainder
+nobody tracks, and the window has 512 GiB, so the addresses that would recover are not worth the
+bookkeeping. The host test that asserted a freed address is *never* handed out again now asserts the
+size and region rules instead, and `a_freed_extent_is_reused` is no longer `#[ignore]`d. There are
+now **no ignored tests** in the kernel crate.
 
 ### 2026-08-11, later (the MSI fault is closed, and it was never an interrupt fault)
 
@@ -3080,7 +3126,7 @@ to guess at; both have a shorter list of candidates than they did.
 |---|---|
 | ~~The block device's MSI is not delivered under interrupt remapping~~ **Closed 2026-08-11.** It was never an interrupt fault: enabling remapping cleared the translation-enable bit through a zeroed `GCMD` shadow, so the device's DMA was untranslated and its address space had no interrupt-remapping region in it. Every hypothesis chased for six days was a symptom | — |
 | ~~A read through the delegated block service returns the wrong bytes, with remapping on~~ **Never a fault.** Recorded on 2026-08-11 and withdrawn the same day: the domain disk is regenerated by `boot-test.sh` before every run because a boot writes a filesystem to it, and the hand-rolled QEMU commands used to chase the MSI fault skipped that. Through the harness, remapping on, every check passes | — |
-| A reused device address keeps its translation | Nothing yet. Reuse is disabled until it is explained, and `free` still records the extent |
+| ~~A reused device address keeps its translation~~ **Closed 2026-08-11.** The diagnosis was right and the missing piece was a test that could tell the fixed state from the broken one. `iommu_reuse_self_test` maps, writes, unmaps, re-maps the same address to a *different* object, and checks the **old** object's page is untouched; with the invalidation removed it fails exactly as M6-13 described. Reuse is on, exact-size | — |
 
 **Nine checks this milestone were not looking at the thing they claimed to check.**
 

@@ -615,6 +615,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("\x1b[91m    iommu grant    FAILED\x1b[0m");
     }
 
+    // Before the refusal test below, which leaves the device unable to answer:
+    // this one needs two working reads.
+    if let Some((found, _)) = iommu_state.as_ref()
+        && !iommu_reuse_self_test(found, handoff, handoff.hhdm_base.as_u64())
+    {
+        println!("\x1b[91m    iommu reuse    FAILED\x1b[0m");
+    }
+
     // RFC 0012 steps 4 and 5 in one demonstration, and it is deliberately one.
     //
     // A refused request never completes, so it leaves the queue unusable and
@@ -6655,6 +6663,142 @@ fn iommu_delegation_self_test(hhdm: u64) -> bool {
 ///
 /// Runs last, and only where translation is on. It deliberately ends with a
 /// refused request outstanding.
+/// Whether a device address that was freed and handed out again translates to
+/// the memory it names *now*.
+///
+/// This is the proof `DevAddrSpace::allocate` was waiting on, and the reason
+/// device-address reuse was disabled at M6-13: after a map, an unmap with a
+/// global invalidation, and a map of the same address, a device was recorded
+/// still reaching the old page. Reuse without this is a revocation with a
+/// delay fuse — an address handed to something new while the hardware may
+/// still translate it to something old.
+///
+/// # What makes it a test rather than a demonstration
+///
+/// Two objects, both alive throughout, and **the old one is checked**. A test
+/// that only confirmed the new object received its sector would pass just as
+/// happily with a stale translation, because a stale translation writes to the
+/// old frame and says nothing. The assertion that catches the fault is that
+/// the first object's page is *unchanged* after the device writes through an
+/// address that used to be its.
+///
+/// Two different sectors, for the same reason: if both reads fetched the same
+/// bytes, every frame would hold the right contents either way.
+///
+/// **If the address is not reused, this proves nothing and says so.** Reuse is
+/// a policy `allocate` decides; a green line here on a bump-only allocator
+/// would be the kind of check that is not looking at what it claims to.
+fn iommu_reuse_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -> bool {
+    let image = handoff.initrd.unwrap_or(&[]);
+    if image.len() < 1024 {
+        println!("    iommu reuse    skipped: the image is too short to hold two sectors");
+        return true;
+    }
+    let (first, second) = (&image[..512], &image[512..1024]);
+    if first == second {
+        println!(
+            "    iommu reuse    skipped: sectors 0 and 1 are identical, so nothing to tell apart"
+        );
+        return true;
+    }
+
+    let Ok(owner) = domain::create("dma-reuse", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    iommu reuse    FAILED to create a domain\x1b[0m");
+        return false;
+    };
+    let (Ok(old), Ok(new)) = (
+        shared::create(owner, bhaskix_mm::FRAME_SIZE),
+        shared::create(owner, bhaskix_mm::FRAME_SIZE),
+    ) else {
+        println!("\x1b[91m    iommu reuse    FAILED to create two memory objects\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
+    let Some(device) = virtio::probe() else {
+        domain::destroy(owner);
+        return true;
+    };
+
+    // Reads a frame of an object through the direct map.
+    let page_of = |id| match crate::shared::frames_of(id) {
+        Some((frames, count)) if count > 0 => {
+            // SAFETY: a frame the object owns, and this reads it only.
+            Some(unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, 512) })
+        }
+        _ => None,
+    };
+
+    let Some(address) = iommu::map_memory(
+        device,
+        old,
+        bhaskix_arch::vtd::Rights::READ_WRITE,
+        false,
+        hhdm,
+    ) else {
+        println!("\x1b[91m    iommu reuse    FAILED to map the first object\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
+    // SAFETY: the unit `iommu_bringup` mapped and programmed. Any fault before
+    // this belongs to something else.
+    let _ = unsafe { iommu::take_fault(found, hhdm) };
+    let _ = virtio::read_into(0, address.as_u64());
+    let old_took_sector_0 = page_of(old) == Some(first);
+
+    // Unmapped, which clears the entries, returns the extent and invalidates.
+    let unmapped = iommu::unmap_device(device, address.as_u64(), 1);
+
+    let Some(again) = iommu::map_memory(
+        device,
+        new,
+        bhaskix_arch::vtd::Rights::READ_WRITE,
+        false,
+        hhdm,
+    ) else {
+        println!("\x1b[91m    iommu reuse    FAILED to map the second object\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
+    let reused = again == address;
+
+    let _ = virtio::read_into(1, again.as_u64());
+    let new_took_sector_1 = page_of(new) == Some(second);
+    // The one that matters: nothing may have arrived through an address this
+    // object no longer owns.
+    let old_is_untouched = page_of(old) == Some(first);
+
+    // SAFETY: as above.
+    let faulted = unsafe { iommu::take_fault(found, hhdm) };
+    let _ = iommu::unmap_device(device, again.as_u64(), 1);
+    shared::revoke(old);
+    shared::revoke(new);
+    domain::destroy(owner);
+
+    if !reused {
+        println!(
+            "    iommu reuse    nothing proven: {} was not handed out again, so no stale \
+             translation could be exercised",
+            address.as_u64()
+        );
+        return true;
+    }
+
+    let ok = old_took_sector_0 && unmapped && new_took_sector_1 && old_is_untouched;
+    if ok {
+        println!(
+            "    iommu reuse    a device address was freed, handed out again, and translated to \
+             the new object -- the old one's page is untouched"
+        );
+    } else {
+        println!(
+            "\x1b[91m    iommu reuse    FAILED: first read {old_took_sector_0}, unmapped \
+             {unmapped}, second read {new_took_sector_1}, old page untouched {old_is_untouched}, \
+             fault {faulted:?}\x1b[0m"
+        );
+    }
+    ok
+}
+
 fn iommu_memory_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -> bool {
     let Ok(owner) = domain::create("dma-object", domain::ResourceEnvelope::new()) else {
         println!("\x1b[91m    iommu memory   FAILED to create a domain\x1b[0m");
