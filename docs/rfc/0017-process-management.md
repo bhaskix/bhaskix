@@ -391,12 +391,27 @@ program can no longer stop this machine.**
    of heap during memory pressure, which is a good reason and is unaffected by the number. Whether
    32 is right is a separate question from whether the limit should be static, and both are now
    answerable by measurement rather than by argument.
-4. **Added by the implementation: should a domain end when its last thread exits, whoever made it?**
-   Today it ends only if a *program* created it. Several boot self-tests run a thread to completion
-   and then go on granting capabilities to the domain it ran in; ending those out from under them
-   turned passing tests into `NoDomain`. The consistent rule is almost certainly the right one, and
-   adopting it means changing the boot sequence rather than this mechanism — which is why it was not
-   done here, and why it is recorded as a question rather than as a limitation to live with.
+4. ~~**Added by the implementation: should a domain end when its last thread exits, whoever made
+   it?**~~ **Answered 2026-08-11: yes.** One lifetime rule, and who created a domain does not enter
+   into it.
+
+   The question described the obstacle as self-tests *granting capabilities* to a domain after its
+   thread had gone. That was not it. `end` calls `shared::destroy_owned_by`, so **a domain's memory
+   dies with it** — and four self-tests created a memory object owned by the very domain they were
+   about to run a thread in, then checked its contents afterwards. They were not losing a domain
+   they wanted to grant into; they were reading frames that had gone back to the allocator.
+
+   Fixed in the tests, by the shape the system already had: **the thing that verifies owns what it
+   verifies**, and hands the child a capability. That is what a program starting a program does —
+   the shell owns the image and grants it — so the exemption was the odd one out rather than the
+   tests being unusual. `bulk-keeper`, `blk-keeper` and `block-keeper` are domains that run nothing
+   and therefore end never.
+
+   Two things worth keeping from doing it. A kernel-made domain shows `Err(())` rather than
+   `Ok(Some(Exited))` after ending, because `end` records a reason only when there is a parent left
+   to ask — a corpse is kept for somebody, and nobody was asking. And the failure this produced in
+   the block-service test was 512 plausible bytes that were the wrong ones, which is the shape of
+   bug that a test asserting "it read something" would have passed.
 
 ---
 

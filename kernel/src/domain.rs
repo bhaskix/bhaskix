@@ -620,30 +620,36 @@ pub fn state_of(id: DomainId) -> Result<Option<Ending>, ()> {
     }
 }
 
-/// Ends `id` because its last thread finished — but only if a program created
-/// it.
+/// Ends `id` because its last thread finished — **whoever made it**.
 ///
 /// Returns whether it ended anything.
 ///
-/// **The restriction is deliberate and is a limitation worth stating.** A
-/// domain a *program* created has an owner who will ask what happened to it, so
-/// running out of threads is the end of it. A domain the *kernel* created at
-/// boot is a container the kernel keeps using: several self-tests run a thread
-/// to completion and then go on granting capabilities to the domain it ran in,
-/// and ending those out from under them replaced a passing test with
-/// `NoDomain`.
+/// # The exemption this used to carry, and why it is gone
 ///
-/// So a kernel-made domain is ended by the kernel that made it, and only that.
-/// The alternative — ending every domain whose threads have all gone — is
-/// arguably more consistent and would require the boot code to stop treating a
-/// domain as outliving its threads, which is a larger change than this step.
+/// Until 2026-08-11 a domain the *kernel* created was exempt: only a domain a
+/// *program* had created ended when its threads ran out. RFC 0017 recorded that
+/// as its fourth open question and as a limitation rather than a decision, and
+/// the reason was not about domains at all. Several boot self-tests created a
+/// memory object **owned by the domain they were about to run a thread in**,
+/// and then checked its contents after that thread exited — and [`end`] calls
+/// `shared::destroy_owned_by`, so the object died with the domain. Ending those
+/// domains replaced a passing test with `NoDomain`.
+///
+/// The fix was in the tests and not here: the thing that verifies now owns what
+/// it verifies, and hands the child a capability. That is the shape the rest of
+/// the system already used — a program that starts another program owns the
+/// image and grants it — so the exemption was the odd one out rather than the
+/// tests being unusual.
+///
+/// One rule now: a domain with no threads left is over, and who created it does
+/// not enter into it.
 pub fn ended_by_last_thread(id: DomainId) -> bool {
     {
         let table = TABLE.lock();
         let Some(domain) = table.domains.get(id.0 as usize) else {
             return false;
         };
-        if !domain.live || domain.parent == u32::MAX {
+        if !domain.live {
             return false;
         }
     }

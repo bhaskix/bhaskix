@@ -706,6 +706,42 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-11, last (a domain ends when its last thread exits, whoever made it)
+
+RFC 0017's fourth question — the one the implementation itself raised — answered **yes**. One
+lifetime rule, with no special case for who created the domain.
+
+**The question misdescribed its own obstacle, and that was the interesting part.** It said boot
+self-tests "go on granting capabilities to the domain it ran in". They do not. `end` calls
+`shared::destroy_owned_by`, so **a domain's memory dies with it** — and four self-tests created a
+memory object owned by the domain they were about to run a thread in, then checked its contents
+after that thread exited. They were reading frames that had gone back to the allocator.
+
+**Fixed in the tests, not in the mechanism**, using the shape the system already had: the thing that
+verifies owns what it verifies and hands the child a capability, which is exactly what the shell's
+`spawn` does with a program image. `bulk-keeper`, `blk-keeper` and `block-keeper` are domains that
+run nothing and therefore end never. Four tests: the bulk path (two objects), the block domain's
+rings, the block service's sector, and the envelope test, whose `destroy` now answers false because
+the domains have already ended themselves.
+
+**Three things this cost, each worth keeping.**
+
+A kernel-made domain reports `Err(())` after ending rather than `Ok(Some(Exited))`. `end` records a
+reason only when a parent is still live to read it — a corpse is kept *for somebody*, and for a
+domain the kernel made, nobody is asking. The first version of the new assertion looked for the
+reason and failed against a rule that was working.
+
+A thread stops counting towards its domain **before** the ending it triggers completes, so reading
+the domain's state the instant the thread count reaches zero catches the teardown half-done. The
+assertion waits for the ending now rather than sampling after a fixed 200 ms — the same lesson §
+above records for tests that waited a duration instead of a condition, re-learned.
+
+And the block-service failure was **512 plausible bytes that were the wrong ones**, not an error and
+not a crash. A test asserting "it read something" would have passed; the one that exists compares
+the bytes.
+
+**Negative-tested**: putting the exemption back turns the new assertion red.
+
 ### 2026-08-11 (the shell can start a program, and the two placements disagreed about how much a read reads)
 
 RFC 0017's first unresolved question — *does the shell get `DomainControl`?* — answered **yes**, and

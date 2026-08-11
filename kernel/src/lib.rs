@@ -3296,7 +3296,16 @@ pub fn start_block_domain(
     // Rings. Four pages, which is more than the descriptor table, available
     // and used rings need for a queue this small -- and the slack is where the
     // request headers and the sector go.
-    let rings = shared::create(realm, 4 * bhaskix_mm::FRAME_SIZE)
+    // Owned by a domain that outlives the driver, not by the driver.
+    //
+    // `bin/blkd` exits when its endpoint stops answering, and since 2026-08-11
+    // a domain ends when its last thread exits -- and ending destroys the
+    // memory that domain owns. Rings owned by the driver would be freed the
+    // moment it stopped, and the check that reads them afterwards would be
+    // reading returned frames. `blk-keeper` runs nothing, so nothing ends it.
+    let keeper = domain::create("blk-keeper", domain::ResourceEnvelope::new())
+        .map_err(|_| "the block rings' owner would not be created")?;
+    let rings = shared::create(keeper, 4 * bhaskix_mm::FRAME_SIZE)
         .map_err(|_| "the block domain's rings would not be created")?;
     let named = shared::name(rings).map_err(|_| "the rings would not be named")?;
     if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
@@ -3684,9 +3693,21 @@ fn block_service_self_test(hhdm: u64) -> bool {
         println!("\x1b[91m    block service  FAILED to create a domain to ask from\x1b[0m");
         return false;
     };
-    let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
+    // The object outlives the asker, because the asker does not outlive its
+    // question. Its thread exits once the sector is read, that ends the domain
+    // since 2026-08-11, and ending destroys the memory the domain owns -- so
+    // the contents check below would be reading frames already handed back to
+    // the allocator. It read *plausible* bytes when it did, which is the worst
+    // shape of failure: 512 of them, and the wrong ones.
+    let Ok(keeper) = domain::create("block-keeper", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    block service  FAILED to create the owning domain\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
+    let Ok(object) = shared::create(keeper, bhaskix_mm::FRAME_SIZE) else {
         println!("\x1b[91m    block service  FAILED to create a memory object\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     };
     let installed = shared::name(object)
@@ -3695,6 +3716,7 @@ fn block_service_self_test(hhdm: u64) -> bool {
     if installed != Some(true) {
         println!("\x1b[91m    block service  FAILED to give the caller its memory\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     }
 
@@ -3713,6 +3735,7 @@ fn block_service_self_test(hhdm: u64) -> bool {
     {
         println!("\x1b[91m    block service  FAILED to spawn a caller\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     }
     let _ = endpoint;
@@ -3741,6 +3764,7 @@ fn block_service_self_test(hhdm: u64) -> bool {
 
     shared::revoke(object);
     domain::destroy(owner);
+    domain::destroy(keeper);
 
     let ok = matches && refused;
     if ok {
@@ -5377,14 +5401,31 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
         println!("\x1b[91m    bulk path      FAILED to create a domain\x1b[0m");
         return false;
     };
-    let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
+
+    // **The objects are owned by a domain that is not going to end**, and the
+    // reader holds capabilities to them. Since 2026-08-11 a domain ends when its
+    // last thread exits, and `end` destroys the memory that domain owns -- so an
+    // object owned by the reader would be gone before the checks below could
+    // look at it, and this test would be asserting on freed frames.
+    //
+    // `keeper` runs no threads, so nothing ends it. It is the same shape the
+    // shell's `spawn` uses: the thing that owns the memory is the thing that
+    // outlives the program using it.
+    let Ok(keeper) = domain::create("bulk-keeper", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    bulk path      FAILED to create the owning domain\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
+    let Ok(object) = shared::create(keeper, bhaskix_mm::FRAME_SIZE) else {
         println!("\x1b[91m    bulk path      FAILED to create a memory object\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     };
     let Ok(memory_cap) = shared::name(object) else {
         println!("\x1b[91m    bulk path      FAILED to name the object\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     };
     // Slot 1: the *same object*, read-only. The caller genuinely holds it and
@@ -5397,6 +5438,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     else {
         println!("\x1b[91m    bulk path      FAILED to derive a read-only capability\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     };
     // **A second object, of four pages, added 2026-08-11.** Separate from the
@@ -5406,14 +5448,16 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     //
     // A one-page object is a size both placements agree about by construction,
     // which is why this test passed for as long as it had only one.
-    let Ok(big) = shared::create(owner, 4 * bhaskix_mm::FRAME_SIZE) else {
+    let Ok(big) = shared::create(keeper, 4 * bhaskix_mm::FRAME_SIZE) else {
         println!("\x1b[91m    bulk path      FAILED to create the multi-page object\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     };
     let Ok(big_cap) = shared::name(big) else {
         println!("\x1b[91m    bulk path      FAILED to name the multi-page object\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     };
     if domain::with(owner, |d| {
@@ -5424,6 +5468,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     {
         println!("\x1b[91m    bulk path      FAILED to install the capabilities\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     }
 
@@ -5436,6 +5481,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     if sched::spawn_on_with(0, "bulk-reader", bulk_client, 0, hhdm, options).is_err() {
         println!("\x1b[91m    bulk path      FAILED to spawn a thread in the domain\x1b[0m");
         domain::destroy(owner);
+        domain::destroy(keeper);
         return false;
     }
     wait_until(|| BULK_DONE.load(Ordering::Acquire), 4_000);
@@ -5492,6 +5538,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     shared::revoke(object);
     shared::revoke(big);
     domain::destroy(owner);
+    domain::destroy(keeper);
 
     // What the same file costs by message, at the RFC's own figure.
     let by_message = bytes.div_ceil(bhaskix_abi::CHUNK_BYTES as u64).max(1);
@@ -8600,9 +8647,56 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     // --- destruction revokes what the domain granted ------------------------
     PHASE.store(PHASE_DOMAIN + 1, Ordering::Release);
-    wait_millis(200);
 
-    let destroyed = domain::destroy(lonely) && domain::destroy(crowded);
+    // Wait for the burners to *go*, not for a duration. Two hundred
+    // milliseconds was enough on an idle machine and is not on a loaded one --
+    // and the difference matters more since 2026-08-11, because what follows
+    // now asks whether the domains ended themselves, which is a question about
+    // whether their threads have finished rather than about how long we waited.
+    // The bound stays, so a thread that never exits reports rather than hangs.
+    let burners_gone = wait_until(
+        || {
+            sched::threads_in_domain(lonely.as_u32()) == 0
+                && sched::threads_in_domain(crowded.as_u32()) == 0
+        },
+        4_000,
+    );
+
+    // **The rule itself, asserted rather than inferred.** These two were made by
+    // boot code and nothing has destroyed them, so if they are over it is
+    // because their last thread exited -- which is what changed on 2026-08-11
+    // and did not apply to a kernel-made domain before it. Read here, ahead of
+    // the `over` below, because destroying them would make the two cases
+    // indistinguishable and a change that silently did nothing would look
+    // exactly like one that worked.
+    // Not `Ok(Some(Exited))`, which is what a *program-made* domain shows. A
+    // corpse is kept only if somebody can ask about it -- `end` records the
+    // reason when there is a parent still live to read it, and drops it
+    // otherwise -- so a kernel-made domain ends and is forgotten in the same
+    // breath. What is asserted is therefore "no longer live", which combined
+    // with nothing here having destroyed them yet is exactly the claim: their
+    // last thread ended them.
+    // Waited for, not sampled. A thread stops counting towards its domain before
+    // the ending it triggers has finished, so reading this the instant the
+    // count reaches zero catches the teardown half-done -- which is what the
+    // first version of this did, and it reported both that the domains were
+    // still live and that capabilities had not come back.
+    let ended_themselves = wait_until(
+        || {
+            !matches!(domain::state_of(lonely), Ok(None))
+                && !matches!(domain::state_of(crowded), Ok(None))
+        },
+        4_000,
+    );
+
+    // `destroy` answers false for a domain that has already ended, and since
+    // 2026-08-11 the last thread to exit ends it -- so by the time this runs
+    // both of these are usually over already and there is nothing for this call
+    // to do. What this section claims is that *destruction returns what the
+    // domain granted*, and that holds however the domain ended, so the question
+    // asked here is "is it over" rather than "did this call end it".
+    let over = |id| domain::destroy(id) || !matches!(domain::state_of(id), Ok(None));
+    let destroyed = over(lonely) && over(crowded);
     let capabilities_after = cap::live();
 
     let checks = [
@@ -8612,7 +8706,15 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "both domains ran at all",
             lonely_cycles > 0 && crowded_cycles > 0,
         ),
-        ("both domains were destroyed", destroyed),
+        ("every burner exited", burners_gone),
+        (
+            "a domain ends when its last thread exits, whoever made it",
+            ended_themselves,
+        ),
+        (
+            "both domains are over, and destruction returned their capabilities",
+            destroyed,
+        ),
         (
             "destruction returned every capability",
             capabilities_after == capabilities_before,
