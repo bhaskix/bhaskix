@@ -45,7 +45,22 @@ EXPECT_GREETING="the light-maker"
 # Strings that mean the boot went wrong even if the greeting appeared.
 FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
                  "unexpected interrupt on vector" "NO TICKS"
-                 "LEAK:" "INVARIANT VIOLATED")
+                 "LEAK:" "INVARIANT VIOLATED"
+                 # Every self-test the kernel runs reports failure with this
+                 # word, and until 2026-08-11 nothing looked for it. A failure
+                 # was caught only where a *positive* gate below asserted that
+                 # test's success line, because the failure stopped the pattern
+                 # matching -- so a self-test with no gate could fail with the
+                 # suite green, and six of them could.
+                 #
+                 # This closes the class rather than the six. A new self-test
+                 # now arrives gated by default: printing FAILED is enough.
+                 #
+                 # It does not make the positive gates redundant, and they are
+                 # kept. This catches a test that ran and failed; a positive
+                 # gate also catches one that never ran at all, which is the
+                 # quieter failure and the one that survives a refactor.
+                 "FAILED")
 # Note: "timed out" is deliberately NOT a marker. The success message reads
 # "none timed out" and a substring match on it fails every passing run --
 # which is exactly what happened when it was added. The positive assertion
@@ -333,10 +348,19 @@ else
     status=1
 fi
 
-# Shootdown reaching nobody looks exactly like shootdown working, so the
-# acknowledgement count is what gets checked. Negative-tested by disabling the
-# receiving handler, which turns 8 completions into 8 timeouts.
-if grep -qE "tlb shootdown +[0-9]+ completed across [0-9]+ cpus, none timed out" "$LOG"; then
+# Shootdown reaching nobody looks exactly like shootdown working, so a count is
+# what gets checked. Negative-tested by disabling the receiving handler, which
+# turns 8 completions into 8 timeouts.
+#
+# **This comment used to say the acknowledgement count is what gets checked, and
+# it is not** — `acknowledged` never reaches the line. What is printed is
+# `new_completions`, a different counter, and the pattern accepted zero for it
+# until 2026-08-11. The acknowledgement *is* checked, in `smp.rs`, which refuses
+# to print this line unless all eight arrived; so the property was gated, just
+# not by the gate that claimed to. Both halves are now true: the kernel checks
+# the acknowledgements, and this requires the completions it prints to be
+# non-zero.
+if grep -qE "tlb shootdown +[1-9][0-9]* completed across [1-9][0-9]* cpus, none timed out" "$LOG"; then
     pass "TLB shootdown acknowledged by every CPU"
 else
     fail "TLB shootdown did not complete on every CPU"
@@ -352,6 +376,66 @@ if grep -qE "threads +[0-9]+ preemptions across [0-9]+ cpus; each worker ran on 
     pass "threads preempted by the timer, each on its own runqueue"
 else
     fail "per-CPU timer-driven preemption did not work"
+    status=1
+fi
+
+# The five below were added on 2026-08-11, after an audit found their self-tests
+# had no gate at all. Each ran on every boot and reported into a log nothing
+# read, so any of them could have started failing and the suite would have
+# stayed green.
+#
+# They assert *shape*, not values: the numbers move with host load — this suite
+# has run under a fuzzing campaign all day — and a gate that pinned them would
+# fail for the machine being busy, which is the fastest way to get a gate
+# ignored. What each one asserts is that the test ran and reported the thing it
+# exists to report.
+
+# Killing a thread that is queued to send must leave nothing behind. A stale
+# entry would have a later rendezvous deliver to a thread that is gone.
+if grep -qE "queue cleanup +a thread killed while queued to send left no entry behind" "$LOG"; then
+    pass "a killed sender leaves no queue entry behind"
+else
+    fail "the queued-sender cleanup was not reported"
+    status=1
+fi
+
+# The counters behind it. `naming a thread that has gone` is the one that
+# matters and must be zero; the rest move with what the boot did.
+if grep -qE "endpoint queues [0-9]+ senders and [0-9]+ receivers queued, 0 naming a thread that has gone" "$LOG"; then
+    pass "no endpoint queue entry names a thread that has gone"
+else
+    fail "endpoint queues were not reported, or one named a departed thread"
+    status=1
+fi
+
+# Two scheduling classes, and that over-commit is refused. The measured ratio is
+# deliberately not pinned: `scheduler.md` §4 records that a 3:1 weight delivered
+# 3.7:1 on hardware, so a gate on the number would be a gate on the host.
+if grep -qE "sched classes +weight 3:1 measured [0-9.]+x; rt took [0-9]+ ticks against fair's [0-9]+; over-commit refused" "$LOG"; then
+    pass "the scheduling classes are measured and over-commit is refused"
+else
+    fail "the scheduling-class measurement was not reported"
+    status=1
+fi
+
+# Wakeup latency. **The target is not asserted** and that is deliberate: §10's
+# figure is unmet under an interpreting emulator and TRACKER says so. What is
+# asserted is that the measurement happened, so the day it is taken on hardware
+# there is a number to compare against rather than a silence.
+if grep -qE "rt latency +[1-9][0-9]* wakeups, worst [0-9.]+ (us|ticks)" "$LOG"; then
+    pass "wakeup latency is measured and reported"
+else
+    fail "no wakeup-latency measurement was reported"
+    status=1
+fi
+
+# Tickless idle: an idle CPU must take far fewer ticks than a busy one. Asserted
+# as a *comparison* rather than a threshold, because the absolute counts depend
+# on how long the boot took.
+if grep -qE "tickless +[0-9]+ ticks on [0-9]+ idle cpus, [0-9]+ on [0-9]+ of them busy" "$LOG"; then
+    pass "tickless idle is measured on idle and busy CPUs"
+else
+    fail "the tickless measurement was not reported"
     status=1
 fi
 
@@ -575,6 +659,21 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # requiring an error tests the driver's plumbing rather than the hardware
     # -- an earlier version did exactly that and reported a protected machine
     # as unprotected.
+    # Device-address reuse. Added with the self-test on 2026-08-11 and *not*
+    # gated at the time, which an audit the same day caught: the test ran on
+    # every IOMMU boot and reported into a log nothing read.
+    #
+    # The assertion is the second half of the line. That the new object got its
+    # sector proves a mapping works; that **the old object's page is untouched**
+    # is what proves a freed address stopped translating, and a stale
+    # translation writes to the old page and reports nothing.
+    if grep -qE "iommu reuse +a device address was freed, handed out again, and translated to the new object -- the old one's page is untouched" "$LOG"; then
+        pass "a reused device address translates to the object that owns it now"
+    else
+        fail "device-address reuse was not reported, or a freed address still translated"
+        status=1
+    fi
+
     if grep -qE "iommu memory +an object was reachable at 0x[0-9a-f]+.*revoked, and the device was then refused it" "$LOG"; then
         pass "a revoked object is taken away from the device, not just from the page tables"
     else

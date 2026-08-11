@@ -123,11 +123,14 @@ targets; **346 host assertions**; the project-invariant gates (bootloader
 containment, `unsafe` budgets with mandatory `// SAFETY:` justifications,
 dependency direction, service placements, no vendor strings, SPDX headers);
 BIOS, UEFI and IOMMU boot tests asserting on captured serial output across four
-service placements; four modes of an **interactive shell test that types at the
-machine** and reads what comes back; and a fault-injection run that triggers six
-CPU exceptions and checks each is reported rather than triple-faulting.
+service placements, plus a run with the IOMMU turned off at the command line to
+prove that escape hatch escapes; four modes of an **interactive shell test that
+types at the machine** and reads what comes back; and a fault-injection run that
+triggers six CPU exceptions and checks each is reported rather than
+triple-faulting. Any `FAILED` the kernel prints fails the run, whether or not a
+gate was looking for that particular one.
 
-That is **553 checks**. A gate that has never been watched failing is not
+That is **594 checks**. A gate that has never been watched failing is not
 counted as a gate here — see [TRACKER.md](TRACKER.md), which records the ones
 that turned out to prove nothing and what was done about them.
 

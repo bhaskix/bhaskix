@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-07 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking is next**, and unblocked: it was gated on the driver framework |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 553 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 594 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
 
 ### Division of responsibility between documents
 
@@ -705,6 +705,51 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-11 (six self-tests nothing was reading, and the class they belong to)
+
+`README.md` says **"a gate that has never been watched failing is not counted as a gate here"**, and
+§ above tabulates nine checks that turned out not to test what they claimed. This is an audit of the
+81 boot gates against that standard, prompted by finding a tenth by accident earlier the same day.
+
+**The structural finding: there was no generic `FAILED` check.** `FAILURE_MARKERS` caught panics,
+`FATAL:`, `LEAK:`, `NO TICKS` and `INVARIANT VIOLATED` — not the word every kernel self-test uses to
+report its own failure. So a self-test was caught **only** where a positive gate asserted its
+success line, because the failure stopped that pattern matching. A self-test with no gate could fail
+with the suite green.
+
+**Six could**, and one of them was added the same morning:
+
+| Self-test | What was unwatched |
+|---|---|
+| `iommu reuse` | device-address reuse — **added that morning, gated the same day it was found** |
+| `queue cleanup` | a killed sender leaving a queue entry behind |
+| `endpoint queues` | an entry naming a thread that has gone |
+| `sched classes` | the 3:1 weight ratio actually measured |
+| `rt latency` | wakeup latency measured at all |
+| `tickless` | idle ticks against busy ones |
+
+**`FAILED` is now a failure marker**, which closes the class rather than the six: a new self-test
+arrives gated by default. The positive gates are kept and are not redundant — this catches a test
+that *ran and failed*, a positive gate also catches one that **never ran at all**, which is the
+quieter failure and the one that survives a refactor.
+
+**Negative-tested against the marker specifically**, not against the gates: a `FAILED` line no
+positive gate looks for was printed from the kernel, and the suite went red naming it. Reverted.
+
+**One gate's stated reason was false.** The TLB shootdown gate says "the acknowledgement count is
+what gets checked". `acknowledged` never reaches the line — what is printed is `new_completions`, a
+different counter, and the pattern accepted zero for it. `smp.rs` does refuse to print unless all
+eight acknowledgements arrived, so the property was gated, just not by the gate claiming to. Both
+halves are true now.
+
+**Three suspicions that were wrong, checked before reporting.** The loose `[0-9]+` in the `ipc`,
+`services` and `threads` gates looked like holes and are not: each is backed by a strict kernel-side
+condition (`delivered >= 8`, `entries >= 5`, `switches == 0` is a failure). And `scheduler`,
+`console domain` and `vfs domain` looked ungated by name while being gated by other wording or by a
+stronger downstream assertion. A name-based search finds candidates, not findings.
+
+Suite: **594 checks**, up from 553.
 
 ### 2026-08-11 (the shell stops giving up on a busy service)
 
