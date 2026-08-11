@@ -517,14 +517,21 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         status=1
     fi
 
-    # RFC 0012 step 6 is built and **off**, and the machine says so. The
-    # assertion is that it states which world it is in, not that remapping is
-    # on: under remapping the I/O APIC's line is delivered and the block
-    # device's message is not, so enabling it by default would cost that driver
-    # its interrupt and leave it polling behind a timer. A machine that quietly
-    # degraded would pass every other gate here.
-    if grep -qE "iommu irq +(interrupts NOT remapped|remapping interrupts;)" "$LOG"; then
-        pass "the machine says whether a device can still forge an interrupt"
+    # RFC 0012 step 6 is **on by default** since 2026-08-11, so this asserts
+    # the state and not merely that a state was reported. It was the weaker
+    # check until then, because remapping was off and the honest thing to gate
+    # was whether the machine said which world it was in.
+    #
+    # The stronger assertion is affordable now and the weaker one is not: a
+    # machine that fell back to unremapped interrupts still boots, still passes
+    # every other gate here, and is a machine where a device can raise any
+    # vector on any CPU by writing a word. That is precisely the degradation
+    # this suite exists to refuse to ship quietly, and only this line sees it.
+    if grep -qE "iommu irq +remapping interrupts;" "$LOG"; then
+        pass "interrupts are remapped, so a device cannot forge one"
+    elif grep -qE "iommu irq +interrupts NOT remapped" "$LOG"; then
+        fail "interrupts are NOT remapped -- the machine fell back to RFC 0011's residual risk"
+        status=1
     else
         fail "nothing was said about interrupt remapping either way"
         status=1

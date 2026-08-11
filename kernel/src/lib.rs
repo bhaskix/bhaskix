@@ -6960,13 +6960,24 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // interrupt per request, and every message that arrives is a handle this
     // kernel issued.
     //
-    // It stays off by default anyway, and the reason is no longer a bug. This
-    // path spent its entire life until that date silently broken, so it has
-    // barely been exercised; it has been seen working on one emulator; and
-    // nothing has ever booted this kernel on physical hardware, where an IOMMU
-    // is much less forgiving than a model of one. Turning it on is a decision
-    // to take deliberately, with its own change and its own boots behind it,
-    // rather than as a consequence of the fix.
+    // **On by default since 2026-08-11**, which is a decision and not a
+    // consequence of the fix: without it a device can raise any vector on any
+    // CPU by writing a word, and RFC 0011 accepted that risk only because
+    // there was no unit to close it. There is now.
+    //
+    // What the default costs, said plainly because it is not nothing: this
+    // path was silently broken for its entire life until the day before it was
+    // turned on, so it has few boots behind it; it has been seen working on
+    // one emulator; and nothing has ever booted this kernel on physical
+    // hardware, where an IOMMU is much less forgiving than a model of one.
+    // `iommu=no-remap-irq` turns it off for a machine where it goes wrong, and
+    // that escape hatch is the reason turning it on is reversible rather than
+    // brave.
+    //
+    // A unit that cannot do it, or refuses, is **not** a boot failure: the
+    // reason is printed and the machine runs with the risk RFC 0011 named,
+    // exactly as it did before. Degrading loudly is the whole difference
+    // between this and a machine that quietly polls.
     //
     // What it was, so that the shape of it is remembered rather than the
     // symptom: **enabling remapping turned translation off**. `GCMD` is
@@ -6983,15 +6994,18 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     //
     // SAFETY: the unit is programmed, and nothing has been routed yet --
     // `console_input` and the block driver's MSI-X both come later.
-    let asked = handoff
+    // `iommu=remap-irq` is still accepted and now means nothing, because a
+    // command line that used to be the only way to get this is on machines and
+    // in scripts that should not break for saying so.
+    let refused = handoff
         .cmdline
         .split_ascii_whitespace()
-        .any(|word| word == "iommu=remap-irq");
-    let remapped = if asked {
+        .any(|word| word == "iommu=no-remap-irq");
+    let remapped = if refused {
+        None
+    } else {
         // SAFETY: as above -- the unit is programmed and nothing is routed yet.
         Some(unsafe { iommu::enable_interrupt_remapping(hhdm) })
-    } else {
-        None
     };
 
     iommu::install(device, found, window);
@@ -7053,12 +7067,20 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
             "    iommu irq      remapping interrupts; compatibility format blocked, \
              every message is a handle this kernel issued"
         ),
-        Some(Err(reason)) => println!("    iommu irq      asked to remap interrupts: {reason}"),
-        // The default, and it says what is still true rather than what is
-        // built: a device may raise an MSI it was never programmed to raise.
+        // Not a boot failure, and not quiet either. The machine runs with the
+        // risk RFC 0011 named, and the line says so in the same words the
+        // opted-out case uses -- because the *state* is what matters to
+        // whoever reads it, not how the machine arrived in it.
+        Some(Err(reason)) => println!(
+            "\x1b[91m    iommu irq      interrupts NOT remapped (RFC 0011's residual risk \
+             stands): {reason}\x1b[0m"
+        ),
+        // Asked for, by `iommu=no-remap-irq`. Says what is still true rather
+        // than what is built: a device may raise an MSI it was never
+        // programmed to raise.
         None => println!(
             "    iommu irq      interrupts NOT remapped (RFC 0011's residual risk stands); \
-             built but off by default, pass iommu=remap-irq"
+             turned off by iommu=no-remap-irq"
         ),
     }
     if let Some(fault) = transition {

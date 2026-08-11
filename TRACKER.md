@@ -268,7 +268,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | M6-12 | RFC 0012 step 3: translation enabled, and a device that can no longer reach the kernel | ✅ `DONE` | Identity-map what must keep working, map the firmware-reserved regions after checking each against the kernel's own image, then enable — the order is the RFC's and is not a preference, because translation has no partial state. `virtio-blk` keeps working with **zero faults**, and the boot line says whether the device is *subject to* translation as well as whether translation is on. **Negative-tested**: unmap the driver's five frames and the disk disappears, failing four gates. The `RMRR`-overlaps-the-kernel refusal has four host tests, because QEMU declares no reserved regions and the path is otherwise unreachable. |
 | M6-13 | RFC 0012 step 4: `MAP`/`UNMAP`, `DevAddr`, and a refusal that names the device | ✅ `DONE` | The unit comes up **before** the device: a window names the device it translates for, and translation must be on before `DRIVER_OK` lets a device read a ring. The driver's frames are mapped as they are allocated and it is handed `DevAddr`s — its memory sits at `0xf8aa000+` and the device is told `0x100000000+`. `UNMAP` invalidates before returning, because until it does the hardware still reaches a page the caller has been told is gone. Fault records are read, so a refusal names the device, the address and the direction. **Negative test**: hand the device an address nobody mapped — `00:03.0 was refused 0x7ffffff000 (write), reason 0x05`. |
 | M6-14 | RFC 0012 step 5: a `Memory` object a device can reach, and a revoke that reaches the device | ✅ `DONE` | RFC 0009's object mapped into the device window — the same frames a domain shares with another domain are what a device is given, through the same object and the same revocation. `revoke` now walks the device mapping too, invalidating the IOTLB per entry. **The assertion is asked of the device**: it reads into the object successfully, the object is revoked, and the same device at the same address is refused. A new `DmaWindow` lock rank sits inside `shared::ARENA`, and the unit's registers are cached at bring-up because mapping MMIO reaches the heap — the outermost lock — while invalidation happens under the innermost. |
-| M6-15 | RFC 0012 step 6: interrupt remapping, and it works | ✅ `DONE` (2026-08-11) | The table, entries that validate **which device** may present a handle — the only thing that answers "who sent this", which is why RFC 0011 left the risk open — remappable I/O APIC lines and MSI messages, and compatibility format blocked. Held at `PARTIAL` for six days by an undelivered MSI that **was never an interrupt fault**: enabling remapping cleared translation-enable through a zeroed shadow of a write-only `GCMD`, so the device's DMA was untranslated and its address space had no remapping region in it. `Unit::adopt` fixes it, and the whole boot test passes with `iommu=remap-irq` — the block driver woken by its own device, one interrupt per request, every message a handle this kernel issued. **Still off by default, and no longer because of a defect**: this path was silently broken for its entire life so it has barely run, it has been seen working on one emulator, and nothing has booted on real hardware. `iommu=remap-irq` turns it on; the boot line says which world the machine is in, and a gate asserts it says something either way. |
+| M6-15 | RFC 0012 step 6: interrupt remapping, and it works | ✅ `DONE` (2026-08-11) | The table, entries that validate **which device** may present a handle — the only thing that answers "who sent this", which is why RFC 0011 left the risk open — remappable I/O APIC lines and MSI messages, and compatibility format blocked. Held at `PARTIAL` for six days by an undelivered MSI that **was never an interrupt fault**: enabling remapping cleared translation-enable through a zeroed shadow of a write-only `GCMD`, so the device's DMA was untranslated and its address space had no remapping region in it. `Unit::adopt` fixes it, and the whole boot test passes with `iommu=remap-irq` — the block driver woken by its own device, one interrupt per request, every message a handle this kernel issued. **On by default from 2026-08-11**, which is a decision taken separately from the fix: without remapping a device can raise any vector on any CPU by writing a word, and RFC 0011 accepted that only because there was no unit to close it. What the default costs is said in the code beside it — few boots, one emulator, no physical hardware — and `iommu=no-remap-irq` is the way out for a machine where it goes wrong. A unit that cannot or will not remap is **not** a boot failure: the reason prints in red and the machine runs with the old risk. The gate is now the strong one — it asserts interrupts *are* remapped, where before it asserted only that the machine said which world it was in. |
 | M6-16 | RFC 0012 step 7: a `DmaWindow` a domain holds | ✅ `DONE` | `ObjectKind::DmaWindow` with `MAP`/`UNMAP`/`INFO`, resolved under the capability arena and performed after it is released — mapping allocates, and allocating takes the heap. **Both** capabilities are checked and the device gets the weaker of their rights, so a read-only share cannot become writable by being handed to a device. **The assertion is the refusal**: a domain holding the memory and *not* the window is denied. Four real bugs fell out — see the changelog. |
 | M6-17 | RFC 0011 step 6: an `IrqHandler` a domain holds | ✅ `DONE` | `BIND`, `ACK`, `RELEASE` — and **never** the MSI-X table, because an MSI is a memory write of an arbitrary vector to an arbitrary CPU and a holder that could program one would hold interrupt injection. Three refusals carry the meaning: a legacy line may not be delegated (it is shared, and a holder that never acknowledges masks a line others need), a `Notification` capability is not authority over an interrupt, and **the RFC's own precondition is enforced in code** — `irq::name` refuses when nothing is translating, because a domain driving a device needs that device's DMA constrained first. **Negative-tested**: removing the object-kind check turns the gate red. |
 | M6-18 | RFC 0009 step 6: the filesystem service's bulk path | ✅ `DONE` | `fs::READ_INTO` fills a shared region in **one** round trip where the message path needs fifteen for the same file — the RFC's own comparison, measured on the data path alone, because opening a file costs the same either way and folding that in would flatter it. The caller names a **slot in its own CSpace**, never an object identity: an identity is a caller asserting what it may reach. The register path stays for short transfers. **Negative-tested** at the third attempt — see the changelog for why the first two proved nothing. |
@@ -705,6 +705,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-11, last (interrupt remapping is on by default)
+
+A decision, taken after the fix rather than inside it. **Without remapping a device can raise any
+vector on any CPU by writing a word** — RFC 0011 named that and accepted it, because at the time
+there was no unit to close it. There is now, and RFC 0012 step 6's whole purpose was to retire it.
+
+**What the default costs, stated because it is not nothing.** This path was silently broken for its
+entire life until the day before it was turned on, so it has few boots behind it. It has been seen
+working on one emulator. Nothing has ever booted this kernel on physical hardware, where an IOMMU is
+much less forgiving than a model of one. `iommu=no-remap-irq` turns it off, and that escape hatch is
+what makes turning it on reversible rather than brave. `iommu=remap-irq` is still accepted and now
+means nothing, because command lines outlive the reasons they were written.
+
+**A unit that cannot remap is not a boot failure.** The reason prints in red and the machine runs
+with the old risk, in the same words the opted-out case uses — what matters to whoever reads the
+line is the state the machine is in, not how it got there.
+
+**The gate got stronger, and only could once the default changed.** It asserted that the machine
+*said which world it was in*; it now asserts that interrupts *are* remapped. The weak version was
+right while remapping was off and is wrong now: a machine that fell back would boot, pass every
+other check here, and be a machine where a device can forge an interrupt. That is the degradation
+this suite exists to refuse to ship quietly, and this is the only line that sees it.
+
+Verified in every configuration: IOMMU with the new default, IOMMU with `iommu=no-remap-irq`, no
+IOMMU at all, UEFI, the `fsd` placement, and the shell tests.
 
 ### 2026-08-11, later still (device-address reuse is on, and the proof is a test that fails when it should)
 
@@ -3223,7 +3249,8 @@ the same borrowed machine. Before trusting a green run, ask which machine it was
   leaves it running on the timer deadline — a machine that still works while quietly polling. That
   is the exact shape of degradation this milestone has caught five times in other people's checks,
   and introducing one deliberately to claim a step complete would be worse than the missing feature.
-  `iommu=remap-irq` turns it on for whoever finishes it.
+  `iommu=remap-irq` turns it on for whoever finishes it. **(Finished 2026-08-11: it works, and it
+  is on by default. See the entries for that date — this bullet is what was true on the day.)**
 - **What is left**: find why the device does not fire. Ruled out so far — `eim` on and off, SHV on
   and off, the destination and format bugs above. Worth trying on a newer QEMU than 4.2 before
   assuming the kernel is at fault; the IPC stall this session was found the same way.

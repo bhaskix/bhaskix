@@ -174,9 +174,12 @@ management, and libc.
   until the bulk paths used shared memory the two placements were identical *by accident*, because
   four registers map into nobody
 - ✅ **IOMMU: discovery, per-device domains, strict mapping** — [RFC 0012](rfc/0012-iommu.md),
-  implemented; interrupt remapping is built and **off**. VT-d first, because QEMU emulates it and a
-  design CI cannot test will be wrong unnoticed; an AMD machine runs degraded and says so. This is
-  what funds `security.md` §1 T3 and T4, and what unblocks a driver running outside the kernel
+  implemented, **all seven steps**. Interrupt remapping is **on by default** from 2026-08-11, which
+  retires RFC 0011's residual risk — a device raising an interrupt it was never programmed to raise;
+  `iommu=no-remap-irq` is the way out on a machine where it goes wrong. VT-d first, because QEMU
+  emulates it and a design CI cannot test will be wrong unnoticed; an AMD machine runs degraded and
+  says so. This is what funds `security.md` §1 T3 and T4, and what unblocks a driver running outside
+  the kernel
 - ✅ **Driver framework** — [RFC 0014](rfc/0014-driver-framework.md), implemented. PCIe/ECAM
   enumeration, `register_block!`, `Mmio<T>`, mock-MMIO test harness. Its motivation is an invoice
   rather than a
@@ -210,7 +213,8 @@ own bootloader.
 - **Secure update** — immutable root, A/B slots, rollback protection
 - **RBAC** — `bhaskixd-authz` over capabilities
 - **Audit framework** — hash-chained log over the telemetry plane, remote attestation
-- **IOMMU, the rest of it** — interrupt remapping, nested translation for VMs, and AMD-Vi.
+- **IOMMU, the rest of it** — nested translation for VMs, and AMD-Vi. Interrupt remapping landed in
+  Phase 2 instead, and is on by default.
   Discovery, per-device domains and strict mapping moved to Phase 2 when
   [RFC 0012](rfc/0012-iommu.md) was accepted: they are what make a driver's mistakes
   containable, and leaving them here left `security.md` §1 T3 and T4 unfunded for the
