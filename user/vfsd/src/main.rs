@@ -39,10 +39,14 @@ const ENDPOINT: u64 = 0;
 /// The most one `fs::READ_INTO` can move in a single reply.
 ///
 /// A page, because the bulk path in this placement copies through a buffer in
-/// this program's own memory and the kernel writes it into the caller's memory
-/// in one call. A caller asking for more gets a short write and is told how
-/// much arrived, which is the same answer it gets from the nucleus placement
-/// when its memory object is smaller than it asked for.
+/// this program's own memory. It is the size of one **piece**, not of one
+/// answer: [`fill`] loops, telling the kernel where each piece goes, so a
+/// caller asking for more than this gets more than this.
+///
+/// That distinction was the bug. This constant used to bound the whole reply,
+/// so the answer to "read me four pages" was one page and a claim that the file
+/// had ended -- while the nucleus placement, which writes through the direct
+/// map, returned all four.
 const BULK_BYTES: usize = 4096;
 
 /// There is nothing to unwind and nowhere to print to.
@@ -92,31 +96,61 @@ fn call(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> u64 {
 /// message this program is answering, and this program cannot say otherwise.
 fn fill(slot: u64, limit: usize, source: &mut dyn FnMut(&mut [u8]) -> usize) -> Option<usize> {
     let mut buffer = [0u8; BULK_BYTES];
-    let want = limit.min(BULK_BYTES);
-    let read = source(&mut buffer[..want]);
+    let mut written = 0usize;
 
-    // Issued even when there is nothing to write. The nucleus placement checks
-    // the caller's capability *before* it reads anything, so a caller with no
-    // right to that memory is refused whether or not the file had bytes left.
-    // An earlier version of this function returned early on an empty read and
-    // therefore answered "fine, nothing" where the nucleus answered "that is
-    // not yours" -- the two placements disagreeing about a refusal, which is
-    // exactly the divergence this whole design exists to prevent. Found by the
-    // negative half of the bulk test and by nothing else.
-    let status = call(
-        syscall::INVOKE,
-        ENDPOINT,
-        method::FILL,
-        [slot, buffer.as_ptr() as u64, read as u64, 0],
-    );
-    if status == status::OK {
-        Some(read)
-    } else {
-        // The caller named memory it does not hold, or does not hold writable.
-        // Indistinguishable from here, and correctly so: this program is told
-        // that the authority was not there, not what the caller's CSpace looks
-        // like.
-        None
+    // **A loop, since 2026-08-11, and it is the whole of this fix.** This
+    // function used to copy `limit.min(BULK_BYTES)` once and report that as the
+    // answer, so a caller asking for more than one page got one page and was
+    // told that was the file. The nucleus placement, which has the object in
+    // front of it, spanned every frame and returned all of it.
+    //
+    // The two placements therefore disagreed about how much `READ_INTO` reads
+    // -- by a factor of four for a sixteen-kilobyte object, and unboundedly in
+    // general. That is the divergence RFC 0013 exists to prevent, and the note
+    // below about the *previous* one is why it stings: the same function had
+    // already diverged once, on refusals, and the fix then did not ask what
+    // else about it might differ.
+    //
+    // It was invisible because the bulk self-test used a one-page object, where
+    // both placements agree by construction.
+    loop {
+        let want = (limit - written).min(BULK_BYTES);
+        let read = source(&mut buffer[..want]);
+
+        // Issued even when there is nothing to write. The nucleus placement
+        // checks the caller's capability *before* it reads anything, so a
+        // caller with no right to that memory is refused whether or not the
+        // file had bytes left. An earlier version of this function returned
+        // early on an empty read and therefore answered "fine, nothing" where
+        // the nucleus answered "that is not yours" -- the two placements
+        // disagreeing about a refusal, which is exactly the divergence this
+        // whole design exists to prevent. Found by the negative half of the
+        // bulk test and by nothing else.
+        //
+        // `written` is the offset: where in the caller's object this piece
+        // goes. Without it every piece would land at the start and the last one
+        // would be the only one that survived.
+        let status = call(
+            syscall::INVOKE,
+            ENDPOINT,
+            method::FILL,
+            [slot, buffer.as_ptr() as u64, read as u64, written as u64],
+        );
+        if status != status::OK {
+            // The caller named memory it does not hold, or does not hold
+            // writable. Indistinguishable from here, and correctly so: this
+            // program is told that the authority was not there, not what the
+            // caller's CSpace looks like.
+            return None;
+        }
+
+        written += read;
+        if read < want || written >= limit {
+            // The source ran out, or the caller has what it asked for. A short
+            // read is the end of the file, which is the same thing `fill_from`
+            // concludes from a short source.
+            return Some(written);
+        }
     }
 }
 

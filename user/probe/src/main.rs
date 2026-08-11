@@ -133,6 +133,37 @@ _start:
     ud2
 1:
 
+    // --- Mode 7: started by the shell, and it says so ----------------------
+    //
+    // The same argument as mode 6 and a different audience. Mode 6 reports to
+    // a self-test through a method only a self-test answers; this writes to a
+    // **console** through the ordinary protocol, because what starts this one
+    // is a person typing `spawn` and the answer has to reach them.
+    //
+    // Capability 0 is a console endpoint the shell granted. If the grant did
+    // not happen this call reaches nobody, the line never appears, and the
+    // test that looks for it fails -- which is the coupling that matters: a
+    // started program holding nothing looks exactly like one that never
+    // started, and only its own output tells them apart.
+    //
+    // One `syscall` and no loop: `Chunk` carries up to sixteen bytes packed
+    // little-endian across two registers, and this line is fifteen.
+    cmp rdi, 7
+    jne 8f
+    mov rax, 1                  // Kind::Call
+    xor rdi, rdi                // capability 0: the console the shell gave us
+    mov rsi, 1                  // console::WRITE
+    mov rdx, 15                 // fifteen bytes, and no MORE flag
+    mov r10, 0x2c64656e77617073 // "spawned,"
+    mov r8,  0x000a6f6c6c656820 // " hello\n"
+    xor r9, r9
+    syscall
+
+    mov rax, 5                  // Kind::Exit
+    syscall
+    ud2
+8:
+
     // --- Evidence that the loader read the file rather than copying it ------
     //
     // Three facts, each obtainable only if a different segment was mapped as

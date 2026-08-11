@@ -130,7 +130,7 @@ triggers six CPU exceptions and checks each is reported rather than
 triple-faulting. Any `FAILED` the kernel prints fails the run, whether or not a
 gate was looking for that particular one.
 
-That is **594 checks**. A gate that has never been watched failing is not
+That is **601 checks**. A gate that has never been watched failing is not
 counted as a gate here — see [TRACKER.md](TRACKER.md), which records the ones
 that turned out to prove nothing and what was done about them.
 

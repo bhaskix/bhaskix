@@ -37,6 +37,45 @@ use bhaskix_abi::{
 const CONSOLE: u64 = 0;
 /// The capability slot the filesystem endpoint was installed in.
 const FILESYSTEM: u64 = 1;
+/// Authority to create a domain — RFC 0017's first unresolved question,
+/// answered on 2026-08-11.
+///
+/// Holding it is not sufficient on its own: the envelope allows one child, so
+/// a second `spawn` is refused for the budget rather than for this. Those are
+/// different refusals and the shell reports them differently.
+const DOMAIN_CONTROL: u64 = 14;
+/// Where [`spawn`] puts the domain it makes. Given back with `RELEASE`.
+const CHILD: u64 = 15;
+/// The badge the child's ending carries, so a wake can be told from any other.
+const CHILD_BADGE: u64 = 0xc1d;
+/// At most this much of a file is read in as an image.
+///
+/// The shell's memory object is four pages, and this is all of it. A larger
+/// program is refused rather than truncated: half an ELF is not a program, and
+/// starting one would fail somewhere less obvious than here.
+const IMAGE_LIMIT: u64 = 4 * 4096;
+/// The name the child is created with, packed little-endian: `child`.
+const NAME_LOW: u64 = 0x0064_6c69_6863;
+const NAME_HIGH: u64 = 0;
+/// Every right this program holds, which is what a grant may pass on at most.
+///
+/// Named rather than spelled `READ | WRITE`: a child given only those two could
+/// not derive or pass on what it was handed, and the failure of a grant that is
+/// too narrow is a program that starts, does nothing, and exits cleanly -- which
+/// looks exactly like a program that was never given anything.
+const EVERYTHING_HELD: u64 = rights::READ
+    | rights::WRITE
+    | rights::EXECUTE
+    | rights::GRANT
+    | rights::REVOKE
+    | rights::DERIVE;
+
+/// The badge the console gave this program, which a grant must carry unchanged.
+///
+/// A holder may not invent a badge: the service uses it to tell its callers
+/// apart, so one a caller chose would be a caller choosing who it looks like.
+const BADGE_CONSOLE: u64 = 0x0000_0000_00c0_0000;
+
 /// Memory this program holds and may write.
 ///
 /// Slot 2 is left empty deliberately: `caps` reports it as "no authority", and
@@ -106,6 +145,21 @@ impl Reply {
 
     fn chunk(&self) -> Chunk {
         Chunk::unpack(&self.args)
+    }
+
+    /// The number a **service** packed beside its outcome.
+    ///
+    /// `with_outcome` puts the outcome eight bits up at bit 16, so the value is
+    /// what is below it. Separate from [`Reply::raw`] because a kernel invoke
+    /// packs nothing: reading one with the other's accessor silently truncates
+    /// or silently includes an outcome byte, and both look like a number.
+    fn value(&self) -> u64 {
+        self.args[0] & 0xffff
+    }
+
+    /// What a **kernel** invoke returned, which carries no outcome.
+    fn raw(&self) -> u64 {
+        self.args[0]
     }
 }
 
@@ -356,11 +410,13 @@ fn help() {
     write(
         b"    map               map memory this program holds, and be refused what it does not\n",
     );
+    write(b"    spawn <path>      start a program in a domain of its own\n");
     write(b"    exit              end this shell\n");
     write(b"\n");
-    write(b"  this shell runs in ring 3. it holds two capabilities -- one for\n");
-    write(b"  the console, one for the filesystem -- and can do nothing that\n");
-    write(b"  is not one of them.\n");
+    write(b"  this shell runs in ring 3 and can do nothing it does not hold a\n");
+    write(b"  capability for. 'caps' lists them. one of them creates domains,\n");
+    write(b"  and the envelope allows exactly one -- so a second 'spawn' is\n");
+    write(b"  refused for the budget rather than for the authority.\n");
 }
 
 /// Reports what each capability slot answers.
@@ -680,6 +736,138 @@ fn list(path: &[u8]) {
     if entries == 0 {
         write(b"  nothing there\n");
     }
+}
+
+/// Reads `path` into this program's memory and starts it in a domain of its own.
+///
+/// RFC 0017 steps 4 to 6, asked for by a person rather than by a self-test.
+/// Every step is an ask on a capability this program holds, and any of them may
+/// be refused — which is the point, and why each one reports separately.
+///
+/// **The child's own line is the assertion.** That a domain existed proves
+/// `SPAWN` worked; that the child *printed* proves the `GRANT` reached it. A
+/// started program holding nothing is indistinguishable from one that never
+/// started, so a report of "started" and "ended" with nothing in between would
+/// pass against a broken grant.
+fn spawn(path: &[u8]) {
+    // The image, into memory this program already holds. `READ_INTO` takes a
+    // slot in *this* CSpace rather than an object identity: a caller naming an
+    // identity would be asserting what it may reach, and naming a slot points
+    // at authority it holds and the service checks. So this cannot read into
+    // anybody else's memory, and the shell's four pages are the limit.
+    let reset = call(FILESYSTEM, fs::RESET, [0; 4]);
+    if !reset.delivered() {
+        report_refusal(b"spawn", &reset);
+        return;
+    }
+    if let Err(reply) = send_path(path) {
+        report_refusal(b"spawn", &reply);
+        return;
+    }
+    let opened = call(FILESYSTEM, fs::OPEN, [0; 4]);
+    if !opened.delivered() {
+        report_refusal(b"spawn", &opened);
+        return;
+    }
+    if opened.outcome() != outcome::OK {
+        report_outcome(b"spawn", opened.outcome());
+        return;
+    }
+
+    let filled = call(FILESYSTEM, fs::READ_INTO, [MEMORY_RW, IMAGE_LIMIT, 0, 0]);
+    if !filled.delivered() {
+        report_refusal(b"spawn: reading the image", &filled);
+        return;
+    }
+    if filled.outcome() != outcome::OK {
+        report_outcome(b"spawn: reading the image", filled.outcome());
+        return;
+    }
+    let bytes = filled.value();
+    if bytes == 0 {
+        write(b"  spawn: the file is empty\n");
+        return;
+    }
+
+    // A domain, empty. No threads, no capabilities, no address space -- which
+    // is what makes the grants below the only way it gets anything.
+    let made = syscall(
+        syscall::INVOKE,
+        DOMAIN_CONTROL,
+        method::SPAWN,
+        [CHILD, NAME_LOW, NAME_HIGH, 0],
+    );
+    if !made.delivered() {
+        report_refusal(b"spawn: creating the domain", &made);
+        return;
+    }
+    write(b"  started in a domain of its own\n");
+
+    // The console, into the child's slot 0, under the same badge. A holder may
+    // not invent a badge -- the service uses it to tell its callers apart, and
+    // one a caller chose would be a caller choosing who it looks like.
+    // `[from, to, rights, badge]`, which is the implementation's order and not
+    // the one the kernel's doc comment gave until this change found it wrong.
+    let granted = syscall(
+        syscall::INVOKE,
+        CHILD,
+        method::GRANT,
+        [CONSOLE, 0, EVERYTHING_HELD, BADGE_CONSOLE],
+    );
+    if !granted.delivered() {
+        report_refusal(b"spawn: granting the console", &granted);
+        return;
+    }
+
+    // Ask to be told it ended **before** starting it. A binding made afterwards
+    // races the program: a short-lived one can be gone before its creator gets
+    // round to watching, and the kernel refuses a watch for an event that has
+    // already happened rather than accepting a wait that never ends.
+    //
+    // Bound to the notification this program already holds. `BIND` names a slot
+    // that has one in it, not an empty slot to put one in -- the domain signals
+    // something the caller owns, which is why a caller with no notification
+    // cannot be told about anything.
+    let bound = syscall(
+        syscall::INVOKE,
+        CHILD,
+        method::BIND,
+        [SIGNAL, CHILD_BADGE, 0, 0],
+    );
+    if !bound.delivered() {
+        report_refusal(b"spawn: asking to be told it ended", &bound);
+        return;
+    }
+
+    // The image arrives as a capability, not a filename: the kernel has no
+    // business opening files on a program's behalf. Entry word 7 is "say so
+    // through the capability you were given, and exit".
+    let started = syscall(
+        syscall::INVOKE,
+        CHILD,
+        method::START,
+        [MEMORY_RW, bytes, 7, 0],
+    );
+    if !started.delivered() {
+        report_refusal(b"spawn: starting it", &started);
+        return;
+    }
+
+    // Wait for it, then ask why it ended and give the slot back.
+    let ended = syscall(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+    if !ended.delivered() {
+        report_refusal(b"spawn: waiting for it", &ended);
+        return;
+    }
+    let reason = syscall(syscall::INVOKE, CHILD, method::INFO, [0; 4]);
+    if reason.delivered() {
+        // `raw`, not `value`: this is a kernel invoke and carries no outcome
+        // byte to mask off.
+        write(b"  it ended: reason ");
+        write_number(reason.raw());
+        write(b"\n");
+    }
+    let _ = syscall(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
 }
 
 fn cat(path: &[u8]) {
@@ -1091,6 +1279,13 @@ fn run(line: &[u8]) {
                 write(b"  cat: which file?\n");
             } else {
                 cat(rest);
+            }
+        }
+        b"spawn" => {
+            if rest.is_empty() {
+                write(b"  spawn: which program?\n");
+            } else {
+                spawn(rest);
             }
         }
         b"exit" => {

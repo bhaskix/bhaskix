@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-07 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking is next**, and unblocked: it was gated on the driver framework |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 594 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
 
 ### Division of responsibility between documents
 
@@ -705,6 +705,61 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-11 (the shell can start a program, and the two placements disagreed about how much a read reads)
+
+RFC 0017's first unresolved question — *does the shell get `DomainControl`?* — answered **yes**, and
+the answer to *which of the two things are you buying* is **both**. The user-mode shell holds one at
+slot 14, and `spawn <path>` reads a program into memory it already has, makes a domain, grants it a
+console, asks to be told when it ends, starts it, and reaps it.
+
+```
+bhaskix$ spawn bin/probe
+  started in a domain of its own
+spawned, hello
+  it ended: reason 1
+```
+
+**The middle line is the assertion.** That a domain existed proves `SPAWN`; that the program in it
+*printed* proves the `GRANT` reached it. Negative-tested by removing the grant: the first and third
+lines still appear and only the middle one goes, so a test asserting "started" and "ended" would
+pass against a broken grant.
+
+**What it cost to get there was a protocol gap, and that is the more valuable half.**
+
+`fs::READ_INTO` returned **4096 bytes of a 13,024-byte file** — and only in one placement. The
+domain-hosted `bin/vfsd` copies through a buffer of its own, capped at a page, and had no way to say
+*continue from here*: `FILL` took `[slot, source, length]` and always wrote from the start of the
+caller's object. So it wrote one page and reported that as the whole file. The nucleus placement,
+which has the object in front of it and calls `fill_from` directly, spanned every frame and returned
+all of it.
+
+**The two placements disagreed about how much a bulk read reads** — by four times here, unboundedly
+in general — which is the divergence RFC 0013 exists to prevent. The same function had *already*
+diverged once, on refusals, and the comment recording that fix is three lines above the bug.
+
+Fixed by giving `FILL` an offset (`arg3`, previously unused) and making the domain placement loop.
+`Fill`'s own signature is unchanged, deliberately: the offset is the placement's business, and a
+service that had to know would be a service that knows where it runs.
+
+**It was invisible because the bulk self-test used a one-page object** — a size both placements agree
+about by construction — and read a 228-byte file. It now has a second object of four pages and reads
+`bin/probe` across the page boundary, comparing contents *past* the first page. The count alone would
+not do: a fill that wrote every piece at offset zero returns the right number and the wrong bytes.
+Negative-tested by disabling the loop, which turns three gates red.
+
+**Three smaller things found on the way.** The shell was invoking kernel-object methods with `CALL`
+where they need `INVOKE`. `GRANT`'s doc comment in `syscall.rs` had `arg1` and `arg2` transposed
+against its implementation — invisible because its only caller was assembly written from the code,
+and the first caller to trust the comment would have granted a capability with rights and
+destination swapped. And `GRANT`, `BIND` and `RELEASE` had no names in the ABI at all; they are
+mirrored now, with the static assertions that make two definitions safe.
+
+**And the containment gate caught its own author.** The entry above this one, added hours earlier,
+named a gitignored local file by name — which is a vendor string in a tracked file, and the blob
+scan added in that very commit found it in the very commit that added it. The commits were unpushed,
+so it was rewritten rather than lived with. That is the whole argument for checking history rather
+than the working tree.
 
 ### 2026-08-11 (the containment gate said "the whole history" and checked the metadata)
 

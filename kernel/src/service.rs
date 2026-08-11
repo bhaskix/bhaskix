@@ -264,7 +264,14 @@ fn filesystem_bulk() -> Bulk {
             // the capability syscalls use, and the reason this cannot be used
             // to read into somebody else's memory.
             let object = crate::shared::caller_object(caller, slot)?;
-            crate::shared::fill_from(object, limit, source)
+            // Offset zero, and no loop: this placement has the object in front
+            // of it and `fill_from` spans every frame of it in one call. The
+            // domain placement cannot -- it copies through a buffer of its own
+            // and has to say where each piece goes. That asymmetry is the
+            // placement's business and not the service's, which is why `Fill`
+            // takes no offset: a service that had to know would be a service
+            // that knows where it runs.
+            crate::shared::fill_from(object, 0, limit, source)
         },
         refused: || {
             REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

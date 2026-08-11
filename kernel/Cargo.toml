@@ -155,7 +155,14 @@ workspace = true
 # looking is the entire test: without it the check would pass on a stale
 # translation, because a stale translation writes to the old page and reports
 # nothing.
-unsafe_budget = 1122
+# 1126 at M9-24. `fill_from` gained an offset, so a service that copies through
+# a buffer of its own can say where each piece goes. The two `unsafe` lines are
+# the same direct-map slice as before, now started part-way into a frame -- and
+# the bulk self-test gained a second object and a read that crosses a page,
+# which is the check that would have caught the divergence this fixes: the
+# domain placement delivered one page and called it the file, while the nucleus
+# placement delivered all four.
+unsafe_budget = 1126
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

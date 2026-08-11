@@ -650,22 +650,43 @@ pub fn drain_into(
 /// name a length would be naming memory beyond what it holds.
 pub fn fill_from(
     id: MemoryId,
+    offset: usize,
     limit: usize,
     mut source: impl FnMut(&mut [u8]) -> usize,
 ) -> Option<usize> {
     let (frames, count) = frames_of(id)?;
     let hhdm = hhdm();
-    let capacity = (count * FRAME_SIZE as usize).min(limit);
+    let size = count * FRAME_SIZE as usize;
+    if offset >= size {
+        // Past the end is not a fault and not a lie: nothing was written, and
+        // saying so lets a caller stop rather than retry for ever.
+        return Some(0);
+    }
+    let capacity = (size - offset).min(limit);
 
     let mut written = 0;
-    for frame in frames.iter().take(count) {
+    for (index, frame) in frames.iter().take(count).enumerate() {
         if written >= capacity {
             break;
         }
-        let room = (capacity - written).min(FRAME_SIZE as usize);
-        // SAFETY: a frame this object owns, reached through the direct map,
-        // and `room` is bounded by the frame size.
-        let page = unsafe { core::slice::from_raw_parts_mut((hhdm + frame) as *mut u8, room) };
+        // Where this frame sits in the object, and where the cursor is now.
+        // Frames entirely before the offset are skipped, and the first one that
+        // is not starts part-way in -- which is the whole of what an offset
+        // means for an object that is not contiguous in physical memory.
+        let start = index * FRAME_SIZE as usize;
+        let cursor = offset + written;
+        if cursor >= start + FRAME_SIZE as usize {
+            continue;
+        }
+        let within = cursor.saturating_sub(start);
+        let room = (FRAME_SIZE as usize - within).min(capacity - written);
+
+        // SAFETY: a frame this object owns, reached through the direct map.
+        // `within` is below the frame size and `room` is bounded by what is
+        // left of the frame, so the slice stays inside it.
+        let page = unsafe {
+            core::slice::from_raw_parts_mut((hhdm + frame + within as u64) as *mut u8, room)
+        };
         let produced = source(page);
         written += produced;
         if produced < room {

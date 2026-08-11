@@ -132,6 +132,11 @@ const _: () = {
     assert!(method::HAND == bhaskix_abi::method::HAND);
     assert!(method::EXPECT == bhaskix_abi::method::EXPECT);
     assert!(method::DRAIN == bhaskix_abi::method::DRAIN);
+    assert!(method::GRANT == bhaskix_abi::method::GRANT);
+    assert!(method::BIND == bhaskix_abi::method::BIND);
+    assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
+    assert!(method::SPAWN == bhaskix_abi::method::SPAWN);
+    assert!(method::START == bhaskix_abi::method::START);
     assert!(crate::cap::Rights::READ.bits() as u64 == bhaskix_abi::rights::READ);
     assert!(crate::cap::Rights::WRITE.bits() as u64 == bhaskix_abi::rights::WRITE);
     assert!(crate::cap::Rights::DERIVE.bits() as u64 == bhaskix_abi::rights::DERIVE);
@@ -196,7 +201,15 @@ pub mod method {
     /// Give a derived capability to the domain this capability names.
     ///
     /// Only on a `Domain` capability. `arg0` = the caller's slot to derive
-    /// from, `arg1` = rights, `arg2` = badge, `arg3` = slot in the recipient.
+    /// from, `arg1` = the slot in the recipient, `arg2` = rights, `arg3` =
+    /// badge.
+    ///
+    /// That order is what `grant` reads, and this comment said `arg1` was
+    /// rights and `arg3` the recipient's slot until 2026-08-11 — wrong in a way
+    /// nothing caught, because the only caller was hand-written assembly that
+    /// had got it right from the implementation. The first caller to trust the
+    /// comment granted a capability with the rights and the destination
+    /// transposed.
     pub const GRANT: u64 = 16;
     /// Map a `Memory` object into this `DmaWindow`, and return a `DevAddr`.
     ///
@@ -1236,7 +1249,14 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
 
         let source = frame.arg1;
         let limit = frame.arg2 as usize;
-        let written = crate::shared::fill_from(object, limit, &mut |bytes: &mut [u8]| {
+        // Where in the caller's object to start. `arg3` was unused until
+        // 2026-08-11, when it turned out a service in a domain could not fill
+        // an object larger than its own stack buffer -- it had no way to say
+        // "continue from here", so it wrote the first page and reported that as
+        // the whole file. The nucleus placement, calling `fill_from` directly,
+        // spanned every frame. Two placements, two answers, silently.
+        let offset = frame.arg3 as usize;
+        let written = crate::shared::fill_from(object, offset, limit, &mut |bytes: &mut [u8]| {
             // From the domain's own address space, through the exception
             // table: a service that passed an address it does not own gets a
             // short write, not a kernel fault.

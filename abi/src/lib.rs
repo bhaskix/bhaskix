@@ -91,7 +91,14 @@ pub mod method {
     /// Only on an `Endpoint` capability, and only from the thread answering a
     /// message taken from it. `arg0` = the *caller's* slot holding the
     /// `Memory` capability, `arg1` = the address of the bytes in this domain,
-    /// `arg2` = how many.
+    /// `arg2` = how many, `arg3` = where in the caller's object to put them.
+    ///
+    /// The offset is what lets a service copy something larger than its own
+    /// buffer: it fills a piece, says where the piece goes, and comes back for
+    /// the next. Without it a service in a domain could deliver only as much as
+    /// it could hold at once, and reported that as the whole answer -- which it
+    /// did until 2026-08-11, disagreeing with the nucleus placement about how
+    /// much a bulk read reads.
     ///
     /// The bulk path a service gets when it runs in its own domain. Which
     /// caller is not an argument: it is the one being answered, and a service
@@ -216,6 +223,35 @@ pub mod method {
     /// copy, `arg2` = its badge. Where it lands comes from the caller's
     /// [`EXPECT`] and not from here.
     pub const HAND: u64 = 47;
+    /// Give a derived capability to the domain this capability names.
+    ///
+    /// Only on a `Domain`. `arg0` = the caller's slot to derive from, `arg1` =
+    /// the slot in the recipient, `arg2` = rights, `arg3` = badge — and that
+    /// order is the implementation's, checked against the kernel by the
+    /// assertions in `syscall.rs`. The kernel's own doc comment had `arg1` and
+    /// `arg2` transposed until 2026-08-11, which nothing caught because the
+    /// only caller was assembly written from the code.
+    ///
+    /// A badge may not be invented: it must be the one the capability already
+    /// carries, because a service uses it to tell its callers apart.
+    pub const GRANT: u64 = 16;
+    /// Ask to be signalled when the domain this capability names ends.
+    ///
+    /// Only on a `Domain`. `arg0` = a slot **already holding** a notification
+    /// this program owns, `arg1` = the badge the signal carries. It is not a
+    /// slot to put a new notification in: the domain signals something the
+    /// caller already has, so a caller with none cannot be told about anything.
+    ///
+    /// Must be asked **before** `START`. A binding made afterwards races a
+    /// short-lived program, and the kernel refuses a watch for an event that
+    /// has already happened rather than accepting a wait that never ends.
+    pub const BIND: u64 = 35;
+    /// Give back a domain that has ended, and the slot naming it.
+    ///
+    /// The capability goes with the slot: leaving it would let a holder ask
+    /// about a domain that has been reaped and get an answer about whatever
+    /// took the slot next.
+    pub const RELEASE: u64 = 37;
     /// Create a domain, and put a capability to it in a slot this program names.
     ///
     /// Only on a `DomainControl` capability. `arg0` = the slot in this

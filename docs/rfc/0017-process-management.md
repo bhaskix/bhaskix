@@ -360,10 +360,21 @@ program can no longer stop this machine.**
 
 **Still open, and deliberately not answered here:**
 
-1. **Does the shell get `DomainControl`?** No step needed it, so no step granted it. It would let
-   `elf` start a program in its own domain — the obvious next demonstration — and would also hand
-   the most exposed program in the tree the ability to make more. Whoever wants it should say which
-   of those they are buying.
+1. ~~**Does the shell get `DomainControl`?**~~ **Answered 2026-08-11: yes, and both halves were
+   bought deliberately.** The user-mode shell holds one at slot 14 and `spawn <path>` reads a
+   program into memory it already has, makes a domain, grants it a console, asks to be told when it
+   ends, starts it, and reaps it. That is RFC 0017 steps 4 to 6 driven by a person rather than by a
+   self-test, which is the first time anything but a self-test has used them.
+
+   The question asked which of the two was being bought, and the answer is that the second is the
+   price of the first: the most exposed program in the tree can now make domains. What makes that
+   acceptable is that the authority is a capability like any other — budgeted by an envelope at one
+   child, derived from a root the kernel keeps so revoking it takes the power back, and refused
+   separately for the capability and for the budget.
+
+   Note that `elf` was the wrong command to name. It lives in the **kernel** shell, which runs in
+   ring 0 and needs no capability to do anything; giving *it* a `DomainControl` would prove nothing
+   about containment. The demonstration only means something in the program that has to ask.
 2. **What restarts a service that died?** The same boundary RFC 0013 drew, for the same reason:
    restart policy is policy, and it now has mechanisms to be written against.
 

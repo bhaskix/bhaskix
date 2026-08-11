@@ -106,6 +106,17 @@ else
         # the middle of its own test.
         commands+=$'lend\r'$'held\r'$'release\r'
     fi
+    # RFC 0017 steps 4 to 6, asked for by a person rather than by a self-test.
+    #
+    # Twice, and **not** to see the second refused: `spawn` reaps the child it
+    # made, which gives the budget back, so a second one succeeds and should.
+    # What running it twice shows is that the reap actually released something
+    # -- a `RELEASE` that quietly did nothing would leave the envelope full and
+    # the second spawn refused, and one `spawn` could not tell the difference.
+    #
+    # Last, because a program started in it writes to the same console this
+    # test is reading.
+    commands+=$'spawn bin/probe\r'$'spawn bin/probe\r'
     commands+=$'nosuchcommand\r'
 fi
 
@@ -307,6 +318,14 @@ else
         "a program cannot rename itself:1 +badge +can be passed on, and cannot be changed by its holder"
         "ls read the filesystem through IPC:hello.txt"
         "cat read a file through IPC:^bhaskix.?$"
+        # RFC 0017 steps 4 to 6 from ring 3. **The child's own line is the
+        # assertion.** That a domain was made proves `SPAWN`; that the program
+        # in it printed proves the `GRANT` reached it -- and a started program
+        # holding nothing is indistinguishable from one that never started, so
+        # "started" and "ended" would both appear against a broken grant.
+        # Watched failing by removing the grant: the two survive, this one goes.
+        "a program the shell started said so through a capability it was given:^spawned, hello"
+        "the shell made a domain and was told when it ended:it ended: reason 1"
         "an unknown command was refused:nosuchcommand: not a command"
     )
     # RFC 0016 step 2, and it only exists where there is a service to ask: two

@@ -2242,7 +2242,7 @@ fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
         let pages = bytes.len().div_ceil(bhaskix_mm::FRAME_SIZE as usize).max(1);
         let object = shared::create(realm, pages as u64 * bhaskix_mm::FRAME_SIZE).ok()?;
         let mut written = 0;
-        shared::fill_from(object, bytes.len(), &mut |page: &mut [u8]| {
+        shared::fill_from(object, 0, bytes.len(), &mut |page: &mut [u8]| {
             let take = page.len().min(bytes.len() - written);
             page[..take].copy_from_slice(&bytes[written..written + take]);
             written += take;
@@ -4837,8 +4837,18 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     let console = service::console_endpoint().ok_or("the console service has no endpoint")?;
     let filesystem = service::filesystem_endpoint().ok_or("the filesystem has no endpoint")?;
 
-    let realm = domain::create("shell", domain::ResourceEnvelope::new())
-        .map_err(|_| "no room for another domain")?;
+    // One child, which is the same limit the probe was given.
+    //
+    // The number is what makes a second `spawn` refused for the **budget**
+    // rather than for the capability, and those are different refusals: one
+    // says "you may not", the other says "not again". Without a limit, one
+    // capability could exhaust a table of 32 for the whole machine, which is
+    // `security.md` T10 through the door RFC 0017 step 4 opens.
+    let realm = domain::create(
+        "shell",
+        domain::ResourceEnvelope::new().max_child_domains(1),
+    )
+    .map_err(|_| "no room for another domain")?;
     SHELL_DOMAIN.store(realm.as_u32(), core::sync::atomic::Ordering::Release);
 
     // A badged capability per service, derived from a root the kernel keeps.
@@ -4891,6 +4901,37 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     }) != Some(true)
     {
         return Err("the shell's memory capabilities would not install");
+    }
+
+    // A `DomainControl` at slot 14, which answers RFC 0017's first unresolved
+    // question: the shell gets one.
+    //
+    // What that buys, both halves, because the RFC asked which was being
+    // bought and the answer is both. It lets a person at the shell start a
+    // program in a domain of its own, which is the first time anything but a
+    // self-test uses RFC 0017 steps 4 to 6. It also hands the most exposed
+    // program in the tree the ability to make more domains.
+    //
+    // The containment argument is that this is a capability like any other. It
+    // is budgeted -- one child, set on the envelope above. It is derived from a
+    // root the kernel keeps, so revoking that root takes the authority back. It
+    // is refused if either the capability or the budget says no, and those are
+    // separate refusals. A shell that could make domains without a limit would
+    // be a shell that could exhaust the domain table; a shell that held this
+    // ambiently rather than as a capability would be `root`.
+    let control = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::DomainControl, 0),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, 0).ok()
+    })
+    .ok_or("the shell's DomainControl would not derive")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(14, control).is_ok()) != Some(true) {
+        return Err("the shell's DomainControl would not install");
     }
 
     // The block device's registers, read-only, at slot 5. A `Frame`
@@ -5194,6 +5235,9 @@ static BULK_TRIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// travels.
 static BULK_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static MESSAGE_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many bytes a multi-page `READ_INTO` delivered, which is where the two
+/// placements disagreed until 2026-08-11.
+static BULK_SPANNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BULK_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 static BULK_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static BULK_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -5293,6 +5337,19 @@ extern "C" fn bulk_client(_argument: u64) -> ! {
     );
     BULK_TRIPS.store(trips, Ordering::Relaxed);
 
+    // **More than one page**, which is the request no caller here made until
+    // 2026-08-11. `bin/probe` is the largest file in the ramdisk, and asking
+    // for four pages of it is what tells the two placements apart: the domain
+    // one copies through a buffer of a single page, so before this it answered
+    // 4096 and called that the file.
+    let _ = send(fs::PATH, Chunk::take(b"bin/probe" as &[u8]).0.pack(0));
+    let _ = send(fs::OPEN, [0; 4]);
+    if let Ok(args) = send(fs::READ_INTO, [2, 4 * 4096, 0, 0])
+        && outcome_of(args[0]) == outcome::OK
+    {
+        BULK_SPANNED.store(args[0] & 0xffff_ffff, Ordering::Relaxed);
+    }
+
     // And the refusal: slot 1 names the same memory, read-only. A service
     // asked to *write* into something the caller may only read must say no,
     // however genuinely the caller holds it.
@@ -5342,8 +5399,27 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
         domain::destroy(owner);
         return false;
     };
+    // **A second object, of four pages, added 2026-08-11.** Separate from the
+    // one above rather than larger, so the measurement and the contents check
+    // it feeds are undisturbed: this one exists only to be asked for more than
+    // a placement can hold at once.
+    //
+    // A one-page object is a size both placements agree about by construction,
+    // which is why this test passed for as long as it had only one.
+    let Ok(big) = shared::create(owner, 4 * bhaskix_mm::FRAME_SIZE) else {
+        println!("\x1b[91m    bulk path      FAILED to create the multi-page object\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
+    let Ok(big_cap) = shared::name(big) else {
+        println!("\x1b[91m    bulk path      FAILED to name the multi-page object\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
     if domain::with(owner, |d| {
-        d.cspace.install_at(0, memory_cap).is_ok() && d.cspace.install_at(1, decoy).is_ok()
+        d.cspace.install_at(0, memory_cap).is_ok()
+            && d.cspace.install_at(1, decoy).is_ok()
+            && d.cspace.install_at(2, big_cap).is_ok()
     }) != Some(true)
     {
         println!("\x1b[91m    bulk path      FAILED to install the capabilities\x1b[0m");
@@ -5382,7 +5458,39 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
         _ => false,
     };
 
+    // And the same thing again, **past the first page**, which is the check
+    // this test did not have. Reading `bin/probe` -- the largest file in the
+    // ramdisk -- and comparing a window that starts after 4 KiB asserts two
+    // things a single-page read cannot: that a placement delivers more than it
+    // can hold at once, and that each piece lands where it belongs. A fill that
+    // wrote every piece at offset zero would return the right *count* and the
+    // wrong bytes, so the count alone would not have caught it either.
+    let spans_pages = match (shared::frames_of(big), vfs::open(b"bin/probe")) {
+        (Some((frames, count)), Ok(mut file)) if count >= 2 => {
+            const PAST: usize = bhaskix_mm::FRAME_SIZE as usize + 64;
+            let mut whole = [0u8; 256];
+            let mut skipped = 0;
+            // Walk the file to `PAST` in bites this stack can hold.
+            while skipped < PAST {
+                let want = (PAST - skipped).min(whole.len());
+                let got = file.read(&mut whole[..want]);
+                if got == 0 {
+                    break;
+                }
+                skipped += got;
+            }
+            let read = file.read(&mut whole[..64]);
+            // SAFETY: the second frame of an object this test owns, through the
+            // direct map. `PAST` is 64 bytes into it, and 64 more is inside it.
+            let landed =
+                unsafe { core::slice::from_raw_parts((hhdm + frames[1] + 64) as *const u8, read) };
+            skipped == PAST && read > 0 && landed == &whole[..read]
+        }
+        _ => false,
+    };
+
     shared::revoke(object);
+    shared::revoke(big);
     domain::destroy(owner);
 
     // What the same file costs by message, at the RFC's own figure.
@@ -5396,11 +5504,22 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     let message_cycles = MESSAGE_CYCLES.load(Ordering::Relaxed);
     let worth_it = shared_cycles > 0 && message_cycles >= shared_cycles.saturating_mul(2);
 
-    let ok = bytes > 0 && matches && refused == bhaskix_abi::outcome::NOT_YOURS && worth_it;
+    // Both placements must deliver more than one page, and put it in the right
+    // place. `spanned` is the count; `spans_pages` is the contents past the
+    // first page -- and the count alone would not do, because a fill that wrote
+    // every piece at offset zero returns the right number and the wrong bytes.
+    let spanned = BULK_SPANNED.load(Ordering::Relaxed);
+    let ok = bytes > 0
+        && matches
+        && spanned > bhaskix_mm::FRAME_SIZE
+        && spans_pages
+        && refused == bhaskix_abi::outcome::NOT_YOURS
+        && worth_it;
     if ok {
         println!(
             "    bulk path      {bytes} bytes in {trips} round trip against {by_message} \
-             by message; contents match, and a slot the caller does not hold is refused"
+             by message; {spanned} bytes across pages, contents match, and a slot the \
+             caller does not hold is refused"
         );
         let shared_cycles = shared_cycles.max(1);
         // Hundredths, because the interesting answers are between one and two
@@ -5416,6 +5535,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
     } else {
         println!(
             "    bulk path      FAILED: {bytes} bytes, contents match {matches}, \
+             spanned {spanned} across pages {spans_pages}, \
              refusal {refused}, shared {shared_cycles} cycles against {message_cycles} \
              by message"
         );

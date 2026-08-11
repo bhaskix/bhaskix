@@ -534,6 +534,10 @@ fn serve(queue: &mut Virtqueue<Volatile>, rings_at_device: u64, sectors: u64) ->
                         syscall::INVOKE,
                         BLOCK_ENDPOINT,
                         method::DRAIN,
+                        // The last argument is the offset into the caller's
+                        // object, and zero is meant: a sector read fills from
+                        // the start. It was padding until FILL gained an
+                        // offset on 2026-08-11.
                         [slot, RINGS_AT + ring::DATA, count * 512, 0],
                     );
                     if taken == status::OK

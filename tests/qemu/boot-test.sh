@@ -1010,10 +1010,16 @@ fi
 # asking a service to write into memory it has no authority over, and a bulk
 # path that skipped that check would be a faster way to read somebody else's
 # memory.
-if grep -qE "bulk path +[0-9]+ bytes in 1 round trip against [0-9]+ by message; contents match, and a slot the caller does not hold is refused" "$LOG"; then
-    pass "bulk data moves through shared memory, and only where the caller may write"
+# The multi-page count is asserted with them, and it is the one that matters
+# for placement. A service in a domain copies through a buffer of its own, so
+# "how much can it deliver" is a question the two placements can answer
+# differently -- and did, silently, until 2026-08-11: the domain one returned
+# one page and called that the file. `[1-9][0-9]{4,}` requires five figures,
+# which is more than the 4096 that was being reported.
+if grep -qE "bulk path +[0-9]+ bytes in 1 round trip against [0-9]+ by message; [1-9][0-9]{4,} bytes across pages, contents match, and a slot the caller does not hold is refused" "$LOG"; then
+    pass "bulk data moves through shared memory, across pages, and only where the caller may write"
 else
-    fail "the bulk path did not move the file, or did not refuse a slot the caller lacks"
+    fail "the bulk path did not move the file across pages, or did not refuse a slot the caller lacks"
     status=1
 fi
 
