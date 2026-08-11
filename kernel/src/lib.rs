@@ -5178,9 +5178,15 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // address space is indistinguishable from keeping the right one. Two
     // services in domains on one CPU is what told the difference, by running in
     // each other's page table.
+    //
+    // A high-water mark, not a sample. It was a sample until domains gave their
+    // address-space slots back, and the two agreed only because the sample was
+    // counting entries left behind by domains that had ended -- five on a boot
+    // whose real concurrency was three. The gate below it asked for "at least
+    // 3" and got it from corpses.
     println!(
         "    address spaces {} in use at once, each program in its own",
-        vm::installed()
+        vm::peak()
     );
     // Whether anything read after this point is complete. The transmitter drops
     // a byte rather than hang, which is right, and it did so silently until a

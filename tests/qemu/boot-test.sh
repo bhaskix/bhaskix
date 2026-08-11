@@ -46,6 +46,13 @@ EXPECT_GREETING="the light-maker"
 FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
                  "unexpected interrupt on vector" "NO TICKS"
                  "LEAK:" "INVARIANT VIOLATED"
+                 # A program started without an address-space slot. The boot
+                 # carries on and the damage lands somewhere else entirely: the
+                 # program's faults cannot be serviced, so it never runs, and
+                 # what gets reported is whatever was waiting on it. That is
+                 # precisely how a leaked slot per ended domain read for six
+                 # days as a broken block driver.
+                 "address space  no free slot"
                  # Every self-test the kernel runs reports failure with this
                  # word, and until 2026-08-11 nothing looked for it. A failure
                  # was caught only where a *positive* gate below asserted that

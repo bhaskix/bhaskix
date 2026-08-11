@@ -706,6 +706,44 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-11, later still (a domain gives its address-space slot back)
+
+`vm` keeps installed address spaces in a table of `MAX_SPACES`, which is eight. `install` took a
+slot and **nothing ever gave one back**: `domain.rs` did not reference `vm` at all, and
+`vm::uninstall` is keyed on the running `CR3`, which makes it the kernel's temporary-install path
+and not domain teardown. So every domain that ended kept its slot for ever.
+
+**What that looked like is the reason this is written down.** The ninth program to start got
+`address space no free slot`, the boot carried on, and its faults could not be serviced — so it
+never ran, and what got *reported* was whatever had been waiting on it. For six days that was
+`block domain FAILED: the driver left no report`, and three fixes were aimed at the block driver.
+The driver was never the problem. A red herring cost hours on top: `block domain no dma window`
+appears in clean, green BIOS boots too, and it prints under a condition about *interrupt
+delegation* rather than a DMA window.
+
+Fixed by recording the domain's page-table root in `vm::install` — the one place that puts a space
+in the table, and already the one place that records the root against the thread — and calling
+`vm::forget` from `end`, beside `shared::destroy_owned_by` and `irq::release_owned_by`, outside the
+table lock. Outside because `Rank::AddressSpace` is 0 and `Rank::Domains` is 6: taking the space
+table while holding the domain table would invert the order.
+
+**The frames are still not freed, deliberately.** `AddressSpace::destroy` may only run when no CPU
+holds the root in `CR3`, and a domain's last thread exits leaving exactly that — `sched::enter_space`
+skips the reload for kernel threads, so the CPU carries on in the dead domain's page tables. Only
+the bookkeeping is dropped, which is safe because the tables stay allocated. Nothing destroyed a
+domain's address space before this either, so no leak is new; what stopped leaking is the slot,
+which was the resource actually running out. **Open:** reclaiming the frames needs every CPU moved
+off the root first, near the `tlb` shootdown machinery.
+
+**A gate was passing on corpses.** `address spaces N in use at once` was an instantaneous count, and
+dead domains inflated it — five on a boot whose real concurrency was three, against a gate asking
+for "at least 3". It is now the high-water mark the sentence always claimed, and reads 3.
+
+Proven in both directions. `bin/sup` restarting **twelve** times — more than the table has slots —
+completes with a peak of four, `MAX_SPACES` still eight; with `vm::forget` removed the same boot
+gives four failures and eleven `no free slot` lines. `address space  no free slot` is now a failure
+marker in its own right: it is silent degradation, and the damage always lands somewhere else.
+
 ### 2026-08-11, last (a domain ends when its last thread exits, whoever made it)
 
 RFC 0017's fourth question — the one the implementation itself raised — answered **yes**. One

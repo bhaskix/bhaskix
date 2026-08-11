@@ -339,6 +339,15 @@ pub struct Domain {
     /// The capability naming this domain. Revoking it revokes everything the
     /// domain was ever granted, because everything was derived from it.
     root: Option<SlotRef>,
+    /// The page table the domain's program runs in, or zero before one is
+    /// installed.
+    ///
+    /// Recorded so that [`end`] can give the address-space slot back. `vm`
+    /// holds installed spaces in a table of `MAX_SPACES`, keyed by root, and
+    /// without this nothing ever knows which entry belonged to a domain that
+    /// has gone -- so every domain that ended kept its slot for ever, and the
+    /// ninth program to start silently ran with unserviceable faults.
+    space_root: u64,
     live: bool,
 }
 
@@ -361,6 +370,7 @@ impl Domain {
             held_capabilities: 0,
             threads: 0,
             root: None,
+            space_root: 0,
             live: false,
         }
     }
@@ -705,6 +715,20 @@ pub fn root_capability(id: DomainId) -> Option<SlotRef> {
     with(id, |domain| domain.root).flatten()
 }
 
+/// Records the page table a domain's program runs in, so [`end`] can give the
+/// address-space slot back.
+///
+/// Called by `vm::install`, which is the only thing that puts a space in the
+/// table this reclaims from — the same place, and for the same reason, that it
+/// calls `sched::set_space_root` for the thread.
+///
+/// A domain that starts a second program overwrites the first root. That is
+/// correct rather than lossy: `install` reuses the slot already holding a root
+/// it is replacing, so the entry this would have named is not a separate one.
+pub fn record_space_root(id: DomainId, root: u64) {
+    with(id, |domain| domain.space_root = root);
+}
+
 /// The first live domain created by `parent`, if any.
 ///
 /// A test affordance rather than a general facility: nothing in the system
@@ -808,6 +832,7 @@ pub fn create_under(
         held_capabilities: 0,
         threads: 0,
         root: Some(root),
+        space_root: 0,
         live: true,
     };
     table.created += 1;
@@ -858,6 +883,32 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
     // releasing reaches the chip and the vector allocator.
     let handlers = crate::irq::release_owned_by(id.0);
     let _ = handlers;
+
+    // The address-space slot next, and for the third time the same reason: an
+    // installed space outlives its domain as an entry in a table of
+    // `vm::MAX_SPACES`, which nothing later can claim and nobody can explain.
+    // Until this existed, every domain that ended kept its slot, and the ninth
+    // program to start got `no free slot` and ran with faults that could not be
+    // serviced -- reported, six days running, as a fault in whatever *else*
+    // started ninth.
+    //
+    // Outside the table lock, because `Rank::AddressSpace` is 0 and
+    // `Rank::Domains` is 6: taking the space table while holding this one would
+    // invert the order, which is exactly what the memory objects and the
+    // handlers above are placed here to avoid.
+    //
+    // The frames are **not** freed. `AddressSpace::destroy` requires that no
+    // CPU holds the root in `CR3`, and that does not hold here:
+    // `sched::enter_space` skips the reload for kernel threads, so the CPU
+    // whose last user thread just exited is still running on these page tables.
+    // Dropping the bookkeeping is safe because they stay allocated. Reclaiming
+    // them needs every CPU moved off the root first, which is its own change --
+    // see TRACKER.
+    if let Some(root) = with(id, |domain| core::mem::take(&mut domain.space_root))
+        && root != 0
+    {
+        crate::vm::forget(root);
+    }
 
     // Threads next, and before the table is touched. Until RFC 0017 step 2
     // this function zeroed a counter and left them running: `destroy` released

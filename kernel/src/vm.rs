@@ -576,7 +576,7 @@ static SPACES: SpinLock<[Option<AddressSpace>; MAX_SPACES]> =
 /// The page table to restore when the installed space is removed.
 static PREVIOUS_ROOT: SpinLock<u64> = SpinLock::new(Rank::AddressSpacePrevious, 0);
 
-/// How many user address spaces exist at once.
+/// How many user address spaces are installed *right now*.
 ///
 /// Printed at boot because it was one for the whole of M5 and M6 and nothing
 /// said so: the kernel kept a single installed space, and with one user
@@ -587,6 +587,24 @@ static PREVIOUS_ROOT: SpinLock<u64> = SpinLock::new(Rank::AddressSpacePrevious, 
 pub fn installed() -> usize {
     SPACES.lock().iter().flatten().count()
 }
+
+/// The most user address spaces installed at any one moment.
+///
+/// The boot line has always said "in use **at once**", and until domains gave
+/// their slots back this read as an instantaneous count that happened to agree:
+/// dead domains kept their entries, so the sample drifted upward and stayed
+/// there. It reached five on a boot whose true concurrency was three, and the
+/// gate asserting "at least 3" was passing on corpses.
+///
+/// A high-water mark is what the sentence claimed all along, and it cannot be
+/// inflated by something that has ended.
+#[must_use]
+pub fn peak() -> usize {
+    PEAK.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// High-water mark for [`peak`], raised by `install`.
+static PEAK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Runs `f` against the address space currently loaded in `CR3`.
 ///
@@ -695,7 +713,11 @@ pub unsafe fn install(space: AddressSpace) {
             .position(|held| held.as_ref().is_some_and(|held| held.root() == root))
             .or_else(|| spaces.iter().position(Option::is_none));
         match slot {
-            Some(slot) => spaces[slot] = Some(space),
+            Some(slot) => {
+                spaces[slot] = Some(space);
+                let live = spaces.iter().flatten().count();
+                PEAK.fetch_max(live, core::sync::atomic::Ordering::Relaxed);
+            }
             // Out of slots. The space is dropped, the switch below still
             // happens, and every fault in it will be unserviceable -- loud,
             // and better than evicting somebody else's mappings.
@@ -713,6 +735,51 @@ pub unsafe fn install(space: AddressSpace) {
     // last on that CPU -- which, with one user program, is always its own.
     if let Some(me) = crate::sched::current_thread_id() {
         crate::sched::set_space_root(me, root);
+        // And against the domain, so that `domain::end` can give the slot back.
+        // Here rather than at the seven call sites, for the same reason the
+        // line above is here: this is the one place that puts a space in the
+        // table, so it is the one place that can say whose it is.
+        //
+        // The `SPACES` guard above is out of scope by now. That is deliberate
+        // and not incidental -- `Rank::AddressSpace` is 0 and `Rank::Domains`
+        // is 6, so the domain table may be taken *after* the space table but
+        // never inside it.
+        //
+        // A thread with no domain is the kernel's own: the self-tests build
+        // spaces that no domain owns, and `domain_of` answers `None` for them
+        // rather than handing back `u32::MAX` -- so the slot for a kernel space
+        // is never recorded against a domain that could later reclaim it.
+        if let Some(domain) = crate::sched::domain_of(me) {
+            crate::domain::record_space_root(domain, root);
+        }
+    }
+}
+
+/// Gives back the table slot holding the space rooted at `root`.
+///
+/// For [`crate::domain::end`], which is the only caller: a domain that has gone
+/// leaves an entry behind otherwise, and the table is `MAX_SPACES` long.
+///
+/// **The page tables are not freed**, and the distinction is the whole of this
+/// function's safety. [`AddressSpace::destroy`] may only run when no CPU holds
+/// the root in `CR3`, and a domain's last thread exits leaving exactly that:
+/// `sched::enter_space` skips the reload for kernel threads, so the CPU carries
+/// on in the dead domain's page tables until some other user thread runs there.
+/// Forgetting the bookkeeping cannot hurt it; freeing the tables underneath it
+/// would.
+///
+/// So this leaks frames, exactly as the code it replaces did — nothing has ever
+/// destroyed a domain's address space. What it stops leaking is the slot, which
+/// is the resource that was actually running out.
+pub fn forget(root: u64) {
+    let mut spaces = SPACES.lock();
+    if let Some(slot) = spaces
+        .iter()
+        .position(|held| held.as_ref().is_some_and(|held| held.root() == root))
+    {
+        // Dropped, not destroyed. `AddressSpace` has no `Drop`, so this frees
+        // nothing and can race with nothing.
+        spaces[slot] = None;
     }
 }
 
