@@ -960,7 +960,12 @@ pub unsafe fn enable_interrupt_remapping(hhdm: u64) -> Result<(), &'static str> 
     // allocated and zeroed -- so every entry reads as absent, which is what
     // makes an unissued handle unusable.
     unsafe {
-        let mut unit = vtd::Unit::new(base as *mut u8);
+        // `adopt`, not `new`: this unit is already translating, and every
+        // command below writes the whole of `GCMD`. Built fresh, the first of
+        // them would write a zero into the translation-enable bit and turn the
+        // IOMMU's memory protection off while reporting remapping on -- which
+        // is what it did, from M6-15 until 2026-08-11.
+        let mut unit = vtd::Unit::adopt(base as *mut u8);
         if !unit.supports_interrupt_remapping() {
             return Err("the unit does not support interrupt remapping");
         }
@@ -971,6 +976,12 @@ pub unsafe fn enable_interrupt_remapping(hhdm: u64) -> Result<(), &'static str> 
         let (status, _) = zeroed_frame(hhdm).ok_or("no frame for the invalidation status")?;
         if !unit.enable_queued_invalidation(queue) {
             return Err("the unit did not report queued invalidation enabled");
+        }
+        // Translation must still be on. Every command here rewrites the whole
+        // register, so a shadow that lost a bit is a protection that silently
+        // went away -- and the only place that is visible is right here.
+        if !unit.translating() {
+            return Err("enabling remapping turned translation off");
         }
         // Published before anything can invalidate, because from the line
         // above the registers stop working and this is the only route left.

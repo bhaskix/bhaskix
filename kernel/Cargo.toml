@@ -144,7 +144,12 @@ workspace = true
 # register writes left behind are the ones the unit now ignores. The kernel's
 # own gate said so -- "the context cache did not invalidate" -- in a boot that
 # was already red for the MSI, which is how it went unread.
-unsafe_budget = 1115
+# 1120 at M6-21. Adopting the unit's own command state before issuing a command
+# to it, and asserting translation survived. Three lines that close the fault
+# the four above were chasing: a `Unit` built fresh carries a zeroed shadow of
+# a write-only `GCMD`, so the first command written through it cleared the
+# translation-enable bit and turned the IOMMU off.
+unsafe_budget = 1120
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

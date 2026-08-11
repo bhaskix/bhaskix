@@ -493,6 +493,14 @@ mod command {
     /// remapping exists to stop. Clearing it is what makes the guarantee
     /// "every interrupt came from a table this kernel wrote".
     pub const CFI: u32 = 1 << 23;
+
+    /// The bits that describe a state the unit stays in, as opposed to a thing
+    /// it was once told to do.
+    ///
+    /// `SRTP` and `SIRTP` are absent on purpose. Their status bits say a
+    /// pointer *was* latched; carrying them into the shadow would re-latch a
+    /// table nobody asked to change on every later command.
+    pub const PERSISTENT: u32 = TE | QIE | IRE | CFI;
 }
 
 /// Descriptors the invalidation queue understands.
@@ -654,6 +662,32 @@ impl Unit {
         // width encoding uses.
         let supported = (capabilities >> 8) & 0x1f;
         supported & (1 << (width as u64)) != 0
+    }
+
+    /// Rebuilds a unit around a window that is **already programmed**.
+    ///
+    /// Use this rather than [`new`](Self::new) for any unit that will issue a
+    /// command to a live one. `GCMD` cannot be read back, so a [`Unit`] carries
+    /// a shadow of what was last written to it, and `new` starts that shadow at
+    /// zero — so the next command writes zeros into every bit it is not
+    /// setting. On a unit that is translating, that turns translation **off**.
+    ///
+    /// This is not hypothetical. Enabling interrupt remapping did exactly that
+    /// from M6-15 until 2026-08-11: `GSTS` went `0xc000_0000` to `0x4400_0000`
+    /// across one command, the machine reported that interrupts were being
+    /// remapped, and every device's DMA was untranslated from that moment. It
+    /// cost a milestone of chasing an undelivered interrupt that was a symptom.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`].
+    #[must_use]
+    pub unsafe fn adopt(base: *mut u8) -> Self {
+        // SAFETY: the caller's obligation.
+        let mut unit = unsafe { Self::new(base) };
+        // SAFETY: as above -- a mapped register window.
+        unit.command = unsafe { unit.read32(reg::GSTS) } & command::PERSISTENT;
+        unit
     }
 
     /// Whether translation is on.
@@ -1100,6 +1134,42 @@ mod tests {
         let high = remappable_message_address(0x8001);
         assert_eq!((high >> 5) & 0x7fff, 1);
         assert_eq!((high >> 2) & 1, 1);
+    }
+
+    #[test]
+    fn adopting_a_live_unit_keeps_translation_on_and_drops_the_one_shots() {
+        // The register window as a buffer, which is all `Unit` needs: this
+        // test writes a status register and asks what shadow comes back.
+        let mut window = [0u8; 4096];
+        // Translating, root table pointer set, remapping and its queue on --
+        // `0xc000_0000` plus the bits interrupt remapping adds.
+        window[reg::GSTS..reg::GSTS + 4].copy_from_slice(&0xe600_0000u32.to_le_bytes());
+
+        // SAFETY: a 4 KiB buffer standing in for the register window, which
+        // nothing else touches for the life of this test.
+        let unit = unsafe { Unit::adopt(window.as_mut_ptr()) };
+
+        assert_eq!(
+            unit.command & command::TE,
+            command::TE,
+            "translation must survive being adopted -- losing it here is the \
+             kernel turning its own IOMMU off on the next command"
+        );
+        assert_eq!(unit.command & command::QIE, command::QIE, "queue kept");
+        assert_eq!(unit.command & command::IRE, command::IRE, "remapping kept");
+        assert_eq!(
+            unit.command & command::SRTP,
+            0,
+            "the root-table-pointer status must not become a command to latch \
+             it again"
+        );
+        assert_eq!(unit.command & command::SIRTP, 0, "nor the remap table's");
+
+        // And a unit built the other way keeps nothing, which is the whole
+        // hazard `adopt` exists for.
+        // SAFETY: as above.
+        let fresh = unsafe { Unit::new(window.as_mut_ptr()) };
+        assert_eq!(fresh.command, 0);
     }
 
     #[test]

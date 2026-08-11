@@ -700,6 +700,63 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-11, later (the MSI fault is closed, and it was never an interrupt fault)
+
+**Enabling interrupt remapping turned the IOMMU off.** One register read says the whole of it:
+
+```
+gsts on entry     0xc0000000     TE=1 — translating
+gsts after QIE    0x44000000     TE=0 — not translating any more
+```
+
+`GCMD` is write-only, so a `vtd::Unit` carries a shadow of what was last written to it, and
+`Unit::new` starts that shadow at **zero**. `enable_interrupt_remapping` built a fresh unit around a
+window that was already translating and then issued a command through it; the command wrote zeros
+into every bit it was not setting, and one of those bits was translation-enable. From that moment
+every device's DMA was untranslated, and the machine went on printing that interrupts were remapped.
+
+**Everything the last six days chased was a symptom of that.**
+
+| Symptom | Why |
+|---|---|
+| The device's MSI never reached the unit | With translation off, QEMU gives the device a passthrough address space, which does not include the interrupt-remapping region. The message went straight to the APIC in compatibility format |
+| The I/O APIC's line worked throughout | It is not a device DMA and never went through that address space |
+| The device completed requests but the driver saw nothing | Untranslated DMA wrote to the addresses as physical, so the used ring the driver was watching was never touched |
+| `iommu memory`: "mapped, unfaulted, and pointing somewhere else" | Exactly what an untranslated write looks like. This was on the screen the whole time, in the same boot, and read as part of the interrupt fault |
+
+**Fixed** by `Unit::adopt`, which seeds the shadow from `GSTS` and keeps the bits that describe a
+state the unit is *in* — translation, the queue, remapping, compatibility-format blocking — while
+dropping the pointer-set bits, whose status means a pointer was latched and whose command would
+latch it again. `enable_interrupt_remapping` now adopts, and checks that translation survived,
+because the only place that is visible is there. Pinned by a host test against a fake register
+window.
+
+**After it**, with `iommu=remap-irq`:
+
+```
+iommu memory   an object was reachable at 0x100006000, 1 mappings revoked, and the device was
+               then refused it (0x100006000, reason 0x05)
+virtio-blk irq msi-x vector 0xfc; 1 waits, 0 spins, 1 interrupts per request,
+               0 woken by the clock rather than the device
+```
+
+Every message now arrives as a handle: 139 through handle 5 to vector 251, three through handle 1 to
+vector 252, the I/O APIC's through handle 0. **RFC 0012 step 6 works**, and RFC 0011's residual risk
+is retired in fact rather than in principle.
+
+**What is still not right, and why remapping stays off by default.** One check still fails with
+remapping on — `block service`: 512 bytes read through the delegated driver, past-the-end correctly
+refused, **contents wrong**. It is much better than it was (it used to return `-1` bytes and refuse
+nothing) and it is not the same fault, but a machine that reads the wrong bytes is not a machine to
+turn a default on for. The flag stays, the boot line still says which world the machine is in, and
+this is the next thing to look at.
+
+**The lesson, which is not about IOMMUs.** A write-only register with a shadow is a cache, and a
+cache rebuilt from nothing is a cache that lies. `Unit::new` was correct exactly once — the first
+time a unit is programmed — and every later use of it was writing zeros into hardware state the
+kernel had set. The comment on the shadow field said "what was last written to `GCMD`, because it
+cannot be read back", which described the mechanism perfectly and did not connect it to `new`.
+
 ### 2026-08-11 (the invalidation that was never happening, and what the MSI fault is not)
 
 **A bug this file introduced on 2026-08-06 and recorded as harmless.** Queued invalidation was
@@ -3015,7 +3072,8 @@ to guess at; both have a shorter list of candidates than they did.
 
 | Open | Ruled out |
 |---|---|
-| The block device's MSI is not delivered under interrupt remapping | A newer QEMU (7.2 fails identically), the message format, the ordering, the missing invalidation queue, and two red herrings. Added 2026-08-11, by read-back rather than argument: the MSI-X entry, the MSI-X enable and function mask, the IRTE, the device being wedged, and a stale context cache or IOTLB. What is left is the gap between a request completing and a message being sent — 274 completions, no message |
+| ~~The block device's MSI is not delivered under interrupt remapping~~ **Closed 2026-08-11.** It was never an interrupt fault: enabling remapping cleared the translation-enable bit through a zeroed `GCMD` shadow, so the device's DMA was untranslated and its address space had no interrupt-remapping region in it. Every hypothesis chased for six days was a symptom | — |
+| **A read through the delegated block service returns the wrong bytes, with remapping on** | Not the fault above: it survives the fix. 512 bytes, correct length, past-the-end correctly refused, contents wrong — where before the fix it returned `-1` bytes and refused nothing. Remapping stays off by default until this is understood |
 | A reused device address keeps its translation | Nothing yet. Reuse is disabled until it is explained, and `free` still records the extent |
 
 **Nine checks this milestone were not looking at the thing they claimed to check.**
