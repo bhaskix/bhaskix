@@ -385,16 +385,26 @@ is a case where "none" is the true answer rather than the convenient one.
 
 ## Unresolved questions
 
-1. **Untyped memory: in or out?** seL4 makes all kernel memory come from
-   `Untyped` capabilities that userspace retypes, which makes kernel memory
-   accounting exact and the API considerably larger. This RFC proposes a
-   simpler model — objects allocated from a domain's envelope — and deleting
-   the unused `Untyped` kind. That is a fork in the road and the one question
-   here that is genuinely architectural. **Decided by: the project owner,
-   before implementation starts.**
-2. **Must a `Memory` object be physically contiguous?** DMA wants it;
-   general sharing does not. Proposal: an attribute set at creation, with
-   contiguous allocation allowed to fail. Deferred until the IOMMU RFC.
+1. ~~**Untyped memory: in or out?**~~ **Decided: out, and built that way.**
+   seL4 makes all kernel memory come from `Untyped` capabilities that userspace
+   retypes, which makes kernel memory accounting exact and the API considerably
+   larger. This RFC proposed the simpler model — objects allocated from a
+   domain's envelope — and deleting the unused `Untyped` kind. That is what
+   exists: `cap.rs` records "there is deliberately no `Untyped`", and
+   `shared.rs`'s header carries the argument and what it cost.
+
+   Marked here because this was the one question in this list called *genuinely
+   architectural*, and a fork in the road that stays open in the document after
+   it has been taken in the code is the kind that gets re-argued.
+2. ~~**Must a `Memory` object be physically contiguous?**~~ **Answered by not
+   being needed.** DMA wants it; general sharing does not. This was deferred to
+   the IOMMU RFC, and [RFC 0012](0012-iommu.md) is now complete without
+   introducing the attribute — the word does not appear in it. An IOMMU is what
+   makes the question go away: a device is given a *contiguous device address*
+   over frames that are not contiguous at all, which is most of what the
+   translation is for. The one constraint that survived is narrower and lives
+   in the allocator rather than the object — `below_4gib`, for a device whose
+   descriptors hold 32-bit addresses.
 3. ~~**Notification capabilities** — the other half of RFC 0008's async
    answer. Same RFC, or its own?~~ **Answered:** its own, and written —
    [RFC 0010](0010-notifications.md). A notification is useful with no shared

@@ -395,6 +395,18 @@ exists and only needs pointing at a new source.
    one loop. Without it, a service needs two threads. Proposal: leave it out,
    and revisit when a service has both — because the mechanism is genuinely
    intricate and the need is not yet demonstrated.
+
+   **Still open, and the trigger has fired.** `bin/blkd` has both: it receives
+   on an endpoint and waits on the notification its device signals. It needed
+   **one** thread, not the two this question predicts, and the reason is
+   structural rather than lucky — the wait happens *inside* handling a request,
+   because the device event it waits for is the completion of the work that
+   request asked for. Nothing arrives unsolicited.
+
+   So the case that would settle this is narrower than "a service has both": it
+   is a service that must answer callers *while* something it did not ask for
+   may arrive. A network driver is the obvious first one, which puts this
+   question in front of whoever writes the networking RFC.
 2. ~~**The `IRQHandler` object** — who may claim an interrupt line, how a
    vector is allocated, and what acknowledgement looks like.~~ **Answered:**
    [RFC 0011](0011-irq-handler.md), which uses this object as its delivery

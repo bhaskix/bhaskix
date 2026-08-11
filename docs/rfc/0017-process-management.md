@@ -365,9 +365,17 @@ program can no longer stop this machine.**
    the most exposed program in the tree the ability to make more. Whoever wants it should say which
    of those they are buying.
 2. **What restarts a service that died?** The same boundary RFC 0013 drew, for the same reason:
-   restart policy is policy, and it now has mechanisms to be written against. A supervisor is
-   writable entirely in userspace, which was this RFC's own test of whether these were the right
-   six. Nobody has written one yet, so the test is passed on paper and not in a program.
+   restart policy is policy, and it now has mechanisms to be written against.
+
+   ~~Nobody has written one yet, so the test is passed on paper and not in a program.~~ **That half
+   is out of date**: step 6 (M9-23) supervises from ring 3 in five system calls — bind a
+   notification to a `Domain`, wait on it, `INFO` for the reason, `RELEASE` for the slot — and none
+   of them is a facility for supervising, which was the point. The test of whether these were the
+   right six is passed in a program.
+
+   **The question itself stands**, and is narrower than it was: nothing *restarts* anything. What
+   exists is the mechanism to notice and to ask why; a policy that acts on it is still unwritten,
+   and still belongs in userspace.
 3. **Should `MAX_DOMAINS` stay fixed at 32?** Fixed so that creating a domain cannot fail for want
    of heap during memory pressure, which is a good reason and is unaffected by the number. Whether
    32 is right is a separate question from whether the limit should be static, and both are now

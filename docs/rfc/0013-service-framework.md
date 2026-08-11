@@ -237,12 +237,21 @@ message (fifteen round trips for a 228-byte file) versus shared memory (one).
   affordance and not a runtime feature: a machine whose placements can be changed at boot has a
   security-relevant table outside the build.
 
-**Still open, and deliberately not answered here:**
+**Answered since, by another RFC:**
 
-1. **What happens to a caller whose service died?** Today an endpoint whose holder has gone leaves
-   the caller blocked for ever — `service.rs` records this as a known limitation and the fix needs
-   a mechanism that does not exist: an endpoint that reports when the capability reaching it is
-   revoked. This RFC surfaces the problem and does not solve it.
+1. ~~**What happens to a caller whose service died?**~~ **Answered by
+   [RFC 0017](0017-process-management.md) step 3**, built as M9-20 — *a caller whose server died is
+   told*. This RFC said the fix needed "a mechanism that does not exist: an endpoint that reports
+   when the capability reaching it is revoked", and that is what step 3 built. Open from M7 until
+   2026-08-07.
+
+   Worth keeping rather than deleting for what writing its test found: **step 2 had a hole**, which
+   the step that depended on it exposed. The question surfaced a defect two steps away from itself.
+
+**Still open, and deliberately not answered here.** The numbering continues from above rather than
+restarting — this file is cited by question number, including in `TRACKER.md`, and renumbering would
+silently repoint those.
+
 2. **How much does the domain placement cost the console?** Every printed line would cross a
    boundary. It may be that the console is permanently in-nucleus and the honest thing is to say so in the
    table rather than pretend it is relocatable.

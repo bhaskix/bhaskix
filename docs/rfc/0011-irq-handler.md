@@ -7,7 +7,7 @@
 | **Subsystem** | kernel (`cap`, `irq`, `trap`), arch (`ioapic`, `pci`) |
 | **Milestone** | Phase 2 — with the driver framework |
 | **Depends on** | [RFC 0010](0010-notifications.md) (the delivery mechanism), [driver-model.md](../driver-model.md) §2, [security.md](../security.md) §2 |
-| **Blocked by** | An IOMMU — [RFC 0012](0012-iommu.md). See *The prerequisite this RFC does not remove* |
+| **Blocked by** | ~~An IOMMU — [RFC 0012](0012-iommu.md)~~ **Unblocked 2026-08-11**: RFC 0012 is complete, all seven steps. See *The prerequisite this RFC does not remove* |
 
 ---
 
@@ -96,7 +96,20 @@ So the honest statement of what this RFC delivers:
 |---|---|
 | An in-nucleus driver stops polling and waits on an interrupt | ✅ Available |
 | Interrupt authority is an object that can be delegated | ✅ Available |
-| A driver **in a domain** can be given a device safely | ❌ Still needs an IOMMU |
+| A driver **in a domain** can be given a device safely | ~~❌ Still needs an IOMMU~~ ✅ **Since 2026-08-11** |
+
+> **The prerequisite was removed, and this table is kept as it was written.**
+> [RFC 0012](0012-iommu.md) is complete: `bin/blkd` runs in a domain, drives a
+> device through a page table of its own under its own domain id, and reaches
+> only the frames it was given. The last row's ❌ stood for eight days.
+>
+> The residual risk this RFC left open — *a device raising an interrupt it was
+> never programmed to raise* — is retired rather than argued away. Interrupt
+> remapping is on by default, every message carries a handle this kernel issued
+> against that device's requester id, and compatibility format is blocked, so
+> presenting a handle from anywhere else is refused by the unit. Two conditions
+> on that: a machine with no IOMMU has none of it and says so at boot, and
+> nothing has ever booted on physical hardware.
 
 That is not a reason to defer this work. The interrupt half is useful on its
 own — it is what lets `virtio-blk` stop burning a CPU — and building it now
@@ -445,10 +458,17 @@ reason beyond "does it boot".
 2. **Should `IrqControl` be global, or one per bus?** Global is simpler and
    makes the initial domain a single point of authority. Per-bus would let a
    bus be delegated whole, which is what a VM would want.
-3. **What happens when a device raises an interrupt on a source whose holder
-   has died?** Proposal: masked permanently at `RELEASE`, and reported. The
-   alternative — leaving it unmasked and letting it become a stray — turns a
-   dead driver into a machine-wide interrupt storm.
+3. ~~**What happens when a device raises an interrupt on a source whose holder
+   has died?**~~ **Answered: exactly the proposal.** Masked permanently at
+   `RELEASE` — `irq::release` is documented as "masks the source permanently
+   and frees the vector", and destroying a domain is a `RELEASE` for every
+   handler it held (M6-09). The alternative, leaving it unmasked and letting it
+   become a stray, would have turned a dead driver into a machine-wide
+   interrupt storm.
+
+   M6-09 also found the part this question did not ask: the assertion that
+   matters is the **re-claim**, not the release, because a release that leaked
+   the vector returns success just as loudly.
 4. **MSI (not -X).** Older devices have MSI with up to 32 vectors and a
    different programming model. Proposal: MSI-X only, and legacy lines for
    everything else, until a device needs otherwise.
