@@ -495,6 +495,59 @@ mod command {
     pub const CFI: u32 = 1 << 23;
 }
 
+/// Descriptors the invalidation queue understands.
+///
+/// Only the three this kernel submits are named. Each is sixteen bytes, and
+/// the type is the low four bits of the first.
+mod descriptor {
+    /// Invalidate the context cache.
+    pub const CONTEXT: u64 = 0x1;
+    /// Invalidate the IOTLB.
+    pub const IOTLB: u64 = 0x2;
+    /// Wait, and say so, once everything before it has finished.
+    pub const WAIT: u64 = 0x5;
+    /// Global granularity, in the two bits above the type. Everything this
+    /// kernel invalidates, it invalidates entirely: the windows are few and
+    /// the cost is a boot-path stall nobody measures.
+    pub const GLOBAL: u64 = 0b01 << 4;
+    /// Drain reads and writes before reporting the IOTLB invalidated.
+    ///
+    /// Without these the unit may report an invalidation complete while a
+    /// transfer that was already translated is still in flight, which is the
+    /// difference between "no device can reach this page" and "no device will
+    /// *start* reaching this page".
+    pub const DRAIN: u64 = (1 << 6) | (1 << 7);
+    /// Write the status word when this descriptor retires.
+    pub const STATUS_WRITE: u64 = 1 << 5;
+    /// Finish everything queued before this descriptor before starting it.
+    pub const FENCE: u64 = 1 << 6;
+}
+
+/// Descriptors in the invalidation queue, fixed by the size written to `IQA`.
+///
+/// Size zero: one page of sixteen-byte descriptors, which is the smallest the
+/// format allows and far more than this kernel queues at once.
+pub const QUEUE_ENTRIES: usize = 256;
+
+/// A descriptor that invalidates the whole context cache.
+///
+/// Global rather than device-selective. A device-selective invalidation needs
+/// the source id and the domain, and gets them wrong quietly; this kernel adds
+/// devices at boot and can afford to throw the cache away.
+#[must_use]
+pub const fn context_invalidation() -> [u64; 2] {
+    [descriptor::CONTEXT | descriptor::GLOBAL, 0]
+}
+
+/// A descriptor that invalidates the whole IOTLB, draining transfers first.
+#[must_use]
+pub const fn iotlb_invalidation() -> [u64; 2] {
+    [
+        descriptor::IOTLB | descriptor::GLOBAL | descriptor::DRAIN,
+        0,
+    ]
+}
+
 /// How long to wait for a register to report a change, in polls.
 ///
 /// Bounded because this runs on the boot path with interrupts off: hardware
@@ -691,6 +744,100 @@ impl Unit {
             self.write64(iotlb, IVT | GLOBAL);
             for _ in 0..WAIT_POLLS {
                 if self.read64(iotlb) & IVT == 0 {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        false
+    }
+
+    /// Whether the unit is taking invalidations through the queue.
+    ///
+    /// Read from `GSTS` rather than remembered, because a [`Unit`] is rebuilt
+    /// around the register window wherever one is needed and a fresh one knows
+    /// nothing about what an earlier one enabled. Every caller that invalidates
+    /// has to ask, and asking the hardware is the only answer that survives.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from `new`.
+    #[must_use]
+    pub unsafe fn queued_invalidation_enabled(&self) -> bool {
+        // SAFETY: the caller's obligation.
+        unsafe { self.read32(reg::GSTS) & command::QIE != 0 }
+    }
+
+    /// Submits `descriptors` through the invalidation queue and waits for them.
+    ///
+    /// **This is not an alternative to the register path; once `QIE` is set it
+    /// is the only path.** A unit with queued invalidation enabled ignores the
+    /// invalidation registers, and ignores them *silently* — the command bit
+    /// clears, the poll succeeds, and nothing is invalidated. That is a
+    /// hardware behaviour a kernel can only discover by looking for it, which
+    /// is why [`queued_invalidation_enabled`](Self::queued_invalidation_enabled)
+    /// exists and why every caller is expected to branch on it.
+    ///
+    /// Completion is a wait descriptor with the status-write bit, not the head
+    /// register catching the tail: the head advancing says the descriptor was
+    /// taken, and what a caller needs to know is that the invalidation it
+    /// describes has finished.
+    ///
+    /// # Safety
+    ///
+    /// `queue` must be the mapped invalidation queue this unit was given, with
+    /// [`QUEUE_ENTRIES`] descriptors. `status` must be a mapped, four-byte
+    /// aligned word the unit may write, and `status_physical` the address the
+    /// hardware reaches it by.
+    pub unsafe fn queued_invalidate(
+        &self,
+        queue: *mut u64,
+        status: *mut u32,
+        status_physical: u64,
+        descriptors: &[[u64; 2]],
+    ) -> bool {
+        /// What the wait descriptor leaves behind. Any value but the zero the
+        /// status word is primed with would do; `INVD` in ASCII makes a stale
+        /// queue obvious in a memory dump.
+        const DONE: u32 = 0x494e_5644;
+
+        // One slot is spent on the wait descriptor, so a caller must leave room
+        // for it. Refused rather than wrapped: a queue that overruns its own
+        // tail invalidates nothing and reports that it did.
+        if descriptors.len() + 1 > QUEUE_ENTRIES {
+            return false;
+        }
+
+        // SAFETY: the caller's obligation -- a queue of `QUEUE_ENTRIES`
+        // descriptors and a status word the unit may write.
+        unsafe {
+            let mut tail = ((self.read64(reg::IQT) >> 4) as usize) % QUEUE_ENTRIES;
+            core::ptr::write_volatile(status, 0);
+
+            for descriptor in descriptors {
+                core::ptr::write_volatile(queue.add(tail * 2), descriptor[0]);
+                core::ptr::write_volatile(queue.add(tail * 2 + 1), descriptor[1]);
+                tail = (tail + 1) % QUEUE_ENTRIES;
+            }
+
+            // Fenced, so the unit may not reorder the wait behind what it is
+            // waiting for, and status-writing, so finishing is observable.
+            core::ptr::write_volatile(
+                queue.add(tail * 2),
+                descriptor::WAIT
+                    | descriptor::STATUS_WRITE
+                    | descriptor::FENCE
+                    | ((DONE as u64) << 32),
+            );
+            core::ptr::write_volatile(queue.add(tail * 2 + 1), status_physical & !0b11);
+            tail = (tail + 1) % QUEUE_ENTRIES;
+
+            // The descriptors must be in memory before the tail says they are.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            self.write64(reg::IQT, (tail as u64) << 4);
+
+            for _ in 0..WAIT_POLLS {
+                if core::ptr::read_volatile(status) == DONE {
                     return true;
                 }
                 core::hint::spin_loop();
@@ -953,6 +1100,36 @@ mod tests {
         let high = remappable_message_address(0x8001);
         assert_eq!((high >> 5) & 0x7fff, 1);
         assert_eq!((high >> 2) & 1, 1);
+    }
+
+    #[test]
+    fn an_invalidation_descriptor_says_what_it_invalidates() {
+        // Pinned, because these are written into a queue the hardware reads
+        // and a wrong type is a descriptor that invalidates something else --
+        // or nothing, which is how this kernel spent a milestone believing it
+        // had invalidated a context cache it had not.
+        let context = context_invalidation();
+        assert_eq!(context[0] & 0xf, 0x1, "context cache invalidation");
+        assert_eq!((context[0] >> 4) & 0b11, 0b01, "global granularity");
+        assert_eq!(context[1], 0, "no domain or source selects anything");
+
+        let iotlb = iotlb_invalidation();
+        assert_eq!(iotlb[0] & 0xf, 0x2, "IOTLB invalidation");
+        assert_eq!((iotlb[0] >> 4) & 0b11, 0b01, "global granularity");
+        assert_eq!((iotlb[0] >> 6) & 1, 1, "drain writes");
+        assert_eq!((iotlb[0] >> 7) & 1, 1, "drain reads");
+        assert_eq!(iotlb[1], 0, "global, so no address");
+    }
+
+    #[test]
+    fn the_wait_descriptor_is_fenced_and_reports() {
+        // The three bits that make a wait descriptor mean "everything before
+        // this is done, and here is how you will know". Dropping the fence
+        // would let the unit retire the wait before what it waits on, and the
+        // caller would read a status word that promises nothing.
+        assert_eq!(descriptor::WAIT & 0xf, 0x5);
+        assert_eq!(descriptor::STATUS_WRITE, 1 << 5, "status write");
+        assert_eq!(descriptor::FENCE, 1 << 6, "fence");
     }
 
     #[test]

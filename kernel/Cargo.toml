@@ -136,7 +136,15 @@ workspace = true
 # the requirement is easy to miss -- it was, here, until an experiment went
 # looking for it. It did not fix the undelivered MSI and the code is still
 # more correct for it.
-unsafe_budget = 1089
+# 1115 at M6-20. Routing invalidations to the queue when it is on. The frame
+# for the status word the unit writes, and the direct-map pointers to it and to
+# the ring. This is the other half of the note above, and it corrects it:
+# enabling queued invalidation did not merely fail to fix the MSI, it stopped
+# the context cache and the IOTLB being invalidated at all, because the
+# register writes left behind are the ones the unit now ignores. The kernel's
+# own gate said so -- "the context cache did not invalidate" -- in a boot that
+# was already red for the MSI, which is how it went unread.
+unsafe_budget = 1115
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

@@ -700,6 +700,59 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-11 (the invalidation that was never happening, and what the MSI fault is not)
+
+**A bug this file introduced on 2026-08-06 and recorded as harmless.** Queued invalidation was
+enabled then, to satisfy the specification before interrupt remapping, and written up as "it did not
+fix anything and the code is more correct with it". The second half was wrong. **Setting `QIE` is
+the moment the unit stops honouring the invalidation registers** — and it stops honouring them
+*silently*: the command bit clears, the poll succeeds, and nothing is invalidated. Every
+register-based invalidation left in the kernel became a no-op on any boot with `iommu=remap-irq`.
+
+The kernel's own gate caught it the whole time and nobody read it:
+
+```
+iommu window   FAILED: the context cache did not invalidate
+```
+
+It only appears with remapping on — which was the boot that was already red for the undelivered MSI,
+so a new failure line read as part of the known one. QEMU said it too, twice a boot: `Queued
+Invalidation enabled, should not use register-based invalidation`.
+
+**Fixed** by submitting context-cache and IOTLB invalidations as queue descriptors when `QIE` is
+set, with an invalidation-wait descriptor for completion rather than the head register catching the
+tail — the head advancing says the descriptor was *taken*. The register path stays for the ordinary
+boot, where the queue is off. Both encodings are pinned by host tests. Afterwards: QEMU's complaint
+gone, the context-cache gate green, `test-boot`, `test-boot-iommu` and `test-host` clean.
+
+**It did not fix the MSI, and that is worth recording as an eliminated cause rather than a
+disappointment.** Same boot, after the fix: still `0 deliveries`.
+
+**What the MSI fault is now known not to be.** All of this is read-back and trace evidence, not
+inference:
+
+| Ruled out | How |
+|---|---|
+| The MSI-X table entry | Read back from the device: `[0xfee00038, 0, 0, 0]` — handle 1, both format bits, unmasked |
+| MSI-X being off, or function-masked | Control reads back `0x8001`; QEMU independently reports `enabled 1 masked 0` |
+| The IRTE | `irte[1] low=0xfc0001 high=0x40018` — vector `0xfc`, source id `00:03.0`, present |
+| The device being wedged | It completes **274 requests** under remapping, against 419 without |
+| Stale context cache or IOTLB | Fixed above; the fault is unchanged |
+
+**Which narrows it to one gap**: between a request completing and a message being sent. With
+remapping off, 419 completions produce ~143 messages at the unit; with it on, 274 completions
+produce **none**. Nothing in this kernel sits in that gap — it is the device model deciding whether
+to raise the interrupt at all.
+
+**A red herring, named so it is not chased.** The trace shows a message `(addr 0xfee00000, data
+0x0)` that looks exactly like a device MSI built from a zeroed table entry. It appears in the
+**working** boot too. It is not the block device and it is not evidence of anything.
+
+**The next thing to look at** is the gate itself: what the device model reads to decide whether to
+notify, which for virtio is the driver's available-ring flags read back over DMA. That is the one
+thing in the path that is both guest-supplied and read through translation, and it is the only
+remaining difference between a boot that delivers and one that does not.
+
 ### 2026-08-10 (the other two parsers, and a checksum that was hiding a quarter of one)
 
 `elf::parse` closed its half of §8's fuzz requirement earlier today. `ustar` and `DMAR` close the
@@ -1784,9 +1837,13 @@ of its causes had been examined.
   back. The missing **invalidation queue** — the specification requires it before remapping, we were
   not doing it, and doing it changed nothing. And `zero sized buffers`, which QEMU 7.2 does not
   report at all.
-- **Queued invalidation is kept.** It did not fix anything and the code is more correct with it:
+- ~~**Queued invalidation is kept.** It did not fix anything and the code is more correct with it:
   register-based invalidation keeps working without it, which is exactly why the requirement is easy
-  to miss, and it was missed here until an experiment went looking.
+  to miss, and it was missed here until an experiment went looking.~~ **Wrong, and corrected on
+  2026-08-11**: it did not fail to fix something, it *broke* something. Enabling `QIE` is the moment
+  the unit stops honouring the invalidation registers, and this kernel went on writing them — so
+  from that day the context cache and the IOTLB were never invalidated on any boot with remapping
+  on. See the entry for 2026-08-11.
 - **What remains true**: the device completes requests throughout, the I/O APIC's remapped interrupt
   is delivered, and the device's MSI never reaches the unit in any arrangement tried.
 - **The value of a wrong hypothesis, tested.** "Try a newer QEMU" was written into this file twice
@@ -2958,7 +3015,7 @@ to guess at; both have a shorter list of candidates than they did.
 
 | Open | Ruled out |
 |---|---|
-| The block device's MSI is not delivered under interrupt remapping | A newer QEMU (7.2 fails identically), the message format, the ordering, the missing invalidation queue, and two red herrings |
+| The block device's MSI is not delivered under interrupt remapping | A newer QEMU (7.2 fails identically), the message format, the ordering, the missing invalidation queue, and two red herrings. Added 2026-08-11, by read-back rather than argument: the MSI-X entry, the MSI-X enable and function mask, the IRTE, the device being wedged, and a stale context cache or IOTLB. What is left is the gap between a request completing and a message being sent — 274 completions, no message |
 | A reused device address keeps its translation | Nothing yet. Reuse is disabled until it is explained, and `free` still records the extent |
 
 **Nine checks this milestone were not looking at the thing they claimed to check.**

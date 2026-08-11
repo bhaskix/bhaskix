@@ -89,7 +89,14 @@ workspace = true
 # and the I/O APIC's remappable redirection: one more accessor apiece, the same
 # shape as the rest of this window. Built and off by default -- see the kernel's
 # note and TRACKER for why.
-unsafe_budget = 1080
+# 1110 at M6-20. Submitting invalidations through the queue instead of the
+# registers, which is not an optimisation: once `QIE` is set the unit ignores
+# the invalidation registers, and ignores them *silently* -- the command bit
+# clears, the poll succeeds, and nothing is invalidated. The volatile writes
+# cannot be avoided, because a descriptor is memory the hardware reads and a
+# compiler that sank or reordered those writes past the tail register would
+# publish a queue entry the unit reads before it exists.
+unsafe_budget = 1110
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

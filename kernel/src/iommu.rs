@@ -874,6 +874,58 @@ static IRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0
 static NEXT_HANDLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static REMAPPING: AtomicBool = AtomicBool::new(false);
 
+/// The invalidation queue, and the word the unit writes when it has drained.
+///
+/// Both physical, because both are reached by rebuilding a [`vtd::Unit`] around
+/// [`UNIT_BASE`] wherever an invalidation is needed, and a rebuilt unit
+/// remembers nothing. Zero means the queue was never enabled, which is the
+/// ordinary case: it goes on only with interrupt remapping.
+///
+/// The status word costs a frame to hold four bytes. The queue is one page and
+/// the format's smallest size fills it, so there is no room inside it for a
+/// word the unit writes *after* the descriptors it is reporting on.
+static IQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static IQ_STATUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Invalidates through the queue, if the unit is taking invalidations that way.
+///
+/// `None` when it is not, which leaves the caller to use the registers. The
+/// split is the whole point: **once `QIE` is set the unit ignores the
+/// invalidation registers and says nothing** — the command bit clears, the
+/// poll succeeds, and the cache is untouched. A kernel that enabled the queue
+/// for interrupt remapping and went on writing registers would believe it was
+/// invalidating and would not be.
+///
+/// # Safety
+///
+/// The unit must be the one this kernel programmed.
+unsafe fn queued(unit: &vtd::Unit, descriptors: &[[u64; 2]]) -> Option<bool> {
+    // SAFETY: the caller's obligation.
+    if !unsafe { unit.queued_invalidation_enabled() } {
+        return None;
+    }
+    let queue = IQ.load(core::sync::atomic::Ordering::Acquire);
+    let status = IQ_STATUS.load(core::sync::atomic::Ordering::Acquire);
+    if queue == 0 || status == 0 {
+        // The unit says the queue is on and this kernel does not know where it
+        // is, so there is no way to invalidate anything. Reported as a failure
+        // rather than falling back to registers the unit is ignoring.
+        return Some(false);
+    }
+
+    let hhdm = crate::shared::hhdm();
+    // SAFETY: frames this module allocated and zeroed for exactly this, mapped
+    // through the direct map, and handed to the unit in `IQA`.
+    Some(unsafe {
+        unit.queued_invalidate(
+            (hhdm + queue) as *mut u64,
+            (hhdm + status) as *mut u32,
+            status,
+            descriptors,
+        )
+    })
+}
+
 /// Whether interrupts are being remapped.
 ///
 /// Every interrupt this kernel programs asks first: in remappable format the
@@ -916,9 +968,14 @@ pub unsafe fn enable_interrupt_remapping(hhdm: u64) -> Result<(), &'static str> 
         // and register-based invalidation working without it is exactly why
         // that is easy to miss.
         let (queue, _) = zeroed_frame(hhdm).ok_or("no frame for the invalidation queue")?;
+        let (status, _) = zeroed_frame(hhdm).ok_or("no frame for the invalidation status")?;
         if !unit.enable_queued_invalidation(queue) {
             return Err("the unit did not report queued invalidation enabled");
         }
+        // Published before anything can invalidate, because from the line
+        // above the registers stop working and this is the only route left.
+        IQ.store(queue, core::sync::atomic::Ordering::Release);
+        IQ_STATUS.store(status, core::sync::atomic::Ordering::Release);
         if !unit.set_interrupt_remap_table(table, vtd::IRT_ENTRIES) {
             return Err("the unit did not accept the remapping table");
         }
@@ -973,12 +1030,6 @@ pub fn remap_interrupt(source: Option<(u8, u8, u8)>, vector: u8, destination: u8
     // SAFETY: the unit that owns this table.
     unsafe {
         let _ = invalidate_interrupt_cache();
-        let entry = ((hhdm + table) as *const u64).add(handle as usize * 2);
-        crate::println!(
-            "  MARK irte[{handle}] low={:#x} high={:#x}",
-            core::ptr::read_volatile(entry),
-            core::ptr::read_volatile(entry.add(1))
-        );
     }
     u16::try_from(handle).ok()
 }
@@ -1349,7 +1400,14 @@ pub unsafe fn invalidate_contexts() -> bool {
         // The IOTLB after the context cache, in that order: entries cached
         // through the old context must go too, and invalidating them first
         // would leave a window in which the old context could fill them again.
-        unit.invalidate_context() && unit.invalidate_iotlb()
+        // One submission keeps that order without a second round trip.
+        match queued(
+            &unit,
+            &[vtd::context_invalidation(), vtd::iotlb_invalidation()],
+        ) {
+            Some(done) => done,
+            None => unit.invalidate_context() && unit.invalidate_iotlb(),
+        }
     }
 }
 
@@ -1366,7 +1424,10 @@ unsafe fn invalidate() -> bool {
     // SAFETY: the caller's obligation.
     unsafe {
         let unit = vtd::Unit::new(base as *mut u8);
-        unit.invalidate_iotlb()
+        match queued(&unit, &[vtd::iotlb_invalidation()]) {
+            Some(done) => done,
+            None => unit.invalidate_iotlb(),
+        }
     }
 }
 
