@@ -65,6 +65,14 @@ fi
 # commit message, an author field, a tag or a branch name that has been pushed
 # to a public repository is permanent, mirrored, and indexed. So the whole
 # history is checked on every run, not just the working tree.
+#
+# **This said "the whole history" and checked only the metadata** until
+# 2026-08-11, when an audit of this script went looking for what it could not
+# catch. A vendor string committed inside a *file* and deleted in a later commit
+# passed every check here: the tracked-file scan below sees only what the
+# working tree has now, and the metadata scan sees only messages, authors, tags
+# and refs. The blob scan added below closes that, and the repository was clean
+# when it was written -- 167 commits, no hit.
 history=$(
     {
         git log --all --format='%s%n%b%n%an%n%ae%n%cn%n%ce' 2>/dev/null
@@ -83,6 +91,35 @@ if [[ -n "$history" ]]; then
     status=1
 else
     pass "no vendor strings in git history"
+fi
+
+# Every version of every file that has ever been committed, by scanning the
+# blobs rather than the commits.
+#
+# Deduplicated, and that is what makes it affordable: a file unchanged across a
+# hundred commits is one blob, so this is O(distinct file versions) where
+# `git grep` over `rev-list` is O(commits x tree). Measured at 167 commits:
+# 245 ms this way, 5.3 s the other -- less than the rest of this script costs.
+#
+# The fast path only answers *whether*. Naming the file and the commit is left
+# to the slow walk below, which runs only when there is something to name --
+# paying for a diagnosis nobody needs is how a cheap gate becomes one that gets
+# skipped.
+blobs=$(git rev-list --all --objects 2>/dev/null | awk '{print $1}' \
+    | git cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null \
+    | awk '$2 == "blob" { print $1 }' \
+    | git cat-file --batch 2>/dev/null \
+    | grep -icE "$PATTERN")
+
+if [[ "$blobs" -gt 0 ]]; then
+    fail "vendor strings found in a file somewhere in history"
+    git grep -liE "$PATTERN" $(git rev-list --all) -- . 2>/dev/null \
+        | grep -v 'tools/check-containment.sh$' | head -20 | sed 's/^/        /' >&2
+    echo "        A file that carried this was committed and may since have been" >&2
+    echo "        deleted -- the working tree being clean does not clear it." >&2
+    status=1
+else
+    pass "no vendor strings in any file in history"
 fi
 
 missing=$(git ls-files '*.rs' '*.sh' '*.py' 2>/dev/null | while read -r f; do

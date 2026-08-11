@@ -706,6 +706,33 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-11 (the containment gate said "the whole history" and checked the metadata)
+
+The boot gates were audited earlier the same day; the **project-invariant** gates were not, and
+`check-containment.sh` was the only one of the four with no self-test and no record of ever having
+been watched fail. Three of its four checks were induced and each went red: a `limine` outside
+`boot/`, a vendor string in a tracked file, a missing SPDX header. All exit 1.
+
+**The fourth could not be tested the way the others were, and that is the finding.** Testing the
+git-history check means making a commit whose message carries a vendor string — the one thing this
+project's standing rules say cannot be undone after a push. So it was read instead, and reading it found the
+gap: its comment says *"the whole history is checked on every run"*, and what it checks is commit
+messages, authors, tags and refs. **A vendor string committed inside a file and deleted in a later
+commit passed every check in this script** — the tracked-file scan sees only what the working tree
+has now.
+
+**Closed by scanning the blobs rather than the commits**, which costs less than the gate already
+did: 245 ms against 5.3 s for `git grep` over `rev-list`, because a file unchanged across a hundred
+commits is one blob. The fast path answers only *whether*; naming the file is left to the slow walk,
+which runs only when there is something to name.
+
+**Negative-tested in a throwaway clone**, never in this repository. A file carrying a vendor string
+was committed and then deleted, leaving a clean working tree and a clean commit message. The old
+check said `ok    no vendor strings in git history`; the new one said `FAIL`. That pair is the whole
+argument for the change.
+
+The repository is clean by the stricter standard: 167 commits, every distinct file version, no hit.
+
 ### 2026-08-11 (six self-tests nothing was reading, and the class they belong to)
 
 `README.md` says **"a gate that has never been watched failing is not counted as a gate here"**, and
