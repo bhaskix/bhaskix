@@ -6811,43 +6811,31 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // Interrupt remapping, and **off unless asked for**. RFC 0012 step 6 is
     // built -- the table, entries that validate which device may present a
     // handle, remappable lines and messages, and compatibility format blocked
-    // -- and it is not yet correct end to end.
+    // -- and as of 2026-08-11 it works: with `iommu=remap-irq` the whole boot
+    // test passes, the block driver is woken by its own device at one
+    // interrupt per request, and every message that arrives is a handle this
+    // kernel issued.
     //
-    // Under it the I/O APIC's line is remapped and delivered; the block
-    // device's message is not. Two real encoding bugs were found and fixed
-    // chasing that (the destination field sits at bit 40, not 32; the format
-    // bit is bit 4 and SHV bit 3, not the reverse) and a third cause is
-    // unidentified. Enabling it by default would cost the block driver its
-    // interrupt and leave it on the timer -- a working machine that quietly
-    // polls, which is exactly the kind of degradation this project refuses to
-    // ship silently.
+    // It stays off by default anyway, and the reason is no longer a bug. This
+    // path spent its entire life until that date silently broken, so it has
+    // barely been exercised; it has been seen working on one emulator; and
+    // nothing has ever booted this kernel on physical hardware, where an IOMMU
+    // is much less forgiving than a model of one. Turning it on is a decision
+    // to take deliberately, with its own change and its own boots behind it,
+    // rather than as a consequence of the fix.
     //
-    // So: `iommu=remap-irq` turns it on for whoever is finishing it, and the
-    // boot line says which world the machine is in either way.
-    //
-    // What is known, so the next attempt does not repeat it. Under remapping
-    // QEMU still pops and completes every request -- around 140 a boot, the
-    // same as without it -- so the device is working and its DMA is fine. The
-    // I/O APIC's line *is* remapped and delivered. What never happens is an
-    // MSI leaving the device: no remap request for it reaches the unit, while
-    // the I/O APIC's does. Ruled out: the destination field's position and the
-    // format/SHV bits (both were real bugs, both fixed), `eim` on and off, SHV
-    // on and off, and the "zero sized buffers" complaint QEMU makes at
-    // translation-enable time -- that one is the firmware's stale ring being
-    // read through a translation that no longer maps it, it happens with
-    // remapping off as well, and QEMU 7.2 does not report it at all.
-    //
-    // Also eliminated, on QEMU **7.2** as well as 4.2, so this is not an old
-    // emulator: the message format (compatibility fares no better than
-    // remappable), the ordering (enabling after the device's interrupts
-    // already work breaks them immediately, and rewriting the entry
-    // afterwards does not bring them back), and the missing invalidation
-    // queue -- which the specification does require before remapping, so it
-    // is enabled now and changed nothing.
-    //
-    // What is left: the device's MSI never reaches the unit in any of these
-    // arrangements, while the I/O APIC's does, and the device keeps completing
-    // requests throughout.
+    // What it was, so that the shape of it is remembered rather than the
+    // symptom: **enabling remapping turned translation off**. `GCMD` is
+    // write-only, `vtd::Unit` shadows it, and `Unit::new` starts that shadow at
+    // zero -- so a unit built fresh around an already-translating window wrote
+    // a zero into the translation-enable bit with its first command. `GSTS`
+    // went 0xc000_0000 to 0x4400_0000 across one line. Everything else was
+    // downstream of that: with translation off the device gets a passthrough
+    // address space, which has no interrupt-remapping region in it, so its
+    // message went to the APIC in compatibility format and no request ever
+    // reached the unit -- while the I/O APIC's line, which is not a device
+    // DMA, kept working. `Unit::adopt` is the fix and the check below is the
+    // guard.
     //
     // SAFETY: the unit is programmed, and nothing has been routed yet --
     // `console_input` and the block driver's MSI-X both come later.
