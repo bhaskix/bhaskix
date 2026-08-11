@@ -415,13 +415,36 @@ prerequisite for calling this done, rather than a parallel task.
 
 ## Unresolved questions
 
-1. **One window per device, or one per driver?** A driver with several
-   functions of the same device wants them sharing a window; two drivers must
-   not. Proposal: per device, with a method to add a second device to an
-   existing window, refused unless both are held by the same domain.
-2. **Do in-nucleus drivers get their own windows, or one shared kernel
-   window?** Separate is the point of T3; shared is cheaper. Proposal:
-   separate, and measure.
+**Three of these were answered by building them, and are marked below rather
+than removed** — a question worth asking is worth leaving visible next to what
+it turned out to be. Amended 2026-08-11, when the last two implementation
+faults closed.
+
+1. ~~**One window per device, or one per driver?**~~ **Answered: per device,
+   and the sharing half of the proposal was not built.** The proposal was "per
+   device, with a method to add a second device to an existing window". What
+   `attach_device` does instead is give the second device its **own page
+   table**, reached through its own context entry in the tables that already
+   exist — because the unit has one root table, so a second `build_window`
+   would point the hardware at a new root and the first device would stop
+   translating.
+
+   The sharing method is not merely unbuilt, it is now argued against in the
+   code: two devices sharing a page table is two devices *translated* rather
+   than two devices *isolated*, and each could reach whatever the other had
+   mapped, which is most of what this RFC is for. If a multi-function device
+   ever genuinely needs one window, that is a new question with that device in
+   front of it, not this one.
+2. ~~**Do in-nucleus drivers get their own windows, or one shared kernel
+   window?**~~ **Answered: separate.** Each device gets its own page table and
+   its own domain id — the boot reports `00:04.0 translating too, its own page
+   table and domain, 2 in use`. Distinct domain ids are not tidiness: the
+   hardware is entitled to share IOTLB entries between devices that share one.
+
+   **The "and measure" half has not happened.** Nothing has measured what
+   separate windows cost against a shared one, and on a machine with two
+   devices there is nothing to measure it on. Recorded as owed rather than
+   done.
 3. **`IommuControl`, `IrqControl`, and the eventual device object** are three
    privileged capabilities that will always be handed out together. Whether
    they should be one object with three methods is a question for whichever
@@ -432,9 +455,13 @@ prerequisite for calling this done, rather than a parallel task.
 5. **ATS and device page faults** — devices that can take a page fault rather
    than requiring pinned memory. Proposal: no. Pinned mappings only, which is
    what a fixed `Memory` object already is.
-6. **What a machine with no IOMMU may run.** Proposal: everything except a
-   domain-hosted driver, reported at boot. The alternative — refusing to
-   boot — makes the project unusable on the hardware most contributors have.
+6. ~~**What a machine with no IOMMU may run.**~~ **Answered: exactly the
+   proposal.** Everything except a domain-hosted driver, reported at boot.
+   `iommu::name` refuses to hand out a `DmaWindow` for a device with no window,
+   so a domain gets a device's registers and no way to make it read; `irq::name`
+   refuses a handler for the same reason, because a domain driving a device
+   needs that device's DMA constrained first. The boot line says which machine
+   it is either way, and a gate asserts it says something.
 
 ---
 
