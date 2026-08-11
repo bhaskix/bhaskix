@@ -82,6 +82,13 @@ LAYERS = {
     # is why that sits lower still.
     "bhaskix-user-probe": -1,
     "bhaskix-user-shell": -1,
+    # The supervisor places no service: it creates domains, starts programs in
+    # them and reaps them, all through capability invocations. So it belongs
+    # here with the other plain programs rather than in PLACEMENTS -- and that
+    # it needs nothing but the ABI is the whole claim RFC 0017 question 2
+    # makes, that a restart policy is writable in userspace with no new kernel
+    # mechanism.
+    "bhaskix-user-sup": -1,
 }
 
 # Programs that *place* a service, and exactly what each may reach.

@@ -2703,6 +2703,29 @@ const CONSOLED_STACK_PAGES: u64 = 4;
 /// Where the console service's program is.
 const CONSOLED_PROGRAM: &[u8] = b"bin/consoled";
 
+/// Where the supervisor's stack and program live.
+const SUP_STACK: u64 = 0x0000_0000_1200_0000;
+const SUP_STACK_PAGES: u64 = 4;
+const SUP_PROGRAM: &[u8] = b"bin/sup";
+
+/// How many bytes of `bin/probe` the supervisor's image object holds.
+///
+/// Passed to the program at entry, because `START` refuses a length of zero and
+/// a supervisor cannot measure memory it was handed -- it holds a capability,
+/// not a mapping, and there is no method that reports an object's size. Telling
+/// it at entry is the same affordance `enter_ring3` documents: everything a
+/// domain has arrives through its CSpace, and this is the one thing that
+/// cannot.
+static SUP_IMAGE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The badge the supervisor's console capability carries.
+///
+/// Its own, not the shell's. A badge is what a service is told about a caller,
+/// and two programs sharing one are two programs the console cannot tell apart
+/// -- which is only a reporting nuisance here and is exactly the property a
+/// badge exists to provide, so spending a distinct one is the honest default.
+const BADGE_SUPERVISOR: u64 = 0x0000_0000_0050_0000;
+
 /// The console object every `Console` capability names.
 ///
 /// One, because there is one console. The identity is not used for anything —
@@ -4630,6 +4653,179 @@ pub fn start_console_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str
 }
 
 /// Loads `bin/consoled` and becomes the console service, in ring 3.
+/// Starts the supervisor: a ring 3 program that restarts what it started.
+///
+/// RFC 0017's second unresolved question asked what restarts a service that
+/// died, and answered that restart policy is **policy** — writable entirely in
+/// userspace, and the RFC's own test of whether its six steps were the right
+/// six. `bin/sup` is that test. Nothing in the kernel was added for it: every
+/// call it makes existed already.
+///
+/// Five capabilities, and the interesting one is the third. The program it
+/// starts arrives as **memory this function staged**, not as a filename — the
+/// kernel has no business opening a file on a program's behalf, so a supervisor
+/// that named one would be naming authority it does not hold. `START` takes a
+/// capability for the same reason.
+///
+/// # Errors
+///
+/// A string naming what would not be built. Every one is survivable: the
+/// machine boots to a shell without a supervisor.
+fn start_supervisor(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
+    let console = service::console_endpoint().ok_or("the console service has no endpoint")?;
+
+    // One child at a time, which is what makes the reap in the loop
+    // load-bearing rather than tidy: without it the second start is refused for
+    // the budget, and that is the negative test for this program.
+    let realm = domain::create("sup", domain::ResourceEnvelope::new().max_child_domains(1))
+        .map_err(|_| "no room for the supervisor's domain")?;
+
+    // Slot 0: the console, badged as itself.
+    let console_cap = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(console.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, BADGE_SUPERVISOR).ok()
+    })
+    .ok_or("the supervisor's console capability would not be created")?;
+
+    // Slot 1: authority to create a domain. Necessary and not sufficient --
+    // the envelope above is the other half.
+    let control = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::DomainControl, 0),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, 0).ok()
+    })
+    .ok_or("the supervisor's DomainControl would not be derive")?;
+
+    // Slot 2: the program to start, staged into memory. The same shape the ring
+    // 3 test uses to hand the probe its own image.
+    let staged = vfs::open(USER_PROGRAM).ok().and_then(|file| {
+        let bytes = file.bytes();
+        let pages = bytes.len().div_ceil(bhaskix_mm::FRAME_SIZE as usize).max(1);
+        let object = shared::create(realm, pages as u64 * bhaskix_mm::FRAME_SIZE).ok()?;
+        let mut written = 0;
+        shared::fill_from(object, 0, bytes.len(), &mut |page: &mut [u8]| {
+            let take = page.len().min(bytes.len() - written);
+            page[..take].copy_from_slice(&bytes[written..written + take]);
+            written += take;
+            take
+        })?;
+        SUP_IMAGE_BYTES.store(bytes.len() as u64, core::sync::atomic::Ordering::Release);
+        shared::name(object).ok()
+    });
+    let staged = staged.ok_or("the supervisor's program image would not be staged")?;
+
+    // Slot 3: a notification it owns, which is what `BIND` names. A supervisor
+    // with none could not be told about anything.
+    let notification = notify::create().map_err(|_| "no notification for the supervisor")?;
+    let signal = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(
+                    cap::ObjectKind::Notification,
+                    u64::from(notification.index()) | (u64::from(notification.generation()) << 32),
+                ),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, 0).ok()
+    })
+    .ok_or("the supervisor's notification would not be created")?;
+
+    // Slot 4 is left empty: it is where each child's `Domain` capability lands
+    // and is given back from.
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(0, console_cap).is_ok()
+            && owner.cspace.install_at(1, control).is_ok()
+            && owner.cspace.install_at(2, staged).is_ok()
+            && owner.cspace.install_at(3, signal).is_ok()
+    }) != Some(true)
+    {
+        return Err("the supervisor's capabilities would not install");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(cpu, "sup", supervisor_entry, hhdm_base, hhdm_base, options)
+        .map_err(|_| "the supervisor's thread would not spawn")?;
+
+    // Wait for it, rather than letting it run alongside everything else.
+    //
+    // It is a ring 3 program printing to the same console the boot is using,
+    // and it creates and destroys domains while other self-tests are counting
+    // them. Left concurrent it tore its own lines in half and turned two
+    // unrelated checks red -- which is the coupling the comment beside the
+    // shell's start describes, met again by a second program.
+    //
+    // Bounded, so a supervisor that wedges reports rather than hanging the
+    // boot; and its domain ending is the signal, which is the rule adopted
+    // earlier today.
+    let finished = wait_until(|| !matches!(domain::state_of(realm), Ok(None)), 4_000);
+    if !finished {
+        println!("    supervisor     did not finish within four seconds");
+    }
+    Ok(())
+}
+
+/// Loads `bin/sup` and enters ring 3, the same way every other domain does.
+extern "C" fn supervisor_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    supervisor     FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(SUP_PROGRAM) else {
+        stop("bin/sup is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/sup is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(SUP_STACK), SUP_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/sup would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = SUP_STACK + SUP_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // How many bytes the image is, passed in the entry word. `START` refuses a
+    // length of zero and the program cannot measure memory it merely holds a
+    // capability to, so this is the one fact that cannot reach it through a
+    // CSpace.
+    let bytes = SUP_IMAGE_BYTES.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed -- `elf::parse` refuses an entry point that is not -- `rsp` is
+    // one past user-writable memory in the same space, and `RSP0` was set
+    // before this thread was spawned.
+    unsafe { enter_user("sup", entry, rsp, [bytes, 0]) }
+}
+
 extern "C" fn console_domain_entry(hhdm_base: u64) -> ! {
     use bhaskix_boot::VirtAddr;
     use bhaskix_mm::{Protection, VirtRange};
@@ -4857,6 +5053,23 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // The console service is pinned to the CPU the serial line is routed to,
     // because it is the thread that blocks in `input::read`.
     service::start(0, hhdm)?;
+
+    // The supervisor, before the shell. It answers RFC 0017's second question
+    // and it runs to completion in a few milliseconds, so putting it here means
+    // its output lands before the shell's prompt rather than interleaved with
+    // what a person is typing -- which is the same reason the lines above the
+    // shell's start are printed where they are.
+    //
+    // Not fatal: a machine with no supervisor still boots to a shell, and
+    // saying so is better than refusing to start.
+    // Not cpu 0. Ring 3 entry is pinned (M9-13), and pinning this to the
+    // processor the boot thread is waiting on puts the two in contention --
+    // which showed up as the block driver missing the three-second window its
+    // own report is waited for in, on a machine where nothing was wrong.
+    let cpu = bhaskix_arch::percpu::online_count().saturating_sub(1);
+    if let Err(reason) = start_supervisor(cpu, hhdm) {
+        println!("    supervisor     not started: {reason}");
+    }
 
     let console = service::console_endpoint().ok_or("the console service has no endpoint")?;
     let filesystem = service::filesystem_endpoint().ok_or("the filesystem has no endpoint")?;
@@ -7695,15 +7908,17 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Six programs in /bin: the ring 3 probe, the user-mode shell,
+            // Seven programs in /bin: the ring 3 probe, the user-mode shell,
             // both services as programs, the block driver (RFC 0013 steps 3, 4
-            // and 6), and the filesystem (RFC 0016 step 3). Exact rather than
-            // "at least", so adding a seventh without noticing this line is a
-            // failure rather than a silently weaker test -- which it has now
-            // been, five times, once per program added. It is the cheapest
-            // assertion in the repository.
+            // and 6), the filesystem (RFC 0016 step 3), and the supervisor
+            // (RFC 0017 question 2). Exact rather than "at least", so adding an
+            // eighth without noticing this line is a failure rather than a
+            // silently weaker test -- which it has now been, six times, once
+            // per program added. It is the cheapest assertion in the
+            // repository, and it caught the seventh the same day it was
+            // written.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 6,
+            entries >= 3 && bin == 7,
         ),
         (
             "the user program is an ELF the loader accepts",

@@ -384,9 +384,28 @@ program can no longer stop this machine.**
    of them is a facility for supervising, which was the point. The test of whether these were the
    right six is passed in a program.
 
-   **The question itself stands**, and is narrower than it was: nothing *restarts* anything. What
-   exists is the mechanism to notice and to ask why; a policy that acts on it is still unwritten,
-   and still belongs in userspace.
+   ~~**The question itself stands**, and is narrower than it was: nothing *restarts* anything.~~
+   **Answered 2026-08-11.** `user/sup` is a restart policy — start a program, wait to be told it
+   ended, ask why, reap it, start it again — and it adds **nothing to the kernel**: every call it
+   makes existed before it did. That was the claim this question made, and a program is what tests
+   it.
+
+   The policy is deliberately the smallest honest one: restart on exit, a fixed number of times,
+   then report and stop. A policy that never finishes cannot be asserted by a boot test, and what
+   is being demonstrated is that the *loop closes* — that reaping a dead child frees the budget the
+   next one needs. A real policy would branch on [`Ending`], which is why that enum records how a
+   domain ended rather than merely that it did.
+
+   **The number of restarts turned out to be load-bearing, for a reason outside this RFC.** Twelve,
+   not three, because the kernel held installed address spaces in a table of eight and a domain that
+   ended never gave its slot back — so a restart loop was bounded by a table rather than by policy,
+   and three was enough to exhaust it. The supervisor is what found that; the fix is a separate
+   change, and the restart count is now the assertion that a slot comes back.
+
+   **What this does not do** is supervise a real service. Replacing `consoled` means the supervisor
+   holds every capability the original was given, so it can hand them to the replacement — a design
+   question of its own, and the reason restart policy was called a separate argument in the first
+   place. This proves the loop; making something depend on it should be its own step.
 3. **Should `MAX_DOMAINS` stay fixed at 32?** Fixed so that creating a domain cannot fail for want
    of heap during memory pressure, which is a good reason and is unaffected by the number. Whether
    32 is right is a separate question from whether the limit should be static, and both are now

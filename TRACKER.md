@@ -706,6 +706,31 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-11, last of the day (a supervisor in ring 3 that restarts what it started)
+
+RFC 0017's second question — *what restarts a service that died* — answered in a program rather than
+on paper. `user/sup` starts `bin/probe` in a domain it made, waits to be told it ended, asks why,
+reaps it, and starts it again, twelve times. **It adds nothing to the kernel**: `SPAWN`, `GRANT`,
+`BIND`, `START`, `WAIT`, `INFO` and `RELEASE` all existed before it did, which was the claim the
+question made.
+
+The policy is the smallest honest one — restart on exit, a fixed count, then report and stop —
+because a policy that never finishes cannot be asserted by a boot test. What is demonstrated is that
+the loop *closes*: the envelope allows one child at a time, so a supervisor that forgot to reap
+would get one start and a refusal.
+
+Two gates, and the second is the one that matters: the summary line, and **twelve** `spawned, hello`
+lines written by the children through a console capability the supervisor granted them. Without the
+second, a supervisor that spawned twelve domains and granted nothing would report exactly the same
+twelve starts and twelve endings.
+
+Twelve rather than three because the count is load-bearing against the address-space table — see the
+entry below, which this program is what found.
+
+**Not done:** it supervises `bin/probe`, not a real service. Restarting `consoled` means holding
+every capability the original was given so the replacement can be handed them, which is a design
+question of its own and the reason RFC 0017 called restart policy a separate argument.
+
 ### 2026-08-11, later still (a domain gives its address-space slot back)
 
 `vm` keeps installed address spaces in a table of `MAX_SPACES`, which is eight. `install` took a

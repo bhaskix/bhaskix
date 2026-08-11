@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A supervisor, in a domain of its own.
+#
+# Not a member of the root workspace, for the reason user/shell/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+#
+# RFC 0017 asked what restarts a service that died, and answered that restart
+# policy is policy -- writable entirely in userspace, and its own test of
+# whether the six steps were the right six. This is that test. Every mechanism
+# it uses already existed; nothing was added to the kernel for it.
+[workspace]
+
+[package]
+name = "bhaskix-user-sup"
+description = "A supervisor: starts a program, notices it end, and starts it again."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "sup"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# Two blocks: the `syscall` instruction with its operand list, and the `ud2` a
+# panic ends at. This program dereferences nothing -- it holds capabilities and
+# invokes methods on them, and a supervisor that needed a raw pointer would be
+# a supervisor reaching past the boundary it exists to work through.
+#
+# The count is lines, not blocks, and nearly all of them are the operand list:
+# every argument register has to be declared an output too, because the kernel
+# writes the whole frame back. Sixteen is what those two blocks measure; it was
+# guessed at 12 before either had been written.
+unsafe_budget = 16

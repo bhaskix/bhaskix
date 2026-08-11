@@ -47,7 +47,9 @@ VFSD_DIR     := user/vfsd
 CONSOLED_DIR := user/consoled
 BLKD_DIR     := user/blkd
 FSD_DIR      := user/fsd
+SUP_DIR      := user/sup
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
+USER_SUP     := $(SUP_DIR)/target/$(TARGET)/release/sup
 USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
 USER_CONSOLED := $(CONSOLED_DIR)/target/$(TARGET)/release/consoled
 USER_BLKD    := $(BLKD_DIR)/target/$(TARGET)/release/blkd
@@ -62,6 +64,10 @@ SHELL_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(SHELL_DIR)/link.ld
 VFSD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(VFSD_DIR)/link.ld
+# The supervisor, which RFC 0017 question 2 asked for: same shape as the rest,
+# its own linker script because it says where it goes.
+SUP_FLAGS    := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(SUP_DIR)/link.ld
 CONSOLED_FLAGS := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(CONSOLED_DIR)/link.ld
 BLKD_FLAGS   := -C relocation-model=static -C code-model=small \
@@ -179,7 +185,7 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_FSD) $(FS_IMAGE)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
@@ -189,6 +195,7 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USE
 	cp $(USER_CONSOLED) $(INITRD_ROOT)/bin/consoled
 	cp $(USER_BLKD) $(INITRD_ROOT)/bin/blkd
 	cp $(USER_FSD) $(INITRD_ROOT)/bin/fsd
+	cp $(USER_SUP) $(INITRD_ROOT)/bin/sup
 	cp $(FS_IMAGE) $(INITRD_ROOT)/fs.img
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
@@ -207,6 +214,12 @@ $(PROBE): $(PROBE_DIR)/src/main.rs $(PROBE_DIR)/link.ld $(PROBE_DIR)/Cargo.toml
 $(USER_SHELL): $(SHELL_DIR)/src/main.rs $(SHELL_DIR)/link.ld $(SHELL_DIR)/Cargo.toml \
                $(wildcard abi/src/*.rs)
 	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+$(USER_SUP): $(SUP_DIR)/src/main.rs $(SUP_DIR)/link.ld $(SUP_DIR)/Cargo.toml \
+             $(wildcard abi/src/*.rs)
+	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
@@ -410,6 +423,7 @@ fmt:
 	cd $(CONSOLED_DIR) && $(CARGO) fmt --all --check
 	cd $(BLKD_DIR) && $(CARGO) fmt --all --check
 	cd $(FSD_DIR) && $(CARGO) fmt --all --check
+	cd $(SUP_DIR) && $(CARGO) fmt --all --check
 
 # Two passes, because they cover different things. `--all-targets` cannot be
 # used on the freestanding target: it would try to build the test harness,
@@ -427,6 +441,8 @@ clippy:
 	cd $(CONSOLED_DIR) && RUSTFLAGS="$(CONSOLED_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(BLKD_DIR) && RUSTFLAGS="$(BLKD_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 
 # The project-specific invariants from docs/. Each one is cheap and catches a

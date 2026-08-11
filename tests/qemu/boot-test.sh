@@ -473,7 +473,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 6 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 7 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -789,6 +789,39 @@ if grep -q "1 round trip per operation either way" "$LOG"; then
     pass "the cost of each placement was measured and reported"
 else
     fail "no placement cost was measured"
+    status=1
+fi
+
+# RFC 0017 question 2: a restart policy, in userspace.
+#
+# `bin/sup` starts a program, waits to be told it ended, reaps it, and starts it
+# again -- twelve times. The kernel gained nothing for this: every call it makes
+# existed already, which is the claim the RFC wanted tested.
+#
+# **The count is the assertion, and twelve is the number for a reason.** One
+# start proves a spawn; a loop longer than `vm::MAX_SPACES` proves that ending a
+# domain gives its address-space slot back, because it cannot finish otherwise.
+# Three used to be the number, and three was what exhausted a table of eight and
+# left the block driver running with faults nothing would service -- reported,
+# for six days, as a fault in the driver. Reaping is asserted too: the envelope
+# allows one child at a time, so a supervisor that forgot would get one start
+# and a refusal.
+if grep -qE "sup: 12 started, 12 ended" "$LOG"; then
+    pass "a supervisor in ring 3 started a program, was told it ended, and started it again"
+else
+    fail "the supervisor did not complete its restarts"
+    status=1
+fi
+
+# And that the children *ran*, which the supervisor's own counters cannot show.
+# Each writes this line through a console capability the supervisor granted it,
+# so counting them separates "the supervisor looped" from "the children did
+# anything" -- a supervisor that spawned twelve domains and granted nothing would
+# report exactly the same twelve starts and twelve endings.
+if [[ "$(grep -c '^spawned, hello' "$LOG")" -eq 12 ]]; then
+    pass "each restarted child ran and spoke through the capability it was given"
+else
+    fail "the restarted children did not report, so the grant did not reach them"
     status=1
 fi
 
