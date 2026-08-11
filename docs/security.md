@@ -38,22 +38,34 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 | Denial of service by an authorised administrator | Authorisation is the boundary; we do not defend against correctly-authorised destruction | Audit log makes it *attributable*, not impossible |
 | Traffic analysis, timing, and power side channels on network paths | Out of scope for an OS kernel | — |
 
-> **T3 and T4 are designed and not yet delivered, as of Phase 1.**
-> [RFC 0012](rfc/0012-iommu.md) was accepted on 2026-08-04 and specifies both mitigations; no code
-> implements them. Until it does, **any DMA-capable device can read and write all of physical
-> memory**, and the kernel prints exactly that at boot rather than leaving this table to be believed:
+> **T3 and T4 are delivered as of 2026-08-11, on a machine that has an IOMMU.**
+> [RFC 0012](rfc/0012-iommu.md) was accepted on 2026-08-04 and all seven of its steps are
+> implemented. Every device the kernel drives translates through **its own** page table under its own
+> domain id, a device reaches only the frames it was given, revoking a mapping is enforced against
+> the hardware, and interrupt remapping is **on by default** — so a device cannot raise an interrupt
+> it was never programmed to raise, which is what retires [RFC 0011](rfc/0011-irq-handler.md)'s
+> residual risk. The boot says which world the machine is in:
 >
 > ```
->     dma            NO IOMMU: this device can reach all of physical memory (docs/memory.md §5)
+>     iommu window   00:03.0 39-bit, 3 levels, 0 reserved pages mapped, 0 refused
+>     iommu irq      remapping interrupts; compatibility format blocked, every message is a handle
+>                    this kernel issued
 > ```
 >
-> A boot gate asserts that line, so the day a device is brought up without the warning is a red build
-> rather than a table that quietly became true-looking. The corresponding roadmap item moved to Phase
-> 2 with the RFC's acceptance.
+> **Three conditions, and a reader should know all of them.** On a machine with **no** IOMMU nothing
+> above is true and the boot says so, in the words this note used to quote — a domain-hosted driver
+> is refused outright, because a domain that could aim a device with physical addresses could aim it
+> at the kernel. `iommu=off` produces the same state deliberately, for a machine where the unit is
+> what is wrong. And **nothing has ever booted on physical hardware** (M1-17), so every word here is
+> QEMU — real firmware declares reserved regions that QEMU never has, and that path has host tests
+> and no more.
 >
-> This note comes out when the code lands, and not before. **A mitigation column is a claim, and a
-> claim with no implementation behind it is the most expensive kind of documentation a security
-> project can carry.**
+> Gated either way: a boot test asserts interrupts *are* remapped, so a machine that quietly fell
+> back to the old risk is a red build rather than a table that became true-looking.
+>
+> This note said it would come out when the code landed. It is kept, rewritten, because the useful
+> version is not "delivered" but *under what conditions* — **a mitigation column is a claim, and a
+> claim whose limits are not written down is believed further than it should be.**
 
 **If you find that a mitigation listed as "in scope" does not actually work, that is a security bug
 and we want the report.** See §9.
