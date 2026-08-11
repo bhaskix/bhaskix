@@ -119,7 +119,7 @@ OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
-        test-placements mkfs \
+        test-boot-iommu-off test-placements mkfs \
         test-shell test-faults fmt clippy gates clean distclean help
 
 all: iso
@@ -290,8 +290,8 @@ run-uefi: $(ISO)
 
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
-test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-placements \
-      test-shell test-faults
+test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
+      test-placements test-shell test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -343,6 +343,17 @@ test-boot-uefi: $(ISO)
 # be a constant for a milestone.
 test-boot-iommu: $(ISO)
 	tests/qemu/boot-test.sh iommu
+
+# RFC 0012's escape hatch, on a machine that has a unit to refuse -- turning
+# off an IOMMU that is not there proves nothing. The script builds an image
+# with `iommu=off` and puts the default back, the same way the shell test does
+# for `shell=kernel`.
+#
+# It is in `test` rather than left to a human because this is the flag that
+# gets reached for on the machine that is already going wrong, and finding out
+# then that it never worked is the worst possible time.
+test-boot-iommu-off: $(ISO)
+	tests/qemu/boot-test.sh iommu-off
 
 
 # Types at the machine over the serial line and asserts on the replies. The

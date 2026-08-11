@@ -456,7 +456,14 @@ faults closed.
    than requiring pinned memory. Proposal: no. Pinned mappings only, which is
    what a fixed `Memory` object already is.
 6. ~~**What a machine with no IOMMU may run.**~~ **Answered: exactly the
-   proposal.** Everything except a domain-hosted driver, reported at boot.
+   proposal**, and since 2026-08-11 a machine *with* one can be told to behave
+   as though it has none — `iommu=off`, which discovers and reports the `DMAR`
+   and then builds and enables nothing. Translation comes up before any
+   service, so without that flag a machine that wedges in the IOMMU cannot be
+   booted far enough to say why; the reserved-region path is where real
+   firmware and QEMU differ most, and M1-17's first hardware boot is where
+   that will be found out. Everything except a domain-hosted driver, reported
+   at boot.
    `iommu::name` refuses to hand out a `DmaWindow` for a device with no window,
    so a domain gets a device's registers and no way to make it read; `irq::name`
    refuses a handler for the same reason, because a domain driving a device

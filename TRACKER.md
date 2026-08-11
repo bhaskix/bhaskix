@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-07 |
 | **Phase** | Phase 1 — Foundation |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. **Process management is next** — nothing creates a domain except boot code — then networking |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 495 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU · 332 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 553 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 332 host assertions |
 
 ### Division of responsibility between documents
 
@@ -705,6 +705,42 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-11, and one for the machine that does not exist yet (`iommu=off`)
+
+**M1-17 is still blocked on a machine**, and this is the part of it that could be done without one.
+
+Translation comes up **before any service**, so a machine that wedges in the IOMMU cannot be booted
+far enough to say why. On QEMU that is an inconvenience. On the first physical machine this kernel
+ever runs on it is the difference between a debugging session and a brick — and the reserved-region
+path is the one place where real firmware and QEMU differ most: **QEMU declares no `RMRR`s at all**,
+so both mapping them and refusing the ones that overlap the kernel have never executed against real
+firmware. They have host tests and nothing else.
+
+`iommu=off` builds nothing and enables nothing, **after discovery and reporting**. That ordering is
+the whole design: a hatch that also silenced the `DMAR` would take away the one thing whoever is
+holding a stuck machine needs, which is what the firmware actually declared. The line says what it
+costs, in yellow, naming `security.md`'s T3 and T4.
+
+Nothing else has to know. The resulting machine is the same state as one with no unit — `present()`
+is false, the block driver takes the untranslated path, and a domain-hosted driver is refused for
+the reason it always was. **That configuration is not novel: it is what `make test-boot` boots every
+run.**
+
+**Tested, on a machine that has a unit to refuse**, because turning off an IOMMU that is not there
+proves nothing. `make test-boot-iommu-off` builds an image with the flag and puts the default back.
+Three assertions, and the third is the one with teeth: **no window may be built and no interrupt
+remapped.** Negative-tested by deleting the early return — the machine then prints "OFF" and
+programs the unit anyway, and the gate fails on "printed its line and then programmed the unit
+anyway". That is the escape hatch worse than none, the one whose log says you are safe.
+
+**An escape hatch nobody exercises is not an escape hatch.** It is a line of code that will be
+reached for the first time on the machine that is already going wrong, which is why this is in
+`make test` and not left for a human to remember.
+
+Also fixed on the way past: `boot-test.sh` had two `trap ... EXIT` handlers after this change, and
+the second would have silently replaced the first — leaking the temporary log on every mode that
+also restores an image. One handler now does both jobs.
 
 ### 2026-08-11, last (interrupt remapping is on by default)
 

@@ -6919,6 +6919,44 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     let found = unsafe { iommu::discover(handoff.rsdp, hhdm) };
     iommu::report(found);
 
+    // The way out, for a machine where the IOMMU is what is wrong.
+    //
+    // **After discovery and reporting, deliberately.** An escape hatch that
+    // also silenced the `DMAR` would take away the one thing whoever is
+    // holding the machine needs: what the firmware actually declared. This
+    // builds nothing and enables nothing, and still prints the units, the
+    // address width and the reserved regions.
+    //
+    // Nothing else has to know. Returning `None` here is the same state as a
+    // machine with no unit at all -- `present()` is false, the block driver
+    // takes the untranslated path every machine took before RFC 0012, and
+    // `irq::name` and `iommu::name` refuse a domain-hosted driver for the
+    // reason they always did. That configuration is not novel and not
+    // untested: it is what `make test-boot` boots on every run.
+    //
+    // Why it exists at all: translation comes up before any service, so a
+    // machine that wedges there cannot be booted far enough to say why. On
+    // QEMU that is an inconvenience. On the first piece of real hardware this
+    // kernel ever runs on -- M1-17, still owed -- it is the difference between
+    // a debugging session and a brick, and real firmware declares reserved
+    // regions that QEMU never has.
+    if handoff
+        .cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == "iommu=off")
+    {
+        println!(
+            "\x1b[93m    iommu          OFF by iommu=off: nothing is translating, every device \
+             reaches all of memory (security.md T3 and T4 unmitigated)\x1b[0m"
+        );
+        // Load-bearing, and measured: with this `return` removed the machine
+        // prints the line above and programs the unit anyway, and
+        // `boot-test.sh iommu-off` fails on "printed its line and then
+        // programmed the unit anyway" -- which is the shape of escape hatch
+        // that is worse than none, because the log says you are safe.
+        return None;
+    }
+
     let found = found.filter(|report| report.units > 0)?;
     let device = virtio::probe()?;
     let (bus, slot, function) = device;

@@ -22,11 +22,18 @@ ISO="$REPO_ROOT/build/bhaskix.iso"
 LOG="${BHASKIX_BOOT_LOG:-$(mktemp)}"
 TIMEOUT="${BOOT_TEST_TIMEOUT:-120}"
 
-# Kept when the caller named it: they asked for the log, so deleting it on the
-# way out would be answering a different question.
-if [[ -z ${BHASKIX_BOOT_LOG:-} ]]; then
-    trap 'rm -f "$LOG"' EXIT
-fi
+# One trap, doing both jobs. Two `trap ... EXIT` lines would not run in
+# sequence: the second replaces the first, silently, and the temporary log
+# would leak for every mode that also has an image to restore.
+#
+# The log is kept when the caller named it: they asked for it, so deleting it
+# on the way out would be answering a different question.
+restore_image() { :; }
+cleanup() {
+    restore_image
+    [[ -n ${BHASKIX_BOOT_LOG:-} ]] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
 # The greeting is the milestone's contract. If you reword it, update
 # docs/roadmap.md M1 and kernel/src/lib.rs::banner in the same change.
@@ -86,10 +93,27 @@ DISK="$REPO_ROOT/build/initrd.tar"
 # domain driver gets a device rather than a share of the kernel's.
 DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
 
+# RFC 0012's escape hatch, and it is tested on a machine that **has** an IOMMU
+# -- turning off a unit that is not there proves nothing. The image is built
+# with the flag and the default is put back afterwards, the same way
+# `shell-test.sh` handles `shell=kernel`.
+#
+# An escape hatch nobody exercises is not an escape hatch: it is a line of code
+# that will be reached for the first time on the machine that is already going
+# wrong. This one exists for M1-17's first boot on real hardware, which is
+# exactly the situation where finding out it never worked would be worst.
+if [[ "$MODE" == "iommu-off" ]]; then
+    make -C "$REPO_ROOT" iso CMDLINE="iommu=off" >/dev/null 2>&1 || {
+        fail "could not build an image with iommu=off"
+        exit 1
+    }
+    restore_image() { make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true; }
+fi
+
 MACHINE="q35"
 IOMMU_ARGS=()
 VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0 -device virtio-blk-pci,drive=disk1)
-if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
+if [[ "$MODE" == "iommu" || "$MODE" == "fsd" || "$MODE" == "iommu-off" ]]; then
     # RFC 0012's testing plan turns on what the RFC is about. `intremap=on`
     # needs a split irqchip, and both are QEMU's requirements rather than this
     # kernel's -- nothing here programs the unit yet, so what is under test is
@@ -448,6 +472,42 @@ if grep -qE "NO IOMMU: this device can reach all of physical memory|translating:
 else
     fail "a DMA-capable device was brought up without saying what can reach memory"
     status=1
+fi
+
+# The escape hatch, on a machine that has a unit to refuse. Three assertions,
+# and the first is the one with teeth.
+#
+# **The DMAR must still be reported.** An escape hatch that also silences
+# discovery takes away the one thing whoever is holding a misbehaving machine
+# needs -- what the firmware actually declared. Turning the IOMMU off is not a
+# reason to stop saying there is one.
+#
+# Then that the machine says plainly it is unprotected, and then that it
+# reached the end of the boot: `iommu=off` is for a machine that cannot get
+# past translation, so a hatch that boots no further than the thing it bypasses
+# is worthless.
+if [[ "$MODE" == "iommu-off" ]]; then
+    if grep -qE "iommu +[1-9][0-9]* unit(s)? found, not enabled; [0-9]+-bit addresses" "$LOG"; then
+        pass "iommu=off still reports what the firmware declared"
+    else
+        fail "iommu=off silenced discovery -- the one thing a stuck machine needs"
+        status=1
+    fi
+    if grep -qE "iommu +OFF by iommu=off:.*every device reaches all of memory" "$LOG"; then
+        pass "the machine says it is unprotected, and what that costs"
+    else
+        fail "nothing said the IOMMU was off, or did not say what it means"
+        status=1
+    fi
+    # Nothing may be translating. This catches a hatch that printed its line
+    # and enabled the unit anyway -- which is the failure that would look fine
+    # in the log and leave the machine exactly as stuck as before.
+    if grep -qE "iommu (window|irq) +" "$LOG"; then
+        fail "iommu=off printed its line and then programmed the unit anyway"
+        status=1
+    else
+        pass "no window was built and no interrupt was remapped"
+    fi
 fi
 
 # RFC 0012 step 1, and only on the machine that has one: the units the firmware
