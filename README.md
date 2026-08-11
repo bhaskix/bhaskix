@@ -25,15 +25,16 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > and tickless idle. Ring 3, `SYSCALL`/`SYSRET`, and capabilities with transitive revocation.
 > Synchronous IPC with badges, shared memory, notifications, and interrupts delivered to a domain.
 > An IOMMU giving a device its own translations. A journalled, writable filesystem with a page
-> cache. And a **user-mode shell** that reaches all of it through capabilities it holds and nothing
-> else — the block driver, the console, and the filesystem each run as services in their own
-> domains, outside the kernel.
+> cache. Process management that is capability-shaped rather than POSIX-shaped: no `fork`, no pid,
+> no signals — a **supervisor in ring 3** creates a domain, grants it authority one piece at a time,
+> starts a program in it, and reaps it. And a **user-mode shell** that reaches all of it through
+> capabilities it holds and nothing else — the block driver, the console, and the filesystem each
+> run as services in their own domains, outside the kernel.
 >
-> **What is not here.** No networking. No process management: nothing creates a domain except boot
-> code. No package management, no libc, no self-hosting. The ELF loader has not had its 24 hours of
-> fuzzing. **Nothing has ever booted on physical hardware** — every claim above is QEMU, and M1-17
-> is blocked on a machine, not on code. Nothing here should run anywhere that matters — see
-> [SECURITY.md](SECURITY.md).
+> **What is not here.** No networking. No package management, no libc, no self-hosting. The ELF
+> loader has not had its 24 hours of fuzzing. **Nothing has ever booted on physical hardware** —
+> every claim above is QEMU, and M1-17 is blocked on a machine, not on code. Nothing here should run
+> anywhere that matters — see [SECURITY.md](SECURITY.md).
 >
 > **The design documents still have one author and no independent reviewers.** Phase 0's exit
 > criterion asks for two people who did not write them, and that is genuinely unmet rather than
@@ -118,7 +119,7 @@ Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 
 `make test` runs, cheapest first, so a trivial mistake fails in seconds rather
 than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host
-targets; **327 host assertions**; the project-invariant gates (bootloader
+targets; **346 host assertions**; the project-invariant gates (bootloader
 containment, `unsafe` budgets with mandatory `// SAFETY:` justifications,
 dependency direction, service placements, no vendor strings, SPDX headers);
 BIOS, UEFI and IOMMU boot tests asserting on captured serial output across four
@@ -126,7 +127,7 @@ service placements; four modes of an **interactive shell test that types at the
 machine** and reads what comes back; and a fault-injection run that triggers six
 CPU exceptions and checks each is reported rather than triple-faulting.
 
-That is **492 checks**. A gate that has never been watched failing is not
+That is **553 checks**. A gate that has never been watched failing is not
 counted as a gate here — see [TRACKER.md](TRACKER.md), which records the ones
 that turned out to prove nothing and what was done about them.
 

@@ -408,7 +408,7 @@ flowchart TB
         NOT["notify: signal this notification when the domain ends"]
     end
 
-    MISSING["not yet: address space per domain,<br/>telemetry channel, threads owned rather than counted"]
+    MISSING["not yet: telemetry channel,<br/>I/O weight enforcement"]
 
     DOM -.- MISSING
     classDef gap stroke-dasharray: 5 4
@@ -416,9 +416,13 @@ flowchart TB
 ```
 
 The dashed boxes are the honest part. `io_weight` is recorded and enforced by nothing, because there
-is no I/O scheduler to enforce it against; threads are *counted* rather than owned, so destroying a
-domain does not yet stop them. Both are stated here and in `TRACKER.md` rather than left for a
-reader to discover by trying.
+is no I/O scheduler to enforce it against. That is stated here and in `TRACKER.md` rather than left
+for a reader to discover by trying.
+
+Two gaps this paragraph used to name are closed, and are noted rather than quietly dropped: a domain
+has **an address space of its own** — the boot reports `address spaces N in use at once, each
+program in its own` — and **destroying a domain takes its threads with it**, which RFC 0017 step 2
+built after the RFC's claim that it already happened turned out to be false (M9-19).
 
 The only difference between a container and a virtual machine:
 
@@ -485,8 +489,8 @@ that nothing built in Phase 1 or 2 has to be undone to accommodate it.
 > `scheduler.md` §3's two-level runqueue: right in aggregate, and unable to prioritise within a
 > domain.
 >
-> **Not yet:** no address space (the field above), no telemetry channel, no I/O weight enforcement,
-> and threads are counted rather than owned — destroying a domain does not stop them.
+> **Not yet:** no telemetry channel, and no I/O weight enforcement. A domain has its own address
+> space, and destroying one stops its threads — both were listed here until 2026-08-11.
 
 ---
 
