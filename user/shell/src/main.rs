@@ -149,9 +149,42 @@ fn syscall(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> Reply {
     }
 }
 
+/// How many times a congested call is retried before it is reported.
+///
+/// Bounded, unlike the retry in `service-domain`'s `serve`. A server with a
+/// congested endpoint has nothing else it could be doing, so spinning there is
+/// free; a shell that retried for ever would stop answering the person typing
+/// at it, and "the machine is wedged" is worse than "the service is busy".
+///
+/// Generous, because the failure this replaces was giving up on the **first**
+/// refusal. Congestion clears when the threads ahead are served, which takes
+/// as long as their work takes -- so a bound this size is the difference
+/// between waiting for a queue and waiting for a deadlock.
+const CONGESTION_RETRIES: u32 = 128;
+
 /// Sends a message to `capability` and waits for the answer.
+///
+/// **Retries congestion**, which is the whole of this function beyond the
+/// syscall. `Congested` means the endpoint's send queue was full at that
+/// instant: the message was never queued, so the service never saw it. That is
+/// what makes retrying safe rather than merely hopeful -- a call that returns
+/// `Congested` cannot have half-happened, so sending it again cannot repeat an
+/// operation. Every other status is an answer, and answers are not retried.
+///
+/// The yield matters as much as the loop. The queue drains when the threads
+/// ahead of this one are served, and a tight retry would spend the CPU they
+/// need to drain it -- which is the same reasoning `service-domain::serve`
+/// gives for the same status on the receiving side.
 fn call(capability: u64, method: u64, args: [u64; 4]) -> Reply {
-    syscall(bhaskix_abi::syscall::CALL, capability, method, args)
+    let mut attempts = 0;
+    loop {
+        let reply = syscall(bhaskix_abi::syscall::CALL, capability, method, args);
+        if reply.status != status::CONGESTED || attempts >= CONGESTION_RETRIES {
+            return reply;
+        }
+        attempts += 1;
+        syscall(bhaskix_abi::syscall::YIELD, 0, 0, [0; 4]);
+    }
 }
 
 /// Ends this program. Never returns.
@@ -172,6 +205,12 @@ fn write(bytes: &[u8]) {
         if !reply.delivered() {
             // Nowhere to report this: the thing that failed is the way to
             // report things. Giving up on the write is all there is.
+            //
+            // This used to drop output for *congestion* too, which is a
+            // console that goes quiet because it is busy -- the one cause that
+            // clears on its own. `call` now retries that before returning, so
+            // what reaches here is an undeliverable console rather than a
+            // loaded one, and giving up is the right answer to it.
             return;
         }
         if tail.is_empty() {
@@ -274,6 +313,14 @@ fn report_refusal(what: &[u8], reply: &Reply) {
         status::REVOKED => write(b": no authority -- the capability was revoked\n"),
         status::NO_SUCH_CAPABILITY => write(b": no authority -- nothing in that slot\n"),
         status::NO_SUCH_METHOD => write(b": the service does not answer that\n"),
+        // Reached only after `call` has already retried this many times. The
+        // count is the message: "refused, status 8" said nothing about whether
+        // waiting would have helped, and waiting is exactly what was tried.
+        status::CONGESTED => {
+            write(b": the service is still busy after ");
+            write_number(u64::from(CONGESTION_RETRIES));
+            write(b" retries\n");
+        }
         _ => {
             write(b": refused, status ");
             write_number(reply.status);
