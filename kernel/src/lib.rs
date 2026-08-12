@@ -3189,6 +3189,13 @@ const BLKD_STACK_PAGES: u64 = 4;
 /// Where the block driver's program is.
 const BLKD_PROGRAM: &[u8] = b"bin/blkd";
 
+/// Where the network driver's domain keeps its stack.
+const NETD_STACK: u64 = 0x0000_0000_1200_0000;
+const NETD_STACK_PAGES: u64 = 4;
+
+/// Where the network driver's program is.
+const NETD_PROGRAM: &[u8] = b"bin/netd";
+
 /// Enters ring 3, refusing to do it from a thread that may migrate.
 ///
 /// **A ring 3 thread in this kernel must be pinned**, and until now that was a
@@ -3584,6 +3591,222 @@ pub fn start_block_domain(
     BLOCK_RINGS.store(rings.as_u64(), core::sync::atomic::Ordering::Release);
     Ok(())
 }
+
+/// Hands a virtio network device to a domain in ring 3.
+///
+/// RFC 0018 step 2. The same delegation `start_block_domain` performs, for a
+/// device that differs in one way that matters: **a disk answers, a network
+/// device initiates.** Everything below is the block path's shape; the receive
+/// direction is what is new, and it is the driver's problem rather than this
+/// function's.
+///
+/// Not a boot dependency. A machine with no network device boots, says so, and
+/// carries on, exactly as it does with one disk.
+///
+/// # Errors
+///
+/// Every failure here leaves the machine bootable and is reported as a string,
+/// because a network device is a convenience and a kernel that refuses to boot
+/// without one is worse than a kernel with no network.
+pub fn start_net_domain(
+    cpu: u32,
+    hhdm_base: u64,
+    apic_id: u32,
+    rsdp: Option<bhaskix_boot::PhysAddr>,
+) -> Result<(), &'static str> {
+    let Some((address, _)) = virtio::find_nth_of(virtio::Class::NET, 0) else {
+        println!("    net domain     no device on the bus; nothing delegated");
+        return Ok(());
+    };
+    let layout = virtio::layout(address).ok_or("the network device is not a modern virtio")?;
+
+    // Memory space only. Bus mastering stays off until the driver has reset the
+    // device and built its rings, for the reason the block path gives: a device
+    // that could write to memory before its owner was ready would do so with
+    // whatever the firmware left in its registers.
+    // SAFETY: this device belongs to nobody -- the kernel has no network driver
+    // of its own, which is the whole point of RFC 0018.
+    unsafe { bhaskix_arch::pci::enable_memory(address) };
+
+    let realm = domain::create("net", domain::ResourceEnvelope::new())
+        .map_err(|_| "the net domain would not be created")?;
+
+    let windows = [layout.common, layout.notify, layout.device];
+    for (slot, (base, length)) in windows.iter().enumerate() {
+        if *length > bhaskix_mm::FRAME_SIZE {
+            return Err("a virtio structure spans more than one page");
+        }
+        let window = cap::with_arena(|arena| {
+            arena
+                .insert_root(
+                    cap::ObjectRef::new(
+                        cap::ObjectKind::Frame,
+                        base & !(bhaskix_mm::FRAME_SIZE - 1),
+                    ),
+                    cap::Rights::READ
+                        .union(cap::Rights::WRITE)
+                        .union(cap::Rights::DERIVE),
+                    0,
+                )
+                .ok()
+        })
+        .ok_or("a device window capability would not be created")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(slot, window).is_ok()) != Some(true)
+        {
+            return Err("a device window capability would not install");
+        }
+    }
+
+    // Rings: eight pages, and the arithmetic rather than a feel for it.
+    //
+    // Two queues, not the block driver's one, and each needs a descriptor
+    // table, an available ring and a used ring. Then the buffers: a receive
+    // queue must have somewhere to put a frame *before* the device has one to
+    // deliver, so every receive descriptor owns a buffer big enough for a full
+    // Ethernet frame plus the virtio header in front of it.
+    //
+    //   2 queues x (descriptors + available + used)        ~2 pages
+    //   4 receive buffers x 2 KiB                            2 pages
+    //   1 transmit buffer                                   <1 page
+    //   slack, so the layout can move without re-sizing      3 pages
+    //
+    // Owned by a keeper domain rather than by the driver, for the reason
+    // `blk-keeper` exists: a domain ends when its last thread exits and takes
+    // the memory it owns with it, so rings owned by the driver would be freed
+    // the moment it stopped and anything reading them afterwards would be
+    // reading returned frames.
+    let keeper = domain::create("net-keeper", domain::ResourceEnvelope::new())
+        .map_err(|_| "the net rings' owner would not be created")?;
+    let rings = shared::create(keeper, 8 * bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the net domain's rings would not be created")?;
+    let named = shared::name(rings).map_err(|_| "the rings would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
+        return Err("the rings capability would not install");
+    }
+
+    let delegated = (address.bus, address.device, address.function);
+    let contained = if iommu::present_for(delegated) {
+        let window = iommu::name(delegated).map_err(|_| "the dma window would not be named")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(4, window).is_ok()) != Some(true) {
+            return Err("the dma window capability would not install");
+        }
+        true
+    } else {
+        false
+    };
+
+    println!(
+        "    net domain     {:02x}:{:02x}.{} delegated: common {:#x}, notify {:#x} x{}, device {:#x}",
+        address.bus,
+        address.device,
+        address.function,
+        layout.common.0,
+        layout.notify.0,
+        layout.notify_multiplier,
+        layout.device.0
+    );
+    NET_CONTAINED.store(contained, core::sync::atomic::Ordering::Release);
+    if contained {
+        println!("    net domain     dma window granted; the device translates through its own");
+    } else {
+        println!(
+            "    net domain     no dma window: nothing would contain the device, so the \
+             driver gets registers and no way to make it send or receive"
+        );
+    }
+
+    // The device's interrupt. Same split as the block driver's: the domain gets
+    // the authority to *wait* for a vector and to acknowledge it, and never the
+    // authority to program one -- an MSI is a memory write of an arbitrary
+    // vector to an arbitrary CPU.
+    const NET_BADGE: u64 = 1 << 2;
+    let signalled = match crate::notify::create() {
+        Ok(notification) => {
+            // SAFETY: `trap` dispatches claimed vectors to `irq::on_interrupt`,
+            // which acknowledges the local APIC. This device is the net
+            // domain's and nothing else claims its entries.
+            let claimed = unsafe {
+                irq::claim_for(
+                    irq::Source::MessageSignalled {
+                        device: address,
+                        entry: 0,
+                    },
+                    realm.as_u32(),
+                    "netd",
+                    apic_id,
+                    rsdp,
+                    hhdm_base,
+                )
+            };
+            match claimed {
+                Ok(handler) if irq::bind(handler, notification, NET_BADGE).is_ok() => {
+                    let named = (irq::name(handler), crate::notify::name(notification));
+                    if let (Ok(handler_cap), Ok(notify_cap)) = named
+                        && domain::with(realm, |owner| {
+                            owner.cspace.install_at(5, handler_cap).is_ok()
+                                && owner.cspace.install_at(6, notify_cap).is_ok()
+                        }) == Some(true)
+                    {
+                        true
+                    } else {
+                        irq::release(handler);
+                        crate::notify::destroy(notification);
+                        false
+                    }
+                }
+                Ok(handler) => {
+                    irq::release(handler);
+                    crate::notify::destroy(notification);
+                    false
+                }
+                Err(_) => {
+                    crate::notify::destroy(notification);
+                    false
+                }
+            }
+        }
+        Err(_) => false,
+    };
+
+    // Bus mastering last, and safe to grant before the driver has reset the
+    // device only because the device translates -- the same argument the block
+    // path makes, and the same one that fails without a unit.
+    // SAFETY: this device is the net domain's; nothing else drives it.
+    unsafe { bhaskix_arch::pci::enable(address) };
+
+    if signalled {
+        println!(
+            "    net domain     interrupt delegated: the kernel programmed the vector, \
+             the driver waits for it"
+        );
+    } else {
+        println!("    net domain     no interrupt delegated; the driver polls its used rings");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(cpu, "netd", net_domain_entry, hhdm_base, hhdm_base, options)
+        .map_err(|_| "the net domain would not spawn")?;
+
+    NET_RINGS.store(rings.as_u64(), core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// The rings the net domain was given, so its report can be read back.
+static NET_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether a unit contains the network device, so its driver could be given a
+/// DMA window.
+///
+/// Recorded because the answer decides what the driver's report *means*. With
+/// no window there is no device address for the rings, so the driver cannot
+/// transmit and cannot receive — and reporting that as a failure would make
+/// every BIOS boot red for a refusal working exactly as designed. The block
+/// path learned this the other way round, when a message about a missing window
+/// was printed from the interrupt's failure and made a gate excuse the wrong
+/// thing.
+static NET_CONTAINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The endpoint the block service answers on, once it exists.
 static BLOCK_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -4211,6 +4434,130 @@ fn block_domain_reported(hhdm: u64) -> bool {
     marker == 0x424c_4b44_5250_5431
 }
 
+/// The marker `bin/netd` writes before its report.
+const NETD_MARKER: u64 = 0x3154_5052_4454_454e;
+
+/// Where in the rings the network driver leaves its report.
+///
+/// The last of the eight pages. Every earlier one is a ring or a buffer the
+/// *device* reads and writes, and a report living in any of them would be a
+/// report the device could overwrite -- which is the same reason the block
+/// driver's report sits in its last page.
+const NETD_REPORT_PAGE: usize = 7;
+
+/// Whether `bin/netd` has written its report yet.
+fn net_domain_reported(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_RINGS.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return true;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return true;
+    };
+    if count <= NETD_REPORT_PAGE {
+        return true;
+    }
+    // SAFETY: a frame this object owns, through the direct map.
+    let marker =
+        unsafe { core::ptr::read_volatile((hhdm + frames[NETD_REPORT_PAGE]) as *const u64) };
+    marker == NETD_MARKER
+}
+
+/// Reads what the network driver wrote, and says so.
+///
+/// Two separate findings, reported on two separate lines **on purpose**. A
+/// driver that transmits into a void and never checks would pass a single gate
+/// covering both; it cannot pass two.
+fn report_net_domain(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_RINGS.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        // No device on the bus, which is not a failure.
+        return true;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        println!("\x1b[91m    net domain     FAILED: the rings are gone\x1b[0m");
+        return false;
+    };
+    if count <= NETD_REPORT_PAGE {
+        println!("\x1b[91m    net domain     FAILED: the rings are too small for a report\x1b[0m");
+        return false;
+    }
+
+    let mut words = [0u64; 9];
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // nine little-endian words the driver wrote there.
+    let raw =
+        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 72) };
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    if words[0] != NETD_MARKER {
+        println!("\x1b[91m    net domain     FAILED: the driver left no report\x1b[0m");
+        return false;
+    }
+
+    let mac = words[1];
+    let octets = |value: u64| {
+        [
+            (value >> 40) as u8,
+            (value >> 32) as u8,
+            (value >> 24) as u8,
+            (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ]
+    };
+    // With no unit to contain the device there is no device address for the
+    // rings, so the driver was never able to drive it. That is the refusal
+    // working rather than a fault, and it is the state every BIOS boot is in.
+    if !NET_CONTAINED.load(Ordering::Acquire) {
+        println!(
+            "    net domain     driver reached the handshake and stopped; without a window \
+             there is no address to give the device"
+        );
+        return true;
+    }
+
+    let [a, b, c, d, e, f] = octets(mac);
+    println!(
+        "    net domain     up: mac {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}, \
+         rx queue {}, tx queue {}",
+        words[6], words[7]
+    );
+
+    let transmitted = words[2];
+    if transmitted == 0 {
+        println!("\x1b[91m    net domain     FAILED: nothing was transmitted\x1b[0m");
+        return false;
+    }
+    println!("    net frame      transmitted {transmitted} bytes onto the wire");
+
+    // The receive half, gated separately. A length of zero means nothing came
+    // back, which on a network that answers is a failure and not an absence.
+    let length = words[3];
+    if length == 0 {
+        println!(
+            "\x1b[91m    net domain     FAILED: nothing was received (the receive ring has \
+             seen {} completions)\x1b[0m",
+            words[8]
+        );
+        return false;
+    }
+    let [p, q, r, s, t, u] = octets(words[4]);
+    println!(
+        "    net frame      received {length} bytes from {p:02x}:{q:02x}:{r:02x}:{s:02x}:{t:02x}:{u:02x}, \
+         virtio header {} bytes",
+        words[5]
+    );
+    true
+}
+
 /// Reads what the driver in a domain wrote, and says so.
 ///
 /// Through the memory the kernel granted it, because the driver holds no
@@ -4394,6 +4741,47 @@ extern "C" fn block_domain_entry(hhdm_base: u64) -> ! {
     // SAFETY: `entry` is inside a user-executable segment of the space
     // just installed, and `rsp` is one past user-writable memory in it.
     unsafe { enter_user("block domain", entry, rsp, [0, 0]) }
+}
+
+/// Loads and enters `bin/netd`.
+extern "C" fn net_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    net domain     FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(NETD_PROGRAM) else {
+        stop("bin/netd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/netd is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(NETD_STACK), NETD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/netd would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = NETD_STACK + NETD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("net domain", entry, rsp, [0, 0]) }
 }
 
 /// Loads and enters `bin/fsd`.
@@ -5314,6 +5702,30 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
         if !start_fs_domain(hhdm) {
             println!("\x1b[91m    fs domain      FAILED\x1b[0m");
+        }
+    }
+
+    // RFC 0018 step 2: the network device, driven from ring 3. Not gated on the
+    // block path above -- a machine with no disk to delegate should still get a
+    // network, and coupling them would make one failure look like two.
+    if let Err(reason) = start_net_domain(cpu, hhdm, handoff.bsp_lapic_id, handoff.rsdp) {
+        println!("\x1b[91m    net domain     FAILED: {reason}\x1b[0m");
+    } else {
+        // Waited for the report rather than for a duration, for the reason the
+        // block path records: a fixed wait is a guess that is too short on a
+        // loaded machine and too long on every other boot.
+        // Longer than the block domain's three seconds, and for a reason: this
+        // driver waits on a *remote* party. Its transmit completes at once and
+        // its receive does not, so the window has to cover a reply that a
+        // network chooses the timing of rather than a disk that answers.
+        for _ in 0..160 {
+            if net_domain_reported(hhdm) {
+                break;
+            }
+            wait_millis(50);
+        }
+        if !report_net_domain(hhdm) {
+            println!("\x1b[91m    net domain     FAILED\x1b[0m");
         }
     }
 
@@ -7455,7 +7867,11 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         Some(unsafe { iommu::enable_interrupt_remapping(hhdm) })
     };
 
-    iommu::install(device, found, window);
+    if !iommu::install(device, found, window) {
+        println!(
+            "\x1b[91m    iommu window   FAILED: the first device's window would not install\x1b[0m"
+        );
+    }
     println!(
         "    iommu window   {bus:02x}:{slot:02x}.{function} {}-bit, {} levels, \
          {reserved} reserved pages mapped, {refused} refused",
@@ -7474,8 +7890,9 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         let delegated = (second.bus, second.device, second.function);
         match iommu::attach_device(&window, delegated, 1, hhdm) {
             Some(second_window) => {
-                if iommu::verify_window(&second_window, 2, hhdm) {
-                    iommu::install(delegated, found, second_window);
+                if iommu::verify_window(&second_window, 2, hhdm)
+                    && iommu::install(delegated, found, second_window)
+                {
                     // The unit is already translating, and it caches context
                     // entries: without this it goes on believing this device
                     // has none, and every request it makes is dropped with the
@@ -7509,6 +7926,49 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
             ),
         }
     }
+
+    // The network device, on the same terms and for the same reason. Its own
+    // page table and its own domain id — the third — because a device that
+    // *initiates* is the last one that should share a translation with
+    // anything: an unsolicited frame arrives at a moment nobody chose, and a
+    // shared page table would let it land wherever the sharer had mapped.
+    if let Some((net, _)) = virtio::find_nth_of(virtio::Class::NET, 0) {
+        let delegated = (net.bus, net.device, net.function);
+        match iommu::attach_device(&window, delegated, 2, hhdm) {
+            Some(net_window) => {
+                if iommu::verify_window(&net_window, 3, hhdm)
+                    && iommu::install(delegated, found, net_window)
+                {
+                    // SAFETY: the unit these windows are programmed into. The
+                    // unit caches context entries, so without this it goes on
+                    // believing this device has none and drops every request it
+                    // makes with the entry sitting correct in memory.
+                    let invalidated = unsafe { iommu::invalidate_contexts() };
+                    if !invalidated {
+                        println!(
+                            "\x1b[91m    iommu window   FAILED: the context cache did not invalidate\x1b[0m"
+                        );
+                    }
+                    println!(
+                        "    iommu window   {:02x}:{:02x}.{} translating too, the network \
+                         device's own page table and domain, {} in use",
+                        delegated.0,
+                        delegated.1,
+                        delegated.2,
+                        iommu::windows()
+                    );
+                } else {
+                    println!(
+                        "\x1b[91m    iommu window   FAILED: the network device's tables did not read back\x1b[0m"
+                    );
+                }
+            }
+            None => println!(
+                "\x1b[91m    iommu window   FAILED: no page table for the network device\x1b[0m"
+            ),
+        }
+    }
+
     match &remapped {
         Some(Ok(())) => println!(
             "    iommu irq      remapping interrupts; compatibility format blocked, \
@@ -7928,17 +8388,18 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Seven programs in /bin: the ring 3 probe, the user-mode shell,
+            // Eight programs in /bin: the ring 3 probe, the user-mode shell,
             // both services as programs, the block driver (RFC 0013 steps 3, 4
-            // and 6), the filesystem (RFC 0016 step 3), and the supervisor
-            // (RFC 0017 question 2). Exact rather than "at least", so adding an
-            // eighth without noticing this line is a failure rather than a
-            // silently weaker test -- which it has now been, six times, once
-            // per program added. It is the cheapest assertion in the
-            // repository, and it caught the seventh the same day it was
-            // written.
+            // and 6), the filesystem (RFC 0016 step 3), the supervisor
+            // (RFC 0017 question 2), and the network driver (RFC 0018 step 2).
+            // Exact rather than "at least", so adding a ninth without noticing
+            // this line is a failure rather than a silently weaker test --
+            // which it has now been, seven times, once per program added. It
+            // is the cheapest assertion in the repository, and it caught the
+            // seventh the same day it was written and the eighth the moment
+            // `bin/netd` appeared.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 7,
+            entries >= 3 && bin == 8,
         ),
         (
             "the user program is an ELF the loader accepts",

@@ -132,9 +132,28 @@ if [[ "$MODE" == "iommu-off" ]]; then
     restore_image() { make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true; }
 fi
 
+# RFC 0018 step 2: a network device, and something on the other end of it.
+#
+# QEMU's built-in user-mode network needs no privileges, no `tap`, and no host
+# configuration, so every contributor gets the same network and CI needs no
+# capabilities it does not already have. Its gateway answers ARP, which is what
+# lets a driver that contains no protocol code prove it can *receive*: the
+# driver sends a fixed forty-two byte broadcast and something replies.
+#
+# `restrict=on` because none of this needs to reach the outside world. A test
+# that could talk to the internet would pass or fail depending on the machine it
+# ran on, and a gate whose answer depends on the network is not a gate.
+NET_ARGS=(-netdev user,id=net0,restrict=on -device virtio-net-pci,netdev=net0)
+# Subject to translation, for the same reason the disks are: a virtio device
+# without `iommu_platform` bypasses the unit entirely on QEMU, and every
+# assertion would then pass on a machine where the IOMMU protects nothing.
+NET_ARGS_IOMMU=(-netdev user,id=net0,restrict=on
+                -device virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on)
+
 MACHINE="q35"
 IOMMU_ARGS=()
-VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0 -device virtio-blk-pci,drive=disk1)
+VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0 -device virtio-blk-pci,drive=disk1
+             "${NET_ARGS[@]}")
 if [[ "$MODE" == "iommu" || "$MODE" == "fsd" || "$MODE" == "iommu-off" ]]; then
     # RFC 0012's testing plan turns on what the RFC is about. `intremap=on`
     # needs a split irqchip, and both are QEMU's requirements rather than this
@@ -148,7 +167,8 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" || "$MODE" == "iommu-off" ]]; then
     # assertion below would pass on a machine where the IOMMU protects
     # nothing -- which is exactly what the first version of this did.
     VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on
-                 -device virtio-blk-pci,drive=disk1,disable-legacy=on,iommu_platform=on)
+                 -device virtio-blk-pci,drive=disk1,disable-legacy=on,iommu_platform=on
+                 "${NET_ARGS_IOMMU[@]}")
 fi
 
 QEMU_ARGS=(-M "$MACHINE" -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
@@ -473,7 +493,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 7 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 8 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -913,6 +933,47 @@ elif grep -qE "block domain +no dma window" "$LOG"; then
 else
     fail "the block service did not answer for a sector"
     grep -E "block service" "$LOG" || true
+    status=1
+fi
+
+# RFC 0018 step 2: a network device driven from ring 3.
+#
+# **Two gates, not one, and that is the point.** A driver that transmits into a
+# void and never looks would pass a single assertion covering both directions,
+# because transmitting is the half that succeeds whether or not anything is
+# listening. Receive is the half that can only pass if a real device really
+# wrote into a buffer this driver posted before it asked for anything.
+#
+# The excuse branch mirrors the block path's: with no unit to contain the
+# device there is no address to give it, so the driver reaches the handshake and
+# stops. That is the refusal working, and it is the state every BIOS boot is in.
+if grep -qE "net frame +transmitted [0-9]+ bytes onto the wire" "$LOG"; then
+    pass "a driver in ring 3 put a frame on the wire"
+elif grep -qE "net domain +no device on the bus" "$LOG"; then
+    pass "no network device on this machine, so nothing to drive"
+elif grep -qE "net domain +driver reached the handshake and stopped" "$LOG"; then
+    pass "no dma window for the network device, so it cannot be driven"
+else
+    fail "nothing was transmitted"
+    grep -E "net domain|net frame" "$LOG" || true
+    status=1
+fi
+
+# The receive half. Asserted on a *source* that is not this station and not
+# broadcast, so a driver that handed back its own transmitted frame -- or an
+# empty buffer -- cannot pass. The virtio header length is matched exactly
+# because it is a fact this project established by measurement rather than from
+# a specification it does not have a copy of; a device model that changed it
+# should fail here rather than silently shift every frame by two bytes.
+if grep -qE "net frame +received [1-9][0-9]* bytes from 52:55:[0-9a-f:]+, virtio header 12 bytes" "$LOG"; then
+    pass "a frame came back from the network and the driver read it"
+elif grep -qE "net domain +no device on the bus" "$LOG"; then
+    pass "no network device on this machine, so nothing to receive"
+elif grep -qE "net domain +driver reached the handshake and stopped" "$LOG"; then
+    pass "no dma window for the network device, so nothing can arrive"
+else
+    fail "nothing was received"
+    grep -E "net domain|net frame" "$LOG" || true
     status=1
 fi
 

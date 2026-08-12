@@ -46,6 +46,7 @@ SHELL_DIR    := user/shell
 VFSD_DIR     := user/vfsd
 CONSOLED_DIR := user/consoled
 BLKD_DIR     := user/blkd
+NETD_DIR     := user/netd
 FSD_DIR      := user/fsd
 SUP_DIR      := user/sup
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
@@ -53,6 +54,7 @@ USER_SUP     := $(SUP_DIR)/target/$(TARGET)/release/sup
 USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
 USER_CONSOLED := $(CONSOLED_DIR)/target/$(TARGET)/release/consoled
 USER_BLKD    := $(BLKD_DIR)/target/$(TARGET)/release/blkd
+USER_NETD    := $(NETD_DIR)/target/$(TARGET)/release/netd
 USER_FSD     := $(FSD_DIR)/target/$(TARGET)/release/fsd
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
@@ -72,6 +74,8 @@ CONSOLED_FLAGS := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(CONSOLED_DIR)/link.ld
 BLKD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(BLKD_DIR)/link.ld
+NETD_FLAGS   := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(NETD_DIR)/link.ld
 FSD_FLAGS    := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(FSD_DIR)/link.ld
 
@@ -185,7 +189,7 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
@@ -194,6 +198,7 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USE
 	cp $(USER_VFSD) $(INITRD_ROOT)/bin/vfsd
 	cp $(USER_CONSOLED) $(INITRD_ROOT)/bin/consoled
 	cp $(USER_BLKD) $(INITRD_ROOT)/bin/blkd
+	cp $(USER_NETD) $(INITRD_ROOT)/bin/netd
 	cp $(USER_FSD) $(INITRD_ROOT)/bin/fsd
 	cp $(USER_SUP) $(INITRD_ROOT)/bin/sup
 	cp $(FS_IMAGE) $(INITRD_ROOT)/fs.img
@@ -247,6 +252,16 @@ $(USER_CONSOLED): $(CONSOLED_DIR)/src/main.rs $(CONSOLED_DIR)/link.ld $(CONSOLED
 $(USER_BLKD): $(BLKD_DIR)/src/main.rs $(BLKD_DIR)/link.ld $(BLKD_DIR)/Cargo.toml \
               $(wildcard abi/src/*.rs)
 	cd $(BLKD_DIR) && RUSTFLAGS="$(BLKD_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# The network driver as a program. RFC 0018 step 2. Like the block driver it
+# shares no code with anything in the kernel -- and unlike it, there is no
+# kernel driver for this device class at all. It does not depend on
+# `bhaskix-net`: the parsers live in the domain that has no device.
+$(USER_NETD): $(NETD_DIR)/src/main.rs $(NETD_DIR)/link.ld $(NETD_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs) $(wildcard device/src/*.rs)
+	cd $(NETD_DIR) && RUSTFLAGS="$(NETD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
@@ -422,6 +437,7 @@ fmt:
 	cd $(VFSD_DIR) && $(CARGO) fmt --all --check
 	cd $(CONSOLED_DIR) && $(CARGO) fmt --all --check
 	cd $(BLKD_DIR) && $(CARGO) fmt --all --check
+	cd $(NETD_DIR) && $(CARGO) fmt --all --check
 	cd $(FSD_DIR) && $(CARGO) fmt --all --check
 	cd $(SUP_DIR) && $(CARGO) fmt --all --check
 
@@ -441,6 +457,8 @@ clippy:
 	cd $(CONSOLED_DIR) && RUSTFLAGS="$(CONSOLED_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(BLKD_DIR) && RUSTFLAGS="$(BLKD_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(NETD_DIR) && RUSTFLAGS="$(NETD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
@@ -528,6 +546,7 @@ clean:
 	cd $(VFSD_DIR) && $(CARGO) clean
 	cd $(CONSOLED_DIR) && $(CARGO) clean
 	cd $(BLKD_DIR) && $(CARGO) clean
+	cd $(NETD_DIR) && $(CARGO) clean
 	cd $(FSD_DIR) && $(CARGO) clean
 	rm -rf build
 

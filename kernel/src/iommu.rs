@@ -50,7 +50,7 @@ use crate::sync::{Rank, SpinLock};
 /// undone the thing RFC 0012 is for: two devices translating through one page
 /// table can reach each other's buffers, so a driver in a domain would have
 /// been contained from the kernel's memory and not from the kernel's *device*.
-pub const MAX_WINDOWS: usize = 2;
+pub const MAX_WINDOWS: usize = 4;
 
 /// Every device with a translation of its own, found by where it is on the bus.
 ///
@@ -59,7 +59,7 @@ pub const MAX_WINDOWS: usize = 2;
 /// memory, and a capability that named "the window" would name whichever one
 /// happened to be first.
 static WINDOWS: SpinLock<[Option<(u64, Report, Window)>; MAX_WINDOWS]> =
-    SpinLock::new(Rank::DmaWindow, [None, None]);
+    SpinLock::new(Rank::DmaWindow, [None, None, None, None]);
 
 /// Packs a device's bus address into the word a `DmaWindow` capability names.
 #[must_use]
@@ -739,7 +739,7 @@ pub fn map_reserved(
 /// Called once, at bring-up. Revocation needs the window without having been
 /// handed it — an object's owner asks for it to be revoked, and what that has
 /// to reach is whichever device was given the object.
-pub fn install(device: (u8, u8, u8), report: Report, window: Window) {
+pub fn install(device: (u8, u8, u8), report: Report, window: Window) -> bool {
     let key = device_key(device);
     let mut windows = WINDOWS.lock();
     // Replace an entry for the same device before taking a free slot: two
@@ -751,8 +751,15 @@ pub fn install(device: (u8, u8, u8), report: Report, window: Window) {
         .or_else(|| windows.iter().position(Option::is_none));
     if let Some(slot) = slot {
         windows[slot] = Some((key, report, window));
+        true
     } else {
+        // Returned rather than only printed, and that is a correction. This
+        // said so on the console and told its caller nothing, so a caller that
+        // went on to announce the device was translating did exactly that with
+        // the refusal one line above it — which is what a third device on a
+        // two-slot table produced the first time one was added.
         crate::println!("    iommu window   no free slot; this device will not translate");
+        false
     }
 }
 

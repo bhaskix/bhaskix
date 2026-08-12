@@ -132,6 +132,23 @@ impl<B: Bus> Virtqueue<B> {
     /// `None` means nothing new — which is a normal answer and not an error,
     /// because a driver polling between requests wants to hear it.
     pub fn completed(&mut self) -> Option<u16> {
+        self.completed_with_length().map(|(id, _)| id)
+    }
+
+    /// Takes the next completion, with **how many bytes the device wrote**.
+    ///
+    /// # Why this exists, and why `completed` did not need it
+    ///
+    /// A block driver knows the size of what it asked for: it requested a
+    /// sector and a sector is what arrives, so the used ring's length field is
+    /// a restatement of the request. A *network* driver knows nothing of the
+    /// kind — a receive buffer is posted before there is a frame to put in it,
+    /// and the length is the only thing that says how much of it is a frame.
+    ///
+    /// So the first driver here discarded it and the second could not. Written
+    /// when `bin/netd` reported a frame's length and the number it printed was
+    /// the descriptor index, because that was all this crate returned.
+    pub fn completed_with_length(&mut self) -> Option<(u16, u32)> {
         // SAFETY: `new`'s obligation. Volatile because this changes without
         // this code writing it, which is the entire question being asked.
         let published = unsafe { B::load16(self.used.at + 2) };
@@ -144,10 +161,16 @@ impl<B: Bus> Virtqueue<B> {
         // that returned the index would be telling its caller how many
         // requests had ever finished rather than which one just did.
         let slot = (self.used_index % self.size) as usize;
-        // SAFETY: as above; an entry is eight bytes, six into the ring.
-        let id = unsafe { B::load32(self.used.at + 4 + slot * 8) };
+        // SAFETY: as above; an entry is eight bytes, six into the ring: a
+        // four-byte id and then the four-byte length beside it.
+        let (id, length) = unsafe {
+            (
+                B::load32(self.used.at + 4 + slot * 8),
+                B::load32(self.used.at + 8 + slot * 8),
+            )
+        };
         self.used_index = self.used_index.wrapping_add(1);
-        Some(id as u16)
+        Some((id as u16, length))
     }
 
     /// How many completions are outstanding, for reporting.

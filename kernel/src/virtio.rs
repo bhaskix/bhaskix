@@ -53,6 +53,63 @@ const DEVICE_TRANSITIONAL: u16 = 0x1001;
 /// The subsystem id a transitional device uses to say "block".
 const SUBSYSTEM_BLOCK: u16 = 0x0002;
 
+/// What kind of device to look for on the bus.
+///
+/// # Why the numbers are a table rather than four constants
+///
+/// A virtio device announces itself twice and differently depending on its age:
+/// a modern one puts its identity in the PCI device id, a transitional one
+/// reports a legacy id and says what it is in the subsystem id. Getting that
+/// wrong means a driver that works on exactly one of QEMU's two default
+/// configurations, which the block path found out and documented at
+/// [`find_nth`].
+///
+/// Stating both ids per class, in one place, is what stops the second device
+/// class re-deriving the same pair by hand -- and the pair *is* derivable, which
+/// is why these constants are written down with their derivation rather than
+/// recalled:
+///
+/// - `/usr/include/linux/virtio_ids.h` gives `VIRTIO_ID_NET = 1` and
+///   `VIRTIO_ID_BLOCK = 2`.
+/// - The modern PCI device id is `0x1040 + id`, which the block constant above
+///   already embodies: `0x1042` for id 2. So net is `0x1041`.
+/// - The transitional id is `0x1000 + id - 1` on the same evidence — block is
+///   `0x1001` — and the subsystem id is the virtio id itself, which
+///   `SUBSYSTEM_BLOCK = 2` likewise already embodies. So net is `0x1000`,
+///   subsystem 1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Class {
+    /// The PCI device id a modern device of this class reports.
+    modern: u16,
+    /// The PCI device id a transitional one reports.
+    transitional: u16,
+    /// The subsystem id a transitional one says what it is with.
+    subsystem: u16,
+}
+
+impl Class {
+    /// A virtio block device.
+    pub const BLOCK: Self = Self {
+        modern: DEVICE_BLOCK_MODERN,
+        transitional: DEVICE_TRANSITIONAL,
+        subsystem: SUBSYSTEM_BLOCK,
+    };
+
+    /// A virtio network device.
+    pub const NET: Self = Self {
+        modern: 0x1041,
+        transitional: 0x1000,
+        subsystem: 0x0001,
+    };
+
+    /// Whether `identity` names a device of this class.
+    fn matches(self, identity: pci::Identity) -> bool {
+        identity.vendor == VIRTIO_VENDOR
+            && (identity.device == self.modern
+                || (identity.device == self.transitional && identity.subsystem == self.subsystem))
+    }
+}
+
 /// The PCI capability id virtio uses for its own structures.
 const CAP_VENDOR_SPECIFIC: u8 = 0x09;
 
@@ -444,23 +501,24 @@ pub fn layout(address: pci::Address) -> Option<Layout> {
 /// makes "the second one" a thing a boot can say and a test can rely on.
 #[must_use]
 pub fn find_nth(skip: usize) -> Option<(pci::Address, pci::Identity)> {
+    find_nth_of(Class::BLOCK, skip)
+}
+
+/// Finds the `skip`-th virtio device of `class` on the bus, in bus order.
+///
+/// The general form of [`find_nth`], which is now a wrapper on it. Written when
+/// the network device arrived and needed the same walk with two different
+/// numbers: the alternative was a second copy of the transitional-versus-modern
+/// rule, and that rule is the one the block path already got wrong once.
+#[must_use]
+pub fn find_nth_of(class: Class, skip: usize) -> Option<(pci::Address, pci::Identity)> {
     let mut found = None;
     let mut seen = 0usize;
     // SAFETY: bootstrap CPU during boot; nothing else is driving a
     // configuration cycle.
     unsafe {
         pci::for_each(|address, identity| {
-            if identity.vendor != VIRTIO_VENDOR {
-                return true;
-            }
-            // A modern device says what it is in its device id. A transitional
-            // one reports the legacy id and says what it is in the subsystem
-            // id instead -- so both have to be understood, or the driver works
-            // on exactly one of QEMU's two default configurations.
-            let block = identity.device == DEVICE_BLOCK_MODERN
-                || (identity.device == DEVICE_TRANSITIONAL
-                    && identity.subsystem == SUBSYSTEM_BLOCK);
-            if block {
+            if class.matches(identity) {
                 if seen == skip {
                     found = Some((address, identity));
                     return false;

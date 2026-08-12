@@ -706,6 +706,68 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12, last (RFC 0018 step 2: a frame left the machine and one came back)
+
+`bin/netd` drives a virtio network device from ring 3, in a domain holding seven capabilities and no
+way to name the bus. It transmits a frame and receives the answer:
+
+```
+net domain     up: mac 52:54:00:12:34:56, rx queue 0, tx queue 1
+net frame      transmitted 54 bytes onto the wire
+net frame      received 64 bytes from 52:55:0a:00:02:02, virtio header 12 bytes
+```
+
+**Two facts were established by experiment because this machine has no copy of the virtio
+specification, and neither was going to be written from memory.**
+
+**Which queue is which.** With receive 0 and transmit 1 a frame reached the network and an answer
+came back. With the two **swapped**, both gates went red — `nothing was transmitted` and `nothing
+was received`. That is a measurement.
+
+**The header is twelve bytes, not ten — and the obvious inference from the one local source is
+wrong.** `/usr/include/linux/virtio_net.h:126-135` defines `struct virtio_net_hdr` as ten bytes and
+says the twelve-byte variant is "the version to use when the MRG_RXBUF feature has been negotiated",
+which this driver does not negotiate. Written as ten, QEMU's own `filter-dump` showed what actually
+left the machine:
+
+```
+#1 len=40 dst=ff:ff:ff:ff:52:54 src=00:12:34:56:08:06 ethertype=0x0001
+```
+
+Forty bytes beginning two bytes into the Ethernet header: the broadcast address short by two, the
+source holding the last four of it, the EtherType holding the ARP hardware type. A modern device
+uses the twelve-byte layout regardless; the UAPI comment describes the legacy rule. With twelve, the
+dump is a well-formed ARP request and a reply from the gateway.
+
+**A gate was announcing success over its own refusal.** `iommu::install` printed `no free slot; this
+device will not translate` and returned nothing, so the caller went on to print that the device *was*
+translating — the two lines one after the other. The table held two windows and a third device
+wanted one. `MAX_WINDOWS` is four now and `install` returns whether it took, which is the half that
+was missing: a refusal nobody can observe is not a refusal.
+
+**RFC 0014's question, answered.** Most of `blkd` did not have to be written again — the virtqueue,
+the register accessors, the notification arithmetic and the domain's whole capability shape came
+across unchanged, and the driver is 210 `unsafe` lines against the block driver's 220 while doing
+strictly more. What the framework did **not** have is the one thing a receive path needs:
+`Virtqueue::completed` returned a descriptor id and discarded the used ring's *length*. A block
+driver knows the size of what it asked for; a network driver posts a buffer before there is a frame
+to put in it, and the length is the only thing that says how much of it is a frame. Found because
+`netd` reported a frame's length and printed the descriptor index. `completed_with_length` now
+exists and `completed` delegates to it.
+
+**Three smaller things, each a gate doing its job.** The exact `bin == 8` listing assertion caught
+the new program the moment it appeared, which is what its comment said it was for — seven times
+running now. `WAIT` has no timeout, so a self-test that waits before looking blocks for ever on a
+device that completes without raising; `netd` looks first and waits second, and the block driver's
+opposite order is safe only because a disk answers every request. And the receive gate is separate
+from the transmit gate on purpose: **posting no receive buffers leaves transmit green and turns
+receive red**, which is exactly the failure a single combined gate would have passed.
+
+**Observed once and not reproduced:** one `iommu` boot faulted in `consoled` with a null dereference
+at address 1, before the net domain started, and took the supervisor and the services test with it.
+Three further runs were clean and the net path worked in all of them. Recorded because it is
+unexplained, not because it is understood — it resembles nothing this change touches.
+
 ### 2026-08-12, last (RFC 0018 step 1: the protocol code, with no machine under it)
 
 `net/src` has been an empty directory since M1 and `tools/check-deps.py` has been reserving a layer

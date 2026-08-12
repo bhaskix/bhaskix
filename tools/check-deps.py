@@ -90,6 +90,14 @@ LAYERS = {
     # is why that sits lower still.
     "bhaskix-user-probe": -1,
     "bhaskix-user-shell": -1,
+    # The network driver. A plain program like the others: it holds
+    # capabilities and reaches the kernel only through system calls. It depends
+    # on the ABI and on `bhaskix-device` for the virtqueue -- and deliberately
+    # **not** on `bhaskix-net`, because linking the protocol parsers into the
+    # domain that holds this device's DMA authority is the arrangement RFC 0018
+    # rejected. Nothing enforces that but this comment and the manifest; the
+    # layer rule would permit it, since `bhaskix-net` sits below.
+    "bhaskix-user-netd": -1,
     # The supervisor places no service: it creates domains, starts programs in
     # them and reaps them, all through capability invocations. So it belongs
     # here with the other plain programs rather than in PLACEMENTS -- and that
