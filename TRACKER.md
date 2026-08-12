@@ -7,7 +7,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 |---|---|
 | **Last updated** | 2026-08-12 |
 | **Phase** | Phase 2 — Core Operating System |
-| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking is next**, and unblocked: it was gated on the driver framework |
+| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 steps 1–6): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged. No TCP, no libc, no sockets API beyond UDP |
 | **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
 
 ### How far along is this, in numbers
@@ -24,7 +24,7 @@ What can be counted honestly, with how to recount it:
 |---|---|---|
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **6 of 7 done** | §4 below; the seventh is networking |
-| Networking, within RFC 0018 | **~4½ of 7 steps** | its implementation plan: crate, driver, ring, return path and ARP, ICMP send |
+| Networking, within RFC 0018 | **6 of 6 steps** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page |
 | Tasks in defined milestones | **92 `DONE`, 4 `TODO`** | `grep -c` on the milestone tables in §3 |
 | Suite | 601 checks, 346 host assertions, 4 placements | §6 |
 
@@ -740,6 +740,69 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12, last (RFC 0018 step 6: an address obtained by a program that holds a socket)
+
+```
+dhcp client    offered 10.0.2.15 by 10.0.2.2, holding a socket and a page and nothing else
+net echo       1 icmp echo replies, payload returned unchanged
+```
+
+**A program with four capabilities asked the network for an address and was given one.** `bin/dhcp`
+holds an endpoint, the slot its socket lands in, one page, and a page to report through — **no
+device, no DMA window, no interrupt, no filesystem, no console**. It broadcasts a `DISCOVER` and
+parses the `OFFER`, and the address it is given, `10.0.2.15`, is the one the kernel used to
+hardcode. That answers RFC 0018's own first unresolved question, which asked what owns the
+interface's address and observed that DHCP "is a client holding a socket, which would be the more
+capability-shaped answer". Built rather than argued.
+
+`bhaskix-net` gained a `dhcp` module — 8 host tests and a **sixth libFuzzer target**, because a
+DHCP reply is bytes from whoever answers first and its options are a length-prefixed walk over
+attacker-chosen input. No lease, no `REQUEST`, no `ACK`, no renewal: what is left out is named in
+the module header so that adding it is a decision somebody makes.
+
+**One register was three mysteries.** `bin/netd` selected each virtqueue and never wrote
+`QUEUE_SIZE` — the two-byte register at `0x18`, in the gap between `QUEUE_SELECT` and
+`QUEUE_MSIX_VECTOR`, simply missing from the driver's list. So the device wrapped the rings at its
+own default of 256 while the driver wrapped them at four. Entries zero to three agree, which is why
+anything worked at all, and why what failed failed so strangely. Past the fourth request the device
+read available-ring slots the driver had never written and wrote used-ring entries the driver never
+read.
+
+Three things recorded in this file as unexplained were all this:
+
+- a frame sent on descriptor 2 going out with descriptor 0's length, truncating **every** frame
+  built for `bin/ipd` to 42 bytes;
+- a transmit buffer at `0x5800` that was filled correctly and never transmitted, which bisection
+  blamed on the address because moving the bytes changed *which* request went wrong rather than
+  whether one did;
+- no received frame larger than 64 bytes ever being delivered, while three of four receive buffers
+  sat free.
+
+None were about descriptors, addresses, or buffers. Each comment claiming otherwise is corrected
+where it lives.
+
+**Three wrong diagnoses came from counters that had stopped moving**, and the pattern is worth more
+than the bugs. `report_net_domain` runs *before* `bin/dhcp` starts, so every number it prints
+predates the exchange — "12 of 12 seen" was read as proof the device dropped the offer, about a
+frame that had not been sent yet. Every `report()` call in `bin/ipd` is in `ipd_main`, so the page
+froze the instant `serve` was entered, and "0 datagrams delivered" was true of a service that had
+since delivered one. And `received` is the *first* frame's length, written once, which reads like a
+running figure and is not one.
+
+**A counter that has stopped moving reads exactly like a subsystem that has stopped working.** The
+fix in each case was to measure the thing after it happened rather than before, and the diagnostics
+that finally cracked it are kept rather than stripped: `bin/ipd` records *which* of its seven
+refusals dropped a frame and the bytes that caused it, `bin/netd` reports the widest frame the
+device wrote and how many buffers it is holding, and both report the ring's own head and tail —
+because counters are a story about the ring, and where they disagreed with it the counters were
+wrong.
+
+**Ordering, for the third time in this subsystem.** `bin/dhcp` was started from inside
+`start_ip_domain`, which runs before the driver exists, and the boot never finished with `netd`
+simply absent from the thread dump. Started after `start_net_domain` it works. Step 3 installed a
+ring after its consumer had started; step 5 installed a capability before the service existed. Each
+time the symptom appeared somewhere other than the cause.
+
 ### 2026-08-12, last (RFC 0018 step 5: a socket you have to hold)
 
 ```
@@ -833,13 +896,23 @@ net echo    echo request sent; nothing answered it
 The last frame the driver forwarded is 59 bytes addressed to `52:55:0a:00:02:02` — the gateway,
 found in the ARP cache, in a datagram whose two checksums `bhaskix-net` computed.
 
-**The reply cannot be obtained on this host, and that is not this kernel's doing.** QEMU's
-user-mode network needs permission from the *host* to open an ICMP socket, and a container without
-it drops the request silently. Removing `restrict=on` changed nothing, which rules out the
-isolation flag. The wire capture shows the request leaving well-formed:
-`IPv4 proto=1 10.0.2.15 -> 10.0.2.2 icmp type=8 code=0`. So the gate asserts what this machine
-controls — that a correct echo request was built and sent — and the round trip is recorded as
-untestable here rather than quietly dropped.
+**~~The reply cannot be obtained on this host, and that is not this kernel's doing.~~ That was
+wrong, and it was this kernel's doing.** This section claimed QEMU's user-mode network needs
+permission from the host to open an ICMP socket and drops the request silently without it. It does
+not. On 2026-08-12 `filter-dump` showed `10.0.2.2 > 10.0.2.15: ICMP echo reply` arriving 32 µs
+after the request.
+
+The request was never well-formed. Every frame transmitted for `bin/ipd` was truncated to 42 bytes,
+so the echo request declared 25 bytes of ICMP payload and carried none, and nothing answered it.
+The root cause was a single register: `bin/netd` never wrote `QUEUE_SIZE`, so the device wrapped
+the virtqueues at its own default of 256 while the driver wrapped them at four. **The ping now
+returns its payload unchanged.** The capture quoted above read the IP header and not the
+length, which is exactly how a wrong claim passes a check: `IPv4 proto=1 10.0.2.15 -> 10.0.2.2`
+is true of a frame missing its whole payload.
+
+The lesson is recorded rather than the excuse: **a capture that stops short of the length cannot
+see the length go wrong**, and "the environment cannot do this" is the conclusion to distrust
+most, because nothing about it is falsifiable from inside the environment.
 
 **A poll loop cost a processor, and the shell test found it.** `netd` and `ipd` polled for ever,
 yielding between looks. Two pinned domains spinning for the life of the boot, plus three fuzz

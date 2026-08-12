@@ -173,7 +173,11 @@ workspace = true
 # 1152 at RFC 0018 step 4a: the configuration page the kernel writes for
 # `bin/ipd`, and the direct-map read of the driver report it takes the address
 # from.
-unsafe_budget = 1152
+# 1157 at RFC 0018 step 6: the driver's and the service's reports are read a
+# second time, *after* the DHCP exchange rather than before it. Reading them
+# once before the thing being measured had happened is what made three separate
+# wrong diagnoses possible.
+unsafe_budget = 1157
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

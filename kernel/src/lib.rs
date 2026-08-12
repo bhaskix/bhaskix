@@ -3203,6 +3203,19 @@ const IPD_STACK_PAGES: u64 = 4;
 /// Where the protocol service's program is.
 const IPD_PROGRAM: &[u8] = b"bin/ipd";
 
+/// Where the DHCP client's domain keeps its stack.
+const DHCPD_STACK: u64 = 0x0000_0000_1400_0000;
+const DHCPD_STACK_PAGES: u64 = 4;
+
+/// Where the DHCP client's program is.
+const DHCPD_PROGRAM: &[u8] = b"bin/dhcp";
+
+/// The marker `bin/dhcp` writes before its report.
+const DHCPD_MARKER: u64 = 0x3145_4e4f_5044_4844;
+
+/// The page `bin/dhcp` leaves its findings in.
+static DHCP_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// Bytes in the ring between `bin/netd` and `bin/ipd`.
 ///
 /// Sixteen pages, of which `abi::ring` uses the largest power of two that fits
@@ -3691,6 +3704,10 @@ pub fn start_net_domain(
     // reading returned frames.
     let keeper = domain::create("net-keeper", domain::ResourceEnvelope::new())
         .map_err(|_| "the net rings' owner would not be created")?;
+    NET_KEEPER.store(
+        keeper.as_u32().saturating_add(1),
+        core::sync::atomic::Ordering::Release,
+    );
     let rings = shared::create(keeper, 8 * bhaskix_mm::FRAME_SIZE)
         .map_err(|_| "the net domain's rings would not be created")?;
     let named = shared::name(rings).map_err(|_| "the rings would not be named")?;
@@ -3972,6 +3989,7 @@ fn start_ip_domain(
         .map_err(|_| "the ip domain would not spawn")?;
 
     NET_RING_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
+
     println!(
         "    net ring       {} KiB between netd and ipd; bin/ipd started, holding two \
          capabilities and no device",
@@ -3987,8 +4005,93 @@ static NET_RING_REPORT: core::sync::atomic::AtomicU64 =
 /// The page telling `bin/ipd` what this interface is.
 static NET_CONFIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// Starts `bin/dhcp`, which asks the network for an address.
+///
+/// # Errors
+///
+/// Any capability that would not be created or installed. None is fatal: a
+/// machine that cannot ask for an address still boots with the one the kernel
+/// hardcoded.
+fn start_dhcp_client(
+    cpu: u32,
+    hhdm_base: u64,
+    keeper: domain::DomainId,
+    endpoint: ipc::EndpointId,
+) -> Result<(), &'static str> {
+    let realm = domain::create("dhcp", domain::ResourceEnvelope::new())
+        .map_err(|_| "the dhcp domain would not be created")?;
+
+    let network = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the client's network capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(0, network).is_ok()) != Some(true) {
+        return Err("the client's network capability would not install");
+    }
+
+    // Slot 1 is left **empty on purpose**: it is where the socket lands, and
+    // the client declares it with `EXPECT` before asking. A slot the kernel
+    // pre-filled would be a slot `HAND` could not use.
+    let memory = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the client's memory would not be created")?;
+    let named = shared::name(memory).map_err(|_| "the client's memory would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(2, named).is_ok()) != Some(true) {
+        return Err("the client's memory would not install");
+    }
+
+    let report = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the client's report page would not be created")?;
+    let named = shared::name(report).map_err(|_| "the client's report would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
+        return Err("the client's report would not install");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        cpu,
+        "dhcp",
+        dhcp_client_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the dhcp client would not spawn")?;
+
+    DHCP_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
 /// The endpoint `bin/ipd` serves the network on, once there is one.
 static NET_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The keeper that owns the network's memory, plus one so zero means "none".
+static NET_KEEPER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The endpoint the protocol service answers on, if it is serving.
+fn net_service_endpoint() -> Option<ipc::EndpointId> {
+    let raw = NET_ENDPOINT.load(core::sync::atomic::Ordering::Acquire);
+    (raw != u64::MAX).then(|| ipc::EndpointId::from_u32(raw as u32))
+}
+
+/// The domain that keeps the network's memory alive.
+///
+/// One keeper for all of it, because a domain is a fixed global resource and a
+/// keeper that keeps several things is no worse at keeping any of them.
+fn net_keeper() -> domain::DomainId {
+    domain::DomainId::from_u32(
+        NET_KEEPER
+            .load(core::sync::atomic::Ordering::Acquire)
+            .saturating_sub(1),
+    )
+}
 
 /// A capability to the protocol service's endpoint, for a program to hold.
 ///
@@ -4783,6 +4886,84 @@ fn net_domain_reported(hhdm: u64) -> bool {
     marker == NETD_MARKER
 }
 
+/// Reads the driver's counters **again, after the DHCP exchange**.
+///
+/// [`report_net_domain`] runs before `bin/dhcp` is even started, so every
+/// number it prints predates the exchange. Reading those numbers and concluding
+/// anything about a frame that had not been sent yet is measuring the reader's
+/// timing rather than the thing measured — the same mistake this file already
+/// records twice, made a third time and caught by the counter not moving.
+///
+/// This prints what the driver saw by the end, which is the only version of
+/// those numbers that can say whether the offer was ever delivered.
+fn report_net_after_exchange(hhdm: u64) {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_RINGS.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return;
+    };
+    if count <= NETD_REPORT_PAGE {
+        return;
+    }
+    let mut words = [0u64; 15];
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // fourteen little-endian words the driver wrote there.
+    let raw =
+        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 120) };
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    if words[0] != NETD_MARKER {
+        return;
+    }
+    println!(
+        "    net after      {} completions seen, {} handed across, {} sent back; widest frame \
+         the device wrote {} bytes, {} buffers left with it",
+        words[8], words[9], words[10], words[13], words[14]
+    );
+
+    let raw = NET_RING_REPORT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return;
+    }
+    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    let mut ipd = [0u64; 13];
+    // SAFETY: a frame this object owns, through the direct map, read as the ten
+    // little-endian words the service wrote there.
+    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 104) };
+    for (index, word) in ipd.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    if ipd[0] != IPD_MARKER {
+        return;
+    }
+    println!(
+        "    ipd after      {} frames taken, {} refused, {} datagrams delivered to a socket; \
+         last refusal reason {}, on a frame of {} bytes with ethertype {:#06x}; ring head {} tail {}",
+        ipd[1],
+        ipd[4],
+        ipd[9],
+        ipd[10] & 0xffff,
+        ipd[10] >> 32,
+        (ipd[10] >> 16) & 0xffff,
+        ipd[11],
+        ipd[12]
+    );
+}
+
 /// Reads what the network driver wrote, and says so.
 ///
 /// Two separate findings, reported on two separate lines **on purpose**. A
@@ -4870,8 +5051,8 @@ fn report_net_domain(hhdm: u64) -> bool {
     let [p, q, r, s, t, u] = octets(words[4]);
     println!(
         "    net frame      received {length} bytes from {p:02x}:{q:02x}:{r:02x}:{s:02x}:{t:02x}:{u:02x}, \
-         virtio header {} bytes; {} handed to the ring, {} sent back for ipd (took {} bytes starting {:#014x})",
-        words[5], words[9], words[10], words[12], words[11]
+         virtio header {} bytes; {} of {} seen handed to the ring, {} sent back for ipd (took {} bytes starting {:#014x})",
+        words[5], words[9], words[8], words[10], words[12], words[11]
     );
     true
 }
@@ -4963,21 +5144,29 @@ fn report_net_ring(hhdm: u64) -> bool {
             words[8]
         );
     } else {
-        // **Not a failure, and this is the honest version of why.** The echo
-        // request this machine sends is correct and reaches the wire — QEMU's
-        // own packet capture shows `IPv4 proto=1 10.0.2.15 -> 10.0.2.2 icmp
-        // type=8`. Nothing answers it, because QEMU's user-mode network needs
-        // permission from the *host* to open an ICMP socket, and a container
-        // without that permission drops the request silently. Removing
-        // `restrict=on` changes nothing, which rules out the isolation flag.
+        // **This said the host could not answer an echo request, and that was
+        // wrong.** The claim was that QEMU's user-mode network needs
+        // permission from the host to open an ICMP socket and drops the
+        // request silently without it. It does not: `filter-dump` on this
+        // machine shows `10.0.2.2 > 10.0.2.15: ICMP echo reply` arriving
+        // 32 microseconds after the request, and `bin/netd` hands that frame
+        // across to `bin/ipd`.
         //
-        // So the round trip is untestable in this environment, and gating on
-        // it would make the suite fail for a reason that has nothing to do
-        // with this kernel. What *is* gated is that the request was built and
-        // sent, which is the half this machine controls.
+        // What actually happened is that every frame this system transmitted
+        // for `bin/ipd` was truncated to 42 bytes by the wrong virtio
+        // descriptor — see `take_from_ipd`'s caller. The echo request left
+        // declaring 25 bytes of ICMP and carrying none, so nothing answered
+        // *that*, and the environment was blamed for what this code did. The
+        // earlier capture showing the request "leaving well-formed" read the
+        // headers and not the length, which is how it survived being checked.
+        //
+        // The round trip now works and this branch no longer runs: see the
+        // `net echo` line above, which counts replies whose payload came back
+        // unchanged. Reaching here again would mean a real regression rather
+        // than a host that cannot answer.
         println!(
-            "    net echo       echo request sent; nothing answered it, which this host \
-             cannot arrange (no icmp socket permission)"
+            "    net echo       echo request sent and nothing answered it, which used to be \
+             blamed on the host and never was the host"
         );
     }
     if words[5] == 0 {
@@ -4993,6 +5182,96 @@ fn report_net_ring(hhdm: u64) -> bool {
         return false;
     }
     true
+}
+
+/// Reads what `bin/dhcp` found, and says so.
+///
+/// Returns whether an address was offered. Not a failure when none was: a
+/// machine with no network still boots, and this program's whole point is that
+/// it needs nothing to try.
+fn report_dhcp_client(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = DHCP_REPORT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return true;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return true;
+    };
+    if count == 0 {
+        return true;
+    }
+
+    let mut words = [0u64; 4];
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // four little-endian words the client wrote there.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, 32) };
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    if words[0] != DHCPD_MARKER {
+        println!("    dhcp client    left no report");
+        return false;
+    }
+
+    let octets = |value: u64| {
+        [
+            (value >> 24) as u8,
+            (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ]
+    };
+    match words[3] {
+        0 => {
+            let [a, b, c, d] = octets(words[1]);
+            let [e, f, g, h] = octets(words[2]);
+            println!(
+                "    dhcp client    offered {a}.{b}.{c}.{d} by {e}.{f}.{g}.{h}, holding a socket \
+                 and a page and nothing else"
+            );
+            true
+        }
+        1 => {
+            println!("    dhcp client    no network to ask");
+            true
+        }
+        // The three ways the client stops before it has asked anything, each
+        // carrying the number that stopped it. Printed rather than folded into
+        // one message: the folded version named the symptom three times over.
+        4 => {
+            println!(
+                "    dhcp client    refused a slot to be answered in, status {}",
+                words[1]
+            );
+            false
+        }
+        5 => {
+            println!(
+                "    dhcp client    bound no socket, status {} and the service said {}",
+                words[1], words[2]
+            );
+            false
+        }
+        6 => {
+            println!(
+                "    dhcp client    sent nothing, status {} and the service said {}",
+                words[1], words[2]
+            );
+            false
+        }
+        3 => {
+            println!("    dhcp client    something answered and it was not an offer");
+            false
+        }
+        _ => {
+            println!("    dhcp client    nobody answered");
+            false
+        }
+    }
 }
 
 /// Reads what the driver in a domain wrote, and says so.
@@ -5260,6 +5539,47 @@ extern "C" fn ip_domain_entry(hhdm_base: u64) -> ! {
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
     unsafe { enter_user("net ring", entry, rsp, [0, 0]) }
+}
+
+/// Loads and enters `bin/dhcp`.
+extern "C" fn dhcp_client_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    dhcp client    FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(DHCPD_PROGRAM) else {
+        stop("bin/dhcp is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/dhcp is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(DHCPD_STACK), DHCPD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/dhcp would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = DHCPD_STACK + DHCPD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("dhcp client", entry, rsp, [0, 0]) }
 }
 
 /// Loads and enters `bin/fsd`.
@@ -6247,9 +6567,57 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         if !report_net_domain(hhdm) {
             println!("\x1b[91m    net domain     FAILED\x1b[0m");
         }
+        // RFC 0018 step 6: a program that asks the network for an address,
+        // holding **four capabilities and nothing else**.
+        //
+        // **Started here, and the position is load-bearing.** It was started
+        // from inside `start_ip_domain`, which runs before `start_net_domain`
+        // has spawned the driver — so the client came up before there was
+        // anything to drive, and the boot never finished. `netd` was simply
+        // absent from the thread dump.
+        //
+        // That is the third ordering bug in this subsystem in one day, all the
+        // same shape: step 3's ring installed after its consumer had started,
+        // step 5's capability installed before the service existed, and this.
+        // Each time the symptom appeared somewhere other than the cause.
+        if let Some(endpoint) = net_service_endpoint()
+            && let Err(reason) = start_dhcp_client(cpu, hhdm, net_keeper(), endpoint)
+        {
+            println!("\x1b[91m    dhcp client    FAILED: {reason}\x1b[0m");
+        }
+
         if !report_net_ring(hhdm) {
             println!("\x1b[91m    net ring       FAILED\x1b[0m");
         }
+        // **Time for the client to actually run**, which it was not given. It
+        // was started ten lines above and read here, microseconds later, still
+        // blocked in its first call — so the page held the "no network" it
+        // writes before it asks anything, and the boot reported a refusal that
+        // had not happened. The same mistake as reading the driver's report the
+        // moment its marker appeared, noted forty lines up and repeated anyway.
+        //
+        // A `DISCOVER` goes out, a server answers, and the client asks for the
+        // reply in a loop; the driver is asleep on its interrupt between those,
+        // so it is woken here for the same reason as above.
+        //
+        // **Every pass rather than every tenth**, and that is the difference
+        // between an offer arriving and not. The driver handed the offer across
+        // half a second after it reached the wire, because half a second is how
+        // often this poke used to happen — and by then `bin/dhcp` had asked
+        // twenty thousand times and stopped. `bin/ipd` drains the ring only
+        // when a client asks, so a frame that crosses after the last ask sits
+        // there: the counters said twelve handed across and eleven taken, which
+        // is the gap stated exactly.
+        for _ in 0..80 {
+            wake_net_driver();
+            wait_millis(50);
+        }
+        // The client needs the service to be serving, which happens after its
+        // own demonstration finishes, so this is read last of all.
+        if !report_dhcp_client(hhdm) {
+            println!("\x1b[91m    dhcp client    FAILED\x1b[0m");
+        }
+        report_net_after_exchange(hhdm);
     }
 
     // The network, at slot 16, and only if there is one. **A program either
@@ -6410,6 +6778,11 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         "    domains        {} of {} slots occupied at once (a slot is held until reaped)",
         domain::peak_occupied(),
         domain::MAX_DOMAINS
+    );
+    println!(
+        "    memory objects {} of {} live at once",
+        shared::peak_live(),
+        shared::MAX_OBJECTS
     );
     // Whether anything read after this point is complete. The transmitter drops
     // a byte rather than hang, which is right, and it did so silently until a
@@ -8983,19 +9356,19 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Nine programs in /bin: the ring 3 probe, the user-mode shell,
+            // Ten programs in /bin: the ring 3 probe, the user-mode shell,
             // both services as programs, the block driver (RFC 0013 steps 3, 4
             // and 6), the filesystem (RFC 0016 step 3), the supervisor
             // (RFC 0017 question 2), the network driver and the protocol
-            // service (RFC 0018 steps 2 and 3).
-            // Exact rather than "at least", so adding a tenth without noticing
+            // service (RFC 0018 steps 2 and 3), and the DHCP client (step 6).
+            // Exact rather than "at least", so adding an eleventh without noticing
             // this line is a failure rather than a silently weaker test --
             // which it has now been, seven times, once per program added. It
             // is the cheapest assertion in the repository, and it caught the
             // seventh the same day it was written and the eighth the moment
             // `bin/netd` appeared.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 9,
+            entries >= 3 && bin == 10,
         ),
         (
             "the user program is an ELF the loader accepts",

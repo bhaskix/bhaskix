@@ -973,10 +973,33 @@ fn network(rest: &[u8]) {
 
     // Use it. The datagram's contents are the service's to choose at this step;
     // what is being shown is that a *held* capability is what makes it possible.
+    // A payload out of memory this program holds. `SEND_TO` reads it with
+    // `DRAIN`, so a call naming no memory sends nothing.
+    const PAYLOAD_AT: u64 = 0x3600_0000;
+    if syscall(
+        syscall::INVOKE,
+        MEMORY_RW,
+        method::ATTACH,
+        [PAYLOAD_AT, 1, 0, 0],
+    )
+    .status
+        == status::OK
+    {
+        // SAFETY: one page of memory this program holds, just mapped writable,
+        // which nothing else in this program uses.
+        unsafe {
+            core::ptr::copy_nonoverlapping(b"ping".as_ptr(), PAYLOAD_AT as *mut u8, 4);
+        }
+    }
     let sent = call(
         SOCKET,
         socket::SEND_TO,
-        [u64::from(u32::from_be_bytes([10, 0, 2, 2])), 9, 0, 0],
+        [
+            u64::from(u32::from_be_bytes([10, 0, 2, 2])),
+            9,
+            MEMORY_RW,
+            4,
+        ],
     );
     if sent.status == status::OK && sent.args[0] == socket::OK {
         write(b"  sent a datagram through it\n");
@@ -1004,6 +1027,13 @@ fn network(rest: &[u8]) {
     } else {
         write(b"  a closed socket still worked -- the generation did not hold\n");
     }
+
+    // **Give the slot back.** Closing ends the socket; it does not empty the
+    // slot the capability sits in, and `HAND` cannot put anything where
+    // something already is. Without this a second bind is answered `NOWHERE`,
+    // which reads as the service refusing rather than as the caller not having
+    // tidied up.
+    let _ = syscall(syscall::INVOKE, SOCKET, method::DELETE, [0; 4]);
 }
 
 /// Splits a line into a command and the rest.

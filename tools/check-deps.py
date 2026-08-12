@@ -99,12 +99,30 @@ LAYERS = {
     # layer rule would permit it, since `bhaskix-net` sits below.
     "bhaskix-user-netd": -1,
     # The protocol service. It holds rings, a report page and a configuration
-    # page: no device, no DMA window, no interrupt. It is the **only** program
-    # that may depend on `bhaskix-net`, because a parser bug here reaches no
-    # hardware -- and `bhaskix-user-netd` above deliberately does not. The layer
-    # rule permits either; this comment and the two manifests are what actually
-    # hold the line, which is worth knowing rather than assuming.
+    # page: no device, no DMA window, no interrupt.
+    #
+    # **The rule about who may link `bhaskix-net` is restated here**, because
+    # the first version of it was "only `ipd`" and that was a description of the
+    # moment rather than a rule: `ipd` was the only program that had a socket.
+    # The shell has one since RFC 0018 step 5, and a DHCP client is protocol
+    # code.
+    #
+    # What the rule protects is that **a parser bug must not be turnable into
+    # hardware pointed anywhere**. So the line is: a program linking
+    # `bhaskix-net` may hold no *writable* device authority -- no DMA window, no
+    # writable register window, no interrupt. `bhaskix-user-netd` fails that and
+    # deliberately does not link it. `ipd` holds no device at all; the shell
+    # holds one read-only page of configuration space, and reading a BAR grants
+    # nothing.
+    #
+    # The layer rule permits any of them; this comment and the manifests are
+    # what hold the line, which is worth knowing rather than assuming.
     "bhaskix-user-ipd": -1,
+    # The DHCP client. Four capabilities: an endpoint, the slot a socket lands
+    # in, one page and a report page. It links `bhaskix-net` under the rule
+    # above -- no device, no DMA window, no interrupt -- and it exists as its own
+    # program rather than a shell command precisely so that stays true.
+    "bhaskix-user-dhcp": -1,
     # The supervisor places no service: it creates domains, starts programs in
     # them and reaps them, all through capability invocations. So it belongs
     # here with the other plain programs rather than in PLACEMENTS -- and that

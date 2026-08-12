@@ -30,7 +30,7 @@
 use bhaskix_abi::{method, rights, ring, socket, status, syscall};
 use bhaskix_net::{
     ArpCache, ArpOp, ArpPacket, EthFrame, EtherType, Ipv4Addr, Ipv4Header, MacAddr, Port, Protocol,
-    arp, eth, icmp, ipv4, udp,
+    UdpDatagram, arp, eth, icmp, ipv4, udp,
 };
 
 /// Slot: the ring `bin/netd` writes frames into.
@@ -328,13 +328,6 @@ fn state(can_send: bool, mac: MacAddr) -> u64 {
     u64::from(can_send) | (u64::from(mac != MacAddr::UNSPECIFIED) << 1)
 }
 
-/// What a datagram this service sends carries.
-///
-/// Fixed, because step 5 is about *who may send* rather than about what is
-/// sent. A caller's own payload crossing into this service needs the shared
-/// region a socket would carry, which is step 6's work.
-const DATAGRAM_PAYLOAD: [u8; 12] = *b"bhaskix-udp1";
-
 /// Builds and hands over one UDP datagram.
 ///
 /// Every layer of it comes from `bhaskix-net`: the same code the parser on the
@@ -346,13 +339,14 @@ fn send_datagram(
     from: u16,
     to: Ipv4Addr,
     to_port: u16,
+    payload: &[u8],
 ) -> bool {
     let mut out = [0u8; MAX_FRAME];
     let body = match udp::write(
         &mut out[eth::HEADER + ipv4::HEADER..],
         Port(from),
         Port(to_port),
-        &DATAGRAM_PAYLOAD,
+        payload,
         me.1,
         to,
     ) {
@@ -371,11 +365,109 @@ fn send_datagram(
     {
         return false;
     }
-    if eth::write_header(&mut out, gateway, me.0, EtherType::IPV4).is_err() {
+    // Broadcast at layer two when the destination is the broadcast address:
+    // a client with no address is answering nobody in particular, and sending
+    // that to the gateway's MAC would be asking one station a question meant
+    // for all of them.
+    let destination = if to == Ipv4Addr::BROADCAST {
+        MacAddr::BROADCAST
+    } else {
+        gateway
+    };
+    if eth::write_header(&mut out, destination, me.0, EtherType::IPV4).is_err() {
         return false;
     }
     // SAFETY: the return ring is mapped writable by this program.
     unsafe { send(&out[..eth::HEADER + ipv4::HEADER + body]) }
+}
+
+/// Datagrams placed into a bound socket. See `drain_ring`.
+static DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Frames taken from the ring **while serving**, which nothing used to count.
+static TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where `drain_ring` has read up to, so the report can show it.
+static SERVING_TAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Why the last frame was not given to a socket.
+///
+/// `drain_ring` has seven ways to refuse a frame and reported none of them, so
+/// a datagram that never reached a socket was indistinguishable from one that
+/// never arrived. Each refusal is a different bug, and a count of zero
+/// deliveries names none of them.
+static WHY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Refusal codes for [`WHY`], in the order `drain_ring` applies them.
+mod why {
+    pub const NOT_A_FRAME: u64 = 1;
+    pub const NOT_IPV4: u64 = 2;
+    pub const NOT_A_HEADER: u64 = 3;
+    pub const NOT_UDP: u64 = 4;
+    pub const NOT_FOR_US: u64 = 5;
+    pub const NOT_A_DATAGRAM: u64 = 6;
+    pub const NO_SOCKET: u64 = 7;
+}
+
+/// Records why a frame was refused, **with the bytes that caused it**.
+///
+/// The code alone said "not IPv4" of a frame that certainly was one, which is
+/// a claim about the parser or a claim about the bytes and no way to tell
+/// which. The length and ethertype the program actually read decide it.
+fn refuse(code: u64, length: usize, ethertype: u16) {
+    WHY.store(
+        code | ((ethertype as u64) << 16) | ((length as u64) << 32),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The last full report, so that [`refresh`] can rewrite the page.
+///
+/// # Why this exists
+///
+/// Every `report` call in this program is in `ipd_main`, so the page stopped
+/// changing the moment `serve` was entered — and `serve` is where all the
+/// interesting work happens. The kernel then read eleven frames and nothing
+/// delivered, and that was true of a service which had since taken more frames
+/// and delivered a datagram. **A counter that has stopped moving reads exactly
+/// like a subsystem that has stopped working**, which cost three separate
+/// wrong diagnoses in one day, twice on this very page.
+static CACHE: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Rewrites the report with what serving has changed since.
+fn refresh() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut held = [0u64; 8];
+    for (slot, value) in held.iter_mut().zip(CACHE.iter()) {
+        *slot = value.load(Relaxed);
+    }
+    write_report([
+        MARKER,
+        held[0] + TAKEN.load(Relaxed),
+        held[1],
+        held[2],
+        held[3],
+        held[4],
+        held[5],
+        held[6],
+        held[7],
+        DELIVERED.load(Relaxed),
+        WHY.load(Relaxed),
+        // The ring's own two numbers. Counters are a story about the ring;
+        // these are the ring. Where they disagree, the counters are wrong.
+        // SAFETY: the ring's header, in the region this program mapped.
+        unsafe { core::ptr::read_volatile((RING_AT + ring::HEAD_OFFSET as u64) as *const u64) },
+        SERVING_TAIL.load(Relaxed),
+    ]);
 }
 
 /// How many sockets this service will hand out.
@@ -383,9 +475,15 @@ fn send_datagram(
 /// Fixed, like every other table this system exposes to something it does not
 /// control: a program that could make the service allocate without bound would
 /// hold a denial of service dressed as a feature.
-const SOCKETS: usize = 8;
+const SOCKETS: usize = 4;
 
 /// One bound socket.
+/// The largest datagram a socket will hold for its owner.
+///
+/// A DHCP offer is about three hundred bytes. Fixed and small, because this is
+/// memory a *remote party* fills and there are [`SOCKETS`] of them.
+const DATAGRAM: usize = 384;
+
 #[derive(Clone, Copy)]
 struct Socket {
     /// Zero when this slot is free.
@@ -393,6 +491,126 @@ struct Socket {
     /// Bumped every time the slot is reused, so a capability held across a
     /// close names a socket that no longer exists rather than the next one.
     generation: u32,
+    /// **One** datagram, and the limit is stated rather than implied. A queue
+    /// is a later question; what this step answers is whether a program holding
+    /// a socket can be given what arrived for it.
+    from: Ipv4Addr,
+    from_port: u16,
+    length: u16,
+    held: [u8; DATAGRAM],
+}
+
+/// Takes whatever has arrived and gives each datagram to the socket it is for.
+///
+/// Called from inside a client's `RECV_FROM`, because that is the only event
+/// this service can act on while asleep on its endpoint.
+///
+/// A datagram is matched to a socket by **destination port**. A broadcast
+/// destination is accepted as well as this interface's own address: a client
+/// with no address yet is answered by broadcast, which is the whole reason
+/// DHCP works at all.
+fn drain_ring(sockets: &mut [Socket; SOCKETS], me: (MacAddr, Ipv4Addr), tail: &mut u64) {
+    let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
+        return;
+    };
+    let mut frame = [0u8; MAX_FRAME];
+
+    // Bounded: a client asking for one datagram must not be made to walk an
+    // arbitrarily long backlog before it is answered.
+    for _ in 0..16 {
+        // SAFETY: the ring's header, in the region this program mapped.
+        let head =
+            unsafe { core::ptr::read_volatile((RING_AT + ring::HEAD_OFFSET as u64) as *const u64) };
+        SERVING_TAIL.store(*tail, core::sync::atomic::Ordering::Relaxed);
+        let Some(cursor) = ring::Cursor::new(layout, head, *tail) else {
+            return;
+        };
+        if cursor.readable() < 4 {
+            return;
+        }
+        let mut prefix = [0u8; 4];
+        // SAFETY: the ring is mapped and `prefix` is four writable bytes.
+        if !unsafe { ring_copy_out(layout, cursor, prefix.as_mut_ptr(), 4) } {
+            return;
+        }
+        let length = u32::from_le_bytes(prefix) as usize;
+        if length == 0 || length > MAX_FRAME {
+            // A length this program has stopped believing. Skip the prefix and
+            // carry on rather than wedging on it for ever.
+            *tail = tail.wrapping_add(4);
+            continue;
+        }
+        let Some(after) = ring::Cursor::new(layout, head, *tail + 4) else {
+            return;
+        };
+        // SAFETY: as above; `frame` is `MAX_FRAME` writable bytes and `length`
+        // is bounded by it.
+        if !unsafe { ring_copy_out(layout, after, frame.as_mut_ptr(), length) } {
+            return;
+        }
+        *tail = tail.wrapping_add(4 + length as u64);
+        publish(*tail);
+        TAKEN.store(
+            TAKEN.load(core::sync::atomic::Ordering::Relaxed) + 1,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+
+        // Every refusal below is `bhaskix-net`'s. This program decides only
+        // which socket a datagram belongs to.
+        let seen = if length >= 14 {
+            u16::from_be_bytes([frame[12], frame[13]])
+        } else {
+            0
+        };
+        let Ok(parsed) = EthFrame::parse(&frame[..length]) else {
+            refuse(why::NOT_A_FRAME, length, seen);
+            continue;
+        };
+        if parsed.ethertype != EtherType::IPV4 {
+            refuse(why::NOT_IPV4, length, seen);
+            continue;
+        }
+        let Ok((header, payload)) = Ipv4Header::parse(parsed.payload) else {
+            refuse(why::NOT_A_HEADER, length, seen);
+            continue;
+        };
+        if header.protocol != Protocol::UDP || header.is_fragment() {
+            refuse(why::NOT_UDP, length, seen);
+            continue;
+        }
+        if header.destination != me.1 && header.destination != Ipv4Addr::BROADCAST {
+            refuse(why::NOT_FOR_US, length, seen);
+            continue;
+        }
+        let Ok(datagram) = UdpDatagram::parse(payload, header.source, header.destination) else {
+            refuse(why::NOT_A_DATAGRAM, length, seen);
+            continue;
+        };
+        let Some(socket) = sockets
+            .iter_mut()
+            .find(|held| held.port != 0 && held.port == datagram.destination.0)
+        else {
+            refuse(why::NO_SOCKET, length, seen);
+            continue;
+        };
+        // One datagram, and a second overwrites the first rather than being
+        // dropped: the newest answer is the one a client asking now wants, and
+        // a queue is a later question.
+        let take = datagram.payload.len().min(DATAGRAM);
+        socket.held[..take].copy_from_slice(&datagram.payload[..take]);
+        socket.length = take as u16;
+        socket.from = header.source;
+        socket.from_port = datagram.source.0;
+        // **Counted, because nothing counted it.** Every number this program
+        // reported described frames crossing the ring; not one said whether a
+        // datagram ever reached a socket. So "the client heard nothing" and
+        // "the service delivered nothing" were the same observation, and the
+        // search went looking at the device three times over.
+        DELIVERED.store(
+            DELIVERED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 /// Serves the network to whoever holds a capability to this endpoint.
@@ -408,9 +626,13 @@ fn serve(
     me: (MacAddr, Ipv4Addr),
     gateway: MacAddr,
     can_send: bool,
+    mut tail: u64,
 ) -> ! {
     loop {
         let (status_in, badge, method, args) = receive();
+        // What serving has changed, put where the kernel can read it. See
+        // `CACHE`: without this the page froze at the moment serving began.
+        refresh();
         if status_in != status::OK {
             continue;
         }
@@ -499,22 +721,70 @@ fn serve(
                 reply(socket::OK, 0, 0);
             }
             socket::SEND_TO => {
+                // The payload comes out of memory the **caller** named, with
+                // `DRAIN` -- the mirror of `FILL`, built by RFC 0016 step 3 for
+                // exactly this and used by the block service since. Which
+                // caller is not an argument: it is the one being answered, so a
+                // service cannot read a third party's memory.
+                let mut payload = [0u8; DATAGRAM];
+                let wanted = (args[3] as usize).min(DATAGRAM);
+                let (drained, took) = call(
+                    syscall::INVOKE,
+                    ENDPOINT,
+                    method::DRAIN,
+                    [args[2], payload.as_mut_ptr() as u64, wanted as u64, 0],
+                );
+                if drained != status::OK {
+                    // No memory named, or not held with `READ`. Sending
+                    // something else in its place would answer a different
+                    // question than the one asked.
+                    reply(socket::GONE, 0, 0);
+                    continue;
+                }
                 let sent = send_datagram(
                     me,
                     gateway,
                     held.port,
                     Ipv4Addr(args[0] as u32),
                     args[1] as u16,
+                    &payload[..(took as usize).min(wanted)],
                 );
                 reply(if sent { socket::OK } else { socket::NO_NETWORK }, 0, 0);
             }
             socket::RECV_FROM => {
-                // Nothing is queued per socket yet: the ring is drained by the
-                // frame path and datagrams are counted rather than kept. What
-                // this answers today is "nothing has arrived", which is an
-                // answer and not an error -- and the shape a caller polling
-                // between sends already expects.
-                reply(socket::EMPTY, 0, 0);
+                // **Asking is what makes this service look at the wire.** It is
+                // asleep in `receive` and has no other wakeup, so a client
+                // asking for a datagram is the only event it can act on. Not a
+                // workaround: the alternative is a poll loop, and this system
+                // has already paid for one of those today.
+                drain_ring(sockets, me, &mut tail);
+
+                let waiting = sockets[index as usize];
+                if waiting.length == 0 {
+                    reply(socket::EMPTY, 0, 0);
+                    continue;
+                }
+                let (filled, _) = call(
+                    syscall::INVOKE,
+                    ENDPOINT,
+                    method::FILL,
+                    [
+                        args[0],
+                        waiting.held.as_ptr() as u64,
+                        u64::from(waiting.length),
+                        0,
+                    ],
+                );
+                if filled != status::OK {
+                    reply(socket::GONE, 0, 0);
+                    continue;
+                }
+                sockets[index as usize].length = 0;
+                let mut source = 0u64;
+                for octet in waiting.from.octets() {
+                    source = (source << 8) | u64::from(octet);
+                }
+                reply(socket::OK, source, u64::from(waiting.from_port));
             }
             _ => reply(socket::GONE, 0, 0),
         }
@@ -553,6 +823,10 @@ extern "C" fn ipd_main() -> ! {
     let mut sockets = [Socket {
         port: 0,
         generation: 1,
+        from: Ipv4Addr::UNSPECIFIED,
+        from_port: 0,
+        length: 0,
+        held: [0u8; DATAGRAM],
     }; SOCKETS];
     let mut pongs = 0u64;
     // Only this program advances the tail, so it is kept here and written out
@@ -738,7 +1012,7 @@ extern "C" fn ipd_main() -> ! {
                         pongs,
                     );
                     let gateway = cache.lookup(GATEWAY, ticks).unwrap_or(MacAddr::BROADCAST);
-                    serve(&mut sockets, me, gateway, can_send);
+                    serve(&mut sockets, me, gateway, can_send, tail);
                 }
                 report(
                     frames,
@@ -964,7 +1238,28 @@ fn report(
         // number here that says the whole stack worked end to end rather than
         // that each piece did.
         pongs,
+        DELIVERED.load(core::sync::atomic::Ordering::Relaxed),
+        WHY.load(core::sync::atomic::Ordering::Relaxed),
+        0,
+        0,
     ];
+    for (slot, value) in CACHE.iter().zip([
+        frames,
+        bytes,
+        first_source,
+        refused,
+        built,
+        learned,
+        state,
+        pongs,
+    ]) {
+        slot.store(value, core::sync::atomic::Ordering::Relaxed);
+    }
+    write_report(words);
+}
+
+/// Puts ten words on the report page.
+fn write_report(words: [u64; 13]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.

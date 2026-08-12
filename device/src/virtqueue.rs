@@ -178,6 +178,18 @@ impl<B: Bus> Virtqueue<B> {
     pub fn seen(&self) -> u16 {
         self.used_index
     }
+
+    /// How many buffers have ever been handed to the device.
+    ///
+    /// With [`seen`](Self::seen), this says how many the device is holding
+    /// right now. A receive queue the device has emptied cannot take a frame,
+    /// and the frame is dropped where no counter on the driver's side can see
+    /// it — so the two numbers together are the only way to tell "nothing
+    /// arrived" from "there was nowhere to put it".
+    #[must_use]
+    pub fn posted(&self) -> u16 {
+        self.available_index
+    }
 }
 
 #[cfg(test)]

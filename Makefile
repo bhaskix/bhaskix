@@ -48,6 +48,7 @@ CONSOLED_DIR := user/consoled
 BLKD_DIR     := user/blkd
 NETD_DIR     := user/netd
 IPD_DIR      := user/ipd
+DHCPD_DIR    := user/dhcp
 FSD_DIR      := user/fsd
 SUP_DIR      := user/sup
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
@@ -57,6 +58,7 @@ USER_CONSOLED := $(CONSOLED_DIR)/target/$(TARGET)/release/consoled
 USER_BLKD    := $(BLKD_DIR)/target/$(TARGET)/release/blkd
 USER_NETD    := $(NETD_DIR)/target/$(TARGET)/release/netd
 USER_IPD     := $(IPD_DIR)/target/$(TARGET)/release/ipd
+USER_DHCPD   := $(DHCPD_DIR)/target/$(TARGET)/release/dhcp
 USER_FSD     := $(FSD_DIR)/target/$(TARGET)/release/fsd
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
@@ -80,6 +82,8 @@ NETD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(NETD_DIR)/link.ld
 IPD_FLAGS    := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(IPD_DIR)/link.ld
+DHCPD_FLAGS  := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(DHCPD_DIR)/link.ld
 FSD_FLAGS    := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(FSD_DIR)/link.ld
 
@@ -193,7 +197,7 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
@@ -204,6 +208,7 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USE
 	cp $(USER_BLKD) $(INITRD_ROOT)/bin/blkd
 	cp $(USER_NETD) $(INITRD_ROOT)/bin/netd
 	cp $(USER_IPD) $(INITRD_ROOT)/bin/ipd
+	cp $(USER_DHCPD) $(INITRD_ROOT)/bin/dhcp
 	cp $(USER_FSD) $(INITRD_ROOT)/bin/fsd
 	cp $(USER_SUP) $(INITRD_ROOT)/bin/sup
 	cp $(FS_IMAGE) $(INITRD_ROOT)/fs.img
@@ -273,8 +278,16 @@ $(USER_NETD): $(NETD_DIR)/src/main.rs $(NETD_DIR)/link.ld $(NETD_DIR)/Cargo.toml
 # The protocol service. RFC 0018 step 3. It depends on the ABI alone -- there
 # is no device to drive and, at this step, no protocol to parse.
 $(USER_IPD): $(IPD_DIR)/src/main.rs $(IPD_DIR)/link.ld $(IPD_DIR)/Cargo.toml \
-             $(wildcard abi/src/*.rs)
+             $(wildcard abi/src/*.rs) $(wildcard net/src/*.rs)
 	cd $(IPD_DIR) && RUSTFLAGS="$(IPD_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# The DHCP client. RFC 0018 step 6, and a program rather than a shell command
+# because it needs a socket and a page and should hold a socket and a page.
+$(USER_DHCPD): $(DHCPD_DIR)/src/main.rs $(DHCPD_DIR)/link.ld $(DHCPD_DIR)/Cargo.toml \
+               $(wildcard abi/src/*.rs) $(wildcard net/src/*.rs)
+	cd $(DHCPD_DIR) && RUSTFLAGS="$(DHCPD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
@@ -452,6 +465,7 @@ fmt:
 	cd $(BLKD_DIR) && $(CARGO) fmt --all --check
 	cd $(NETD_DIR) && $(CARGO) fmt --all --check
 	cd $(IPD_DIR) && $(CARGO) fmt --all --check
+	cd $(DHCPD_DIR) && $(CARGO) fmt --all --check
 	cd $(FSD_DIR) && $(CARGO) fmt --all --check
 	cd $(SUP_DIR) && $(CARGO) fmt --all --check
 
@@ -475,6 +489,8 @@ clippy:
 	cd $(NETD_DIR) && RUSTFLAGS="$(NETD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(IPD_DIR) && RUSTFLAGS="$(IPD_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(DHCPD_DIR) && RUSTFLAGS="$(DHCPD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
@@ -564,6 +580,7 @@ clean:
 	cd $(BLKD_DIR) && $(CARGO) clean
 	cd $(NETD_DIR) && $(CARGO) clean
 	cd $(IPD_DIR) && $(CARGO) clean
+	cd $(DHCPD_DIR) && $(CARGO) clean
 	cd $(FSD_DIR) && $(CARGO) clean
 	rm -rf build
 

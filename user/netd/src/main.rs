@@ -126,10 +126,13 @@ mod ring {
     // no other change, put them on the wire. Isolated by bisection: the
     // descriptor index was not the cause, the buffer address was.
     //
-    // **Why is not understood.** 0x5800 and 0x5000 are in the same page of the
-    // same object, inside the same DMA window, so no explanation involving the
-    // mapping survives contact with that. Recorded rather than guessed at, and
-    // the constant removed so nobody inherits an address that does not work.
+    // **Why is now understood, and it was never the address.** This driver did
+    // not write `QUEUE_SIZE`, so the device wrapped the rings at its own
+    // default of 256 while this side wrapped them at four; past the fourth
+    // request the two were reading different slots. Bisection blamed the
+    // address because moving the bytes changed which request went wrong, not
+    // whether one did. The constant stays removed: one transmit buffer is all
+    // this loop can use anyway.
     // One buffer means one transmit outstanding at a time, which this loop
     // already enforces and which the specification requires anyway.
     /// Where this program leaves its findings for the kernel.
@@ -150,6 +153,13 @@ mod common {
     pub const NUM_QUEUES: u64 = 0x12;
     pub const DEVICE_STATUS: u64 = 0x14;
     pub const QUEUE_SELECT: u64 = 0x16;
+    /// How many entries the queue has — **and this was missing entirely**.
+    ///
+    /// The register sits in the two bytes between `QUEUE_SELECT` and
+    /// `QUEUE_MSIX_VECTOR`, which is how the gap in this list was noticed. A
+    /// driver that never writes it leaves the device on its own default, and
+    /// QEMU's default is 256 while this driver builds rings of four.
+    pub const QUEUE_SIZE: u64 = 0x18;
     pub const QUEUE_MSIX_VECTOR: u64 = 0x1a;
     pub const QUEUE_ENABLE: u64 = 0x1c;
     pub const QUEUE_NOTIFY_OFF: u64 = 0x1e;
@@ -359,6 +369,16 @@ unsafe fn kick(index: u16) {
     }
 }
 
+/// The largest frame the **device** has said it wrote, virtio header included.
+///
+/// `received` above is the *first* frame's length and is written once, which
+/// read like a running figure and is not one. A high-water mark is what says
+/// whether a large frame ever arrived at all.
+static WIDEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Receive buffers the device is holding, the last time one completed.
+static OUTSTANDING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Whether the queues took MSI-X vectors.
 static VECTORED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -378,6 +398,22 @@ unsafe fn configure(
     // SAFETY: the caller guarantees the window and the offsets.
     let vectored = unsafe {
         write16(COMMON_AT + common::QUEUE_SELECT, index);
+        // **The size, which this driver never told the device.** Both sides
+        // index the same three rings, and they were indexing them differently:
+        // the driver wrapping at four and the device at its own default of
+        // 256. Entries zero to three agree, which is why anything worked at
+        // all — and why what failed failed so strangely. Past the fourth
+        // request the device read available-ring slots the driver had never
+        // written, and wrote used-ring entries the driver never looked at.
+        //
+        // Three recorded mysteries are this one register. A frame sent on
+        // descriptor two went out with descriptor zero's length. A transmit
+        // buffer at 0x5800 was filled correctly and never transmitted. And no
+        // received frame larger than sixty-four bytes was ever delivered while
+        // three of four buffers sat free. None of them were about descriptors
+        // or addresses or buffers; the two sides simply disagreed about how
+        // long the rings were.
+        write16(COMMON_AT + common::QUEUE_SIZE, QUEUE_ENTRIES);
         // Which MSI-X entry this queue uses is this driver's to say, in a
         // register it holds. What that entry *contains* is the kernel's, and
         // this program has no way to write it. Both queues share entry zero,
@@ -1041,6 +1077,24 @@ extern "C" fn netd_main() -> ! {
         if back_mapped && !outstanding {
             // SAFETY: both rings are mapped and the transmit buffer is inside
             // the rings object this program holds.
+            // **Descriptor zero, and it was descriptor two.** Every frame this
+            // program sent for `bin/ipd` reached the wire truncated to exactly
+            // 42 bytes -- the probe's length, 54, less the virtio header --
+            // however long the frame actually was. The headers were correct
+            // because they are the first 42 bytes of a correct frame, so the
+            // damage was invisible from this side: the ring said 59 bytes taken
+            // and `filter-dump` said 42 on the wire, which is what finally
+            // named it. A server cannot answer a datagram whose IP header
+            // promises 272 bytes and whose frame carries 28.
+            //
+            // **Why descriptor two behaved that way is now known**, and it was
+            // not descriptor two: this driver never wrote `QUEUE_SIZE`, so the
+            // device wrapped the rings at 256 while this side wrapped them at
+            // four. Past the fourth request the device was reading available
+            // entries nobody had written. Descriptor two would work today.
+            // Descriptor zero is kept because it is simpler and `outstanding`
+            // already allows one transmit at a time, so there is never a second
+            // one to name.
             if let Some(from_ipd) = unsafe { take_from_ipd() } {
                 idle = 0;
                 // SAFETY: the transmit buffer this program mapped, just filled.
@@ -1056,13 +1110,13 @@ extern "C" fn netd_main() -> ! {
                 };
                 took_length = from_ipd as u64;
                 transmit.describe(
-                    2,
+                    0,
                     rings_at_device + ring::TX_BUFFER,
                     (VIRTIO_NET_HEADER + from_ipd as u64) as u32,
                     0,
                     0,
                 );
-                transmit.publish(2);
+                transmit.publish(0);
                 // SAFETY: the notify window is mapped and the queue is enabled.
                 unsafe { kick(queue::TRANSMIT) };
                 sent_for_ipd += 1;
@@ -1073,6 +1127,13 @@ extern "C" fn netd_main() -> ! {
         idle = idle.saturating_add(1);
         if let Some((index, written)) = poll_completion(&mut receive) {
             idle = 0;
+            if u64::from(written) > WIDEST.load(core::sync::atomic::Ordering::Relaxed) {
+                WIDEST.store(u64::from(written), core::sync::atomic::Ordering::Relaxed);
+            }
+            OUTSTANDING.store(
+                u64::from(receive.posted().wrapping_sub(receive.seen())),
+                core::sync::atomic::Ordering::Relaxed,
+            );
             let buffer = RINGS_AT + ring_buffer_of(index) + header;
             let length = u64::from(written).saturating_sub(header) as usize;
             // SAFETY: as above.
@@ -1171,6 +1232,8 @@ fn report(
         sent_for_ipd,
         took,
         took_length,
+        WIDEST.load(core::sync::atomic::Ordering::Relaxed),
+        OUTSTANDING.load(core::sync::atomic::Ordering::Relaxed),
     ];
     // SAFETY: the last page of the rings this program mapped writable, which no
     // ring and no buffer reaches. The marker is written *last*, so a kernel

@@ -36,7 +36,28 @@ use crate::sync::{Rank, SpinLock};
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 /// Memory objects that can exist at once.
-pub const MAX_OBJECTS: usize = 16;
+pub const MAX_OBJECTS: usize = 24;
+// Raised from 16 on 2026-08-12, and **this one was measured full before it was
+// raised** -- `peak_live` below reported 16 of 16 on a boot that then refused
+// to create the DHCP client's memory.
+//
+// Worth contrasting with `MAX_DOMAINS` on the same day, which was raised from
+// 32 to 64 on a misread failure and measured 9 of 64 when somebody finally
+// counted. Same shape of fix, opposite justification: one table was full and
+// the other never was. The counter is why the difference is knowable.
+
+/// The most objects ever live at once.
+static PEAK_LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The high-water mark of live objects.
+///
+/// Reported at boot so this table is sized by measurement rather than by
+/// raising it whenever something fails — which is how `MAX_DOMAINS` got raised
+/// on 2026-08-12 for a reason that turned out not to be true.
+#[must_use]
+pub fn peak_live() -> usize {
+    PEAK_LIVE.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Address spaces one object may be mapped into at once.
 ///
@@ -281,6 +302,11 @@ pub fn create(owner: DomainId, length: u64) -> Result<MemoryId, MemoryError> {
                     generation,
                     live: true,
                 };
+                // Live objects, which is what `create` actually competes for.
+                PEAK_LIVE.fetch_max(
+                    arena.objects.iter().filter(|object| object.live).count(),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
                 Some(MemoryId {
                     index: index as u32,
                     generation,

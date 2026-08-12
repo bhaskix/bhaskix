@@ -51,7 +51,9 @@ bhaskix-abi = { path = "../../abi" }
 #      fails if the mapping ever arrives writable.
 #
 # A seventh block would need a reason these six have.
-unsafe_budget = 29
+# 32 at step 5: the socket demonstration, which maps a page and reads what a
+# service filled into it.
+unsafe_budget = 32
 
 [profile.release]
 panic = "abort"

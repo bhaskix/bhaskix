@@ -94,3 +94,10 @@ path = "fuzz_targets/icmp_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dhcp_parse"
+path = "fuzz_targets/dhcp_parse.rs"
+test = false
+doc = false
+bench = false

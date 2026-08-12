@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A DHCP client, in a domain of its own.
+#
+# Not a member of the root workspace, for the reason user/ipd/Cargo.toml gives:
+# it needs its own code model and its own linker script.
+#
+# **A separate program rather than a shell command**, and that is a decision
+# rather than tidiness. The client was written into `bin/shell` first, which
+# meant linking `bhaskix-net` into a program that already holds a domain
+# control capability, a filesystem, a console and a read-only device window --
+# and the binary grew by five kilobytes until the kernel would no longer load
+# it. A client that needs a socket, a page and nothing else should hold a
+# socket, a page and nothing else.
+[workspace]
+
+[package]
+name = "bhaskix-user-dhcp"
+description = "A DHCP client holding a socket and nothing else."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "dhcp"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+# The protocol code. This program holds no device, no DMA window and no
+# interrupt, which is the rule for linking it -- see tools/check-deps.py.
+bhaskix-net = { path = "../../net" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 25, measured after the fact. A program with no library: its own system call
+# stub, its own page mapping and its own report writing are all it contains, and
+# all of it is unsafe by construction. There is no service loop here at all.
+unsafe_budget = 25

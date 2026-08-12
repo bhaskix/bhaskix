@@ -50,4 +50,7 @@ opt-level = "s"
 # become a service. One `asm!` block, and its operand list is most of the count
 # -- the kernel writes the whole message frame back, so every argument register
 # has to be declared as an output.
-unsafe_budget = 105
+# 113 at step 6: the report page is now rewritten while serving, and the ring's
+# own head is read volatile to report it. The counters froze the moment serving
+# began, which read exactly like a service that had stopped working.
+unsafe_budget = 113

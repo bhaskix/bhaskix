@@ -56,4 +56,9 @@ opt-level = "s"
 # 306 at step 4a: the return ring from `bin/ipd`, which is a second ring read
 # and a transmit buffer filled from it. A driver that only ever sent its own
 # bytes now forwards somebody else's, and that is the whole increase.
-unsafe_budget = 307
+# 323 at step 6: the queue-size fix needed no unsafe at all, but finding it did.
+# A high-water mark of what the device says it wrote, and a count of the buffers
+# it is holding — both volatile reads of memory the device shares. Kept rather
+# than removed: they are the two numbers that told a dropped frame from a
+# misread one, and the next receive bug will want them already there.
+unsafe_budget = 323
