@@ -218,7 +218,8 @@ for needing.
 | Situation | Behaviour |
 |---|---|
 | No virtio-net device | The system boots without networking and says so on the console, as it already says `block domain no second device`. Networking is not a boot dependency. |
-| `netd` dies | Every socket stops. **This is RFC 0013's open question 1** — a caller whose service died blocks for ever — and networking makes it worse rather than raising it: a filesystem client that hangs is one program, a stack that hangs is every program that has a socket. This RFC does not solve it and flags that it is now the largest thing standing between this design and something a person would rely on. |
+| `netd` **dies** | Every socket stops, and every caller blocked on it **is told**: `exit` takes the dying thread's reply obligation and abandons its caller with `Revoked`, naming both sides on the console (`kernel/src/sched.rs:2047`). RFC 0017 step 3 built this and closed RFC 0013's question 1 on 2026-08-07. Nothing new is needed here. |
+| `netd` **hangs** | Every caller blocks, indefinitely. This is the live gap, and it is a different one: `kernel/src/ipc.rs:44` states it plainly — *"No timeout on `Recv`. A service bug hangs its callers. RFC 0008 records this as unresolved; it needs a policy decision, not code."* A dead server is detectable because something died; a live server that never answers is indistinguishable from a slow one, which is why it needs a policy and not a mechanism. Networking sharpens it: a hung filesystem stalls the programs using it, a hung stack stalls every program holding a socket, and a stack has a reason to be slow that a filesystem does not — it is waiting for a remote party who may never answer. **This RFC does not solve it and should not be accepted as though it had.** |
 | Ring full, receive | The oldest datagram is dropped and a counter increments. Dropping is what a datagram protocol is permitted to do; blocking the driver is not, because the driver blocking stops every flow rather than one. |
 | Ring full, transmit | `SEND_TO` returns `CONGESTED`, which the shell already knows how to retry (`status::CONGESTED`, and the bounded retry added 2026-08-11). |
 | Hostile frame | Refused at the parser, counted, and never propagated. Every refusal path is a host test. |
@@ -348,10 +349,24 @@ discovered later.
 3. **Does `netd` need to be told its MAC address, or read it?** The device reports one; whether the
    domain may choose a different one is a question about whether a domain can spoof at layer 2, and
    the answer is probably no, and it is not obvious.
-4. **RFC 0013's question 1 is now blocking in practice.** A caller whose service died blocks for
-   ever. With a filesystem that is one program hanging; with a stack it is every program holding a
-   socket. This RFC does not solve it, and it should not be accepted without a decision about who
-   does.
+4. **A service that hangs rather than dies still hangs its callers, and this RFC makes it matter
+   more.** There is no timeout on `Recv`; `kernel/src/ipc.rs:44` has said so since it was written
+   and attributes it to RFC 0008, calling it a policy decision rather than a missing mechanism. A
+   stack is the worst subsystem to have it in, because it is the first one with a legitimate reason
+   to be slow — it is waiting on a remote party — so "unresponsive" and "waiting" are genuinely hard
+   to tell apart here in a way they never were for a disk. Who decides the policy, and whether it
+   is a per-call deadline or something a caller opts into, is not decided by this RFC.
+
+   **Correction, 2026-08-12, the same day this was drafted.** The first version of this document
+   said instead that *"RFC 0013's question 1 is now blocking in practice — a caller whose service
+   died blocks for ever"*. That was wrong, and it was wrong about something already fixed: RFC 0017
+   step 3 closed question 1 on 2026-08-07, `docs/rfc/0013-service-framework.md:242` records it
+   struck through, and `kernel/src/sched.rs:1987-2064` is the code — a dying thread's reply
+   obligation is taken as it stops and its caller is woken with `Revoked` and named on the console.
+   The claim was written from the summary in TRACKER's Phase 2 table, which lists question 1 among
+   the gaps RFC 0017 *found*, without reading on to the row that says it also answered it. Left in
+   rather than deleted, because the wrong version is the reason this question is stated narrowly
+   now.
 
 ## Implementation plan
 

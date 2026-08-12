@@ -656,7 +656,7 @@ what is actually ahead.
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012, all seven steps; per-device windows landed with M7-13. Interrupt remapping **works** as of 2026-08-11 (M6-15) and is still off by default — not for a defect, but because the path was silently broken for its whole life, has been seen working on one emulator, and has never run on real hardware |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets: 901 million executions over `elf::parse` and 12 billion seeded mutations, 2.45 billion over `DMAR`, and 96 million over `ustar` uncapped plus 250 million capped. No crash, no hang, no unbounded loop. The duration §8 asks for is still not met: 24 hours, against two |
-| Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1. Six steps, and **step 1 is worth doing alone** |
+| Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1 — ✅ **answered by step 3** on 2026-08-07, and this row said only that the RFC *found* it until 2026-08-12, when that omission misled the author of RFC 0018 into calling it open. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
 ---
@@ -736,9 +736,20 @@ packet, so the implementation plan ends with building the folded single-domain v
 numbers and throwing the build away — an architectural argument for a boundary should be able to say
 what the boundary costs. Nothing here will ever run on a real NIC while M1-17 is blocked, so the
 whole stack will be tested against one emulated device, and this project's own record says machines
-see different bugs. And **RFC 0013's question 1 is now blocking in practice**: a caller whose service
-died blocks for ever, which with a filesystem hangs one program and with a stack hangs every program
-holding a socket. The draft says it should not be accepted without a decision about who owns that.
+see different bugs. And **a service that hangs rather than dies still hangs its callers**:
+`kernel/src/ipc.rs:44` has recorded that there is no timeout on `Recv` since it was written, calling
+it a policy decision rather than a missing mechanism. A stack is the worst place to have it, because
+it is the first subsystem with a legitimate reason to be slow — it is waiting on a remote party — so
+"unresponsive" and "waiting" are hard to tell apart in a way they never were for a disk.
+
+**A correction, made the same day.** The draft first said that RFC 0013's question 1 — *a caller
+whose service died blocks for ever* — was open and blocking. It is not, and has not been since
+**2026-08-07**: RFC 0017 step 3 closed it, `docs/rfc/0013-service-framework.md:242` has it struck
+through, and `sched.rs:1987-2064` takes a dying thread's reply obligation as it stops and wakes its
+caller with `Revoked`, naming both sides. The wrong claim came from reading this file's Phase 2 row,
+which lists question 1 among the gaps RFC 0017 *found* and does not repeat there that it also
+answered it — the answer is in the PM1 decision-log row instead. Corrected in the RFC in place,
+kept rather than deleted, and noted here because the summary that misled is still in §4.
 
 ### 2026-08-12, last (two documents describing machinery that was never built)
 
