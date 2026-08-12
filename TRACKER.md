@@ -5,10 +5,44 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 
 | | |
 |---|---|
-| **Last updated** | 2026-08-07 |
-| **Phase** | Phase 1 — Foundation |
+| **Last updated** | 2026-08-12 |
+| **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking is next**, and unblocked: it was gated on the driver framework |
 | **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
+
+### How far along is this, in numbers
+
+**There is no single percentage here, and that is a deliberate refusal rather than an omission.**
+Most of this project has no denominator: Phases 3 to 5 are a handful of bullets each with no tasks
+broken out, so any figure computed from the task tables measures how much has been *written down*,
+not how much is left. A headline of "96% complete" would be arithmetically true and badly
+misleading, which is the specific failure this file exists to prevent.
+
+What can be counted honestly, with how to recount it:
+
+| | | how it is derived |
+|---|---|---|
+| Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
+| Phase 2 bullets | **6 of 7 done** | §4 below; the seventh is networking |
+| Networking, within RFC 0018 | **~4½ of 7 steps** | its implementation plan: crate, driver, ring, return path and ARP, ICMP send |
+| Tasks in defined milestones | **92 `DONE`, 4 `TODO`** | `grep -c` on the milestone tables in §3 |
+| Suite | 601 checks, 346 host assertions, 4 placements | §6 |
+
+**Three exit criteria are unmet, and no task count reaches them.** They are the honest answer to
+"how far along":
+
+1. **Phase 0's review criterion.** The design documents have one author and no independent
+   reviewers. Nothing mechanical gates on it, which is exactly why a task count hides it.
+2. **Nothing has ever booted on physical hardware** — M1-17, blocked on a machine. Every number
+   above was measured on one emulator, and this project's own record says machines see different
+   bugs.
+3. **The ELF loader's 24 hours of fuzzing**, unmet since it was written down.
+
+The four remaining `TODO` tasks are `M4-06c` (topology-aware balancing, wants ACPI topology),
+`M4-07b` (priority inheritance, wants a sleeping lock), `M4-10b` (timer wheel, wants a
+many-short-timers workload that no network stack exists to produce yet) — and networking itself.
+Three of the four are waiting on something that does not exist rather than on somebody's time,
+which is the shape of this project's remaining work and is not visible in a ratio.
 
 ### Division of responsibility between documents
 
@@ -705,6 +739,29 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-12, last (a timing assertion removed from a boot gate)
+
+The bulk-path self-test required `message_cycles >= shared_cycles * 2` — shared memory at least
+twice as fast as message passing. **It is now reported and not asserted.**
+
+The comment beside it claimed the factor of two "fails when the bulk path has stopped being one and
+not when the builder is busy". That was exactly backwards. Measured at eight to ten on an idle
+machine, it fell to **1.74** with three fuzz campaigns holding three of eight cores, and went red
+three times in one day — each time in a subsystem unrelated to whatever was being changed.
+
+**The cost was worse than noise: it misdirected.** One red bulk path sent an investigation into the
+domain table, produced a diagnosis built on reading `refusal 7` as `NO_DOMAIN` when it was
+`NOT_YOURS`, and that wrong diagnosis reached the remote before it was caught. A gate whose answer
+depends on how busy the machine is cannot tell a regression from a neighbour — which is this
+project's own definition of a check that is not looking at the thing it claims to check.
+
+What survives is the measurement, printed every boot where a person or a soak can watch it move.
+What is still *asserted* is that the measurement happened at all, because a zero means a broken test
+rather than a slow machine. A ratio that collapses is now a question somebody asks rather than a
+build that fails for a reason nobody trusts.
+
+**Asserting a timing needs an idle machine, and a boot test does not get one.**
 
 ### 2026-08-12, last (RFC 0018 step 4b: ICMP, and a poll loop that cost a processor)
 
