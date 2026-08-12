@@ -376,6 +376,28 @@ unsafe fn kick(index: u16) {
 /// whether a large frame ever arrived at all.
 static WIDEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Bulk copies of a packet's bytes this program has made.
+///
+/// **Counted rather than reasoned about**, which is RFC 0018's own wording. The
+/// RFC claims the two-domain split costs "two copies and two domain crossings
+/// per packet that a monolithic stack does not pay", and a claim of that shape
+/// is a hypothesis until something counts. One increment per packet-sized copy:
+/// the four-byte length prefix in front of each frame is not a packet and is
+/// not counted.
+///
+/// Both sites here are the *ring*, which is exactly the cost the boundary adds:
+/// a frame received into this program's buffer must be copied to reach `ipd`,
+/// and a frame `ipd` built must be copied to reach the device.
+static COPIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Adds one to [`COPIES`].
+fn copied() {
+    COPIES.store(
+        COPIES.load(core::sync::atomic::Ordering::Relaxed) + 1,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Receive buffers the device is holding, the last time one completed.
 static OUTSTANDING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -739,6 +761,8 @@ unsafe fn hand_to_ipd(frame_at: u64, length: usize) -> bool {
     else {
         return false;
     };
+    // Inbound, copy one of two: this program's receive buffer into the ring.
+    copied();
 
     // The bytes, then a fence, then the index that makes them visible. The
     // reader is another domain on another CPU and takes no lock, so this fence
@@ -805,6 +829,8 @@ unsafe fn take_from_ipd() -> Option<usize> {
             core::ptr::write_volatile((RINGS_AT + ring::TX_BUFFER + offset) as *mut u8, 0);
         }
         ring_copy_out(layout, after, into as *mut u8, length)?;
+        // Outbound, copy two of two: the ring into the transmit buffer.
+        copied();
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         core::ptr::write_volatile(
             (BACK_AT + chan::TAIL_OFFSET as u64) as *mut u64,
@@ -1234,6 +1260,7 @@ fn report(
         took_length,
         WIDEST.load(core::sync::atomic::Ordering::Relaxed),
         OUTSTANDING.load(core::sync::atomic::Ordering::Relaxed),
+        COPIES.load(core::sync::atomic::Ordering::Relaxed),
     ];
     // SAFETY: the last page of the rings this program mapped writable, which no
     // ring and no buffer reaches. The marker is written *last*, so a kernel

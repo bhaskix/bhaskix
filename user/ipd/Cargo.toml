@@ -53,4 +53,6 @@ opt-level = "s"
 # 113 at step 6: the report page is now rewritten while serving, and the ring's
 # own head is read volatile to report it. The counters froze the moment serving
 # began, which read exactly like a service that had stopped working.
-unsafe_budget = 113
+# 114 at RFC 0018 step 7: the ring copies are counted now, which is what turned
+# the RFC's "two copies per packet" from a claim into 1.99 measured.
+unsafe_budget = 114

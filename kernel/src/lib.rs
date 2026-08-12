@@ -4886,6 +4886,143 @@ fn net_domain_reported(hhdm: u64) -> bool {
     marker == NETD_MARKER
 }
 
+/// RFC 0018 step 7: times the echo burst and prices the domain boundary.
+///
+/// `bin/ipd` has no clock. It counts phases and replies into its report page,
+/// and this watches the phase number move — so the elapsed time of a phase is
+/// measured by the kernel while the work is done entirely in ring 3.
+///
+/// # What the numbers mean, and what they do not
+///
+/// The serialised phases have one request in flight at a time, so their elapsed
+/// time *is* round trips end to end. The pipelined phases do not wait, and are
+/// bounded in **both** builds by this driver allowing one transmit outstanding
+/// at a time — that is a property of `bin/netd`, not of the boundary.
+///
+/// These are means over a phase, not minima. `report_service_cost` explains why
+/// a mean is the weaker statistic here: one preempted round trip in sixty-four
+/// moves it. A per-packet minimum would need a clock in ring 3, which no
+/// program has.
+fn time_the_burst(hhdm: u64) {
+    use core::sync::atomic::Ordering;
+
+    // `bin/ipd` runs the burst and reports it. RFC 0018 step 7's folded build
+    // read these same four numbers off the *driver's* page instead, because it
+    // had no `bin/ipd`; that build is measured and gone, and what it found is
+    // in TRACKER. The indirection it needed is gone with it.
+    let (raw, marker, base, page) = (
+        NET_RING_REPORT.load(Ordering::Acquire),
+        IPD_MARKER,
+        14usize,
+        0,
+    );
+    if raw == u64::MAX {
+        return;
+    }
+    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return;
+    };
+    if count <= page {
+        return;
+    }
+    let Some(hertz) = bhaskix_arch::tsc::hertz() else {
+        println!("    burst          no calibrated timer; nothing measured");
+        return;
+    };
+
+    let word = |index: usize| -> u64 {
+        // SAFETY: a frame this object owns, through the direct map, read as the
+        // little-endian words the service wrote there.
+        let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[page]) as *const u8, 176) };
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+        u64::from_le_bytes(buffer)
+    };
+
+    if word(0) != marker {
+        return;
+    }
+
+    const NAMES: [&str; 4] = [
+        "serialised   16 B",
+        "serialised 1400 B",
+        "pipelined    16 B",
+        "pipelined  1400 B",
+    ];
+
+    let mut done = 0usize;
+    // **The clock starts when the burst does, not when this function does.**
+    //
+    // It started here once, and the first phase came back at 0.65 microseconds
+    // a round trip — a number that is not physically possible through an
+    // emulated NIC and was believed for exactly as long as it took to read it.
+    // What had happened is that the phase finished before anything looked, so
+    // its elapsed time was measured from the wrong end. The burst does not
+    // begin until `bin/ipd`'s first demonstration ping is answered, which takes
+    // an ARP exchange and a round trip of its own.
+    //
+    // So this waits for the first request of phase zero to go out, and stamps
+    // then.
+    let mut stamp = bhaskix_arch::tsc::read();
+    let mut started = false;
+    // Bounded: a burst that never finishes must not hold the boot. Whatever
+    // completed is reported and the rest is said to be missing rather than
+    // quietly left out.
+    for _ in 0..40_000 {
+        if !started {
+            if word(base + 3) >= 1 || word(base) >= 1 {
+                started = true;
+                stamp = bhaskix_arch::tsc::read();
+            } else {
+                // The driver sleeps on its interrupt; nothing crosses the
+                // return ring unless it is woken. See `wake_net_driver`.
+                wake_net_driver();
+                wait_millis(1);
+                continue;
+            }
+        }
+        let phase = word(base) as usize;
+        while done < phase.min(4) {
+            let now = bhaskix_arch::tsc::read();
+            let elapsed = now.saturating_sub(stamp);
+            stamp = now;
+            let replies = word(base + 2);
+            let micros = elapsed.saturating_mul(1_000_000) / hertz.max(1);
+            let each = micros.checked_div(replies).unwrap_or(0);
+            let rate = replies
+                .saturating_mul(1_000_000)
+                .checked_div(micros)
+                .unwrap_or(0);
+            println!(
+                "    burst          {}: {replies} replies in {}.{:03} ms, {each} us each, {rate}/s",
+                NAMES[done],
+                micros / 1000,
+                micros % 1000
+            );
+            done += 1;
+        }
+        if done >= 4 {
+            break;
+        }
+        wake_net_driver();
+        // **One millisecond, not five.** A phase lasts tens of milliseconds, so
+        // a five-millisecond sampling interval put a large fraction of the
+        // answer into the quantisation: phases came back in an order that made
+        // no sense, with 1400-byte packets faster than 16-byte ones. The burst
+        // is longer for the same reason. This is still a coarse instrument and
+        // the spread across runs is reported rather than hidden.
+        wait_millis(1);
+    }
+    if done < 4 {
+        println!(
+            "\x1b[93m    burst          only {done} of 4 phases finished; the last had sent {} \
+             and heard {} back\x1b[0m",
+            word(base + 3),
+            word(base + 1)
+        );
+    }
+}
+
 /// Reads the driver's counters **again, after the DHCP exchange**.
 ///
 /// [`report_net_domain`] runs before `bin/dhcp` is even started, so every
@@ -4909,11 +5046,11 @@ fn report_net_after_exchange(hhdm: u64) {
     if count <= NETD_REPORT_PAGE {
         return;
     }
-    let mut words = [0u64; 15];
+    let mut words = [0u64; 16];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // fourteen little-endian words the driver wrote there.
+    // sixteen little-endian words the driver wrote there.
     let raw =
-        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 120) };
+        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 128) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -4938,10 +5075,10 @@ fn report_net_after_exchange(hhdm: u64) {
     if count == 0 {
         return;
     }
-    let mut ipd = [0u64; 13];
+    let mut ipd = [0u64; 17];
     // SAFETY: a frame this object owns, through the direct map, read as the ten
     // little-endian words the service wrote there.
-    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 104) };
+    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 136) };
     for (index, word) in ipd.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -4962,6 +5099,27 @@ fn report_net_after_exchange(hhdm: u64) {
         ipd[11],
         ipd[12]
     );
+
+    // RFC 0018 step 7: what the boundary cost, counted rather than argued.
+    //
+    // The RFC claims the split costs "two copies and two domain crossings per
+    // packet that a monolithic stack does not pay". Every copy counted here is
+    // a ring copy, and every ring copy exists only because the driver and the
+    // protocol code are in different domains — so this total divided by the
+    // packets that crossed *is* the claim, checked.
+    let packets = words[9].saturating_add(words[10]);
+    let copies = words[15].saturating_add(ipd[13]);
+    if let Some(whole) = copies.checked_div(packets)
+        && let Some(hundredths) = copies.saturating_mul(100).checked_div(packets)
+    {
+        println!(
+            "    boundary       {copies} ring copies over {packets} packets = {whole}.{:02} per \
+             packet ({} by the driver, {} by the service)",
+            hundredths % 100,
+            words[15],
+            ipd[13]
+        );
+    }
 }
 
 /// Reads what the network driver wrote, and says so.
@@ -6587,6 +6745,16 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         //
         // `ipd` polls, so it needs wall-clock time rather than a barrier, and
         // the frames it counts arrive from a network that chooses when.
+        //
+        // **The burst is timed first, and the position is the measurement.**
+        // It ran after this wait once, and reported the first phase at 0.65
+        // microseconds a round trip — impossible through an emulated NIC, and
+        // exactly what a phase that finished before anyone looked reads as.
+        // The burst starts as soon as `bin/ipd`'s demonstration ping comes
+        // back, which happens inside this wait; a timer that starts afterwards
+        // is measuring its own lateness. This function does the driver poking
+        // the loop below does, so nothing is lost by going first.
+        time_the_burst(hhdm);
         for step in 0..80 {
             // Every half second, so a driver asleep on its interrupt looks at
             // the return ring. See `wake_net_driver` for why the kernel is the

@@ -177,7 +177,9 @@ workspace = true
 # second time, *after* the DHCP exchange rather than before it. Reading them
 # once before the thing being measured had happened is what made three separate
 # wrong diagnoses possible.
-unsafe_budget = 1157
+# 1158 at RFC 0018 step 7: one more report page read, to time the echo burst
+# from a program that has no clock of its own.
+unsafe_budget = 1158
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

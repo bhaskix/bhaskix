@@ -24,7 +24,7 @@ What can be counted honestly, with how to recount it:
 |---|---|---|
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **6 of 7 done** | §4 below; the seventh is networking |
-| Networking, within RFC 0018 | **6 of 7 steps** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page. Step 7, the folded-domain measurement, is not done |
+| Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
 | Tasks in defined milestones | **92 `DONE`, 4 `TODO`** | `grep -c` on the milestone tables in §3 |
 | Suite | 601 checks, 346 host assertions, 4 placements | §6 |
 
@@ -739,6 +739,68 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-13, last (RFC 0018 step 7: what the domain boundary actually costs)
+
+The last step of RFC 0018, and the only one that is not a feature. The RFC says of the folded-domain
+row: *"an architectural argument for a boundary should be able to say what the boundary costs. If
+nobody builds the folded version once, the number is a guess."* So it was built once, measured, and
+deleted.
+
+**Method.** An ICMP echo burst of 256 packets per phase, at 16 and 1400 byte payloads, serialised
+(one in flight, so elapsed time *is* round trips) and pipelined (window of 16). `bin/ipd` counts
+phases and replies into its report page; the kernel stamps `tsc::read()` when the phase number
+moves, because no ring 3 program has a clock. Three runs of each build, `iommu` mode, QEMU with
+slirp, `-smp 4`. Every reply was checked against the wire with `filter-dump`: **1025 echo requests
+and 1025 replies**, which is 4 × 256 plus a warm-up — the counters are not counting themselves.
+
+**Round-trip latency, microseconds, three runs each:**
+
+| | split (netd + ipd) | folded (one domain) |
+|---|---|---|
+| serialised 16 B | 122, 165, 188 | *not measurable, see below* |
+| serialised 1400 B | 137, 162, 167 | 13, 14, 16 |
+| pipelined 16 B | 106, 137, 234 | 10, 11, 13 |
+| pipelined 1400 B | 127, 130, 146 | *phase did not close in time* |
+| **ring copies per packet** | **1.99** (2063 driver + 2062 service over 2063 packets) | **0** |
+
+**The copy claim is confirmed and it is not where the cost is.** RFC 0018 predicted "two copies and
+two domain crossings per packet"; the counter says 1.99, which is that claim measured rather than
+argued. But two copies of at most 1442 bytes are tens of nanoseconds, and the gap between the builds
+is **roughly 130 microseconds** — four orders of magnitude more. The copies do not explain it and
+the RFC's headline, taken alone, would have been misleading.
+
+**What the boundary actually costs here is a missing wakeup.** `bin/ipd` cannot signal `bin/netd`:
+RFC 0010 gives no user-mode signal at all, so a frame `ipd` puts in the return ring sits there until
+the driver happens to be awake — woken by its own receive interrupt, or poked by the kernel, which
+is what `wake_net_driver` exists to do and says so in its own comment. The folded build has no
+handoff to wait for. **So the measured price of the split is not the copies the RFC worried about;
+it is the absence of a primitive the system has not built yet**, and that is a fixable design gap
+rather than an inherent cost of putting the driver in its own domain.
+
+That is the useful result, and it is the opposite of what the RFC expected to find.
+
+**What these numbers are not.** They describe QEMU with slirp and nothing else; **nothing has ever
+booted on physical hardware** (M1-17). The folded build is this driver with the rings taken out, not
+an optimised monolithic stack, so it prices *this* boundary rather than the best possible
+alternative. The spread across runs is wide — 106 to 234 microseconds on one split phase — and is
+reported rather than reduced to a best run.
+
+**Two phases are absent and neither is hidden.** The folded build's first phase begins before the
+kernel's clock does — it has no `bin/ipd` to wait for and starts as soon as it learns the gateway —
+and read 0.04 ms for 256 round trips, which is not physically possible and is excluded. The split's
+warm-up gate is what makes the other phases comparable. The folded pipelined 1400 B phase sent and
+received all 256 but the kernel stopped polling before the phase counter moved.
+
+**Three things went wrong on the way and each was caught by checking rather than by reasoning.** The
+first folded image never reached the initrd, so "folded" numbers were the split build again — caught
+by `10 in /bin` being unchanged. The folded program then spun for ever before its main loop, because
+it inherited `bin/netd`'s refusal to run without a ring to `bin/ipd` that it does not use. And the
+first timing run put phase zero at 0.65 microseconds a round trip, because the clock started after
+the phase had finished. Every one of these produced a confident, plausible, wrong number.
+
+The folded crate, its Makefile rule and the kernel's conditional are **deleted**. The instrumentation
+stays: the copy counters, the burst, and the phase timing are what make this re-checkable.
 
 ### 2026-08-13 (one machine for every harness, and an intermittent failure written down)
 

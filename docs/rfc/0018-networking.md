@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | ✅ **Accepted 2026-08-13**, with all seven steps implemented. A ring 3 program holding a socket and a page obtains an address by DHCP; a ping returns its payload unchanged; six parsers have fuzz targets. **Three claims this document made were wrong and were corrected by building them**, each recorded in place rather than edited away — the `Socket` object kind (step 5), the per-socket payload ring (step 5), and, most usefully, this document's own performance headline (step 7). Open question 1 is answered by step 6; 2, 3 and 4 stay open. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `net`, `drivers`, userspace, ABI |
 | **Milestone** | Phase 2 in [roadmap.md](../roadmap.md) — the last `TODO` bullet |
@@ -314,6 +314,22 @@ That is the honest headline and it should be measured before it is argued about.
 That last row is the one that matters: an architectural argument for a boundary should be able to
 say what the boundary costs. If nobody builds the folded version once, the number is a guess.
 
+**Measured, 2026-08-13 (step 7). The paragraph above is right about the copies and wrong about the
+cost.** The counter says **1.99 ring copies per packet**, which is this document's prediction
+confirmed by counting rather than by argument. But two copies of at most 1442 bytes are tens of
+nanoseconds, and the folded build is roughly **130 microseconds per round trip faster** — four
+orders of magnitude more than the copies can account for.
+
+What the boundary actually costs is a **missing wakeup**. `bin/ipd` cannot signal `bin/netd`:
+RFC 0010 gives no user-mode signal, so a frame in the return ring waits until the driver is awake —
+woken by its own receive interrupt, or poked by the kernel, which is what `wake_net_driver` exists
+to do. The folded build has no handoff to wait for.
+
+So the price of this split is not the copies this section worried about; **it is the absence of a
+primitive the system has not built yet**, which is a fixable gap rather than an inherent cost of
+putting a driver in its own domain. The numbers, the method and the caveats are in `TRACKER.md`; the
+folded build was deleted as this document said it should be.
+
 ## Testing plan
 
 **On the host, which is most of it.** The four parsers take a byte slice and return a decision, so
@@ -354,10 +370,12 @@ discovered later.
 
 ### Genuinely open
 
-1. **What owns the interface's address?** DHCP is a protocol, a client, and a lease timer, and it is
-   not obvious it belongs in `ipd` rather than in a program holding a socket — which would be the
-   more capability-shaped answer, and would make the address configurable by something that can be
-   restarted. Deferred; a static address is enough to prove the path.
+1. ~~**What owns the interface's address?**~~ **Answered by step 6, and the answer is the one this
+   question guessed at.** `bin/dhcp` is a program holding a socket: an endpoint, the slot its socket
+   lands in, one page and a page to report through — no device, no DMA window, no interrupt, no
+   filesystem, no console. It obtains `10.0.2.15` from the network, which is the address the kernel
+   used to hardcode. A program that can get an address for the machine turns out to need almost
+   nothing, and that is only true because a socket is a capability rather than an ambient right.
 2. **How many interfaces?** One, today, because the routing table has one entry. The design does not
    forbid more and nothing has been built that assumes one.
 3. **Does `netd` need to be told its MAC address, or read it?** The device reports one; whether the

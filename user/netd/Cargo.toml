@@ -61,4 +61,5 @@ opt-level = "s"
 # it is holding — both volatile reads of memory the device shares. Kept rather
 # than removed: they are the two numbers that told a dropped frame from a
 # misread one, and the next receive bug will want them already there.
-unsafe_budget = 323
+# 325 at RFC 0018 step 7: the same copy counter at this end of the ring.
+unsafe_budget = 325

@@ -91,6 +91,62 @@ const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 /// What this program puts in an echo request, and expects back unchanged.
 const PING_PAYLOAD: [u8; 17] = *b"bhaskix-icmp-0001";
 
+/// RFC 0018 step 7: the burst that prices the two-domain split.
+///
+/// Every packet in this burst crosses the boundary twice — once from `bin/netd`
+/// into this program, once back — and each crossing is a copy. The RFC claims
+/// that costs "two copies and two domain crossings per packet"; this is the
+/// traffic that makes the claim checkable, and `COPIES` is what checks it.
+///
+/// ICMP echo because it is the only flow QEMU's gateway answers. The identifier
+/// is this program's own and differs from the single demonstration ping above,
+/// so the gate that asserts *that* ping came back unchanged still means what it
+/// meant before.
+const BURST: u32 = 256;
+/// Payload sizes: the smallest worth sending, and near a full frame.
+const BURST_SMALL: usize = 16;
+const BURST_LARGE: usize = 1400;
+/// Whose replies these are.
+const BURST_ID: u16 = 0xbe58;
+/// Requests a pipelined phase keeps in flight at once.
+///
+/// **Not unbounded, and the bound is the point.** "Pipelined" first meant "send
+/// all 256 without waiting", which for 1400-byte packets is 369 KiB pushed at a
+/// 64 KiB ring: the ring overran, frames were dropped at both ends, the phase
+/// never collected its replies and `bin/ipd` went quiet and left for `serve`
+/// with the measurement half done. A sender that overruns its own ring is
+/// measuring drops, not throughput.
+///
+/// Sixteen frames is 23 KiB at the largest payload — comfortably inside a ring
+/// — and is still sixteen times the serialised phase's one.
+const BURST_WINDOW: u32 = 16;
+/// Passes to wait for a phase's replies before giving up on it. Bounded because
+/// a burst that never finishes would keep this program out of `serve`, and the
+/// shell, the DHCP client and every socket wait behind that.
+///
+/// **The pipelined 1400-byte phase needs this and does not reach 256 replies.**
+/// Two hundred and fifty-six frames of 1442 bytes is 369 KiB, and each ring is
+/// 64 KiB, so a sender that does not wait overruns the ring and frames are
+/// dropped at both ends. That is a real property of this boundary — the rings
+/// are a fixed size and a fixed size refuses — and the phase reports how many
+/// replies it actually got rather than pretending to a round number.
+const BURST_PATIENCE: u32 = 20_000;
+
+/// How many burst phases have finished. The kernel stamps the clock when this
+/// moves, which is how a program with no clock gets timed.
+static BURST_PHASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Replies counted in the phase now running.
+static BURST_PONGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Requests sent in the phase now running.
+static BURST_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Replies the phase that just finished actually got.
+///
+/// Kept separately because the running counters reset when a phase ends, and
+/// the kernel reads the page after the edge rather than on it. Without this a
+/// phase that answered 61 of 64 would be indistinguishable from one that
+/// answered all of them.
+static BURST_RESULT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// How long a learned mapping is believed, in **frames handled**.
 ///
 /// This program has no clock — `bhaskix-net` takes time as an argument
@@ -292,6 +348,8 @@ unsafe fn send(frame: &[u8]) -> bool {
     else {
         return false;
     };
+    // Outbound, copy one of two: this program's frame into the return ring.
+    copied();
     // The bytes, then a fence, then the index that publishes them. The reader
     // is another domain on another CPU and takes no lock.
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -384,6 +442,23 @@ fn send_datagram(
 /// Datagrams placed into a bound socket. See `drain_ring`.
 static DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Bulk copies of a packet's bytes this program has made.
+///
+/// **Counted rather than reasoned about**, which is RFC 0018's own wording. See
+/// the same counter in `bin/netd`: together they are what prices the boundary,
+/// because every one of these copies exists only because the driver and the
+/// protocol code are in different domains. The four-byte length prefix in front
+/// of each frame is not a packet and is not counted.
+static COPIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Adds one to [`COPIES`].
+fn copied() {
+    COPIES.store(
+        COPIES.load(core::sync::atomic::Ordering::Relaxed) + 1,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Frames taken from the ring **while serving**, which nothing used to count.
 static TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -467,6 +542,11 @@ fn refresh() {
         // SAFETY: the ring's header, in the region this program mapped.
         unsafe { core::ptr::read_volatile((RING_AT + ring::HEAD_OFFSET as u64) as *const u64) },
         SERVING_TAIL.load(Relaxed),
+        COPIES.load(Relaxed),
+        BURST_PHASE.load(Relaxed),
+        BURST_PONGS.load(Relaxed),
+        BURST_RESULT.load(Relaxed),
+        BURST_SENT.load(Relaxed),
     ]);
 }
 
@@ -548,6 +628,8 @@ fn drain_ring(sockets: &mut [Socket; SOCKETS], me: (MacAddr, Ipv4Addr), tail: &m
         if !unsafe { ring_copy_out(layout, after, frame.as_mut_ptr(), length) } {
             return;
         }
+        // Inbound, copy two of two: the ring into this program's buffer.
+        copied();
         *tail = tail.wrapping_add(4 + length as u64);
         publish(*tail);
         TAKEN.store(
@@ -829,6 +911,12 @@ extern "C" fn ipd_main() -> ! {
         held: [0u8; DATAGRAM],
     }; SOCKETS];
     let mut pongs = 0u64;
+    // RFC 0018 step 7's burst state. See `BURST`.
+    let mut phase = 0u32;
+    let mut burst_sent = 0u32;
+    let mut burst_pongs = 0u32;
+    let mut burst_waited = 0u32;
+    let mut burst_gateway: Option<MacAddr> = None;
     // Only this program advances the tail, so it is kept here and written out
     // rather than read back. A consumer that re-read its own index would be
     // trusting the producer with it.
@@ -947,6 +1035,108 @@ extern "C" fn ipd_main() -> ! {
             }
         }
 
+        // RFC 0018 step 7: the burst, once the single ping above has come back.
+        //
+        // Four phases: serialised at each payload size, then pipelined at each.
+        // Serialised gives round-trip latency, because one request is in flight
+        // at a time and the elapsed time *is* the round trip. Pipelined gives a
+        // rate — bounded, in both the split and folded builds, by this driver
+        // allowing one transmit outstanding at a time, which is a property of
+        // the driver and not of the boundary being priced.
+        //
+        // The kernel cannot see inside this loop, so the phase counter is the
+        // signal: it stamps its clock when the number moves.
+        // The gateway's hardware address is taken once and held for the whole
+        // burst. **The cache expires in frames handled, and the burst handles
+        // more frames than the lifetime**: every run stopped at exactly 245 of
+        // 256 in the last phase, which is the tick where `ARP_LIFETIME` ran out
+        // and `lookup` began returning nothing. Re-asking mid-burst would put
+        // an ARP exchange inside the interval being timed, so the address is
+        // held instead — a measurement keeps everything constant except the
+        // thing it is measuring.
+        if burst_gateway.is_none()
+            && let Some(found) = cache.lookup(GATEWAY, ticks)
+        {
+            burst_gateway = Some(found);
+        }
+        if can_send
+            && pongs >= 1
+            && phase < 4
+            && me.0 != MacAddr::UNSPECIFIED
+            && let Some(gateway) = burst_gateway
+        {
+            let size = if phase.is_multiple_of(2) {
+                BURST_SMALL
+            } else {
+                BURST_LARGE
+            };
+            let serialised = phase < 2;
+            // Serialised waits for the previous reply; pipelined does not.
+            let in_flight = burst_sent.saturating_sub(burst_pongs);
+            let room = if serialised {
+                in_flight == 0
+            } else {
+                in_flight < BURST_WINDOW
+            };
+            if burst_sent < BURST && room {
+                let mut message = [0u8; icmp::HEADER + BURST_LARGE];
+                let mut payload = [0u8; BURST_LARGE];
+                // A pattern rather than zeroes, so a reply that came back
+                // hollow is not mistaken for one that came back whole.
+                for (index, byte) in payload[..size].iter_mut().enumerate() {
+                    *byte = (index as u8) ^ 0x5a;
+                }
+                if let Ok(body) = icmp::write(
+                    &mut message[..icmp::HEADER + size],
+                    false,
+                    BURST_ID,
+                    (burst_sent + 1) as u16,
+                    &payload[..size],
+                ) && ipv4::write_header(
+                    &mut outgoing[eth::HEADER..],
+                    me.1,
+                    GATEWAY,
+                    Protocol::ICMP,
+                    body,
+                    0x2602,
+                )
+                .is_ok()
+                {
+                    let at = eth::HEADER + ipv4::HEADER;
+                    outgoing[at..at + body].copy_from_slice(&message[..body]);
+                    let total = at + body;
+                    if eth::write_header(&mut outgoing, gateway, me.0, EtherType::IPV4).is_ok()
+                        // SAFETY: the return ring is mapped writable.
+                        && unsafe { send(&outgoing[..total]) }
+                    {
+                        burst_sent += 1;
+                        BURST_SENT
+                            .store(u64::from(burst_sent), core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+
+            burst_waited += 1;
+            // A phase ends when every reply is in, or when waiting for them has
+            // gone on long enough that something is not coming. Both end it:
+            // a burst that hangs would keep this program out of `serve`.
+            if burst_pongs >= BURST || burst_waited > BURST_PATIENCE {
+                // What this phase achieved, before the counters go back to zero.
+                BURST_RESULT.store(
+                    u64::from(burst_pongs),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                phase += 1;
+                burst_sent = 0;
+                burst_pongs = 0;
+                burst_waited = 0;
+                BURST_SENT.store(0, core::sync::atomic::Ordering::Relaxed);
+                BURST_PONGS.store(0, core::sync::atomic::Ordering::Relaxed);
+                // Written last, because it is the edge the kernel is watching.
+                BURST_PHASE.store(u64::from(phase), core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         // SAFETY: the ring's header, in the region this program mapped. Read
         // volatile because the producer is another domain and takes no lock.
         let head =
@@ -990,7 +1180,19 @@ extern "C" fn ipd_main() -> ! {
             // configuration never comes at all, which is every boot without a
             // DMA window: there is nothing to wait for and no reason to spin.
             let done = asked && pinged;
-            if (done && quiet > 20_000) || quiet > 2_000_000 {
+            // **Not while a burst phase is unfinished.** This left for `serve`
+            // with the last phase at 245 replies of 256: the ring went quiet
+            // between packets, the counter tripped, and the measurement was
+            // abandoned rather than finished. `BURST_PATIENCE` already bounds a
+            // phase that will never complete, so waiting here cannot hang.
+            //
+            // Gated on the same conditions the burst itself needs. Without
+            // them the burst never starts, `phase` stays at zero for ever, and
+            // waiting for it would strand this program short of `serve` — on
+            // every machine with no network, which is every BIOS boot.
+            if can_send && pongs >= 1 && phase < 4 {
+                // Still measuring. Fall through to another pass.
+            } else if (done && quiet > 20_000) || quiet > 2_000_000 {
                 // **Serve rather than stop.** Through step 4 this program
                 // exited here, because it had nothing to wait on and a poll
                 // loop that never ends is a processor nobody else can have.
@@ -1062,6 +1264,12 @@ extern "C" fn ipd_main() -> ! {
             call(syscall::YIELD, 0, 0, [0; 4]);
             continue;
         }
+        // Inbound, copy two of two, on the demonstration loop's path rather than
+        // the service's. **After** the copy, not before: this path retries when
+        // the producer has published a length and not yet the bytes, and a
+        // counter incremented before the retry would price crossings that never
+        // happened.
+        copied();
 
         // The clock advances per *frame handled*, not per pass round the loop.
         // Per pass it ran at the speed of a spin, so a cache lifetime of a
@@ -1100,6 +1308,19 @@ extern "C" fn ipd_main() -> ! {
                 // any other echo reply on the segment.
                 if echo.payload == PING_PAYLOAD {
                     pongs += 1;
+                } else if echo.identifier == BURST_ID {
+                    // A burst reply. Counted by identifier and length rather
+                    // than by comparing every byte: the comparison is what the
+                    // demonstration ping above is for, and doing it per packet
+                    // would put this program's own memcmp inside the number it
+                    // is trying to measure.
+                    if echo.payload.len() == BURST_SMALL || echo.payload.len() == BURST_LARGE {
+                        burst_pongs += 1;
+                        BURST_PONGS.store(
+                            u64::from(burst_pongs),
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 }
             } else if can_send {
                 // Somebody pinged us. Written, and not exercised on this
@@ -1242,6 +1463,11 @@ fn report(
         WHY.load(core::sync::atomic::Ordering::Relaxed),
         0,
         0,
+        COPIES.load(core::sync::atomic::Ordering::Relaxed),
+        BURST_PHASE.load(core::sync::atomic::Ordering::Relaxed),
+        BURST_PONGS.load(core::sync::atomic::Ordering::Relaxed),
+        BURST_RESULT.load(core::sync::atomic::Ordering::Relaxed),
+        BURST_SENT.load(core::sync::atomic::Ordering::Relaxed),
     ];
     for (slot, value) in CACHE.iter().zip([
         frames,
@@ -1259,7 +1485,7 @@ fn report(
 }
 
 /// Puts ten words on the report page.
-fn write_report(words: [u64; 13]) {
+fn write_report(words: [u64; 18]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.
