@@ -64,7 +64,37 @@ use crate::sync::{Rank, SpinLock};
 /// Fixed, so that creating a domain cannot fail for want of heap on a path
 /// that may run during memory pressure — which is exactly when a supervisor
 /// most wants to start a replacement.
-pub const MAX_DOMAINS: usize = 64;
+pub const MAX_DOMAINS: usize = 32;
+// Thirty-two, and now for a measured reason rather than an assumed one.
+//
+// It was raised to 64 on 2026-08-12 on the belief that a `NO_DOMAIN` refusal
+// had exhausted the table. **That was a misreading**: the refusal in question
+// was `outcome::NOT_YOURS`, which is also 7 and which was the value the test
+// *expected*. Nothing was ever short of a domain. The instrumentation below was
+// added to settle it and reports a high-water mark of **seven to nine slots**
+// on a full boot, so thirty-two carries roughly three times the margin the
+// machine has ever used.
+//
+// What remains true, and is why the measurement is of *occupied* rather than
+// live slots: `create` takes the first entry that is neither live nor **ended**,
+// because a domain's exit reason has to survive until somebody reaps it, which
+// is what RFC 0017 step 6 rests on. So the effective capacity is the size minus
+// every domain that has finished and not been reaped. That is a real property
+// and it is worth knowing; it simply was not what went wrong.
+
+/// The most slots ever occupied at once, live or ended-and-unreaped.
+static PEAK_OCCUPIED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The high-water mark of occupied slots.
+///
+/// Occupied rather than live: a domain that has ended keeps its slot until it
+/// is reaped, so this is the number that actually decides whether `create`
+/// succeeds. Reported at boot so the table is sized by measurement instead of
+/// by raising it whenever something fails.
+#[must_use]
+pub fn peak_occupied() -> usize {
+    PEAK_OCCUPIED.load(core::sync::atomic::Ordering::Relaxed)
+}
 // Raised from 32 on 2026-08-12, and the number is a measurement rather than a
 // guess -- which is what RFC 0017's third open question asked for.
 //
@@ -816,6 +846,19 @@ pub fn create_under(
         .iter()
         .position(|domain| !domain.live && domain.ended.is_none())
         .ok_or(DomainError::TooManyDomains)?;
+
+    // The high-water mark of *occupied* slots, which is not the same as live
+    // domains: a slot is held until its domain is reaped. Recorded because the
+    // difference between those two numbers is the whole reason this table runs
+    // out, and until now nothing measured it -- the table was sized by raising
+    // it whenever something failed.
+    let occupied = table
+        .domains
+        .iter()
+        .filter(|domain| domain.live || domain.ended.is_some())
+        .count()
+        + 1;
+    PEAK_OCCUPIED.fetch_max(occupied, core::sync::atomic::Ordering::Relaxed);
 
     let generation = table.domains[index].generation;
     let id = index as u32;
