@@ -706,6 +706,68 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12, last (RFC 0018 step 3: frames cross a domain boundary)
+
+Nine frames crossed from `bin/netd` to `bin/ipd` through a shared ring, and the first came from the
+same address the driver's own report names — the same frame, intact, after two domain boundaries:
+
+```
+net ring       64 KiB between netd and ipd; bin/ipd started, holding two capabilities and no device
+net frame      received 64 bytes from 52:55:0a:00:02:02, virtio header 12 bytes; 9 handed to the ring
+net ring       9 frames crossed to ipd, 576 bytes, first from 52:55:0a:00:02:02, 0 refused
+```
+
+`bin/ipd` holds **two capabilities**: the ring and a page to report through. No device, no DMA
+window, no interrupt, no configuration space. That asymmetry is the whole of RFC 0018's argument and
+it is now a number on the console rather than a paragraph.
+
+**`abi::ring` had its first caller.** It was written for RFC 0009 step 5 and had waited unused since
+— nine host tests and nobody calling them. Using it instead of writing a second ring was not
+politeness: its shape carries a rule this code needed, which is that `Cursor` is built from
+*numbers* rather than from the region, so a reader physically cannot validate one value and then use
+a different one the writer changed in between.
+
+**Three findings, and the first is the one worth keeping.**
+
+**A capability a program needs at start must be in its space before the program is.** The ring was
+installed into `netd`'s CSpace *after* `netd` was spawned, so the driver reached its own `ATTACH`
+first, failed it, and fell into its idle loop. Nothing ever crossed — and the symptom was **the
+consumer reporting zero frames**, which points at the wrong end of the channel entirely. Diagnosed
+by making the producer report how many frames it had handed over, which turned one ambiguous number
+into two unambiguous ones.
+
+**A report read at the wrong moment measures the reader's timing.** The kernel read `netd`'s report
+the instant its marker appeared, which was before the receive loop had run, so it always said zero
+handed. Both reports are now read after the same wait.
+
+**`MAX_DOMAINS` was 32 and a slot is not freed when a domain ends.** `create` takes the first entry
+that is neither live nor *ended*, because an exit reason has to survive until somebody reaps it —
+which is what RFC 0017 step 6 rests on. So the table's effective capacity is its size minus every
+domain that finished and was never reaped, and the kernel's own self-tests end a dozen that nothing
+reaps. Adding one domain tipped it over, and **the failure appeared in the bulk-path self-test** on
+a UEFI boot: a subsystem with nothing to do with networking, getting `NO_DOMAIN` for the second of
+its own two domains. That is what a shared fixed table does when it runs out. Raised to 64 with the
+mechanism written down, which is **RFC 0017's third open question answered by measurement** rather
+than by argument. A reaper for the kernel's own corpses is a policy decision about who owns an
+unreaped exit reason, and belongs in an RFC rather than in a bug fix.
+
+**The wakeup half of step 3 does not exist, and that is a gap in RFC 0010 rather than a shortcut
+here.** A notification can only be signalled by the **kernel**: a program holding one may `WAIT` and
+`PEEK`, and there is no method that signals. So one domain cannot wake another today, and `ipd`
+polls with a yield between looks. RFC 0018 step 3 asked for a notification and this is why it has
+none; inventing a syscall mid-step would have been the wrong way to find that out.
+
+**Watched failing.** With the frames written into the ring but the index deliberately not published,
+`0 frames crossed` — so the consumer honours the index rather than reading whatever is in the slot.
+The gate requires **at least two** frames, because `netd`'s step-2 self-test handled exactly one and
+a gate satisfied by one could not tell a working receive loop from the old behaviour with a ring
+bolted alongside it.
+
+**Also fixed on the way:** `netd` spun eight million iterations twice per probe while **pinned**,
+which tripped the bring-up watchdog at forty-five seconds. Under emulation a spin is not cheap and a
+pinned thread's spin is a CPU nothing else can have. The steady-state loop polls and yields; the long
+spin stays only in the one-shot self-test.
+
 ### 2026-08-12, last (RFC 0018 step 2: a frame left the machine and one came back)
 
 `bin/netd` drives a virtio network device from ring 3, in a domain holding seven capabilities and no

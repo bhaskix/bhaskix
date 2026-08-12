@@ -43,9 +43,14 @@ opt-level = "s"
 # this domain was not given: three pages of registers, eight of its own memory,
 # and a device that translates through a page table of its own.
 #
-# 210 lines, against `blkd`'s 220 for a device with one queue and no receive
+# 247 at step 3: the ring to `bin/ipd`, which is two copies into a mapping the
+# other domain reads and a volatile publish of the index that makes them
+# visible. Above `blkd`'s 220 now, and the reason is the direction rather than
+# the volume -- this driver hands memory *on*, and a block driver never does.
+#
+# 210 lines at step 2, against `blkd`'s 220 for a device with one queue and no receive
 # path. Two queues cost more setup and the receive side costs more again; what
 # this program does *not* carry is a service loop, which is most of the
 # difference the other way. A wild pointer in here faults in ring 3 and takes
 # the driver down; the same mistake in a kernel driver takes the machine.
-unsafe_budget = 210
+unsafe_budget = 247

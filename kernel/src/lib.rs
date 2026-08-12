@@ -3196,6 +3196,20 @@ const NETD_STACK_PAGES: u64 = 4;
 /// Where the network driver's program is.
 const NETD_PROGRAM: &[u8] = b"bin/netd";
 
+/// Where the protocol service's domain keeps its stack.
+const IPD_STACK: u64 = 0x0000_0000_1300_0000;
+const IPD_STACK_PAGES: u64 = 4;
+
+/// Where the protocol service's program is.
+const IPD_PROGRAM: &[u8] = b"bin/ipd";
+
+/// Bytes in the ring between `bin/netd` and `bin/ipd`.
+///
+/// Sixteen pages, of which `abi::ring` uses the largest power of two that fits
+/// after its header — 32 KiB of frames, which is sixteen at the Ethernet MTU.
+/// Chosen rather than found: a ring is sized by the program that owns it.
+const NET_RING_BYTES: u64 = 16 * 4096;
+
 /// Enters ring 3, refusing to do it from a thread that may migrate.
 ///
 /// **A ring 3 thread in this kernel must be pinned**, and until now that was a
@@ -3783,6 +3797,23 @@ pub fn start_net_domain(
         println!("    net domain     no interrupt delegated; the driver polls its used rings");
     }
 
+    // RFC 0018 step 3: the other half of the stack, and the ring between them.
+    //
+    // **Before the driver is spawned, and that ordering is load-bearing.** It
+    // was after, and `netd` reached its own `ATTACH` of the ring before this
+    // code had installed it — so the attach failed, the driver fell into its
+    // idle loop, and nothing ever crossed. The symptom was a consumer reporting
+    // zero frames, which points at the wrong end entirely. **A capability a
+    // program needs at start has to be in its space before the program is.**
+    //
+    // Started even where the device has no window. `ipd` then finds an empty
+    // ring and says so, which is a more useful state than a domain that was
+    // never created, and it keeps the capability count the architecture
+    // argument rests on visible on every boot.
+    if let Err(reason) = start_ip_domain(cpu, hhdm_base, realm, keeper) {
+        println!("\x1b[91m    net ring       FAILED: {reason}\x1b[0m");
+    }
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -3792,6 +3823,81 @@ pub fn start_net_domain(
     NET_RINGS.store(rings.as_u64(), core::sync::atomic::Ordering::Release);
     Ok(())
 }
+
+/// Creates the ring between `bin/netd` and `bin/ipd`, and starts `bin/ipd`.
+///
+/// # Errors
+///
+/// Any capability that would not be created or installed. Every one of them
+/// leaves the machine bootable: a network stack is a convenience, and a kernel
+/// that refuses to boot without one is worse than a kernel with no network.
+fn start_ip_domain(
+    cpu: u32,
+    hhdm_base: u64,
+    net: domain::DomainId,
+    keeper: domain::DomainId,
+) -> Result<(), &'static str> {
+    let realm = domain::create("ip", domain::ResourceEnvelope::new())
+        .map_err(|_| "the ip domain would not be created")?;
+
+    // The ring is owned by `net-keeper` rather than by either side of it. Both
+    // domains die independently and the ring must outlive whichever goes
+    // first, which is why a keeper exists at all — and it is the *same* keeper
+    // that holds the device's rings rather than a second one, because a domain
+    // is a fixed global resource and a keeper that keeps two things is not
+    // worse at keeping either. A separate `net-ring-keeper` cost a slot, and
+    // the slot was the one the bulk-path self-test needed on a UEFI boot.
+    let ring =
+        shared::create(keeper, NET_RING_BYTES).map_err(|_| "the ring would not be created")?;
+
+    // The same object, named twice. Both sides map it **read-write**, because
+    // both advance an index — so the rights do not enforce the direction here;
+    // the protocol does. Worth stating rather than implying: `netd` already
+    // holds the device and its DMA window, so a compromised `netd` has worse
+    // available to it than scribbling a ring. A future ring between two domains
+    // that are *not* in that relationship needs two objects, not one.
+    let for_producer = shared::name(ring).map_err(|_| "the ring would not be named")?;
+    let for_consumer = shared::name(ring).map_err(|_| "the ring would not be named twice")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(0, for_consumer).is_ok()
+    }) != Some(true)
+    {
+        return Err("the ring would not install in the ip domain");
+    }
+    if domain::with(net, |owner| {
+        owner.cspace.install_at(7, for_producer).is_ok()
+    }) != Some(true)
+    {
+        return Err("the ring would not install in the net domain");
+    }
+
+    // One page for what `ipd` finds, read by the kernel the same way `netd`'s
+    // report is. A driver has no business printing and neither has a service.
+    let report = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the ip report page would not be created")?;
+    let named = shared::name(report).map_err(|_| "the ip report would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(1, named).is_ok()) != Some(true) {
+        return Err("the ip report would not install");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(cpu, "ipd", ip_domain_entry, hhdm_base, hhdm_base, options)
+        .map_err(|_| "the ip domain would not spawn")?;
+
+    NET_RING_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
+    println!(
+        "    net ring       {} KiB between netd and ipd; bin/ipd started, holding two \
+         capabilities and no device",
+        NET_RING_BYTES / 1024
+    );
+    Ok(())
+}
+
+/// The page `bin/ipd` leaves its findings in.
+static NET_RING_REPORT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// The rings the net domain was given, so its report can be read back.
 static NET_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -4487,11 +4593,11 @@ fn report_net_domain(hhdm: u64) -> bool {
         return false;
     }
 
-    let mut words = [0u64; 9];
+    let mut words = [0u64; 10];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // nine little-endian words the driver wrote there.
+    // ten little-endian words the driver wrote there.
     let raw =
-        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 72) };
+        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 80) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -4552,9 +4658,83 @@ fn report_net_domain(hhdm: u64) -> bool {
     let [p, q, r, s, t, u] = octets(words[4]);
     println!(
         "    net frame      received {length} bytes from {p:02x}:{q:02x}:{r:02x}:{s:02x}:{t:02x}:{u:02x}, \
-         virtio header {} bytes",
-        words[5]
+         virtio header {} bytes; {} handed to the ring",
+        words[5], words[9]
     );
+    true
+}
+
+/// The marker `bin/ipd` writes before its report.
+const IPD_MARKER: u64 = 0x3154_5052_4450_4931;
+
+/// Reads what `bin/ipd` found, and says so.
+///
+/// Returns whether anything crossed. **More than one frame is required**, and
+/// that is not fussiness: `netd`'s step-2 self-test handled exactly one frame,
+/// so a gate satisfied by one could not tell a working receive loop from the
+/// old behaviour with a ring bolted to the side of it. A receive queue that is
+/// drained and never refilled works precisely once.
+fn report_net_ring(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_RING_REPORT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return true;
+    }
+    let Some((frames_of, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        println!("\x1b[91m    net ring       FAILED: the report page is gone\x1b[0m");
+        return false;
+    };
+    if count == 0 {
+        println!("\x1b[91m    net ring       FAILED: the report page is empty\x1b[0m");
+        return false;
+    }
+
+    let mut words = [0u64; 5];
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // five little-endian words the service wrote there.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames_of[0]) as *const u8, 40) };
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    // No window means the driver could never make the device receive, so there
+    // is nothing to hand across and nothing to count. Checked **before** the
+    // count rather than only when the report is missing: `ipd` writes a report
+    // the moment it starts, precisely so that "never ran" and "ran and saw
+    // nothing" are distinguishable, which means the absent-marker branch no
+    // longer catches this case. It did, until `ipd` started reporting early.
+    if !NET_CONTAINED.load(Ordering::Acquire) {
+        println!("    net ring       nothing crossed; without a dma window there are no frames");
+        return true;
+    }
+    if words[0] != IPD_MARKER {
+        println!("\x1b[91m    net ring       FAILED: the service left no report\x1b[0m");
+        return false;
+    }
+
+    let (frames, bytes, source, refused) = (words[1], words[2], words[3], words[4]);
+    let octets = [
+        (source >> 40) as u8,
+        (source >> 32) as u8,
+        (source >> 24) as u8,
+        (source >> 16) as u8,
+        (source >> 8) as u8,
+        source as u8,
+    ];
+    let [a, b, c, d, e, f] = octets;
+    println!(
+        "    net ring       {frames} frames crossed to ipd, {bytes} bytes, first from \
+         {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}, {refused} refused"
+    );
+    if frames < 2 {
+        println!(
+            "\x1b[91m    net ring       FAILED: {frames} frames crossed, which one buffer \
+             would explain\x1b[0m"
+        );
+        return false;
+    }
     true
 }
 
@@ -4782,6 +4962,47 @@ extern "C" fn net_domain_entry(hhdm_base: u64) -> ! {
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
     unsafe { enter_user("net domain", entry, rsp, [0, 0]) }
+}
+
+/// Loads and enters `bin/ipd`.
+extern "C" fn ip_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    net ring       FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(IPD_PROGRAM) else {
+        stop("bin/ipd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/ipd is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(IPD_STACK), IPD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/ipd would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = IPD_STACK + IPD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("net ring", entry, rsp, [0, 0]) }
 }
 
 /// Loads and enters `bin/fsd`.
@@ -5724,8 +5945,22 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             }
             wait_millis(50);
         }
+        // Both reports are read after the same wait, and that is a correction:
+        // reading the driver's report the moment its marker appeared caught it
+        // before its receive loop had run, so it always said nothing had been
+        // handed across. A report read at the wrong moment is a measurement of
+        // the reader's timing rather than of the thing measured.
+        //
+        // `ipd` polls, so it needs wall-clock time rather than a barrier, and
+        // the frames it counts arrive from a network that chooses when.
+        for _ in 0..80 {
+            wait_millis(50);
+        }
         if !report_net_domain(hhdm) {
             println!("\x1b[91m    net domain     FAILED\x1b[0m");
+        }
+        if !report_net_ring(hhdm) {
+            println!("\x1b[91m    net ring       FAILED\x1b[0m");
         }
     }
 
@@ -8388,18 +8623,19 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Eight programs in /bin: the ring 3 probe, the user-mode shell,
+            // Nine programs in /bin: the ring 3 probe, the user-mode shell,
             // both services as programs, the block driver (RFC 0013 steps 3, 4
             // and 6), the filesystem (RFC 0016 step 3), the supervisor
-            // (RFC 0017 question 2), and the network driver (RFC 0018 step 2).
-            // Exact rather than "at least", so adding a ninth without noticing
+            // (RFC 0017 question 2), the network driver and the protocol
+            // service (RFC 0018 steps 2 and 3).
+            // Exact rather than "at least", so adding a tenth without noticing
             // this line is a failure rather than a silently weaker test --
             // which it has now been, seven times, once per program added. It
             // is the cheapest assertion in the repository, and it caught the
             // seventh the same day it was written and the eighth the moment
             // `bin/netd` appeared.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 8,
+            entries >= 3 && bin == 9,
         ),
         (
             "the user program is an ELF the loader accepts",

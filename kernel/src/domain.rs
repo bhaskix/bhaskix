@@ -64,7 +64,28 @@ use crate::sync::{Rank, SpinLock};
 /// Fixed, so that creating a domain cannot fail for want of heap on a path
 /// that may run during memory pressure — which is exactly when a supervisor
 /// most wants to start a replacement.
-pub const MAX_DOMAINS: usize = 32;
+pub const MAX_DOMAINS: usize = 64;
+// Raised from 32 on 2026-08-12, and the number is a measurement rather than a
+// guess -- which is what RFC 0017's third open question asked for.
+//
+// **A slot is not freed when a domain ends.** `create` takes the first entry
+// that is neither live nor *ended*, because a domain's exit reason has to
+// survive until somebody asks for it: that is what reaping is, and RFC 0017
+// step 6 rests on it. So the table's effective capacity is its size minus every
+// domain that has finished and not been reaped, and the kernel's own self-tests
+// end a dozen domains that nothing ever reaps.
+//
+// It went unnoticed while the boot created few enough domains to fit anyway.
+// RFC 0018 step 3 added one -- `ip` -- and a UEFI boot then failed in the
+// *bulk-path self-test*, which creates two domains of its own and got
+// `NO_DOMAIN` for the second. The symptom named a subsystem with nothing to do
+// with networking, which is what a shared fixed table does when it runs out.
+//
+// Sixty-four rather than a reaper for the kernel's own corpses: a reaper is a
+// policy decision about who owns an unreaped domain's exit reason, and that
+// belongs in an RFC rather than in a bug fix. The cost is a larger fixed
+// table; the alternative is a limit that depends on how many self-tests ran
+// earlier in the same boot.
 
 /// How a domain ended.
 ///

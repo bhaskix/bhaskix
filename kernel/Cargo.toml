@@ -162,13 +162,15 @@ workspace = true
 # which is the check that would have caught the divergence this fixes: the
 # domain placement delivered one page and called it the file, while the nucleus
 # placement delivered all four.
+# 1139 at RFC 0018 steps 2 and 3. The last three are the direct-map read of
+# the page `bin/ipd` leaves its findings in.
 # 1136 at RFC 0018 step 2. Nine lines, all of them delegation the block path
 # already performs for its device: claiming the network device's MSI-X entry,
 # and two direct-map reads of the page `bin/netd` leaves its report in. The
 # kernel gains no network code at all -- there is no kernel driver for this
 # device class and RFC 0018 says there will not be one -- so what grew is the
 # handing over, not the driving.
-unsafe_budget = 1136
+unsafe_budget = 1139
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The protocol service, in a domain with no device.
+#
+# Not a member of the root workspace, for the reason user/netd/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+#
+# At RFC 0018 step 3 it depends on the ABI alone -- it counts frames and parses
+# nothing. Step 4 adds `bhaskix-net`, and this is the program that may have it:
+# it holds no device, no DMA window and no interrupt, so a parser bug here
+# cannot be turned into a device pointed anywhere. That asymmetry is the whole
+# argument for the two-domain split, and it is visible in these two manifests.
+[workspace]
+
+[package]
+name = "bhaskix-user-ipd"
+description = "The protocol service, in a domain with no device."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "ipd"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 50, measured. A fifth of either driver's, and that is the point rather than a
+# coincidence: this program touches two mappings and no hardware at all. Every
+# line of it is a copy out of a region another domain writes, or a store into
+# the page it reports through -- there is no device register anywhere in it.
+unsafe_budget = 50
