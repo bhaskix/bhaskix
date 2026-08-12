@@ -706,6 +706,37 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12, last (two documents describing machinery that was never built)
+
+Found while checking what `docs/architecture.md` §1 had drifted into, and worth their own entry
+because one of them was not a stale name but a **false safety guarantee**.
+
+**`docs/memory.md` §1 promised a protection the language cannot give.** Its wording: everything is
+copied out of the handoff in `kernel::init::consume_handoff()`, the `Handoff` is moved into that
+function and inaccessible afterwards, and *"the borrow checker enforces what a comment would not"*.
+No such function exists anywhere in the tree. Nothing is copied out. And `Handoff` derives `Copy`,
+so it cannot be moved into a consuming function and made unreachable — there is no borrow to end.
+The paragraph offered a compiler-enforced guarantee about the single bug it names as most likely.
+
+The truth is that the hazard is **not prevented, merely not yet reachable**. `is_usable_now()` is
+true for `Usable` alone, so neither reclaimable kind is ever allocated from, and every boot prints
+`bootloader-reclaimable N KiB -- NOT yet free`. Three facts now stand in the document in place of
+the guarantee: `lib.rs:288` copies the structure and therefore the *pointers*, four of which are
+`&'static` slices into bootloader memory; `initrd` among them is read for the life of the machine —
+program images load out of it and the filesystem serves from it, so "after we stop reading the
+handoff" is not a moment that has arrived; and whoever implements reclaiming gets no diagnostic if
+they miss one. The `AcpiReclaimable` row was the same kind of claim and is marked the same way.
+
+**`docs/security.md` §3 describes a boot-integrity chain with no code behind it.** The specific
+falsehood was `Handoff.tpm_event_log`, a field that has never existed, stated in the present tense.
+`grep -riE '\bpcr\b|attest|secure ?boot'` over the tree returns nothing on the subject: no TPM, no
+PCR extension, no signature verification. The section now says so above the diagram — present-tense
+design writing is exactly how a bullet comes to describe a field nobody ever wrote.
+
+Neither is a code change and both are gate-clean. Recorded because a security document asserting an
+attestation chain it does not have, and a memory document asserting a borrow-check invariant it
+cannot have, are the two places a reader is least able to check for themselves.
+
 ### 2026-08-12, later (the loader returns who it released, so a missing CPU has a name)
 
 The open-defect row asked for "a real deadline plus a report naming which CPU never arrived". The

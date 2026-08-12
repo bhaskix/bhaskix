@@ -28,16 +28,42 @@ the whole point is that it cannot develop bugs.
 | Type | Action |
 |---|---|
 | `Usable` | Hand to the buddy allocator |
-| `BootloaderReclaimable` | Reclaimed *after* we stop reading the handoff — not before |
+| `BootloaderReclaimable` | *Intended*: reclaimed after we stop reading the handoff. **Nothing reclaims it — see below** |
 | `KernelAndModules` | Reserved; already mapped |
 | `Framebuffer` | Reserved; mapped write-combining |
-| `AcpiReclaimable` | Reserved until ACPI tables are parsed and copied, then released |
+| `AcpiReclaimable` | *Intended*: reserved until ACPI tables are parsed and copied, then released. **Nothing releases it either** |
 | `AcpiNvs`, `Reserved`, `BadMemory` | Never touched |
 
+`MemoryKind::is_usable_now()` is true for `Usable` alone, which is what makes the two rows above
+statements of intent rather than of behaviour. Every boot says so on the console:
+`bootloader-reclaimable N KiB -- NOT yet free`.
+
+### Reclaiming, and why the compiler will not save you
+
 The single most common bring-up bug is reclaiming `BootloaderReclaimable` while a `&'static` slice
-still points into it. We copy everything we need out of the handoff into kernel-owned memory in
-`kernel::init::consume_handoff()`, and only then reclaim. The `Handoff` struct is moved into that
-function and is not accessible afterwards — the borrow checker enforces what a comment would not.
+still points into it.
+
+**This section claimed until 2026-08-12 that Bhaskix was protected from it** — that everything was
+copied out in a `kernel::init::consume_handoff()`, that the `Handoff` was moved into it and
+inaccessible afterwards, and that "the borrow checker enforces what a comment would not". None of
+that was true. There is no such function anywhere in the tree, nothing is copied out, and `Handoff`
+derives `Copy`, so it cannot be moved into a consuming function and made unreachable: there is no
+borrow to end. The paragraph offered a guarantee the language cannot give, about the one bug it
+names as most likely.
+
+What is actually true is that the hazard is **not prevented, merely not yet reachable**, and three
+things stand between here and it being reachable:
+
+- **The bytes are still borrowed.** `kernel/src/lib.rs:288` copies the `Handoff` *structure*, and
+  four of its fields are `&'static` slices — `memory_map`, `cmdline`, `loader`, `initrd`. Copying
+  the structure copies the pointers; the bytes stay where the bootloader put them.
+- **They are read for the life of the machine, not just during bring-up.** Program images are
+  loaded out of `handoff.initrd` (`kernel/src/lib.rs:7098`) and the filesystem serves from the same
+  archive. "After we stop reading the handoff" is not a moment that has arrived.
+- **Nothing will warn you.** Whoever implements reclaiming must copy each slice's *contents* into
+  kernel-owned memory and repoint the kernel at the copies. If they forget one, the compiler is
+  silent and the failure is a use-after-free of memory the allocator has since handed to somebody
+  else.
 
 ---
 

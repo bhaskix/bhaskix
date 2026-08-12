@@ -149,6 +149,12 @@ nothing about roles, users, or organisations. This means:
 
 ## 3. Boot integrity
 
+> **None of this is built.** There is no TPM code, no PCR extension, no attestation and no
+> signature verification anywhere in the tree — `grep -riE '\bpcr\b|attest|secure ?boot'` over
+> `*.rs` returns nothing on this subject. What follows is the intended chain, and it is written in
+> the present tense throughout, which is how one of its bullets came to describe a handoff field
+> that has never existed. Read it as a design.
+
 ```
 UEFI firmware (Secure Boot)
    │  verifies signature  ─────────────────────────► PCR 0-7  (firmware, config)
@@ -166,7 +172,9 @@ Domain 0 / init (measured)
 - **Measured boot** gives us an *attestable* chain: the TPM PCRs record what actually ran, and a
   remote verifier can check it. Verification prevents; measurement detects. We do both, because
   Secure Boot alone cannot tell you *which* signed thing ran.
-- The TPM event log is passed through `Handoff.tpm_event_log` so the kernel can extend it.
+- The TPM event log has **no path into the kernel**. This document said until 2026-08-12 that it
+  "is passed through `Handoff.tpm_event_log`"; no such field has ever existed, and carrying one
+  will mean a new handoff field and a `HANDOFF_VERSION` bump.
 - **Sealing:** disk encryption keys are sealed to a PCR policy. A tampered boot chain cannot unseal
   them. The failure mode is "the disk does not decrypt", not "the disk decrypts for an attacker".
 
