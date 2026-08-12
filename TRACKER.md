@@ -706,6 +706,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12, last (a networking RFC, drafted — not accepted)
+
+[RFC 0018](docs/rfc/0018-networking.md) exists as a **draft**. Phase 2's only remaining `TODO`, and
+the bullet its exit criterion — *"does useful network I/O"* — depends on. `net/src` is an empty
+directory today and `tools/check-deps.py` has been reserving layer 4 for a `bhaskix-net` crate that
+has never existed, so the dependency gate has been guarding a hole.
+
+Three decisions were taken before drafting, and the document is shaped by them: **UDP now and TCP as
+its own RFC**, **two domains rather than one** (`bin/netd` drives the device, `bin/ipd` owns the
+protocols, mirroring `blkd`/`fsd`), and **IPv4 first with the address type abstract from the first
+line**, so the second family is additive rather than a retrofit.
+
+The argument the document actually rests on is about where a parser lives. Every untrusted input
+this system parses today arrives from a *medium* — an ELF image, a `ustar` archive, a `DMAR` table —
+controlled by whoever can write the boot device: serious, and bounded, and it arrives once. Network
+input arrives continuously, from anyone who can reach the wire, at line rate. That is why the
+protocol code is in a different domain from the one holding the device's DMA authority, and it is
+the first time this project has had a threat that is not at rest.
+
+**A socket is a capability handed back in a reply** — RFC 0016's mechanism, used a third time after
+`OPEN_AT` and the lent cache page, which is the first evidence it was a mechanism rather than a
+special case. A program holds a socket or it cannot name the network: no port table, no interface
+list, nothing reachable without one. Binding a port is granting, which is the same sentence RFC 0015
+wrote about mounting, and it keeps coming out that way whenever the ambient version is removed.
+
+**What the draft admits rather than hides.** The split costs two copies and two domain crossings per
+packet, so the implementation plan ends with building the folded single-domain version, taking four
+numbers and throwing the build away — an architectural argument for a boundary should be able to say
+what the boundary costs. Nothing here will ever run on a real NIC while M1-17 is blocked, so the
+whole stack will be tested against one emulated device, and this project's own record says machines
+see different bugs. And **RFC 0013's question 1 is now blocking in practice**: a caller whose service
+died blocks for ever, which with a filesystem hangs one program and with a stack hangs every program
+holding a socket. The draft says it should not be accepted without a decision about who owns that.
+
 ### 2026-08-12, last (two documents describing machinery that was never built)
 
 Found while checking what `docs/architecture.md` §1 had drifted into, and worth their own entry
