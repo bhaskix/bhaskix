@@ -845,13 +845,22 @@ else
     status=1
 fi
 
-# The bulk path is still a bulk path. Asserted in the kernel against a factor
-# of two, measured at eight to ten, so it fails when shared memory has stopped
-# paying rather than when the builder is loaded.
+# The cost of the bulk path, **reported and not asserted**.
+#
+# The kernel used to require a factor of two here and this comment used to say
+# it "fails when shared memory has stopped paying rather than when the builder
+# is loaded". That was backwards: measured at eight to ten idle, it fell to 1.74
+# with three fuzz campaigns running, and went red three times in one day in a
+# subsystem unrelated to the change under test -- once sending an investigation
+# into the domain table and producing a wrong diagnosis that reached the remote.
+#
+# So what is checked now is that the measurement *happened*. The numbers are on
+# the record for a person or a soak to watch; a timing assertion needs an idle
+# machine and a boot test does not get one.
 if grep -qE "bulk cost +[0-9]+ bytes: [0-9]+ cycles shared, [0-9]+ by message" "$LOG"; then
-    pass "shared memory still beats the message path, and by how much is on the record"
+    pass "the bulk path's cost was measured and recorded"
 else
-    fail "the bulk path's cost was not reported"
+    fail "the bulk path's cost was not measured"
     status=1
 fi
 

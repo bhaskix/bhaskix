@@ -6667,14 +6667,31 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
 
     // What the same file costs by message, at the RFC's own figure.
     let by_message = bytes.div_ceil(bhaskix_abi::CHUNK_BYTES as u64).max(1);
-    // The one thing worth asserting about a timing: that shared memory is
-    // still faster than fifteen round trips. Not a budget -- a factor of two,
-    // against a measured eight to ten, so it fails when the bulk path has
-    // stopped being one and not when the builder is busy. A tighter number
-    // here would be a test of whatever machine CI runs on.
+    // **The ratio is reported and no longer asserted**, and the sentence that
+    // used to be here is why it had to change. It said a factor of two "fails
+    // when the bulk path has stopped being one and not when the builder is
+    // busy", and that turned out to be exactly backwards: measured against
+    // eight to ten on an idle machine, it fell to 1.74 with three fuzz
+    // campaigns holding three of eight cores, and the gate went red three times
+    // in one day in a subsystem unrelated to whatever was being changed.
+    //
+    // Worse than the noise, it misdirected. A red bulk path sent one
+    // investigation into the domain table and produced a wrong diagnosis that
+    // reached the remote before it was caught. A gate whose answer depends on
+    // how busy the machine is cannot distinguish a regression from a neighbour,
+    // and this project has a name for that: it is a check that is not looking
+    // at the thing it claims to check.
+    //
+    // What survives is the measurement. The numbers are printed on every boot,
+    // where a person or a soak can watch them move; a ratio that collapses is
+    // then a question somebody asks, rather than a build that fails for a
+    // reason nobody trusts. Asserting a *timing* needs an idle machine, and a
+    // boot test does not get one.
     let shared_cycles = BULK_CYCLES.load(Ordering::Relaxed);
     let message_cycles = MESSAGE_CYCLES.load(Ordering::Relaxed);
-    let worth_it = shared_cycles > 0 && message_cycles >= shared_cycles.saturating_mul(2);
+    // Still asserted, because it is not a timing: a zero means the measurement
+    // never happened, which is a broken test rather than a slow machine.
+    let measured = shared_cycles > 0 && message_cycles > 0;
 
     // Both placements must deliver more than one page, and put it in the right
     // place. `spanned` is the count; `spans_pages` is the contents past the
@@ -6686,7 +6703,7 @@ fn bulk_service_self_test(filesystem: ipc::EndpointId, hhdm: u64) -> bool {
         && spanned > bhaskix_mm::FRAME_SIZE
         && spans_pages
         && refused == bhaskix_abi::outcome::NOT_YOURS
-        && worth_it;
+        && measured;
     if ok {
         println!(
             "    bulk path      {bytes} bytes in {trips} round trip against {by_message} \
