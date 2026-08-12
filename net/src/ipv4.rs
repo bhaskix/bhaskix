@@ -181,6 +181,67 @@ impl Ipv4Header {
     }
 }
 
+/// Writes an IPv4 header with no options, and returns how many bytes.
+///
+/// The total length written is `HEADER + payload_length`, so a caller fills the
+/// payload itself and this never copies it — the same arrangement
+/// [`crate::udp::write`] uses, and for the same reason: a writer that took the
+/// payload would copy every byte twice on the way to a device.
+///
+/// # Errors
+///
+/// - [`NetError::Truncated`] if `out` cannot hold [`HEADER`] bytes.
+/// - [`NetError::LengthBeyondBuffer`] if the header plus the payload would
+///   exceed what a total-length field can state.
+pub fn write_header(
+    out: &mut [u8],
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    protocol: Protocol,
+    payload_length: usize,
+    identification: u16,
+) -> Result<usize, NetError> {
+    let total = HEADER
+        .checked_add(payload_length)
+        .ok_or(NetError::LengthBeyondBuffer {
+            stated: payload_length,
+            have: MAX_DATAGRAM,
+        })?;
+    if total > MAX_DATAGRAM {
+        return Err(NetError::LengthBeyondBuffer {
+            stated: total,
+            have: MAX_DATAGRAM,
+        });
+    }
+    let available = out.len();
+    let header = out.get_mut(..HEADER).ok_or(NetError::Truncated {
+        need: HEADER,
+        have: available,
+    })?;
+
+    header[0] = 0x45; // version 4, five 32-bit words of header
+    header[1] = 0;
+    header[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    header[4..6].copy_from_slice(&identification.to_be_bytes());
+    // `DF`: this datagram is not to be fragmented. Set rather than left clear
+    // because nothing here reassembles what it sends, and a sender that permits
+    // fragmentation of traffic it cannot reassemble the answer to is asking a
+    // question it may not be able to hear.
+    header[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    header[8] = 64; // a hop count that crosses the internet and does not loop
+    header[9] = protocol.0;
+    header[10..12].copy_from_slice(&[0, 0]);
+    header[12..16].copy_from_slice(&source.octets());
+    header[16..20].copy_from_slice(&destination.octets());
+
+    // Computed last, over the header with its own field zeroed — which it is,
+    // because the two bytes were written as zero above and nothing has changed
+    // them.
+    let sum = checksum(&[&header[..HEADER]]);
+    header[10..12].copy_from_slice(&sum.to_be_bytes());
+    Ok(HEADER)
+}
+
 /// Identifies the datagram a fragment belongs to.
 ///
 /// All four fields, as the specification requires. Keying on the identification
@@ -533,6 +594,54 @@ mod tests {
             Ipv4Header::parse(&bytes[..HEADER + 4]),
             Err(NetError::BadHeaderLength { words: 15, .. })
         ));
+    }
+
+    #[test]
+    fn a_written_header_parses_back_and_its_checksum_verifies() {
+        // The writer and the parser are the two halves most likely to disagree
+        // about the checksum, because each computes it over a span it decides
+        // for itself. A round trip is the cheapest way to keep them honest.
+        let mut out = [0u8; 64];
+        assert_eq!(
+            write_header(&mut out, SOURCE, DESTINATION, Protocol::ICMP, 8, 0x1234).unwrap(),
+            HEADER
+        );
+        out[HEADER..HEADER + 8].copy_from_slice(&[9u8; 8]);
+        let (header, payload) = Ipv4Header::parse(&out[..HEADER + 8]).unwrap();
+        assert_eq!(header.source, SOURCE);
+        assert_eq!(header.destination, DESTINATION);
+        assert_eq!(header.protocol, Protocol::ICMP);
+        assert_eq!(header.total_length, HEADER + 8);
+        assert_eq!(header.identification, 0x1234);
+        assert!(header.dont_fragment);
+        assert!(!header.is_fragment());
+        assert_eq!(payload, &[9u8; 8]);
+
+        // One bit of the header flipped must now fail, which is what says the
+        // checksum written was the checksum and not a constant.
+        out[8] ^= 0x01;
+        assert!(matches!(
+            Ipv4Header::parse(&out[..HEADER + 8]),
+            Err(NetError::BadChecksum { .. })
+        ));
+    }
+
+    #[test]
+    fn a_header_that_will_not_fit_is_refused() {
+        let mut small = [0u8; HEADER - 1];
+        assert!(write_header(&mut small, SOURCE, DESTINATION, Protocol::ICMP, 0, 0).is_err());
+        let mut out = [0u8; 64];
+        assert!(
+            write_header(
+                &mut out,
+                SOURCE,
+                DESTINATION,
+                Protocol::ICMP,
+                MAX_DATAGRAM,
+                0
+            )
+            .is_err()
+        );
     }
 
     #[test]

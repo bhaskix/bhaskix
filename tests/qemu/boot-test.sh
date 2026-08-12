@@ -980,7 +980,11 @@ fi
 # RFC 0018 step 3: frames crossing from the driver's domain to the protocol
 # service's, through a shared ring.
 #
-# **At least two frames**, not at least one. `netd`'s step-2 self-test handled
+# **At least two frames**, not at least one. Written as `([2-9]|[1-9][0-9]+)`
+# rather than `[2-9][0-9]*`, which was the first version and which stopped
+# matching the moment the count reached ten -- it pins the first digit, so "10"
+# fails a test meaning "at least two". A range written as a character class is
+# a range that is wrong at the next power of ten. `netd`'s step-2 self-test handled
 # exactly one, so a gate satisfied by one could not tell a working receive loop
 # from the old behaviour with a ring bolted alongside it — a receive queue that
 # is drained and never refilled works precisely once.
@@ -989,7 +993,7 @@ fi
 # the same address the driver's own report names. That is what makes this a test
 # of a frame crossing intact rather than of a counter moving: a ring delivering
 # zeroed slots would pass a count and fail this.
-if grep -qE "net ring +[2-9][0-9]* frames crossed to ipd, [0-9]+ bytes, first from 52:55:[0-9a-f:]+, 0 refused" "$LOG"; then
+if grep -qE "net ring +([2-9]|[1-9][0-9]+) frames crossed to ipd, [0-9]+ bytes, first from 52:55:[0-9a-f:]+, 0 refused" "$LOG"; then
     pass "frames crossed from the driver's domain to the protocol service's"
 elif grep -qE "net domain +no device on the bus" "$LOG"; then
     pass "no network device on this machine, so nothing to hand across"
@@ -998,6 +1002,33 @@ elif grep -qE "net ring +nothing crossed; without a dma window" "$LOG"; then
 else
     fail "frames did not cross to the protocol service"
     grep -E "net ring|net frame" "$LOG" || true
+    status=1
+fi
+
+# RFC 0018 step 4a: the return path, gated from **both ends**.
+#
+# `ipd` says how many frames it built; `netd` says how many it took out of the
+# return ring and put on the wire. Two assertions rather than one, because
+# "nothing came out" has an end at each side of a ring and a single number
+# cannot say which — the ambiguity that cost step 3 an hour of looking at the
+# wrong program.
+#
+# What makes this a test of the *path* and not of a counter: the frame `ipd`
+# builds is an ARP request for 10.0.2.3, and `netd`'s own probe asks for
+# 10.0.2.2. A request for .3 on the wire can only have been built by a program
+# that holds no device, crossed the ring, and been transmitted by one that
+# cannot parse it. That is checked by hand with `filter-dump`; what the boot can
+# check is the pair of counts.
+if grep -qE "net reply +ipd built [1-9][0-9]* frames" "$LOG" &&
+   grep -qE "net frame +.*, [1-9][0-9]* sent back for ipd" "$LOG"; then
+    pass "the protocol service built a frame and the driver put it on the wire"
+elif grep -qE "net domain +no device on the bus" "$LOG"; then
+    pass "no network device on this machine, so nothing to send"
+elif grep -qE "net ring +nothing crossed; without a dma window" "$LOG"; then
+    pass "no dma window, so nothing can be sent"
+else
+    fail "the return path did not carry a frame"
+    grep -E "net reply|net frame|net config" "$LOG" || true
     status=1
 fi
 

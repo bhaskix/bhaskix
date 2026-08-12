@@ -6,11 +6,10 @@
 # gives: it needs its own code model and its own linker script, and a workspace
 # member cannot have its own `rustflags`.
 #
-# At RFC 0018 step 3 it depends on the ABI alone -- it counts frames and parses
-# nothing. Step 4 adds `bhaskix-net`, and this is the program that may have it:
-# it holds no device, no DMA window and no interrupt, so a parser bug here
-# cannot be turned into a device pointed anywhere. That asymmetry is the whole
-# argument for the two-domain split, and it is visible in these two manifests.
+# It depends on `bhaskix-net`, and it is the program that may: it holds no
+# device, no DMA window and no interrupt, so a parser bug here cannot be turned
+# into a device pointed anywhere. That asymmetry is the whole argument for the
+# two-domain split, and it is visible in these two manifests.
 [workspace]
 
 [package]
@@ -28,6 +27,12 @@ path = "src/main.rs"
 
 [dependencies]
 bhaskix-abi = { path = "../../abi" }
+# RFC 0018 step 4a. The first program to link the protocol code, and the only
+# one that may: it holds no device, no DMA window and no interrupt, so a parser
+# bug here cannot be turned into hardware pointed anywhere. `user/netd` is
+# deliberately without this dependency and the two manifests together are what
+# the two-domain split looks like from the build system.
+bhaskix-net = { path = "../../net" }
 
 [profile.release]
 panic = "abort"
@@ -38,4 +43,7 @@ opt-level = "s"
 # coincidence: this program touches two mappings and no hardware at all. Every
 # line of it is a copy out of a region another domain writes, or a store into
 # the page it reports through -- there is no device register anywhere in it.
-unsafe_budget = 50
+# 87 at step 4a: writing into the return ring, and reading the configuration
+# page. Still a third of either driver's, and still not a device register
+# anywhere in it.
+unsafe_budget = 89

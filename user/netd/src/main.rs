@@ -56,6 +56,8 @@ const HANDLER: u64 = 5;
 const SIGNAL: u64 = 6;
 /// Slot: the ring frames are handed to `bin/ipd` through.
 const RING: u64 = 7;
+/// Slot: the ring `bin/ipd` hands frames back through.
+const BACK: u64 = 8;
 
 /// Where this program maps what it holds.
 const COMMON_AT: u64 = 0x2000_0000;
@@ -66,6 +68,8 @@ const RINGS_AT: u64 = 0x2010_0000;
 /// memory a *device* reads, this is memory another *domain* reads, and the two
 /// are deliberately different objects with different owners.
 const RING_AT: u64 = 0x2020_0000;
+/// Where the return ring from `bin/ipd` is mapped.
+const BACK_AT: u64 = 0x2030_0000;
 
 /// Bytes in the ring to `bin/ipd`, matching what the kernel granted.
 const RING_BYTES: usize = 16 * 4096;
@@ -114,6 +118,20 @@ mod ring {
     pub const RX_BUFFER: u64 = 0x800;
     /// The frame this program sends.
     pub const TX_BUFFER: u64 = 0x5000;
+    // A second transmit buffer at 0x5800 was here and is **deliberately gone**.
+    //
+    // Frames copied into it were correct -- the driver read back the right
+    // forty-two bytes beginning with the broadcast address -- and the device
+    // never transmitted them. Moving the same bytes to the buffer above, with
+    // no other change, put them on the wire. Isolated by bisection: the
+    // descriptor index was not the cause, the buffer address was.
+    //
+    // **Why is not understood.** 0x5800 and 0x5000 are in the same page of the
+    // same object, inside the same DMA window, so no explanation involving the
+    // mapping survives contact with that. Recorded rather than guessed at, and
+    // the constant removed so nobody inherits an address that does not work.
+    // One buffer means one transmit outstanding at a time, which this loop
+    // already enforces and which the specification requires anyway.
     /// Where this program leaves its findings for the kernel.
     pub const REPORT: u64 = 0x7000;
 }
@@ -701,6 +719,103 @@ unsafe fn hand_to_ipd(frame_at: u64, length: usize) -> bool {
     true
 }
 
+/// Takes one frame out of the return ring, if `bin/ipd` has put one there.
+///
+/// Returns its length. The frame is copied straight into the transmit buffer
+/// **after** the virtio header, so nothing is copied twice.
+///
+/// # Safety
+///
+/// The return ring must be mapped at [`BACK_AT`] and the rings at [`RINGS_AT`].
+unsafe fn take_from_ipd() -> Option<usize> {
+    let layout = chan::Layout::for_region(RING_BYTES)?;
+    // SAFETY: the ring's header, in the region this program mapped. Volatile
+    // because the producer is another domain and takes no lock.
+    let (head, tail) = unsafe {
+        (
+            core::ptr::read_volatile((BACK_AT + chan::HEAD_OFFSET as u64) as *const u64),
+            core::ptr::read_volatile((BACK_AT + chan::TAIL_OFFSET as u64) as *const u64),
+        )
+    };
+    let cursor = chan::Cursor::new(layout, head, tail)?;
+    if cursor.readable() < 4 {
+        return None;
+    }
+
+    let mut prefix = [0u8; 4];
+    // SAFETY: the ring is mapped and `prefix` is four writable bytes.
+    unsafe { ring_copy_out(layout, cursor, prefix.as_mut_ptr(), 4)? };
+    let length = u32::from_le_bytes(prefix) as usize;
+    // A length the *other side* wrote. Bounded before it is used, and refused
+    // rather than clamped: a frame that does not fit a buffer is not a shorter
+    // frame, it is a producer this program has stopped believing.
+    if length == 0 || length > (ring::RX_BUFFER as usize - VIRTIO_NET_HEADER as usize) {
+        return None;
+    }
+    let after = chan::Cursor::new(layout, head, tail + 4)?;
+    if after.readable() < length {
+        // The length is published and the bytes are not. Look again later
+        // without moving the tail: this is not an error, it is a race the
+        // producer will finish losing in a moment.
+        return None;
+    }
+
+    let into = RINGS_AT + ring::TX_BUFFER + VIRTIO_NET_HEADER;
+    // SAFETY: the ring is mapped, and the destination is inside a transmit
+    // buffer this program mapped writable, bounded by the check above.
+    unsafe {
+        // The virtio header this device expects in front of every frame.
+        for offset in 0..VIRTIO_NET_HEADER {
+            core::ptr::write_volatile((RINGS_AT + ring::TX_BUFFER + offset) as *mut u8, 0);
+        }
+        ring_copy_out(layout, after, into as *mut u8, length)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        core::ptr::write_volatile(
+            (BACK_AT + chan::TAIL_OFFSET as u64) as *mut u64,
+            tail + 4 + length as u64,
+        );
+    }
+    Some(length)
+}
+
+/// Copies `length` bytes out of a ring at `cursor` into `into`.
+///
+/// # Safety
+///
+/// The ring must be mapped at [`BACK_AT`] and `into` writable for `length`.
+unsafe fn ring_copy_out(
+    layout: chan::Layout,
+    cursor: chan::Cursor,
+    into: *mut u8,
+    length: usize,
+) -> Option<()> {
+    if cursor.readable() < length {
+        return None;
+    }
+    let (first, second) = chan::read_runs(layout, cursor, length);
+    if first.length + second.length != length {
+        return None;
+    }
+    // SAFETY: both runs are offsets `abi::ring` computed inside the region this
+    // program mapped, and `into` is writable for `length` by the caller's
+    // obligation.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (BACK_AT + first.offset as u64) as *const u8,
+            into,
+            first.length,
+        );
+        if !second.is_empty() {
+            core::ptr::copy_nonoverlapping(
+                (BACK_AT + second.offset as u64) as *const u8,
+                into.add(first.length),
+                second.length,
+            );
+        }
+    }
+    Some(())
+}
+
 /// Looks once, without spinning and without blocking.
 ///
 /// The steady-state loop uses this rather than [`await_completion`], and the
@@ -732,12 +847,12 @@ extern "C" fn netd_main() -> ! {
     // kernel.
     let (mapped, rings_at_device) = call(syscall::INVOKE, WINDOW, method::MAP, [RINGS, 0, 0, 0]);
     if mapped != status::OK {
-        report(0, 0, 0, 0, 0, 0, 0);
+        report(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         exit()
     }
 
     let Some((mut receive, mut transmit)) = bring_up(rings_at_device) else {
-        report(0, 0, 0, 0, 0, 0, 0);
+        report(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         exit()
     };
 
@@ -832,6 +947,9 @@ extern "C" fn netd_main() -> ! {
         header,
         u64::from(receive.seen()),
         0,
+        0,
+        0,
+        0,
     );
 
     // Everything after this is step 3: frames go to `bin/ipd` rather than into
@@ -839,6 +957,10 @@ extern "C" fn netd_main() -> ! {
     // idles rather than exiting -- a domain that ended would take the rings the
     // kernel reads its report from with it.
     let mut handed = 0u64;
+    let mut sent_for_ipd = 0u64;
+    let mut took = 0u64;
+    let mut took_length = 0u64;
+    let back_mapped = attach(BACK, BACK_AT, 1);
     if !attach(RING, RING_AT, 1) {
         loop {
             call(syscall::YIELD, 0, 0, [0; 4]);
@@ -884,21 +1006,73 @@ extern "C" fn netd_main() -> ! {
         header,
         u64::from(receive.seen()),
         handed,
+        sent_for_ipd,
+        took,
+        took_length,
     );
     let mut probes = 0u32;
+    let mut outstanding = false;
+    let mut idle = 0u32;
     loop {
-        // One probe per pass, and the completion collected on a later pass
-        // rather than waited for here.
-        if probes < 8 {
+        // **One transmit outstanding at a time.** A descriptor handed to the
+        // device is the device's until it appears in the used ring, and this
+        // loop was republishing descriptor zero every pass without waiting --
+        // rewriting a descriptor the device had not finished with. The probes
+        // survived it because every probe is the same bytes; the first frame
+        // that differed, `ipd`'s, was published into a queue already being
+        // mishandled and never reached the wire.
+        if poll_completion(&mut transmit).is_some() {
+            outstanding = false;
+        }
+
+        // One probe per pass, and only when the last one is done.
+        if probes < 8 && !outstanding {
             transmit.describe(0, rings_at_device + ring::TX_BUFFER, length as u32, 0, 0);
             transmit.publish(0);
             // SAFETY: the notify window is mapped and the queue is enabled.
             unsafe { kick(queue::TRANSMIT) };
             probes += 1;
+            outstanding = true;
         }
-        let _ = poll_completion(&mut transmit);
 
+        // Anything `bin/ipd` has built goes out. One per pass, and the
+        // completion collected on a later pass -- this program is pinned, and
+        // step 3 established that a spin here trips the bring-up watchdog.
+        if back_mapped && !outstanding {
+            // SAFETY: both rings are mapped and the transmit buffer is inside
+            // the rings object this program holds.
+            if let Some(from_ipd) = unsafe { take_from_ipd() } {
+                idle = 0;
+                // SAFETY: the transmit buffer this program mapped, just filled.
+                took = unsafe {
+                    let mut value = 0u64;
+                    for octet in 0..6u64 {
+                        value = (value << 8)
+                            | u64::from(read8(
+                                RINGS_AT + ring::TX_BUFFER + VIRTIO_NET_HEADER + octet,
+                            ));
+                    }
+                    value
+                };
+                took_length = from_ipd as u64;
+                transmit.describe(
+                    2,
+                    rings_at_device + ring::TX_BUFFER,
+                    (VIRTIO_NET_HEADER + from_ipd as u64) as u32,
+                    0,
+                    0,
+                );
+                transmit.publish(2);
+                // SAFETY: the notify window is mapped and the queue is enabled.
+                unsafe { kick(queue::TRANSMIT) };
+                sent_for_ipd += 1;
+                outstanding = true;
+            }
+        }
+
+        idle = idle.saturating_add(1);
         if let Some((index, written)) = poll_completion(&mut receive) {
+            idle = 0;
             let buffer = RINGS_AT + ring_buffer_of(index) + header;
             let length = u64::from(written).saturating_sub(header) as usize;
             // SAFETY: as above.
@@ -913,6 +1087,9 @@ extern "C" fn netd_main() -> ! {
                 header,
                 u64::from(receive.seen()),
                 handed,
+                sent_for_ipd,
+                took,
+                took_length,
             );
             receive.describe(
                 index,
@@ -925,7 +1102,23 @@ extern "C" fn netd_main() -> ! {
             // SAFETY: the notify window is mapped and the queue is enabled.
             unsafe { kick(queue::RECEIVE) };
         }
-        call(syscall::YIELD, 0, 0, [0; 4]);
+        // **Quiesce rather than spin.** This loop polled for ever, and a pinned
+        // program that never stops polling is a processor the rest of the
+        // machine cannot have -- which showed up as the shell test timing out
+        // with the shell answering every command correctly.
+        //
+        // A driver has something to sleep on, unlike `bin/ipd`: its own
+        // interrupt. After a run of passes with nothing to do it blocks on the
+        // notification the kernel binds to the device's vector, and the device
+        // wakes it when there is a frame. That is what the interrupt was
+        // delegated for, and until now this program only used it as a fallback.
+        if idle > 200 && VECTORED.load(core::sync::atomic::Ordering::Relaxed) {
+            let _ = call(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+            let _ = call(syscall::INVOKE, HANDLER, method::ACK, [0; 4]);
+            idle = 0;
+        } else {
+            call(syscall::YIELD, 0, 0, [0; 4]);
+        }
     }
 }
 
@@ -939,7 +1132,19 @@ const fn ring_buffer_of(index: u16) -> u64 {
 /// Through memory rather than a console, because this driver holds no console
 /// capability: a driver has no business printing, and giving it one to make a
 /// test easier would have made the test prove less.
-fn report(mac: u64, sent: u64, received: u64, source: u64, header: u64, rx_seen: u64, handed: u64) {
+#[allow(clippy::too_many_arguments)]
+fn report(
+    mac: u64,
+    sent: u64,
+    received: u64,
+    source: u64,
+    header: u64,
+    rx_seen: u64,
+    handed: u64,
+    sent_for_ipd: u64,
+    took: u64,
+    took_length: u64,
+) {
     let at = RINGS_AT + ring::REPORT;
     let words = [
         MARKER,
@@ -960,6 +1165,12 @@ fn report(mac: u64, sent: u64, received: u64, source: u64, header: u64, rx_seen:
         // handed anything over, and a consumer that never read it -- and they
         // are indistinguishable from the far end.
         handed,
+        // Frames taken out of the return ring and put on the wire. Counted
+        // separately from `handed` because "nothing came out" has an end at
+        // each side of a ring, and one number cannot say which.
+        sent_for_ipd,
+        took,
+        took_length,
     ];
     // SAFETY: the last page of the rings this program mapped writable, which no
     // ring and no buffer reaches. The marker is written *last*, so a kernel

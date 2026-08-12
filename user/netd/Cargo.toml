@@ -53,4 +53,7 @@ opt-level = "s"
 # this program does *not* carry is a service loop, which is most of the
 # difference the other way. A wild pointer in here faults in ring 3 and takes
 # the driver down; the same mistake in a kernel driver takes the machine.
-unsafe_budget = 247
+# 306 at step 4a: the return ring from `bin/ipd`, which is a second ring read
+# and a transmit buffer filled from it. A driver that only ever sent its own
+# bytes now forwards somebody else's, and that is the whole increase.
+unsafe_budget = 307

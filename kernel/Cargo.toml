@@ -170,7 +170,10 @@ workspace = true
 # kernel gains no network code at all -- there is no kernel driver for this
 # device class and RFC 0018 says there will not be one -- so what grew is the
 # handing over, not the driving.
-unsafe_budget = 1139
+# 1152 at RFC 0018 step 4a: the configuration page the kernel writes for
+# `bin/ipd`, and the direct-map read of the driver report it takes the address
+# from.
+unsafe_budget = 1152
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

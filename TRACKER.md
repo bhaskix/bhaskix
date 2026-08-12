@@ -706,6 +706,118 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12, last (RFC 0018 step 4b: ICMP, and a poll loop that cost a processor)
+
+`bhaskix-net` gained an **IPv4 writer** and an **ICMP echo module** — 64 host tests, and a fifth
+libFuzzer target that repairs the checksum so the type and code checks behind it are reachable, for
+the reason `DMAR` taught this project. `bin/ipd` now builds a whole packet from an address it
+learned itself:
+
+```
+net frame   received 64 bytes ...; 10 handed to the ring, 2 sent back for ipd
+            (took 59 bytes starting 0x52550a000202)
+net reply   ipd built 2 frames, 1 arp mappings learned (can send 1, configured 1)
+net echo    echo request sent; nothing answered it
+```
+
+The last frame the driver forwarded is 59 bytes addressed to `52:55:0a:00:02:02` — the gateway,
+found in the ARP cache, in a datagram whose two checksums `bhaskix-net` computed.
+
+**The reply cannot be obtained on this host, and that is not this kernel's doing.** QEMU's
+user-mode network needs permission from the *host* to open an ICMP socket, and a container without
+it drops the request silently. Removing `restrict=on` changed nothing, which rules out the
+isolation flag. The wire capture shows the request leaving well-formed:
+`IPv4 proto=1 10.0.2.15 -> 10.0.2.2 icmp type=8 code=0`. So the gate asserts what this machine
+controls — that a correct echo request was built and sent — and the round trip is recorded as
+untestable here rather than quietly dropped.
+
+**A poll loop cost a processor, and the shell test found it.** `netd` and `ipd` polled for ever,
+yielding between looks. Two pinned domains spinning for the life of the boot, plus three fuzz
+campaigns, saturated five of eight cores — and `make test` failed at **`test-shell`**, which timed
+out with the shell answering every command correctly. A test failing in a subsystem that has
+nothing to do with the change is what a *shared* resource does when it runs short — here processor
+time, and the resource was genuinely exhausted: five of eight cores, two of them burned by pinned
+domains that never stopped polling.
+
+*(This sentence originally said "the second time today, after `MAX_DOMAINS`". The `MAX_DOMAINS`
+episode turned out to be a misdiagnosis — see the step 3 entry below — so this is the first, not
+the second.)*
+
+The fix is different for each program, and the difference is the point. **A driver has something to
+sleep on**: after a run of idle passes `netd` blocks on the notification bound to its device's
+vector, which is what that interrupt was delegated for. **`ipd` has nothing**, so it stops: it is a
+demonstration rather than a service, and once its work is done and the ring has been quiet it writes
+a last report and exits. Its report page belongs to the keeper domain, so the kernel still reads it.
+
+**And that left the driver asleep through everything `ipd` built**, because no domain can wake
+another. The kernel now pokes `netd`'s notification every half second while it waits — the one
+thing only the kernel can do, standing in for the mechanism RFC 0010 does not have. **This is the
+second concrete cost of that gap in one day** and it should be read as evidence when the RFC is
+revisited, not as a workaround that settled the question.
+
+**Two more corrections about stopping too early.** `ipd` first exited after twenty thousand idle
+passes, which elapse in a fraction of a second — before the kernel could publish its configuration,
+which cannot happen until the driver has read the device's address. A program that quits on
+idleness alone quits before there is anything to be idle about; it now requires its work to be done
+first, with a much larger bound as the backstop for a machine that never configures it at all.
+
+### 2026-08-12, last (RFC 0018 step 4a: a packet built by a program with no device)
+
+`bin/ipd` links `bhaskix-net`, parses what arrives, and builds a frame of its own. QEMU's own
+`filter-dump` is the oracle:
+
+```
+request for 10.0.2.2: 9      <- bin/netd's probes
+request for 10.0.2.3: 1      <- built by bin/ipd
+reply   for 10.0.2.15: 10
+```
+
+**The `.3` request can only exist if a program holding no device built it**, handed it across a
+ring, and a program that cannot parse it put it on the wire. One byte of difference between the two
+targets is what makes them distinguishable, and it was chosen for that.
+
+`net reply ipd built 1 frames, 1 arp mappings learned (can send 1, configured 1)` — the `ArpCache`
+running outside a host test for the first time since it was written this morning, learning the
+gateway from a reply that `bhaskix-net` parsed off a real wire.
+
+**A transmit buffer at `0x5800` did not work and the same bytes at `0x5000` did, and I cannot
+explain it.** Frames copied into the second buffer were verifiably correct — the driver read back
+forty-two bytes beginning with the broadcast address — and the device never transmitted them.
+Bisected: the descriptor index was **not** the cause; the buffer address was. Both addresses are in
+the same page of the same object inside the same DMA window, so no explanation involving the mapping
+survives contact with that. The constant is removed so nobody inherits an address that does not
+work, and this paragraph is here because the alternative was inventing a reason.
+
+**The lock-order detector earned its keep.** `blocking on cap::ARENA (rank 7) while holding mask
+0b10000000, at kernel/src/cap.rs:733` — the arena blocking on the arena, because the config
+capability was derived by calling `shared::name` *inside* a `with_arena` closure and `shared::name`
+takes the arena itself. The report named the file and the line.
+
+**Three smaller things, each a lesson about measurement rather than about networking.**
+
+A report written only when something happens cannot say what happened last: `ipd` reported only on
+receiving a frame, so its page froze at the moment the last frame crossed — which was *before* the
+kernel published its configuration, and the page said "unconfigured" long after it was configured.
+It reports every pass now.
+
+A clock has to tick at the rate of the thing it is timing. The ARP cache's lifetime was counted in
+loop passes, which run at the speed of a spin, so a thousand of them elapsed in milliseconds and the
+cache always read empty. Counted in frames handled, it reads what it holds.
+
+**A range written as a character class is wrong at the next power of ten.** The step-3 gate asserted
+`[2-9][0-9]*` frames crossed, meaning "at least two" — and stopped matching the moment the count
+reached **10**, because it pins the first digit. It is `([2-9]|[1-9][0-9]+)` now. The gate had been
+green for exactly as long as the number stayed single-digit.
+
+**And a vendor string nearly reached a tracked file.** A `filter-dump` path pointing into the
+scratchpad carries this machine's session directory in it, and one of those paths survived a
+restore into `tests/qemu/boot-test.sh`. `make gates` refused it before the commit, which is what
+that check is for and the first time it has ever fired.
+
+**Still not exercised:** the ARP *responder*. It is written and rests on `bhaskix-net`'s own tests,
+but QEMU's gateway has no reason to ask for our address at this step, so nothing has asked. 4b's
+ICMP echo is what gives it one.
+
 ### 2026-08-12, last (RFC 0018 step 3: frames cross a domain boundary)
 
 Nine frames crossed from `bin/netd` to `bin/ipd` through a shared ring, and the first came from the
@@ -740,16 +852,41 @@ into two unambiguous ones.
 the instant its marker appeared, which was before the receive loop had run, so it always said zero
 handed. Both reports are now read after the same wait.
 
-**`MAX_DOMAINS` was 32 and a slot is not freed when a domain ends.** `create` takes the first entry
-that is neither live nor *ended*, because an exit reason has to survive until somebody reaps it —
-which is what RFC 0017 step 6 rests on. So the table's effective capacity is its size minus every
-domain that finished and was never reaped, and the kernel's own self-tests end a dozen that nothing
-reaps. Adding one domain tipped it over, and **the failure appeared in the bulk-path self-test** on
-a UEFI boot: a subsystem with nothing to do with networking, getting `NO_DOMAIN` for the second of
-its own two domains. That is what a shared fixed table does when it runs out. Raised to 64 with the
-mechanism written down, which is **RFC 0017's third open question answered by measurement** rather
-than by argument. A reaper for the kernel's own corpses is a policy decision about who owns an
-unreaped exit reason, and belongs in an RFC rather than in a bug fix.
+~~**`MAX_DOMAINS` was 32 and a slot is not freed when a domain ends.**~~ **This paragraph was
+wrong, and the commit carrying it — `6dee3f0` — was pushed before the error was found. Corrected
+below rather than deleted.**
+
+It said a UEFI boot had exhausted the domain table, that the bulk-path self-test had got
+`NO_DOMAIN` for its second domain, that raising `MAX_DOMAINS` to 64 fixed it, and that this
+**answered RFC 0017's third open question by measurement**. None of that is true.
+
+**The refusal was never `NO_DOMAIN`.** The bulk path reports a number it calls `refusal`, and it was
+7. `status::NO_DOMAIN` is 7 — and so is `outcome::NOT_YOURS`, which is the value that test
+*expects*. That clause was passing every time. A constant was matched to the wrong enum and the
+whole diagnosis was built on it.
+
+**The table was never near full.** `domain::peak_occupied` was added to settle it and reports a
+high-water mark of **seven to nine slots** on a full boot — of thirty-two. `MAX_DOMAINS` is back to
+32; raising it fixed nothing, and the boot that passed afterwards passed for unrelated reasons.
+
+**RFC 0017's third open question is therefore still open.** It asked for a measurement, and there
+now is one — seven to nine of thirty-two — but it arrived from instrumentation rather than from the
+failure this paragraph claimed, and the question is about what the number *should* be, which no
+boot can answer on its own.
+
+**What actually failed is a performance assertion.** The bulk path requires
+`message_cycles >= shared_cycles * 2` — shared memory at least twice as fast as message passing.
+The failing run measured 234,378 against 408,748, which is 1.74x. Under CPU load the ratio falls
+below two and the gate goes red in a subsystem that has nothing to do with whatever change is being
+tested. Three 24-hour fuzz campaigns were holding three of eight cores at the time. **This also
+explains the "unexplained intermittent" recorded twice earlier today** — same gate, same cause, and
+it was never a mystery about domains or about `consoled`.
+
+What remains true from the original paragraph, and is why the new counter measures *occupied* slots
+rather than live ones: `create` takes the first entry that is neither live nor **ended**, because an
+exit reason has to survive until it is reaped, which is what RFC 0017 step 6 rests on. The effective
+capacity really is the size minus every unreaped corpse. That property is real. It simply was not
+what went wrong.
 
 **The wakeup half of step 3 does not exist, and that is a gap in RFC 0010 rather than a shortcut
 here.** A notification can only be signalled by the **kernel**: a program holding one may `WAIT` and
@@ -829,6 +966,12 @@ receive red**, which is exactly the failure a single combined gate would have pa
 at address 1, before the net domain started, and took the supervisor and the services test with it.
 Three further runs were clean and the net path worked in all of them. Recorded because it is
 unexplained, not because it is understood — it resembles nothing this change touches.
+
+> **Still unexplained, and deliberately not folded into the later finding.** The bulk-path
+> performance gate turned out to explain the *other* intermittents recorded on 2026-08-12, and it
+> would be convenient to attribute this one to it as well. It does not fit: this was a page fault at
+> address 1 in a program, not a ratio falling under two, and the two have nothing in common but the
+> word "intermittent". One explanation arriving is not a reason to close every open question near it.
 
 ### 2026-08-12, last (RFC 0018 step 1: the protocol code, with no machine under it)
 

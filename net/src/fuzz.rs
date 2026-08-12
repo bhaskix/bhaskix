@@ -47,6 +47,7 @@ use crate::{
     arp::ArpPacket,
     checksum,
     eth::{self, EthFrame, EtherType},
+    icmp,
     ipv4::{self, Ipv4Header, Reassembly},
     udp::{self, UdpDatagram},
 };
@@ -331,6 +332,29 @@ fn reassembly_never_panics_and_never_exceeds_its_table() {
                 table.release(index);
             }
             assert!(table.in_flight() <= 4, "the table grew past its capacity");
+        }
+    }
+}
+
+#[test]
+fn icmp_never_panics() {
+    let (first, iterations) = campaign();
+    for seed in first..first.saturating_add(iterations) {
+        let mut rng = rng_for(seed);
+        let mut bytes = vec![0u8; icmp::HEADER + 24];
+        icmp::write(&mut bytes, false, 0x1234, 1, &[0xee; 24]).unwrap();
+        let count = 1 + rng.below(6);
+        mutate(&mut rng, &mut bytes, count);
+        // Half the seeds repair the checksum, so the type and code checks
+        // behind it are reachable at all; the other half exercise the check.
+        if seed & 1 == 0 && bytes.len() >= icmp::HEADER {
+            bytes[2..4].copy_from_slice(&[0, 0]);
+            let sum = checksum(&[&bytes]);
+            bytes[2..4].copy_from_slice(&sum.to_be_bytes());
+        }
+        maybe_truncate(&mut rng, &mut bytes);
+        if let Ok(parsed) = icmp::Echo::parse(&bytes) {
+            assert!(parsed.payload.len() + icmp::HEADER <= bytes.len());
         }
     }
 }

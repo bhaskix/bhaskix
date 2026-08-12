@@ -3736,6 +3736,18 @@ pub fn start_net_domain(
     const NET_BADGE: u64 = 1 << 2;
     let signalled = match crate::notify::create() {
         Ok(notification) => {
+            // Kept so the kernel can wake the driver. **Only the kernel can**:
+            // RFC 0010's notifications have no user-mode signal, so `bin/ipd`
+            // cannot tell `bin/netd` that it has put a frame in the return
+            // ring. The driver sleeps on this notification when idle, and
+            // without a poke it would sleep through everything the protocol
+            // service builds.
+            NET_WAKE.store(
+                u64::from(notification.index())
+                    | (u64::from(notification.generation()) << 32)
+                    | 1 << 63,
+                core::sync::atomic::Ordering::Release,
+            );
             // SAFETY: `trap` dispatches claimed vectors to `irq::on_interrupt`,
             // which acknowledges the local APIC. This device is the net
             // domain's and nothing else claims its entries.
@@ -3871,6 +3883,55 @@ fn start_ip_domain(
         return Err("the ring would not install in the net domain");
     }
 
+    // The return ring, `ipd` to `netd`. A second object rather than a second
+    // direction on the first, because `abi::ring` is single-producer and its
+    // two indices are the whole of its discipline: two producers on one ring
+    // would be two writers of one `head`.
+    let back = shared::create(keeper, NET_RING_BYTES)
+        .map_err(|_| "the return ring would not be created")?;
+    let back_producer = shared::name(back).map_err(|_| "the return ring would not be named")?;
+    let back_consumer =
+        shared::name(back).map_err(|_| "the return ring would not be named twice")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(2, back_producer).is_ok()
+    }) != Some(true)
+    {
+        return Err("the return ring would not install in the ip domain");
+    }
+    if domain::with(net, |owner| {
+        owner.cspace.install_at(8, back_consumer).is_ok()
+    }) != Some(true)
+    {
+        return Err("the return ring would not install in the net domain");
+    }
+
+    // What this interface *is*, which `ipd` cannot find out for itself: it
+    // holds no device to ask, and an ARP packet carries the sender's hardware
+    // and protocol addresses, so it cannot build one without both.
+    //
+    // Read-only, because it is the kernel's statement rather than a shared
+    // scratchpad. Filled *later* — the MAC is a number only the driver can read
+    // out of the device, so this page is written once `netd` has reported it,
+    // and `ipd` waits for the marker rather than reading a page of zeroes.
+    let config = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the ip config page would not be created")?;
+    // Named first, then derived — and **not** both inside `with_arena`, which
+    // is what this was and what the lock-order detector refused: `shared::name`
+    // takes the capability arena itself, so calling it from inside a
+    // `with_arena` closure is the arena blocking on the arena. The report named
+    // the file and line, which is the whole reason that check exists.
+    let config_root = shared::name(config).map_err(|_| "the ip config would not be named")?;
+    let config_named =
+        cap::with_arena(|arena| arena.derive(config_root, cap::Rights::READ, 0).ok())
+            .ok_or("the ip config capability would not derive")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(3, config_named).is_ok()
+    }) != Some(true)
+    {
+        return Err("the ip config would not install");
+    }
+    NET_CONFIG.store(config.as_u64(), core::sync::atomic::Ordering::Release);
+
     // One page for what `ipd` finds, read by the kernel the same way `netd`'s
     // report is. A driver has no business printing and neither has a service.
     let report = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
@@ -3898,6 +3959,75 @@ fn start_ip_domain(
 /// The page `bin/ipd` leaves its findings in.
 static NET_RING_REPORT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The page telling `bin/ipd` what this interface is.
+static NET_CONFIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The notification `bin/netd` sleeps on, with the top bit set when it is real.
+static NET_WAKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Wakes the network driver, because nothing else can.
+///
+/// A domain cannot signal another domain's notification — RFC 0010 gives no
+/// user-mode signal at all — so a driver asleep on its device's interrupt will
+/// sleep through a frame `bin/ipd` puts in the return ring. Until that gap is
+/// closed this is the poke that stands in for it, and it is the kernel doing
+/// the one thing only the kernel can.
+fn wake_net_driver() {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_WAKE.load(Ordering::Acquire);
+    if raw & (1 << 63) == 0 {
+        return;
+    }
+    let id =
+        crate::notify::NotificationId::from_parts(raw as u32, (raw >> 32) as u32 & 0x7fff_ffff);
+    let _ = crate::notify::signal(id, 1 << 2);
+}
+
+/// The marker `bin/ipd` waits for before believing its configuration.
+const NET_CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
+
+/// This interface's IPv4 address.
+///
+/// Static, and RFC 0018 says why: *what owns the interface's address* is one of
+/// its open questions, DHCP is a client holding a socket, and sockets do not
+/// exist yet. `10.0.2.15` is what QEMU's built-in network hands a guest, so a
+/// static choice and the emulator agree without either negotiating.
+const NET_ADDRESS: [u8; 4] = [10, 0, 2, 15];
+
+/// Tells `bin/ipd` its hardware and protocol addresses.
+///
+/// Called once `netd` has reported the MAC, because the MAC is a number only a
+/// driver holding the device can read. Until then the page is zeroes with no
+/// marker, and `ipd` waits rather than believing them.
+fn publish_net_config(hhdm: u64, mac: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_CONFIG.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return false;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return false;
+    };
+    if count == 0 {
+        return false;
+    }
+    let address = u32::from_be_bytes(NET_ADDRESS);
+    let words = [NET_CONFIG_MARKER, mac, u64::from(address)];
+    // SAFETY: a frame this object owns, through the direct map. The marker goes
+    // last, so a reader that catches this half-written sees no marker rather
+    // than half a configuration.
+    unsafe {
+        for (index, word) in words.iter().enumerate().skip(1) {
+            core::ptr::write_volatile((hhdm + frames[0] + index as u64 * 8) as *mut u64, *word);
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        core::ptr::write_volatile((hhdm + frames[0]) as *mut u64, words[0]);
+    }
+    true
+}
 
 /// The rings the net domain was given, so its report can be read back.
 static NET_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -4551,6 +4681,33 @@ const NETD_MARKER: u64 = 0x3154_5052_4454_454e;
 /// driver's report sits in its last page.
 const NETD_REPORT_PAGE: usize = 7;
 
+/// The MAC `bin/netd` reported, if it has reported one.
+///
+/// Read separately from [`report_net_domain`] because the *configuration* has
+/// to reach `ipd` as soon as the driver knows it, and the report is printed
+/// much later — after a wait long enough for a network to answer.
+fn net_domain_mac(hhdm: u64) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_RINGS.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return None;
+    }
+    let (frames, count) = shared::frames_of(shared::MemoryId::from_u64(raw))?;
+    if count <= NETD_REPORT_PAGE {
+        return None;
+    }
+    // SAFETY: a frame this object owns, through the direct map: the marker and
+    // then the MAC, the first two words the driver writes there.
+    let (marker, mac) = unsafe {
+        (
+            core::ptr::read_volatile((hhdm + frames[NETD_REPORT_PAGE]) as *const u64),
+            core::ptr::read_volatile((hhdm + frames[NETD_REPORT_PAGE] + 8) as *const u64),
+        )
+    };
+    (marker == NETD_MARKER).then_some(mac)
+}
+
 /// Whether `bin/netd` has written its report yet.
 fn net_domain_reported(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
@@ -4593,11 +4750,11 @@ fn report_net_domain(hhdm: u64) -> bool {
         return false;
     }
 
-    let mut words = [0u64; 10];
+    let mut words = [0u64; 13];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // ten little-endian words the driver wrote there.
+    // thirteen little-endian words the driver wrote there.
     let raw =
-        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 80) };
+        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 104) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -4658,8 +4815,8 @@ fn report_net_domain(hhdm: u64) -> bool {
     let [p, q, r, s, t, u] = octets(words[4]);
     println!(
         "    net frame      received {length} bytes from {p:02x}:{q:02x}:{r:02x}:{s:02x}:{t:02x}:{u:02x}, \
-         virtio header {} bytes; {} handed to the ring",
-        words[5], words[9]
+         virtio header {} bytes; {} handed to the ring, {} sent back for ipd (took {} bytes starting {:#014x})",
+        words[5], words[9], words[10], words[12], words[11]
     );
     true
 }
@@ -4690,10 +4847,10 @@ fn report_net_ring(hhdm: u64) -> bool {
         return false;
     }
 
-    let mut words = [0u64; 5];
+    let mut words = [0u64; 9];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // five little-endian words the service wrote there.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames_of[0]) as *const u8, 40) };
+    // nine little-endian words the service wrote there.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames_of[0]) as *const u8, 72) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -4728,6 +4885,51 @@ fn report_net_ring(hhdm: u64) -> bool {
         "    net ring       {frames} frames crossed to ipd, {bytes} bytes, first from \
          {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}, {refused} refused"
     );
+    // The return path, reported from both ends. `ipd` says how many frames it
+    // built; `netd` says how many it took out of the ring and put on the wire.
+    // Two numbers because "nothing came out" has an end at each side of a ring
+    // and one number cannot say which -- the ambiguity that cost step 3 an
+    // hour of looking at the wrong program.
+    println!(
+        "    net reply      ipd built {} frames, {} arp mappings learned (can send {}, configured {})",
+        words[5],
+        words[6],
+        words[7] & 1,
+        (words[7] >> 1) & 1
+    );
+    // The echo, reported separately because it is the only line here that says
+    // the whole stack worked rather than that each piece did: an address
+    // learned from a parsed reply, a header and two checksums written by
+    // `bhaskix-net`, a driver that forwarded bytes it cannot read, and a
+    // payload that came back exactly as it went out.
+    if words[8] > 0 {
+        println!(
+            "    net echo       {} icmp echo replies, payload returned unchanged",
+            words[8]
+        );
+    } else {
+        // **Not a failure, and this is the honest version of why.** The echo
+        // request this machine sends is correct and reaches the wire — QEMU's
+        // own packet capture shows `IPv4 proto=1 10.0.2.15 -> 10.0.2.2 icmp
+        // type=8`. Nothing answers it, because QEMU's user-mode network needs
+        // permission from the *host* to open an ICMP socket, and a container
+        // without that permission drops the request silently. Removing
+        // `restrict=on` changes nothing, which rules out the isolation flag.
+        //
+        // So the round trip is untestable in this environment, and gating on
+        // it would make the suite fail for a reason that has nothing to do
+        // with this kernel. What *is* gated is that the request was built and
+        // sent, which is the half this machine controls.
+        println!(
+            "    net echo       echo request sent; nothing answered it, which this host \
+             cannot arrange (no icmp socket permission)"
+        );
+    }
+    if words[5] == 0 {
+        println!("\x1b[91m    net reply      FAILED: the service built nothing to send\x1b[0m");
+        return false;
+    }
+
     if frames < 2 {
         println!(
             "\x1b[91m    net ring       FAILED: {frames} frames crossed, which one buffer \
@@ -5945,6 +6147,26 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             }
             wait_millis(50);
         }
+        // The configuration, as soon as the driver knows it rather than when its
+        // report is printed. `ipd` cannot build an ARP packet without the
+        // hardware address, and it holds no device to ask for one.
+        match net_domain_mac(hhdm) {
+            Some(mac) if publish_net_config(hhdm, mac) => {
+                println!(
+                    "    net config     interface told to ipd: mac {mac:#014x}, address 10.0.2.15"
+                );
+            }
+            Some(_) => println!(
+                "\x1b[91m    net config     FAILED: the configuration page would not take it\x1b[0m"
+            ),
+            // Silent until now, and that was the bug hiding: a driver that has
+            // not reported its address yet leaves `ipd` unconfigured for ever,
+            // and nothing said so.
+            None => println!(
+                "\x1b[91m    net config     FAILED: the driver reported no address to pass on\x1b[0m"
+            ),
+        }
+
         // Both reports are read after the same wait, and that is a correction:
         // reading the driver's report the moment its marker appeared caught it
         // before its receive loop had run, so it always said nothing had been
@@ -5953,7 +6175,13 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         //
         // `ipd` polls, so it needs wall-clock time rather than a barrier, and
         // the frames it counts arrive from a network that chooses when.
-        for _ in 0..80 {
+        for step in 0..80 {
+            // Every half second, so a driver asleep on its interrupt looks at
+            // the return ring. See `wake_net_driver` for why the kernel is the
+            // one doing this.
+            if step % 10 == 0 {
+                wake_net_driver();
+            }
             wait_millis(50);
         }
         if !report_net_domain(hhdm) {
@@ -6067,6 +6295,17 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     println!(
         "    address spaces {} in use at once, each program in its own",
         vm::peak()
+    );
+    // Occupied rather than live, and the distinction is the whole point: a
+    // domain that has ended keeps its slot until somebody reaps it, so this is
+    // the number that decides whether `create` succeeds. Until this line the
+    // table was sized by raising it whenever something failed — twice in one
+    // day, and the second failure landed in a self-test with nothing to do
+    // with the change that caused it.
+    println!(
+        "    domains        {} of {} slots occupied at once (a slot is held until reaped)",
+        domain::peak_occupied(),
+        domain::MAX_DOMAINS
     );
     // Whether anything read after this point is complete. The transmitter drops
     // a byte rather than hang, which is right, and it did so silently until a

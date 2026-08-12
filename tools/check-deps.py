@@ -98,10 +98,12 @@ LAYERS = {
     # rejected. Nothing enforces that but this comment and the manifest; the
     # layer rule would permit it, since `bhaskix-net` sits below.
     "bhaskix-user-netd": -1,
-    # The protocol service. It holds a ring and a report page: no device, no
-    # DMA window, no interrupt. At step 3 it depends on the ABI alone; step 4
-    # adds `bhaskix-net`, and this is the program that may have it, because a
-    # parser bug here reaches no hardware.
+    # The protocol service. It holds rings, a report page and a configuration
+    # page: no device, no DMA window, no interrupt. It is the **only** program
+    # that may depend on `bhaskix-net`, because a parser bug here reaches no
+    # hardware -- and `bhaskix-user-netd` above deliberately does not. The layer
+    # rule permits either; this comment and the two manifests are what actually
+    # hold the line, which is worth knowing rather than assuming.
     "bhaskix-user-ipd": -1,
     # The supervisor places no service: it creates domains, starts programs in
     # them and reaps them, all through capability invocations. So it belongs

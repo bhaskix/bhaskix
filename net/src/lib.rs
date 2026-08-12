@@ -50,6 +50,7 @@
 pub mod addr;
 pub mod arp;
 pub mod eth;
+pub mod icmp;
 pub mod ipv4;
 pub mod udp;
 
@@ -59,6 +60,7 @@ mod fuzz;
 pub use addr::{Address, Ipv4Addr, MacAddr, Port};
 pub use arp::{ArpCache, ArpOp, ArpPacket};
 pub use eth::{EthFrame, EtherType};
+pub use icmp::Echo;
 pub use ipv4::{Ipv4Header, Protocol, Reassembly};
 pub use udp::UdpDatagram;
 
