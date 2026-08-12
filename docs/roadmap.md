@@ -148,9 +148,9 @@ physical hardware, and the ELF loader has not had its 24 hours of fuzzing.
 
 Order within the phase is flexible; dependencies are noted. Done so far — see
 [TRACKER.md](../TRACKER.md) §4 for the detail: shared memory and notifications, the service
-framework, IOMMU discovery and per-device domains, the driver framework, and the full VFS. What
-remains is process management, networking, the telemetry plane, `bhaskixboot.efi`, package
-management, and libc.
+framework, IOMMU discovery and per-device domains, the driver framework, the full VFS, and process
+management. Networking runs as far as UDP. What remains is TCP and a sockets API above it, the
+telemetry plane, `bhaskixboot.efi`, package management, and libc.
 
 - ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
   M9-18 … M9-23. Capability-shaped rather than POSIX-shaped: no `fork` (it duplicates a capability
@@ -191,7 +191,12 @@ management, and libc.
   plan: the second driver — `bin/blkd`, in a domain — cost three bugs the first one had already
   learned and written down in comments, and a framework is the difference between a lesson recorded
   and a lesson enforced
-- ⬜ **Networking** — virtio-net, Ethernet, ARP, IPv4/IPv6, UDP, TCP, sockets
+- 🟡 **Networking** — `PARTIAL`. [RFC 0018](rfc/0018-networking.md) steps 1–6 implemented:
+  virtio-net in a domain, Ethernet, ARP, IPv4, ICMP and UDP in a `no_std` crate with six fuzz
+  targets, and a socket that is a badged capability rather than a descriptor. A ring 3 program
+  holding a socket and a page obtains an address by DHCP, which is the roadmap's "does useful
+  network I/O" met by demonstration. **Not done:** TCP, IPv6, any sockets API above UDP, and step 7
+  — the folded-domain measurement, which prices the `netd`/`ipd` boundary this design argues for
 - ⬜ **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing
   tool
 - ⬜ **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the

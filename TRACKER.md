@@ -24,7 +24,7 @@ What can be counted honestly, with how to recount it:
 |---|---|---|
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **6 of 7 done** | §4 below; the seventh is networking |
-| Networking, within RFC 0018 | **6 of 6 steps** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page |
+| Networking, within RFC 0018 | **6 of 7 steps** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page. Step 7, the folded-domain measurement, is not done |
 | Tasks in defined milestones | **92 `DONE`, 4 `TODO`** | `grep -c` on the milestone tables in §3 |
 | Suite | 601 checks, 346 host assertions, 4 placements | §6 |
 
