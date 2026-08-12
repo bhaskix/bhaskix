@@ -706,6 +706,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12 (a diagnostic printed from the wrong branch, and the gate that trusted it)
+
+`block domain no dma window: nothing would contain the device` was printed by the `else` of
+`signalled` — a variable about **interrupt delegation**. The DMA window is `contained`, a different
+question decided three hundred lines earlier. The line has been wrong since it was written; the
+2026-08-11 entry below records it costing hours on the address-space hunt, which is what made it
+worth chasing down rather than living with.
+
+**It had made a check untrue, which is the part worth writing down.** `boot-test.sh:903` accepts
+that string as an excuse for a block service that answers nothing — a fair excuse when the *window*
+is missing, since a driver that cannot read a sector cannot answer for one. Keyed to a line printed
+on the *interrupt's* failure, the excuse covered a case it was never meant to: a machine with a
+window and no interrupt would have let a genuinely broken service through.
+
+**Latent, not live, and checked rather than assumed.** Two configurations were captured and read:
+
+| | dma window | interrupt |
+|---|---|---|
+| BIOS | absent | absent |
+| `iommu` | granted | delegated |
+
+Both are absent together or present together, so no configuration in the suite produces
+`contained && !signalled` and nothing was ever wrongly excused. That is luck, not design.
+
+Fixed by giving each question its own report: the window states its absence beside where it states
+its grant, and the interrupt's `else` now says `no interrupt delegated; the driver polls its used
+ring instead` — which is what `user/blkd/src/main.rs:851` actually does, a bounded two-million spin
+on the used ring when it has no vector. The gate keeps its string and starts meaning it.
+
 ### 2026-08-11, last of the day (a supervisor in ring 3 that restarts what it started)
 
 RFC 0017's second question — *what restarts a service that died* — answered in a program rather than

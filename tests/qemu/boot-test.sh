@@ -904,6 +904,11 @@ elif grep -qE "block domain +no dma window" "$LOG"; then
     # No unit to contain the device, so the driver was given registers and no
     # way to make it read -- and a service that cannot read a sector cannot
     # answer for one. That is the refusal working, not a service missing.
+    #
+    # This excuse is only sound because the kernel prints that line from the
+    # window's own report. It used to be printed from the `else` of the
+    # *interrupt* delegation, which meant a machine that had a window and lost
+    # its interrupt could excuse a block service that was genuinely broken.
     pass "no dma window on this machine, so the block service has nothing to answer with"
 else
     fail "the block service did not answer for a sector"

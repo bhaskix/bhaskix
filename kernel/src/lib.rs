@@ -3363,8 +3363,17 @@ pub fn start_block_domain(
         layout.notify_multiplier,
         layout.device.0
     );
+    // Both halves of one fact, in one place. The absence used to be reported
+    // three hundred lines below, in the `else` of a different question, and a
+    // reader who found it there was told the wrong thing about the wrong
+    // subsystem -- see the interrupt report at the end of this function.
     if contained {
         println!("    block domain   dma window granted; the device translates through its own");
+    } else {
+        println!(
+            "    block domain   no dma window: nothing would contain the device, so the \
+             driver gets registers and no way to make it read"
+        );
     }
 
     // The endpoint this driver answers block requests on, at slot 8.
@@ -3542,9 +3551,20 @@ pub fn start_block_domain(
              the driver waits for it"
         );
     } else {
+        // This branch is about the *interrupt*, and for most of its life it
+        // said "no dma window" instead -- a message about a different
+        // subsystem, printed on the failure of this one. It appears in clean
+        // BIOS boots, where both happen to be absent together, so it read as
+        // routine; it sent two investigations at the DMA path and cost days.
+        //
+        // The gate in `boot-test.sh` grepped for that string to excuse a block
+        // service that answered nothing, which is only a fair excuse when the
+        // *window* is missing. So on a machine that had a window and lost its
+        // interrupt, a genuinely broken service would have been let through.
+        // Moving the window's absence to the window's own report is what makes
+        // that excuse true again.
         println!(
-            "    block domain   no dma window: nothing would contain the device, so the \
-             driver gets registers and no way to make it read"
+            "    block domain   no interrupt delegated; the driver polls its used ring instead"
         );
     }
 
