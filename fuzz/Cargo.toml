@@ -26,6 +26,7 @@ libfuzzer-sys = "0.4"
 bhaskix-kernel = { path = "../kernel", features = ["host"] }
 bhaskix-service-vfs = { path = "../services/vfs" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
+bhaskix-net = { path = "../net" }
 
 [[bin]]
 name = "elf_parse"
@@ -49,6 +50,40 @@ bench = false
 [[bin]]
 name = "dmar_parse"
 path = "fuzz_targets/dmar_parse.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 0018 step 1. Four parsers, because they fail differently: framing,
+# a fixed-layout packet plus the cache it drives, three lengths that must
+# agree plus stateful reassembly, and one optional checksum over a
+# pseudo-header. Splitting them keeps a corpus per failure mode rather than
+# one corpus whose coverage is dominated by whichever parser is cheapest to
+# reach.
+[[bin]]
+name = "eth_parse"
+path = "fuzz_targets/eth_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arp_parse"
+path = "fuzz_targets/arp_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipv4_parse"
+path = "fuzz_targets/ipv4_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_parse"
+path = "fuzz_targets/udp_parse.rs"
 test = false
 doc = false
 bench = false

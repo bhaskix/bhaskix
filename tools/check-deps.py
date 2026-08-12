@@ -54,6 +54,15 @@ LAYERS = {
     # kernel, from a service in a domain, and from a host tool. Depends on
     # nothing, for the same reason the device crate does not.
     "bhaskix-fs": -2,
+    # The wire formats, and the same argument exactly. This entry read `4` from
+    # M1 until 2026-08-12 -- a number reserved before there was a design, on the
+    # assumption that a network stack sits above the kernel the way a driver
+    # does. RFC 0018 put the protocol code in a domain of its own, which makes
+    # it what `bhaskix-fs` is: arithmetic over a byte slice, reachable from a
+    # service, from a host test and from a fuzz target, and therefore able to
+    # depend on none of them. Layer 4 would have permitted a dependency on the
+    # kernel, which is the one thing this crate must never acquire.
+    "bhaskix-net": -2,
     "bhaskix-service": -1,
     "bhaskix-service-domain": 0,
     "bhaskix-service-console": 0,
@@ -65,7 +74,6 @@ LAYERS = {
     "bhaskix-sched": 2,
     "bhaskix-kernel": 3,
 
-    "bhaskix-net": 4,
     "bhaskix-drivers": 4,
     "bhaskix-boot-shim": 5,    # the binary, top of the graph
 

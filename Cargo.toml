@@ -40,7 +40,9 @@ members = [
     "services/console",
     "services/vfs",
 
-    # "net",
+    # Phase 2 — RFC 0018 step 1. Host-testable protocol arithmetic, with no
+    # device, no domain and no IPC under it. `netd` and `ipd` are steps 2 and 4.
+    "net",
 ]
 
 # The negative fixture for `tools/check-placements.sh`: a service that reaches

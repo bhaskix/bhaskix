@@ -54,6 +54,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bhaskix-net"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-service"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhaskix-net"
+description = "Ethernet, ARP, IPv4 and UDP, as arithmetic over a byte slice."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_net"
+path = "src/lib.rs"
+
+# Nothing, and for the same reason `bhaskix-fs` depends on nothing: this is
+# arithmetic over a byte slice. It must be reachable from a service in a
+# domain, from a host test, and from a fuzz target, which means depending on
+# none of them.
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, and unlike most zeroes in this tree it is also enforced by the crate
+# root, which `forbid`s `unsafe` outright -- `docs/coding-style.md` §3 names
+# `net` among the crates that must contain none at all.
+#
+# It matters more here than anywhere else it is written. Every byte this crate
+# reads arrives from whoever can reach the wire, continuously, at line rate. A
+# parser bug in the filesystem needs an attacker who can already write your
+# disk; a parser bug here needs nobody.
+unsafe_budget = 0

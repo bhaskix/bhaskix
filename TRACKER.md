@@ -706,6 +706,58 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12, last (RFC 0018 step 1: the protocol code, with no machine under it)
+
+`net/src` has been an empty directory since M1 and `tools/check-deps.py` has been reserving a layer
+for a crate that never existed. `bhaskix-net` now exists: Ethernet II, ARP, IPv4 and UDP, the
+address types, the ARP cache and the fragment reassembly table. **53 host tests, four libFuzzer
+targets, no device, no domain, no IPC and no clock.**
+
+**The reserved layer was wrong, and that is worth recording rather than quietly fixing.** The entry
+said `4` — above the kernel, where a driver sits — because it was written before there was a design
+and on the assumption that a network stack is a kernel thing. RFC 0018 put the protocol code in a
+domain of its own, which makes this crate what `bhaskix-fs` is: arithmetic over a byte slice,
+reachable from a service, a host test and a fuzz target, and therefore depending on none of them.
+It is `-2` now. Layer 4 would have *permitted* a dependency on the kernel, which is the one thing
+this crate must never acquire, and a gate that permits the thing you care about is not guarding it.
+
+**Time is an argument, not a dependency.** Every method that ages something — ARP expiry, fragment
+deadlines — takes `now` in nanoseconds. That is what makes expiry testable on the host at all, and
+expiry is otherwise the hardest thing here to test and the easiest to get subtly wrong.
+
+**Two tables, two opposite policies, both deliberate.** A full ARP cache *replaces* the entry
+closest to expiry; a full reassembly table *refuses*. The trade-offs genuinely differ: an evicted
+ARP entry costs one round trip, so refusing would let an attacker freeze the cache permanently for
+no gain; an evicted reassembly costs a whole datagram, so evicting would let an attacker destroy
+legitimate reassemblies at will by starting new ones. Neither is safe against a flood, and the code
+says so rather than implying otherwise.
+
+**Fragment overlap is answered structurally.** First writer wins: a fragment overlapping blocks
+already held has its overlapping bytes discarded, so no byte already accepted can be changed by a
+later fragment. That is the property which stops one datagram parsing differently for a filter and
+for its destination, and it is a test.
+
+**The §8 harness was watched failing, and the measurement was not what was expected.** The guard
+refusing a UDP length below its own header was removed on purpose, with the bounds-checked read
+behind it; the harness caught the panic — `range end index 6 out of range for slice of length 0`.
+Then the **edge-value list was disabled** and the same bug was hunted with uniform draws only. *It
+was still caught, at 20,000 seeds, and at 200,000, and at 2,000,000.* The arithmetic says why: the
+bug needs any of eight values out of 65,536, about one draw in 8,192, and each seed draws several
+times — nothing like the ELF parser's wrapping check, which needed one draw in 2^60 and survived
+half a million mutations. The list is kept, because some bugs are unreachable without it and it
+costs a branch, but **the claim in the module header was corrected to what was measured** rather
+than left asserting a rationale that had not been tested.
+
+Four fuzz targets, smoke-run for twenty seconds each: 12.0M, 2.7M, 1.4M and 8.4M executions, no
+crashes. Two of them fuzz *state* rather than a parser — `arp_parse` drives a sequence of packets
+into one cache and asserts its bounds, `ipv4_parse` drives fragments into one reassembly table and
+asserts the same, because in both cases the parser was never going to be the interesting half. Both
+repair or exercise the checksum deliberately, for the reason `DMAR` taught this project: a parser
+behind a checksum is unreachable to a fuzzer that does not repair it.
+
+Steps 2 onward — `netd`, the ring, `ipd`, the `Socket` capability — are unstarted. Nothing here
+runs on a machine yet, which is exactly what step 1 was defined to be.
+
 ### 2026-08-12, last (a networking RFC, drafted — not accepted)
 
 [RFC 0018](docs/rfc/0018-networking.md) exists as a **draft**. Phase 2's only remaining `TODO`, and
