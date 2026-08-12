@@ -43,6 +43,13 @@ DISK="$REPO_ROOT/build/initrd.tar"
 # run in twelve, and that was the whole of the difference.
 DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
 
+# Two disks and no network, from the list every harness shares. The soak runs
+# many machines at once and has nothing to say about the wire; see `devices.sh`
+# for why the list is not written here.
+# shellcheck source=tests/qemu/devices.sh
+source "$REPO_ROOT/tests/qemu/devices.sh"
+qemu_device_list disks
+
 RUNS="${1:-40}"
 JOBS="${2:-2}"
 # An upper bound, not the cost of a run. Each boot is stopped the moment it
@@ -84,11 +91,10 @@ boot() {
     # disk and reporting the result against the kernel.
     cp "$DOMAIN_DISK" "$WORK/disk-$1.img"
     timeout "$TIMEOUT" qemu-system-x86_64 \
-        -M q35 -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
+        -M "$MACHINE" -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
         -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on" \
         -drive "file=$WORK/disk-$1.img,format=raw,if=none,id=disk1" \
-        -device virtio-blk-pci,drive=disk0 \
-        -device virtio-blk-pci,drive=disk1 \
+        "${VIRTIO_ARGS[@]}" \
         -no-reboot -cdrom "$ISO" -boot d -serial "file:$WORK/run-$1.log" \
         -display none > /dev/null 2>&1 &
     local pid=$! start

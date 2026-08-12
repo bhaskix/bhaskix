@@ -507,6 +507,21 @@ gates:
 	    || { echo "  FAIL  the filesystem image builder does not build"; exit 1; }
 	tools/check-unsafe-budget.py
 	tools/check-deps.py
+	tools/check-one-machine.sh
+# And watched refusing one, against a fixture that is wrong on purpose. The
+# real harnesses are correct, so the only way to see this go red is to keep a
+# wrong one -- making a real harness wrong to watch it fail is a change somebody
+# forgets to undo.
+	@if tools/check-one-machine.sh tests/fixtures/qemu >build/one-machine-fixture.log 2>&1; then \
+	    echo "  FAIL  the machine check accepted a harness building its own device list"; \
+	    exit 1; \
+	elif ! grep -q "builds its own device list" build/one-machine-fixture.log; then \
+	    echo "  FAIL  the machine check rejected the fixture for the wrong reason:"; \
+	    cat build/one-machine-fixture.log; \
+	    exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the machine check rejects a harness with its own device list\n'; \
+	fi
 	tools/check-placements.sh
 # The placement check has to be watched failing or it is worth nothing, so the
 # negative fixture runs immediately after it: a service that reaches into the

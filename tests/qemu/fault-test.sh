@@ -18,6 +18,14 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
+# The smallest machine that can take a fault, from the list every harness
+# shares. See `devices.sh`: harnesses that wrote their own device lists drifted
+# apart, and this one had drifted furthest — a single disk and nothing else.
+# That is still what it wants, so it is a profile rather than an exception.
+# shellcheck source=tests/qemu/devices.sh
+source "$REPO_ROOT/tests/qemu/devices.sh"
+qemu_device_list one-disk
+
 TIMEOUT="${FAULT_TEST_TIMEOUT:-120}"
 
 RED=$'\033[1;31m'; GREEN=$'\033[1;32m'; DIM=$'\033[2m'; RESET=$'\033[0m'
@@ -181,9 +189,9 @@ for fault in "${FAULTS[@]}"; do
   log="$(mktemp)"
   qemu_log="$(mktemp)"
   run_until "$log" "${EXPECT[$fault]}" "$TIMEOUT" \
-      -M q35 -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom build/bhaskix.iso -boot d \
+      -M "$MACHINE" -cpu ${QEMU_CPU:-max} -m 256M -no-reboot -cdrom build/bhaskix.iso -boot d \
       -drive file=build/initrd.tar,format=raw,if=none,id=disk0,readonly=on \
-      -device virtio-blk-pci,drive=disk0 \
+      "${VIRTIO_ARGS[@]}" \
       -serial "file:$log" -display none \
       -d cpu_reset -D "$qemu_log"
   verdict=$?

@@ -165,26 +165,31 @@ echo "booting and typing at it, up to ${TIMEOUT}s..."
 # only answers where one contains the device -- without it the driver cannot
 # read a sector, so it exits rather than serving, which is the refusal working
 # and is why RFC 0016 step 2's demonstration needs this mode to exist.
+#
+# **The device list is `devices.sh`'s, not this file's.** It was this file's,
+# and it was missing the network device that `boot-test.sh` had: the shell
+# reported holding no network capability, correctly, on a machine with no
+# network, while the boot log two directories away said networking worked. Both
+# were true. Neither was checkable against the other.
+# shellcheck source=tests/qemu/devices.sh
+source "$REPO_ROOT/tests/qemu/devices.sh"
+
 if [[ "$MODE" == "iommu" ]]; then
-    IOMMU_ARGS=(-device intel-iommu,intremap=on)
-    VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on
-                 -device virtio-blk-pci,drive=disk1,disable-legacy=on,iommu_platform=on
-                 # RFC 0018 step 5: `net` needs something to be a network. This
-                 # harness builds its own device list and had none -- the NIC was
-                 # added to boot-test.sh and not here, so the shell was correctly
-                 # reporting that it held no capability to a service that did not
-                 # exist. Two harnesses with two device lists is how one of them
-                 # ends up testing a different machine.
-                 -netdev user,id=net0,restrict=on
-                 -device virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on)
+    qemu_device_list full yes
 else
-    IOMMU_ARGS=()
-    VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0
-                 -device virtio-blk-pci,drive=disk1)
+    # **No network without a unit, and that is a choice rather than drift.**
+    # Without an IOMMU the driver has no address to give the device and stops at
+    # the handshake, so a NIC here would be hardware nothing can drive -- paid
+    # for in boot time by a test about the shell and the filesystem. The boot
+    # test asserts that refusal; this one has no business re-asserting it.
+    #
+    # The difference is written here, in one file, next to the other profile.
+    # That is the whole distinction between a decision and a divergence.
+    qemu_device_list disks
 fi
 
 timeout "$TIMEOUT" qemu-system-x86_64 \
-    -M q35 -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
+    -M "$MACHINE" -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
     "${IOMMU_ARGS[@]}" \
     -drive "file=$REPO_ROOT/build/initrd.tar,format=raw,if=none,id=disk0,readonly=on" \
     -drive "file=$REPO_ROOT/build/domain-disk.img,format=raw,if=none,id=disk1" \

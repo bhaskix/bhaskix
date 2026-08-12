@@ -5196,6 +5196,19 @@ fn report_dhcp_client(hhdm: u64) -> bool {
     if raw == u64::MAX {
         return true;
     }
+    // **No unit, no network, and therefore no offer** — which is a state and
+    // not a fault, exactly as it is for the driver twenty lines up. Without a
+    // window there is no address to give the device, so `bin/netd` stops at the
+    // handshake and nothing this client sends can reach a wire. Every BIOS boot
+    // is in this position by construction.
+    //
+    // This gate read "nobody answered" as a failure on those machines, which
+    // meant the whole boot test failed for the one reason it should not: the
+    // machine being what it says it is.
+    if !NET_CONTAINED.load(Ordering::Acquire) {
+        println!("    dhcp client    no unit contains the device, so there is no network to ask");
+        return true;
+    }
     let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
         return true;
     };
@@ -5249,12 +5262,31 @@ fn report_dhcp_client(hhdm: u64) -> bool {
             );
             false
         }
+        // **A machine with no network is a state, not a failure**, and this
+        // returned `false` for it. Every BIOS boot has no unit, so the driver
+        // has no address to give the device and `bin/ipd` answers `NO_NETWORK`
+        // to anyone asking for a socket -- which is the refusal working exactly
+        // as the driver's own "reached the handshake and stopped" does. The
+        // diagnostics that split this outcome into three made the honest answer
+        // look like a fault.
+        //
+        // Any *other* reason for the same two calls failing is still a failure:
+        // a service that is there and refusing for a reason nobody chose is
+        // precisely what a gate should catch.
+        5 if words[2] == bhaskix_abi::socket::NO_NETWORK => {
+            println!("    dhcp client    no network on this machine, so no address to ask for");
+            true
+        }
         5 => {
             println!(
                 "    dhcp client    bound no socket, status {} and the service said {}",
                 words[1], words[2]
             );
             false
+        }
+        6 if words[2] == bhaskix_abi::socket::NO_NETWORK => {
+            println!("    dhcp client    a socket, but no network under it");
+            true
         }
         6 => {
             println!(

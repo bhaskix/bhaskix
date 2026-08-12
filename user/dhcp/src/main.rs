@@ -215,14 +215,20 @@ extern "C" fn dhcp_main() -> ! {
     // Asking is what makes the service look at the wire, so asking repeatedly
     // is how a client waits without a timer it does not have.
     //
-    // **With a yield, and far more attempts.** Four hundred calls in a row cost
-    // less than a millisecond, and the frame they are waiting for cannot arrive
-    // that fast: `bin/netd` sleeps on its interrupt and is woken twice a second,
-    // so a client that does not yield asks four hundred times inside a single
-    // gap between wakes and concludes nobody answered. The server had in fact
-    // answered in under a millisecond -- the reply was on the wire, and this
-    // loop had already given up on it.
-    for _ in 0..1_000_000 {
+    // **With a yield between asks, and a bound that is deliberately modest.**
+    // Four hundred calls in a row cost less than a millisecond and cannot
+    // outlast a driver that is asleep, so this yields. It was briefly a million
+    // attempts, which was tuning against a bug rather than against the network:
+    // frames larger than sixty-four bytes were not being delivered at all, so
+    // no amount of patience would have helped and more of it only hid how long
+    // the client stayed alive. With `QUEUE_SIZE` written the offer arrives in
+    // milliseconds.
+    //
+    // The bound matters because this is a **spin**, and a spinning program on a
+    // pinned thread is a processor the rest of the machine cannot have. The
+    // shell test found exactly that once for `netd` and `ipd`, and it found it
+    // again here: with a million attempts the shell's own commands timed out.
+    for _ in 0..20_000 {
         let got = call(syscall::CALL, SOCKET, socket::RECV_FROM, [MEMORY, 0, 0, 0]);
         if got.0 != status::OK || got.1 != socket::OK {
             call(syscall::YIELD, 0, 0, [0; 4]);

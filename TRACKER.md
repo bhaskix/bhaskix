@@ -5,7 +5,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 
 | | |
 |---|---|
-| **Last updated** | 2026-08-12 |
+| **Last updated** | 2026-08-13 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 steps 1–6): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged. No TCP, no libc, no sockets API beyond UDP |
 | **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
@@ -739,6 +739,41 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-13 (one machine for every harness, and an intermittent failure written down)
+
+Four QEMU harnesses each built their own device list. `boot-test.sh` grew a network device and
+`shell-test.sh` did not, so the shell reported holding no network capability — correctly, on a
+machine that had none — while the boot log said networking worked. **Both logs were true about
+different machines, and neither could see the other.** `shell-test.sh` was also asking for
+`intremap=on` without the split irqchip QEMU requires for it, which `boot-test.sh` got right.
+
+`tests/qemu/devices.sh` now holds every machine, and a harness picks a *profile* — `full`,
+`disks`, `one-disk` — rather than writing a list. The profiles differ on purpose and the
+differences are visible side by side, which is the distinction between a decision and a divergence.
+
+**`tools/check-one-machine.sh` fails the build if a harness names a device itself**, because there
+was already a comment saying not to and it did not work. Agreement between two lists is not
+something either list can check. The gate found two more harnesses the moment it was written —
+`fault-test.sh` and `soak-test.sh` — so the drift was worse than the two files that had been
+noticed. It is watched refusing a fixture that is wrong on purpose, kept permanently in
+`tests/fixtures/qemu/`, for the reason `check-placements.sh` keeps one.
+
+**Two regressions of my own, both caught by running the whole suite rather than the part that
+looked relevant.** Splitting `bin/dhcp`'s single outcome into three made "this machine has no
+network" report as a failure, which every BIOS boot is by construction — the gate now checks
+`NET_CONTAINED` first, exactly as the driver's own report does. And the client's patience had been
+raised to a million attempts while chasing the `QUEUE_SIZE` bug; that was tuning against a defect
+rather than against the network, and with frames crossing properly 20,000 is ample. The million
+showed up as the shell test timing out, which is the second time that test has caught a spinning
+program nobody meant to write.
+
+**An intermittent failure, recorded rather than waited out.** Twice on 2026-08-12–13 an `iommu`
+boot failed with every `services` assertion reading `0 bytes, 0 entries` and `vfsd` blocked, and
+both times the following runs were clean — three consecutive green runs after the second. It is not
+caused by the harness change (it was first seen before it) and it is **not understood**. It is
+written here because a test that fails one run in ten and is never mentioned is worse than one that
+fails every time: the next person to see it should know it is known.
 
 ### 2026-08-12, last (RFC 0018 step 6: an address obtained by a program that holds a socket)
 

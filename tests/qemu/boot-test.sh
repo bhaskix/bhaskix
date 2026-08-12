@@ -132,43 +132,23 @@ if [[ "$MODE" == "iommu-off" ]]; then
     restore_image() { make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true; }
 fi
 
-# RFC 0018 step 2: a network device, and something on the other end of it.
+# The machine, from `devices.sh`, which both QEMU harnesses share.
 #
-# QEMU's built-in user-mode network needs no privileges, no `tap`, and no host
-# configuration, so every contributor gets the same network and CI needs no
-# capabilities it does not already have. Its gateway answers ARP, which is what
-# lets a driver that contains no protocol code prove it can *receive*: the
-# driver sends a fixed forty-two byte broadcast and something replies.
+# It used to be built here and built again in `shell-test.sh`, and the two
+# drifted: this file grew a network device and that one did not. See the header
+# of `devices.sh` for what that cost.
 #
-# `restrict=on` because none of this needs to reach the outside world. A test
-# that could talk to the internet would pass or fail depending on the machine it
-# ran on, and a gate whose answer depends on the network is not a gate.
-NET_ARGS=(-netdev user,id=net0,restrict=on -device virtio-net-pci,netdev=net0)
-# Subject to translation, for the same reason the disks are: a virtio device
-# without `iommu_platform` bypasses the unit entirely on QEMU, and every
-# assertion would then pass on a machine where the IOMMU protects nothing.
-NET_ARGS_IOMMU=(-netdev user,id=net0,restrict=on
-                -device virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on)
+# What stays here is the *policy* — which of this harness's modes want a unit —
+# because that is genuinely this harness's business. `iommu-off` is in the list
+# on purpose: the machine has a unit and the kernel is told to ignore it, which
+# is the whole point of the escape hatch.
+# shellcheck source=tests/qemu/devices.sh
+source "$REPO_ROOT/tests/qemu/devices.sh"
 
-MACHINE="q35"
-IOMMU_ARGS=()
-VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0 -device virtio-blk-pci,drive=disk1
-             "${NET_ARGS[@]}")
 if [[ "$MODE" == "iommu" || "$MODE" == "fsd" || "$MODE" == "iommu-off" ]]; then
-    # RFC 0012's testing plan turns on what the RFC is about. `intremap=on`
-    # needs a split irqchip, and both are QEMU's requirements rather than this
-    # kernel's -- nothing here programs the unit yet, so what is under test is
-    # discovery: that the `DMAR` the firmware writes is found, parsed, and
-    # described, on a machine that has one.
-    MACHINE="q35,kernel-irqchip=split"
-    IOMMU_ARGS=(-device intel-iommu,intremap=on)
-    # And the device must actually be *subject* to it. A virtio device without
-    # `iommu_platform` bypasses translation entirely on QEMU, so every
-    # assertion below would pass on a machine where the IOMMU protects
-    # nothing -- which is exactly what the first version of this did.
-    VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on
-                 -device virtio-blk-pci,drive=disk1,disable-legacy=on,iommu_platform=on
-                 "${NET_ARGS_IOMMU[@]}")
+    qemu_device_list full yes
+else
+    qemu_device_list full no
 fi
 
 QEMU_ARGS=(-M "$MACHINE" -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
