@@ -170,10 +170,24 @@ The reply carries the capability, by RFC 0016's mechanism — a one-shot reply c
 one thread that asked, valid only while it waits. Nothing here is new; this is the third caller of
 it, after `OPEN_AT` and the lent cache page.
 
-A new `ObjectKind::Socket`, badged with `(index, generation)` exactly as a directory handle is, so a
-socket that has been closed and its slot reused is distinguishable from the one that was there
-before. Badges are one-way and unforgeable, which RFC 0016 step 1 established and which everything
-below depends on.
+~~A new `ObjectKind::Socket`, badged with `(index, generation)` exactly as a directory handle is~~ —
+**corrected 2026-08-12, before step 5 was built.**
+
+There is no new object kind, and the sentence above got its own cited precedent backwards. **A
+directory handle is not an object kind**: RFC 0016 deleted `ObjectKind::Directory` and
+`ObjectKind::File`, and a directory a program holds is a *badged endpoint capability to the
+filesystem service*. `kernel/src/cap.rs` contains no `Directory`, and the decision log's CR1 row
+records why.
+
+Following that precedent properly means **the kernel gains nothing**: no object kind, no capability
+type, no kernel code at all. `ipd` is a userspace service, so a socket is a badged capability to
+*its own* endpoint — minted by `ipd` with `HAND`, stamped by the kernel so the badge cannot be
+forged, and landing in the slot the **caller** named with `EXPECT` rather than one the service
+chose. `user/fsd/src/main.rs` already does exactly this for a directory.
+
+The badge is still `(index, generation)`, so a socket that has been closed and its slot reused is
+distinguishable from the one that was there before. Badges are one-way and unforgeable, which
+RFC 0016 step 1 established and which everything below depends on.
 
 Methods, proposed at 51–53. `START` is 50 and is the highest allocated; **45 is also free**, an
 apparent gap in the existing numbering that should be understood before it is filled rather than

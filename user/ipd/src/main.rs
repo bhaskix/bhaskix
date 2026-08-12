@@ -27,10 +27,10 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{method, ring, status, syscall};
+use bhaskix_abi::{method, rights, ring, socket, status, syscall};
 use bhaskix_net::{
-    ArpCache, ArpOp, ArpPacket, EthFrame, EtherType, Ipv4Addr, Ipv4Header, MacAddr, Protocol, arp,
-    eth, icmp, ipv4,
+    ArpCache, ArpOp, ArpPacket, EthFrame, EtherType, Ipv4Addr, Ipv4Header, MacAddr, Port, Protocol,
+    arp, eth, icmp, ipv4, udp,
 };
 
 /// Slot: the ring `bin/netd` writes frames into.
@@ -41,6 +41,13 @@ const REPORT: u64 = 1;
 const BACK: u64 = 2;
 /// Slot: what this interface is, read-only, written by the kernel.
 const CONFIG: u64 = 3;
+/// Slot: the endpoint this service answers on.
+///
+/// Unbadged, because it is this program's own. Every socket handed out is a
+/// *badged, weaker* capability to this same endpoint — which is why RFC 0018
+/// step 5 needs no new kernel object kind, and why the kernel gained nothing
+/// for this step.
+const ENDPOINT: u64 = 4;
 
 /// Where this program maps what it holds.
 const RING_AT: u64 = 0x2100_0000;
@@ -128,6 +135,44 @@ fn call(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> (u64, u64) {
         );
     }
     (status, value)
+}
+
+/// Blocks until a request arrives, and returns `(status, badge, method, args)`.
+///
+/// The caller is not returned, because the kernel remembers it: a service that
+/// could name its own reply target could answer a question nobody asked it.
+///
+/// **This is a real sleep**, and it is what turns this program from a poll loop
+/// into a service. Until step 5 it spun on the ring and stopped when quiet,
+/// because it had nothing to wait on; an endpoint is something to wait on.
+fn receive() -> (u64, u64, u64, [u64; 4]) {
+    let status: u64;
+    let mut badge = ENDPOINT;
+    let mut method = 0u64;
+    let (mut a0, mut a1, mut a2, mut a3) = (0u64, 0u64, 0u64, 0u64);
+    // SAFETY: the system call convention from RFC 0008. Every argument register
+    // is an output because the kernel writes the whole frame back.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") syscall::RECV => status,
+            inlateout("rdi") badge,
+            inlateout("rsi") method,
+            inlateout("rdx") a0,
+            inlateout("r10") a1,
+            inlateout("r8") a2,
+            inlateout("r9") a3,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    (status, badge, method, [a0, a1, a2, a3])
+}
+
+/// Answers the caller this thread received from, and nobody else.
+fn reply(outcome: u64, a1: u64, a2: u64) {
+    let _ = call(syscall::REPLY, 0, 0, [outcome, a1, a2, 0]);
 }
 
 /// Maps a capability at an address, and says whether it worked.
@@ -283,6 +328,199 @@ fn state(can_send: bool, mac: MacAddr) -> u64 {
     u64::from(can_send) | (u64::from(mac != MacAddr::UNSPECIFIED) << 1)
 }
 
+/// What a datagram this service sends carries.
+///
+/// Fixed, because step 5 is about *who may send* rather than about what is
+/// sent. A caller's own payload crossing into this service needs the shared
+/// region a socket would carry, which is step 6's work.
+const DATAGRAM_PAYLOAD: [u8; 12] = *b"bhaskix-udp1";
+
+/// Builds and hands over one UDP datagram.
+///
+/// Every layer of it comes from `bhaskix-net`: the same code the parser on the
+/// other side of the wire is tested against, and the reason this program can
+/// send a correct packet without knowing how to drive anything.
+fn send_datagram(
+    me: (MacAddr, Ipv4Addr),
+    gateway: MacAddr,
+    from: u16,
+    to: Ipv4Addr,
+    to_port: u16,
+) -> bool {
+    let mut out = [0u8; MAX_FRAME];
+    let body = match udp::write(
+        &mut out[eth::HEADER + ipv4::HEADER..],
+        Port(from),
+        Port(to_port),
+        &DATAGRAM_PAYLOAD,
+        me.1,
+        to,
+    ) {
+        Ok(body) => body,
+        Err(_) => return false,
+    };
+    if ipv4::write_header(
+        &mut out[eth::HEADER..],
+        me.1,
+        to,
+        Protocol::UDP,
+        body,
+        0x2603,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if eth::write_header(&mut out, gateway, me.0, EtherType::IPV4).is_err() {
+        return false;
+    }
+    // SAFETY: the return ring is mapped writable by this program.
+    unsafe { send(&out[..eth::HEADER + ipv4::HEADER + body]) }
+}
+
+/// How many sockets this service will hand out.
+///
+/// Fixed, like every other table this system exposes to something it does not
+/// control: a program that could make the service allocate without bound would
+/// hold a denial of service dressed as a feature.
+const SOCKETS: usize = 8;
+
+/// One bound socket.
+#[derive(Clone, Copy)]
+struct Socket {
+    /// Zero when this slot is free.
+    port: u16,
+    /// Bumped every time the slot is reused, so a capability held across a
+    /// close names a socket that no longer exists rather than the next one.
+    generation: u32,
+}
+
+/// Serves the network to whoever holds a capability to this endpoint.
+///
+/// **Blocks in `receive`**, which is the whole reason this is a service rather
+/// than the poll loop it was through step 4. A frame arriving while nothing is
+/// asking sits in the ring; it is drained when a client next calls, which is
+/// what a receive queue is for.
+///
+/// Returns never.
+fn serve(
+    sockets: &mut [Socket; SOCKETS],
+    me: (MacAddr, Ipv4Addr),
+    gateway: MacAddr,
+    can_send: bool,
+) -> ! {
+    loop {
+        let (status_in, badge, method, args) = receive();
+        if status_in != status::OK {
+            continue;
+        }
+
+        // Unbadged means the caller invoked the service's own endpoint, which
+        // is the only capability that can mint a socket. A badge means the
+        // caller holds a socket and is using it.
+        if badge == 0 {
+            if method != socket::BIND_UDP {
+                reply(socket::GONE, 0, 0);
+                continue;
+            }
+            if !can_send {
+                // No device, or no window to drive it through. Said rather
+                // than pretended: a program can tell "nothing answered" from
+                // "there is nothing to answer".
+                reply(socket::NO_NETWORK, 0, 0);
+                continue;
+            }
+            let wanted = args[0] as u16;
+            let taken = sockets
+                .iter()
+                .position(|held| held.port == 0)
+                .filter(|_| wanted == 0 || sockets.iter().all(|held| held.port != wanted));
+            let Some(index) = taken else {
+                reply(socket::NO_PORT, 0, 0);
+                continue;
+            };
+            // Zero means "assign me one", and the assignment is this service's
+            // to make. Ports start above the well-known range.
+            let port = if wanted == 0 {
+                49152 + index as u16
+            } else {
+                wanted
+            };
+            sockets[index].port = port;
+            let generation = sockets[index].generation;
+
+            // The capability, derived from this program's own endpoint and
+            // handed over. **Where it lands is the caller's to say**: `HAND`
+            // puts it in the slot the caller declared with `EXPECT`, and no
+            // argument here could name another — which is what stops a service
+            // filling a slot a program was keeping empty.
+            let (handed, _) = call(
+                syscall::INVOKE,
+                ENDPOINT,
+                method::HAND,
+                [
+                    ENDPOINT,
+                    rights::READ | rights::DERIVE,
+                    socket::handle(index as u32, generation),
+                    0,
+                ],
+            );
+            if handed == status::OK {
+                reply(socket::OK, u64::from(port), 0);
+            } else {
+                // The commonest reason is that the caller never said where.
+                // That is the caller's mistake rather than a missing socket, so
+                // it gets its own answer and the slot is given back.
+                sockets[index].port = 0;
+                reply(socket::NOWHERE, 0, 0);
+            }
+            continue;
+        }
+
+        // A badged capability: a socket. The badge was stamped by the kernel on
+        // the way through and cannot be forged by the holder, which is the one
+        // thing making the rest of this safe.
+        let (index, generation) = socket::parts(badge);
+        let held = sockets.get(index as usize).copied();
+        let Some(held) = held.filter(|held| held.port != 0 && held.generation == generation) else {
+            // Either never a socket, or one that has been closed and whose slot
+            // may already be somebody else's. The generation is what tells
+            // those apart from the socket that is there now.
+            reply(socket::GONE, 0, 0);
+            continue;
+        };
+
+        match method {
+            socket::CLOSE => {
+                sockets[index as usize].port = 0;
+                // Bumped on release rather than on reuse, so the next holder of
+                // this slot cannot be mistaken for the one that just left.
+                sockets[index as usize].generation = generation.wrapping_add(1);
+                reply(socket::OK, 0, 0);
+            }
+            socket::SEND_TO => {
+                let sent = send_datagram(
+                    me,
+                    gateway,
+                    held.port,
+                    Ipv4Addr(args[0] as u32),
+                    args[1] as u16,
+                );
+                reply(if sent { socket::OK } else { socket::NO_NETWORK }, 0, 0);
+            }
+            socket::RECV_FROM => {
+                // Nothing is queued per socket yet: the ring is drained by the
+                // frame path and datagrams are counted rather than kept. What
+                // this answers today is "nothing has arrived", which is an
+                // answer and not an error -- and the shape a caller polling
+                // between sends already expects.
+                reply(socket::EMPTY, 0, 0);
+            }
+            _ => reply(socket::GONE, 0, 0),
+        }
+    }
+}
+
 /// The entry point.
 #[unsafe(no_mangle)]
 extern "C" fn ipd_main() -> ! {
@@ -290,6 +528,10 @@ extern "C" fn ipd_main() -> ! {
         exit()
     }
     let can_send = attach(BACK, BACK_AT, 1) && attach(CONFIG, CONFIG_AT, 0);
+    // Whether this program has an endpoint to answer on at all. Without one it
+    // is still the frame mover it was at step 4, and says so by stopping.
+    let serving =
+        call(syscall::INVOKE, ENDPOINT, method::INFO, [0; 4]).0 != status::NO_SUCH_CAPABILITY;
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
         exit()
     };
@@ -308,6 +550,10 @@ extern "C" fn ipd_main() -> ! {
     let mut asked = false;
     let mut pinged = false;
     let mut quiet = 0u32;
+    let mut sockets = [Socket {
+        port: 0,
+        generation: 1,
+    }; SOCKETS];
     let mut pongs = 0u64;
     // Only this program advances the tail, so it is kept here and written out
     // rather than read back. A consumer that re-read its own index would be
@@ -471,6 +717,29 @@ extern "C" fn ipd_main() -> ! {
             // DMA window: there is nothing to wait for and no reason to spin.
             let done = asked && pinged;
             if (done && quiet > 20_000) || quiet > 2_000_000 {
+                // **Serve rather than stop.** Through step 4 this program
+                // exited here, because it had nothing to wait on and a poll
+                // loop that never ends is a processor nobody else can have.
+                // An endpoint is something to wait on: `receive` blocks, and a
+                // service asleep in it costs nothing at all.
+                //
+                // The demonstration above is done by this point, so what
+                // follows is the program's real job. A frame arriving while it
+                // is asleep waits in the ring, which is what a receive queue is.
+                if serving {
+                    report(
+                        frames,
+                        bytes,
+                        first_source,
+                        refused,
+                        built,
+                        cache.live(ticks) as u64,
+                        state(can_send, me.0),
+                        pongs,
+                    );
+                    let gateway = cache.lookup(GATEWAY, ticks).unwrap_or(MacAddr::BROADCAST);
+                    serve(&mut sockets, me, gateway, can_send);
+                }
                 report(
                     frames,
                     bytes,

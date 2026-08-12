@@ -740,6 +740,59 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-12, last (RFC 0018 step 5: a socket you have to hold)
+
+```
+ok    a socket was handed back as a capability
+ok    a held socket can send
+ok    a closed socket is gone, and its slot is not inherited
+```
+
+**The kernel gained nothing for this step, and that is the finding.** RFC 0018 said a socket needed
+`ObjectKind::Socket`, "exactly as a directory handle is" — but a directory handle **is not an object
+kind**. RFC 0016 deleted `ObjectKind::Directory` and `ObjectKind::File`; a directory a program holds
+is a badged endpoint capability to `fsd`, and `kernel/src/cap.rs` has no `Directory` in it. The RFC
+had its own cited precedent backwards.
+
+Following it properly: a socket is a badged capability to `ipd`'s **own endpoint**, minted with
+`HAND`, stamped by the kernel so the badge cannot be forged, and landing in the slot the *caller*
+named with `EXPECT` rather than one the service chose. No object kind, no capability type, no kernel
+code. The RFC's paragraph is corrected in place.
+
+The third assertion is the one worth keeping. After `close` the capability is still a capability —
+the kernel resolves it, the endpoint is still there — and the service refuses it because the badge
+names a generation that no longer exists. **A holder who kept one across a close does not inherit
+whatever lands in that slot next.**
+
+**`ipd` is a service now, and it blocks.** Through step 4 it polled and stopped when quiet, because
+it had nothing to wait on. An endpoint is something to wait on: `receive` sleeps, and a service
+asleep in it costs nothing. That retires the CPU burn the polling fix worked around rather than
+working around it again.
+
+**The two-thread design in the plan is dead, for a reason worth recording.** It was to be one thread
+blocking in `RECV` and one moving frames. Every `*_domain_entry` builds and installs its **own**
+address space, so two threads in one domain would share no memory at all. Blocking in `RECV` and
+draining the ring when a client calls is better anyway: a datagram waiting in the ring until
+somebody asks for it is what a receive queue *is*.
+
+**And the bug that cost the most was two harnesses with two device lists.** `boot-test.sh` got the
+network device; `shell-test.sh` builds its own QEMU arguments and did not. So the shell correctly
+reported holding no capability to a service that did not exist, while the boot log — from the *other*
+harness — showed the kernel installing that capability successfully. Both were true and they were
+describing different machines.
+
+It ended the way three other searches ended today: **by printing the measured value instead of a
+paraphrase of it.** The shell said "this program holds no capability to one"; replacing that with the
+status it actually got — `2`, `NO_SUCH_CAPABILITY` — pointed straight at an empty slot rather than at
+the ordering theory being chased. A message that restates what the code *meant* cannot correct the
+reader who wrote it.
+
+An ordering fix went in on its own merits along the way: the shell's network capability was installed
+two hundred lines before `start_net_domain` ran, in the same function. Real, and not this symptom.
+
+**Left open:** the two harnesses still keep separate device lists, which is exactly what let this
+happen and will let it happen again.
+
 ### 2026-08-12, last (a timing assertion removed from a boot gate)
 
 The bulk-path self-test required `message_cycles >= shared_cycles * 2` — shared memory at least

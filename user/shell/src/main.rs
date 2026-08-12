@@ -30,7 +30,7 @@
 
 use bhaskix_abi::{
     CHUNK_BYTES, Chunk, Edit, LineEditor, block, console, dir, entry_of, fs, method, outcome,
-    rights, status, syscall,
+    rights, socket, status, syscall,
 };
 
 /// The capability slot the console endpoint was installed in.
@@ -125,6 +125,17 @@ const BADGE_FILESYSTEM: u64 = 0x0000_0000_00f5_0000;
 /// so the kernel manufactures one — the check that catches these should be
 /// working *before* the step that makes them happen for real.
 const STALE_DIRECTORY: u64 = 10;
+
+/// Slot: the network, if this program was given one.
+///
+/// **The whole of what "having networking" means here.** There is no port table
+/// to ask and no interface list to enumerate, so a program without this has no
+/// way to name the network at all — which is not a refused call, it is nothing
+/// to call. `bin/probe` holds none and never will.
+const NETWORK: u64 = 16;
+
+/// Slot: where a socket lands, declared with `EXPECT` before asking for one.
+const SOCKET: u64 = 17;
 
 /// What a system call returned: the status, and the message's four registers.
 struct Reply {
@@ -912,6 +923,89 @@ fn cat(path: &[u8]) {
     }
 }
 
+/// Binds a socket, uses it, and gives it back.
+///
+/// RFC 0018 step 5, and the point is what the *absence* of the capability
+/// means. This program holds one at [`NETWORK`]; `bin/probe` does not, and
+/// there is nothing it could invoke instead — no port table, no interface
+/// list, no fallback path.
+///
+/// The socket that comes back is a **badged capability to the protocol
+/// service's own endpoint**, not an object the kernel knows about. `close`
+/// then shows what the badge's second half is for: the capability keeps
+/// working as a *name* and stops working as a *socket*, because the generation
+/// it carries no longer matches the slot.
+fn network(rest: &[u8]) {
+    let (word, _) = split(rest);
+
+    // Where a capability may land. Declared by *this* program, one-shot, and
+    // the service cannot name another slot -- which is what stops a service
+    // filling a slot a caller was keeping empty.
+    let declared = self::syscall(syscall::INVOKE, NETWORK, method::EXPECT, [SOCKET, 0, 0, 0]);
+    if declared.status != status::OK {
+        write(b"  no network: expect refused with status ");
+        write_number(declared.status);
+        write(b"\n");
+        return;
+    }
+
+    let reply = call(NETWORK, socket::BIND_UDP, [0, 0, 0, 0]);
+    if reply.status != status::OK {
+        write(b"  no network: the service did not answer\n");
+        return;
+    }
+    match reply.args[0] {
+        socket::NO_NETWORK => {
+            write(b"  no network: there is a service but no device behind it\n");
+            return;
+        }
+        socket::NO_PORT => {
+            write(b"  no port free\n");
+            return;
+        }
+        socket::OK => {}
+        _ => {
+            write(b"  the service refused\n");
+            return;
+        }
+    }
+    write(b"  bound a socket, handed back as a capability\n");
+
+    // Use it. The datagram's contents are the service's to choose at this step;
+    // what is being shown is that a *held* capability is what makes it possible.
+    let sent = call(
+        SOCKET,
+        socket::SEND_TO,
+        [u64::from(u32::from_be_bytes([10, 0, 2, 2])), 9, 0, 0],
+    );
+    if sent.status == status::OK && sent.args[0] == socket::OK {
+        write(b"  sent a datagram through it\n");
+    } else {
+        write(b"  the socket would not send\n");
+    }
+
+    if word == b"keep" {
+        return;
+    }
+
+    let closed = call(SOCKET, socket::CLOSE, [0; 4]);
+    if closed.status == status::OK && closed.args[0] == socket::OK {
+        write(b"  closed it\n");
+    }
+
+    // And now the generation earns itself. The capability is still a
+    // capability -- the kernel resolves it, the endpoint is still there -- and
+    // the badge names a socket that no longer exists, so the service refuses
+    // it. A holder that kept one across a close does not inherit whatever is
+    // in that slot next.
+    let stale = call(SOCKET, socket::SEND_TO, [0, 0, 0, 0]);
+    if stale.status == status::OK && stale.args[0] == socket::GONE {
+        write(b"  the closed socket is gone, and its slot may be somebody else's\n");
+    } else {
+        write(b"  a closed socket still worked -- the generation did not hold\n");
+    }
+}
+
 /// Splits a line into a command and the rest.
 fn split(line: &[u8]) -> (&[u8], &[u8]) {
     let start = line.iter().position(|b| !b.is_ascii_whitespace());
@@ -1274,6 +1368,7 @@ fn run(line: &[u8]) {
         b"caps" => capabilities(),
         b"map" => map(),
         b"irq" => signals(),
+        b"net" => network(rest),
         b"cat" => {
             if rest.is_empty() {
                 write(b"  cat: which file?\n");

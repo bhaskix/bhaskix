@@ -105,6 +105,11 @@ else
         # RFC 0017 step 1 a fault ends the domain, which would end the shell in
         # the middle of its own test.
         commands+=$'lend\r'$'held\r'$'release\r'
+        # RFC 0018 step 5, and only under `iommu` because that is the only mode
+        # where there is a device behind the service. Without one the command
+        # still answers -- "there is a service but no device behind it" -- which
+        # is a different sentence and a different assertion.
+        commands+=$'net\r'
     fi
     # RFC 0017 steps 4 to 6, asked for by a person rather than by a self-test.
     #
@@ -163,7 +168,15 @@ echo "booting and typing at it, up to ${TIMEOUT}s..."
 if [[ "$MODE" == "iommu" ]]; then
     IOMMU_ARGS=(-device intel-iommu,intremap=on)
     VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=on
-                 -device virtio-blk-pci,drive=disk1,disable-legacy=on,iommu_platform=on)
+                 -device virtio-blk-pci,drive=disk1,disable-legacy=on,iommu_platform=on
+                 # RFC 0018 step 5: `net` needs something to be a network. This
+                 # harness builds its own device list and had none -- the NIC was
+                 # added to boot-test.sh and not here, so the shell was correctly
+                 # reporting that it held no capability to a service that did not
+                 # exist. Two harnesses with two device lists is how one of them
+                 # ends up testing a different machine.
+                 -netdev user,id=net0,restrict=on
+                 -device virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on)
 else
     IOMMU_ARGS=()
     VIRTIO_ARGS=(-device virtio-blk-pci,drive=disk0
@@ -407,6 +420,23 @@ else
             "a released page cannot be mapped again:released page +can no longer be mapped"
         )
         for check in "${lend_checks[@]}"; do
+            checks+=("$check")
+        done
+
+        # RFC 0018 step 5: a socket is a capability, and holding it is the whole
+        # of having networking.
+        #
+        # The stale check is the one that matters. After `close` the capability
+        # is *still a capability* -- the kernel resolves it and the endpoint is
+        # still there -- and the service refuses it because the badge names a
+        # generation that no longer exists. Without that, a holder who kept one
+        # across a close would inherit whatever socket lands in the slot next.
+        net_checks=(
+            "a socket was handed back as a capability:bound a socket, handed back as a capability"
+            "a held socket can send:sent a datagram through it"
+            "a closed socket is gone, and its slot is not inherited:the closed socket is gone"
+        )
+        for check in "${net_checks[@]}"; do
             checks+=("$check")
         done
     fi

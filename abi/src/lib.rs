@@ -461,6 +461,91 @@ pub mod dir {
     }
 }
 
+/// Methods a socket answers, and the one that mints them.
+///
+/// [RFC 0018](../../docs/rfc/0018-networking.md) step 5. A socket is **a badged
+/// capability to the protocol service's own endpoint**, not an object the
+/// kernel knows about — the same shape a directory has since RFC 0016 deleted
+/// `ObjectKind::Directory`, and for the same reason: the thing being named
+/// lives in a userspace service, so the kernel has no business having a type
+/// for it.
+///
+/// What the kernel does provide is the part a service cannot: the badge is
+/// stamped on the way through and cannot be forged by the holder, so a program
+/// cannot invent a socket it was never given.
+///
+/// # What holding one means
+///
+/// A program with a socket can send and receive on that flow. It cannot
+/// enumerate ports, cannot bind another, cannot see another program's traffic,
+/// and cannot reach the device. **A program without one has no way to name the
+/// network at all** — there is no port table and no interface list to ask, so
+/// the absence is not a refused call, it is nothing to call.
+pub mod socket {
+    /// Bind a local UDP port, and be handed a socket.
+    ///
+    /// Invoked on a capability to the protocol service's endpoint — the one a
+    /// program is given at boot if it is to have networking at all.
+    ///
+    /// `arg0` is the port, or zero to be assigned one. The caller must have
+    /// said where a capability may land with [`method::EXPECT`] first, exactly
+    /// as [`dir::OPEN_AT`] requires, so the service cannot choose the slot.
+    ///
+    /// Replies with `args[0]` an outcome below and `args[1]` the port actually
+    /// bound. On [`OK`] a socket capability has been handed to the caller.
+    pub const BIND_UDP: u64 = 51;
+
+    /// Send a datagram from this socket.
+    ///
+    /// Invoked on the socket capability itself. `arg0` is the destination
+    /// address, `arg1` the destination port, and the payload is whatever the
+    /// caller has put in the socket's ring.
+    pub const SEND_TO: u64 = 52;
+
+    /// Take the next datagram this socket has received.
+    ///
+    /// Replies with the source address in `args[1]` and its port in `args[2]`,
+    /// or [`EMPTY`] when nothing has arrived — which is an answer rather than
+    /// an error, because a caller polling between sends wants to hear it.
+    pub const RECV_FROM: u64 = 53;
+
+    /// Give up this socket.
+    ///
+    /// The binding ends and the capability stops working. A capability held
+    /// after a close names a *generation* that no longer exists, which is what
+    /// the badge's second half is for: the slot may be reused immediately and
+    /// the old holder must not inherit the new socket.
+    pub const CLOSE: u64 = 54;
+
+    /// It worked.
+    pub const OK: u64 = 0;
+    /// That port is already bound, or none is free.
+    pub const NO_PORT: u64 = 1;
+    /// This socket has been closed, and its slot may already be somebody
+    /// else's. Distinct from a refusal: the capability was real once.
+    pub const GONE: u64 = 2;
+    /// Nothing has arrived.
+    pub const EMPTY: u64 = 3;
+    /// The caller never said where a capability may land.
+    pub const NOWHERE: u64 = 4;
+    /// The network is not reachable — no device, or no window to drive it
+    /// through. Said rather than pretended, so a program can tell "nothing
+    /// answered" from "there is nothing to answer".
+    pub const NO_NETWORK: u64 = 5;
+
+    /// Packs a socket's identity into the badge a capability carries.
+    #[must_use]
+    pub const fn handle(index: u32, generation: u32) -> u64 {
+        (index as u64) | ((generation as u64) << 32)
+    }
+
+    /// The socket index and generation a badge names.
+    #[must_use]
+    pub const fn parts(badge: u64) -> (u32, u32) {
+        (badge as u32, (badge >> 32) as u32)
+    }
+}
+
 /// Methods a block service answers.
 ///
 /// Sector data never crosses in message registers. The caller names memory it

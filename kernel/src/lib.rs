@@ -3941,6 +3941,30 @@ fn start_ip_domain(
         return Err("the ip report would not install");
     }
 
+    // The endpoint programs reach the network through, at slot 4 and
+    // **unbadged** — this is the service's own, the one it receives on. Every
+    // socket it hands out will be a *badged, weaker* capability to this same
+    // endpoint, which is the shape RFC 0016 settled for directories and the
+    // reason step 5 needs no new object kind.
+    let net_endpoint = ipc::create().map_err(|_| "no endpoint for the protocol service")?;
+    let serving = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(net_endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the network endpoint capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(4, serving).is_ok()) != Some(true) {
+        return Err("the network endpoint capability would not install");
+    }
+    NET_ENDPOINT.store(
+        u64::from(net_endpoint.as_u32()),
+        core::sync::atomic::Ordering::Release,
+    );
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -3962,6 +3986,33 @@ static NET_RING_REPORT: core::sync::atomic::AtomicU64 =
 
 /// The page telling `bin/ipd` what this interface is.
 static NET_CONFIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The endpoint `bin/ipd` serves the network on, once there is one.
+static NET_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// A capability to the protocol service's endpoint, for a program to hold.
+///
+/// **This is the whole of what "having networking" means for a program.** There
+/// is no port table to ask and no interface list to enumerate: a program either
+/// holds this or it has no way to name the network at all — which is not a
+/// refused call, it is nothing to call.
+fn network_endpoint_capability() -> Option<cap::SlotRef> {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_ENDPOINT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return None;
+    }
+    cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, raw),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+}
 
 /// The notification `bin/netd` sleeps on, with the top bit set when it is real.
 static NET_WAKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -4705,7 +4756,11 @@ fn net_domain_mac(hhdm: u64) -> Option<u64> {
             core::ptr::read_volatile((hhdm + frames[NETD_REPORT_PAGE] + 8) as *const u64),
         )
     };
-    (marker == NETD_MARKER).then_some(mac)
+    // A zero address is not an address. The driver writes its report with the
+    // marker set and the MAC still zero when it had no window to read the
+    // device through, so believing the marker alone publishes an interface that
+    // does not exist -- and says so on the console every boot without an IOMMU.
+    (marker == NETD_MARKER && mac != 0).then_some(mac)
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -6159,9 +6214,14 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             Some(_) => println!(
                 "\x1b[91m    net config     FAILED: the configuration page would not take it\x1b[0m"
             ),
-            // Silent until now, and that was the bug hiding: a driver that has
-            // not reported its address yet leaves `ipd` unconfigured for ever,
-            // and nothing said so.
+            // A driver with no DMA window never gets as far as reading the
+            // device's address, so there is nothing to pass on and nothing
+            // wrong — that is every boot without an IOMMU. Only a driver that
+            // *could* have read one and did not is a failure.
+            None if !NET_CONTAINED.load(core::sync::atomic::Ordering::Acquire) => println!(
+                "    net config     no address to pass on; the driver has no window to read one \
+                 through"
+            ),
             None => println!(
                 "\x1b[91m    net config     FAILED: the driver reported no address to pass on\x1b[0m"
             ),
@@ -6190,6 +6250,50 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         if !report_net_ring(hhdm) {
             println!("\x1b[91m    net ring       FAILED\x1b[0m");
         }
+    }
+
+    // The network, at slot 16, and only if there is one. **A program either
+    // holds this or cannot name the network at all** — RFC 0018 step 5's whole
+    // claim, and the thing `bin/probe` demonstrates by not having it.
+    //
+    // **Installed here rather than with the shell's other capabilities**, and
+    // that is the whole of a bug: the rest are installed two hundred lines
+    // above, before `start_net_domain` has run, so the endpoint did not exist
+    // yet and the slot stayed empty. The shell then reported that it held no
+    // network — which is the *negative* half of step 5 working perfectly and
+    // the positive half never being tested at all.
+    //
+    // The same shape as step 3's ring, which was installed after its consumer
+    // had already started. A capability a program needs has to exist before the
+    // program's space is finished with, and "before it is spawned" is the line
+    // that matters: the shell is spawned below.
+    // **Not fatal, and that is the correction.** This returned `Err` when the
+    // capability would not install, which fails the *whole* of `user_shell` —
+    // so the machine fell back to the kernel shell and thirty-eight assertions
+    // in unrelated subsystems went red because networking could not be wired.
+    //
+    // A shell that cannot be given a network is still a shell. It reports what
+    // it has and carries on, which is what every other optional capability here
+    // already does: the block registers at slot 5 are installed "only if there
+    // *is* a device, so a machine booted without one still gets a shell".
+    //
+    // The same lesson as the bulk path's timing assertion, arriving from
+    // another direction: a check that turns a small local failure into a broad
+    // unrelated one is worse than the failure it reports.
+    match network_endpoint_capability() {
+        Some(network)
+            if domain::with(realm, |owner| owner.cspace.install_at(16, network).is_ok())
+                == Some(true) =>
+        {
+            println!("    shell network  the shell holds a capability to the protocol service")
+        }
+        Some(_) => println!(
+            "\x1b[93m    shell network  the capability would not install; this shell has no \
+             network\x1b[0m"
+        ),
+        None => println!(
+            "    shell network  none: there is no protocol service for the shell to be given"
+        ),
     }
 
     // The directories this program holds, at slots 8 and 10, and they are now

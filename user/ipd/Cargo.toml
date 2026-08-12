@@ -46,4 +46,8 @@ opt-level = "s"
 # 87 at step 4a: writing into the return ring, and reading the configuration
 # page. Still a third of either driver's, and still not a device register
 # anywhere in it.
-unsafe_budget = 89
+# 105 at RFC 0018 step 5: the `receive` system call this program needed to
+# become a service. One `asm!` block, and its operand list is most of the count
+# -- the kernel writes the whole message frame back, so every argument register
+# has to be declared as an output.
+unsafe_budget = 105
