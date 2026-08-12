@@ -121,9 +121,9 @@ job is to translate whatever the bootloader gave us into `bhaskix_boot::Handoff`
 version:
 
 ```rust
-#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct Handoff {
-    pub version: u32,
+    pub version: u32,                 // must equal HANDOFF_VERSION
     pub memory_map: &'static [MemoryRegion],
     pub hhdm_base: VirtAddr,          // direct map of all physical memory
     pub kernel_phys_base: PhysAddr,
@@ -131,11 +131,27 @@ pub struct Handoff {
     pub framebuffer: Option<Framebuffer>,
     pub rsdp: Option<PhysAddr>,       // ACPI
     pub smbios: Option<PhysAddr>,
-    pub boot_cmdline: &'static str,
-    pub initrd: Option<PhysSlice>,
-    pub tpm_event_log: Option<PhysSlice>,
+    pub cmdline: &'static str,
+    pub loader: &'static str,         // diagnostics only
+    pub cpu_count: u32,               // including the bootstrap processor
+    pub bsp_lapic_id: u32,
+    pub start_secondaries: Option<StartSecondaries>,
+    pub regions_truncated: bool,      // must be reported, never ignored
+    pub initrd: Option<&'static [u8]>,
 }
+
+/// Releases every secondary CPU, returning the local APIC identifier of each.
+pub type StartSecondaries = fn(entry: extern "C" fn(u32) -> !) -> &'static [u32];
 ```
+
+Three things are load-bearing and easy to read past. **Every variable-length payload is a borrowed
+slice**, not an address and a length, so the kernel cannot read past one by arithmetic. **No
+`repr`** is specified, and none is needed: both sides are built from this crate in the same
+compilation, which is also why `version` is checked rather than negotiated — it catches a shim and
+a kernel built from different trees, not a foreign loader. And **`start_secondaries` returns
+identities rather than a count**, because the count cannot answer the question a bring-up failure
+asks: *which* processor never arrived. Only the code that released them knows, and the structure
+itself is built before any of them is released.
 
 This is deliberate. It costs roughly 200 lines and buys three things:
 

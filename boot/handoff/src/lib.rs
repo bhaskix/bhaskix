@@ -40,7 +40,7 @@ use core::fmt;
 ///
 /// The shim writes it into [`Handoff::version`] and the kernel checks it. Bump
 /// this on any change to the layout or meaning of the structures below.
-pub const HANDOFF_VERSION: u32 = 1;
+pub const HANDOFF_VERSION: u32 = 2;
 
 /// A physical address.
 ///
@@ -239,15 +239,29 @@ impl Framebuffer {
     }
 }
 
-/// Starts every secondary CPU at `entry`, returning how many were started.
+/// Starts every secondary CPU at `entry`, returning the ones it released.
 ///
 /// A function pointer rather than a list of CPU descriptors, because *how* a
 /// CPU is started is a bootloader detail and the kernel must not learn it
 /// (`docs/architecture.md` §1). The shim keeps the mechanism; the kernel keeps
 /// the policy of what a secondary CPU should do.
 ///
+/// The returned slice holds the local APIC identifier of every CPU that was
+/// released, so its length is the count this used to return. **Identities
+/// rather than a number, because a CPU that never reports in can then be
+/// named**: the kernel knows which processors arrived and had nothing to
+/// subtract them from, so a bring-up failure could say how many were missing
+/// but not which — the difference between a curiosity on an emulator and a
+/// finding that can be taken to a firmware vendor.
+///
+/// This is the only thing that can answer it. A field on [`Handoff`] could
+/// carry only what firmware *reported*, because the structure is built before
+/// any CPU is released; what was actually released is known here and nowhere
+/// else, and returning it is what keeps the count and the list from ever
+/// disagreeing.
+///
 /// `entry` receives the CPU's local APIC identifier and must never return.
-pub type StartSecondaries = fn(entry: extern "C" fn(u32) -> !) -> u32;
+pub type StartSecondaries = fn(entry: extern "C" fn(u32) -> !) -> &'static [u32];
 
 /// Everything the kernel is given at entry.
 ///

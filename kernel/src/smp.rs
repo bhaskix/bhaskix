@@ -147,7 +147,8 @@ pub fn start_secondaries(handoff: &bhaskix_boot::Handoff) -> u32 {
     // moved above the call, that same print boots cleanly five times out of
     // five.
     let before = percpu::online_count();
-    let requested = start(secondary_main);
+    let released = start(secondary_main);
+    let requested = released.len() as u32;
     if requested == 0 {
         return 0;
     }
@@ -199,6 +200,17 @@ pub fn start_secondaries(handoff: &bhaskix_boot::Handoff) -> u32 {
             expected - online,
             WAIT_NANOS / 1_000_000
         );
+        // And *which*. A count says a processor is missing; only an identifier
+        // can be taken to a firmware vendor, and on a machine that is not an
+        // emulator that is the whole of the diagnosis. The loader returns the
+        // identities it released precisely so this line can exist.
+        for lapic_id in released {
+            if !percpu::is_online_lapic(*lapic_id) {
+                println!(
+                    "\x1b[93m    smp              lapic {lapic_id} was released and never reported in\x1b[0m"
+                );
+            }
+        }
     }
 
     online.saturating_sub(1)

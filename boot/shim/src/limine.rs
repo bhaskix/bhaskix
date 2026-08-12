@@ -333,11 +333,29 @@ request!(
 /// memory a device already owns.
 const MAX_MEMORY_REGIONS: usize = 256;
 
+/// Maximum secondary CPUs whose identity the shim records.
+///
+/// Matched to `bhaskix_arch::percpu::MAX_CPUS`, which is 64, and not by
+/// coincidence: a processor past that has no per-CPU area, so `percpu::install`
+/// refuses it and [`crate`]'s secondary entry parks it for ever. Releasing one
+/// only sends a CPU into a halt loop, so the release loop stops at this cap
+/// too — which keeps the returned identities and the count of them in
+/// agreement by construction, rather than reporting a CPU as missing because
+/// its identity did not fit.
+///
+/// Stated as its own constant rather than imported, because `bhaskix-boot` sits
+/// at the same dependency layer as `bhaskix-arch-x86-64` and may never reach
+/// it (`tools/check-deps.py`). If one moves the other must be moved by hand;
+/// this comment is the link between them.
+const MAX_SECONDARIES: usize = 64;
+
 /// Storage for a value written exactly once during boot.
 ///
-/// Used for the memory-map array and the loader name buffer, both of which are
-/// filled by [`collect_handoff`] before any other CPU exists and are read-only
-/// thereafter.
+/// Used for the memory-map array, the loader name buffer and the released-CPU
+/// identities. The first two are filled by [`collect_handoff`] before any other
+/// CPU exists; the third is filled by [`start_secondaries`], which is the call
+/// that ends that window — see its own SAFETY comment, which does not rely on
+/// this one.
 struct BootStatic<T>(UnsafeCell<T>);
 
 // SAFETY: written once by `collect_handoff`, which runs on the bootstrap CPU
@@ -354,6 +372,10 @@ static MEMORY_MAP: BootStatic<[MemoryRegion; MAX_MEMORY_REGIONS]> = BootStatic(U
 ));
 
 static LOADER_NAME: BootStatic<[u8; 96]> = BootStatic(UnsafeCell::new([0; 96]));
+
+/// Local APIC identifiers of the secondaries [`start_secondaries`] released.
+static RELEASED: BootStatic<[u32; MAX_SECONDARIES]> =
+    BootStatic(UnsafeCell::new([0; MAX_SECONDARIES]));
 
 /// Where secondary CPUs should jump once the loader has them in long mode.
 ///
@@ -386,26 +408,52 @@ extern "C" fn secondary_trampoline(info: *mut MpInfo) -> ! {
     }
 }
 
-/// Releases every secondary CPU to `entry`. Returns how many were started.
+/// Releases every secondary CPU to `entry`. Returns the ones it released.
 ///
 /// The bootstrap CPU is skipped -- it is already running this code.
-fn start_secondaries(entry: extern "C" fn(u32) -> !) -> u32 {
+///
+/// The returned slice holds each released CPU's local APIC identifier, which is
+/// what lets the kernel name a processor that never reports in rather than
+/// merely counting it.
+fn start_secondaries(entry: extern "C" fn(u32) -> !) -> &'static [u32] {
     let Some(response) = MP.response() else {
-        return 0;
+        return &[];
     };
 
     // SAFETY: single-threaded; no CPU has been released yet, so nothing else
     // can observe this write.
     unsafe { *AP_ENTRY.0.get() = Some(entry) };
 
+    // SAFETY: no CPU has been released yet, so this is still single-threaded --
+    // and the released CPUs never read `RELEASED`, only the bootstrap CPU does,
+    // after this function returns. Held across the loop below, where each entry
+    // is written *before* the write that releases its CPU.
+    let released = unsafe { &mut *RELEASED.0.get() };
+
     let mut started = 0;
     for index in 0..response.cpu_count as usize {
+        // Stop at the cap rather than releasing a CPU whose identity would not
+        // fit. Said out loud: a processor the kernel will never hear from, that
+        // this function cannot name, is exactly the situation the identities
+        // exist to prevent.
+        if started == MAX_SECONDARIES {
+            bhaskix_kernel::println!(
+                "    smp            more than {MAX_SECONDARIES} secondaries reported; \
+                 the rest stay parked"
+            );
+            break;
+        }
+
         // SAFETY: the protocol guarantees `cpus` points to `cpu_count` valid
         // `MpInfo` pointers.
         let info = unsafe { &mut **response.cpus.add(index) };
         if info.lapic_id == response.bsp_lapic_id {
             continue;
         }
+
+        // Recorded before the release, so the slice can never name a CPU that
+        // was not let go.
+        released[started] = info.lapic_id;
 
         // Writing `goto_address` is what actually releases the CPU, so it must
         // be the last thing to happen and must be a volatile write -- the
@@ -419,7 +467,14 @@ fn start_secondaries(entry: extern "C" fn(u32) -> !) -> u32 {
         }
         started += 1;
     }
-    started
+
+    // SAFETY: `RELEASED` is a `[u32; MAX_SECONDARIES]`, and the loop above
+    // wrote elements `0..started`, which the cap holds at most
+    // `MAX_SECONDARIES`. Built from the raw pointer rather than by indexing
+    // `released`, so the returned slice borrows the static itself and is
+    // genuinely `'static` -- the same reason `collect_handoff` builds the
+    // memory map this way.
+    unsafe { core::slice::from_raw_parts(RELEASED.0.get().cast::<u32>(), started) }
 }
 
 /// Reads a NUL-terminated string into a `&'static str`.

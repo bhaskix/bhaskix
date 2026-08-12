@@ -256,6 +256,24 @@ pub fn lapic_id_of(cpu_id: u32) -> Option<u32> {
         .map(|area| area.lapic_id)
 }
 
+/// Whether a CPU with this local APIC identifier has come online.
+///
+/// The inverse of [`lapic_id_of`], and needed for the question that one cannot
+/// answer: given the processors a bootloader released, which of them never
+/// reported in. Everything else here is keyed by the dense identifier, which a
+/// CPU that never arrived was never given.
+#[must_use]
+pub fn is_online_lapic(lapic_id: u32) -> bool {
+    let count = online_count() as usize;
+    // SAFETY: elements below `count` were fully written by `install` before the
+    // counter that publishes them was incremented, and never change again.
+    let areas = unsafe { AREAS.get() };
+    areas
+        .iter()
+        .take(count)
+        .any(|area| area.online && area.lapic_id == lapic_id)
+}
+
 /// Runs `f` for each online CPU: `(cpu_id, lapic_id)`.
 pub fn for_each_online(mut f: impl FnMut(u32, u32)) {
     let count = online_count() as usize;
