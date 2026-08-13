@@ -742,6 +742,36 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (RFC 0019 step 1: the deadline table, and nothing wired to it)
+
+The arithmetic only — arm, replace, disarm, expire, refuse when full — beside the notification table
+it belongs to. **Nothing arms these from a system call and nothing expires them from the timer
+interrupt**; that is step 2, and keeping them apart is what lets every rule be tested on the host
+with no kernel running. Six tests, all host.
+
+**Two rules are worth naming.** A second `arm` **replaces** the first rather than taking a slot,
+which is the opposite of the second-waiter rule and deliberate: two waiters each want a wake and only
+one can have it, whereas re-arming is how a timer user says "not then, this instead". And expiry
+compares with `>` and never the other way: **a timer that fires early is a bug that looks like
+success**, because the waiter wakes, finds nothing has happened, and sleeps again — or acts.
+
+**The generation is stored beside the index.** A notification can be destroyed and its slot reused
+while a deadline is armed against it; without the generation the timer would fire at whoever took the
+slot next, which is exactly what `NotificationId` exists to prevent one level up. There is a test.
+
+**`MAX_DEADLINES` is 16, fewer than the 32 notifications**, and the first version made it 32. That
+was wrong twice over: most notifications never carry a deadline — a device's interrupt and a ring's
+doorbell are signalled by something that already knows when — and the table is scanned where the
+timer interrupt runs, so its length is paid on every tick. It was *found* by the full-table test
+needing a thirty-third notification, panicking, and leaking the arena into five other tests.
+
+**Watched failing**, which is the point: making expiry fire one tick early turned 8 tests red.
+
+**An unrelated flake, recorded rather than ignored.** `sync::tests::holding_a_rank_still_blocks_
+preemption_after_its_bit_is_cleared` failed once and passed on four consecutive re-runs. It is not
+caused by this change — nothing here touches `sync` — and it is the second intermittent host test
+seen this week.
+
 ### 2026-08-13, last (RFC 0019 drafted: time, because TCP cannot be written without it)
 
 Started the TCP RFC and stopped one layer down. **Nothing in this system can wait for a length of

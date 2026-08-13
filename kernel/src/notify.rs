@@ -300,6 +300,144 @@ pub fn name(id: NotificationId) -> Result<crate::cap::SlotRef, NotifyError> {
     .map_err(|_| NotifyError::Exhausted)
 }
 
+/// Deadlines the kernel can have armed at once.
+///
+/// Fixed, like every other table this system exposes to something it does not
+/// control: a program that could make the kernel allocate by asking for another
+/// timer would hold a denial of service dressed as a feature. Full is a
+/// refusal.
+///
+/// **Fewer than there are notifications**, and deliberately: most notifications
+/// never carry a deadline — a device's interrupt and a ring's doorbell are
+/// signalled by something that already knows when — and this table is scanned
+/// where the timer interrupt runs, so its length is a cost paid on every tick.
+///
+/// **RFC 0019 step 1.** The arithmetic only — nothing arms these from a system
+/// call yet, and nothing expires them from the timer interrupt. That is step 2,
+/// and keeping them apart is what lets every rule below be tested on the host
+/// with no kernel running.
+pub const MAX_DEADLINES: usize = 16;
+
+/// One armed deadline: a notification, and when it should be signalled.
+struct Armed {
+    /// The notification's index, plus one. Zero means this slot is free.
+    ///
+    /// Plus one because index zero is a real notification, and a table whose
+    /// "empty" and "the first one" are the same value is a table that arms a
+    /// timer for somebody who did not ask.
+    who: AtomicU32,
+    /// The generation that was current when it was armed.
+    ///
+    /// A notification can be destroyed and its slot reused while a deadline is
+    /// armed against it. Without this the timer would fire at whoever took the
+    /// slot next, which is the same mistake `NotificationId` exists to prevent
+    /// one level up.
+    generation: AtomicU32,
+    /// When to signal, on the same monotonic scale `rdtsc` reads.
+    deadline: AtomicU64,
+}
+
+impl Armed {
+    const fn new() -> Self {
+        Self {
+            who: AtomicU32::new(0),
+            generation: AtomicU32::new(0),
+            deadline: AtomicU64::new(0),
+        }
+    }
+}
+
+static DEADLINES: [Armed; MAX_DEADLINES] = [const { Armed::new() }; MAX_DEADLINES];
+
+/// Arms `id` to be signalled at `deadline`, replacing any deadline it has.
+///
+/// **A second arming replaces the first**, which is the opposite of the
+/// second-waiter rule and deliberately so: two waiters each want a wake and
+/// only one can have it, whereas re-arming is how every timer user in practice
+/// says "not then, this instead".
+///
+/// # Errors
+///
+/// [`NotifyError::Gone`] if the notification is not live, and
+/// [`NotifyError::Exhausted`] if every slot is armed for somebody else.
+pub fn arm(id: NotificationId, deadline: u64) -> Result<(), NotifyError> {
+    if resolve(id).is_none() {
+        return Err(NotifyError::Gone);
+    }
+    let want = id.index() + 1;
+
+    // Replace first, so a caller re-arming does not consume a second slot and
+    // then find the table full of its own timers.
+    for slot in &DEADLINES {
+        if slot.who.load(Ordering::Acquire) == want
+            && slot.generation.load(Ordering::Acquire) == id.generation()
+        {
+            slot.deadline.store(deadline, Ordering::Release);
+            return Ok(());
+        }
+    }
+
+    for slot in &DEADLINES {
+        if slot
+            .who
+            .compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            slot.generation.store(id.generation(), Ordering::Release);
+            slot.deadline.store(deadline, Ordering::Release);
+            return Ok(());
+        }
+    }
+    Err(NotifyError::Exhausted)
+}
+
+/// Forgets any deadline armed for `id`. Whether one was armed is the answer.
+pub fn disarm(id: NotificationId) -> bool {
+    let want = id.index() + 1;
+    let mut found = false;
+    for slot in &DEADLINES {
+        if slot.who.load(Ordering::Acquire) == want
+            && slot.generation.load(Ordering::Acquire) == id.generation()
+        {
+            slot.deadline.store(0, Ordering::Release);
+            slot.who.store(0, Ordering::Release);
+            found = true;
+        }
+    }
+    found
+}
+
+/// Hands every deadline that has passed to `visit`, and clears it.
+///
+/// **`now` is compared with `>=`, and never the other way round.** A timer that
+/// fires early is a bug that looks like success: the waiter wakes, finds what it
+/// was waiting for has not happened, and goes back to sleep — or worse, acts.
+/// "Not before the deadline" is the half of the promise correctness rests on.
+///
+/// Cleared before `visit` is called, so a handler that arms a new deadline for
+/// the same notification does not have it taken away again on the way out.
+pub fn expire(now: u64, mut visit: impl FnMut(NotificationId)) {
+    for slot in &DEADLINES {
+        let who = slot.who.load(Ordering::Acquire);
+        if who == 0 || slot.deadline.load(Ordering::Acquire) > now {
+            continue;
+        }
+        let id = NotificationId::from_parts(who - 1, slot.generation.load(Ordering::Acquire));
+        slot.who.store(0, Ordering::Release);
+        slot.deadline.store(0, Ordering::Release);
+        visit(id);
+    }
+}
+
+/// How many deadlines are armed, for reporting.
+#[must_use]
+pub fn armed_deadlines() -> usize {
+    DEADLINES
+        .iter()
+        .filter(|slot| slot.who.load(Ordering::Acquire) != 0)
+        .count()
+}
+
 /// Binds this notification to `thread`, so a blocking receive also wakes for it.
 ///
 /// RFC 0010 question 1. Returns `false` if the notification is gone or already
@@ -567,5 +705,124 @@ mod tests {
             destroy(id);
         }
         assert_eq!(count(), 0);
+    }
+
+    /// Arming, and the wake arriving only once the deadline has passed.
+    #[test]
+    fn a_deadline_fires_at_its_time_and_not_before() {
+        let _alone = alone();
+        let id = create().expect("a notification");
+        arm(id, 100).expect("armed");
+
+        // **The half correctness rests on.** A timer that fires early wakes a
+        // waiter for something that has not happened yet.
+        let mut fired = std::vec::Vec::new();
+        expire(99, |who| fired.push(who));
+        assert!(fired.is_empty(), "fired before its deadline");
+
+        expire(100, |who| fired.push(who));
+        assert_eq!(fired, std::vec![id], "did not fire at its deadline");
+
+        assert_eq!(armed_deadlines(), 0, "an expired deadline stays armed");
+        destroy(id);
+    }
+
+    /// A second arming replaces the first rather than taking a second slot.
+    #[test]
+    fn arming_again_replaces_and_does_not_accumulate() {
+        let _alone = alone();
+        let id = create().expect("a notification");
+        arm(id, 100).expect("armed");
+        arm(id, 500).expect("re-armed");
+        assert_eq!(armed_deadlines(), 1, "re-arming consumed a second slot");
+
+        let mut fired = std::vec::Vec::new();
+        expire(100, |who| fired.push(who));
+        assert!(fired.is_empty(), "the replaced deadline still fired");
+
+        expire(500, |who| fired.push(who));
+        assert_eq!(fired, std::vec![id]);
+        destroy(id);
+    }
+
+    /// Disarming, and the absence of a wake afterwards.
+    #[test]
+    fn a_disarmed_deadline_never_fires() {
+        let _alone = alone();
+        let id = create().expect("a notification");
+        arm(id, 100).expect("armed");
+        assert!(disarm(id), "disarm did not find it");
+        assert!(!disarm(id), "disarm found it twice");
+
+        let mut fired = std::vec::Vec::new();
+        expire(u64::MAX, |who| fired.push(who));
+        assert!(fired.is_empty(), "a disarmed deadline fired");
+        destroy(id);
+    }
+
+    /// **A full table refuses rather than allocating**, and an armed slot is not
+    /// stolen from whoever holds it.
+    #[test]
+    fn a_full_table_is_a_refusal() {
+        let _alone = alone();
+        let mut held = std::vec::Vec::new();
+        for _ in 0..MAX_DEADLINES {
+            let id = create().expect("a notification");
+            arm(id, 100).expect("armed");
+            held.push(id);
+        }
+        let extra = create().expect("a notification");
+        assert_eq!(arm(extra, 100), Err(NotifyError::Exhausted));
+
+        // The ones already armed are untouched by the refusal.
+        assert_eq!(armed_deadlines(), MAX_DEADLINES);
+        for id in &held {
+            disarm(*id);
+            destroy(*id);
+        }
+        destroy(extra);
+    }
+
+    /// A deadline armed against a notification that has since been destroyed
+    /// must not fire at whoever took its slot.
+    #[test]
+    fn a_deadline_does_not_outlive_the_notification_it_named() {
+        let _alone = alone();
+        let first = create().expect("a notification");
+        arm(first, 100).expect("armed");
+        destroy(first);
+
+        // Whatever takes the slot next has a different generation, so the armed
+        // entry names nobody. This is the same rule `NotificationId` enforces
+        // one level up, and it is why the generation is stored beside the index.
+        let second = create().expect("a notification");
+
+        // The reuse is what makes this test mean something, but it is the
+        // arena's choice rather than this test's. Said rather than asserted: a
+        // run where the slot is not reused proves nothing and should not fail.
+        let reused = first.index() == second.index();
+
+        let mut fired = std::vec::Vec::new();
+        expire(u64::MAX, |who| fired.push(who));
+        assert!(
+            !fired.contains(&second),
+            "a stale deadline fired at the notification that took the slot"
+        );
+        assert!(
+            reused || fired.is_empty(),
+            "the stale deadline fired at somebody"
+        );
+        disarm(second);
+        destroy(second);
+    }
+
+    /// Arming against a notification that is gone is refused, not recorded.
+    #[test]
+    fn arming_a_dead_notification_is_refused() {
+        let _alone = alone();
+        let id = create().expect("a notification");
+        destroy(id);
+        assert_eq!(arm(id, 100), Err(NotifyError::Gone));
+        assert_eq!(armed_deadlines(), 0);
     }
 }
