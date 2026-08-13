@@ -335,6 +335,14 @@ struct Armed {
     generation: AtomicU32,
     /// When to signal, on the same monotonic scale `rdtsc` reads.
     deadline: AtomicU64,
+    /// The bits to signal with, taken from the badge of the capability that
+    /// armed it.
+    ///
+    /// **Recorded at arming rather than chosen at expiry**, because by the time
+    /// this fires the caller is gone and the kernel has no business inventing a
+    /// source. It is the same rule `SIGNAL` follows: the bits say who, and the
+    /// holder did not pick them.
+    badge: AtomicU64,
 }
 
 impl Armed {
@@ -343,6 +351,7 @@ impl Armed {
             who: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             deadline: AtomicU64::new(0),
+            badge: AtomicU64::new(0),
         }
     }
 }
@@ -360,7 +369,7 @@ static DEADLINES: [Armed; MAX_DEADLINES] = [const { Armed::new() }; MAX_DEADLINE
 ///
 /// [`NotifyError::Gone`] if the notification is not live, and
 /// [`NotifyError::Exhausted`] if every slot is armed for somebody else.
-pub fn arm(id: NotificationId, deadline: u64) -> Result<(), NotifyError> {
+pub fn arm(id: NotificationId, deadline: u64, badge: u64) -> Result<(), NotifyError> {
     if resolve(id).is_none() {
         return Err(NotifyError::Gone);
     }
@@ -372,6 +381,7 @@ pub fn arm(id: NotificationId, deadline: u64) -> Result<(), NotifyError> {
         if slot.who.load(Ordering::Acquire) == want
             && slot.generation.load(Ordering::Acquire) == id.generation()
         {
+            slot.badge.store(badge, Ordering::Release);
             slot.deadline.store(deadline, Ordering::Release);
             return Ok(());
         }
@@ -384,6 +394,7 @@ pub fn arm(id: NotificationId, deadline: u64) -> Result<(), NotifyError> {
             .is_ok()
         {
             slot.generation.store(id.generation(), Ordering::Release);
+            slot.badge.store(badge, Ordering::Release);
             slot.deadline.store(deadline, Ordering::Release);
             return Ok(());
         }
@@ -416,17 +427,46 @@ pub fn disarm(id: NotificationId) -> bool {
 ///
 /// Cleared before `visit` is called, so a handler that arms a new deadline for
 /// the same notification does not have it taken away again on the way out.
-pub fn expire(now: u64, mut visit: impl FnMut(NotificationId)) {
+pub fn expire(now: u64, mut visit: impl FnMut(NotificationId, u64)) {
     for slot in &DEADLINES {
         let who = slot.who.load(Ordering::Acquire);
         if who == 0 || slot.deadline.load(Ordering::Acquire) > now {
             continue;
         }
-        let id = NotificationId::from_parts(who - 1, slot.generation.load(Ordering::Acquire));
-        slot.who.store(0, Ordering::Release);
+        let generation = slot.generation.load(Ordering::Acquire);
+        let badge = slot.badge.load(Ordering::Acquire);
+
+        // **Claimed, not merely cleared.** This runs from the timer interrupt
+        // on every processor, so two of them can reach the same expired slot at
+        // once. A plain store would let both fire it, and a timer that fires
+        // twice is a retransmission nobody asked for. Whoever wins the exchange
+        // owns the wake; the loser moves on.
+        if slot
+            .who
+            .compare_exchange(who, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
         slot.deadline.store(0, Ordering::Release);
-        visit(id);
+        visit(NotificationId::from_parts(who - 1, generation), badge);
     }
+}
+
+/// The soonest armed deadline, if any.
+///
+/// **The tickless path needs this or the promise is worthless.** Expiry runs on
+/// the timer interrupt, and a processor with nothing else to do arms for its own
+/// backstop — a whole second. A deadline armed for twenty milliseconds then
+/// fired after a hundred and forty, which is "not before the deadline" kept to
+/// the letter and useless in practice.
+#[must_use]
+pub fn earliest_deadline() -> Option<u64> {
+    DEADLINES
+        .iter()
+        .filter(|slot| slot.who.load(Ordering::Acquire) != 0)
+        .map(|slot| slot.deadline.load(Ordering::Acquire))
+        .min()
 }
 
 /// How many deadlines are armed, for reporting.
@@ -712,15 +752,15 @@ mod tests {
     fn a_deadline_fires_at_its_time_and_not_before() {
         let _alone = alone();
         let id = create().expect("a notification");
-        arm(id, 100).expect("armed");
+        arm(id, 100, 1).expect("armed");
 
         // **The half correctness rests on.** A timer that fires early wakes a
         // waiter for something that has not happened yet.
         let mut fired = std::vec::Vec::new();
-        expire(99, |who| fired.push(who));
+        expire(99, |who, _| fired.push(who));
         assert!(fired.is_empty(), "fired before its deadline");
 
-        expire(100, |who| fired.push(who));
+        expire(100, |who, _| fired.push(who));
         assert_eq!(fired, std::vec![id], "did not fire at its deadline");
 
         assert_eq!(armed_deadlines(), 0, "an expired deadline stays armed");
@@ -732,15 +772,15 @@ mod tests {
     fn arming_again_replaces_and_does_not_accumulate() {
         let _alone = alone();
         let id = create().expect("a notification");
-        arm(id, 100).expect("armed");
-        arm(id, 500).expect("re-armed");
+        arm(id, 100, 1).expect("armed");
+        arm(id, 500, 1).expect("re-armed");
         assert_eq!(armed_deadlines(), 1, "re-arming consumed a second slot");
 
         let mut fired = std::vec::Vec::new();
-        expire(100, |who| fired.push(who));
+        expire(100, |who, _| fired.push(who));
         assert!(fired.is_empty(), "the replaced deadline still fired");
 
-        expire(500, |who| fired.push(who));
+        expire(500, |who, _| fired.push(who));
         assert_eq!(fired, std::vec![id]);
         destroy(id);
     }
@@ -750,12 +790,12 @@ mod tests {
     fn a_disarmed_deadline_never_fires() {
         let _alone = alone();
         let id = create().expect("a notification");
-        arm(id, 100).expect("armed");
+        arm(id, 100, 1).expect("armed");
         assert!(disarm(id), "disarm did not find it");
         assert!(!disarm(id), "disarm found it twice");
 
         let mut fired = std::vec::Vec::new();
-        expire(u64::MAX, |who| fired.push(who));
+        expire(u64::MAX, |who, _| fired.push(who));
         assert!(fired.is_empty(), "a disarmed deadline fired");
         destroy(id);
     }
@@ -768,11 +808,11 @@ mod tests {
         let mut held = std::vec::Vec::new();
         for _ in 0..MAX_DEADLINES {
             let id = create().expect("a notification");
-            arm(id, 100).expect("armed");
+            arm(id, 100, 1).expect("armed");
             held.push(id);
         }
         let extra = create().expect("a notification");
-        assert_eq!(arm(extra, 100), Err(NotifyError::Exhausted));
+        assert_eq!(arm(extra, 100, 1), Err(NotifyError::Exhausted));
 
         // The ones already armed are untouched by the refusal.
         assert_eq!(armed_deadlines(), MAX_DEADLINES);
@@ -789,7 +829,7 @@ mod tests {
     fn a_deadline_does_not_outlive_the_notification_it_named() {
         let _alone = alone();
         let first = create().expect("a notification");
-        arm(first, 100).expect("armed");
+        arm(first, 100, 1).expect("armed");
         destroy(first);
 
         // Whatever takes the slot next has a different generation, so the armed
@@ -803,7 +843,7 @@ mod tests {
         let reused = first.index() == second.index();
 
         let mut fired = std::vec::Vec::new();
-        expire(u64::MAX, |who| fired.push(who));
+        expire(u64::MAX, |who, _| fired.push(who));
         assert!(
             !fired.contains(&second),
             "a stale deadline fired at the notification that took the slot"
@@ -822,7 +862,7 @@ mod tests {
         let _alone = alone();
         let id = create().expect("a notification");
         destroy(id);
-        assert_eq!(arm(id, 100), Err(NotifyError::Gone));
+        assert_eq!(arm(id, 100, 1), Err(NotifyError::Gone));
         assert_eq!(armed_deadlines(), 0);
     }
 }

@@ -742,6 +742,38 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (RFC 0019 step 2: a deadline a program can arm, and a resolution that is poor)
+
+`Invoke(notification, ARM, deadline)` and `DISARM`, both needing the write right that `SIGNAL` needs
+— arming *is* a signal, just a later one. Expiry runs where the timer interrupt already runs, through
+`notify::signal`, which is lock-free and safe from a handler: the property RFC 0010 built it for, and
+the reason this needed no new wake machinery.
+
+**Two corrections to step 1's table, both found by wiring it up.** The badge is recorded at arming
+rather than chosen at expiry — by the time it fires the caller is gone and the kernel has no business
+inventing a source. And expiry now **claims** each entry with a compare-exchange instead of clearing
+it: this runs on every processor, two can reach the same expired slot at once, and a timer that fires
+twice is a retransmission nobody asked for.
+
+**The boot asserts both halves**: that a wake arrives, and that it did not arrive early. An early wake
+is the failure that looks like success.
+
+```
+deadline       armed for 20 ms, woke after 157.280 ms, never early
+```
+
+**Which is the honest bad news.** The promise — never early — holds. The resolution is poor:
+142–173 ms for a 20 ms deadline across runs. Expiry happens on a tick, and **arming from a system
+call does not re-program the hardware**, so a deadline waits for a tick that was going to happen for
+another reason. Folding the soonest armed deadline into the tickless re-arm decision was necessary
+and not sufficient, because `rearm` itself only runs on a tick.
+
+It is recorded as the answer to RFC 0019's open question 2 rather than left as a surprise for whoever
+uses it. Closing it means the `ARM` path re-programming this processor's timer when the new deadline
+beats what it is armed for — a small change in an interrupt-adjacent path, and precisely the workload
+`M4-10b`'s wheel has been waiting for. Step 3 (`bin/dhcp` waiting on a duration) will feel this
+number, which is the right order: a caller first, then the tuning it asks for.
+
 ### 2026-08-13, last (RFC 0019 step 1: the deadline table, and nothing wired to it)
 
 The arithmetic only — arm, replace, disarm, expire, refuse when full — beside the notification table

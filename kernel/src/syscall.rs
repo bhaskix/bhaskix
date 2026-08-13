@@ -128,6 +128,8 @@ const _: () = {
     assert!(method::PEEK == bhaskix_abi::method::PEEK);
     assert!(method::SIGNAL == bhaskix_abi::method::SIGNAL);
     assert!(method::BIND_SELF == bhaskix_abi::method::BIND_SELF);
+    assert!(method::ARM == bhaskix_abi::method::ARM);
+    assert!(method::DISARM == bhaskix_abi::method::DISARM);
     assert!(method::INFO == bhaskix_abi::method::INFO);
     assert!(method::DELETE == bhaskix_abi::method::DELETE);
     assert!(method::DERIVE == bhaskix_abi::method::DERIVE);
@@ -264,6 +266,10 @@ pub mod method {
     pub const SIGNAL: u64 = 45;
     /// Bind a notification to the calling thread. RFC 0010 question 1.
     pub const BIND_SELF: u64 = 55;
+    /// Arm a deadline on a notification. RFC 0019.
+    pub const ARM: u64 = 56;
+    /// Forget a notification's deadline. RFC 0019.
+    pub const DISARM: u64 = 57;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1048,6 +1054,37 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             // Already bound to somebody else, or gone. Refused rather than
             // replacing: substituting a binding loses whoever held the first.
             Outcome::err(Status::Congested)
+        };
+    }
+
+    // Arming and disarming a deadline. **RFC 0019.**
+    //
+    // Beside `SIGNAL` because it *is* a signal, just a later one: the same
+    // right, the same badge, the same wake path. What the kernel adds is the
+    // waiting, which is the part a program cannot do for itself -- it can
+    // already read the clock, since `rdtsc` is unprivileged here.
+    if kind == Some(Kind::Invoke) && (frame.method == method::ARM || frame.method == method::DISARM)
+    {
+        let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Notification) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        if !resolved.rights.contains(crate::cap::Rights::WRITE) {
+            return Outcome::err(Status::InsufficientRights);
+        }
+        let id = crate::notify::NotificationId::from_parts(
+            resolved.object.id as u32,
+            (resolved.object.id >> 32) as u32,
+        );
+        if frame.method == method::DISARM {
+            return Outcome::ok(u64::from(crate::notify::disarm(id)));
+        }
+        return match crate::notify::arm(id, frame.arg0, resolved.badge) {
+            Ok(()) => Outcome::ok(0),
+            // Every slot is armed for somebody else. A refusal rather than
+            // taking one from whoever holds it.
+            Err(crate::notify::NotifyError::Exhausted) => Outcome::err(Status::Congested),
+            Err(_) => Outcome::err(Status::Revoked),
         };
     }
 

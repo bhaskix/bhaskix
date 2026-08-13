@@ -178,9 +178,19 @@ the weaker statistic for anything a scheduler can preempt.
 1. **Is a minimum deadline enforced, and by what argument?** A floor stops the tightest re-arm loop
    and is also a limit on what the system can express. Deferred until something needs a short timer,
    because a number chosen now would be chosen without a caller.
-2. **What resolution is promised?** The kernel has TSC-deadline and an HPET fallback, and `M4-10b`
-   would change the answer. This RFC promises only "not before the deadline", which is the half that
-   correctness depends on.
+2. **What resolution is promised?** This RFC promises only "not before the deadline", which is the
+   half correctness depends on.
+
+   **Measured at step 2, and the number is bad: a deadline armed for 20 ms fired after 142–173 ms.**
+   Expiry runs on the timer interrupt, and arming from a system call does not re-program the
+   hardware, so a deadline waits for a tick that was going to happen anyway. Folding the soonest
+   armed deadline into the tickless re-arm decision was necessary and not sufficient — `rearm` itself
+   only runs *on* a tick.
+
+   Closing the gap means the `ARM` path re-programming this processor's timer when the new deadline
+   is sooner than what it is armed for. That is a small change in an interrupt-adjacent path, and it
+   is exactly the workload `M4-10b`'s wheel is waiting for, so it is left to step 4's measurement
+   rather than guessed at here.
 3. **Does a timer survive being handed on?** A notification capability can be derived and passed;
    whether an armed deadline is a property of the object or of the granting is not decided, and
    nothing needs it yet.

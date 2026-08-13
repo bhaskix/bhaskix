@@ -179,6 +179,33 @@ pub mod method {
     /// kernel's and could not collide, but a reader checking a number should not
     /// have to know that.
     pub const BIND_SELF: u64 = 55;
+    /// Ask the kernel to signal this `Notification` at `arg0`.
+    ///
+    /// **RFC 0019.** `arg0` is an absolute deadline on the same monotonic scale
+    /// `rdtsc` reads — absolute rather than a duration, because a duration read
+    /// before being descheduled becomes a lie, and this program can read that
+    /// clock itself: `rdtsc` is unprivileged unless `CR4.TSD` is set and this
+    /// kernel does not set it.
+    ///
+    /// The bits the wake carries are this capability's **badge**, recorded now
+    /// and used when it fires, so a receiver can tell a timer from a frame in
+    /// the one word it waits on.
+    ///
+    /// **A second `ARM` replaces the first.** That is the opposite of the
+    /// second-waiter rule and deliberate: two waiters each want a wake and only
+    /// one can have it, whereas re-arming is how a timer user says "not then,
+    /// this instead". A program needing many timers keeps its own ordered list
+    /// and arms the nearest.
+    ///
+    /// Needs the write right, as `SIGNAL` does, because arming causes a signal.
+    /// Refused with `Congested` when every deadline slot is taken.
+    pub const ARM: u64 = 56;
+    /// Forget any deadline armed on this `Notification`. Never blocks.
+    ///
+    /// Returns whether one was armed, which is an answer rather than an error:
+    /// a timer that has already fired and one that was never set look the same
+    /// to the program that is cancelling it.
+    pub const DISARM: u64 = 57;
 
     /// Map the memory this capability names into the caller's address space.
     ///

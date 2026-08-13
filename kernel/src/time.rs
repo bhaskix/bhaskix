@@ -348,6 +348,16 @@ pub unsafe fn on_tick() {
         crate::sched::wake_from_interrupt(*thread);
     }
 
+    // Deadlines a program armed on a notification. **RFC 0019 step 2.**
+    //
+    // Here rather than anywhere else because this is where the kernel already
+    // knows the time has moved, and because `notify::signal` is lock-free and
+    // safe from a handler -- which is the property RFC 0010 built it for and
+    // the reason this needs no new wake machinery.
+    crate::notify::expire(now, |id, badge| {
+        let _ = crate::notify::signal(id, badge);
+    });
+
     // Anything an earlier handler could not deliver, including on this CPU.
     crate::sched::drain_deferred_wakes();
 
@@ -399,7 +409,18 @@ unsafe fn rearm(cpu: usize, now: u64) {
         return;
     };
 
-    let earliest = TIMERS[cpu].try_lock().and_then(|timers| timers.earliest());
+    // This CPU's thread timers, and the deadlines programs armed on
+    // notifications. The second is a global table rather than a per-CPU one, so
+    // every processor arms for it and whichever tick arrives first expires it —
+    // `notify::expire` claims each entry, so it fires once. RFC 0019 step 2.
+    let earliest = match (
+        TIMERS[cpu].try_lock().and_then(|timers| timers.earliest()),
+        crate::notify::earliest_deadline(),
+    ) {
+        (Some(thread), Some(armed)) => Some(thread.min(armed)),
+        (Some(thread), None) => Some(thread),
+        (None, armed) => armed,
+    };
 
     // A CPU needs a periodic interrupt only to take the CPU *away* from a
     // thread, which is meaningless when there is no other thread to give it

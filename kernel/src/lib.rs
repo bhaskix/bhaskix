@@ -502,6 +502,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if input_ready && !irq_teardown_self_test(handoff) {
         println!("\x1b[91m    irq teardown   FAILED\x1b[0m");
     }
+    if !deadline_self_test() {
+        println!("\x1b[91m    deadline       FAILED\x1b[0m");
+    }
     if input_ready {
         // Which notification each signal hit, and what its waiter slot held.
         // `UNWAITED` counts signals that found nobody; with a console and a
@@ -5209,6 +5212,71 @@ fn report_net_after_exchange(hhdm: u64) {
             ipd[13]
         );
     }
+}
+
+/// RFC 0019 step 2: a deadline fires, and not before it is due.
+///
+/// **Both halves are asserted.** That a wake arrives is half a timer; the other
+/// half is that it did not arrive early, and an early wake is the failure that
+/// looks like success — the waiter runs, finds what it was waiting for has not
+/// happened, and either sleeps again or acts on nothing.
+///
+/// Measured against the same clock the deadline is expressed in, so the two
+/// cannot disagree about units.
+fn deadline_self_test() -> bool {
+    const BADGE: u64 = 1 << 5;
+
+    let Some(hertz) = bhaskix_arch::tsc::hertz() else {
+        println!("    deadline       no calibrated timer; nothing measured");
+        return true;
+    };
+    let Ok(notification) = notify::create() else {
+        println!("\x1b[91m    deadline       FAILED: no notification to arm\x1b[0m");
+        return false;
+    };
+
+    // Twenty milliseconds: long enough that the tick granularity is not the
+    // whole measurement, short enough that a boot does not wait on it.
+    let wait = hertz / 50;
+    let armed_at = bhaskix_arch::tsc::read();
+    if notify::arm(notification, armed_at + wait, BADGE).is_err() {
+        notify::destroy(notification);
+        println!("\x1b[91m    deadline       FAILED: the table would not take it\x1b[0m");
+        return false;
+    }
+
+    // Polled rather than waited on, because this is the boot thread and it has
+    // other things to start. What is being tested is the kernel's expiry, not
+    // this thread's blocking.
+    let mut fired_at = None;
+    for _ in 0..400 {
+        if notify::poll(notification) & BADGE != 0 {
+            fired_at = Some(bhaskix_arch::tsc::read());
+            break;
+        }
+        wait_millis(1);
+    }
+    notify::disarm(notification);
+    notify::destroy(notification);
+
+    let Some(fired_at) = fired_at else {
+        println!("\x1b[91m    deadline       FAILED: it never fired\x1b[0m");
+        return false;
+    };
+    let took = fired_at.saturating_sub(armed_at);
+    if took < wait {
+        println!(
+            "\x1b[91m    deadline       FAILED: fired early, {took} ticks against {wait}\x1b[0m"
+        );
+        return false;
+    }
+    let micros = took.saturating_mul(1_000_000) / hertz.max(1);
+    println!(
+        "    deadline       armed for 20 ms, woke after {}.{:03} ms, never early",
+        micros / 1000,
+        micros % 1000
+    );
+    true
 }
 
 /// Reads what the network driver wrote, and says so.
