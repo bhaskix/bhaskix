@@ -740,6 +740,39 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the intermittent failure reproduces on demand, and the fault is impossible)
+
+**It reproduces in about one boot in three at `-smp 2`.** `QEMU_SMP=2 tests/qemu/boot-test.sh iommu`,
+with `BHASKIX_BOOT_LOG` set. That recipe came from this project's own record: the earlier bug of this
+family in `arch/x86_64/src/syscall.rs` is noted as only ever happening "with two programs on one CPU
+and one of them waiting", so the thing to raise was contention, not luck. Twenty-three boots at four
+processors produced one sighting; three boots at two processors produced another.
+
+**The registers are byte-for-byte identical to the sighting of 2026-08-12** — same `rip`, `rsp`,
+`rbp`, `rbx`, `rdi`, `rsi`, `rdx`, `r10`, `r12`, `r13`, `r14`, `r15` — on a different processor count
+and with different thread numbers. **That rules out random corruption**, which was the standing
+hypothesis and was mine. Whatever this is, it is a deterministic state that is only *reached*
+intermittently.
+
+**And the state is impossible.** Verified against the shipped binary, whose `.text` runs
+`0x10000000`–`0x10000dbf`, so `rip 0x10000275` really is `<Console as Service>::handle`:
+
+- `handle` has **exactly one caller** in the binary, and it always passes `rdi` from `r14`, which is
+  `lea 0x48(%rsp)` — a stack slot computed once at `serve`'s entry.
+- The faulting instruction is reached from the method dispatch with **no intervening call**, so `rbx`
+  is unmodified since `mov %rdi,%rbx` at entry. Therefore `rdi` was 1 when `handle` was entered.
+- Yet at the fault `rsp`, `rbp`, `r12`, `r14`, `r15` are all coherent stack addresses, and only
+  **`rbx`, `rdi` and `r13` hold exactly 1**.
+
+Three registers carrying the same small value while the stack-derived ones stay coherent is a
+pattern, not noise. `1` is also what Rust uses for a dangling reference to an align-1 zero-sized
+type, and `Console::State` is `()`.
+
+**Not fixed, and the next step is not more reading.** The contradiction says one of two things: the
+thread's registers were restored wrongly on some path, or `handle` was entered other than by a call.
+Both are answerable by catching it under a debugger — the recipe above makes that a three-minute
+wait rather than an afternoon.
+
 ### 2026-08-13, last (the intermittent failure, localised and not fixed)
 
 **The `services … 0 bytes` failure is not a filesystem failure.** One line above it in the log says
