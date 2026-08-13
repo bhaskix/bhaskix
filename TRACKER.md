@@ -740,7 +740,57 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (every program lives at the same address, and two conclusions were built on forgetting it)
+
+Dumping **both** vCPUs at the stop, which was the control the previous entry asked for, answered a
+different question than the one it was asked.
+
+vCPU 1 was in the kernel. vCPU 2 was at `0x10000275` — the breakpoint — with registers that look
+nothing like the fault: `rbx 0x200`, `rdi 0xb20000`, `rsp 0x11003ec0`, `rcx` pointing into *code*.
+The page fault records `rbx 1`, `rdi 1`, `rsp 0x11003ce0`.
+
+**Because every user program links at `0x10000000`:**
+
+```
+consoled 0x10000000   vfsd 0x10000000   sup   0x10000000   probe 0x10000000
+shell    0x10000000   ipd  0x10000000   netd  0x10000000   dhcp  0x10000000
+```
+
+Each in its own address space. A gdb hardware breakpoint is on a **virtual** address, so it fires in
+whichever program reaches it, and `0x10000275` is a different instruction in each of the eight.
+
+**Two conclusions are therefore withdrawn**, both mine, both committed:
+
+- *"The corruption is before the call, in a window of four instructions."* The stop that produced it
+  was a breakpoint at `0x1000009e` conditioned on `$rdi != $r14` — a condition that is trivially true
+  in any program whose `0x1000009e` is not that `mov`. The "impossible" register state was never
+  impossible; it was another program's.
+- *"The fault is impossible."* Same cause. What made it look impossible was comparing one program's
+  registers against another program's disassembly.
+
+**What survives, and it is not nothing.** The kernel's own page-fault dump is authoritative — it
+reads the trapping thread's frame, in that thread's address space, and names the domain: `consoled`
+faults at `rip 0x10000275` writing to address `1`, with `rbx 1`. The reproduction recipe stands
+(`-smp 2`, about one boot in three). The disassembly of `Console::handle` and its single call site
+stands. What does not stand is any claim about *how* it got there.
+
+**The method to use next.** A breakpoint on a shared virtual address must be qualified. The cheapest
+filter is the value already known to be distinctive — `hbreak *0x10000275 if $rbx == 1` — since the
+other programs reaching that address carry something else. Better still would be matching the
+address space, which the fault dump prints (`cr3`) and which gdb can compare if QEMU exposes it.
+
+**The lesson, which is the reason this entry exists.** Three gdb sessions produced confident,
+detailed, wrong analysis because the tool was answering about a different program than the one being
+debugged, and nothing in its output said so. The check that would have caught it on the first
+session — "which program is at this address?" — takes one command.
+
 ### 2026-08-13, last (the corruption is before the call, in a window of four instructions)
+
+> **WITHDRAWN 2026-08-13, later the same day. This entry is wrong and the reason is below it.**
+> Every user program in this system links at `0x10000000`, each in its own address space, so a gdb
+> breakpoint on a *virtual* address fires in whichever program reaches it. The stop recorded here
+> was almost certainly a different program, where `rdi` and `r14` have no relationship at all. Left
+> in place rather than deleted, because the mistake is the useful part.
 
 A conditional hardware breakpoint at the call site — `hbreak *0x1000009e` with `condition $rdi !=
 $r14` — **fired**, on the CPU whose `rip` was that instruction. So `rdi` is already wrong *before*
