@@ -3753,13 +3753,13 @@ pub fn start_net_domain(
     const NET_BADGE: u64 = 1 << 2;
     let signalled = match crate::notify::create() {
         Ok(notification) => {
-            // Kept so the kernel can wake the driver. **Only the kernel can
-            // today**, because RFC 0010's `SIGNAL` was specified and never
-            // implemented -- see `wake_net_driver`, which corrects the claim
-            // this comment used to make. So `bin/ipd` cannot tell `bin/netd`
-            // that it has put a frame in the return ring. The driver sleeps on
-            // this notification when idle, and without a poke it would sleep
-            // through everything the protocol service builds.
+            // Kept so `bin/ipd` can be given a doorbell onto it. **The kernel
+            // used to poke this notification itself**, twice a second, because
+            // RFC 0010's `SIGNAL` was specified in 2026 and not implemented
+            // until 2026-08-13; no domain could wake another, so a frame in the
+            // return ring waited for the poke. `wake_net_driver` is gone and
+            // `bin/ipd` rings this notification directly -- see the doorbell
+            // derived from it in `start_ip_domain`.
             NET_WAKE.store(
                 u64::from(notification.index())
                     | (u64::from(notification.generation()) << 32)
@@ -3983,6 +3983,48 @@ fn start_ip_domain(
         core::sync::atomic::Ordering::Release,
     );
 
+    // **The doorbell. RFC 0010 step 6, and the reason step 2 was built.**
+    //
+    // `bin/netd` sleeps on one notification. Its device's interrupt already
+    // sets bit 2 of that notification's word; this gives `bin/ipd` a capability
+    // to the *same* notification carrying a different bit, so the driver wakes
+    // for either and the word says which.
+    //
+    // That is RFC 0010's badge-as-bitmask used for exactly what it was designed
+    // for -- "64 distinguishable senders, one wait" -- and it is why `netd`
+    // needs no second slot, no second wait and no change at all.
+    //
+    // **Write only.** A doorbell rings; it does not listen. `WAIT` needs the
+    // read right and this capability does not carry it, so a bug in `ipd`
+    // cannot consume the wake the driver is asleep for.
+    let doorbell = {
+        use core::sync::atomic::Ordering;
+        let raw = NET_WAKE.load(Ordering::Acquire);
+        if raw & (1 << 63) == 0 {
+            None
+        } else {
+            let id = crate::notify::NotificationId::from_parts(
+                raw as u32,
+                (raw >> 32) as u32 & 0x7fff_ffff,
+            );
+            crate::notify::name(id).ok().and_then(|root| {
+                cap::with_arena(|arena| {
+                    arena
+                        .derive(root, cap::Rights::WRITE, NET_DOORBELL_BADGE)
+                        .ok()
+                })
+            })
+        }
+    };
+    // Absent on a machine with no interrupt to delegate, which is every BIOS
+    // boot. `ipd` finds an empty slot and does not ring, exactly as it finds an
+    // empty ring and does not send.
+    if let Some(doorbell) = doorbell
+        && domain::with(realm, |owner| owner.cspace.install_at(5, doorbell).is_ok()) != Some(true)
+    {
+        return Err("the doorbell capability would not install");
+    }
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -4121,35 +4163,13 @@ fn network_endpoint_capability() -> Option<cap::SlotRef> {
 /// The notification `bin/netd` sleeps on, with the top bit set when it is real.
 static NET_WAKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Wakes the network driver, because nothing else can.
+/// `bin/ipd`'s bit in that notification's word.
 ///
-/// A domain cannot signal another domain's notification, so a driver asleep on
-/// its device's interrupt sleeps through a frame `bin/ipd` puts in the return
-/// ring. This poke stands in for the missing wake, and it is the kernel doing
-/// the one thing only the kernel can.
-///
-/// **This said RFC 0010 "gives no user-mode signal at all", and that is wrong.**
-/// RFC 0010 was accepted on 2026-08-04 specifying exactly this operation —
-/// `Invoke(notification, SIGNAL)`, in its own table of operations, never
-/// blocking — and its implementation plan step 2 is that signal path. What
-/// landed was the other direction: an interrupt signalling a notification a
-/// program waits on, which RFC 0011 step 3 needed. `WAIT`, `PEEK` and `POLL`
-/// exist; there is no `SIGNAL` method in `bhaskix_abi` and never was.
-///
-/// So this is not a missing design. It is an accepted design with an
-/// unimplemented step, and RFC 0018 step 7 priced its absence at roughly 130
-/// microseconds a round trip.
-fn wake_net_driver() {
-    use core::sync::atomic::Ordering;
-
-    let raw = NET_WAKE.load(Ordering::Acquire);
-    if raw & (1 << 63) == 0 {
-        return;
-    }
-    let id =
-        crate::notify::NotificationId::from_parts(raw as u32, (raw >> 32) as u32 & 0x7fff_ffff);
-    let _ = crate::notify::signal(id, 1 << 2);
-}
+/// Distinct from the device's `1 << 2` so the driver can tell a frame arriving
+/// from the wire from a frame `bin/ipd` has built for it. Neither sender chose
+/// its own bit; the kernel stamped both at derivation, which is what makes the
+/// distinction worth anything.
+const NET_DOORBELL_BADGE: u64 = 1 << 3;
 
 /// The marker `bin/ipd` waits for before believing its configuration.
 const NET_CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
@@ -4986,9 +5006,6 @@ fn time_the_burst(hhdm: u64) {
                 started = true;
                 stamp = bhaskix_arch::tsc::read();
             } else {
-                // The driver sleeps on its interrupt; nothing crosses the
-                // return ring unless it is woken. See `wake_net_driver`.
-                wake_net_driver();
                 wait_millis(1);
                 continue;
             }
@@ -5016,7 +5033,6 @@ fn time_the_burst(hhdm: u64) {
         if done >= 4 {
             break;
         }
-        wake_net_driver();
         // **One millisecond, not five.** A phase lasts tens of milliseconds, so
         // a five-millisecond sampling interval put a large fraction of the
         // answer into the quantisation: phases came back in an order that made
@@ -6767,13 +6783,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // is measuring its own lateness. This function does the driver poking
         // the loop below does, so nothing is lost by going first.
         time_the_burst(hhdm);
-        for step in 0..80 {
-            // Every half second, so a driver asleep on its interrupt looks at
-            // the return ring. See `wake_net_driver` for why the kernel is the
-            // one doing this.
-            if step % 10 == 0 {
-                wake_net_driver();
-            }
+        for _ in 0..80 {
             wait_millis(50);
         }
         if !report_net_domain(hhdm) {
@@ -6821,7 +6831,6 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // there: the counters said twelve handed across and eleven taken, which
         // is the gap stated exactly.
         for _ in 0..80 {
-            wake_net_driver();
             wait_millis(50);
         }
         // The client needs the service to be serving, which happens after its

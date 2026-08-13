@@ -685,7 +685,7 @@ what is actually ahead.
 
 | Phase 2 bullet | Status | Notes |
 |---|---|---|
-| Shared memory and notifications | 🟡 `PARTIAL` | RFC 0009 and RFC 0010, M6-13 … M6-18. **Read as ✅ until 2026-08-13, and it was not.** RFC 0010's implementation plan step 2 — `Invoke(notification, SIGNAL)`, one domain waking another — and step 6, a ring plus a doorbell, were never built. The interrupt→notification direction landed because RFC 0011 step 3 needed it, and that was mistaken for the whole object |
+| Shared memory and notifications | 🟡 `PARTIAL` | RFC 0009 and RFC 0010, M6-13 … M6-18. Step 2 — `Invoke(notification, SIGNAL)` — was **built 2026-08-13**, nine days after acceptance; until then no domain could wake another. Step 6, a ring plus a doorbell, is **half done**: `bin/ipd` rings `bin/netd`, the reverse direction is still polled, and none of it is packaged in `abi` as the channel that step describes |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012, all seven steps; per-device windows landed with M7-13. Interrupt remapping **works** as of 2026-08-11 (M6-15) and is still off by default — not for a defect, but because the path was silently broken for its whole life, has been seen working on one emulator, and has never run on real hardware |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
@@ -739,6 +739,60 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-13, last (RFC 0010 step 2 built, and the hypothesis it was built to confirm failed)
+
+**`Invoke(notification, SIGNAL)` exists.** Specified when RFC 0010 was accepted on 2026-08-04, step 2
+of its implementation plan, and not built until now. `method::SIGNAL = 45`, one arm in the syscall
+dispatch, the write right required where `WAIT` requires read. **The bits are not an argument**: they
+are the badge the kernel stamped at derivation, which is what makes a badge trustworthy as a source
+identifier — a sender cannot choose its own bit.
+
+The mechanism needed nothing new. `notify::signal` already matched the RFC's pseudocode exactly, and
+`resolve_for_ipc` already returned the badge. Nine days of "no domain can wake another" were one
+method number and about thirty lines away.
+
+**`bin/ipd` now rings a doorbell, and `wake_net_driver` is deleted.** The driver's device interrupt
+sets bit 2 of its notification; `ipd` holds a write-only capability to the *same* notification
+carrying bit 3, so one wait serves both senders and the word says which rang. That is this RFC's
+badge-as-bitmask used for its purpose. The kernel no longer pokes a sleeping driver on anybody's
+behalf.
+
+**It works, and it did not help.**
+
+| | before | after |
+|---|---|---|
+| serialised 16 B | 122, 165, 188 µs | 114, 153 µs |
+| serialised 1400 B | 137, 162, 167 µs | 113, 111 µs |
+| pipelined 16 B | 106, 137, 234 µs | 103, 138 µs |
+| pipelined 1400 B | 127, 130, 146 µs | 111, 112 µs |
+
+The spreads overlap. **No improvement can be claimed from these numbers**, and the folded build's
+10–16 µs is as far away as it was.
+
+That the doorbell *works* is not in doubt: `wake_net_driver` is gone, and the two paths that need a
+sleeping driver woken — the shell's socket tests and `bin/dhcp` obtaining an address — both still
+pass. Neither could work if nothing woke `netd`.
+
+**So the explanation RFC 0018 step 7 offered for the boundary's cost is wrong, and it was mine.**
+Yesterday's entry said the price of the split "is the absence of a primitive the system has not built
+yet". The primitive has now been built, in the direction that was blamed, and the number did not
+move. The ~130 µs is **unexplained again**, and the corrected claim is in RFC 0018's performance
+section where the wrong one was.
+
+**The next hypothesis, stated as one.** The other direction is still polled: `netd` cannot tell `ipd`
+that a frame has arrived, and `ipd` yields between looks at its ring. A doorbell that way needs `ipd`
+to block on a notification rather than spin, which it cannot do unconditionally — on a machine with
+no network no frame ever arrives, and a blocked `ipd` never reaches `serve` and never answers the
+shell. That is the design problem, and it is not solved by copying this change.
+
+**A correction to RFC 0010 itself, found by building it.** It says "a badge of zero is refused at
+derivation for a notification capability". Implemented as written, the machine does not boot: most
+notification capabilities this kernel derives are held in order to **wait**, the supervisor's among
+them, and a waiter has no use for a badge. The rule's own reasoning is about senders and does not
+reach them. The refusal stays at `SIGNAL`, where the distinction is real, and the RFC is corrected in
+place — the boot hung with `consoled`, `vfsd` and the shell each blocked after a single run, which is
+how the sentence was found to be too broad.
 
 ### 2026-08-13, last (the wakeup was never a missing design; it is an unfinished step)
 

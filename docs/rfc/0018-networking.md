@@ -325,9 +325,20 @@ frame in the return ring waits until the driver is awake —
 woken by its own receive interrupt, or poked by the kernel, which is what `wake_net_driver` exists
 to do. The folded build has no handoff to wait for.
 
-So the price of this split is not the copies this section worried about; **it is the absence of a
+So the price of this split is not the copies this section worried about. ~~**It is the absence of a
 primitive the system has not built yet**, which is a fixable gap rather than an inherent cost of
-putting a driver in its own domain.
+putting a driver in its own domain.~~
+
+**That attribution was tested on 2026-08-13 and is not supported.** RFC 0010's `SIGNAL` was
+implemented, `bin/ipd` was given a doorbell onto the notification `bin/netd` sleeps on, and the
+kernel's `wake_net_driver` poke was deleted. The doorbell demonstrably works — the shell's sockets
+and `bin/dhcp` both need it and both still pass with the poke gone — and the burst did **not** get
+faster: 103–153 µs a round trip against a 106–234 µs baseline, spreads that overlap.
+
+So the ~130 µs gap between the split and folded builds is **still unexplained**. The missing wakeup
+was a plausible cause, it has been removed, and the number stayed. What remains untested is the
+other direction: `bin/netd` still has no way to tell `bin/ipd` a frame has arrived, and `ipd` polls
+its ring with a yield between looks. That is the next hypothesis, and it is a hypothesis.
 
 **And it is not even a missing design.** [RFC 0010](0010-notifications.md), accepted 2026-08-04,
 specifies `Invoke(notification, SIGNAL)` — in its table of operations, never blocking — and makes it

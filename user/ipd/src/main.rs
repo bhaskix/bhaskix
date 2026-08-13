@@ -48,6 +48,20 @@ const CONFIG: u64 = 3;
 /// step 5 needs no new kernel object kind, and why the kernel gained nothing
 /// for this step.
 const ENDPOINT: u64 = 4;
+/// Slot: the doorbell that wakes `bin/netd`.
+///
+/// **RFC 0010 step 6.** A frame published into the return ring is invisible to
+/// a driver asleep on its interrupt, and until 2026-08-13 nothing in this
+/// system could wake another domain: the kernel poked `bin/netd` twice a second
+/// on this program's behalf. RFC 0018 step 7 measured what that cost — 122 to
+/// 234 microseconds a round trip against 10 to 16 with the two domains folded
+/// into one, which is four orders of magnitude more than the copies the
+/// networking RFC blamed.
+///
+/// Write only, and the badge is the kernel's. This capability cannot be waited
+/// on, so a bug here cannot eat the wake the driver is asleep for, and its bit
+/// was not chosen here, so the driver can trust the word to say who rang.
+const DOORBELL: u64 = 5;
 
 /// Where this program maps what it holds.
 const RING_AT: u64 = 0x2100_0000;
@@ -360,6 +374,15 @@ unsafe fn send(frame: &[u8]) -> bool {
             after_frame,
         );
     }
+    // **Then ring the doorbell.** Index first, wake second: a driver woken
+    // before the index was published would look, find nothing, and go back to
+    // sleep holding a frame that had already been written. The same ordering
+    // the bytes and the index have, for the same reason, one level up.
+    //
+    // Unchecked, deliberately. On a machine with no interrupt to delegate there
+    // is no notification and this slot is empty, which is a refusal rather than
+    // a fault — and a driver that cannot be woken is one that is not asleep.
+    call(syscall::INVOKE, DOORBELL, method::SIGNAL, [0; 4]);
     true
 }
 

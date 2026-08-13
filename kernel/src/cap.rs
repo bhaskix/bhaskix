@@ -500,6 +500,23 @@ impl Arena {
             return Err(CapError::BadgeNotMonotone);
         }
 
+        // **No badge rule for notifications here, and RFC 0010 says there
+        // should be one.** That RFC states: "a badge of zero is refused at
+        // derivation for a notification capability."
+        //
+        // Implemented exactly as written, it stops the machine booting. The
+        // supervisor's notification is `insert_root` then `derive(root, ALL,
+        // 0)` -- a badge-zero derivation -- and so are others; every one of
+        // them is a capability held in order to **wait**, and a waiter has no
+        // use for a badge. The rule's own reason is about senders: "a signal
+        // that sets no bits is a wake that says nothing". It does not reach a
+        // capability that will never signal.
+        //
+        // So the check stays where it can tell the two apart: `notify::signal`
+        // refuses a zero badge, which is the only moment the distinction is
+        // real. RFC 0010's sentence is corrected in place rather than enforced
+        // into a boot failure.
+
         let free = self.free_index().ok_or(CapError::Exhausted)?;
         let generation = self.nodes[free].generation;
         self.nodes[free] = CapNode {

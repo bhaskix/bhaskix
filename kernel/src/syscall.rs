@@ -126,6 +126,7 @@ const _: () = {
     assert!(method::ACK == bhaskix_abi::method::ACK);
     assert!(method::WAIT == bhaskix_abi::method::WAIT);
     assert!(method::PEEK == bhaskix_abi::method::PEEK);
+    assert!(method::SIGNAL == bhaskix_abi::method::SIGNAL);
     assert!(method::INFO == bhaskix_abi::method::INFO);
     assert!(method::DELETE == bhaskix_abi::method::DELETE);
     assert!(method::DERIVE == bhaskix_abi::method::DERIVE);
@@ -257,6 +258,8 @@ pub mod method {
     /// signalled, which is a real answer and not an error — a driver polling
     /// between requests wants to know "nothing yet" without blocking.
     pub const PEEK: u64 = 44;
+    /// Signal a notification, with the bits taken from the capability's badge.
+    pub const SIGNAL: u64 = 45;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -992,6 +995,45 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             // destroyed, which for a holder is indistinguishable from never
             // having had it and is reported the same way.
             Err(crate::notify::NotifyError::Congested) => Outcome::err(Status::Congested),
+            Err(_) => Outcome::err(Status::Revoked),
+        };
+    }
+
+    // Signalling a notification, from a domain. **RFC 0010 step 2**, specified
+    // when that RFC was accepted on 2026-08-04 and not built until now.
+    //
+    // Beside `WAIT` above rather than folded into it, because they are opposite
+    // halves and want opposite rights: waiting reads the word, signalling
+    // writes it.
+    //
+    // **The badge is the payload and the caller does not supply it.** No
+    // argument here carries bits; `resolve_for_ipc` returns the badge the
+    // kernel stamped on this capability at derivation, and that is what gets
+    // or-ed into the pending word. It is the whole reason a receiver can trust
+    // a badge to say *which* sender fired: the sender never chose it.
+    //
+    // Never blocks, so nothing is held across it and there is no ordering
+    // hazard to avoid -- `notify::signal` publishes the bits before it looks
+    // for a waiter, which is the rule that keeps a signal from being lost
+    // against a waiter that is on its way to sleep.
+    if kind == Some(Kind::Invoke) && frame.method == method::SIGNAL {
+        let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Notification) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        if !resolved.rights.contains(crate::cap::Rights::WRITE) {
+            return Outcome::err(Status::InsufficientRights);
+        }
+        let id = crate::notify::NotificationId::from_parts(
+            resolved.object.id as u32,
+            (resolved.object.id >> 32) as u32,
+        );
+        return match crate::notify::signal(id, resolved.badge) {
+            Ok(()) => Outcome::ok(0),
+            // A badge of zero is a capability that cannot say anything, which
+            // is the granter's mistake and is refused at derivation too. Gone:
+            // the notification was destroyed, reported as it is for a waiter.
+            Err(crate::notify::NotifyError::EmptyBadge) => Outcome::err(Status::WrongObject),
             Err(_) => Outcome::err(Status::Revoked),
         };
     }

@@ -139,9 +139,21 @@ receiver treats a group as one source — or get its own notification. Aliasing
 is a choice the *granter* makes when it sets the badge, which is the right
 place for it.
 
-A badge of zero is refused at derivation for a notification capability. A
+~~A badge of zero is refused at derivation for a notification capability.~~ A
 signal that sets no bits is a wake that says nothing, and a receiver cannot
 tell it from a spurious one.
+
+**Corrected 2026-08-13, when step 2 was built.** Refusing at *derivation* is too
+broad and stops the machine booting. Most notification capabilities this kernel
+derives are held in order to **wait** — the supervisor's is `derive(root, ALL,
+0)` — and a waiter has no use for a badge. The reason given above is about
+senders, and it does not reach a capability that will never signal.
+
+The refusal therefore lives at `SIGNAL`, which is the only moment the
+distinction is real: `notify::signal` returns `EmptyBadge` for a zero badge, and
+the syscall answers `WrongObject`. Enforcing the sentence as written was tried
+first, and the boot hung with `consoled`, `vfsd` and the shell each blocked
+after a single run.
 
 ### Signalling, including from an interrupt handler
 
@@ -428,9 +440,21 @@ Each step leaves the tree green.
 1. **The object and its arena.** Create, destroy, revoke; `ObjectKind::
    Notification` given meaning; quota charged. Host tests for the arena and
    the state machine.
-2. **`Invoke(SIGNAL)` and `Recv` on a notification.** The lock-free signal
+2. ✅ **`Invoke(SIGNAL)` and `Recv` on a notification.** The lock-free signal
    path, the mark-blocked-then-check wait, the second-waiter refusal. The
    two-thread QEMU test.
+
+   **Done 2026-08-13, nine days after acceptance.** The waiting half landed
+   early, in 2026-08-05, because RFC 0011 step 3 needed an interrupt to reach a
+   thread — and that was recorded as "RFC 0010's `Notification` landed with it",
+   which was read as this RFC having landed. It had not. There was no `SIGNAL`
+   method in `bhaskix_abi` until RFC 0018 step 7 measured what its absence cost
+   and went looking for the design, which was here all along.
+
+   The mechanism needed nothing new: `notify::signal` already matched the
+   pseudocode above. What was missing was one method number and one arm in the
+   syscall dispatch, taking the bits from the badge `resolve_for_ipc` already
+   returns.
 3. **`Invoke(POLL)`**, and the drain-then-block pattern in a service.
 4. **Signal from an interrupt handler**, proved by rewriting `input.rs`'s
    private reader on it. This is the step that retires a hand-written
@@ -438,8 +462,19 @@ Each step leaves the tree green.
    whole exercise.
 5. **Destruction while a waiter is blocked**, with the stranded count and its
    gate.
-6. **A ring plus a doorbell** — RFC 0009's shared memory with a notification
+6. 🟡 **A ring plus a doorbell** — RFC 0009's shared memory with a notification
    on top, in `abi`, as the async channel RFC 0008 promised. No kernel change.
+
+   **Half done 2026-08-13.** `bin/ipd` rings a doorbell on the notification
+   `bin/netd` sleeps on, badged so the driver can tell it from its own device's
+   interrupt — this RFC's badge-as-bitmask used for what it was designed for.
+   The kernel's `wake_net_driver`, which poked the driver twice a second because
+   no domain could, is **deleted**.
+
+   The other direction is not built: `netd` cannot tell `ipd` a frame has
+   arrived, and `ipd` polls its ring. It is also not yet packaged in `abi` as
+   the channel this step describes — what exists is one use of it, in one pair
+   of programs.
 
 Steps 1–3 are the object. Step 4 is the justification. Step 6 is the reason
 RFC 0008 said any of this.

@@ -138,6 +138,26 @@ pub mod method {
     /// Zero if nothing has been signalled, which is an answer and not an
     /// error.
     pub const PEEK: u64 = 44;
+    /// Signal a `Notification`. Never blocks.
+    ///
+    /// **Takes no arguments, and that is the design.** The bits or-ed into the
+    /// waiting word are the **badge on this capability**, which the kernel
+    /// stamped when the capability was derived and which the holder can neither
+    /// read nor choose. So a receiver waiting on one notification can tell its
+    /// senders apart — up to 64 of them, one bit each — and the identification
+    /// is trustworthy precisely because the sender did not pick its own bit.
+    ///
+    /// Needs the write right: signalling changes the word somebody else is
+    /// waiting on. `WAIT` needs only read.
+    ///
+    /// Specified by [RFC 0010](../../docs/rfc/0010-notifications.md) when it was
+    /// accepted on 2026-08-04, as step 2 of its implementation plan, and not
+    /// built until 2026-08-13. What landed first was the other direction — an
+    /// interrupt signalling a notification — because RFC 0011 step 3 needed it,
+    /// and that half was mistaken for the whole object. Until this existed no
+    /// domain could wake another, and the kernel poked a sleeping driver on
+    /// their behalf.
+    pub const SIGNAL: u64 = 45;
 
     /// Map the memory this capability names into the caller's address space.
     ///
