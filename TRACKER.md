@@ -742,6 +742,45 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the filtered trace: execution enters one byte inside an instruction)
+
+`-d exec,cpu,in_asm -dfilter 0x10000080..0x100000a5` — QEMU's `-dfilter` restricts logging to an
+address range, so this records every translated block and CPU state in the call window and nothing
+else. 1.3 MB a boot. Caught on attempt 18.
+
+**Every CPU dump in the failing boot is at `RIP=0x10000093`**, forty-four of them, and none at
+`0x10000080` where the block starts in a healthy run. The trace contains **two** translated blocks at
+that one address:
+
+```
+IN:  0x10000093:  48 89 54 24 28   movq %rdx,0x28(%rsp)     <- a real boundary, in another program
+IN:  0x10000093:  89 f7            movl %esi,%edi           <- consoled, entered mid-instruction
+```
+
+`bin/consoled`'s instruction there begins at `0x10000092` and is `4c 89 f7`, `mov %r14,%rdi`.
+Entering one byte in decodes the tail `89 f7` as **`mov %esi,%edi`** — `rdi` takes `rsi`. That is
+exactly the faulting `rdi`, and it explains why `rsi`, `rdx` and `rcx`, loaded at the instructions
+after, were always correct.
+
+**It also explains the falsification.** Capture two had no interrupt before the fault because none is
+needed: once a block exists at `0x10000093` it is entered again directly. The interrupt in capture
+one was how execution first arrived there, not the mechanism.
+
+**The hypothesis, stated as one: this is emulator aliasing, not a kernel bug.** Every program in this
+system links at `0x10000000` — eight of them, in eight address spaces, sharing every virtual address.
+The trace shows two different byte sequences translated at the same guest address, and control
+entering `consoled` at an offset that is an instruction boundary only in a *different* program.
+
+**The decisive test is cheap: give the programs different link addresses.** If the fault disappears
+when no two programs share a virtual address, the cause is the sharing. That is worth doing on its
+own merits — every debugging session in this file has been confused by it, twice fatally — and it
+would settle whether Bhaskix has a bug here at all.
+
+**What this would mean if confirmed.** The `services … 0 bytes` failure has been carried in this file
+as a kernel defect since 2026-08-12. It may be QEMU, in which case the correct entry is that the
+kernel was never at fault and the investigation found an emulator artefact — which is a different
+and much less comfortable kind of result than a fix.
+
 ### 2026-08-13, last (`-d int` is the right instrument, and it falsified the mechanism it suggested)
 
 **QEMU's `-d int -D file` reproduces the bug where gdb could not**: caught on attempt 2 of one hunt
