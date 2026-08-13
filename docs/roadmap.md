@@ -191,12 +191,12 @@ telemetry plane, `bhaskixboot.efi`, package management, and libc.
   plan: the second driver — `bin/blkd`, in a domain — cost three bugs the first one had already
   learned and written down in comments, and a framework is the difference between a lesson recorded
   and a lesson enforced
-- 🟡 **Networking** — `PARTIAL`. [RFC 0018](rfc/0018-networking.md) steps 1–6 implemented:
+- 🟡 **Networking** — `PARTIAL`. [RFC 0018](rfc/0018-networking.md) is **accepted, all seven steps**:
   virtio-net in a domain, Ethernet, ARP, IPv4, ICMP and UDP in a `no_std` crate with six fuzz
-  targets, and a socket that is a badged capability rather than a descriptor. A ring 3 program
-  holding a socket and a page obtains an address by DHCP, which is the roadmap's "does useful
-  network I/O" met by demonstration. **Not done:** TCP, IPv6, any sockets API above UDP, and step 7
-  — the folded-domain measurement, which prices the `netd`/`ipd` boundary this design argues for
+  targets, a socket that is a badged capability rather than a descriptor, and the folded-domain
+  measurement that priced the boundary. A ring 3 program holding a socket and a page obtains an
+  address by DHCP, which is this roadmap's "does useful network I/O" met by demonstration.
+  **Not done:** TCP — reserved as RFC 0019 — IPv6, and any sockets API above UDP
 - ⬜ **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing
   tool
 - ⬜ **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
