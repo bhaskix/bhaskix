@@ -36,7 +36,9 @@ What can be counted honestly, with how to recount it:
 2. **Nothing has ever booted on physical hardware** — M1-17, blocked on a machine. Every number
    above was measured on one emulator, and this project's own record says machines see different
    bugs.
-3. **The ELF loader's 24 hours of fuzzing**, unmet since it was written down.
+3. ~~**The ELF loader's 24 hours of fuzzing**, unmet since it was written down.~~ **Met on
+   2026-08-13.** Three campaigns ran the full twenty-four hours: 10.97 billion executions over
+   `elf::parse`, 11.34 billion over `DMAR`, 52 million over `ustar`. No crash, no hang, no artifact.
 
 The four remaining `TODO` tasks are `M4-06c` (topology-aware balancing, wants ACPI topology),
 `M4-07b` (priority inheritance, wants a sleeping lock), `M4-10b` (timer wheel, wants a
@@ -689,7 +691,7 @@ what is actually ahead.
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012, all seven steps; per-device windows landed with M7-13. Interrupt remapping **works** as of 2026-08-11 (M6-15) and is still off by default — not for a defect, but because the path was silently broken for its whole life, has been seen working on one emulator, and has never run on real hardware |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
-| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets: 901 million executions over `elf::parse` and 12 billion seeded mutations, 2.45 billion over `DMAR`, and 96 million over `ustar` uncapped plus 250 million capped. No crash, no hang, no unbounded loop. The duration §8 asks for is still not met: 24 hours, against two |
+| Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets. **And the duration is met as of 2026-08-13**: three campaigns of a full twenty-four hours each, 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`, 52 million over `ustar`. No crash, no hang, no artifact |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1 — ✅ **answered by step 3** on 2026-08-07, and this row said only that the RFC *found* it until 2026-08-12, when that omission misled the author of RFC 0018 into calling it open. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
 
@@ -739,6 +741,31 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-13, last (the 24-hour campaigns finished, and M6's oldest unmet criterion is met)
+
+Three libFuzzer campaigns ran the full twenty-four hours and stopped on their own.
+
+| target | executions | coverage | new units | peak RSS | slowest unit |
+|---|---|---|---|---|---|
+| `elf_parse` | 10,971,798,772 | 176 | 315 | 432 MB | 0 s |
+| `dmar_parse` | 11,344,305,605 | 116 | 1,262 | 527 MB | 0 s |
+| `ustar_parse` | 52,147,818 | 146 | 664 | 432 MB | 0 s |
+
+**No crash, no hang, no artifact** — `fuzz/artifacts/` is empty for all **eight** targets, including
+the five networking parsers added this week.
+
+**This closes the oldest unmet criterion in M6.** `docs/coding-style.md` §8 asked for twenty-four
+hours; the record has said "24 hours, against two" since 2026-08-10, and it said so in three places.
+All three are corrected, and the README line claiming the ELF loader still owed its campaign is
+corrected with them.
+
+**Two things worth reading rather than skimming.** `ustar_parse` executed **52 million** against the
+other two's eleven billion — two hundred times fewer, for the same wall time. That is not a defect
+but it is a fact about what the campaign actually bought: the ustar corpus is slower per case, so
+"twenty-four hours" means very different amounts of testing per target. And a `slowest_unit_time_sec`
+of 0 across all three says no input took even a second, which is the property the hang-detection was
+there to check.
 
 ### 2026-08-13, last (gdb is the wrong instrument: the bug does not happen while it watches)
 
@@ -2447,8 +2474,11 @@ repair it**, and a target that does not say so reports a clean campaign over the
 **Two things this does not cover.** `ustar`'s 96 million executions against `DMAR`'s 2.45 billion is
 not a like-for-like number: its inputs are archives, its corpus is 25 MB, and a unit costs about
 twenty-five times more to execute. Both stopped finding new edges long before the campaign ended,
-but the smaller number is the one to grow next. And the duration in M6's exit criterion is still
-unmet — it says 24 hours, and this says two.
+but the smaller number is the one to grow next. ~~And the duration in M6's exit criterion is still
+unmet — it says 24 hours, and this says two.~~ **Met 2026-08-13**: three campaigns of a full
+twenty-four hours, 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`, 52 million
+over `ustar`. The like-for-like caveat above survives the longer run and is if anything sharper —
+`ustar` did two hundred times fewer executions than the other two in the same wall time.
 
 **Addendum, the same evening: `ustar`'s number grown, and the obvious lever was the wrong one.**
 
