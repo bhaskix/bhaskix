@@ -742,6 +742,45 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (`-d int` is the right instrument, and it falsified the mechanism it suggested)
+
+**QEMU's `-d int -D file` reproduces the bug where gdb could not**: caught on attempt 2 of one hunt
+and attempt 14 of another, against **0 in 18** boots under gdb. It logs asynchronously and never
+stops the guest, which is the property this failure needs. That is the instrument to use from here.
+
+**Capture one suggested a mechanism.** Immediately before the fault, a user-mode interrupt at
+`IP=0x10000093` — *one byte into* the three-byte `mov %r14,%rdi` at `0x10000092`, confirmed by
+disassembling from a known boundary. Resuming there decodes the remaining `89 f7` as
+`mov %esi,%edi`, and `rsi` was **1** at that moment, which is exactly the faulting `rdi`. It
+explained why only `rdi` was wrong while `rsi`, `rdx` and `rcx` — loaded at the following
+instructions — were all correct.
+
+**Capture two falsified it.** Identical fault registers, and **no user-mode interrupt before the
+fault at all** — every preceding event is `cpl=0`. The same fault occurs with consoled never
+interrupted in user mode, so the `0x10000093` event was a coincidence and the mechanism is wrong.
+
+It was not committed to this file before the second capture, and this is why.
+
+**What both captures agree on**, byte for byte: `rdi 1`, `rbx 1`, `r13 1`, `r14 0x11003db8`,
+`rsi 0x11003d70`, `rdx` and `r12` `0x11003eb8`, `r15 0x11003d70`, `rsp 0x11003ce0`.
+
+**What has been ruled out, each by a check rather than an argument:**
+
+- An alternate path into the call: every jump into that region targets `0x10000080`, before the
+  `mov %r14,%rdi`, so no path reaches the call without executing it.
+- A stale binary: `bin/consoled` in `build/initrd.tar` is **byte-identical** to the one disassembled.
+- An asynchronous event: capture two has none.
+- The kernel shifting a return address: the only write to `frame.rip` is the uaccess fixup, guarded
+  by `!frame.from_user_mode()`.
+
+So `rdi != r14` at an instruction that loads one from the other, with no interrupt and no other way
+in. One assumption is still wrong and it has not been found.
+
+**Next instrument.** `-d int` shows only interrupts. QEMU's `-dfilter` restricts logging to an
+address range, so `-d in_asm,cpu -dfilter 0x10000080..0x100000a5` would record every translated block
+and CPU state in exactly the window in question, and nothing else — the volume that makes `-d exec`
+unusable is the reason `-dfilter` exists.
+
 ### 2026-08-13, last (the 24-hour campaigns finished, and M6's oldest unmet criterion is met)
 
 Three libFuzzer campaigns ran the full twenty-four hours and stopped on their own.
