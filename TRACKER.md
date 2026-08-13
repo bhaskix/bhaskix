@@ -740,6 +740,41 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the corruption is before the call, in a window of four instructions)
+
+A conditional hardware breakpoint at the call site — `hbreak *0x1000009e` with `condition $rdi !=
+$r14` — **fired**, on the CPU whose `rip` was that instruction. So `rdi` is already wrong *before*
+`handle` is entered. The callee is exonerated.
+
+The window is four instructions, and the disassembly is unambiguous:
+
+```
+10000092: mov %r14,%rdi      <- rdi loaded from r14 here
+10000095: mov %r15,%rsi
+10000098: mov %rbx,%rdx
+1000009b: mov %r12,%rcx
+1000009e: callq handle       <- stopped here: rdi = 1, r14 = 0x11003db8
+```
+
+`rsi`, `rdx` and `rcx` — loaded at the three instructions *between* — are all exactly right. Only
+`rdi` diverges from the register it was copied from, and **nothing in that window writes either
+one**. No code can produce this state, so an asynchronous event did: an interrupt whose return leaves
+`rdi` (or `r14`) different from how it found it.
+
+At the same moment the intended reply slot at `r14` and the request at `r12` both read as **zeroes**.
+
+**A control, and it came back empty.** Ten further boots with the same breakpoint produced no stop —
+and no fault either: `grep` for the page fault across all ten serial logs finds nothing. The bug did
+not occur, so the absence of a stop says nothing. Worth recording because a silent breakpoint reads
+like evidence and is not.
+
+**Still not fixed.** Two things remain to be ruled out before blaming the interrupt return path.
+First, that gdb reported the registers of the CPU that stopped rather than another one — the `rip`
+matching the breakpoint address argues it did, but a run that dumps *both* vCPUs at the stop would
+settle it. Second, which interrupt: the timer and the console's own line are both candidates, and
+the entry and exit stubs in `arch/x86_64/src/trap.rs` push and pop symmetrically, so if it is that
+path the fault is not in the obvious place.
+
 ### 2026-08-13, last (caught under gdb: one register, and a Request of zeroes)
 
 Caught on the **first attempt** with a hardware breakpoint on the unknown-method arm — nothing sends
