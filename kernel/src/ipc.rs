@@ -528,17 +528,62 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
 /// # Errors
 ///
 /// [`IpcError::NoSuchEndpoint`] or [`IpcError::Congested`].
+/// What a blocking receive came back with.
+///
+/// RFC 0010 question 1: a thread that has bound a notification is woken by
+/// whichever arrives first, so a receive has two ways to succeed.
+pub enum Received {
+    /// A message, and who sent it.
+    Message(Message, u32),
+    /// The bound notification's badge word, taken whole.
+    Notified(u64),
+}
+
+/// Blocks until a message arrives on `id`.
+///
+/// The plain shape, for callers that have bound no notification. See
+/// [`recv_either`] for the one that can also be woken by a signal.
+///
+/// # Errors
+///
+/// [`IpcError::NoSuchEndpoint`] if the endpoint dies or the thread is stopped.
 pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
+    match recv_either(id)? {
+        Received::Message(message, from) => Ok((message, from)),
+        // Only a thread that bound a notification can be told about one, and a
+        // caller asking for this shape did not.
+        Received::Notified(_) => Err(IpcError::NoSuchEndpoint),
+    }
+}
+
+/// Blocks until a message arrives **or the bound notification fires**.
+///
+/// RFC 0010 question 1, answered 2026-08-13. A service that must answer callers
+/// while something it did not ask for may arrive had, until this existed, to
+/// poll: `bin/ipd` looked at its ring about 37 times per frame.
+///
+/// # Errors
+///
+/// [`IpcError::NoSuchEndpoint`] if the endpoint dies or the thread is stopped.
+pub fn recv_either(id: EndpointId) -> Result<Received, IpcError> {
     let Some(me) = sched::current_thread_id() else {
         return Err(IpcError::NoSuchEndpoint);
     };
+
+    // Anything already pending, before committing to a rendezvous. A signal that
+    // arrived while this thread was busy is work in hand, and queueing as a
+    // receiver first would sleep on top of it.
+    let waiting = crate::notify::take_bound(me);
+    if waiting != 0 {
+        return Ok(Received::Notified(waiting));
+    }
 
     match rendezvous_recv(id, me)? {
         // A sender was already waiting; its message is in hand.
         Rendezvous::Matched { partner, message } => {
             RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
             sched::set_reply_target(me, partner);
-            Ok((message, partner))
+            Ok(Received::Message(message, partner))
         }
 
         // Queued as a receiver. A sender that arrives writes the message into
@@ -553,7 +598,7 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
                     RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
                     trace(Event::RecvTook, me, from);
                     sched::set_reply_target(me, from);
-                    return Ok((message, from));
+                    return Ok(Received::Message(message, from));
                 }
                 // The endpoint was destroyed under us. Leaving the queue entry
                 // behind would have a later rendezvous deliver to a thread that
@@ -568,6 +613,25 @@ pub fn recv(id: EndpointId) -> Result<(Message, u32), IpcError> {
                     return Err(IpcError::NoSuchEndpoint);
                 }
                 sched::Delivery::Blocked => {
+                    // **Message first, notification second.** `take_message_or_
+                    // block` has just marked this thread blocked and found no
+                    // message; only now is the bound notification read. A thread
+                    // that looked at the notification first, and cancelled on
+                    // finding bits, could throw away a message a sender had
+                    // already written into its mailbox -- stranding that sender
+                    // for ever.
+                    //
+                    // The mark-blocked-then-check order is what makes the read
+                    // safe against a signal arriving right here: the signaller
+                    // wakes this thread, so `block_self` returns at once and the
+                    // loop looks again.
+                    let bits = crate::notify::take_bound(me);
+                    if bits != 0 {
+                        // Out of the receive queue, or a later rendezvous
+                        // delivers to a thread that has stopped waiting.
+                        cancel(id, me);
+                        return Ok(Received::Notified(bits));
+                    }
                     RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
                     sched::block_self();
                 }

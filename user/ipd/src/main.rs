@@ -62,6 +62,16 @@ const ENDPOINT: u64 = 4;
 /// on, so a bug here cannot eat the wake the driver is asleep for, and its bit
 /// was not chosen here, so the driver can trust the word to say who rang.
 const DOORBELL: u64 = 5;
+/// Slot: the notification `bin/netd` rings when a frame has arrived.
+///
+/// **RFC 0010 question 1, answered 2026-08-13.** This program has to answer
+/// socket calls on its endpoint *and* notice frames it did not ask for. Until
+/// now it could not wait for both — there is no second thread to spare and no
+/// timed wait — so it polled, about thirty-seven looks at the ring per frame.
+///
+/// Bound to this thread, so `receive` wakes for a caller or a frame, whichever
+/// comes first, and says which.
+const INBOX: u64 = 6;
 
 /// Where this program maps what it holds.
 const RING_AT: u64 = 0x2100_0000;
@@ -153,6 +163,13 @@ static BURST_PHASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 static BURST_PONGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Requests sent in the phase now running.
 static BURST_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Times `receive` came back because a frame arrived rather than a caller.
+///
+/// The number that says RFC 0010 question 1's answer is **used** rather than
+/// merely wired. Zero here would mean the binding never fired and any speed-up
+/// came from somewhere else.
+static NOTIFIED_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Passes round the demonstration loop that found the ring empty.
 ///
 /// **Measured before anything is changed.** RFC 0010 step 2 gave `bin/ipd` a
@@ -588,6 +605,7 @@ fn refresh() {
         BURST_SENT.load(Relaxed),
         EMPTY_POLLS.load(Relaxed),
         LONGEST_WAIT.load(Relaxed),
+        NOTIFIED_WAKES.load(Relaxed),
     ]);
 }
 
@@ -756,6 +774,18 @@ fn serve(
         // What serving has changed, put where the kernel can read it. See
         // `CACHE`: without this the page froze at the moment serving began.
         refresh();
+        // **Woken by a frame rather than by a caller.** RFC 0010 question 1:
+        // this is the wake that used to be impossible, and the reason this loop
+        // no longer has to be asked before it looks at the wire. Drain, then go
+        // back to waiting; there is nobody to reply to.
+        if status_in == status::NOTIFIED {
+            NOTIFIED_WAKES.store(
+                NOTIFIED_WAKES.load(core::sync::atomic::Ordering::Relaxed) + 1,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            drain_ring(sockets, me, &mut tail);
+            continue;
+        }
         if status_in != status::OK {
             continue;
         }
@@ -1256,6 +1286,11 @@ extern "C" fn ipd_main() -> ! {
                         pongs,
                     );
                     let gateway = cache.lookup(GATEWAY, ticks).unwrap_or(MacAddr::BROADCAST);
+                    // Bound before serving, not before the demonstration: the
+                    // loop above polls deliberately and would be woken for
+                    // nothing. Refused on a machine with no inbox, which is a
+                    // state — `serve` then behaves exactly as it did before.
+                    call(syscall::INVOKE, INBOX, method::BIND_SELF, [0; 4]);
                     serve(&mut sockets, me, gateway, can_send, tail);
                 }
                 report(
@@ -1523,6 +1558,7 @@ fn report(
         BURST_SENT.load(core::sync::atomic::Ordering::Relaxed),
         EMPTY_POLLS.load(core::sync::atomic::Ordering::Relaxed),
         LONGEST_WAIT.load(core::sync::atomic::Ordering::Relaxed),
+        NOTIFIED_WAKES.load(core::sync::atomic::Ordering::Relaxed),
     ];
     for (slot, value) in CACHE.iter().zip([
         frames,
@@ -1540,7 +1576,7 @@ fn report(
 }
 
 /// Puts ten words on the report page.
-fn write_report(words: [u64; 20]) {
+fn write_report(words: [u64; 21]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.

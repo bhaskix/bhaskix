@@ -2029,6 +2029,10 @@ pub fn exit() -> ! {
     // `ipc::cancel_all`.
     if let Some(thread) = me {
         crate::ipc::cancel_all(thread);
+        // And any notification it had bound. A binding that outlives its thread
+        // is a wake sent for ever to somebody who is not there, and a slot that
+        // can never be bound again. RFC 0010 question 1.
+        crate::notify::unbind_thread(thread);
     }
 
     let owed = if cpu < MAX_CPUS {

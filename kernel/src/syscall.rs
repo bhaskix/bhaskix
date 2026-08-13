@@ -127,6 +127,7 @@ const _: () = {
     assert!(method::WAIT == bhaskix_abi::method::WAIT);
     assert!(method::PEEK == bhaskix_abi::method::PEEK);
     assert!(method::SIGNAL == bhaskix_abi::method::SIGNAL);
+    assert!(method::BIND_SELF == bhaskix_abi::method::BIND_SELF);
     assert!(method::INFO == bhaskix_abi::method::INFO);
     assert!(method::DELETE == bhaskix_abi::method::DELETE);
     assert!(method::DERIVE == bhaskix_abi::method::DERIVE);
@@ -154,6 +155,7 @@ const _: () = {
     assert!(Status::NoSuchMethod as u64 == bhaskix_abi::status::NO_SUCH_METHOD);
     assert!(Status::QuotaExceeded as u64 == bhaskix_abi::status::QUOTA_EXCEEDED);
     assert!(Status::Exhausted as u64 == bhaskix_abi::status::EXHAUSTED);
+    assert!(Status::Notified as u64 == bhaskix_abi::status::NOTIFIED);
     assert!(method::SPAWN == bhaskix_abi::method::SPAWN);
     assert!(method::START == bhaskix_abi::method::START);
 };
@@ -260,6 +262,8 @@ pub mod method {
     pub const PEEK: u64 = 44;
     /// Signal a notification, with the bits taken from the capability's badge.
     pub const SIGNAL: u64 = 45;
+    /// Bind a notification to the calling thread. RFC 0010 question 1.
+    pub const BIND_SELF: u64 = 55;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -397,6 +401,9 @@ pub enum Status {
     /// second it should look at the machine, and asking again later is the only
     /// thing that can help.
     Exhausted = 13,
+    /// A blocking receive was woken by its bound notification rather than by a
+    /// message. Not a failure. RFC 0010 question 1.
+    Notified = 14,
 }
 
 impl Status {
@@ -1016,6 +1023,34 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // hazard to avoid -- `notify::signal` publishes the bits before it looks
     // for a waiter, which is the rule that keeps a signal from being lost
     // against a waiter that is on its way to sleep.
+    // Binding a notification to this thread. **RFC 0010 question 1.**
+    //
+    // No argument names a thread: the caller binds itself, which is the whole
+    // authority question answered by construction rather than by a check.
+    if kind == Some(Kind::Invoke) && frame.method == method::BIND_SELF {
+        let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Notification) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        if !resolved.rights.contains(crate::cap::Rights::READ) {
+            return Outcome::err(Status::InsufficientRights);
+        }
+        let Some(me) = crate::sched::current_thread_id() else {
+            return Outcome::err(Status::NoDomain);
+        };
+        let id = crate::notify::NotificationId::from_parts(
+            resolved.object.id as u32,
+            (resolved.object.id >> 32) as u32,
+        );
+        return if crate::notify::bind_to(id, me) {
+            Outcome::ok(0)
+        } else {
+            // Already bound to somebody else, or gone. Refused rather than
+            // replacing: substituting a binding loses whoever held the first.
+            Outcome::err(Status::Congested)
+        };
+    }
+
     if kind == Some(Kind::Invoke) && frame.method == method::SIGNAL {
         let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Notification) {
             Ok(resolved) => resolved,
@@ -1401,8 +1436,17 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 }
             };
             let endpoint = crate::ipc::EndpointId::from_u32(resolved.object.id as u32);
-            match crate::ipc::recv(endpoint) {
-                Ok((message, _caller)) => {
+            match crate::ipc::recv_either(endpoint) {
+                // The bound notification fired. The badge word goes back in the
+                // value register and no message registers are touched: there is
+                // no message, and writing zeroes into them would look like one.
+                Ok(crate::ipc::Received::Notified(bits)) => {
+                    return Outcome {
+                        status: Status::Notified,
+                        value: bits,
+                    };
+                }
+                Ok(crate::ipc::Received::Message(message, _caller)) => {
                     // All four registers, because a message is four registers
                     // (RFC 0008) and a server that received one of them could
                     // not speak the protocols this system already has. The

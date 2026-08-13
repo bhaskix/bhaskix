@@ -58,6 +58,13 @@ const SIGNAL: u64 = 6;
 const RING: u64 = 7;
 /// Slot: the ring `bin/ipd` hands frames back through.
 const BACK: u64 = 8;
+/// Slot: the doorbell that wakes `bin/ipd`.
+///
+/// **RFC 0010 question 1.** The service used to poll this ring — about
+/// thirty-seven looks per frame — because it could not wait on its endpoint and
+/// the ring at once. It binds this notification now, so a frame handed across
+/// wakes it directly. Write only: a driver rings, it does not listen.
+const INBOX: u64 = 9;
 
 /// Where this program maps what it holds.
 const COMMON_AT: u64 = 0x2000_0000;
@@ -776,6 +783,14 @@ unsafe fn hand_to_ipd(frame_at: u64, length: usize) -> bool {
             after_frame,
         );
     }
+    // **Then wake the service.** Index first, wake second, for the reason the
+    // bytes go before the index: a reader woken before the index was published
+    // would look, find nothing, and sleep again holding a frame that had
+    // already been written.
+    //
+    // Unchecked. On a machine with no service this slot is empty and the call
+    // is refused, which is a state rather than a fault.
+    call(syscall::INVOKE, INBOX, method::SIGNAL, [0; 4]);
     true
 }
 

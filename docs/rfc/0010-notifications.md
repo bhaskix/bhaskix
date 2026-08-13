@@ -419,6 +419,63 @@ exists and only needs pointing at a new source.
    is a service that must answer callers *while* something it did not ask for
    may arrive. A network driver is the obvious first one, which puts this
    question in front of whoever writes the networking RFC.
+
+   ### Answered 2026-08-13. Bound notifications, and why the alternatives are gone
+
+   `bin/ipd` is that service. It answers socket calls on its endpoint while
+   frames arrive in a ring it did not ask for, and it resolves the conflict by
+   **polling** — about **37 looks at the ring per frame**, each one a `YIELD`
+   and a scheduling round trip, measured by RFC 0018 step 7. In steady state it
+   is worse: `ipd` blocks in `receive` and drains the ring only when a client
+   calls, so a frame arriving unsolicited waits for somebody to ask.
+
+   **The two-thread workaround this question assumed does not exist.** The ABI
+   has `SPAWN`, which creates a *domain*, and `START`, which runs a program in
+   one. There is no way to make a second thread in your own domain. There is
+   also no timed wait, so a service cannot block speculatively and recover if
+   no wake comes. Poll, or wait on both: there is no third option.
+
+   #### The design
+
+   **Bind is a method on the notification and it binds the calling thread.**
+   seL4 binds a notification to a TCB. This system has no thread object, and
+   does not need one here: the only thread that may bind is the one asking, so
+   the authority question is answered by construction rather than by a check.
+   One bound notification per thread. A second is **refused**, not substituted —
+   replacing one silently loses whoever was relying on it.
+
+   **`Recv` on an endpoint then returns a message or the notification's word.**
+   The queued-receive loop already re-checks a mailbox on every wake; that is
+   the mark-blocked-then-check order established at M4-09 and relearned at
+   M5-05. The bound notification is read in the same place and the same order,
+   and `ipc::cancel` — which exists — takes the receive registration out when a
+   notification wins.
+
+   **Message first, notification second, and cancel only when there is no
+   message.** A sender part-way through a rendezvous may already have written
+   into this thread's mailbox. A thread that cancelled on a signal without
+   looking would strand that sender for ever. This is the whole delicacy of the
+   change, and it is the shape of both lost-wakeup bugs already in this
+   project's record.
+
+   **The signal path gains a second wake target and stays lock-free.** `signal`
+   wakes `slot.waiter`, which only `wait` sets; a bound thread is recorded
+   separately on the same slot and woken the same way, through
+   `wake_from_interrupt`. No lock is added, for the reason this RFC already
+   gives for having one waiter: a lock in the signal path must be `try_lock`,
+   and a failed `try_lock` on a wake is a lost wakeup.
+
+   **A bound notification is cleared when its thread exits**, or a dead thread
+   is woken for ever.
+
+   #### What would say this was the wrong answer
+
+   That a mistake here does not fail loudly. It strands a caller rarely and
+   under load, which is exactly the shape of the intermittent failure already
+   recorded in `TRACKER.md` and not yet understood. If this change cannot be
+   held to that standard — a deliberate send-and-signal race, run hard, with no
+   caller stranded — it should not land, and a service with two *domains* is the
+   fallback the ABI can already express.
 2. ~~**The `IRQHandler` object** — who may claim an interrupt line, how a
    vector is allocated, and what acknowledgement looks like.~~ **Answered:**
    [RFC 0011](0011-irq-handler.md), which uses this object as its delivery

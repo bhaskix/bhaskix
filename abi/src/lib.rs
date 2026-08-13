@@ -158,6 +158,27 @@ pub mod method {
     /// domain could wake another, and the kernel poked a sleeping driver on
     /// their behalf.
     pub const SIGNAL: u64 = 45;
+    /// Bind a `Notification` to the calling thread, so that a blocking `Recv`
+    /// on an endpoint also wakes when this notification is signalled.
+    ///
+    /// **RFC 0010's unresolved question 1, answered 2026-08-13.** A service that
+    /// must answer callers *while* something it did not ask for may arrive had
+    /// no way to wait for both: there is no second thread to spare — the ABI can
+    /// create a domain but not a thread — and no timed wait to poll safely
+    /// around. `bin/ipd` looked at its ring about thirty-seven times per frame.
+    ///
+    /// The calling thread binds itself; no argument names a thread, because the
+    /// only thread that may bind is the one asking. One binding per thread, and
+    /// a second is **refused** rather than replacing the first, which would
+    /// silently lose whoever was relying on it. Cleared when the thread stops.
+    ///
+    /// Needs the read right: being woken is a way of being told.
+    ///
+    /// 55 rather than 33: the kernel's own `UNMAP` holds 33, and 51–54 are the
+    /// socket protocol's. Those are a service's methods rather than the
+    /// kernel's and could not collide, but a reader checking a number should not
+    /// have to know that.
+    pub const BIND_SELF: u64 = 55;
 
     /// Map the memory this capability names into the caller's address space.
     ///
@@ -370,6 +391,13 @@ pub mod status {
     /// about this program's envelope; the second is about the machine, and
     /// only asking again later can help.
     pub const EXHAUSTED: u64 = 13;
+    /// `Recv` came back because the **bound notification** fired, not because a
+    /// message arrived. The badge word is in the value register.
+    ///
+    /// Not an error, which is why it is worth its own number rather than being
+    /// squeezed into `OK`: a service must be able to tell "somebody called me"
+    /// from "something happened", and both are success. RFC 0010 question 1.
+    pub const NOTIFIED: u64 = 14;
 }
 
 /// Methods the console service answers.

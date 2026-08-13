@@ -740,6 +740,45 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (RFC 0010 question 1 answered: waiting on an endpoint and a notification)
+
+A service can now answer callers **while** something it did not ask for arrives. `bin/ipd` binds a
+notification to its thread; its blocking `receive` returns either a message or `NOTIFIED` with the
+badge word, and `bin/netd` rings that notification after handing a frame across.
+
+**Why now.** RFC 0010 left this open in 2026-08-04 with a condition: *"revisit when a service has
+both — a network driver is the obvious first one."* `bin/ipd` is that service, and it resolved the
+conflict by polling: **about 37 looks at its ring per frame**, measured. The two-thread workaround
+that question assumed **does not exist** — the ABI creates *domains*, not threads — and there is no
+timed wait, so blocking speculatively was not an option either. Poll, or wait on both.
+
+**The design, and the one dangerous part.** The queued-receive loop already re-checks a mailbox on
+every wake; the bound notification is read in the same place, in the same mark-blocked-then-check
+order. **Message first, notification second, and the receive registration is cancelled only when
+there is no message** — a thread that cancelled on a signal without looking would throw away a
+message a sender had already written into its mailbox and strand that sender for ever. The signal
+path gains a second wake target and stays lock-free, for the reason RFC 0010 already gives for
+allowing one waiter.
+
+**What it did and did not do.**
+
+- The service path is fixed: `ipd` is **woken by a frame 1–2 times per boot** with nobody calling it,
+  which was impossible before. That number is small because the burst is over by the time serving
+  starts; it is not zero, which is what says the mechanism fires rather than merely exists.
+- **The burst did not get faster: 37–151 µs against 34–149 µs before.** The burst runs in the
+  demonstration loop, which still polls by design — and its empty-look counter is unchanged at about
+  39,600. Two of the three runs looked like an improvement and the third did not; attributing that
+  would have been a fourth wrong guess about this number in three days, so it is not claimed.
+
+**Also corrected by building it.** RFC 0010 says "a badge of zero is refused at derivation for a
+notification capability". Implemented literally the machine does not boot — most notification
+capabilities this kernel derives are held in order to *wait*, the supervisor's among them, and a
+waiter has no use for a badge. The refusal stays at `SIGNAL`, and the RFC says so now.
+
+**What this unblocks** is the point rather than the microseconds: any service that must react to
+something it did not ask for. TCP is the next one, and RFC 0018 step 6's other half — packaging the
+ring and its doorbell in `abi` as the async channel RFC 0008 promised — is now buildable.
+
 ### 2026-08-13, last (the boundary's cost was two domains on one processor)
 
 `bin/netd` and `bin/ipd` were both spawned with `spawn_on_with(cpu, …)` and both pinned — **the same

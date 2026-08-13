@@ -4005,6 +4005,38 @@ fn start_ip_domain(
         core::sync::atomic::Ordering::Release,
     );
 
+    // **`bin/ipd`'s inbox, and `bin/netd`'s doorbell onto it.**
+    //
+    // RFC 0010 question 1, answered 2026-08-13. Until this existed `ipd` had to
+    // choose: block on its endpoint and be deaf to arriving frames, or poll the
+    // ring and burn a processor. It polled — about thirty-seven looks per
+    // frame. Now it binds this notification, and its blocking receive wakes for
+    // whichever comes first, with the badge saying which.
+    //
+    // Read for the service, write for the driver. Neither can do the other's
+    // half: `ipd` cannot signal itself awake, and `netd` cannot consume the
+    // wake it is supposed to be sending.
+    let inbox = crate::notify::create().ok();
+    if let Some(inbox) = inbox {
+        let for_service = crate::notify::name(inbox).ok().and_then(|root| {
+            cap::with_arena(|arena| arena.derive(root, cap::Rights::READ, 0).ok())
+        });
+        let for_driver = crate::notify::name(inbox).ok().and_then(|root| {
+            cap::with_arena(|arena| arena.derive(root, cap::Rights::WRITE, NET_INBOX_BADGE).ok())
+        });
+        match (for_service, for_driver) {
+            (Some(service), Some(driver))
+                if domain::with(realm, |owner| owner.cspace.install_at(6, service).is_ok())
+                    == Some(true)
+                    && domain::with(net, |owner| owner.cspace.install_at(9, driver).is_ok())
+                        == Some(true) => {}
+            _ => {
+                crate::notify::destroy(inbox);
+                return Err("the inbox notification would not install");
+            }
+        }
+    }
+
     // **The doorbell. RFC 0010 step 6, and the reason step 2 was built.**
     //
     // `bin/netd` sleeps on one notification. Its device's interrupt already
@@ -4184,6 +4216,9 @@ fn network_endpoint_capability() -> Option<cap::SlotRef> {
 
 /// The notification `bin/netd` sleeps on, with the top bit set when it is real.
 static NET_WAKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `bin/netd`'s bit in `bin/ipd`'s inbox. See `start_ip_domain`.
+const NET_INBOX_BADGE: u64 = 1 << 1;
 
 /// `bin/ipd`'s bit in that notification's word.
 ///
@@ -5125,10 +5160,10 @@ fn report_net_after_exchange(hhdm: u64) {
     if count == 0 {
         return;
     }
-    let mut ipd = [0u64; 20];
+    let mut ipd = [0u64; 21];
     // SAFETY: a frame this object owns, through the direct map, read as the ten
     // little-endian words the service wrote there.
-    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 160) };
+    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 168) };
     for (index, word) in ipd.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -5140,7 +5175,7 @@ fn report_net_after_exchange(hhdm: u64) {
     println!(
         "    ipd after      {} frames taken, {} refused, {} datagrams delivered to a socket; \
          last refusal reason {}, on a frame of {} bytes with ethertype {:#06x}; ring head {} tail {}; \
-         {} empty looks at the ring, longest run {}",
+         {} empty looks at the ring, longest run {}; woken by a frame {} times",
         ipd[1],
         ipd[4],
         ipd[9],
@@ -5150,7 +5185,8 @@ fn report_net_after_exchange(hhdm: u64) {
         ipd[11],
         ipd[12],
         ipd[18],
-        ipd[19]
+        ipd[19],
+        ipd[20]
     );
 
     // RFC 0018 step 7: what the boundary cost, counted rather than argued.

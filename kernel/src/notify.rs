@@ -97,6 +97,14 @@ struct Slot {
     pending: AtomicU64,
     /// The one thread blocked in [`wait`], or zero.
     waiter: AtomicU32,
+    /// The one thread that has **bound** this notification, or zero.
+    ///
+    /// RFC 0010 question 1, answered 2026-08-13. A bound thread is not waiting
+    /// *here* — it is blocked in `ipc::recv` on an endpoint, and wants to be
+    /// woken by whichever arrives first. Kept beside [`Slot::waiter`] rather
+    /// than sharing it because they are woken for different reasons and a
+    /// thread may not be both.
+    bound: AtomicU32,
     /// Bumped on destruction, so a stale [`NotificationId`] cannot address a
     /// reused slot.
     generation: AtomicU32,
@@ -108,6 +116,7 @@ impl Slot {
         Self {
             pending: AtomicU64::new(0),
             waiter: AtomicU32::new(0),
+            bound: AtomicU32::new(0),
             generation: AtomicU32::new(0),
             live: AtomicBool::new(false),
         }
@@ -214,6 +223,16 @@ pub fn signal(id: NotificationId, badge: u64) -> Result<(), NotifyError> {
     slot.pending.fetch_or(badge, Ordering::Release);
     SIGNALS.fetch_add(1, Ordering::Relaxed);
 
+    // The bound thread, if any, is blocked on an *endpoint* and wants waking for
+    // this. Woken before the direct waiter is looked at, and by the same
+    // lock-free call, because a lock here would have to be `try_lock` and a
+    // failed `try_lock` on a wake is a lost wakeup -- this RFC's own reason for
+    // allowing one waiter.
+    let bound = slot.bound.load(Ordering::Acquire);
+    if bound != 0 {
+        crate::sched::wake_from_interrupt(bound);
+    }
+
     let waiter = slot.waiter.load(Ordering::Acquire);
     {
         let at = SIGNAL_AT.fetch_add(1, Ordering::Relaxed) as usize;
@@ -279,6 +298,73 @@ pub fn name(id: NotificationId) -> Result<crate::cap::SlotRef, NotifyError> {
         )
     })
     .map_err(|_| NotifyError::Exhausted)
+}
+
+/// Binds this notification to `thread`, so a blocking receive also wakes for it.
+///
+/// RFC 0010 question 1. Returns `false` if the notification is gone or already
+/// bound to a different thread — **refused rather than replaced**, because
+/// substituting one silently loses whoever was relying on it.
+///
+/// # Errors
+///
+/// `false` on a gone or already-bound notification.
+pub fn bind_to(id: NotificationId, thread: u32) -> bool {
+    if thread == 0 {
+        return false;
+    }
+    let Some(slot) = resolve(id) else {
+        return false;
+    };
+    slot.bound
+        .compare_exchange(0, thread, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        || slot.bound.load(Ordering::Acquire) == thread
+}
+
+/// Forgets every binding `thread` held. Called when a thread stops.
+///
+/// A binding outliving its thread is a wake sent for ever to somebody who is
+/// not there, and — worse — a slot that can never be bound again.
+pub fn unbind_thread(thread: u32) {
+    if thread == 0 {
+        return;
+    }
+    for slot in &SLOTS {
+        let _ = slot
+            .bound
+            .compare_exchange(thread, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// What `thread` has bound, and whatever it has pending, taken.
+///
+/// Scans, because the table is [`MAX_NOTIFICATIONS`] entries and this runs on
+/// the receive path rather than the signal path. A per-thread index would be a
+/// second structure to keep in step with this one, for a saving of thirty-two
+/// atomic loads.
+#[must_use]
+pub fn take_bound(thread: u32) -> u64 {
+    if thread == 0 {
+        return 0;
+    }
+    for slot in &SLOTS {
+        if slot.live.load(Ordering::Acquire) && slot.bound.load(Ordering::Acquire) == thread {
+            return slot.pending.swap(0, Ordering::AcqRel);
+        }
+    }
+    0
+}
+
+/// Whether `thread` has a notification bound at all.
+#[must_use]
+pub fn has_bound(thread: u32) -> bool {
+    if thread == 0 {
+        return false;
+    }
+    SLOTS.iter().any(|slot| {
+        slot.live.load(Ordering::Acquire) && slot.bound.load(Ordering::Acquire) == thread
+    })
 }
 
 /// Takes the pending word without blocking. Zero means nothing is pending.
