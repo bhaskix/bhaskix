@@ -153,7 +153,7 @@ fairness within 2% for two equal-weight workloads.
 | M4-09 | Sleeping, wait queues, blocking | ✅ `DONE` | `Blocked` state, `WaitQueue`, cross-CPU wake. Ring self-test over 4 CPUs. **Negative-tested**: disabling `wake` gives laps `[1,1,1,0]`, 0 wakeups. |
 | M4-09b | Reschedule IPI on wake | ✅ `DONE` | Required by M4-10: a tickless CPU can only be woken by an interrupt. Ring throughput rose from 84 to 736 laps. |
 | M4-10 | Tickless idle, one-shot timers | ✅ `DONE` | One-shot APIC timer, per-CPU deadlines, `sleep_micros`, reschedule IPI. **0 ticks over 400 ms idle vs 320–483 busy**; negative-testable as a ratio. |
-| M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape; there is no network stack. |
+| M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape. ~~There is no network stack.~~ **There is one as of 2026-08-13**, and [RFC 0019](docs/rfc/0019-time-and-timers.md) is where the workload comes from: TCP will want a timer per connection. The wheel is still not built, and now it can be designed against something. |
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
 
@@ -741,6 +741,44 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-13, last (RFC 0019 drafted: time, because TCP cannot be written without it)
+
+Started the TCP RFC and stopped one layer down. **Nothing in this system can wait for a length of
+time** — no sleep, no timed receive, no deadline, no timer object. TCP needs four timers before any
+argument about congestion control: retransmission, delayed acknowledgement, `TIME_WAIT`, and a
+zero-window probe.
+
+[RFC 0019](docs/rfc/0019-time-and-timers.md) is a **draft**. TCP becomes **RFC 0020**, and 0018's
+three references to "RFC 0019" are corrected in place.
+
+**The design is small because today's work made it small.** A deadline is a property of a
+notification, not a new object: `Invoke(notification, ARM, deadline)` asks the kernel to signal it
+later, and the program is woken through machinery that did not exist this morning — a bound
+notification and a `Recv` that returns `NOTIFIED`. So a service handles callers, arriving frames and
+expiring timers **in one loop with one blocking call**, which is what RFC 0010's question 1 was
+for.
+
+**One fact settled a whole section: reading time is already ambient.** `rdtsc` is unprivileged unless
+`CR4.TSD` is set, and this kernel does not set it — `CR4` is `0x300020`. A `Clock` capability would
+guard an instruction any program can execute. What is scarce is being *woken*, and that is what the
+RFC hands out.
+
+**Three costs already paid for the absence, all of them in this file**: `bin/dhcp` polls with a
+patience tuned by experiment — 400 was too few, a million made the shell test time out; `bin/ipd`
+cannot give up on anything; and RFC 0018's open question 4, which calls a service that hangs
+indistinguishable from one that is waiting "the worst subsystem to have it in".
+
+**`M4-10b` is unblocked from the other side.** Its `TODO` said a timer wheel "wants a
+many-short-timers workload to have a shape; there is no network stack". There is one now, and TCP
+will want a timer per connection. The entry is corrected; the wheel is still not built, and now it
+can be designed against something rather than guessed at.
+
+**Decided with the user, and recorded so RFC 0020 does not reopen them**: minimal but correct TCP —
+handshake, state machine, measured RTO, fixed window, orderly close with `TIME_WAIT`, and no
+congestion control, window scaling or SACK, each absence stated rather than implied. And the state
+machine goes in its **own domain, `bin/tcpd`**, on the same argument that split `netd` from `ipd`:
+the largest parser of remote input should not share a failure domain with every working UDP socket.
 
 ### 2026-08-13, last (distinct link addresses, and the intermittent failure stops)
 

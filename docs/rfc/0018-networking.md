@@ -215,7 +215,7 @@ not a coincidence — it is what the model produces every time the ambient versi
 ways: by connecting, and by *accepting* — and an accepted connection is a new socket the service
 creates on the program's behalf. So `Socket` must be a kind that a service can mint and hand back at
 a moment the program did not initiate, which the reply mechanism supports but only if the program is
-waiting in a call. RFC 0019 will need `ACCEPT` to be a call the program blocks in, not a callback.
+waiting in a call. TCP will need `ACCEPT` to be a call the program blocks in, not a callback.
 Recorded here so that it constrains this design rather than surprising that one.
 
 ### Address abstraction, with only one family implemented
@@ -257,7 +257,7 @@ conversation.
 | Vendor an existing stack (`smoltcp` or similar) | `ALLOWED_EXTERNAL` in `tools/check-deps.py` is empty by policy, and `docs/security.md` §1 treats a dependency as attack surface. The one exception ever made — `libfuzzer-sys` — is host-only and never linked into anything that boots. A network stack is the opposite: it is in the boot graph and it faces the attacker. | If it could be vendored under this project's own `unsafe` budget, fuzzed as our own code, and reviewed as such. That is most of the cost of writing one. |
 | A socket as a file-descriptor number | A number that means *the network* is ambient authority. The system deleted `kernel/src/namespace.rs` to stop exactly this. | Never. |
 | A `Call` per packet, no shared ring | Simpler, and one fewer revocable region to get wrong. But it makes throughput a measurement of the IPC path rather than of the stack. | If measurement shows the ring buys less than it costs in complexity at the packet rates we actually reach. |
-| TCP in this RFC | Its state machine, retransmission policy, congestion control and failure modes are an RFC's worth of argument on their own, and none of the path below it can land while that argument runs. | It is RFC 0019, and this document is shaped so it does not have to reopen anything here. |
+| TCP in this RFC | Its state machine, retransmission policy, congestion control and failure modes are an RFC's worth of argument on their own, and none of the path below it can land while that argument runs. | It is **RFC 0020** — this said 0019 until 2026-08-13, when timers took that number because TCP cannot be written without them — and this document is shaped so it does not have to reopen anything here. |
 | IPv6 in this RFC | Doubles the first implementation, including a second neighbour-discovery mechanism, before anything has sent a packet. | The address type is abstract from the start specifically so this is additive. |
 
 ## Impact on existing design documents
@@ -396,7 +396,7 @@ discovered later.
 ### Decided by acceptance
 
 1. Two domains, not one, and not the nucleus.
-2. UDP now; TCP is RFC 0019; the socket shape must not need changing for it.
+2. UDP now; TCP is **RFC 0020** (0019 is time and timers, which TCP needs first); the socket shape must not need changing for it.
 3. IPv4 now; the address type is abstract from the first line.
 4. Shared rings between domains, not a call per packet.
 
