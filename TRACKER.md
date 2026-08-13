@@ -740,6 +740,62 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the intermittent failure, localised and not fixed)
+
+**The `services … 0 bytes` failure is not a filesystem failure.** One line above it in the log says
+what happens: *"A SERVER EXITED OWING A REPLY: consoled left while sup (thread 38) was waiting."*
+`bin/consoled` **page-faults and its domain is destroyed**; every `services` assertion afterwards is
+downstream of a console that is gone.
+
+**What the fault says.** Writing to address `0x1`, `rip 0x10000275`, which disassembles inside
+`<Console as Service>::handle` — specifically the arm that answers an **unknown method**, storing a
+32-byte `Reply` through the hidden return pointer. That pointer is in `rbx`, loaded from the first
+argument at entry. `rbx` held **1**.
+
+Two things follow, and both are verified rather than argued:
+
+- `1` is what Rust uses for a dangling reference to an align-1 zero-sized type, and
+  `Console::State` is `()`.
+- The call site loads that argument from `r14`, and at the moment of the fault **`r14` still held a
+  valid stack address** (`0x11003db8`). So the caller had a good pointer and `rbx` did not — and
+  `rbx` is callee-saved.
+
+`r10` held `0x0000202c74697865`, which is `"exit, "` — `user/sup/src/main.rs:243` writes
+`"sup: restart-on-exit, "`. So this happens while the supervisor is exercising restart-on-exit.
+
+**Neither program sends an unknown method.** `sup` only ever sends `console::WRITE`; `bin/probe`'s
+mode 7 sends `console::WRITE` too (`mov rsi, 1`). So the method `consoled` dispatched on was not one
+anybody sent, which points at the same place the bad pointer does: a register frame that is not what
+the callee thinks it is, on return from a call that **blocked**.
+
+That is the family of the bug already fixed in `arch/x86_64/src/syscall.rs`, whose own comment says
+a blocking syscall left a per-CPU slot for another thread to overwrite and *"it looked like random
+corruption in whichever program blocked"*.
+
+**A gap in RFC 0008.** Its register convention names `rax`, `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`
+and says `rcx` and `r11` are destroyed by `SYSCALL`. **It says nothing about `rbx`, `rbp` or
+`r12`–`r15`**, and every user-side stub in this tree declares nine clobbers and depends on the
+kernel leaving the rest alone — across blocking calls included. That promise is unwritten and
+untested.
+
+**A gate was built for exactly that and it did not work.** `bin/probe` was given sentinels in
+`rbx`, `r12`, `r14`, `r15` across a blocking call and a method to report what survived. Watched
+failing — deliberately reporting a violation — **the gate stayed green**, and printing the value
+showed the kernel recording `0` no matter what the probe sent. Why is not understood. It was
+**removed rather than left in place**: a check that cannot fail is worse than no check, because it
+reads as assurance.
+
+**Reproduced once in about twenty-three boots today, and the evidence was lost** — that run was
+started without `BHASKIX_BOOT_LOG`, so the fault dump went to a file the harness deletes. Every
+future attempt at this must set it.
+
+**Still not fixed.** What is new is that it is no longer "unexplained": it is a `consoled` fault with
+a known instruction, a known bad register, and a named suspect path.
+
+Kept from the attempt: the boot test's ring 3 pattern matched `[1-9] ipc calls` — a **single digit**
+— so any change taking that count to ten would have failed the gate for the wrong reason. It is
+`[1-9][0-9]*` now.
+
 ### 2026-08-13, last (RFC 0010 step 6: the ring and its doorbell, and four copies of the same bug)
 
 Step 6 finished. Doorbells both ways — `bin/ipd` rings the notification `bin/netd` sleeps on, `netd`
@@ -1020,10 +1076,8 @@ program nobody meant to write.
 
 **An intermittent failure, recorded rather than waited out.** Twice on 2026-08-12–13 an `iommu`
 boot failed with every `services` assertion reading `0 bytes, 0 entries` and `vfsd` blocked, and
-both times the following runs were clean — three consecutive green runs after the second. It is not
-caused by the harness change (it was first seen before it) and it is **not understood**. It is
-written here because a test that fails one run in ten and is never mentioned is worse than one that
-fails every time: the next person to see it should know it is known.
+both times the following runs were clean. **Localised on 2026-08-13 — see the entry above — and
+still not fixed.**
 
 ### 2026-08-12, last (RFC 0018 step 6: an address obtained by a program that holds a socket)
 
