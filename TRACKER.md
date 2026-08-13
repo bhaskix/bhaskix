@@ -685,7 +685,7 @@ what is actually ahead.
 
 | Phase 2 bullet | Status | Notes |
 |---|---|---|
-| Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18 |
+| Shared memory and notifications | 🟡 `PARTIAL` | RFC 0009 and RFC 0010, M6-13 … M6-18. **Read as ✅ until 2026-08-13, and it was not.** RFC 0010's implementation plan step 2 — `Invoke(notification, SIGNAL)`, one domain waking another — and step 6, a ring plus a doorbell, were never built. The interrupt→notification direction landed because RFC 0011 step 3 needed it, and that was mistaken for the whole object |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012, all seven steps; per-device windows landed with M7-13. Interrupt remapping **works** as of 2026-08-11 (M6-15) and is still off by default — not for a defect, but because the path was silently broken for its whole life, has been seen working on one emulator, and has never run on real hardware |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
@@ -740,6 +740,43 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the wakeup was never a missing design; it is an unfinished step)
+
+Step 7 measured the domain boundary at roughly 130 microseconds a round trip and attributed it to a
+missing primitive — a domain cannot wake another domain. Five places in this repository, three of
+them written the same day, said that primitive was **a gap in RFC 0010**.
+
+**That is wrong, and RFC 0010 says so on its own page.** Accepted 2026-08-04, its table of
+operations reads:
+
+| Operation | How it is expressed | Blocks? |
+|---|---|---|
+| **Signal** | `Invoke(notification, SIGNAL)` | Never |
+
+and its implementation plan, step 2, is *"`Invoke(SIGNAL)` and `Recv` on a notification. The
+lock-free signal path, the mark-blocked-then-check wait, the second-waiter refusal."* Step 6 is *"a
+ring plus a doorbell — RFC 0009's shared memory with a notification on top, in `abi`, as the async
+channel RFC 0008 promised"*, which is exactly the `netd` ↔ `ipd` arrangement that was measured.
+
+Neither step was built. What landed is the **other direction** — an interrupt signalling a
+notification a program waits on — because RFC 0011 step 3 needed it, and that half was mistaken for
+the whole object. `WAIT`, `PEEK` and `POLL` are in `bhaskix_abi`; **there is no `SIGNAL` method and
+there never was.**
+
+So the number step 7 produced does not price an open question. It prices an **unfinished step of an
+accepted RFC**, which is a much more actionable thing to have measured, and the corrections are made
+where the wrong claim lives: `TRACKER.md` in three places, `docs/rfc/0018-networking.md`, and two
+comments in `kernel/src/lib.rs`. The Phase 2 bullet for notifications moves from ✅ to `PARTIAL`.
+
+**How the mistake happened is worth more than the mistake.** RFC 0011 step 3 needed notifications, it
+built the half it needed, and the tracker recorded "RFC 0010's `Notification` landed with it". That
+sentence is true and was read as "RFC 0010 landed". Nothing checked the accepted implementation plan
+against what exists, and for nine days a document specifying the exact mechanism three subsequent
+pieces of work went looking for sat unread by the people who needed it — including, twice in one day,
+its own author's assistant.
+
+**No new RFC is needed for the wakeup.** The design is accepted; the work is RFC 0010 steps 2 and 6.
+
 ### 2026-08-13, last (RFC 0018 step 7: what the domain boundary actually costs)
 
 The last step of RFC 0018, and the only one that is not a feature. The RFC says of the folded-domain
@@ -770,8 +807,8 @@ argued. But two copies of at most 1442 bytes are tens of nanoseconds, and the ga
 is **roughly 130 microseconds** — four orders of magnitude more. The copies do not explain it and
 the RFC's headline, taken alone, would have been misleading.
 
-**What the boundary actually costs here is a missing wakeup.** `bin/ipd` cannot signal `bin/netd`:
-RFC 0010 gives no user-mode signal at all, so a frame `ipd` puts in the return ring sits there until
+**What the boundary actually costs here is a missing wakeup.** `bin/ipd` cannot signal `bin/netd`,
+so a frame `ipd` puts in the return ring sits there until
 the driver happens to be awake — woken by its own receive interrupt, or poked by the kernel, which
 is what `wake_net_driver` exists to do and says so in its own comment. The folded build has no
 handoff to wait for. **So the measured price of the split is not the copies the RFC worried about;
@@ -1031,9 +1068,10 @@ a last report and exits. Its report page belongs to the keeper domain, so the ke
 
 **And that left the driver asleep through everything `ipd` built**, because no domain can wake
 another. The kernel now pokes `netd`'s notification every half second while it waits — the one
-thing only the kernel can do, standing in for the mechanism RFC 0010 does not have. **This is the
-second concrete cost of that gap in one day** and it should be read as evidence when the RFC is
-revisited, not as a workaround that settled the question.
+thing only the kernel can do, standing in for a mechanism ~~RFC 0010 does not have~~ **RFC 0010
+specified and nobody built** (corrected 2026-08-13; see that RFC's implementation plan, step 2).
+**This is the second concrete cost of that gap in one day** and it should be read as evidence when
+the step is finished, not as a workaround that settled the question.
 
 **Two more corrections about stopping too early.** `ipd` first exited after twenty thousand idle
 passes, which elapse in a fraction of a second — before the kernel could publish its configuration,
@@ -1168,9 +1206,11 @@ exit reason has to survive until it is reaped, which is what RFC 0017 step 6 res
 capacity really is the size minus every unreaped corpse. That property is real. It simply was not
 what went wrong.
 
-**The wakeup half of step 3 does not exist, and that is a gap in RFC 0010 rather than a shortcut
-here.** A notification can only be signalled by the **kernel**: a program holding one may `WAIT` and
-`PEEK`, and there is no method that signals. So one domain cannot wake another today, and `ipd`
+**The wakeup half of step 3 does not exist.** ~~and that is a gap in RFC 0010 rather than a shortcut
+here.~~ **Corrected 2026-08-13: it is not a gap in RFC 0010.** That RFC, accepted 2026-08-04,
+specifies `Invoke(notification, SIGNAL)` in its own table of operations and makes it step 2 of its
+implementation plan. The step was never done. A notification can only be signalled by the **kernel**
+today: a program holding one may `WAIT` and `PEEK`, and there is no `SIGNAL` method in the ABI. So one domain cannot wake another today, and `ipd`
 polls with a yield between looks. RFC 0018 step 3 asked for a notification and this is why it has
 none; inventing a syscall mid-step would have been the wrong way to find that out.
 

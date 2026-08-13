@@ -3753,12 +3753,13 @@ pub fn start_net_domain(
     const NET_BADGE: u64 = 1 << 2;
     let signalled = match crate::notify::create() {
         Ok(notification) => {
-            // Kept so the kernel can wake the driver. **Only the kernel can**:
-            // RFC 0010's notifications have no user-mode signal, so `bin/ipd`
-            // cannot tell `bin/netd` that it has put a frame in the return
-            // ring. The driver sleeps on this notification when idle, and
-            // without a poke it would sleep through everything the protocol
-            // service builds.
+            // Kept so the kernel can wake the driver. **Only the kernel can
+            // today**, because RFC 0010's `SIGNAL` was specified and never
+            // implemented -- see `wake_net_driver`, which corrects the claim
+            // this comment used to make. So `bin/ipd` cannot tell `bin/netd`
+            // that it has put a frame in the return ring. The driver sleeps on
+            // this notification when idle, and without a poke it would sleep
+            // through everything the protocol service builds.
             NET_WAKE.store(
                 u64::from(notification.index())
                     | (u64::from(notification.generation()) << 32)
@@ -4122,11 +4123,22 @@ static NET_WAKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 
 /// Wakes the network driver, because nothing else can.
 ///
-/// A domain cannot signal another domain's notification — RFC 0010 gives no
-/// user-mode signal at all — so a driver asleep on its device's interrupt will
-/// sleep through a frame `bin/ipd` puts in the return ring. Until that gap is
-/// closed this is the poke that stands in for it, and it is the kernel doing
+/// A domain cannot signal another domain's notification, so a driver asleep on
+/// its device's interrupt sleeps through a frame `bin/ipd` puts in the return
+/// ring. This poke stands in for the missing wake, and it is the kernel doing
 /// the one thing only the kernel can.
+///
+/// **This said RFC 0010 "gives no user-mode signal at all", and that is wrong.**
+/// RFC 0010 was accepted on 2026-08-04 specifying exactly this operation —
+/// `Invoke(notification, SIGNAL)`, in its own table of operations, never
+/// blocking — and its implementation plan step 2 is that signal path. What
+/// landed was the other direction: an interrupt signalling a notification a
+/// program waits on, which RFC 0011 step 3 needed. `WAIT`, `PEEK` and `POLL`
+/// exist; there is no `SIGNAL` method in `bhaskix_abi` and never was.
+///
+/// So this is not a missing design. It is an accepted design with an
+/// unimplemented step, and RFC 0018 step 7 priced its absence at roughly 130
+/// microseconds a round trip.
 fn wake_net_driver() {
     use core::sync::atomic::Ordering;
 

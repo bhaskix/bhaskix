@@ -320,14 +320,21 @@ confirmed by counting rather than by argument. But two copies of at most 1442 by
 nanoseconds, and the folded build is roughly **130 microseconds per round trip faster** — four
 orders of magnitude more than the copies can account for.
 
-What the boundary actually costs is a **missing wakeup**. `bin/ipd` cannot signal `bin/netd`:
-RFC 0010 gives no user-mode signal, so a frame in the return ring waits until the driver is awake —
+What the boundary actually costs is a **missing wakeup**. `bin/ipd` cannot signal `bin/netd`, so a
+frame in the return ring waits until the driver is awake —
 woken by its own receive interrupt, or poked by the kernel, which is what `wake_net_driver` exists
 to do. The folded build has no handoff to wait for.
 
 So the price of this split is not the copies this section worried about; **it is the absence of a
 primitive the system has not built yet**, which is a fixable gap rather than an inherent cost of
-putting a driver in its own domain. The numbers, the method and the caveats are in `TRACKER.md`; the
+putting a driver in its own domain.
+
+**And it is not even a missing design.** [RFC 0010](0010-notifications.md), accepted 2026-08-04,
+specifies `Invoke(notification, SIGNAL)` — in its table of operations, never blocking — and makes it
+step 2 of its implementation plan, with step 6 "a ring plus a doorbell… as the async channel RFC
+0008 promised", which is exactly the arrangement measured here. What landed was the other direction,
+an interrupt signalling a notification, because RFC 0011 step 3 needed it. So the number above
+prices an **unfinished step of an accepted RFC**, not an unanswered question. The numbers, the method and the caveats are in `TRACKER.md`; the
 folded build was deleted as this document said it should be.
 
 ## Testing plan
