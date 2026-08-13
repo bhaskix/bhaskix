@@ -742,6 +742,44 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the context switch instrumented, and what it rules out)
+
+`finish_switch` now records what every switch decided — the thread it resumed and the address space
+it loaded — into a sixteen-entry ring, with counters for the two ways a switch can decide nothing.
+The fault path replays it. Caught in 13 boots at `-smp 2`.
+
+```
+  thread 22 (consoled) expects space 0xf046000, cr3 holds 0xf052000
+    IT IS RUNNING IN SOMEBODY ELSE'S ADDRESS SPACE
+      81133 switches resumed with no space to load, 0 with no thread at all
+      switch: t0 resumed with no space
+      switch: t17 resumed with no space
+      ...
+```
+
+**What it rules out.** `0 with no thread at all`: the runqueue always had a thread at the index it
+resumed, so this is not a stale `current`. And the faulting thread **has a recorded space** —
+`0xf046000` — so this is not "`space_root` was never set". Both were live hypotheses an hour ago and
+both are dead.
+
+**What it leaves.** `consoled` was resumed with a space recorded and a different one loaded. Since
+`finish_switch` calls `enter_space(root)` and that switches whenever `root` is non-zero and differs,
+the resume that put `consoled` back on a processor **did not go through `finish_switch`**. Something
+returns to a thread without loading its space.
+
+**And `enter_space(0)` is the shape of the hazard.** It returns without touching `CR3`, so a switch
+that resumes a thread with no space of its own leaves whatever was loaded. That is correct for a
+kernel thread and it happened 81,133 times in one boot — mostly idle threads, which is fine. It also
+means the wrong `CR3` can persist across many switches waiting for a user thread to be resumed by a
+path that does not fix it. `kernel/src/vm.rs` warns about exactly this in a comment written long
+before today: *"Without this a user thread resumes in whichever space ran last on that CPU — which,
+with one user program, is always its own."* There are eight user programs now.
+
+**Next instrument, and it follows from what is left**: record `CR3` against the thread's own root at
+the *last* moment before returning to user mode — the syscall and trap exits — so the return path
+that skips the load names itself. That is a check on every exit to ring 3, which is why it is worth
+measuring the cost of before it is left in.
+
 ### 2026-08-13, last (the real diagnosis: a thread runs in somebody else's address space)
 
 RFC 0019 step 3 gave `bin/dhcp` a deadline to wait on, and the first boot after it produced a fault

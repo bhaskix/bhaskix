@@ -1609,18 +1609,88 @@ fn try_steal(cpu: usize, mine: &mut RunQueue) -> Option<usize> {
 /// has run before, and from the trampoline via `bhaskix_thread_entered` for
 /// one that has not. Until it runs, no other CPU will steal from here — so
 /// missing a path does not corrupt anything, it quietly stops balancing.
+/// The last few switches, so the fault path can say what led to one.
+///
+/// Packed as `thread << 32 | root >> 12`: a thread identifier and the frame
+/// number of the address space it resumed into. `u64::MAX` is "nothing yet".
+static SWITCH_TRACE: [core::sync::atomic::AtomicU64; SWITCH_TRACE_LEN] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; SWITCH_TRACE_LEN];
+static SWITCH_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const SWITCH_TRACE_LEN: usize = 16;
+
+/// Switches that resumed a thread with **no address space to load**.
+///
+/// `enter_space(0)` returns without touching `CR3`, so a switch that computes a
+/// root of zero leaves whatever the previous thread had loaded. For a kernel
+/// thread that is correct and deliberate. For a user thread it is the fault
+/// `trap.rs` prints as "IT IS RUNNING IN SOMEBODY ELSE'S ADDRESS SPACE", and
+/// this counts how often the situation arises at all.
+static SWITCHES_WITHOUT_SPACE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Switches where the runqueue had no thread at the index it was about to
+/// resume — which is the way a root of zero arises without anybody choosing it.
+static SWITCHES_WITHOUT_THREAD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Replays the switch ring, oldest first, as `(thread, space frame)`.
+pub fn replay_switches(mut visit: impl FnMut(u32, u64)) {
+    use core::sync::atomic::Ordering;
+    let at = SWITCH_AT.load(Ordering::Relaxed) as usize;
+    let first = at.saturating_sub(SWITCH_TRACE_LEN);
+    for index in first..at {
+        let packed = SWITCH_TRACE[index % SWITCH_TRACE_LEN].load(Ordering::Relaxed);
+        if packed != u64::MAX {
+            visit((packed >> 32) as u32, (packed & 0xffff_ffff) << 12);
+        }
+    }
+}
+
+/// How many switches resumed without a space, and without a thread.
+#[must_use]
+pub fn switch_gaps() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        SWITCHES_WITHOUT_SPACE.load(Ordering::Relaxed),
+        SWITCHES_WITHOUT_THREAD.load(Ordering::Relaxed),
+    )
+}
+
 fn finish_switch() {
+    use core::sync::atomic::Ordering;
+
     let cpu = percpu::cpu_id() as usize;
     let mut root = 0;
+    let mut who = 0;
+    let mut found = false;
     if cpu < MAX_CPUS {
         let mut queue = QUEUES[cpu].lock();
         queue.switching = false;
-        root = queue
+        if let Some(thread) = queue
             .threads
             .get(queue.current)
             .and_then(|thread| thread.as_ref())
-            .map_or(0, |thread| thread.space_root);
+        {
+            found = true;
+            who = thread.id;
+            root = thread.space_root;
+        }
     }
+
+    // **Recorded before the space is loaded**, so a fault afterwards can say
+    // what the switch decided rather than what it should have decided.
+    if !found {
+        SWITCHES_WITHOUT_THREAD.fetch_add(1, Ordering::Relaxed);
+    }
+    if root == 0 {
+        // Correct for a kernel thread, which has no space of its own. The
+        // question this counter exists to answer is whether it ever happens to
+        // a thread that *does*.
+        SWITCHES_WITHOUT_SPACE.fetch_add(1, Ordering::Relaxed);
+    }
+    let at = SWITCH_AT.fetch_add(1, Ordering::Relaxed) as usize;
+    SWITCH_TRACE[at % SWITCH_TRACE_LEN]
+        .store((u64::from(who) << 32) | (root >> 12), Ordering::Relaxed);
 
     // Each thread loads its own address space as it resumes, rather than
     // something loading it on the way out. That way a thread stolen to another

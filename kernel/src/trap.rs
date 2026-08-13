@@ -477,6 +477,24 @@ fn report_exception(frame: &mut TrapFrame) {
         println!("  thread {me} ({name}) expects space {expected:#x}, cr3 holds {loaded:#x}");
         if expected != 0 && expected != loaded {
             println!("    IT IS RUNNING IN SOMEBODY ELSE'S ADDRESS SPACE");
+
+            // What the last few switches decided, oldest first. `enter_space`
+            // returns without touching `CR3` when the root is zero, so a switch
+            // that resumed a user thread with no space is how the wrong one
+            // stays loaded — and a zero here beside this thread's identifier is
+            // that, caught.
+            let (without_space, without_thread) = crate::sched::switch_gaps();
+            println!(
+                "      {without_space} switches resumed with no space to load, \
+                 {without_thread} with no thread at all"
+            );
+            crate::sched::replay_switches(|thread, space| {
+                if space == 0 {
+                    println!("      switch: t{thread} resumed with no space");
+                } else {
+                    println!("      switch: t{thread} -> {space:#x}");
+                }
+            });
         }
     }
 
