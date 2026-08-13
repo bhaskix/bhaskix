@@ -740,6 +740,42 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (gdb is the wrong instrument: the bug does not happen while it watches)
+
+The breakpoint was qualified properly this time — `$r14 == 0x11003db8 && $rdi != $r14` at the call
+site, and `$rbx == 1 && $rsp == 0x11003ce0 && $r14 == 0x11003db8` at the faulting arm — so a stop
+could only be `bin/consoled` and not one of the seven other programs sharing that address.
+
+It never fired, and not because the filter was wrong.
+
+**The fault does not occur under gdb at all: 0 in 18 boots**, against about one in three without it.
+Counted across every gdb session run today, by grepping each run's own serial log for the page
+fault:
+
+| session | boots | faults |
+|---|---|---|
+| unconditional breakpoint | 1 | 0 |
+| both-vCPU dump | 10 | 0 |
+| qualified, two breakpoints | 1 | 0 |
+| qualified, retried | 6 | 0 |
+
+Every "catch" today was one of the other programs reaching a shared virtual address. **The bug
+itself was never present in a single gdb run.**
+
+**Why, and it follows from what is already known.** This failure needs contention — it went from one
+sighting in twenty-three boots at four processors to one in three at two. A breakpoint at
+`0x10000275` is reached by all eight programs, so gdb stops the machine constantly merely to evaluate
+its conditions, and every stop halts **both** vCPUs. The instrument removes the thing the bug needs.
+
+**So the next instrument must not stop the guest.** QEMU's own `-d int -D file` records interrupts
+and exceptions asynchronously; the kernel's fault handler already prints the whole frame and could be
+made to print the last few interrupts the faulting thread took before it died. Either watches
+without serialising, which is the property gdb cannot offer here.
+
+**Recorded as a negative result on purpose.** "Debug it under gdb" is the obvious next step, it was
+tried four times, and it cannot work for this bug as configured. Nobody should spend a day
+rediscovering that.
+
 ### 2026-08-13, last (every program lives at the same address, and two conclusions were built on forgetting it)
 
 Dumping **both** vCPUs at the stop, which was the control the previous entry asked for, answered a
