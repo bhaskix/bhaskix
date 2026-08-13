@@ -742,6 +742,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (distinct link addresses, and the intermittent failure stops)
+
+Every program linked at `0x10000000`. They now link a megabyte apart — `bin/probe` stays where it
+was, because two gates assert its entry point, and the other seven move to `0x10100000` through
+`0x10700000`.
+
+**The failure stops: 0 in 24 boots at `-smp 2`**, against roughly one in three before. If the old
+rate held, the chance of seeing none in twenty-four is about six in a hundred thousand.
+
+**So the shared address layout was the cause**, which the filtered trace had already shown the shape
+of: control entering `bin/consoled` at `0x10000093`, an offset that is an instruction boundary only
+in a *different* program, decoding the tail of `mov %r14,%rdi` as `mov %esi,%edi`.
+
+**Which side the remaining bug is on is not settled, and should not be claimed.** That distinct
+*virtual* bases fix it points at the emulator — QEMU keys its translation-block lookup on the virtual
+PC and validates afterwards, so two programs sharing a virtual address are exactly the case that
+stresses it. But "the emulator did it" is the comfortable answer and this file has been wrong about
+comfortable answers three times this week. What is established is the correlation, at 24 boots, and
+the mechanism the trace showed.
+
+**Keep the change regardless of which side it is.** It is the difference between a debugger being
+usable and not: every gdb session in this investigation was answering about whichever program reached
+an address first, and twice that produced confident wrong conclusions that had to be withdrawn. A
+breakpoint now means one program.
+
+**What this costs.** Nothing at runtime — the loader reads program headers and puts each program
+where its headers ask. It costs one line per linker script and a note saying why, so the next person
+who is tempted to unify them knows what happens.
+
+**And a build wrinkle worth knowing.** `make` lists `link.ld` as a prerequisite, but cargo does not
+treat a linker script as an input, so the first rebuild produced identical binaries at the old
+address. The sources have to be touched to force a relink. That is the kind of thing that makes a
+change look like it did nothing.
+
 ### 2026-08-13, last (the filtered trace: execution enters one byte inside an instruction)
 
 `-d exec,cpu,in_asm -dfilter 0x10000080..0x100000a5` — QEMU's `-dfilter` restricts logging to an

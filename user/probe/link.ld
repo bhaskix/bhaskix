@@ -11,6 +11,14 @@
  * The base address is fixed rather than position-independent. The loader
  * refuses `ET_DYN` — it does no relocation — so the program must say where it
  * goes and be put exactly there.
+ *
+ * **The base is this program's own, and no two programs share one.** They were
+ * all at 0x10000000, in eight address spaces, so every virtual address meant
+ * eight different instructions depending on which program was running. That
+ * made a debugger useless -- a breakpoint fired in whichever program reached
+ * the address -- and a filtered QEMU trace showed control entering one
+ * program's code at an offset that is an instruction boundary only in another.
+ * See TRACKER, 2026-08-13.
  */
 
 ENTRY(_start)
