@@ -290,81 +290,6 @@ fn exit() -> ! {
     loop {}
 }
 
-/// Copies `length` bytes out of the ring at free-running `tail` into `into`.
-///
-/// # Safety
-///
-/// The ring must be mapped at [`RING_AT`] and `into` writable for `length`.
-unsafe fn ring_copy_out(
-    layout: ring::Layout,
-    cursor: ring::Cursor,
-    into: *mut u8,
-    length: usize,
-) -> bool {
-    if cursor.readable() < length {
-        return false;
-    }
-    let (first, second) = ring::read_runs(layout, cursor, length);
-    if first.length + second.length != length {
-        return false;
-    }
-    // SAFETY: both runs are offsets `abi::ring` computed inside the region this
-    // program mapped, `into` is writable for `length` by the caller's
-    // obligation, and the two runs are the halves one transfer wraps into.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            (RING_AT + first.offset as u64) as *const u8,
-            into,
-            first.length,
-        );
-        if !second.is_empty() {
-            core::ptr::copy_nonoverlapping(
-                (RING_AT + second.offset as u64) as *const u8,
-                into.add(first.length),
-                second.length,
-            );
-        }
-    }
-    true
-}
-
-/// Copies `length` bytes from `source` into the return ring.
-///
-/// # Safety
-///
-/// The return ring must be mapped writable at [`BACK_AT`], and `source`
-/// readable for `length`.
-unsafe fn back_copy_in(
-    layout: ring::Layout,
-    head: u64,
-    tail: u64,
-    source: *const u8,
-    length: usize,
-) -> Option<u64> {
-    let cursor = ring::Cursor::new(layout, head, tail)?;
-    if cursor.writable() < length {
-        return None;
-    }
-    let (first, second) = ring::write_runs(layout, cursor, length);
-    // SAFETY: both runs are offsets `abi::ring` computed inside the region this
-    // program mapped, and `source` is readable for `length` by the caller.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            source,
-            (BACK_AT + first.offset as u64) as *mut u8,
-            first.length,
-        );
-        if !second.is_empty() {
-            core::ptr::copy_nonoverlapping(
-                source.add(first.length),
-                (BACK_AT + second.offset as u64) as *mut u8,
-                second.length,
-            );
-        }
-    }
-    Some(head + length as u64)
-}
-
 /// Hands one frame to `bin/netd` to put on the wire.
 ///
 /// # Safety
@@ -382,19 +307,21 @@ unsafe fn send(frame: &[u8]) -> bool {
             core::ptr::read_volatile((BACK_AT + ring::TAIL_OFFSET as u64) as *const u64),
         )
     };
+    // Where the frame goes, from `abi::ring` rather than from arithmetic
+    // written here. See `frame_to_write`.
+    let Some(cursor) = ring::Cursor::new(layout, head, tail) else {
+        return false;
+    };
+    let Some(framed) = ring::frame_to_write(layout, cursor, frame.len()) else {
+        return false;
+    };
     let prefix = (frame.len() as u32).to_le_bytes();
-    // SAFETY: the ring is mapped and both sources are readable.
-    let Some(after_prefix) = (unsafe { back_copy_in(layout, head, tail, prefix.as_ptr(), 4) })
-    else {
-        return false;
-    };
-    // SAFETY: as above -- the ring is mapped writable and `frame` is a slice
-    // this program owns, readable for its own length.
-    let Some(after_frame) =
-        (unsafe { back_copy_in(layout, after_prefix, tail, frame.as_ptr(), frame.len()) })
-    else {
-        return false;
-    };
+    // SAFETY: every offset is `abi::ring`'s, inside the region this program
+    // mapped writable, and `frame` is a slice it owns.
+    unsafe {
+        write_back_runs(prefix.as_ptr(), framed.prefix);
+        write_back_runs(frame.as_ptr(), framed.payload);
+    }
     // Outbound, copy one of two: this program's frame into the return ring.
     copied();
     // The bytes, then a fence, then the index that publishes them. The reader
@@ -404,7 +331,7 @@ unsafe fn send(frame: &[u8]) -> bool {
     unsafe {
         core::ptr::write_volatile(
             (BACK_AT + ring::HEAD_OFFSET as u64) as *mut u64,
-            after_frame,
+            framed.next,
         );
     }
     // **Then ring the doorbell.** Index first, wake second: a driver woken
@@ -440,6 +367,56 @@ fn frame(
 /// What this program was able to do, as bits.
 fn state(can_send: bool, mac: MacAddr) -> u64 {
     u64::from(can_send) | (u64::from(mac != MacAddr::UNSPECIFIED) << 1)
+}
+
+/// Copies `source` into the return ring at the offsets `runs` names.
+///
+/// # Safety
+///
+/// `runs` must be offsets `abi::ring` computed for the region mapped at
+/// [`BACK_AT`], and `source` readable for their combined length.
+unsafe fn write_back_runs(source: *const u8, runs: (ring::Run, ring::Run)) {
+    let (first, second) = runs;
+    // SAFETY: the caller's obligation; a wrap's two halves do not overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            source,
+            (BACK_AT + first.offset as u64) as *mut u8,
+            first.length,
+        );
+        if !second.is_empty() {
+            core::ptr::copy_nonoverlapping(
+                source.add(first.length),
+                (BACK_AT + second.offset as u64) as *mut u8,
+                second.length,
+            );
+        }
+    }
+}
+
+/// Copies out of the inbound ring at the offsets `runs` names, into `into`.
+///
+/// # Safety
+///
+/// `runs` must be offsets `abi::ring` computed for the region mapped at
+/// [`RING_AT`], and `into` writable for their combined length.
+unsafe fn read_ring_runs(into: *mut u8, runs: (ring::Run, ring::Run)) {
+    let (first, second) = runs;
+    // SAFETY: as above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (RING_AT + first.offset as u64) as *const u8,
+            into,
+            first.length,
+        );
+        if !second.is_empty() {
+            core::ptr::copy_nonoverlapping(
+                (RING_AT + second.offset as u64) as *const u8,
+                into.add(first.length),
+                second.length,
+            );
+        }
+    }
 }
 
 /// Builds and hands over one UDP datagram.
@@ -664,32 +641,29 @@ fn drain_ring(sockets: &mut [Socket; SOCKETS], me: (MacAddr, Ipv4Addr), tail: &m
         let Some(cursor) = ring::Cursor::new(layout, head, *tail) else {
             return;
         };
-        if cursor.readable() < 4 {
+        let mut prefix = [0u8; ring::PREFIX];
+        let Some(runs) = ring::length_to_read(layout, cursor) else {
             return;
-        }
-        let mut prefix = [0u8; 4];
-        // SAFETY: the ring is mapped and `prefix` is four writable bytes.
-        if !unsafe { ring_copy_out(layout, cursor, prefix.as_mut_ptr(), 4) } {
-            return;
-        }
+        };
+        // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
+        unsafe { read_ring_runs(prefix.as_mut_ptr(), runs) };
         let length = u32::from_le_bytes(prefix) as usize;
         if length == 0 || length > MAX_FRAME {
             // A length this program has stopped believing. Skip the prefix and
             // carry on rather than wedging on it for ever.
-            *tail = tail.wrapping_add(4);
+            *tail = tail.wrapping_add(ring::PREFIX as u64);
             continue;
         }
-        let Some(after) = ring::Cursor::new(layout, head, *tail + 4) else {
+        // `None` is the producer mid-write, not an error. See `frame_to_read`.
+        let Some(framed) = ring::frame_to_read(layout, cursor, length) else {
             return;
         };
         // SAFETY: as above; `frame` is `MAX_FRAME` writable bytes and `length`
         // is bounded by it.
-        if !unsafe { ring_copy_out(layout, after, frame.as_mut_ptr(), length) } {
-            return;
-        }
+        unsafe { read_ring_runs(frame.as_mut_ptr(), framed.payload) };
         // Inbound, copy two of two: the ring into this program's buffer.
         copied();
-        *tail = tail.wrapping_add(4 + length as u64);
+        *tail = framed.next;
         publish(*tail);
         TAKEN.store(
             TAKEN.load(core::sync::atomic::Ordering::Relaxed) + 1,
@@ -1322,36 +1296,33 @@ extern "C" fn ipd_main() -> ! {
         quiet = 0;
 
         // The four-byte length first.
-        let mut prefix = [0u8; 4];
-        // SAFETY: the ring is mapped and `prefix` is four writable bytes.
-        if !unsafe { ring_copy_out(layout, cursor, prefix.as_mut_ptr(), 4) } {
+        let mut prefix = [0u8; ring::PREFIX];
+        let Some(runs) = ring::length_to_read(layout, cursor) else {
             call(syscall::YIELD, 0, 0, [0; 4]);
             continue;
-        }
+        };
+        // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
+        unsafe { read_ring_runs(prefix.as_mut_ptr(), runs) };
         let length = u32::from_le_bytes(prefix) as usize;
         // A number the other side chose. Bounded before it is used, and a
         // refusal rather than a clamp: a frame that does not fit is not a
         // shorter frame, it is a producer this program has stopped believing.
         if length == 0 || length > MAX_FRAME {
             refused += 1;
-            tail = tail.wrapping_add(4);
+            tail = tail.wrapping_add(ring::PREFIX as u64);
             publish(tail);
             continue;
         }
 
-        let Some(after_prefix) = ring::Cursor::new(layout, head, tail + 4) else {
-            refused += 1;
+        // The producer has published a length but not yet the bytes. Not an
+        // error and not a refusal: look again without moving the tail.
+        let Some(framed) = ring::frame_to_read(layout, cursor, length) else {
             call(syscall::YIELD, 0, 0, [0; 4]);
             continue;
         };
         // SAFETY: the ring is mapped and `buffer` is `MAX_FRAME` writable
         // bytes, which `length` is bounded by above.
-        if !unsafe { ring_copy_out(layout, after_prefix, buffer.as_mut_ptr(), length) } {
-            // The producer has published a length but not yet the bytes. Not
-            // an error and not a refusal: look again without moving the tail.
-            call(syscall::YIELD, 0, 0, [0; 4]);
-            continue;
-        }
+        unsafe { read_ring_runs(buffer.as_mut_ptr(), framed.payload) };
         // Inbound, copy two of two, on the demonstration loop's path rather than
         // the service's. **After** the copy, not before: this path retries when
         // the producer has published a length and not yet the bytes, and a
@@ -1487,7 +1458,7 @@ extern "C" fn ipd_main() -> ! {
             }
         }
 
-        tail = tail.wrapping_add(4 + length as u64);
+        tail = framed.next;
         publish(tail);
         report(
             frames,

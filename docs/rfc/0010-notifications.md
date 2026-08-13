@@ -522,16 +522,29 @@ Each step leaves the tree green.
 6. 🟡 **A ring plus a doorbell** — RFC 0009's shared memory with a notification
    on top, in `abi`, as the async channel RFC 0008 promised. No kernel change.
 
-   **Half done 2026-08-13.** `bin/ipd` rings a doorbell on the notification
-   `bin/netd` sleeps on, badged so the driver can tell it from its own device's
-   interrupt — this RFC's badge-as-bitmask used for what it was designed for.
-   The kernel's `wake_net_driver`, which poked the driver twice a second because
-   no domain could, is **deleted**.
+   **Done 2026-08-13.** Doorbells both ways: `bin/ipd` rings the notification
+   `bin/netd` sleeps on, and `netd` rings the inbox `ipd` binds to its thread —
+   each badged, so one wait tells its senders apart, which is this RFC's
+   badge-as-bitmask used for what it was designed for. The kernel's
+   `wake_net_driver`, which poked the driver twice a second because no domain
+   could, is **deleted**.
 
-   The other direction is not built: `netd` cannot tell `ipd` a frame has
-   arrived, and `ipd` polls its ring. It is also not yet packaged in `abi` as
-   the channel this step describes — what exists is one use of it, in one pair
-   of programs.
+   **The `abi` half is the framing, and it is safe code.** This step says "in
+   `abi`", and `bhaskix-abi` carries an `unsafe` budget of **zero** — its
+   manifest explains why: it compiles into the kernel *and* into programs, so an
+   `unsafe` there is an obligation owed on both sides at once. So what moved is
+   the part that was getting things wrong anyway: `frame_to_write`,
+   `length_to_read` and `frame_to_read` compute where a length prefix and its
+   payload sit, where the index lands, and when a frame is refused — with tests,
+   including the wrap and the producer-mid-write case. The byte moving stays in
+   each program, where a pointer is genuinely needed, as one small helper per
+   region.
+
+   That is a refinement of this step rather than a shortcut. `bin/netd` and
+   `bin/ipd` had **four** hand-rolled versions of that arithmetic between them,
+   and between them those four produced a frame truncated to 42 bytes, a tail
+   advanced past bytes nobody read, and a copy counted that had not happened.
+   All four are deleted.
 
 Steps 1–3 are the object. Step 4 is the justification. Step 6 is the reason
 RFC 0008 said any of this.

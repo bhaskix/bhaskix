@@ -62,4 +62,9 @@ opt-level = "s"
 # than removed: they are the two numbers that told a dropped frame from a
 # misread one, and the next receive bug will want them already there.
 # 325 at RFC 0018 step 7: the same copy counter at this end of the ring.
-unsafe_budget = 325
+# 327 at RFC 0010 step 6, and it went **up** by two, which is worth saying. The
+# ring arithmetic moved to `bhaskix-abi` where it is safe and tested, and what
+# is left here is the byte moving — one helper per region rather than the two
+# general walkers they replaced. Fewer lines of arithmetic, marginally more
+# lines of `unsafe`, and the arithmetic was the part that was getting it wrong.
+unsafe_budget = 327

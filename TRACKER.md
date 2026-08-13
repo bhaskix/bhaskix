@@ -685,7 +685,7 @@ what is actually ahead.
 
 | Phase 2 bullet | Status | Notes |
 |---|---|---|
-| Shared memory and notifications | 🟡 `PARTIAL` | RFC 0009 and RFC 0010, M6-13 … M6-18. Step 2 — `Invoke(notification, SIGNAL)` — was **built 2026-08-13**, nine days after acceptance; until then no domain could wake another. Step 6, a ring plus a doorbell, is **half done**: `bin/ipd` rings `bin/netd`, the reverse direction is still polled, and none of it is packaged in `abi` as the channel that step describes |
+| Shared memory and notifications | ✅ done | RFC 0009 and RFC 0010, M6-13 … M6-18. Step 2 — `Invoke(notification, SIGNAL)` — was **built 2026-08-13**, nine days after acceptance; until then no domain could wake another. Step 6, a ring plus a doorbell, is **done**: doorbells both ways, and the framing in `abi` as safe tested code because that crate's `unsafe` budget is zero |
 | Service framework | ✅ done | RFC 0013, M7 above |
 | IOMMU: discovery, per-device domains, strict mapping | ✅ done | RFC 0012, all seven steps; per-device windows landed with M7-13. Interrupt remapping **works** as of 2026-08-11 (M6-15) and is still off by default — not for a defect, but because the path was silently broken for its whole life, has been seen working on one emulator, and has never run on real hardware |
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
@@ -739,6 +739,33 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-13, last (RFC 0010 step 6: the ring and its doorbell, and four copies of the same bug)
+
+Step 6 finished. Doorbells both ways — `bin/ipd` rings the notification `bin/netd` sleeps on, `netd`
+rings the inbox `ipd` binds to its thread — and the framing packaged where the RFC asked for it.
+
+**`bhaskix-abi` has an `unsafe` budget of zero, and that shaped the answer.** Its manifest says why:
+it compiles into the kernel *and* into unprivileged programs, so an `unsafe` there is an obligation
+owed on both sides at once. A channel that moves bytes through a raw pointer cannot live there. So
+what moved is the part that was getting things wrong anyway — the arithmetic. `frame_to_write`,
+`length_to_read` and `frame_to_read` say where a length prefix and its payload sit, where the index
+lands afterwards, and when a frame is refused rather than truncated. Six host tests, including the
+wrap and the producer-mid-write case.
+
+**Four hand-rolled versions of that arithmetic are deleted**, two in each program. Between them,
+this week, they produced: a frame truncated to 42 bytes because a length and its payload disagreed;
+a tail advanced past bytes nobody had read; and a copy counted that had not happened. One tested
+function now, and the byte moving stays in each program as one small helper per region, where a
+pointer is genuinely needed.
+
+**One test failed on the first run and it was the test.** The wrap case put the cursor where the
+four prefix bytes landed exactly on the boundary, so the payload started at zero and did not wrap at
+all. The arithmetic was right and the case was not being exercised — which is the failure mode a
+test that passes quietly has.
+
+Verified end to end: 1035 frames across the ring, 0 refused, 2.00 ring copies per packet unchanged,
+`ipd` still woken by a frame with nobody calling it, and the boot green.
 
 ### 2026-08-13, last (RFC 0010 question 1 answered: waiting on an endpoint and a notification)
 

@@ -686,35 +686,16 @@ fn await_completion(queue: &mut Virtqueue<Volatile>) -> Option<(u16, u32)> {
     None
 }
 
-/// Copies `length` bytes from `source` into the ring at free-running `head`.
-///
-/// Returns the head the copy ended at, or `None` if the ring has no room.
-///
-/// The wrap is `abi::ring`'s arithmetic and not this program's. That module was
-/// written for RFC 0009 step 5 and had **no caller until now** — which is worth
-/// saying, because the alternative here was a second ring format written in a
-/// hurry, and two ring formats disagree the first time either is edited.
+/// Copies `source` into the region at the offsets `runs` names.
 ///
 /// # Safety
 ///
-/// The ring must be mapped writable at [`RING_AT`], and `source` must be
-/// readable for `length` bytes.
-unsafe fn ring_copy_in(
-    layout: chan::Layout,
-    head: u64,
-    tail: u64,
-    source: *const u8,
-    length: usize,
-) -> Option<u64> {
-    let cursor = chan::Cursor::new(layout, head, tail)?;
-    if cursor.writable() < length {
-        return None;
-    }
-    let (first, second) = chan::write_runs(layout, cursor, length);
-    // SAFETY: both runs are offsets `abi::ring` computed inside the region this
-    // program mapped, `source` is readable for `length` by the caller's
-    // obligation, and the two runs do not overlap -- they are the two halves a
-    // wrap divides one transfer into.
+/// `runs` must be offsets `abi::ring` computed for the region mapped at
+/// [`RING_AT`], and `source` readable for their combined length.
+unsafe fn write_runs_from(source: *const u8, runs: (chan::Run, chan::Run)) {
+    let (first, second) = runs;
+    // SAFETY: the caller's obligation. The two runs are the halves a wrap
+    // divides one transfer into and do not overlap.
     unsafe {
         core::ptr::copy_nonoverlapping(
             source,
@@ -729,7 +710,6 @@ unsafe fn ring_copy_in(
             );
         }
     }
-    Some(head + length as u64)
 }
 
 /// Hands one frame to `bin/ipd`: a four-byte length, then the bytes.
@@ -756,18 +736,27 @@ unsafe fn hand_to_ipd(frame_at: u64, length: usize) -> bool {
         )
     };
 
+    // **Where the frame goes, from `abi::ring`.** This function used to do the
+    // arithmetic itself, twice -- once for the prefix and once for the payload
+    // -- and so did the three others like it. Between them they produced a
+    // frame truncated to 42 bytes and a tail advanced past bytes nobody had
+    // read. The arithmetic is one tested function now; what is left here is the
+    // copying, which is the part that genuinely needs a pointer.
+    let Some(cursor) = chan::Cursor::new(layout, head, tail) else {
+        return false;
+    };
+    let Some(framed) = chan::frame_to_write(layout, cursor, length) else {
+        return false;
+    };
     let prefix = (length as u32).to_le_bytes();
-    // SAFETY: the ring is mapped and `prefix` is four readable bytes.
-    let Some(after_prefix) = (unsafe { ring_copy_in(layout, head, tail, prefix.as_ptr(), 4) })
-    else {
-        return false;
-    };
-    // SAFETY: as above; the frame is in a receive buffer this program mapped.
-    let Some(after_frame) =
-        (unsafe { ring_copy_in(layout, after_prefix, tail, frame_at as *const u8, length) })
-    else {
-        return false;
-    };
+    // SAFETY: every offset is one `abi::ring` computed inside the region this
+    // program mapped writable, `frame_at` is a receive buffer readable for
+    // `length`, and the runs of a transfer do not overlap -- they are the two
+    // halves a wrap divides it into.
+    unsafe {
+        write_runs_from(prefix.as_ptr(), framed.prefix);
+        write_runs_from(frame_at as *const u8, framed.payload);
+    }
     // Inbound, copy one of two: this program's receive buffer into the ring.
     copied();
 
@@ -780,7 +769,7 @@ unsafe fn hand_to_ipd(frame_at: u64, length: usize) -> bool {
     unsafe {
         core::ptr::write_volatile(
             (RING_AT + chan::HEAD_OFFSET as u64) as *mut u64,
-            after_frame,
+            framed.next,
         );
     }
     // **Then wake the service.** Index first, wake second, for the reason the
@@ -792,6 +781,32 @@ unsafe fn hand_to_ipd(frame_at: u64, length: usize) -> bool {
     // is refused, which is a state rather than a fault.
     call(syscall::INVOKE, INBOX, method::SIGNAL, [0; 4]);
     true
+}
+
+/// Copies out of the return ring at the offsets `runs` names, into `into`.
+///
+/// # Safety
+///
+/// `runs` must be offsets `abi::ring` computed for the region mapped at
+/// [`BACK_AT`], and `into` writable for their combined length.
+unsafe fn read_runs_into(into: *mut u8, runs: (chan::Run, chan::Run)) {
+    let (first, second) = runs;
+    // SAFETY: the caller's obligation; the runs are a wrap's two halves and do
+    // not overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (BACK_AT + first.offset as u64) as *const u8,
+            into,
+            first.length,
+        );
+        if !second.is_empty() {
+            core::ptr::copy_nonoverlapping(
+                (BACK_AT + second.offset as u64) as *const u8,
+                into.add(first.length),
+                second.length,
+            );
+        }
+    }
 }
 
 /// Takes one frame out of the return ring, if `bin/ipd` has put one there.
@@ -817,9 +832,10 @@ unsafe fn take_from_ipd() -> Option<usize> {
         return None;
     }
 
-    let mut prefix = [0u8; 4];
-    // SAFETY: the ring is mapped and `prefix` is four writable bytes.
-    unsafe { ring_copy_out(layout, cursor, prefix.as_mut_ptr(), 4)? };
+    let mut prefix = [0u8; chan::PREFIX];
+    let runs = chan::length_to_read(layout, cursor)?;
+    // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
+    unsafe { read_runs_into(prefix.as_mut_ptr(), runs) };
     let length = u32::from_le_bytes(prefix) as usize;
     // A length the *other side* wrote. Bounded before it is used, and refused
     // rather than clamped: a frame that does not fit a buffer is not a shorter
@@ -827,13 +843,12 @@ unsafe fn take_from_ipd() -> Option<usize> {
     if length == 0 || length > (ring::RX_BUFFER as usize - VIRTIO_NET_HEADER as usize) {
         return None;
     }
-    let after = chan::Cursor::new(layout, head, tail + 4)?;
-    if after.readable() < length {
-        // The length is published and the bytes are not. Look again later
-        // without moving the tail: this is not an error, it is a race the
-        // producer will finish losing in a moment.
-        return None;
-    }
+    // **Where the frame is, from `abi::ring`.** The refusal below used to be
+    // written here by hand: a length published without its bytes is a producer
+    // mid-write, not an error, and a consumer that read anyway would take half a
+    // frame and whatever was behind it. It is `frame_to_read`'s rule now, and
+    // it is tested.
+    let framed = chan::frame_to_read(layout, cursor, length)?;
 
     let into = RINGS_AT + ring::TX_BUFFER + VIRTIO_NET_HEADER;
     // SAFETY: the ring is mapped, and the destination is inside a transmit
@@ -843,54 +858,16 @@ unsafe fn take_from_ipd() -> Option<usize> {
         for offset in 0..VIRTIO_NET_HEADER {
             core::ptr::write_volatile((RINGS_AT + ring::TX_BUFFER + offset) as *mut u8, 0);
         }
-        ring_copy_out(layout, after, into as *mut u8, length)?;
+        read_runs_into(into as *mut u8, framed.payload);
         // Outbound, copy two of two: the ring into the transmit buffer.
         copied();
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         core::ptr::write_volatile(
             (BACK_AT + chan::TAIL_OFFSET as u64) as *mut u64,
-            tail + 4 + length as u64,
+            framed.next,
         );
     }
     Some(length)
-}
-
-/// Copies `length` bytes out of a ring at `cursor` into `into`.
-///
-/// # Safety
-///
-/// The ring must be mapped at [`BACK_AT`] and `into` writable for `length`.
-unsafe fn ring_copy_out(
-    layout: chan::Layout,
-    cursor: chan::Cursor,
-    into: *mut u8,
-    length: usize,
-) -> Option<()> {
-    if cursor.readable() < length {
-        return None;
-    }
-    let (first, second) = chan::read_runs(layout, cursor, length);
-    if first.length + second.length != length {
-        return None;
-    }
-    // SAFETY: both runs are offsets `abi::ring` computed inside the region this
-    // program mapped, and `into` is writable for `length` by the caller's
-    // obligation.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            (BACK_AT + first.offset as u64) as *const u8,
-            into,
-            first.length,
-        );
-        if !second.is_empty() {
-            core::ptr::copy_nonoverlapping(
-                (BACK_AT + second.offset as u64) as *const u8,
-                into.add(first.length),
-                second.length,
-            );
-        }
-    }
-    Some(())
 }
 
 /// Looks once, without spinning and without blocking.

@@ -217,6 +217,86 @@ pub fn write_runs(layout: Layout, cursor: Cursor, count: usize) -> (Run, Run) {
     runs_from(layout, cursor.head(), count.min(cursor.writable()))
 }
 
+/// How many bytes carry a frame's length in front of it.
+///
+/// Every ring in this system that carries frames rather than a byte stream puts
+/// the length first, and every one of them wrote that rule out again. See
+/// [`frame_to_write`].
+pub const PREFIX: usize = 4;
+
+/// Where a frame of `length` bytes goes, and where the head lands after it.
+///
+/// **RFC 0010 step 6, the framing half.** `bin/netd` and `bin/ipd` each wrote
+/// this arithmetic twice — once per ring, per direction — and between them it
+/// produced a frame truncated to 42 bytes because a length and its payload
+/// disagreed, a tail advanced past bytes nobody read, and a counter that
+/// counted a copy which had not happened. It is one function now, and it is
+/// safe code with tests, because `bhaskix-abi` carries an `unsafe` budget of
+/// zero and this is the part that was getting things wrong anyway.
+///
+/// `None` when the ring cannot take the whole frame. **Refused rather than
+/// truncated**: a frame that does not fit is not a shorter frame.
+#[must_use]
+pub fn frame_to_write(layout: Layout, cursor: Cursor, length: usize) -> Option<Framed> {
+    let total = PREFIX.checked_add(length)?;
+    if length == 0 || total > cursor.writable() {
+        return None;
+    }
+    let prefix = write_runs(layout, cursor, PREFIX);
+    let after_prefix = Cursor::new(layout, cursor.head() + PREFIX as u64, cursor.tail())?;
+    let payload = write_runs(layout, after_prefix, length);
+    Some(Framed {
+        prefix,
+        payload,
+        next: cursor.head() + total as u64,
+    })
+}
+
+/// Where the next frame's length bytes are, if the producer has published them.
+///
+/// `None` when fewer than [`PREFIX`] bytes are readable, which is not an error:
+/// it is a ring with nothing in it yet.
+#[must_use]
+pub fn length_to_read(layout: Layout, cursor: Cursor) -> Option<(Run, Run)> {
+    (cursor.readable() >= PREFIX).then(|| read_runs(layout, cursor, PREFIX))
+}
+
+/// Where a frame of `length` bytes is, and where the tail lands after it.
+///
+/// `None` when the producer has published a length but not yet all the bytes.
+/// **That is a race the producer is in the middle of losing, not an error** —
+/// the caller looks again without moving the tail. Reading the payload anyway
+/// is how a consumer gets half a frame and a plausible-looking one.
+#[must_use]
+pub fn frame_to_read(layout: Layout, cursor: Cursor, length: usize) -> Option<Framed> {
+    let total = PREFIX.checked_add(length)?;
+    if length == 0 || total > cursor.readable() {
+        return None;
+    }
+    let prefix = read_runs(layout, cursor, PREFIX);
+    let after_prefix = Cursor::new(layout, cursor.head(), cursor.tail() + PREFIX as u64)?;
+    let payload = read_runs(layout, after_prefix, length);
+    Some(Framed {
+        prefix,
+        payload,
+        next: cursor.tail() + total as u64,
+    })
+}
+
+/// A framed transfer: where its two parts sit, and the index after it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Framed {
+    /// The length prefix, as at most two runs.
+    pub prefix: (Run, Run),
+    /// The frame itself, as at most two runs.
+    pub payload: (Run, Run),
+    /// What the mover's own index becomes once every byte is in place.
+    ///
+    /// **Published last, and only then.** A ring whose index moves before its
+    /// bytes hands the other side whatever happened to be in the region.
+    pub next: u64,
+}
+
 fn runs_from(layout: Layout, from: u64, count: usize) -> (Run, Run) {
     // An empty run still names a legal offset. Returning `Run::default()`
     // gave one at offset zero -- inside the header, where the *other* side's
@@ -417,5 +497,79 @@ mod tests {
         let snapshot = (4u64, 0u64);
         let cursor = Cursor::new(layout, snapshot.0, snapshot.1).expect("valid");
         assert_eq!(cursor.readable(), 4);
+    }
+
+    /// A frame and its prefix land where the runs say, and the head lands after.
+    #[test]
+    fn a_framed_write_places_the_prefix_then_the_payload() {
+        let layout = Layout::for_region(HEADER_BYTES + 64).expect("valid");
+        let cursor = Cursor::new(layout, 0, 0).expect("valid");
+        let framed = frame_to_write(layout, cursor, 10).expect("fits");
+        assert_eq!(framed.prefix.0.length, PREFIX);
+        assert_eq!(framed.payload.0.length, 10);
+        assert_eq!(framed.next, (PREFIX + 10) as u64);
+    }
+
+    /// **A frame that does not fit is refused, not shortened.** This is the rule
+    /// a truncating writer breaks, and a truncated frame is one the far end
+    /// parses happily and acts on.
+    #[test]
+    fn a_frame_larger_than_the_ring_is_refused() {
+        let layout = Layout::for_region(HEADER_BYTES + 64).expect("valid");
+        let cursor = Cursor::new(layout, 0, 0).expect("valid");
+        assert_eq!(frame_to_write(layout, cursor, 61), None);
+        assert!(frame_to_write(layout, cursor, 60).is_some());
+    }
+
+    /// A frame written across the wrap comes back as two runs that add up.
+    #[test]
+    fn a_frame_that_wraps_is_two_runs() {
+        let layout = Layout::for_region(HEADER_BYTES + 64).expect("valid");
+        // Chosen so the *payload* straddles the end rather than the prefix:
+        // at 60 the four prefix bytes land exactly on the boundary and the
+        // payload starts at zero, which is the case this test was written to
+        // miss and did.
+        let cursor = Cursor::new(layout, 58, 58).expect("valid");
+        let framed = frame_to_write(layout, cursor, 10).expect("fits");
+        assert_eq!(framed.payload.0.length + framed.payload.1.length, 10);
+        assert!(
+            !framed.payload.1.is_empty(),
+            "expected a wrapped second run"
+        );
+    }
+
+    /// **A length published without its bytes is not a frame yet.** The producer
+    /// is mid-write; a consumer that read anyway would take half a frame and
+    /// whatever was in the region behind it.
+    #[test]
+    fn a_length_without_its_payload_is_refused() {
+        let layout = Layout::for_region(HEADER_BYTES + 64).expect("valid");
+        // Four bytes readable: the prefix is there, the payload is not.
+        let cursor = Cursor::new(layout, 4, 0).expect("valid");
+        assert!(length_to_read(layout, cursor).is_some());
+        assert_eq!(frame_to_read(layout, cursor, 10), None);
+    }
+
+    /// What the writer laid down is what the reader is told to pick up.
+    #[test]
+    fn a_write_and_a_read_agree_on_where_the_frame_is() {
+        let layout = Layout::for_region(HEADER_BYTES + 64).expect("valid");
+        let write = Cursor::new(layout, 0, 0).expect("valid");
+        let written = frame_to_write(layout, write, 12).expect("fits");
+        let read = Cursor::new(layout, written.next, 0).expect("valid");
+        let got = frame_to_read(layout, read, 12).expect("published");
+        assert_eq!(got.payload, written.payload);
+        assert_eq!(got.next, written.next);
+    }
+
+    /// An empty frame is refused at both ends: it would advance an index by the
+    /// prefix alone and leave the two sides describing different rings.
+    #[test]
+    fn an_empty_frame_is_refused() {
+        let layout = Layout::for_region(HEADER_BYTES + 64).expect("valid");
+        let cursor = Cursor::new(layout, 0, 0).expect("valid");
+        assert_eq!(frame_to_write(layout, cursor, 0), None);
+        let full = Cursor::new(layout, 8, 0).expect("valid");
+        assert_eq!(frame_to_read(layout, full, 0), None);
     }
 }
