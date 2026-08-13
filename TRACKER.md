@@ -740,6 +740,37 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the boundary's cost was two domains on one processor)
+
+`bin/netd` and `bin/ipd` were both spawned with `spawn_on_with(cpu, …)` and both pinned — **the same
+processor**, for two domains that hand a frame to each other and back on every packet. Every frame
+was a context switch between them, and `bin/ipd`'s `YIELD` on an empty ring was the handoff.
+
+**Three measurements, in order, because the first two changed the wrong thing.**
+
+1. `bin/ipd` looks at its ring **about 37 times per frame** — 37,912 and 39,676 empty looks over
+   1035 frames. Each look is a `YIELD` and a scheduling round trip. Counted before anything was
+   changed, which is the only reason the next two experiments could be read.
+2. **Yielding less made it worse.** One yield in 32 instead of every look: 11 frames taken instead
+   of 1035, and the burst never started. The yields were not overhead — they were what let the
+   producer run, which is what a shared processor looks like from the consumer's side.
+3. **A processor of its own fixed it.** Changing nothing but `bin/ipd`'s CPU: **103–234 µs a round
+   trip becomes 34–149 µs**, three runs each.
+
+Kept, guarded: only when at least three processors are online. With two, the only other is the boot
+processor, and moving a busy service onto the thread bringing the machine up trades one contention
+for a worse one.
+
+**This is the third explanation offered for the same number, and the first two were mine.** RFC 0018
+said the split cost two copies per packet — true as a count (1.99, measured) and worth nanoseconds.
+Step 7 said it was the missing wakeup — built the next day, and the number did not move. It was the
+placement. The measurement was right all three times; the attribution was wrong twice, and both
+corrections are recorded where the wrong claims were, not only here.
+
+**What is still unexplained is smaller and honest.** 34–149 µs against the folded build's 10–16 µs.
+Some of that is the cross-domain path itself, which is what the boundary genuinely costs. Nobody
+should call it explained until it is measured.
+
 ### 2026-08-13, last (RFC 0010 step 2 built, and the hypothesis it was built to confirm failed)
 
 **`Invoke(notification, SIGNAL)` exists.** Specified when RFC 0010 was accepted on 2026-08-04, step 2

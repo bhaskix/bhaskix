@@ -153,6 +153,22 @@ static BURST_PHASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 static BURST_PONGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Requests sent in the phase now running.
 static BURST_SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Passes round the demonstration loop that found the ring empty.
+///
+/// **Measured before anything is changed.** RFC 0010 step 2 gave `bin/ipd` a
+/// doorbell to `bin/netd` and the round-trip latency did not move, which leaves
+/// the other direction as the standing hypothesis: `netd` cannot tell this
+/// program a frame has arrived, so this program polls, and every look that
+/// finds nothing is a `YIELD` and a scheduling round trip.
+///
+/// If that is where the time goes, these counters are large. If this program
+/// takes a frame within a look or two of it being published, the polling is not
+/// the cost and the hypothesis is wrong. A change made before this is measured
+/// would be a guess with a diff attached.
+static EMPTY_POLLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The longest run of empty looks between two frames.
+static LONGEST_WAIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Replies the phase that just finished actually got.
 ///
 /// Kept separately because the running counters reset when a phase ends, and
@@ -570,6 +586,8 @@ fn refresh() {
         BURST_PONGS.load(Relaxed),
         BURST_RESULT.load(Relaxed),
         BURST_SENT.load(Relaxed),
+        EMPTY_POLLS.load(Relaxed),
+        LONGEST_WAIT.load(Relaxed),
     ]);
 }
 
@@ -925,6 +943,7 @@ extern "C" fn ipd_main() -> ! {
     let mut asked = false;
     let mut pinged = false;
     let mut quiet = 0u32;
+    let mut run = 0u64;
     let mut sockets = [Socket {
         port: 0,
         generation: 1,
@@ -1251,9 +1270,20 @@ extern "C" fn ipd_main() -> ! {
                 );
                 exit()
             }
+            // One look that found nothing. See `EMPTY_POLLS`.
+            EMPTY_POLLS.store(
+                EMPTY_POLLS.load(core::sync::atomic::Ordering::Relaxed) + 1,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            run += 1;
             call(syscall::YIELD, 0, 0, [0; 4]);
             continue;
         }
+        // A frame arrived: close the run of empty looks that preceded it.
+        if run > LONGEST_WAIT.load(core::sync::atomic::Ordering::Relaxed) {
+            LONGEST_WAIT.store(run, core::sync::atomic::Ordering::Relaxed);
+        }
+        run = 0;
         quiet = 0;
 
         // The four-byte length first.
@@ -1491,6 +1521,8 @@ fn report(
         BURST_PONGS.load(core::sync::atomic::Ordering::Relaxed),
         BURST_RESULT.load(core::sync::atomic::Ordering::Relaxed),
         BURST_SENT.load(core::sync::atomic::Ordering::Relaxed),
+        EMPTY_POLLS.load(core::sync::atomic::Ordering::Relaxed),
+        LONGEST_WAIT.load(core::sync::atomic::Ordering::Relaxed),
     ];
     for (slot, value) in CACHE.iter().zip([
         frames,
@@ -1508,7 +1540,7 @@ fn report(
 }
 
 /// Puts ten words on the report page.
-fn write_report(words: [u64; 18]) {
+fn write_report(words: [u64; 20]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.

@@ -335,10 +335,24 @@ kernel's `wake_net_driver` poke was deleted. The doorbell demonstrably works —
 and `bin/dhcp` both need it and both still pass with the poke gone — and the burst did **not** get
 faster: 103–153 µs a round trip against a 106–234 µs baseline, spreads that overlap.
 
-So the ~130 µs gap between the split and folded builds is **still unexplained**. The missing wakeup
-was a plausible cause, it has been removed, and the number stayed. What remains untested is the
-other direction: `bin/netd` still has no way to tell `bin/ipd` a frame has arrived, and `ipd` polls
-its ring with a yield between looks. That is the next hypothesis, and it is a hypothesis.
+**Explained, same day, and it was neither the copies nor the wake.** `bin/netd` and `bin/ipd` were
+pinned to the **same processor**. Two domains that ping-pong every frame, sharing one CPU: each
+frame is a context switch between them, and the service's `YIELD` on an empty ring *is* the handoff.
+The driver was never asleep — it was runnable and waiting for a processor.
+
+Three measurements settle it. `bin/ipd` looks at its ring about **37 times per frame**, each look a
+`YIELD` and a scheduling round trip. Yielding *less* made it **worse** — 11 frames instead of 1035 —
+because the yields were what let the producer run. And giving `bin/ipd` its own processor, changing
+nothing else, moved the round trip from **103–234 µs to 34–149 µs**.
+
+So the boundary's price, as this system was built, was mostly **co-location**: the copies cost
+nanoseconds, the missing wakeup cost nothing measurable, and two pinned domains sharing a core cost
+roughly half the gap. The rest is still the cross-domain path itself, against 10–16 µs folded.
+
+**Three explanations were offered for this number before the right one.** The copies (this section's
+original claim, confirmed as a count and irrelevant as a cost), the missing signal (built, and it
+changed nothing), and finally the placement. Each was plausible, each was written down as settled,
+and the first two were wrong. The measurement was right every time; the attribution was not.
 
 **And it is not even a missing design.** [RFC 0010](0010-notifications.md), accepted 2026-08-04,
 specifies `Invoke(notification, SIGNAL)` — in its table of operations, never blocking — and makes it

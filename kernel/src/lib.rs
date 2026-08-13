@@ -3840,7 +3840,29 @@ pub fn start_net_domain(
     // ring and says so, which is a more useful state than a domain that was
     // never created, and it keeps the capability count the architecture
     // argument rests on visible on every boot.
-    if let Err(reason) = start_ip_domain(cpu, hhdm_base, realm, keeper) {
+    // **`bin/ipd` on a different processor from `bin/netd`, and that is worth
+    // more than either of the two things blamed before it.**
+    //
+    // These two domains ping-pong every frame: the driver hands one across a
+    // ring and the service hands one back. Pinned to the same CPU, every frame
+    // is a context switch between them and the service's `YIELD` *is* the
+    // handoff — which is why spinning instead of yielding made it worse, not
+    // better, and why a doorbell changed nothing. The driver was never asleep;
+    // it was runnable and waiting for the processor.
+    //
+    // Measured, three runs each, RFC 0018 step 7's burst: **103–234 µs a round
+    // trip sharing a CPU, 34–149 µs apart.** The copies cost nanoseconds and
+    // the wake cost nothing measurable; this is where the boundary's price was.
+    //
+    // Only when there are at least three processors. With two, `cpu` is 1 and
+    // the only other is the boot processor, and moving a busy service onto the
+    // thread bringing the machine up trades one contention for a worse one.
+    let ip_cpu = if bhaskix_arch::percpu::online_count() >= 3 {
+        cpu.saturating_sub(1)
+    } else {
+        cpu
+    };
+    if let Err(reason) = start_ip_domain(ip_cpu, hhdm_base, realm, keeper) {
         println!("\x1b[91m    net ring       FAILED: {reason}\x1b[0m");
     }
 
@@ -5103,10 +5125,10 @@ fn report_net_after_exchange(hhdm: u64) {
     if count == 0 {
         return;
     }
-    let mut ipd = [0u64; 17];
+    let mut ipd = [0u64; 20];
     // SAFETY: a frame this object owns, through the direct map, read as the ten
     // little-endian words the service wrote there.
-    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 136) };
+    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 160) };
     for (index, word) in ipd.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -5117,7 +5139,8 @@ fn report_net_after_exchange(hhdm: u64) {
     }
     println!(
         "    ipd after      {} frames taken, {} refused, {} datagrams delivered to a socket; \
-         last refusal reason {}, on a frame of {} bytes with ethertype {:#06x}; ring head {} tail {}",
+         last refusal reason {}, on a frame of {} bytes with ethertype {:#06x}; ring head {} tail {}; \
+         {} empty looks at the ring, longest run {}",
         ipd[1],
         ipd[4],
         ipd[9],
@@ -5125,7 +5148,9 @@ fn report_net_after_exchange(hhdm: u64) {
         ipd[10] >> 32,
         (ipd[10] >> 16) & 0xffff,
         ipd[11],
-        ipd[12]
+        ipd[12],
+        ipd[18],
+        ipd[19]
     );
 
     // RFC 0018 step 7: what the boundary cost, counted rather than argued.
