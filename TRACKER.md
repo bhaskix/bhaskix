@@ -740,6 +740,41 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (caught under gdb: one register, and a Request of zeroes)
+
+Caught on the **first attempt** with a hardware breakpoint on the unknown-method arm — nothing sends
+an unknown method in a healthy boot, so `hbreak *0x10000275` fires exactly when the bug does:
+
+```
+qemu-system-x86_64 -M q35,kernel-irqchip=split -smp 2 ... -S -gdb tcp::1234
+gdb -batch -ex 'target remote :1234' -ex 'hbreak *0x10000275' -ex continue
+```
+
+**What it settled.**
+
+- **`handle` was entered normally.** The return address `0x100000a3` — the instruction after the only
+  `call` in the binary — is on the stack at `rsp+0x88`. The "entered other than by a call" branch of
+  the previous entry's contradiction is closed.
+- **The `Request` reads all zeroes.** `rcx` points at it and every word is zero, so `method` is 0,
+  which is neither `WRITE` nor `READ`. The unknown method is not a mystery: the service dispatched on
+  a Request that was not there.
+- **Three of four arguments are correct.** `handle`'s prologue pushes the caller's registers, and
+  they are on the stack: `r15 = 0x11003d70`, `r14 = 0x11003db8`, `r12 = 0x11003d80`,
+  `rbx = 0x11003eb8`. The call site loads `rdi←r14, rsi←r15, rdx←rbx, rcx←r12`, and `rsi`, `rdx` and
+  `rcx` match those exactly. **Only `rdi` does not**: it should be `0x11003db8` and it is **1**.
+
+So one argument register is wrong at the callee's entry while the value it should have carried is
+intact, in `r14`, on the same stack — and the memory the other arguments point at is zeroed.
+
+**What it ruled out.** The trap entry and exit push and pop symmetrically, and nothing in the kernel
+writes `frame.rdi` — the only mention is the fault printer reading it. `cargo tree -d` shows no
+duplicate crate instances, so caller and callee agree about every type's layout; the
+different-`Reply`-definition theory is dead.
+
+**Still not fixed**, and the next experiment is now cheap and obvious: breakpoint the call site at
+`0x1000009e`, single-step across the `call`, and watch `rdi` change — or put a hardware watchpoint on
+the Request slot at `0x11003d80` and see who zeroes it. Either takes one attempt at `-smp 2`.
+
 ### 2026-08-13, last (the intermittent failure reproduces on demand, and the fault is impossible)
 
 **It reproduces in about one boot in three at `-smp 2`.** `QEMU_SMP=2 tests/qemu/boot-test.sh iommu`,
