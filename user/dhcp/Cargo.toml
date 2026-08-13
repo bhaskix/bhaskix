@@ -41,4 +41,8 @@ opt-level = "s"
 # 25, measured after the fact. A program with no library: its own system call
 # stub, its own page mapping and its own report writing are all it contains, and
 # all of it is unsafe by construction. There is no service loop here at all.
-unsafe_budget = 25
+# 28 at RFC 0019 step 3: `rdtsc`, which is one instruction and no memory. The
+# clock is readable at every privilege level here -- `CR4.TSD` is clear -- so
+# this program reads time without holding anything, and holds a capability only
+# for the thing that is actually scarce, which is being woken.
+unsafe_budget = 28

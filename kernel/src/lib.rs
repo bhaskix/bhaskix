@@ -4141,6 +4141,36 @@ fn start_dhcp_client(
     let memory = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
         .map_err(|_| "the client's memory would not be created")?;
     let named = shared::name(memory).map_err(|_| "the client's memory would not be named")?;
+    // **A notification the client can arm a deadline on.** RFC 0019 step 3: it
+    // waits for an offer by sleeping until a deadline rather than by counting
+    // loop iterations, so its patience is a duration in its source instead of a
+    // number somebody tuned by experiment.
+    //
+    // Read and write: it waits on this and arms it, and both are itself. The
+    // badge is what the wake carries, so a client that later waits on more than
+    // one source can tell them apart.
+    const DHCP_TIMER_BADGE: u64 = 1 << 0;
+    let timer = crate::notify::create()
+        .ok()
+        .and_then(|id| crate::notify::name(id).ok())
+        .and_then(|root| {
+            cap::with_arena(|arena| {
+                arena
+                    .derive(
+                        root,
+                        cap::Rights::READ.union(cap::Rights::WRITE),
+                        DHCP_TIMER_BADGE,
+                    )
+                    .ok()
+            })
+        });
+    // Absent is a state, not a fault: the client then behaves as it did before.
+    if let Some(timer) = timer
+        && domain::with(realm, |owner| owner.cspace.install_at(4, timer).is_ok()) != Some(true)
+    {
+        return Err("the dhcp client's timer would not install");
+    }
+
     if domain::with(realm, |owner| owner.cspace.install_at(2, named).is_ok()) != Some(true) {
         return Err("the client's memory would not install");
     }
@@ -5926,7 +5956,14 @@ extern "C" fn dhcp_client_entry(hhdm_base: u64) -> ! {
     // SAFETY: `entry` is inside a user-executable segment of the space just
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
-    unsafe { enter_user("dhcp client", entry, rsp, [0, 0]) }
+    // **The clock's rate, handed over at entry.** `rdtsc` is unprivileged on this
+    // machine so the program can read the counter, but nothing tells it how fast
+    // the counter runs, and a deadline is a duration times a rate. RFC 0019
+    // says reading time is ambient; knowing the units is not, and this is the
+    // one thing that cannot arrive through a CSpace.
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    // SAFETY: as above.
+    unsafe { enter_user("dhcp client", entry, rsp, [hertz, 0]) }
 }
 
 /// Loads and enters `bin/fsd`.

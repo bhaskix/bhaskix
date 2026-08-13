@@ -742,6 +742,47 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the real diagnosis: a thread runs in somebody else's address space)
+
+RFC 0019 step 3 gave `bin/dhcp` a deadline to wait on, and the first boot after it produced a fault
+that has never been seen before — because until this morning every program lived at the same address
+and the fault had nowhere to show:
+
+```
+  faulting address 0x0000000010100000   (cr2)
+    page not present while reading in user mode, on an instruction fetch
+  thread 36 (consoled) expects space 0xf186000, cr3 holds 0xf192000
+    IT IS RUNNING IN SOMEBODY ELSE'S ADDRESS SPACE
+```
+
+**The kernel already had that check.** Somebody wrote it in `kernel/src/trap.rs` expecting exactly
+this, and it has been silent for months because nothing could reach it.
+
+**This is the diagnosis the whole hunt was for, and it is a kernel bug.** A thread runs with the
+wrong `CR3`. When every program linked at `0x10000000`, running in the wrong address space still
+found *an* executable page at the program counter — somebody else's — so the thread quietly executed
+foreign instructions. That is precisely the mid-instruction entry the filtered trace caught: a block
+translated at `0x10000093` whose bytes were another program's, decoding as `mov %esi,%edi` and
+putting 1 in `rdi`.
+
+**Two of my conclusions are corrected by this, both committed:**
+
+- ~~"this looks like emulator aliasing rather than a kernel bug"~~ — it is a kernel bug. The trace
+  was right about *what* executed and wrong about *why* it was reachable.
+- ~~"the failure stops: 0 in 24 boots"~~ — the detector stopped matching. Those boots were grepped
+  for `null pointer dereference|SERVER EXITED OWING`; the new symptom is an instruction-fetch fault
+  and matches neither. Grepping for `SOMEBODY ELSE'S ADDRESS SPACE` finds it at **1 boot in 10**.
+
+**Distinct link addresses are still worth keeping, for a better reason than the one they were
+adopted for.** They do not fix anything. They convert a silent execution of another program's code
+into an immediate fault that *names itself* — which is the difference between four wrong analyses in
+a day and a diagnosis in one boot.
+
+**What is now known, and what is not.** The what: a thread is entered, or resumed, with a page table
+that is not its own. The when: rarely, under contention, at `-smp 2`. The where is not known — the
+context switch, `enter_user`, or the resume path after a block are all candidates, and this file has
+been wrong enough this week that the next step is to instrument rather than to reason.
+
 ### 2026-08-13, last (RFC 0019 step 2: a deadline a program can arm, and a resolution that is poor)
 
 `Invoke(notification, ARM, deadline)` and `DISARM`, both needing the write right that `SIGNAL` needs
@@ -848,8 +889,14 @@ Every program linked at `0x10000000`. They now link a megabyte apart — `bin/pr
 was, because two gates assert its entry point, and the other seven move to `0x10100000` through
 `0x10700000`.
 
-**The failure stops: 0 in 24 boots at `-smp 2`**, against roughly one in three before. If the old
-rate held, the chance of seeing none in twenty-four is about six in a hundred thousand.
+~~**The failure stops: 0 in 24 boots at `-smp 2`**, against roughly one in three before. If the old
+rate held, the chance of seeing none in twenty-four is about six in a hundred thousand.~~
+
+> **WRONG, corrected hours later. That measured the detector, not the bug.** The twenty-four boots
+> were grepped for `null pointer dereference|SERVER EXITED OWING`. Distinct link addresses change the
+> *symptom*: the fault is now an instruction-fetch fault at a program's own entry point, which
+> matches neither pattern. Grepping for what the kernel actually prints finds it still happening, at
+> about one boot in ten. See the entry above.
 
 **So the shared address layout was the cause**, which the filtered trace had already shown the shape
 of: control entering `bin/consoled` at `0x10000093`, an offset that is an instruction boundary only

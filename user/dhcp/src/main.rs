@@ -40,6 +40,25 @@ const SOCKET: u64 = 1;
 const MEMORY: u64 = 2;
 /// Slot: the page this program leaves its findings in.
 const REPORT: u64 = 3;
+/// Slot: a notification this program arms a deadline on, and waits on.
+///
+/// **RFC 0019 step 3, and the point of that RFC.** This program used to wait by
+/// counting: four hundred passes round a loop was too few to catch a reply, and
+/// a million kept a processor busy long enough that the shell test timed out.
+/// Neither number meant anything — both were "how long is a loop", which
+/// depends on the machine.
+///
+/// It waits for a *duration* now. Read to wait on, write to arm; both are
+/// itself, and the badge is what the wake carries.
+const TIMER: u64 = 4;
+
+/// How long to wait for an offer, and how long between asks.
+///
+/// **Durations, in the source, in units a reader has.** The retry interval is
+/// not tuning: `bin/ipd` drains its ring when a client asks, so asking is what
+/// makes the service look at the wire, and this is how often that happens.
+const PATIENCE_MS: u64 = 3_000;
+const RETRY_MS: u64 = 20;
 
 /// Where this program maps what it holds.
 const MEMORY_AT: u64 = 0x2200_0000;
@@ -141,9 +160,39 @@ const NO_BIND: u64 = 5;
 /// Outcome: the datagram was not sent. Carries the status and the service's.
 const NO_SEND: u64 = 6;
 
+/// Reads the cycle counter. Unprivileged: `CR4.TSD` is clear on this machine.
+fn rdtsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: reads a counter and touches no memory. RFC 0019 records that this
+    // is readable at every privilege level here, which is why reading time needs
+    // no capability and being *woken* does.
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Sleeps until `deadline`. Says whether it actually slept.
+///
+/// A machine that could not give this program a notification is one where
+/// asking again immediately is all that is left, and saying so beats spinning
+/// silently.
+fn sleep_until(deadline: u64) -> bool {
+    if call(syscall::INVOKE, TIMER, method::ARM, [deadline, 0, 0, 0]).0 != status::OK {
+        return false;
+    }
+    // Blocks until the word is non-zero, which the kernel makes it when the
+    // deadline passes. No endpoint is needed: this program serves nobody.
+    call(syscall::INVOKE, TIMER, method::WAIT, [0; 4]).0 == status::OK
+}
+
 /// The entry point.
+///
+/// `hertz` is the cycle counter's rate, handed over at entry because it is the
+/// one thing about the clock that cannot arrive through a CSpace.
 #[unsafe(no_mangle)]
-extern "C" fn dhcp_main() -> ! {
+extern "C" fn dhcp_main(hertz: u64) -> ! {
     if !attach(MEMORY, MEMORY_AT, 1) || !attach(REPORT, REPORT_AT, 1) {
         exit()
     }
@@ -173,8 +222,11 @@ extern "C" fn dhcp_main() -> ! {
     // A yield between attempts rather than a spin: this program is pinned like
     // every other, and a client busy-waiting for a service to start would be
     // the third poll loop this system has paid for today.
-    let mut bound = (0, 0, 0);
-    for _ in 0..2_000 {
+    let per_retry = hertz.saturating_mul(RETRY_MS) / 1000;
+    let give_up_at = rdtsc().saturating_add(hertz.saturating_mul(PATIENCE_MS) / 1000);
+
+    let mut bound;
+    loop {
         bound = call(
             syscall::CALL,
             NETWORK,
@@ -184,7 +236,11 @@ extern "C" fn dhcp_main() -> ! {
         if bound.0 == status::OK && bound.1 == socket::OK {
             break;
         }
-        call(syscall::YIELD, 0, 0, [0; 4]);
+        // A service that is not answering yet is not a service that refused,
+        // and the wait for it is a length of time now rather than a count.
+        if rdtsc() >= give_up_at || !sleep_until(rdtsc().saturating_add(per_retry)) {
+            break;
+        }
     }
     if bound.0 != status::OK || bound.1 != socket::OK {
         report(bound.0 as u32, bound.1 as u32, NO_BIND);
@@ -228,10 +284,19 @@ extern "C" fn dhcp_main() -> ! {
     // pinned thread is a processor the rest of the machine cannot have. The
     // shell test found exactly that once for `netd` and `ipd`, and it found it
     // again here: with a million attempts the shell's own commands timed out.
-    for _ in 0..20_000 {
+    let wait_until = rdtsc().saturating_add(hertz.saturating_mul(PATIENCE_MS) / 1000);
+    loop {
         let got = call(syscall::CALL, SOCKET, socket::RECV_FROM, [MEMORY, 0, 0, 0]);
         if got.0 != status::OK || got.1 != socket::OK {
-            call(syscall::YIELD, 0, 0, [0; 4]);
+            if rdtsc() >= wait_until {
+                break;
+            }
+            // **Asleep, not spinning.** Asking is what makes `bin/ipd` look at
+            // the wire, so this asks again after a while rather than as fast as
+            // the scheduler will let it.
+            if !sleep_until(rdtsc().saturating_add(per_retry)) {
+                call(syscall::YIELD, 0, 0, [0; 4]);
+            }
             continue;
         }
         // SAFETY: the same page, still attached.
