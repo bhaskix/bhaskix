@@ -1633,6 +1633,97 @@ static SWITCHES_WITHOUT_SPACE: core::sync::atomic::AtomicU64 =
 static SWITCHES_WITHOUT_THREAD: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Wrong address spaces caught on the way back to ring 3, and where.
+///
+/// Packed `site << 62 | thread << 32 | loaded >> 12`, with site 0 for the
+/// system call exit and 1 for the trap exit.
+static EXIT_TRACE: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 8];
+static EXIT_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many exits to ring 3 found the wrong space loaded, and how many were
+/// skipped because the runqueue was busy.
+static EXIT_WRONG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static EXIT_UNCHECKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Checks that the thread about to run in ring 3 owns the loaded address space.
+///
+/// **The last moment the kernel can tell.** The switch instrumentation showed a
+/// thread resumed with a space recorded and a different one loaded, which means
+/// some return path does not load it; this is the check that names which.
+///
+/// `site` says which exit: 0 for the system call path, 1 for the trap path, and
+/// 2 for the first entry to ring 3 — which is where every capture of this fault
+/// has been, at a program's own entry point rather than inside it.
+///
+/// Takes the local runqueue with `try_lock` and gives up rather than waiting.
+/// This runs on the trap exit, which may have interrupted a thread holding that
+/// very lock — waiting there is how M6-04's one-CPU deadlock happened, and the
+/// skipped checks are counted rather than hidden.
+pub fn check_user_space(site: u64) {
+    use core::sync::atomic::Ordering;
+
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    let Some(queue) = QUEUES[cpu].try_lock() else {
+        EXIT_UNCHECKED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let Some((who, root)) = queue
+        .threads
+        .get(queue.current)
+        .and_then(|thread| thread.as_ref())
+        .map(|thread| (thread.id, thread.space_root))
+    else {
+        return;
+    };
+    drop(queue);
+
+    if root == 0 {
+        return;
+    }
+    // SAFETY: reading CR3 at CPL 0 has no side effects.
+    let loaded = unsafe { bhaskix_arch::paging::active_page_table() };
+    if loaded == root {
+        return;
+    }
+
+    EXIT_WRONG.fetch_add(1, Ordering::Relaxed);
+    let at = EXIT_AT.fetch_add(1, Ordering::Relaxed) as usize;
+    EXIT_TRACE[at % 8].store(
+        (site << 62) | (u64::from(who) << 32) | (loaded >> 12),
+        Ordering::Relaxed,
+    );
+}
+
+/// What the exit check found: wrong spaces, and checks skipped for a busy lock.
+#[must_use]
+pub fn exit_check_counts() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        EXIT_WRONG.load(Ordering::Relaxed),
+        EXIT_UNCHECKED.load(Ordering::Relaxed),
+    )
+}
+
+/// Replays the exit ring, oldest first, as `(site, thread, loaded space)`.
+pub fn replay_exit_checks(mut visit: impl FnMut(u64, u32, u64)) {
+    use core::sync::atomic::Ordering;
+    let at = EXIT_AT.load(Ordering::Relaxed) as usize;
+    let first = at.saturating_sub(8);
+    for index in first..at {
+        let packed = EXIT_TRACE[index % 8].load(Ordering::Relaxed);
+        if packed != u64::MAX {
+            visit(
+                packed >> 62,
+                ((packed >> 32) & 0x3fff_ffff) as u32,
+                (packed & 0xffff_ffff) << 12,
+            );
+        }
+    }
+}
+
 /// Replays the switch ring, oldest first, as `(thread, space frame)`.
 pub fn replay_switches(mut visit: impl FnMut(u32, u64)) {
     use core::sync::atomic::Ordering;

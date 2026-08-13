@@ -179,7 +179,11 @@ workspace = true
 # wrong diagnoses possible.
 # 1158 at RFC 0018 step 7: one more report page read, to time the echo burst
 # from a program that has no clock of its own.
-unsafe_budget = 1158
+# 1159 while the address-space instrumentation is in: one `CR3` read on the way
+# back to ring 3, to check the thread about to run owns the space that is
+# loaded. Reading `CR3` at CPL 0 has no side effects; the cost is the check, and
+# the boot cost did not move (7677 ms against 7678 before it).
+unsafe_budget = 1159
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

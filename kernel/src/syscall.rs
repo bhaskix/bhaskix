@@ -1590,6 +1590,12 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     let frame = unsafe { &mut *frame };
     let outcome = dispatch(frame);
 
+    // Every system call returns to ring 3, so this needs no condition. See
+    // `sched::check_user_space`: the switch instrumentation proved some return
+    // path resumes a thread without loading its space, and this is one of the
+    // two places that can say which.
+    crate::sched::check_user_space(0);
+
     // The results go back through the same two registers the ABI names, which
     // the stub pops into `rax` and `rdx`.
     frame.kind = outcome.status.as_u64();

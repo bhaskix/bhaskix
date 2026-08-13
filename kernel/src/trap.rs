@@ -170,6 +170,12 @@ fn handle(frame: &mut TrapFrame) {
     // fatal.
     if frame.vector >= 32 {
         handle_interrupt(frame);
+        // On the way back to ring 3, and only then: an interrupt that
+        // preempted a thread may return to a *different* one, which is exactly
+        // the moment a space could go unloaded. See `sched::check_user_space`.
+        if frame.from_user_mode() {
+            crate::sched::check_user_space(1);
+        }
         return;
     }
 
@@ -488,6 +494,19 @@ fn report_exception(frame: &mut TrapFrame) {
                 "      {without_space} switches resumed with no space to load, \
                  {without_thread} with no thread at all"
             );
+            let (wrong, unchecked) = crate::sched::exit_check_counts();
+            println!(
+                "      exits to ring 3 with the wrong space: {wrong} ({unchecked} not checked, \
+                 runqueue busy)"
+            );
+            crate::sched::replay_exit_checks(|site, thread, loaded| {
+                let where_ = match site {
+                    0 => "syscall",
+                    1 => "trap",
+                    _ => "first entry",
+                };
+                println!("      exit: t{thread} left {where_} with {loaded:#x} loaded");
+            });
             crate::sched::replay_switches(|thread, space| {
                 if space == 0 {
                     println!("      switch: t{thread} resumed with no space");

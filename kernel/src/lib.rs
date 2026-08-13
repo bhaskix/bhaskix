@@ -510,6 +510,33 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // `UNWAITED` counts signals that found nobody; with a console and a
         // block device both signalling it cannot say which, and that is the
         // question.
+        // **The exit check, reported on every boot and not only on a fault.**
+        // A thread that reached ring 3 with somebody else's space loaded is the
+        // bug being hunted; waiting for it to fault is waiting for it to land
+        // somewhere unmapped, which is luck. This says whether it happened at
+        // all.
+        let (wrong_space, unchecked) = sched::exit_check_counts();
+        let (no_space, no_thread) = sched::switch_gaps();
+        if wrong_space == 0 {
+            println!(
+                "    address space  every exit to ring 3 held its own space ({unchecked} unchecked, \
+                 runqueue busy; {no_space} switches loaded none, {no_thread} found no thread)"
+            );
+        } else {
+            println!(
+                "\x1b[91m    address space  {wrong_space} exits to ring 3 held somebody else's \
+                 space\x1b[0m"
+            );
+            sched::replay_exit_checks(|site, thread, loaded| {
+                let where_ = match site {
+                    0 => "syscall",
+                    1 => "trap",
+                    _ => "first entry",
+                };
+                println!("      exit: t{thread} left {where_} with {loaded:#x} loaded");
+            });
+        }
+
         let (signals, unwaited, stranded) = notify::statistics();
         print!(
             "    notifications  {signals} signalled, {unwaited} found no waiter, {stranded} stranded;"
@@ -3260,6 +3287,14 @@ unsafe fn enter_user(who: &str, entry: u64, rsp: u64, arguments: [u64; 2]) -> ! 
         sched::exit()
     }
     // SAFETY: delegated to this function's own contract.
+    // **The first entry to ring 3, which is where the fault was seen.** The
+    // faulting `rip` in every capture is a program's own entry point, not
+    // somewhere inside it — so the thread arrived in user mode with the wrong
+    // space rather than losing it later. Checked here, immediately before the
+    // jump, because after this there is no kernel left to ask.
+    crate::sched::check_user_space(2);
+
+    // SAFETY: as above.
     unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, arguments) }
 }
 

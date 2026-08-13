@@ -742,6 +742,39 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (the exit check: three sites, no cost, and silent so far)
+
+Every path back to ring 3 now checks that the thread about to run owns the address space that is
+loaded: the system call return, the interrupt return, and **the first entry to ring 3** — which is
+where every capture of this fault has actually been. The faulting `rip` is a program's own entry
+point, not somewhere inside it, so the thread arrives in user mode with the wrong space rather than
+losing it later. That clue was in the first capture and went unread for three rounds.
+
+It is reported on **every boot**, not only on a fault:
+
+```
+address space  every exit to ring 3 held its own space (0 unchecked, runqueue busy;
+               155007 switches loaded none, 0 found no thread)
+```
+
+Waiting for the fault is waiting for the wrong space to be one where the program counter happens to
+be unmapped, which is luck. The counter says whether it happened at all.
+
+**It costs nothing measurable.** Boot cost 7677 ms, against 7678–7679 ms before it. The check takes
+the local runqueue with `try_lock` and gives up rather than waiting — the trap exit may have
+interrupted a thread holding that very lock, which is how M6-04's one-CPU deadlock happened — and
+the skipped checks are counted rather than hidden. They have been zero.
+
+**And it has not caught anything in about fifty boots**, where the rate was one in ten. Two
+readings, and no way yet to tell them apart: the check perturbs the timing, as gdb did far more
+crudely; or the wrong space arrives by a path none of the three covers. The uncovered one is an
+**exception** return to user mode — a demand-paging fault serviced and retried — which is not the
+interrupt path and is the obvious next site.
+
+**What is now permanent, whatever the cause turns out to be.** The kernel says on every boot whether
+any thread reached user mode in somebody else's address space. That check did not exist this
+morning, and the failure it looks for spent two days being read as a filesystem bug.
+
 ### 2026-08-13, last (the context switch instrumented, and what it rules out)
 
 `finish_switch` now records what every switch decided — the thread it resumed and the address space
