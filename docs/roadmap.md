@@ -196,7 +196,13 @@ telemetry plane, `bhaskixboot.efi`, package management, and libc.
   targets, a socket that is a badged capability rather than a descriptor, and the folded-domain
   measurement that priced the boundary. A ring 3 program holding a socket and a page obtains an
   address by DHCP, which is this roadmap's "does useful network I/O" met by demonstration.
-  **Not done:** TCP — **RFC 0020**, which waits on [RFC 0019](rfc/0019-time-and-timers.md) because nothing in this system can yet wait for a length of time — IPv6, and any sockets API above UDP
+  **Not done:** TCP — [RFC 0020](rfc/0020-tcp.md), **drafted 2026-08-14**. ~~It waits on RFC 0019
+  because nothing in this system can yet wait for a length of time~~ — that was true until
+  2026-08-14, when [RFC 0019](rfc/0019-time-and-timers.md) was accepted and a deadline became
+  something a program can be woken by. It now waits on
+  [RFC 0021](rfc/0021-unpredictability.md) instead, because a TCP sequence number must be
+  unpredictable and this system cannot yet produce an unpredictable number. Also not done: IPv6, and
+  any sockets API above UDP
 - ⬜ **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing
   tool
 - ⬜ **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
