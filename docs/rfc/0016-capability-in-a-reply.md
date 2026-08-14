@@ -68,6 +68,12 @@ There are two ways today for a capability to reach a domain, and neither fits:
 
 So a directory capability cannot come from the thing that owns directories.
 
+> **2026-08-15:** the missing direction described here went on to block a second design — RFC
+> 0020's caller-supplied connection rings — and is now drafted as
+> [RFC 0022](0022-capability-in-a-call.md): the same `EXPECT`/`HAND` rule with the direction
+> removed, the caller's half staging and the transfer completing at the rendezvous. This section's
+> analysis, including the rejection of `GRANT`, is carried over there unchanged.
+
 ### A cached frame cannot be lent
 
 RFC 0015 step 6 built the cache and stopped at its headline claim. Handing a reader a capability to a
