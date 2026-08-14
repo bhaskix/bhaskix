@@ -1441,6 +1441,36 @@ pub enum Delivery<T> {
     Revoked,
 }
 
+/// Clears a blocked mark this thread set on itself and then decided against.
+///
+/// The receive path marks itself blocked *before* checking its bound
+/// notification — that order is what makes the check race-free — and when the
+/// check finds bits, the thread returns to its caller instead of sleeping. The
+/// mark has to be taken back first: a thread that returns still marked
+/// `Blocked` keeps executing only until the next reschedule on its CPU, which
+/// believes the mark, switches away, and never comes back — the wake that
+/// would have corrected it was consumed by the very check that decided to
+/// return. Whether it survived was decided by whichever of the wake and the
+/// mark landed second, which is a coin toss taken on every notified receive.
+///
+/// Found as RFC 0020 step 5's one-in-three stall: a TCP service that armed a
+/// deadline, was handed its wake, and vanished — and the same hole under
+/// `bin/ipd`'s serve loop stranded the DHCP client's first call. Returns
+/// whether a mark was actually cleared.
+pub fn clear_blocked_mark(thread: u32) -> bool {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            if target.state == State::Blocked {
+                target.state = State::Running;
+                return true;
+            }
+            return false;
+        }
+    }
+    false
+}
+
 /// Takes the message waiting for `thread`, if there is one.
 #[must_use]
 pub fn take_message(thread: u32) -> Option<(crate::ipc::Message, u32)> {

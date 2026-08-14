@@ -627,6 +627,19 @@ pub fn recv_either(id: EndpointId) -> Result<Received, IpcError> {
                     // loop looks again.
                     let bits = crate::notify::take_bound(me);
                     if bits != 0 {
+                        // **The blocked mark must come off before this
+                        // returns.** `take_message_or_block` marked this
+                        // thread blocked — that is what makes reading the
+                        // notification race-free — and a thread that returns
+                        // still carrying the mark runs only until the next
+                        // reschedule believes it, switches away, and never
+                        // comes back: the wake that would have corrected the
+                        // mark is the one this line just consumed. Whether
+                        // the thread survived used to depend on whether the
+                        // signaller's wake landed before or after the mark —
+                        // a coin toss taken on every notified receive, and
+                        // RFC 0020 step 5's one-in-three stall.
+                        sched::clear_blocked_mark(me);
                         // Out of the receive queue, or a later rendezvous
                         // delivers to a thread that has stopped waiting.
                         cancel(id, me);
