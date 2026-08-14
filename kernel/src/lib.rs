@@ -6444,18 +6444,20 @@ fn report_block_domain(hhdm: u64) -> bool {
     // sector zero. Without one it gets as far as the handshake and stops,
     // because nothing would contain a device it aimed at memory.
     let contained = iommu::present();
-    // What `HAND` refused the driver before it was answering anybody. One
-    // rule, checked on its own: the *other* refusal -- passing on a capability
-    // without `GRANT` -- has to be asked from inside a request or it is
-    // refused for having no caller instead, and the two would be
-    // indistinguishable. The shell asks that one.
-    // Exactly `WrongObject`, and not merely "something refused it". A version
-    // of this asked only that the status was non-zero, and passed with the
-    // rule deleted: the driver had declared nothing, so it was refused for
-    // *that* instead. The driver now declares first, so this number is the
-    // only one it can be.
+    // What `HAND` did for the driver while it was answering nobody. This was
+    // "refused with exactly WrongObject" until RFC 0022 step 1: such a hand
+    // now *stages* the capability for the thread's next call, so the checked
+    // property is the new mechanism's actual promise — the hand is accepted
+    // (high byte 0), and the slot the driver had declared stayed empty (low
+    // byte NoSuchCapability), because a staged gift moves only at a
+    // rendezvous the stager initiates. A capability appearing in the declared
+    // slot without a call would be the old bug wearing the new rule.
     let not_answering = hand_refusals as u32;
-    let ok = not_answering == syscall::Status::WrongObject as u32
+    // The pair is hand-status * 256 + probe-status; the expected hand status
+    // is OK, whose contribution to the high byte is zero by value rather than
+    // by an arithmetic identity written out.
+    let expected_pair = syscall::Status::NoSuchCapability as u32;
+    let ok = not_answering == expected_pair
         && if contained {
             drove_to == 15 && read_ok == 1 && by_interrupt == 1 && queue_size > 0 && sectors > 0
         } else {
@@ -6469,8 +6471,8 @@ fn report_block_domain(hhdm: u64) -> bool {
              rings at {rings_at_device:#x} for the device, queue of {queue_size}, \
              {sectors} sectors, sector 0 begins {text:?}, woken by the device, \
              and says it is {:04x}:{:04x} from its own configuration space; \
-             handing a capability while answering nobody was refused it \
-             (status {not_answering})",
+             a hand while answering nobody staged and installed nothing \
+             (pair {not_answering:#x})",
             identified >> 16,
             identified & 0xffff
         );

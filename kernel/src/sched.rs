@@ -201,6 +201,30 @@ impl Policy {
     }
 }
 
+/// A capability a caller has staged for its next call.
+///
+/// [RFC 0022](../../docs/rfc/0022-capability-in-a-call.md) step 1. A caller's
+/// `HAND` cannot execute a transfer — the service thread that will take its
+/// call is not known until the rendezvous — so it records intent here, one
+/// gift per thread, and the rendezvous completes it or refuses the call.
+///
+/// **One-shot and replaceable**: a second staging before the call replaces the
+/// first — the same replace-not-accumulate rule `ARM` follows, because
+/// re-staging is how a caller says "this one instead" — and the rendezvous
+/// consumes it. Addressed to one endpoint, so a gift staged for one service
+/// cannot ride a call to another; a `Call` elsewhere leaves it in place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StagedGift {
+    /// The slot in the staging thread's own CSpace holding the capability.
+    pub from_slot: u32,
+    /// The rights the derive at the rendezvous will request.
+    pub rights: u8,
+    /// The badge the derive will request, monotone or refused there.
+    pub badge: u64,
+    /// The endpoint this gift is for.
+    pub endpoint: u32,
+}
+
 /// One kernel thread. Owned outright by the CPU whose queue holds it.
 pub struct Thread {
     /// Globally unique identifier.
@@ -270,6 +294,12 @@ pub struct Thread {
     /// means an unrelated call cannot consume it, and a server still cannot
     /// receive an invitation addressed to somebody else.
     pub receive_slot: Option<(u32, u32)>,
+    /// The capability this thread has staged for its next call, if any.
+    ///
+    /// The caller-direction mirror of [`Self::receive_slot`]: that says where
+    /// this thread will *accept* one, this says which one it will *send*.
+    /// Dies with the thread, exactly as the declaration does.
+    pub staged_gift: Option<StagedGift>,
 
     /// The domain this thread belongs to, or `u32::MAX` for none.
     ///
@@ -731,6 +761,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         space_root: 0,
         reply_to: None,
         receive_slot: None,
+        staged_gift: None,
         domain: u32::MAX,
         dying: false,
         answer_lost: false,
@@ -930,6 +961,7 @@ pub fn spawn_on_with(
         space_root: 0,
         reply_to: None,
         receive_slot: None,
+        staged_gift: None,
         domain: options.domain,
         dying: false,
         answer_lost: false,
@@ -1323,6 +1355,62 @@ pub fn take_receive_slot(thread: u32, endpoint: u32) -> Option<u32> {
         }
     }
     None
+}
+
+impl Thread {
+    /// Takes this thread's staged gift, if it was staged for `endpoint`.
+    ///
+    /// The semantics [`take_staged_gift`] promises, kept on the type so a host
+    /// test can hold them to it without a runqueue: one-shot — taking clears —
+    /// and addressed, so a gift staged for one endpoint does not ride a call
+    /// to another and is still there for the call it was meant for.
+    pub fn take_gift_for(&mut self, endpoint: u32) -> Option<StagedGift> {
+        match self.staged_gift {
+            Some(gift) if gift.endpoint == endpoint => {
+                self.staged_gift = None;
+                Some(gift)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Stages a capability for `thread`'s next call, replacing any staged one.
+///
+/// Returns whether the thread was found. See [`StagedGift`] for the one-shot
+/// and replace semantics; this function is deliberately just the storage.
+pub fn stage_gift(thread: u32, gift: StagedGift) -> bool {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            target.staged_gift = Some(gift);
+            return true;
+        }
+    }
+    false
+}
+
+/// Takes what `thread` staged, if it staged it for `endpoint`.
+///
+/// Taking, not reading: a gift rides one call. The endpoint must match — a
+/// gift staged for one service must not ride a call to another, and a call
+/// elsewhere leaves the gift in place for the call it was meant for.
+pub fn take_staged_gift(thread: u32, endpoint: u32) -> Option<StagedGift> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            return target.take_gift_for(endpoint);
+        }
+    }
+    None
+}
+
+/// Puts a taken gift back, for a refusal that retains it.
+///
+/// RFC 0022's draft answer to its open question 3: a refused call leaves the
+/// gift staged, so a retry loop stages once. Recorded there as provisional.
+pub fn restore_staged_gift(thread: u32, gift: StagedGift) -> bool {
+    stage_gift(thread, gift)
 }
 
 /// How many threads are holding a message nobody has collected.
@@ -3301,6 +3389,7 @@ mod tests {
             space_root: 0,
             reply_to: None,
             receive_slot: None,
+            staged_gift: None,
             dying: false,
             answer_lost: false,
             domain: u32::MAX,
@@ -3800,5 +3889,57 @@ mod tests {
         queue.threads[1].as_mut().unwrap().vruntime = 10;
         queue.threads[1].as_mut().unwrap().state = State::Blocked;
         assert_eq!(queue.min_fair_vruntime(), 500);
+    }
+
+    /// RFC 0022 step 1: a staged gift is one-shot, addressed, and replaceable.
+    #[test]
+    fn a_staged_gift_rides_one_call_to_one_endpoint() {
+        let mut held = thread(0, State::Running, Policy::Fair { weight: 1 });
+        let gift = StagedGift {
+            from_slot: 3,
+            rights: 0b11,
+            badge: 7,
+            endpoint: 42,
+        };
+        held.staged_gift = Some(gift);
+
+        // Addressed: a call to a different endpoint must not consume it, and
+        // the gift is still there for the call it was staged for.
+        assert_eq!(held.take_gift_for(41), None);
+        assert_eq!(held.staged_gift, Some(gift), "a mismatch must not consume");
+
+        // One-shot: the matching call takes it, and takes it once.
+        assert_eq!(held.take_gift_for(42), Some(gift));
+        assert_eq!(held.take_gift_for(42), None, "a gift rides one call");
+    }
+
+    /// A second staging replaces the first — the `ARM` rule, restated.
+    #[test]
+    fn staging_again_replaces_rather_than_accumulating() {
+        let mut held = thread(0, State::Running, Policy::Fair { weight: 1 });
+        let first = StagedGift {
+            from_slot: 3,
+            rights: 0b11,
+            badge: 7,
+            endpoint: 42,
+        };
+        let second = StagedGift {
+            from_slot: 5,
+            rights: 0b01,
+            badge: 7,
+            endpoint: 42,
+        };
+        held.staged_gift = Some(first);
+        held.staged_gift = Some(second);
+        assert_eq!(
+            held.take_gift_for(42),
+            Some(second),
+            "re-staging is how a caller says: this one instead"
+        );
+        assert_eq!(
+            held.take_gift_for(42),
+            None,
+            "and the first is gone, not queued"
+        );
     }
 }

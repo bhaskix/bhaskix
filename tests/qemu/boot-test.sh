@@ -1349,12 +1349,19 @@ fi
 # the only rule left that can refuse it. Without the declaration it would be
 # refused for not having said where -- which is what an earlier version of this
 # gate accepted, and it accepted it with the rule deleted.
-if grep -qE "handing a capability while answering nobody was refused it \(status 4\)" "$LOG"; then
-    pass "a server with no caller cannot hand a capability to anybody"
+#
+# RFC 0022 changed what the right answer is: a hand while answering nobody now
+# *stages* the capability for the thread's next call. The property watched is
+# therefore the new mechanism's promise -- the hand is accepted AND the slot
+# the driver had declared stayed empty, because a staged gift moves only at a
+# rendezvous the stager initiates. A capability landing without a call would
+# be the old bug wearing the new rule, and fails here.
+if grep -qE "a hand while answering nobody staged and installed nothing \(pair 0x2\)" "$LOG"; then
+    pass "a hand outside a reply stages, and installs nothing until a rendezvous"
 elif grep -qE "block domain +no second device" "$LOG"; then
     pass "no block domain on this machine, so nothing to hand anything"
 else
-    fail "a server not answering anybody was allowed to hand a capability"
+    fail "a hand outside a reply did not behave as RFC 0022 specifies"
     status=1
 fi
 

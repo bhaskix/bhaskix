@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Draft. **Step 1 implemented 2026-08-15** — the staging record and the caller-side `HAND`, inert until step 2's rendezvous transfer. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel, ABI |
 | **Milestone** | Phase 2 — required before [RFC 0020](0020-tcp.md)'s connection capabilities |
@@ -220,6 +220,18 @@ Each step leaves the tree green.
 
 1. **The staging record and the caller-side `HAND`**: per-thread pending gift, the role inference,
    host tests for one-shot and replace. Nothing consumes it yet.
+
+   **Done 2026-08-15.** `sched::StagedGift`, one per thread beside the declaration it mirrors;
+   `hand()` infers the role from the reply obligation — answering somebody is RFC 0016's path
+   unchanged, answering nobody stages. The semantics live as a method on `Thread` so the host
+   holds them without a runqueue: taking clears, a mismatched endpoint leaves the gift in place,
+   re-staging replaces. Both watched failing — removing the clear reddens two tests, removing the
+   address check reddens the one about it. Staging validates nothing beyond argument shape, on
+   purpose: the rendezvous derive is the authoritative check and must be, so a check here would be
+   reassurance that expires. Open question 2's refinement (the mid-reply thread calling a *third*
+   endpoint) is **not** implemented — the conservative rule ships first: any reply obligation makes
+   `HAND` a server's, so that case gets today's refusal rather than a wrong success — and the
+   question stays open with this note as its status.
 2. **The transfer at rendezvous**: declaration lookup, derive with `hand()`'s checks, install,
    refusal matrix with restoration — the atomicity property tested on the host, the end-to-end
    hand-map-write gate in QEMU.

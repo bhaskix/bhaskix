@@ -755,6 +755,24 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (RFC 0022 step 1: the staging record, and a `HAND` that knows which way it is facing)
+
+**The caller's half of the mechanism exists and is deliberately inert.** `sched::StagedGift` — one
+per thread, beside the `receive_slot` declaration it mirrors — and `hand()` now infers its role
+from the thread's state: a reply obligation makes it RFC 0016's server-hand, unchanged; no
+obligation makes it a caller staging for its next call. The semantics live as a method on `Thread`
+so the host tests hold them without a runqueue: taking clears, a mismatched endpoint leaves the
+gift in place for the call it was meant for, re-staging replaces. **Watched failing both ways** —
+deleting the clear reddens two tests, deleting the address check reddens the one about it. Kernel
+host tests: 150 become 152.
+
+**Staging validates nothing beyond argument shape, and the RFC says why in place**: the rendezvous
+derive is the authoritative check — holding, `GRANT`, monotone rights and badge — and has to be,
+because a capability revoked between staging and calling must fail *there*. A check at staging
+would be reassurance that expires. Open question 2's refinement is consciously not implemented:
+the conservative rule ships first (any reply obligation makes `HAND` a server's), so the
+mid-reply-calls-a-third-service case gets today's refusal rather than a wrong success.
+
 ### 2026-08-15 (RFC 0022 drafted: a capability in a call, because the missing direction has blocked two designs)
 
 **Decided with the user: the kernel gains the mechanism rather than `bin/tcpd` gaining buffers.**

@@ -276,6 +276,11 @@ pub mod method {
     ///
     /// One-shot: the declaration is consumed by the capability that arrives,
     /// and cleared when the call it was made for returns.
+    ///
+    /// **And the other direction, RFC 0022**: a *service* invoking this on its
+    /// own endpoint declares where a capability arriving *in a call* may land.
+    /// Same declaration, same one-shot rule, different holder — which end you
+    /// hold is the role.
     pub const EXPECT: u64 = 46;
     /// Read bytes out of memory the caller of this endpoint named.
     ///
@@ -290,6 +295,12 @@ pub mod method {
     /// taken from it. `arg0` = the server's own slot, `arg1` = rights for the
     /// copy, `arg2` = its badge. Where it lands comes from the caller's
     /// [`EXPECT`] and not from here.
+    ///
+    /// **And the other direction, RFC 0022 step 1**: a thread that is *not*
+    /// answering anybody stages instead — `arg0` = its slot, `arg1` = rights,
+    /// `arg2` = badge — one gift per thread, replaced by a second staging,
+    /// to be consumed by its next `Call` on this endpoint. Until the
+    /// rendezvous consumes gifts (step 2), a staged gift is inert.
     pub const HAND: u64 = 47;
     /// Give a derived capability to the domain this capability names.
     ///

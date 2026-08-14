@@ -2061,11 +2061,39 @@ fn hand(frame: &SyscallFrame) -> Outcome {
     let Some(server) = crate::sched::current_thread_id() else {
         return Outcome::err(Status::NoDomain);
     };
-    // Not answering anybody. A server that could hand a capability outside a
-    // call would be a server that picks its recipient, and picking the
-    // recipient is the whole authority this does not have.
-    let Some(caller) = crate::sched::reply_target(server) else {
-        return Outcome::err(Status::WrongObject);
+    // Which direction this is comes from what the thread is doing, not from an
+    // argument. A thread answering a caller is a server handing into its reply
+    // — RFC 0016's path, below, unchanged. A thread answering nobody is a
+    // **caller staging for its next call** — RFC 0022 step 1: the transfer
+    // cannot run yet, because the service thread that will take the call is
+    // not known until the rendezvous, so the kernel records intent — the slot,
+    // the rights, the badge, the endpoint — one per thread, replaced by a
+    // second staging, consumed by the next `Call` on that endpoint.
+    //
+    // Nothing validates the staged capability here beyond the arguments'
+    // shape: the derive at the rendezvous is the authoritative check (holding,
+    // `GRANT`, monotone rights and badge), and it must be — a capability
+    // revoked between staging and calling has to fail *there*, so a check here
+    // would be reassurance that expires. Until the rendezvous consumes gifts
+    // (RFC 0022 step 2), a staged gift is inert.
+    let caller = match crate::sched::reply_target(server) {
+        Some(caller) => caller,
+        None => {
+            let Ok(slot) = u32::try_from(frame.arg0) else {
+                return Outcome::err(Status::SlotUnavailable);
+            };
+            let gift = crate::sched::StagedGift {
+                from_slot: slot,
+                rights: frame.arg1 as u8,
+                badge: frame.arg2,
+                endpoint,
+            };
+            return if crate::sched::stage_gift(server, gift) {
+                Outcome::ok(frame.arg0)
+            } else {
+                Outcome::err(Status::NoDomain)
+            };
+        }
     };
     let Some(recipient) = crate::sched::domain_of(caller) else {
         return Outcome::err(Status::NoDomain);

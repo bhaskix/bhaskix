@@ -447,18 +447,32 @@ extern "C" fn blkd_main() -> ! {
     // deleted, because the missing declaration refused it instead. Declared,
     // the only thing standing between this program and handing itself a
     // capability is the rule being watched.
+    //
+    // **The rule changed with RFC 0022, and this test changed with it.** A
+    // `HAND` while answering nobody used to be refused outright; it now
+    // *stages* the capability for this thread's next call and returns OK --
+    // and installs nothing anywhere. So the property watched here is the new
+    // mechanism's actual promise: the hand is accepted, and the declared slot
+    // stays empty, because a staged gift moves only at a rendezvous the
+    // stager initiates. A capability appearing in SPARE without a call would
+    // be the old bug wearing the new rule.
     let _ = call_two(
         syscall::INVOKE,
         BLOCK_ENDPOINT,
         method::EXPECT,
         [SPARE, 0, 0, 0],
     );
-    let (not_answering, _) = call_two(
+    let (staged, _) = call_two(
         syscall::INVOKE,
         BLOCK_ENDPOINT,
         method::HAND,
         [CONFIG, rights::READ, 0, 0],
     );
+    let (spare_probe, _) = call_two(syscall::INVOKE, SPARE, method::INFO, [0; 4]);
+    // One word for the pair: the hand's status in the high byte, what the
+    // declared slot held afterwards in the low. The expected value is
+    // 0 << 8 | NO_SUCH_CAPABILITY -- accepted, and nothing landed.
+    let not_answering = staged * 256 + spare_probe;
 
     report(
         found,
