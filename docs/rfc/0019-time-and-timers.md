@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | ✅ **Accepted 2026-08-14**, with all four steps implemented: the deadline table, `ARM`/`DISARM` and expiry, `bin/dhcp` waiting on a duration instead of a loop count, and the measurement. **Its own open question 2 is answered against it** — a deadline is honoured to the millisecond in the direction correctness depends on, never early, and to nothing better than a third of a second in the direction usefulness depends on, because nothing re-programs the timer when a deadline is armed. That is recorded below rather than presented as a resolution. Questions 1 and 3 stay open. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`notify`, `time`, `syscall`) |
 | **Milestone** | Phase 2 — required before TCP (RFC 0020), and before any service that must give up waiting |
@@ -162,6 +162,16 @@ arm one, and a scan of a small fixed table where the timer interrupt already run
 distribution rather than a mean — `report_service_cost` in `kernel/src/lib.rs` records why a mean is
 the weaker statistic for anything a scheduler can preempt.
 
+**Measured at step 4**; the numbers and what they mean are under unresolved question 2, because they
+answer it. One warning belongs here, for whoever measures this next. A measuring loop that arms its
+next deadline the moment the last one fires is arming *inside the expiring tick's own handler*,
+before that handler reaches `rearm` — which then finds a deadline waiting and programs the hardware
+for it exactly. The first version of this measurement did that and reported a median lateness of
+0.1 ms on a machine ticking every 100 ms, which is not a number that can happen: fourteen samples in
+sixteen cannot each land in a 0.2 ms window by chance. It was measuring the loop, not the timer. The
+measurement now waits a growing interval before each arm, so the arrivals are spread over the phase
+of the machine's own timers instead of locking to one point in it.
+
 ## Testing plan
 
 - **Host**: the deadline table — arming, replacing, disarming, expiry ordering, and a full table
@@ -181,16 +191,44 @@ the weaker statistic for anything a scheduler can preempt.
 2. **What resolution is promised?** This RFC promises only "not before the deadline", which is the
    half correctness depends on.
 
-   **Measured at step 2, and the number is bad: a deadline armed for 20 ms fired after 142–173 ms.**
+   **Measured at step 2, and the number was bad: a deadline armed for 20 ms fired after 142–173 ms.**
    Expiry runs on the timer interrupt, and arming from a system call does not re-program the
    hardware, so a deadline waits for a tick that was going to happen anyway. Folding the soonest
    armed deadline into the tickless re-arm decision was necessary and not sufficient — `rearm` itself
    only runs *on* a tick.
 
+   **Measured properly at step 4, and the shape is worse than one number could show.** Sixteen
+   samples at each of five durations, on a four-processor QEMU machine, run twice — during bring-up
+   and again with the services up (`make iso CMDLINE=timers=measure`):
+
+   ```
+     0.100 ms deadline: late by 282.503 / 328.029 / 372.759 ms (min/median/max), 16 samples
+     1.000 ms deadline: late by 279.949 / 325.155 / 367.769 ms
+     5.000 ms deadline: late by 277.159 / 324.757 / 361.815 ms
+    20.000 ms deadline: late by 263.203 / 306.999 / 347.603 ms
+   100.000 ms deadline: late by 181.407 / 226.033 / 268.388 ms
+   ```
+
+   **The lateness is not a cost, it is the deadline being ignored.** Read down the column: as the
+   deadline grows by 100 ms the lateness falls by 102 ms. The form is `lateness ≈ C − d`, with `C`
+   around 330 ms — which is to say the **wake instant is the same instant whatever the deadline
+   was**. A program asking for 0.1 ms and a program asking for 100 ms are woken together.
+
+   `C` is then no mystery. Over the 26 seconds of the measurement the timer was armed for a computed
+   deadline **zero** times: every interrupt on the machine was an idle CPU's `IDLE_BACKSTOP_MS`
+   one-second backstop, four of them staggered, giving one tick somewhere every 250–330 ms. The
+   promise this RFC can honestly make today is therefore **"not before the deadline, and before the
+   backstop"** — one second, not one anything-else.
+
+   Step 2's fold of `earliest_deadline` into `rearm` is weaker than "not sufficient": in this regime
+   it never runs. `on_tick` expires the deadline before calling `rearm`, so by the time `rearm` asks
+   what is armed, the answer is nothing.
+
    Closing the gap means the `ARM` path re-programming this processor's timer when the new deadline
    is sooner than what it is armed for. That is a small change in an interrupt-adjacent path, and it
-   is exactly the workload `M4-10b`'s wheel is waiting for, so it is left to step 4's measurement
-   rather than guessed at here.
+   is exactly the workload `M4-10b`'s wheel is waiting for. **Step 4's measurement is what justifies
+   it**, and the justification is not the median: it is that the deadline currently has no effect on
+   the wake at all.
 3. **Does a timer survive being handed on?** A notification capability can be derived and passed;
    whether an armed deadline is a property of the object or of the granting is not decided, and
    nothing needs it yet.
@@ -207,6 +245,9 @@ Each step leaves the tree green.
    caller, and the one that shows the difference: its patience becomes a duration in the source
    rather than a number tuned by experiment.
 4. **The measurement** — wake delay at several durations, as a distribution, recorded in TRACKER.
+   Done 2026-08-14, gated behind `timers=measure` on the command line because it costs the best part
+   of a minute and answers a question that is asked once. It found that the deadline does not affect
+   the wake instant at all; see unresolved question 2.
 
 Steps 1 and 2 are the mechanism. Step 3 is the justification. Step 4 is what lets `M4-10b` be
 designed against a workload rather than a guess.

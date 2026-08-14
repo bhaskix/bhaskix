@@ -153,7 +153,7 @@ fairness within 2% for two equal-weight workloads.
 | M4-09 | Sleeping, wait queues, blocking | ✅ `DONE` | `Blocked` state, `WaitQueue`, cross-CPU wake. Ring self-test over 4 CPUs. **Negative-tested**: disabling `wake` gives laps `[1,1,1,0]`, 0 wakeups. |
 | M4-09b | Reschedule IPI on wake | ✅ `DONE` | Required by M4-10: a tickless CPU can only be woken by an interrupt. Ring throughput rose from 84 to 736 laps. |
 | M4-10 | Tickless idle, one-shot timers | ✅ `DONE` | One-shot APIC timer, per-CPU deadlines, `sleep_micros`, reschedule IPI. **0 ticks over 400 ms idle vs 320–483 busy**; negative-testable as a ratio. |
-| M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape. ~~There is no network stack.~~ **There is one as of 2026-08-13**, and [RFC 0019](docs/rfc/0019-time-and-timers.md) is where the workload comes from: TCP will want a timer per connection. The wheel is still not built, and now it can be designed against something. |
+| M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape. ~~There is no network stack.~~ **There is one as of 2026-08-13**, and [RFC 0019](docs/rfc/0019-time-and-timers.md) is where the workload comes from: TCP will want a timer per connection. The wheel is still not built, and now it can be designed against something. **And against a number, as of 2026-08-14**: RFC 0019 step 4 measured a deadline as late by `C − d` with `C ≈ 325 ms`, which is to say the wake instant does not depend on the deadline at all, because nothing re-programs the timer when one is armed. |
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
 
@@ -741,6 +741,67 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-14 (RFC 0019 step 4: the measurement, and the deadline turns out not to matter)
+
+**RFC 0019 is accepted, and its own open question 2 is answered against it.** Sixteen samples at
+each of five durations, twice a boot — once during bring-up, once with the services up — behind
+`timers=measure` on the command line, because it costs the best part of a minute and answers a
+question that is asked once. `make iso CMDLINE=timers=measure`.
+
+Three runs, and the bring-up half of them is reproducible to the tick: 80 machine ticks, 26.63
+seconds, every time.
+
+```
+    timer delay    bring-up,   0.100 ms deadline: late by 275.698 / 324.292 / 377.936 ms (min/median/max)
+    timer delay    bring-up,   1.000 ms deadline: late by 272.990 / 321.327 / 378.078 ms
+    timer delay    bring-up,   5.000 ms deadline: late by 270.011 / 320.833 / 372.428 ms
+    timer delay    bring-up,  20.000 ms deadline: late by 255.974 / 303.735 / 358.463 ms
+    timer delay    bring-up, 100.000 ms deadline: late by 174.431 / 221.520 / 279.632 ms
+```
+
+**Read down the column rather than across it.** The deadline grows by a factor of a thousand and the
+lateness *falls by exactly what the deadline gained*: 324.3 − 221.5 = 102.8 ms for a deadline
+100 ms longer, and 324.3 − 303.7 = 20.6 ms for one 20 ms longer. The form is `lateness ≈ C − d`,
+with `C` about 325 ms, which says the thing the medians alone do not: **the wake instant is the same
+instant whatever the deadline was**. A program asking for a tenth of a millisecond and a program
+asking for a tenth of a second are woken together. The deadline is not late, it is ignored.
+
+**And `C` is not a mystery, because the same line counts it.** Over the 26 seconds of the
+measurement the timer was armed for a computed deadline **zero** times. Every interrupt on the
+machine was an idle CPU's one-second `IDLE_BACKSTOP_MS`, four of them staggered — one tick somewhere
+every 253–333 ms, which is `C`. The honest promise today is *"not before the deadline, and before
+the backstop"*: one second, not one anything-else.
+
+**This is stronger than what step 2 recorded**, and that entry is corrected by it rather than
+edited. Step 2 said folding the soonest armed deadline into `rearm` was "necessary and not
+sufficient". It is not merely insufficient — in this regime it never runs: `on_tick` expires the
+deadline *before* it calls `rearm`, so when `rearm` asks what is armed the answer is nothing. Step
+2's 142–173 ms was one sample per boot, and eleven boots today drew between 150.261 and 193.284 ms —
+all consistent with single draws from the distribution above, and none of them a resolution.
+
+**A measurement of mine was wrong before it was published, and the wrongness is the interesting
+part.** The first version had no gap between samples: it armed the next deadline the moment the last
+one fired, which is *inside the expiring tick's own handler*, microseconds before that handler
+reaches `rearm`. `rearm` then found a deadline waiting and programmed the hardware for it exactly,
+and the next sample fired on time. It reported a **median lateness of 0.1 ms on a machine ticking
+every 100 ms** — impossible, and the reason it was caught: fourteen samples in sixteen cannot each
+land inside a 0.2 ms window by chance, and the tick counter said each sample consumed exactly one
+tick. It was a self-clocking chain between the poll loop and the handler. Nothing that blocks in
+`Recv` arms its next deadline a microsecond after the last one fired. The loop now waits a growing
+interval before each arm, so arrivals are spread across the phase of the machine's own timers
+instead of locking to one point in it.
+
+**What it costs the callers that exist.** `bin/dhcp`'s `RETRY_MS = 20` is not 20 ms, it is about
+330; its `PATIENCE_MS = 3_000` is nine retries rather than a hundred and fifty. It still gets an
+address, so nothing is broken — but its patience is again a number that does not mean what it says,
+which is the exact complaint RFC 0019 was written to fix.
+
+**What it costs the caller that does not exist yet, and this is the finding that matters.** TCP
+cannot measure a round trip it can only observe to a third of a second, so a retransmission timeout
+derived from one would be noise. **Re-programming the timer from the `ARM` path is therefore a
+prerequisite for RFC 0020, not an optimisation of RFC 0019**, and `M4-10b`'s wheel now has both a
+workload and a number to beat.
 
 ### 2026-08-13, last (found: the address space was loaded before the thread recorded owning it)
 

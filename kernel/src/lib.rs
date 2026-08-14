@@ -505,6 +505,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !deadline_self_test() {
         println!("\x1b[91m    deadline       FAILED\x1b[0m");
     }
+    if !measure_deadlines(handoff, "bring-up") {
+        println!("\x1b[91m    timer delay    FAILED\x1b[0m");
+    }
     if input_ready {
         // Which notification each signal hit, and what its waiter slot held.
         // `UNWAITED` counts signals that found nobody; with a console and a
@@ -5345,6 +5348,250 @@ fn deadline_self_test() -> bool {
     true
 }
 
+/// RFC 0019 step 4: how late a deadline is, across four orders of magnitude.
+///
+/// Step 2 measured one duration once and got 157 ms for a 20 ms deadline. One
+/// number cannot say whether that is a cost proportional to the wait, a fixed
+/// overhead, or a quantisation — and those three want three different fixes.
+/// So this arms the same notification at 0.1, 1, 5, 20 and 100 ms, sixteen
+/// times each, and reports the lateness as a **distribution**.
+///
+/// A mean would hide the answer. `report_service_cost` says why at length for
+/// the scheduler; here the specific reason is that if lateness is quantised by
+/// something the deadline does not control, the spread runs from nearly zero
+/// to nearly a whole period and the mean lands in the middle, looking like a
+/// tidy fixed cost that no fix would remove.
+///
+/// **The tick interval is reported beside it, and that is the hypothesis under
+/// test.** Expiry runs where the timer interrupt already runs, and arming does
+/// not re-program the hardware, so the prediction is that lateness is the wait
+/// for a tick that was going to happen anyway — bounded by the tick interval,
+/// independent of the deadline. Printing the interval next to the lateness is
+/// what lets that be read off rather than argued.
+///
+/// Two intervals, because expiry is not this CPU's job alone: the table is
+/// global and `on_tick` scans it on **every** processor, so a deadline is
+/// serviced by whichever tick lands first anywhere. The machine's interval is
+/// therefore the one that predicts the lateness, and this CPU's is what a
+/// reader would otherwise assume it was.
+///
+/// **Run twice, and the difference is the point.** Once during bring-up, where
+/// little is running and a tickless machine can be silent for most of a
+/// second; once with the services up, which is the machine a caller actually
+/// meets. A timer measured only on an idle machine is measured in the one
+/// configuration nothing uses.
+///
+/// **Polled by spinning, not by `wait_millis`**, which sleeps a millisecond at
+/// a time — larger than the shortest deadline here. A measurement quantised by
+/// its own polling loop would be reporting the loop.
+///
+/// **Gated on `timers=measure`.** Sixteen samples at five durations costs
+/// seconds when each one waits out a tick, and a boot gate that slow would be
+/// paid on every run by everyone to answer a question that is asked once.
+fn measure_deadlines(handoff: &Handoff, when: &str) -> bool {
+    const BADGE: u64 = 1 << 6;
+    /// Four orders of magnitude on purpose: if the lateness is the same at all
+    /// of them, it is not a property of the duration.
+    const DURATIONS_US: [u64; 5] = [100, 1_000, 5_000, 20_000, 100_000];
+    const SAMPLES: usize = 16;
+    /// How far past its deadline a sample is waited for before it is called
+    /// lost. Generous, because the point is to measure lateness and a bound
+    /// that cut the tail off would flatter the number this exists to report.
+    const PATIENCE_US: u64 = 3_000_000;
+
+    if !handoff
+        .cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == "timers=measure")
+    {
+        return true;
+    }
+
+    let Some(hertz) = bhaskix_arch::tsc::hertz() else {
+        println!("    timer delay    no calibrated timer; nothing measured");
+        return true;
+    };
+    let Some(patience) = bhaskix_arch::tsc::from_micros(PATIENCE_US) else {
+        println!("    timer delay    no calibrated timer; nothing measured");
+        return true;
+    };
+    let Ok(notification) = notify::create() else {
+        println!("\x1b[91m    timer delay    FAILED: no notification to arm\x1b[0m");
+        return false;
+    };
+
+    let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / hertz.max(1);
+    let cpu = bhaskix_arch::percpu::cpu_id();
+    let ticks_before = trap::ticks_on(cpu);
+    let machine_ticks_before = trap::ticks();
+    // Re-arms, which are **not** the same as ticks and are the thing that
+    // turned out to matter. `rearm` folds `notify::earliest_deadline` into
+    // whatever it programs, and it runs on every reschedule IPI as well as on
+    // every tick -- so a deadline armed just before an unrelated re-arm is
+    // programmed into the hardware after all, without the `ARM` path having
+    // asked for it. Counting them is what tells that story from the alternative
+    // one, where lateness is simply the wait for the next tick.
+    let arms_before = time::armed();
+    let started = bhaskix_arch::tsc::read();
+    let mut early = 0u64;
+    let mut lost = 0u64;
+
+    for duration_us in DURATIONS_US {
+        let Some(wait) = bhaskix_arch::tsc::from_micros(duration_us) else {
+            continue;
+        };
+        let mut late = [0u64; SAMPLES];
+        let mut taken = 0usize;
+        // Ticks that landed anywhere on the machine between arming a deadline
+        // and seeing it fire, summed over the samples.
+        //
+        // This is the question the aggregate counters could not answer. Expiry
+        // runs only in `on_tick`, so every sample must contain at least one.
+        // **One per sample means the tick was the deadline's own** -- something
+        // programmed the hardware for it. Many per sample means it waited for
+        // ticks that were happening for other reasons, which is what the RFC
+        // recorded as the diagnosis.
+        let mut ticks_waited = 0u64;
+
+        for sample in 0..SAMPLES {
+            // **Wait before arming, and this gap is the measurement working at
+            // all.** Without it every sample is armed microseconds after the
+            // previous one expired -- which is inside the expiring tick's own
+            // handler, before it reaches `rearm`. That re-arm then picks up the
+            // deadline armed moments ago and programs the hardware for it
+            // exactly, and the next sample fires on time.
+            //
+            // The first version of this had no gap and reported a median
+            // lateness of 0.1 ms with a 100 ms tick interval, which is
+            // impossible for a deadline waiting on background ticks: 14 samples
+            // in 16 cannot each land a 0.2 ms window by chance. What it had
+            // measured was a self-clocking chain between its own poll loop and
+            // the handler, not what a caller gets. Nothing that blocks in `Recv`
+            // arms its next deadline a microsecond after the last one fired.
+            //
+            // The gap grows with the sample so the arrivals are spread across
+            // whatever phase the machine's own timers are in rather than
+            // locking to one point in it.
+            if let Some(gap) = bhaskix_arch::tsc::from_micros(1_000 + sample as u64 * 917) {
+                let until = bhaskix_arch::tsc::read().saturating_add(gap);
+                while bhaskix_arch::tsc::read() < until {
+                    core::hint::spin_loop();
+                }
+            }
+
+            let ticks_at_arm = trap::ticks();
+            let due = bhaskix_arch::tsc::read().saturating_add(wait);
+            if notify::arm(notification, due, BADGE).is_err() {
+                break;
+            }
+
+            let mut fired_at = None;
+            loop {
+                if notify::poll(notification) & BADGE != 0 {
+                    // Read *after* seeing it fire, so the error is a poll's
+                    // worth of overestimate rather than an underestimate. A
+                    // timer measured as earlier than it was is the direction
+                    // that would hide the failure this whole RFC guards.
+                    fired_at = Some(bhaskix_arch::tsc::read());
+                    break;
+                }
+                if bhaskix_arch::tsc::read() > due.saturating_add(patience) {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+
+            let Some(fired_at) = fired_at else {
+                notify::disarm(notification);
+                lost += 1;
+                continue;
+            };
+            if fired_at < due {
+                // Never expected, and counted rather than clamped: a negative
+                // lateness saturated to zero would read as a very good result.
+                early += 1;
+                continue;
+            }
+            late[taken] = fired_at - due;
+            ticks_waited += trap::ticks().saturating_sub(ticks_at_arm);
+            taken += 1;
+        }
+
+        if taken == 0 {
+            println!(
+                "\x1b[93m    timer delay    {when}, {}.{:03} ms deadline: no samples\x1b[0m",
+                duration_us / 1000,
+                duration_us % 1000
+            );
+            continue;
+        }
+
+        // Insertion sort. Sixteen values in a fixed array, no allocator, and
+        // the median is the statistic this is for.
+        let samples = &mut late[..taken];
+        for i in 1..samples.len() {
+            let mut j = i;
+            while j > 0 && samples[j - 1] > samples[j] {
+                samples.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        let (low, mid, high) = (
+            micros(samples[0]),
+            micros(samples[taken / 2]),
+            micros(samples[taken - 1]),
+        );
+        println!(
+            "    timer delay    {when}, {}.{:03} ms deadline: late by {}.{:03} / {}.{:03} / \
+             {}.{:03} ms (min/median/max), {taken} samples, {}.{:02} ticks a sample",
+            duration_us / 1000,
+            duration_us % 1000,
+            low / 1000,
+            low % 1000,
+            mid / 1000,
+            mid % 1000,
+            high / 1000,
+            high % 1000,
+            ticks_waited * 100 / taken as u64 / 100,
+            ticks_waited * 100 / taken as u64 % 100,
+        );
+    }
+
+    notify::disarm(notification);
+    notify::destroy(notification);
+
+    // The tick interval this CPU actually ran at, over the whole measurement.
+    // The comparison to make is against the medians above.
+    let elapsed = micros(bhaskix_arch::tsc::read().saturating_sub(started));
+    let mine = trap::ticks_on(cpu).saturating_sub(ticks_before);
+    let machine = trap::ticks().saturating_sub(machine_ticks_before);
+    // Zero re-arms is the interesting answer rather than a missing one, so it
+    // is said in words. A rate printed as `one every 0.000 ms` would read as
+    // continuous re-arming, which is the opposite of what it means.
+    let arms = time::armed().saturating_sub(arms_before);
+    println!(
+        "    timer delay    {when}, over {}.{:03} ms: cpu {cpu} ticked {mine} times, the machine \
+         {machine} times (one every {}.{:03} ms), and the timer was armed for a computed deadline \
+         {arms} times",
+        elapsed / 1000,
+        elapsed % 1000,
+        elapsed.checked_div(machine).unwrap_or(0) / 1000,
+        elapsed.checked_div(machine).unwrap_or(0) % 1000,
+    );
+    if lost > 0 {
+        println!(
+            "\x1b[93m    timer delay    {when}, {lost} deadlines never fired within {} ms of \
+             being due\x1b[0m",
+            PATIENCE_US / 1000
+        );
+    }
+    if early > 0 {
+        println!("\x1b[91m    timer delay    FAILED: {early} fired early, {when}\x1b[0m");
+        return false;
+    }
+    true
+}
+
 /// Reads what the network driver wrote, and says so.
 ///
 /// Two separate findings, reported on two separate lines **on purpose**. A
@@ -7232,6 +7479,14 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             service::VFS_PLACEMENT
         );
     }
+    // RFC 0019 step 4, the second half: the same measurement on a machine with
+    // its services running. The first ran during bring-up, where a tickless
+    // CPU can be silent for most of a second; this one is the machine every
+    // caller of a deadline actually meets.
+    if !measure_deadlines(handoff, "services up") {
+        println!("\x1b[91m    timer delay    FAILED\x1b[0m");
+    }
+
     // Endpoint queues, after every domain the tests build and tear down.
     //
     // Placed here for the same reason the second lock-order check is placed
