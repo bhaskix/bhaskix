@@ -9488,6 +9488,28 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     let kernel = iommu::kernel_extent(handoff);
     let (reserved, refused) = iommu::map_reserved(&window, &found, kernel, hhdm);
 
+    // **Reset the delegated disk before translation exists at all.** The
+    // firmware drove it looking for a boot sector and left its rings live at
+    // physical addresses. The paragraph below already knows what that means at
+    // the transition — one stray DMA, expected and cleared — but a live ring
+    // is not one-shot: the device model can look at it again whenever it is
+    // next poked, and the second look arrives mid-boot as an unowned fault at
+    // an address whose appearance depends on image layout and nothing visible.
+    // Found as `00:03.0 read 0xffd9000` the day RFC 0020's third domain
+    // shifted the image; reason 0x06 with translation up, 0x02 when the reset
+    // came after enable and the flush beat the context entry. Reset first,
+    // and the firmware's configuration is gone before there is anything to
+    // fault against. `bin/blkd` still does its own full reset when it claims
+    // the device, exactly as before.
+    if let Some((second, _)) = virtio::find_nth(1)
+        && !virtio::quiesce_delegated(second, hhdm)
+    {
+        println!(
+            "\x1b[93m    iommu          the delegated disk would not quiesce; the firmware's \
+             rings may still be live behind the translation\x1b[0m"
+        );
+    }
+
     // SAFETY: the window is built and verified, and its tables are never
     // freed. Nothing is doing DMA yet -- the device has not been programmed.
     if let Err(reason) = unsafe { iommu::enable(&found, &window, hhdm) } {

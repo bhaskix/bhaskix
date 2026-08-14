@@ -492,6 +492,48 @@ pub fn layout(address: pci::Address) -> Option<Layout> {
     })
 }
 
+/// Resets a device this kernel does not drive, so translation can be put in
+/// front of it safely.
+///
+/// # Why this exists, found the hard way
+///
+/// The firmware drives every bootable virtio disk while it looks for a boot
+/// sector, and it does not reset them when it is done: the device keeps the
+/// firmware's rings, live, at physical addresses the firmware chose. That is
+/// harmless right up until an IOMMU starts translating for the device — the
+/// old ring addresses translate to nothing, and the next time the device looks
+/// at its ring the unit reports a read fault at an address this kernel never
+/// mapped. `init_mapped` already knew this for the kernel's own device — its
+/// comment calls the result "a fault nobody owns" — and reset before enabling
+/// translation. The *delegated* device had nobody doing the same, and the
+/// fault duly arrived with nobody owning it: `00:03.0 read 0xffd9000`, the
+/// firmware's ring, deterministic per image layout and absent the moment the
+/// layout shifted enough that the stale ring was never touched.
+///
+/// A status write of zero is the whole of a virtio reset. The device forgets
+/// its queues, and its only configuration from here on is whatever the driver
+/// that eventually claims it writes — which for the delegated disk is
+/// `bin/blkd`, doing its own full bring-up exactly as before.
+///
+/// Returns whether the reset was performed and read back as zero.
+pub fn quiesce_delegated(address: pci::Address, hhdm: u64) -> bool {
+    let Some(layout) = layout(address) else {
+        return false;
+    };
+    let Some(common_at) = crate::mmio::map(layout.common.0, layout.common.1, hhdm) else {
+        return false;
+    };
+    // SAFETY: `mmio::map` returned a mapping of this device's common
+    // configuration structure. Writing zero to the status register is the
+    // reset the specification defines, and reading it back is the check the
+    // specification permits.
+    unsafe {
+        let common = CommonCfg::<bhaskix_device::Volatile>::new(common_at as usize);
+        common.device_status.write(0);
+        common.device_status.read() == 0
+    }
+}
+
 /// Finds the `skip`-th virtio block device on the bus, in bus order.
 ///
 /// The kernel drives the first and hands the second to a domain. Two drivers
