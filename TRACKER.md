@@ -742,6 +742,50 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-13, last (found: the address space was loaded before the thread recorded owning it)
+
+**The bug is an ordering mistake of two lines**, in `vm::install`:
+
+```rust
+let previous = unsafe { paging::switch_address_space(root) };   // CR3 loaded
+*PREVIOUS_ROOT.lock() = previous;                                // a lock, mid-window
+if let Some(me) = crate::sched::current_thread_id() {
+    crate::sched::set_space_root(me, root);                      // recorded only here
+```
+
+A thread preempted between the switch and the record — and there is a **lock acquisition sitting in
+the middle of that window** — has `CR3` pointing at its new space while its recorded root is still
+zero. `finish_switch` then calls `enter_space(0)`, which returns without touching `CR3`, so the
+thread resumes in whichever space the thread before it left loaded. It then records its own root a
+moment later and enters ring 3 in somebody else's address space.
+
+**The fix is to record before loading.** Safe in both orders: a thread preempted between the two
+lines now resumes with `finish_switch` loading the root it has just recorded, which is the one it was
+about to switch to anyway.
+
+**Every observation matches, and that is why this one is believed after four that were not.**
+
+| Observation | Explained by |
+|---|---|
+| Always at a program's **entry point**, never inside it | the window is in `install`, just before the first entry to ring 3 |
+| The thread **has** a recorded space when it faults | `set_space_root` runs on resume, after the damage |
+| Rare, and commoner at `-smp 2` | needs a preemption inside a few-instruction window |
+| Mid-instruction execution at `0x10000093` | with all eight programs at one address the wrong space had *an* executable page there |
+| `0 switches with no thread at all` | the runqueue was never wrong; the recorded root was |
+
+**Verified: 0 faults in 50 boots** at `-smp 2`, against roughly one in ten to one in twenty-five
+before — and this time counted with the kernel's own message rather than the grep that produced the
+false "0 in 24" earlier the same day.
+
+**What found it was the instrument, not the reasoning.** Four analyses were wrong: the environment,
+the copies, the missing wakeup, and emulator aliasing. What worked was a check at every path back to
+ring 3 that says which one let a thread through with the wrong space — and it named the first entry
+on the first capture. The check stays, and reports on every boot.
+
+**The two days this cost are the argument for one line.** `docs/coding-style.md` could reasonably
+gain: *state that a thread owns a resource before you give it the resource*. The symptom was every
+`services` assertion reading `0 bytes`, which is why it was read as a filesystem bug for two days.
+
 ### 2026-08-13, last (the exit check: three sites, no cost, and silent so far)
 
 Every path back to ring 3 now checks that the thread about to run owns the address space that is
@@ -1622,8 +1666,9 @@ program nobody meant to write.
 
 **An intermittent failure, recorded rather than waited out.** Twice on 2026-08-12–13 an `iommu`
 boot failed with every `services` assertion reading `0 bytes, 0 entries` and `vfsd` blocked, and
-both times the following runs were clean. **Localised on 2026-08-13 — see the entry above — and
-still not fixed.**
+both times the following runs were clean. **Diagnosed and fixed on 2026-08-13**: a thread could
+enter ring 3 in another domain's address space, because `vm::install` loaded `CR3` before recording
+that the thread owned it. See the entry above.
 
 ### 2026-08-12, last (RFC 0018 step 6: an address obtained by a program that holds a socket)
 

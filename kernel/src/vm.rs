@@ -726,15 +726,35 @@ pub unsafe fn install(space: AddressSpace) {
             }
         }
     }
+    // **Recorded before it is loaded, and the order is the whole fix.**
+    //
+    // This ran the other way round: `switch_address_space` first, then a lock,
+    // then `set_space_root`. A thread preempted inside that window -- and the
+    // lock acquisition is a preemption point sitting in the middle of it --
+    // had `CR3` pointing at its new space while its recorded root was still
+    // zero. `finish_switch` then calls `enter_space(0)`, which returns without
+    // touching `CR3`, so on resume the thread inherited whichever space the
+    // thread before it had left loaded, recorded its own root a moment later,
+    // and entered ring 3 in somebody else's address space.
+    //
+    // Recording first is safe in both orders: a thread preempted between these
+    // two lines resumes with `finish_switch` loading the root it has just
+    // recorded, which is the one it is about to switch to anyway.
+    //
+    // Found on 2026-08-13 after two days in which the symptom -- every
+    // `services` assertion reading `0 bytes` -- was read as a filesystem bug.
+    // With all eight programs linked at the same address the wrong space still
+    // had *an* executable page at the program counter, so the thread quietly
+    // ran another program's instructions instead of faulting.
+    if let Some(me) = crate::sched::current_thread_id() {
+        crate::sched::set_space_root(me, root);
+    }
+
     // SAFETY: delegated to the caller's obligation above.
     let previous = unsafe { paging::switch_address_space(root) };
     *PREVIOUS_ROOT.lock() = previous;
 
-    // The thread carries its root from here on, so that a context switch can
-    // put it back. Without this a user thread resumes in whichever space ran
-    // last on that CPU -- which, with one user program, is always its own.
     if let Some(me) = crate::sched::current_thread_id() {
-        crate::sched::set_space_root(me, root);
         // And against the domain, so that `domain::end` can give the slot back.
         // Here rather than at the seven call sites, for the same reason the
         // line above is here: this is the one place that puts a space in the

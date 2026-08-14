@@ -191,7 +191,18 @@ fn handle(frame: &mut TrapFrame) {
         let address = read_cr2();
 
         match crate::vm::handle_fault(address, write) {
-            crate::vm::FaultOutcome::Handled => return,
+            crate::vm::FaultOutcome::Handled => {
+                // **The fourth way back to ring 3, and the one the other three
+                // did not cover.** A demand-paging fault taken in user mode is
+                // serviced here and the instruction retried — a return to user
+                // mode that is neither a system call nor an interrupt. If a
+                // thread can arrive in the wrong space at all, this path had to
+                // be ruled in or out like the others.
+                if frame.from_user_mode() {
+                    crate::sched::check_user_space(3);
+                }
+                return;
+            }
             crate::vm::FaultOutcome::NotOurs => {
                 // The region map could not service it. Before treating the
                 // fault as a bug, check whether the faulting instruction is
@@ -502,8 +513,9 @@ fn report_exception(frame: &mut TrapFrame) {
             crate::sched::replay_exit_checks(|site, thread, loaded| {
                 let where_ = match site {
                     0 => "syscall",
-                    1 => "trap",
-                    _ => "first entry",
+                    1 => "interrupt",
+                    2 => "first entry",
+                    _ => "serviced fault",
                 };
                 println!("      exit: t{thread} left {where_} with {loaded:#x} loaded");
             });

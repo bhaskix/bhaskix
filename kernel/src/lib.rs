@@ -530,8 +530,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             sched::replay_exit_checks(|site, thread, loaded| {
                 let where_ = match site {
                     0 => "syscall",
-                    1 => "trap",
-                    _ => "first entry",
+                    1 => "interrupt",
+                    2 => "first entry",
+                    _ => "serviced fault",
                 };
                 println!("      exit: t{thread} left {where_} with {loaded:#x} loaded");
             });

@@ -1651,9 +1651,14 @@ static EXIT_UNCHECKED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// thread resumed with a space recorded and a different one loaded, which means
 /// some return path does not load it; this is the check that names which.
 ///
-/// `site` says which exit: 0 for the system call path, 1 for the trap path, and
-/// 2 for the first entry to ring 3 — which is where every capture of this fault
-/// has been, at a program's own entry point rather than inside it.
+/// `site` says which way back to ring 3: 0 the system call return, 1 the
+/// interrupt return, 2 the first entry — which is where every capture of this
+/// fault has been, at a program's own entry point rather than inside it — and 3
+/// a serviced page fault, where the instruction is retried.
+///
+/// Four sites, because "the wrong space is loaded" cannot be narrowed by
+/// reasoning about which return path is likely; each one either accounts for it
+/// or does not.
 ///
 /// Takes the local runqueue with `try_lock` and gives up rather than waiting.
 /// This runs on the trap exit, which may have interrupted a thread holding that
