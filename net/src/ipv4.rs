@@ -52,7 +52,13 @@ pub struct Protocol(pub u8);
 impl Protocol {
     /// ICMP.
     pub const ICMP: Self = Self(1);
-    /// TCP, recognised so it can be counted. RFC 0019 will parse it.
+    /// TCP, recognised so it can be counted. [RFC 0020] parses it.
+    ///
+    /// This said RFC 0019 until 2026-08-14. Timers took that number on
+    /// 2026-08-13, because TCP could not be written without them, and this
+    /// reference was missed when the others were corrected.
+    ///
+    /// [RFC 0020]: ../../docs/rfc/0020-tcp.md
     pub const TCP: Self = Self(6);
     /// UDP.
     pub const UDP: Self = Self(17);

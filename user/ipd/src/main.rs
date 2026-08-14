@@ -618,8 +618,15 @@ struct Socket {
 
 /// Takes whatever has arrived and gives each datagram to the socket it is for.
 ///
-/// Called from inside a client's `RECV_FROM`, because that is the only event
-/// this service can act on while asleep on its endpoint.
+/// Called from a client's `RECV_FROM` **and** from the wake a frame rings.
+///
+/// This said "called from inside a client's `RECV_FROM`, because that is the
+/// only event this service can act on while asleep on its endpoint" until
+/// 2026-08-14. That stopped being true on 2026-08-13, when RFC 0010's question
+/// 1 was answered and `serve` gained the `NOTIFIED` arm that drains without
+/// anybody asking — see `serve`, which is the other caller. A comment
+/// describing the constraint a change removed is worse than no comment: it
+/// tells the next reader the service still cannot do the thing it now does.
 ///
 /// A datagram is matched to a socket by **destination port**. A broadcast
 /// destination is accepted as well as this interface's own address: a client

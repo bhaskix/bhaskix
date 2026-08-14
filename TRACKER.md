@@ -121,6 +121,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **PM1** | Process management | ✅ **Accepted** 2026-08-07 | **Create, grant, start, kill, reap** — each an operation on a capability, none a new syscall kind. No `fork` (it duplicates a capability space by implication, which is ambient authority through the back door), no pid (the process tree is the capability tree), no signals ("stop" is `KILL` on a capability you hold; "something happened" is a `Notification`). `DomainControl` hands out `Domain` capabilities, the shape RFC 0011 and RFC 0012 already use. Accepted with **all six steps implemented and gated**, which is why it is accepted rather than argued: four of its own claims were wrong and were corrected by building them — the process tree was *not* transitive over created domains, `GRANT` to a domain did not exist, a ring 3 fault cost a **processor** rather than the machine, and a domain handle must **not** derive from that domain's root. Each correction is written into the document in place. Acceptance decides one open question — a thread spinning inside the kernel is a kernel bug and no mechanism will be built to interrupt it. Three stay open, plus a fourth the implementation added: whether a domain should end when its last thread exits *whoever made it*, which needs the boot sequence to stop treating a domain as outliving its threads. Answers **RFC 0013's unresolved question 1**, open since M7, and closes **M5's exit criterion**, which had been false and untested since M5. | [RFC 0017](docs/rfc/0017-process-management.md) |
 | **NW1** | Network stack | ✅ **Accepted** 2026-08-13 | **Outside the kernel, in three domains.** A virtio-net driver (`bin/netd`) that holds the device and understands no protocol, a protocol service (`bin/ipd`) that parses remote input and holds no device, and a client (`bin/dhcp`) holding a socket and a page and nothing else. A **socket is not an object kind** — it is a property of a capability the program already holds, which was this document's own claim corrected by building it. Accepted with all seven steps, six fuzz targets, and **three of its own claims proved wrong in the process**, including its performance headline. Open questions 2, 3 and 4 stay open. | [RFC 0018](docs/rfc/0018-networking.md) |
 | **TM1** | Time and timers | ✅ **Accepted** 2026-08-14 | **A deadline is a property of a notification, not a new object.** `Invoke(notification, ARM, deadline)` asks the kernel to signal it later; the program waits through RFC 0010's machinery, so a service handles callers, frames and expiring timers in one loop with one blocking call. Absolute deadlines, because a duration read before being descheduled becomes a lie. **Reading time is deliberately not a capability**: `rdtsc` is unprivileged on this machine and a `Clock` object would guard nothing — being *woken* is the scarce thing. Accepted with all four steps, and its open question 2 answered against it and then fixed: the measurement found the deadline had no effect on the wake instant at all, and arming now re-programs the timer. Questions 1 and 3 stay open, and 1 is sharper for the fix. | [RFC 0019](docs/rfc/0019-time-and-timers.md) |
+| **NW2** | TCP | ⬜ Draft | **A state machine that can be tested without a network.** `bin/tcpd` in its own domain, and a **pure transition function** in `bhaskix-net` — no I/O, no clock, no allocation — so loss, reordering, backoff and close are host tests against a virtual clock rather than things a live network refuses to reproduce. A connection's **stream lives in the program's pages**, so the receive window *is* the program's free space and a connection costs the memory of whoever opened it. Minimal but correct, with every absence named: no congestion control, window scaling, SACK, timestamps, PMTU discovery, keepalive or urgent data. Found a prerequisite it could not write around — **the system has no source of randomness at all**, and a TCP initial sequence number must be unpredictable. | [RFC 0020](docs/rfc/0020-tcp.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
@@ -750,6 +751,60 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-14, last (RFC 0020 drafted: TCP, as a state machine that can be tested without a network)
+
+[RFC 0020](docs/rfc/0020-tcp.md) is a **draft**, and it is the last of Phase 2's networking bullet.
+The scope decided with the user on 2026-08-13 is carried in unchanged — minimal but correct,
+`bin/tcpd` in its own domain — and the document's job was to decide the things that decision left
+open.
+
+**The design decision that matters is that the state machine is a pure function.**
+`step(state, event, now) -> (state, actions)` in `bhaskix-net`: no I/O, no clock, no allocation, no
+knowledge that domains or capabilities exist. Loss, reordering, a `RST` in each of eleven states, a
+`FIN` crossing a `FIN`, a peer that advertises zero and never opens — all host tests against a
+virtual clock. `docs/coding-style.md` calls a subsystem testable only in QEMU a design smell; TCP is
+where that rule either pays for itself or is worthless, because its interesting behaviour is exactly
+what a live network will not reproduce on demand.
+
+**The second is that a connection's stream lives in the program's pages**, one ring each way. The
+receive window is then the free space in the program's own ring, so flow control needs no separate
+accounting, unacknowledged bytes need no second copy, and **a connection costs the memory of whoever
+opened it**. `bin/ipd` holds 384 bytes per socket across four sockets, which is fine for a datagram
+and impossible for a stream: sixteen 64 KiB windows is a megabyte of service memory a remote party
+decides how to fill.
+
+**A prerequisite the draft found and could not write around: this system has no source of
+randomness.** Not a weak one — none. No `rdrand`, no `rdseed`, no entropy pool, no interface that
+returns an unpredictable number; the only `Rng` in the tree is a seeded mutation harness in
+`kernel/src/elf.rs`, and even KASLR is the bootloader's, with the kernel merely observing the slide.
+A TCP initial sequence number must be unpredictable or an off-path attacker injects into connections
+without seeing a packet. So step 1 is `RDRAND` behind a `CPUID` check, **a refusal and not a
+fallback** where it is absent — seeding from the TSC would look solved while being guessable to
+anyone who can estimate uptime, which is worse than being visibly missing. Whether that primitive
+gets its own RFC is the draft's open question 1 and is **for the user to decide before step 1
+starts**.
+
+**The QEMU peer is solved rather than hoped for.** A TCP gate needs something to talk to, and the
+harness boots `restrict=on` deliberately. QEMU's `guestfwd` redirects a guest TCP connection to a
+host-side command, and it was **checked on this machine's QEMU 4.2.1** rather than recalled:
+`guestfwd=tcp:10.0.2.100:9-cmd:...` is accepted. This project's own rule from RFC 0012 is that a
+design CI cannot test will be wrong unnoticed, and TCP is not a subsystem to learn that on.
+
+**Costs stated in advance rather than discovered at step 6.** A third domain adds a crossing each
+way, against RFC 0018 step 7's measured 34–149 µs a round trip on separate processors and 10–16 µs
+folded. And out-of-order segments are **dropped, not buffered** in the first version — correct, and
+it turns one loss into a stall of one retransmission timeout. Both are in the document as costs, and
+the loss-recovery measurement at step 6 is what decides whether reassembly or congestion control is
+the next RFC.
+
+**Two stale comments found while grounding the draft, and fixed in the same change.**
+`net/src/ipv4.rs` said `Protocol::TCP` would be parsed by "RFC 0019" — written before timers took
+that number on 2026-08-13, and missed when the other three references were corrected. And
+`drain_ring` in `bin/ipd` still claimed a client's `RECV_FROM` was "the only event this service can
+act on while asleep on its endpoint", which stopped being true the day RFC 0010's question 1 was
+answered and `serve` gained the arm that drains on a frame. A comment describing a constraint that
+was removed is worse than no comment.
 
 ### 2026-08-14, last (the ARM path re-programs the timer, and a deadline starts meaning something)
 
