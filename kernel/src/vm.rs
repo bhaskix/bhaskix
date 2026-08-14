@@ -552,16 +552,20 @@ pub fn self_test(hhdm_base: u64, iterations: u32) -> bool {
 
 /// How many user address spaces can exist at once.
 ///
-/// Eight. Three are in use with both services in domains — the shell and the
-/// two of them — and the headroom is deliberate: running out is handled below,
+/// Twelve. Live simultaneously on a full boot: the shell, both placed
+/// services, the block driver, the filesystem, the supervisor, the network
+/// driver, the protocol service, the DHCP client and — the one that found the
+/// old bound of eight — RFC 0020's TCP service. Running out is handled below,
 /// and handled *safely*, but a machine that has run out has a program with no
-/// region map and every fault in it refused.
+/// region map and every fault in it refused; the eleventh program hit exactly
+/// that, and the domain-death path's own comment predicts how it presents:
+/// as a fault in whatever else started last.
 ///
 /// It was one until RFC 0013 step 4, which is not a number anybody chose — the
 /// kernel simply kept a single installed space, because until there were two
 /// programs to run at once nothing could tell. What told was two services in
 /// domains landing on the same CPU and running in each other's page table.
-pub const MAX_SPACES: usize = 8;
+pub const MAX_SPACES: usize = 12;
 
 /// Every user address space the kernel has installed, found by its root.
 ///
