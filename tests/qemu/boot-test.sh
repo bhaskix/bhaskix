@@ -473,7 +473,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 10 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 11 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -1018,6 +1018,39 @@ elif grep -qE "net ring +nothing crossed; without a dma window" "$LOG"; then
 else
     fail "the return path did not carry a frame"
     grep -E "net reply|net frame|net config" "$LOG" || true
+    status=1
+fi
+
+# RFC 0020 steps 4 and 5: the TCP domain, against the deterministic peer
+# devices.sh provides. The state word is bits -- attached, keyed, configured,
+# serving -- and "keyed" means bin/tcpd drew a 128-bit secret from the
+# hardware in ring 3: RFC 0021's deliverable consumed by the caller it was
+# built for, minting the sequence number the handshake below uses. On a
+# machine with a network the demonstration must have COMPLETED: outcome 6 is
+# sixteen bytes sent to the guestfwd echo peer and received back unchanged
+# with the orderly close under way, and outcome 7 is the same connection
+# after TIME_WAIT expired -- a boot long enough to see 2xMSL out. Anything
+# less is a failure now, because the peer answers the same way every boot:
+# "pending" stopped being weather when the network stopped being one.
+#
+# On a machine without a network the honest report is state 0x3 and outcome
+# 5: the key drawn, no network, said so, exited. A machine that cannot be
+# unpredictable would report outcome 4 and never serve, which no machine this
+# harness boots should ever do -- so it fails here rather than passing as a
+# variant.
+# The echo is demanded outright. This gate briefly carried a third arm that
+# accepted a stall in SYN-SENT, while a one-in-three wake loss was being
+# hunted; the loss was a thread returning from a notified receive still
+# marked blocked (sched::clear_blocked_mark is the fix and carries the story),
+# and with it fixed the demonstration completes on every boot that completes.
+# A stall here is a regression now, not weather.
+if grep -qE "tcpd +state 0xf \(attached/keyed/configured/serving\), outcome (6|7): " "$LOG"; then
+    pass "tcp connected to the echo peer, the payload came back unchanged, and the close is orderly"
+elif grep -qE "tcpd +state 0x3 \(attached/keyed/configured/serving\), outcome 5" "$LOG"; then
+    pass "the tcp domain drew its secret, found no network, and said so"
+else
+    fail "the tcp demonstration did not complete against the deterministic peer"
+    grep -E "tcpd|tcp domain" "$LOG" || true
     status=1
 fi
 

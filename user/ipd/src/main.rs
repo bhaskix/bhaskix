@@ -72,12 +72,26 @@ const DOORBELL: u64 = 5;
 /// Bound to this thread, so `receive` wakes for a caller or a frame, whichever
 /// comes first, and says which.
 const INBOX: u64 = 6;
+/// Slot: the ring this program forwards TCP segments into.
+///
+/// **RFC 0020 step 4.** `bin/tcpd` is on the other end. What crosses is not a
+/// frame: it is eight bytes of addresses — source, destination — and then the
+/// TCP segment, because the pseudo-header needs the addresses and `tcpd`
+/// deliberately parses no IP. This program stays the only parser of the IPv4
+/// header, exactly as the RFC's diagram draws it.
+const TCP_FWD: u64 = 7;
+/// Slot: the ring `bin/tcpd` hands segments back through.
+const TCP_BACK: u64 = 8;
+/// Slot: the doorbell that wakes `bin/tcpd`.
+const TCP_BELL: u64 = 9;
 
 /// Where this program maps what it holds.
 const RING_AT: u64 = 0x2100_0000;
 const REPORT_AT: u64 = 0x2110_0000;
 const BACK_AT: u64 = 0x2120_0000;
 const CONFIG_AT: u64 = 0x2130_0000;
+const TCP_FWD_AT: u64 = 0x2140_0000;
+const TCP_BACK_AT: u64 = 0x2150_0000;
 
 /// Bytes in the ring, matching what the kernel granted.
 const RING_BYTES: usize = 16 * 4096;
@@ -319,8 +333,8 @@ unsafe fn send(frame: &[u8]) -> bool {
     // SAFETY: every offset is `abi::ring`'s, inside the region this program
     // mapped writable, and `frame` is a slice it owns.
     unsafe {
-        write_back_runs(prefix.as_ptr(), framed.prefix);
-        write_back_runs(frame.as_ptr(), framed.payload);
+        write_runs(BACK_AT, prefix.as_ptr(), framed.prefix);
+        write_runs(BACK_AT, frame.as_ptr(), framed.payload);
     }
     // Outbound, copy one of two: this program's frame into the return ring.
     copied();
@@ -365,53 +379,65 @@ fn frame(
 }
 
 /// What this program was able to do, as bits.
-fn state(can_send: bool, mac: MacAddr) -> u64 {
-    u64::from(can_send) | (u64::from(mac != MacAddr::UNSPECIFIED) << 1)
+///
+/// Bit 2 is whether the TCP rings attached, which cannot be a one-shot answer:
+/// the kernel installs them after this program starts, so the bit may be clear
+/// on an early report and set on a later one — and a final report with it
+/// still clear is the finding that matters.
+fn state(can_send: bool, mac: MacAddr, can_tcp: bool) -> u64 {
+    u64::from(can_send)
+        | (u64::from(mac != MacAddr::UNSPECIFIED) << 1)
+        | (u64::from(can_tcp) << 2)
+        | (u64::from(SERVING_NOW.load(core::sync::atomic::Ordering::Relaxed)) << 3)
 }
 
-/// Copies `source` into the return ring at the offsets `runs` names.
+/// Copies `source` into a ring mapped at `base`, at the offsets `runs` names.
+///
+/// It hardcoded the return ring until RFC 0020 step 4 gave this program a
+/// second ring it produces into, and one reviewed copy routine beats two that
+/// agree by inspection.
 ///
 /// # Safety
 ///
-/// `runs` must be offsets `abi::ring` computed for the region mapped at
-/// [`BACK_AT`], and `source` readable for their combined length.
-unsafe fn write_back_runs(source: *const u8, runs: (ring::Run, ring::Run)) {
+/// `runs` must be offsets `abi::ring` computed for the region mapped writable
+/// at `base`, and `source` readable for their combined length.
+unsafe fn write_runs(base: u64, source: *const u8, runs: (ring::Run, ring::Run)) {
     let (first, second) = runs;
     // SAFETY: the caller's obligation; a wrap's two halves do not overlap.
     unsafe {
         core::ptr::copy_nonoverlapping(
             source,
-            (BACK_AT + first.offset as u64) as *mut u8,
+            (base + first.offset as u64) as *mut u8,
             first.length,
         );
         if !second.is_empty() {
             core::ptr::copy_nonoverlapping(
                 source.add(first.length),
-                (BACK_AT + second.offset as u64) as *mut u8,
+                (base + second.offset as u64) as *mut u8,
                 second.length,
             );
         }
     }
 }
 
-/// Copies out of the inbound ring at the offsets `runs` names, into `into`.
+/// Copies out of a ring mapped at `base` at the offsets `runs` names.
 ///
 /// # Safety
 ///
 /// `runs` must be offsets `abi::ring` computed for the region mapped at
-/// [`RING_AT`], and `into` writable for their combined length.
-unsafe fn read_ring_runs(into: *mut u8, runs: (ring::Run, ring::Run)) {
+/// `base`, and `into` writable for their combined length.
+unsafe fn read_runs(base: u64, into: *mut u8, runs: (ring::Run, ring::Run)) {
     let (first, second) = runs;
     // SAFETY: as above.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            (RING_AT + first.offset as u64) as *const u8,
+            (base + first.offset as u64) as *const u8,
             into,
             first.length,
         );
         if !second.is_empty() {
             core::ptr::copy_nonoverlapping(
-                (RING_AT + second.offset as u64) as *const u8,
+                (base + second.offset as u64) as *const u8,
                 into.add(first.length),
                 second.length,
             );
@@ -566,7 +592,7 @@ fn refresh() {
         held[3],
         held[4],
         held[5],
-        held[6],
+        held[6] | (u64::from(SERVING_NOW.load(Relaxed)) << 3),
         held[7],
         DELIVERED.load(Relaxed),
         WHY.load(Relaxed),
@@ -616,6 +642,159 @@ struct Socket {
     held: [u8; DATAGRAM],
 }
 
+/// TCP segments handed on to `bin/tcpd`.
+static TCP_FORWARDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// TCP segments taken back from `bin/tcpd` and transmitted.
+static TCP_RETURNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Hands one TCP segment to `bin/tcpd`: eight bytes of addresses, then the
+/// segment itself.
+///
+/// This program stays the only parser of the IPv4 header — what crosses is the
+/// payload and the two addresses the pseudo-header needs, which is RFC 0020's
+/// diagram exactly: "IPv4 payloads where protocol = 6".
+///
+/// # Safety
+///
+/// The forward ring must be mapped writable at [`TCP_FWD_AT`].
+unsafe fn forward_tcp(source: Ipv4Addr, destination: Ipv4Addr, segment: &[u8]) -> bool {
+    let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
+        return false;
+    };
+    // SAFETY: the ring's header, in the region this program mapped. Volatile
+    // because the consumer is another domain and takes no lock.
+    let (head, tail) = unsafe {
+        (
+            core::ptr::read_volatile((TCP_FWD_AT + ring::HEAD_OFFSET as u64) as *const u64),
+            core::ptr::read_volatile((TCP_FWD_AT + ring::TAIL_OFFSET as u64) as *const u64),
+        )
+    };
+    let Some(cursor) = ring::Cursor::new(layout, head, tail) else {
+        return false;
+    };
+    let total = 8 + segment.len();
+    let Some(framed) = ring::frame_to_write(layout, cursor, total) else {
+        return false;
+    };
+    // Assembled contiguously, then written through `abi::ring`'s offsets. The
+    // eight address bytes and the segment could be written as separate runs to
+    // save this copy, but a wrap can fall inside the address prefix and the
+    // arithmetic for that case is exactly the kind this program refuses to
+    // write by hand. One bounded memcpy is the price of one copy routine.
+    let mut entry = [0u8; 8 + MAX_FRAME];
+    entry[0..4].copy_from_slice(&source.octets());
+    entry[4..8].copy_from_slice(&destination.octets());
+    let Some(slot) = entry.get_mut(8..total) else {
+        return false;
+    };
+    slot.copy_from_slice(segment);
+    let prefix = (total as u32).to_le_bytes();
+    // SAFETY: offsets are `abi::ring`'s, inside the region mapped writable, and
+    // `entry` is a buffer this program owns, `total` bounded by its size.
+    unsafe {
+        write_runs(TCP_FWD_AT, prefix.as_ptr(), framed.prefix);
+        write_runs(TCP_FWD_AT, entry.as_ptr(), framed.payload);
+    }
+    copied();
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: the ring's header, which only this program writes.
+    unsafe {
+        core::ptr::write_volatile(
+            (TCP_FWD_AT + ring::HEAD_OFFSET as u64) as *mut u64,
+            framed.next,
+        );
+    }
+    // Index first, wake second, as every doorbell in this system orders it.
+    call(syscall::INVOKE, TCP_BELL, method::SIGNAL, [0; 4]);
+    TCP_FORWARDED.store(
+        TCP_FORWARDED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    true
+}
+
+/// Takes segments `bin/tcpd` has handed back and puts them on the wire.
+///
+/// Each entry is eight bytes of addresses and a segment; this program wraps it
+/// in the IPv4 and Ethernet headers `tcpd` deliberately cannot build, using
+/// the gateway's hardware address for every destination — one interface, one
+/// route, which is all this network has.
+fn drain_tcp_back(me: (MacAddr, Ipv4Addr), gateway: MacAddr, tail: &mut u64) {
+    let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
+        return;
+    };
+    let mut entry = [0u8; 8 + MAX_FRAME];
+    let mut outgoing = [0u8; MAX_FRAME];
+    for _ in 0..16 {
+        // SAFETY: the ring's header, in the region this program mapped.
+        let head = unsafe {
+            core::ptr::read_volatile((TCP_BACK_AT + ring::HEAD_OFFSET as u64) as *const u64)
+        };
+        let Some(cursor) = ring::Cursor::new(layout, head, *tail) else {
+            return;
+        };
+        let mut prefix = [0u8; ring::PREFIX];
+        let Some(runs) = ring::length_to_read(layout, cursor) else {
+            return;
+        };
+        // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
+        unsafe { read_runs(TCP_BACK_AT, prefix.as_mut_ptr(), runs) };
+        let length = u32::from_le_bytes(prefix) as usize;
+        if !(8..=8 + MAX_FRAME).contains(&length) {
+            *tail = tail.wrapping_add(ring::PREFIX as u64);
+            publish_tcp_tail(*tail);
+            continue;
+        }
+        let Some(framed) = ring::frame_to_read(layout, cursor, length) else {
+            return;
+        };
+        // SAFETY: as above; `entry` is large enough and `length` bounded.
+        unsafe { read_runs(TCP_BACK_AT, entry.as_mut_ptr(), framed.payload) };
+        copied();
+        *tail = framed.next;
+        publish_tcp_tail(*tail);
+
+        let destination = Ipv4Addr(u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]));
+        let segment = &entry[8..length];
+        let body_length = segment.len();
+        if ipv4::write_header(
+            &mut outgoing[eth::HEADER..],
+            me.1,
+            destination,
+            Protocol::TCP,
+            body_length,
+            0x2604,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let at = eth::HEADER + ipv4::HEADER;
+        let Some(slot) = outgoing.get_mut(at..at + body_length) else {
+            continue;
+        };
+        slot.copy_from_slice(segment);
+        if eth::write_header(&mut outgoing, gateway, me.0, EtherType::IPV4).is_ok()
+            // SAFETY: the return ring is mapped writable.
+            && unsafe { send(&outgoing[..at + body_length]) }
+        {
+            TCP_RETURNED.store(
+                TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Tells `bin/tcpd` how far this program has read its back ring.
+fn publish_tcp_tail(tail: u64) {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: the ring's header, which only this program writes.
+    unsafe {
+        core::ptr::write_volatile((TCP_BACK_AT + ring::TAIL_OFFSET as u64) as *mut u64, tail);
+    }
+}
+
 /// Takes whatever has arrived and gives each datagram to the socket it is for.
 ///
 /// Called from a client's `RECV_FROM` **and** from the wake a frame rings.
@@ -632,7 +811,12 @@ struct Socket {
 /// destination is accepted as well as this interface's own address: a client
 /// with no address yet is answered by broadcast, which is the whole reason
 /// DHCP works at all.
-fn drain_ring(sockets: &mut [Socket; SOCKETS], me: (MacAddr, Ipv4Addr), tail: &mut u64) {
+fn drain_ring(
+    sockets: &mut [Socket; SOCKETS],
+    me: (MacAddr, Ipv4Addr),
+    tail: &mut u64,
+    can_tcp: bool,
+) {
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
         return;
     };
@@ -653,7 +837,7 @@ fn drain_ring(sockets: &mut [Socket; SOCKETS], me: (MacAddr, Ipv4Addr), tail: &m
             return;
         };
         // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
-        unsafe { read_ring_runs(prefix.as_mut_ptr(), runs) };
+        unsafe { read_runs(RING_AT, prefix.as_mut_ptr(), runs) };
         let length = u32::from_le_bytes(prefix) as usize;
         if length == 0 || length > MAX_FRAME {
             // A length this program has stopped believing. Skip the prefix and
@@ -667,7 +851,7 @@ fn drain_ring(sockets: &mut [Socket; SOCKETS], me: (MacAddr, Ipv4Addr), tail: &m
         };
         // SAFETY: as above; `frame` is `MAX_FRAME` writable bytes and `length`
         // is bounded by it.
-        unsafe { read_ring_runs(frame.as_mut_ptr(), framed.payload) };
+        unsafe { read_runs(RING_AT, frame.as_mut_ptr(), framed.payload) };
         // Inbound, copy two of two: the ring into this program's buffer.
         copied();
         *tail = framed.next;
@@ -696,6 +880,19 @@ fn drain_ring(sockets: &mut [Socket; SOCKETS], me: (MacAddr, Ipv4Addr), tail: &m
             refuse(why::NOT_A_HEADER, length, seen);
             continue;
         };
+        // RFC 0020 step 4: a TCP segment for this interface goes to the
+        // domain that understands it. Forwarded before the UDP refusal, so
+        // "not UDP" keeps meaning what it says — a protocol nobody here
+        // serves — rather than covering the one that is served next door.
+        if can_tcp
+            && header.protocol == Protocol::TCP
+            && !header.is_fragment()
+            && header.destination == me.1
+        {
+            // SAFETY: the forward ring is mapped writable when `can_tcp`.
+            unsafe { forward_tcp(header.source, header.destination, payload) };
+            continue;
+        }
         if header.protocol != Protocol::UDP || header.is_fragment() {
             refuse(why::NOT_UDP, length, seen);
             continue;
@@ -748,9 +945,19 @@ fn serve(
     me: (MacAddr, Ipv4Addr),
     gateway: MacAddr,
     can_send: bool,
+    mut can_tcp: bool,
     mut tail: u64,
+    mut tcp_tail: u64,
 ) -> ! {
     loop {
+        // The rings may land after serving has begun — a boot whose
+        // demonstration ends early reaches here first — and a serve loop
+        // that froze the answer it was constructed with refused `SYN·ACK`s
+        // as `NOT_UDP` for the life of the boot, on the boots that lost
+        // that race and only those.
+        if can_send && !can_tcp {
+            can_tcp = try_attach_tcp();
+        }
         let (status_in, badge, method, args) = receive();
         // What serving has changed, put where the kernel can read it. See
         // `CACHE`: without this the page froze at the moment serving began.
@@ -759,16 +966,26 @@ fn serve(
         // this is the wake that used to be impossible, and the reason this loop
         // no longer has to be asked before it looks at the wire. Drain, then go
         // back to waiting; there is nobody to reply to.
+        //
+        // The wake does not say which ring, and it does not need to: `tcpd`'s
+        // doorbell and `netd`'s land in the same word, and looking at a ring
+        // that is empty costs one volatile read.
         if status_in == status::NOTIFIED {
             NOTIFIED_WAKES.store(
                 NOTIFIED_WAKES.load(core::sync::atomic::Ordering::Relaxed) + 1,
                 core::sync::atomic::Ordering::Relaxed,
             );
-            drain_ring(sockets, me, &mut tail);
+            drain_ring(sockets, me, &mut tail, can_tcp);
+            if can_tcp {
+                drain_tcp_back(me, gateway, &mut tcp_tail);
+            }
             continue;
         }
         if status_in != status::OK {
             continue;
+        }
+        if can_tcp {
+            drain_tcp_back(me, gateway, &mut tcp_tail);
         }
 
         // Unbadged means the caller invoked the service's own endpoint, which
@@ -891,7 +1108,7 @@ fn serve(
                 // asking for a datagram is the only event it can act on. Not a
                 // workaround: the alternative is a poll loop, and this system
                 // has already paid for one of those today.
-                drain_ring(sockets, me, &mut tail);
+                drain_ring(sockets, me, &mut tail, can_tcp);
 
                 let waiting = sockets[index as usize];
                 if waiting.length == 0 {
@@ -925,6 +1142,33 @@ fn serve(
     }
 }
 
+/// Whether each TCP ring has attached. Statics because both the
+/// demonstration loop and `serve` retry them — the kernel installs the rings
+/// after this program starts, so any single moment's answer can be "not yet".
+static FWD_ATTACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BACK_ATTACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Set the moment `serve` is entered, and reported: the kernel holds the DHCP
+/// client back until this is true, because a caller that calls before its
+/// service is receiving strands in the send queue — the fourth ordering bug
+/// of this shape, and the first whose fix is to say when readiness happens
+/// rather than to reorder who starts first.
+static SERVING_NOW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Retries whichever TCP ring is not attached yet. Idempotent, one ring at a
+/// time, because a successful attach is not repeatable: retrying the pair as
+/// one expression wedged `can_tcp` false forever on any boot where the two
+/// slots were installed a pass apart.
+fn try_attach_tcp() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !FWD_ATTACHED.load(Relaxed) && attach(TCP_FWD, TCP_FWD_AT, 1) {
+        FWD_ATTACHED.store(true, Relaxed);
+    }
+    if !BACK_ATTACHED.load(Relaxed) && attach(TCP_BACK, TCP_BACK_AT, 1) {
+        BACK_ATTACHED.store(true, Relaxed);
+    }
+    FWD_ATTACHED.load(Relaxed) && BACK_ATTACHED.load(Relaxed)
+}
+
 /// The entry point.
 #[unsafe(no_mangle)]
 extern "C" fn ipd_main() -> ! {
@@ -932,6 +1176,17 @@ extern "C" fn ipd_main() -> ! {
         exit()
     }
     let can_send = attach(BACK, BACK_AT, 1) && attach(CONFIG, CONFIG_AT, 0);
+    // RFC 0020 step 4: the rings to and from `bin/tcpd`. **Retried in the
+    // demonstration loop rather than attached once here**, because the kernel
+    // installs them *after* this program has started — the TCP domain is set
+    // up on the other side of this program's own spawn — so a one-shot attach
+    // at entry loses the race on every boot, silently, and the loss presents
+    // as a service that took segments into a ring nobody ever drained. A slot
+    // that is empty now and full in a moment is what retrying is for. Absent
+    // on a machine with no TCP domain, which is a state rather than a fault —
+    // TCP frames are then refused as `NOT_UDP` exactly as before the domain
+    // existed.
+    let mut can_tcp = false;
     // Whether this program has an endpoint to answer on at all. Without one it
     // is still the frame mover it was at step 4, and says so by stopping.
     let serving =
@@ -974,12 +1229,23 @@ extern "C" fn ipd_main() -> ! {
     // rather than read back. A consumer that re-read its own index would be
     // trusting the producer with it.
     let mut tail = 0u64;
+    // Where this program has read `tcpd`'s back ring up to. Same discipline.
+    let mut tcp_tail = 0u64;
 
     // A report before anything has arrived, so that "this program never ran"
     // and "this program ran and saw nothing" are different findings. Without
     // it the kernel reads an absent marker for both, and the two have entirely
     // different causes.
-    report(0, 0, 0, 0, 0, 0, u64::from(can_send), 0);
+    report(
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        state(can_send, MacAddr::UNSPECIFIED, can_tcp),
+        0,
+    );
 
     // No wakeup, and this is a gap rather than a choice. RFC 0018 step 3 asked
     // for a notification here; RFC 0010's notifications can only be signalled
@@ -1001,9 +1267,24 @@ extern "C" fn ipd_main() -> ! {
             refused,
             built,
             cache.live(ticks) as u64,
-            state(can_send, me.0),
+            state(can_send, me.0, can_tcp),
             pongs,
         );
+
+        // The TCP rings, once the kernel has installed them. See the note at
+        // `can_tcp`'s declaration: they land after this program starts.
+        //
+        // **Each ring retried separately, because a successful attach is not
+        // repeatable.** The first version retried the pair as one expression;
+        // on a boot where the forward ring's slot was installed a pass before
+        // the back ring's, the forward attach succeeded, the pair failed, and
+        // every later pass re-attached an already-mapped ring — which is
+        // refused — so the pair stayed false for the life of the boot with
+        // both rings sitting installed. One boot in a handful lost that race,
+        // which is the worst kind of failure to have.
+        if can_send && !can_tcp {
+            can_tcp = try_attach_tcp();
+        }
 
         // What this interface is, once the kernel has been able to say. It
         // cannot say until `bin/netd` has read the address out of the device,
@@ -1190,6 +1471,25 @@ extern "C" fn ipd_main() -> ! {
             }
         }
 
+        // Segments `bin/tcpd` has queued while this loop was measuring. One
+        // volatile read when the ring is empty, and a `SYN` that would
+        // otherwise wait for `serve` when it is not.
+        //
+        // The gateway's address is used if the cache still holds it and the
+        // broadcast address if not — **not** gated on the lookup, which is
+        // what it was: the cache expires by frames handled, the burst handles
+        // more frames than the lifetime, so whether a segment drained here
+        // depended on whether it arrived before or after an expiry nobody
+        // was thinking about. The demonstration connected on the boots where
+        // it won that race and sat unsent on the boots where it lost, which
+        // is the exact shape of flakiness this project keeps paying for.
+        // Slirp routes on the IP header and accepts a broadcast frame — the
+        // DHCP exchange depends on that already.
+        if can_tcp && me.0 != MacAddr::UNSPECIFIED {
+            let mac = cache.lookup(GATEWAY, ticks).unwrap_or(MacAddr::BROADCAST);
+            drain_tcp_back(me, mac, &mut tcp_tail);
+        }
+
         // SAFETY: the ring's header, in the region this program mapped. Read
         // volatile because the producer is another domain and takes no lock.
         let head =
@@ -1263,7 +1563,7 @@ extern "C" fn ipd_main() -> ! {
                         refused,
                         built,
                         cache.live(ticks) as u64,
-                        state(can_send, me.0),
+                        state(can_send, me.0, can_tcp),
                         pongs,
                     );
                     let gateway = cache.lookup(GATEWAY, ticks).unwrap_or(MacAddr::BROADCAST);
@@ -1272,7 +1572,20 @@ extern "C" fn ipd_main() -> ! {
                     // nothing. Refused on a machine with no inbox, which is a
                     // state — `serve` then behaves exactly as it did before.
                     call(syscall::INVOKE, INBOX, method::BIND_SELF, [0; 4]);
-                    serve(&mut sockets, me, gateway, can_send, tail);
+                    // Published *before* the blocking receive, so the kernel
+                    // reads "serving" only when a caller can no longer strand.
+                    SERVING_NOW.store(true, core::sync::atomic::Ordering::Relaxed);
+                    report(
+                        frames,
+                        bytes,
+                        first_source,
+                        refused,
+                        built,
+                        cache.live(ticks) as u64,
+                        state(can_send, me.0, can_tcp),
+                        pongs,
+                    );
+                    serve(&mut sockets, me, gateway, can_send, can_tcp, tail, tcp_tail);
                 }
                 report(
                     frames,
@@ -1281,7 +1594,7 @@ extern "C" fn ipd_main() -> ! {
                     refused,
                     built,
                     cache.live(ticks) as u64,
-                    state(can_send, me.0),
+                    state(can_send, me.0, can_tcp),
                     pongs,
                 );
                 exit()
@@ -1309,7 +1622,7 @@ extern "C" fn ipd_main() -> ! {
             continue;
         };
         // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
-        unsafe { read_ring_runs(prefix.as_mut_ptr(), runs) };
+        unsafe { read_runs(RING_AT, prefix.as_mut_ptr(), runs) };
         let length = u32::from_le_bytes(prefix) as usize;
         // A number the other side chose. Bounded before it is used, and a
         // refusal rather than a clamp: a frame that does not fit is not a
@@ -1329,7 +1642,7 @@ extern "C" fn ipd_main() -> ! {
         };
         // SAFETY: the ring is mapped and `buffer` is `MAX_FRAME` writable
         // bytes, which `length` is bounded by above.
-        unsafe { read_ring_runs(buffer.as_mut_ptr(), framed.payload) };
+        unsafe { read_runs(RING_AT, buffer.as_mut_ptr(), framed.payload) };
         // Inbound, copy two of two, on the demonstration loop's path rather than
         // the service's. **After** the copy, not before: this path retries when
         // the producer has published a length and not yet the bytes, and a
@@ -1355,6 +1668,23 @@ extern "C" fn ipd_main() -> ! {
                 value = (value << 8) | u64::from(*octet);
             }
             first_source = value;
+        }
+
+        // A TCP segment arriving while the demonstration is still running.
+        // Forwarded here as well as in `drain_ring`, because `bin/tcpd` opens
+        // its own connection as soon as it is configured — which is while this
+        // loop is still measuring — and an answer eaten here would cost it a
+        // retransmission timeout for nothing.
+        if can_tcp
+            && let Ok(parsed) = EthFrame::parse(&buffer[..length])
+            && parsed.ethertype == EtherType::IPV4
+            && let Ok((header, payload)) = Ipv4Header::parse(parsed.payload)
+            && header.protocol == Protocol::TCP
+            && !header.is_fragment()
+            && header.destination == me.1
+        {
+            // SAFETY: the forward ring is mapped writable when `can_tcp`.
+            unsafe { forward_tcp(header.source, header.destination, payload) };
         }
 
         // An IPv4 datagram addressed to us. The echo reply this program asked
@@ -1474,7 +1804,7 @@ extern "C" fn ipd_main() -> ! {
             refused,
             built,
             cache.live(ticks) as u64,
-            state(can_send, me.0),
+            state(can_send, me.0, can_tcp),
             pongs,
         );
     }

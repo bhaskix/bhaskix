@@ -55,4 +55,7 @@ opt-level = "s"
 # began, which read exactly like a service that had stopped working.
 # 114 at RFC 0018 step 7: the ring copies are counted now, which is what turned
 # the RFC's "two copies per packet" from a claim into 1.99 measured.
-unsafe_budget = 114
+# 131 at RFC 0020 step 4: the forward and back rings to bin/tcpd -- two more
+# regions another domain shares, read and written through the same one pair of
+# copy routines as before, which is why seventeen lines buys two rings.
+unsafe_budget = 131

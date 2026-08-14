@@ -129,6 +129,14 @@ LAYERS = {
     # above -- no device, no DMA window, no interrupt -- and it exists as its own
     # program rather than a shell command precisely so that stays true.
     "bhaskix-user-dhcp": -1,
+    # The TCP service, RFC 0020 step 4. It links `bhaskix-net` under the same
+    # rule -- two rings, a report page, a configuration page, an endpoint and a
+    # timer; no device, no DMA window, no interrupt -- and `bhaskix-rand`,
+    # because the initial sequence number's secret is drawn at start and the
+    # service refuses to serve without one. TCP is the largest remote-driven
+    # *stateful* parser this system will contain, which is exactly why it is a
+    # separate program with this short a capability list.
+    "bhaskix-user-tcpd": -1,
     # The supervisor places no service: it creates domains, starts programs in
     # them and reaps them, all through capability invocations. So it belongs
     # here with the other plain programs rather than in PLACEMENTS -- and that

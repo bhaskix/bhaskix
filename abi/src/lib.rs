@@ -621,6 +621,106 @@ pub mod socket {
     }
 }
 
+/// Methods a TCP service answers.
+///
+/// [RFC 0020](../../docs/rfc/0020-tcp.md) step 4. A connection is the same
+/// shape a socket is — **a badged capability to the service's own endpoint**,
+/// minted with [`method::HAND`], landing where the caller said with
+/// [`method::EXPECT`] — because RFC 0018 committed to a socket shape that could
+/// carry TCP without reopening anything, and this is that commitment kept. No
+/// new object kind, and no kernel change.
+///
+/// A *listener* is a differently-badged capability to the same endpoint, and
+/// the badge carries which of the two it is: the operations do not overlap —
+/// there is no `SEND` on a listener and no `ACCEPT` on a connection — so a
+/// method applied to the wrong one is refused rather than reinterpreted.
+///
+/// [`socket::CLOSE`] is reused, unchanged in meaning: end the binding. The
+/// numbers here start at 58 because [`method::DISARM`] is 57 and is the highest
+/// allocated; there is no gap this time.
+pub mod tcp {
+    /// Open a connection.
+    ///
+    /// Invoked on a capability to the TCP service's endpoint. `arg0` is the
+    /// destination address, `arg1` the destination port. Blocks until the
+    /// handshake completes or fails, and the reply carries an outcome below.
+    pub const CONNECT: u64 = 58;
+
+    /// Listen on a local port. Replies with a *listener* capability.
+    pub const LISTEN: u64 = 59;
+
+    /// On a listener: block until a connection is established. The reply
+    /// carries it.
+    pub const ACCEPT: u64 = 60;
+
+    /// On a connection: "I have written `arg0` bytes into the send ring."
+    /// No payload crosses in the message; the ring is where the bytes are.
+    pub const SEND: u64 = 61;
+
+    /// On a connection: "I have consumed `arg0` bytes." The reply says how
+    /// many are available.
+    pub const RECV: u64 = 62;
+
+    /// Half-close: no more data this way. The other direction keeps working,
+    /// which is what makes a request/response protocol expressible.
+    pub const SHUTDOWN: u64 = 63;
+
+    /// It worked.
+    pub const OK: u64 = 0;
+    /// The peer answered the connection request with a reset.
+    pub const REFUSED: u64 = 1;
+    /// The peer never answered, and the bounded retransmissions ran out.
+    pub const UNREACHABLE: u64 = 2;
+    /// The peer reset an established connection. Distinct from an orderly
+    /// close, because a program that has read half a response needs to know
+    /// the rest is not coming.
+    pub const RESET: u64 = 3;
+    /// This capability names a connection that no longer exists.
+    pub const GONE: u64 = 4;
+    /// The connection table is full. A fixed table refusing is this system's
+    /// posture everywhere; a growing one's failure is somebody else's
+    /// out-of-memory.
+    pub const CONGESTED: u64 = 5;
+    /// This machine cannot produce an unpredictable number, so this service
+    /// refuses to mint sequence numbers at all.
+    ///
+    /// [RFC 0021](../../docs/rfc/0021-unpredictability.md)'s policy — *the
+    /// caller refuses* — with this service as the caller. A guessable initial
+    /// sequence number lets an off-path attacker inject into connections
+    /// without seeing a packet, and shipping that unlabelled would be worse
+    /// than shipping nothing.
+    pub const NO_ENTROPY: u64 = 6;
+    /// The service is running but not yet accepting connections.
+    ///
+    /// Step 4 starts the domain, the rings and the loop; minting connection
+    /// capabilities to callers is the half that needs a program to call, and
+    /// arrives with step 5. An honest "not yet" is distinguishable from a
+    /// missing service, which is the difference between waiting and giving up.
+    pub const LATER: u64 = 7;
+
+    /// Packs a connection's identity into the badge a capability carries.
+    ///
+    /// Bit 63 distinguishes a listener from a connection, which is what makes
+    /// the two different capabilities rather than differently-documented ones.
+    /// The generation therefore keeps 31 bits, and the mask here matches the
+    /// one in [`parts`] — packing a generation the unpacking would truncate
+    /// silently is how bit 63 gets stepped on.
+    #[must_use]
+    pub const fn handle(index: u32, generation: u32, listener: bool) -> u64 {
+        (index as u64) | (((generation & 0x7fff_ffff) as u64) << 32) | ((listener as u64) << 63)
+    }
+
+    /// The index, generation, and whether this badge names a listener.
+    #[must_use]
+    pub const fn parts(badge: u64) -> (u32, u32, bool) {
+        (
+            badge as u32,
+            ((badge >> 32) as u32) & 0x7fff_ffff,
+            badge >> 63 != 0,
+        )
+    }
+}
+
 /// Methods a block service answers.
 ///
 /// Sector data never crosses in message registers. The caller names memory it

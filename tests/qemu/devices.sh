@@ -60,7 +60,14 @@ qemu_device_list() {
             VIRTIO_ARGS=(
                 -device "virtio-blk-pci,drive=disk0$suffix"
                 -device "virtio-blk-pci,drive=disk1$suffix"
-                -netdev user,id=net0,restrict=on
+                # The one TCP peer this network contains, and it is
+                # deterministic: `guestfwd` hands a guest connection to
+                # 10.0.2.100:9 to a host-side `cat`, which echoes the stream
+                # until EOF. RFC 0020 step 5 -- a live network will not
+                # reproduce a handshake on demand, but this one answers the
+                # same way every boot, inside `restrict=on`, needing no host
+                # configuration and reaching nothing outside the emulator.
+                -netdev user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat
                 -device "virtio-net-pci,netdev=net0$suffix"
             )
             ;;

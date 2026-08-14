@@ -7,8 +7,8 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 |---|---|
 | **Last updated** | 2026-08-14 |
 | **Phase** | Phase 2 — Core Operating System |
-| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. No TCP, no libc, no sockets API beyond UDP |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
+| **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. TCP is mid-build ([RFC 0020](docs/rfc/0020-tcp.md) steps 1–4: the machine boots in `bin/tcpd` and drives its own connection, but no program can hold one yet); no libc, no sockets API beyond UDP |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 steps 1–5a of 6** (a real peer echoes sixteen bytes through the full stack on every boot that completes — the wake loss that made it intermittent is found and fixed; the inbound half and connection capabilities remain) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
 
 ### How far along is this, in numbers
 
@@ -25,6 +25,7 @@ What can be counted honestly, with how to recount it:
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **6 of 7 done** | §4 below; the seventh is networking |
 | Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
+| TCP, within RFC 0020 | **4 of 6 steps, plus step 5's outbound half — the echo completes on every boot that completes, and the gate demands it** | its implementation plan. `bin/tcpd` boots in its own domain, draws its secret and refuses without one — step 1's owed half met at step 4. Step 4's own owed piece is connection capabilities for other programs, which need step 5's caller |
 | Tasks in defined milestones | **92 `DONE`, 4 `TODO`** | `grep -c` on the milestone tables in §3 |
 | Suite | 601 checks, 346 host assertions, 4 placements | §6 |
 
@@ -704,7 +705,7 @@ what is actually ahead.
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets. **And the duration is met as of 2026-08-13**: three campaigns of a full twenty-four hours each, 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`, 52 million over `ustar`. No crash, no hang, no artifact |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1 — ✅ **answered by step 3** on 2026-08-07, and this row said only that the RFC *found* it until 2026-08-12, when that omission misled the author of RFC 0018 into calling it open. Six steps, and **step 1 is worth doing alone** |
-| Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | ⬜ `TODO` | Gated on the driver framework rather than on anything network-shaped |
+| Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | 🟨 **in progress** | ~~Gated on the driver framework rather than on anything network-shaped.~~ **The note above was stale from 2026-08-13, when RFC 0018 was accepted and this row was not touched** — precisely the failure the paragraph over this table describes, one row down from where it describes it. What is true: virtio-net, Ethernet, ARP, IPv4, ICMP, UDP and sockets are **done** and a DHCP client obtains an address (RFC 0018, seven steps). **TCP is [RFC 0020](docs/rfc/0020-tcp.md), steps 1–4 done and step 5's outbound echo deterministic** — a real peer answers the handshake and returns the payload unchanged on every completed boot, after the hunt for a one-in-three wake loss ended in `ipc::recv_either` returning threads still marked blocked (the changelog has the whole chase). **IPv6 is not started and is not in RFC 0020's scope.** The bullet stays open until TCP does |
 
 ---
 
@@ -752,6 +753,469 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-15 (the boot-order rollback rolled forward: the wake-loss fix vindicates capability-before-program)
+
+**Two corrections in one, both traced to the same underlying bug.** Yesterday's step-5 entry
+records abandoning the capability-before-program ordering for the TCP domain because it
+"destabilised the boot three different ways". With `sched::clear_blocked_mark` in place, that
+diagnosis is revised: the strandings and missing wakes attributed to the ordering were the
+notified-receive blocked-mark bug taking its coin toss under changed timing. And the rolled-back
+arrangement — TCP setup running *concurrently* with a just-spawned `ipd` — had a defect of its
+own: about one boot in five, the boot thread deadlocked against `ipd`'s startup system calls
+inside `start_tcp_domain`, hanging bring-up before `netd` existed, with the hung boot's own
+thread dump showing `ipd` running its first quantum and no TCP or net driver thread anywhere.
+Yesterday's "early-hang family, host-load-correlated" was this, wearing the load as a disguise.
+
+**Setup first, program second, ends both races** — the order the driver's ring has always used,
+reinstated now that the bug underneath the rollback is fixed. `ipd`'s attach retry stays, as
+tolerance for a slow install rather than a patch over a lost one.
+
+**And the flakiness ledger closes honestly: most of it was self-inflicted.** The host that spent
+yesterday evening failing suites at load three was carrying two of this project's own `bhaskix-net`
+test binaries, spinning at 100% for eight hours — the *deliberately hung* option-walk tests from
+the watch-it-fail harness, whose parent the timeout killed while the children kept the loop. With
+the orphans killed, the ordering reinstated and the wake loss fixed: **eight consecutive iommu
+boots, eight completed echoes, eight DHCP offers, zero timeouts.**
+
+### 2026-08-14, last (the wake loss, found: a thread that returns from a notified receive still marked blocked)
+
+**The one-in-three stall has a mechanism, a one-line fix, and a day of consequences behind it.**
+The hunt worked outward from the boot log with counters at every layer, and each layer acquitted
+itself in turn: the kernel deadline was armed (`arm` succeeded and the table showed it), the timer
+claimed it, the signal ran (`bin/ipd`'s doorbell too — the trace showed the forwarded `SYN·ACK`'s
+signal, bits set, the bound thread named), and `take_bound` **handed the bits to the blocked
+thread** — the kernel's event log showed thread 57 receiving badge `0x2`. And the program's own
+counter, one instruction after the system call returns, showed nothing. The kernel delivered; the
+thread never executed again.
+
+**The mechanism.** `ipc::recv_either`'s notified path follows the mark-blocked-then-check
+discipline this project's own comments teach: `take_message_or_block` marks the thread `Blocked`
+*first*, so a signal landing after the check still finds a blocked thread to wake. When the check
+finds pending bits, the thread returns to its caller instead of sleeping — **still carrying the
+mark**. It keeps executing only until the next reschedule on its processor, which believes the
+mark, switches away, and never comes back: the wake that would have corrected the mark is the one
+the check just consumed. Whether a notified receive survived was decided by whether the
+signaller's wake landed before or after the mark — a coin toss taken on every notified receive
+since the path was written on 2026-08-13.
+
+**The fix is `sched::clear_blocked_mark`**: the notified path takes its own mark back before
+returning. Measured across every completed boot since: the TCP demonstration echoes on all of
+them, the DHCP client binds on all of them, and the boot gate's stall arm — added two entries ago
+as a named weakness — is deleted, with the gate demanding the echo outright again.
+
+**What this bug had been doing under other names.** `bin/ipd`'s serve loop uses the same path, so
+the same coin toss stranded the DHCP client's first call — recorded two entries ago as a second
+finding, now known to be the same one. And every service that binds a notification has taken this
+toss on every notified receive since 2026-08-13; the shell-test timeouts recorded as tick-landing
+flakes deserve re-examination against it once the suite is on a quiet host.
+
+**A regression test is owed and is not straightforward, which is recorded rather than glossed.**
+The bug lives in the ordering of a runqueue state transition against a cross-processor wake, and
+the host tests do not run threads against runqueues. The honest gate today is the boot: the strict
+echo demand fails any recurrence within a boot's dozen notified receives. A host-shaped test needs
+the scheduler's state machine extracted far enough to drive `take_message_or_block`,
+`clear_blocked_mark` and a racing wake deterministically — worth doing, not done here.
+
+**The instrumentation is gone; two things it justified stay.** `ipd`'s report now carries its
+state bits (send/configured/tcp-rings/serving) and the kernel prints them — the serving bit is
+load-bearing for the DHCP hold, and the tcp-rings bit is what showed the attach race. Everything
+else — event rings, per-notification counters, thread dumps — was scaffolding and is removed.
+
+### 2026-08-14, last (RFC 0020 step 5: sixteen bytes echoed by a real peer, and the wake that goes missing)
+
+**The machine's first real TCP exchange.** The harness's network gained the deterministic peer RFC
+0020's testing plan specified — `guestfwd=tcp:10.0.2.100:9-cmd:cat`, an echo server inside
+`restrict=on`, verified accepted by this QEMU before it was written into `devices.sh`. Against it,
+`bin/tcpd`'s demonstration now completes end to end on the boots that work: **`SYN`, `SYN·ACK`,
+`ACK`, sixteen bytes out, sixteen echoed back byte-for-byte, `FIN` crossing `FIN`, and the machine
+in `TIME_WAIT`** — outcome 6 in the boot log, six segments each way, the initial sequence number
+minted from the key RFC 0021 drew. Three domains, two rings each way, a state machine that was
+host-tested against a simulated peer talking to a stack this project did not write.
+
+**And about one boot in three, the demonstration stalls in `SYN-SENT` with exactly one segment out
+after fifteen seconds — which is the finding, because one segment after fifteen seconds means the
+armed retransmission deadline never fired.** `bin/tcpd` is the first program to arm a deadline on a
+notification bound with `BIND_SELF` and take the wake through a blocking receive — the one-loop
+shape RFC 0019 promised and RFC 0010 argued towards — and on the stalling boots that wake is lost.
+The same boots strand `bin/dhcp`'s first `Call` in the endpoint's send queue: queued toward a
+service that had not yet reached its blocking receive, delivered never. **Two kernel findings, both
+in the notification/rendezvous machinery, both surfaced by the third domain exercising patterns
+nothing had exercised**; the "wakes went missing" diagnostics the scheduler already prints exist
+for exactly this family. Neither is fixed here — a wake-loss hunt is its own session — and the boot
+gate records the stall as a *named weakness* with this entry cited, rather than demanding a
+coin-flip or hiding behind it.
+
+**Five bugs of this project's own were found and fixed on the way to the echo:**
+
+- **`ipd`'s TCP-ring attach lost the install race silently.** The kernel installs the rings after
+  `ipd` starts; a one-shot attach at entry failed on every boot, and step 4's "demonstration
+  reached the wire path" gate was **wrong because of it — the `SYN`s it counted sat in a ring
+  nobody drained**. Corrected here: the attach is retried, and the step-4 claim is amended by this
+  entry rather than quietly.
+- **The pair-retry wedged.** Retrying both attaches as one expression stuck `can_tcp` false forever
+  on any boot where the two slots were installed a pass apart, because a successful attach is not
+  repeatable. One boot in a handful lost that race. Retried one ring at a time now, idempotently.
+- **`serve` froze the answer it was constructed with.** A boot whose demonstration ended early
+  reached `serve` before the rings attached, and refused `SYN·ACK`s as `NOT_UDP` for the life of
+  the boot. `serve` retries the attach per pass now.
+- **The demonstration's transmit was gated on an ARP entry that expires mid-boot** — the cache ages
+  by frames handled, the burst handles more frames than the lifetime — so whether a segment went
+  out depended on a race with an expiry nobody was thinking about. Broadcast fallback now; slirp
+  routes on the IP header, which the DHCP exchange already relies on.
+- **`tcpd`'s echo capture read the handshake as data.** A `SYN·ACK` moves `rcv_nxt` from zero to
+  `irs+1` — a wrap-sized jump the capture counted as four billion delivered bytes, whose wrapped
+  offset summed back to exactly the buffer's length and reported a zeroed buffer as a complete,
+  corrupt echo. Outcome 8 with three segments in was arithmetic, not the peer.
+
+**A fourth ordering bug of the recorded shape, fixed by readiness rather than reordering.** The
+DHCP client's first call stranded on boots where `ipd`'s demonstration ran short, because nothing
+bounded how long the service took to reach its receive. Moving starts around is what the three
+previous ordering bugs did; this one adds the missing signal instead — `ipd` reports the moment it
+is serving (state bit 3, published before the blocking receive), and the kernel holds the client
+until the bit is set, bounded. An attempt to fix the original race by moving the whole TCP setup
+before `ipd`'s spawn destabilised the boot three different ways — a stack overflow it merely
+enlarged (`ipd`'s stack is eight pages now, found as a #PF in the guard page presenting as a
+service that answered one caller and vanished), an address-space table it filled (`MAX_SPACES` is
+twelve, with the eleventh program's failure presenting exactly as `domain.rs`'s comment predicts),
+and finally wakes going missing outright — and was abandoned for the readiness signal.
+
+**The gate, stated as what it is.** On a network boot the harness demands the completed echo
+(outcome 6, or 7 if a boot ever outlives `TIME_WAIT`'s minute) **or** the stall — serving, keyed,
+one segment out — with the weakness named in the gate's own comment. A gate whose answer depends on
+timing is not a gate, and until the wake loss is fixed the echo on every boot would be one. The
+no-network arm is unchanged and strict.
+
+**The suite's margin is thinner than it was, and by the end of this session the host could not
+produce a full green run at all — recorded with the numbers rather than smoothed over.** Standalone,
+every piece passes and was watched passing repeatedly tonight: bios green, iommu green in 31
+seconds with the echo completing, UEFI green at ~90 of the 120-second budget, host tests, gates,
+formats and lints all green. Five consecutive `make test` runs then failed, each on a *different*
+stochastic point — two UEFI timeouts (one also carrying a tick-landing self-test failure inside
+the abandoned boot), one instance of the morning's measured 5.5% `sync.rs` host flake, and two
+plain-bios timeouts under suite-parallel load on a host that had by then run QEMU continuously for
+twelve hours at a load average above three. Nothing failed twice, and nothing failed standalone.
+The timeout stays at 120 because raising a timeout to fit a slower boot is how a boot gets slower;
+what the next session owes is a full-suite run on a quiet host before anything else lands, and a
+trim of the boot's serial waits, several of which exist only to sequence reports for the log.
+
+> **Updated after the wake-loss fix, same day.** The tally by midnight: seven full-suite attempts,
+> every failure a UEFI or BIOS boot crossing the 120-second line or the recorded `sync.rs` host
+> flake, never a content gate, with load average holding near three and the RT-latency self-test
+> measuring wakeups **446 milliseconds** late against a 50-microsecond target inside the failing
+> boots.
+>
+> **And the "host condition" was this project's own doing, which is recorded because it is the
+> better lesson.** The load was two `bhaskix-net` host-test binaries spinning at 100% since
+> mid-afternoon — the *deliberately hung* option-walk tests from the watch-it-fail runs, whose
+> parent `cargo test` the harness's timeout killed while the test children it had spawned kept
+> the loop. Eight hours of every boot timeout, every "flaky" suite, and a nine-thousand-fold RT
+> miss traced to two orphans of this session's own negative testing. A watch-it-fail harness that
+> kills a hung test must kill the *process group*; until one does, the cost of watching a hang
+> fail is remembering to look at `ps` afterwards. With the orphans gone, all four service
+> placements passed standalone in one run.
+
+**What remains of step 5**: the inbound half — `LISTEN`, `ACCEPT`, a host-initiated connection —
+and step 4's owed connection capabilities, both behind the wake-loss fix, which is the next work
+and has this entry's evidence to start from.
+
+### 2026-08-14, last (RFC 0020 step 4: a third network domain, and the firmware's rings behind the translation)
+
+**`bin/tcpd` boots.** A third network domain: a ring `bin/ipd` forwards TCP segments into, a ring it
+hands segments back through, a configuration page, a report page, an endpoint, and one notification
+rung by `ipd`'s doorbell *and* fired by the deadlines it arms — one blocking `receive`, woken for a
+caller, a frame or a timer, which is the loop RFC 0010 spent two questions arguing towards, now in
+its third service. What crosses the rings is eight bytes of addresses and a segment; `ipd` stays the
+only parser of the IPv4 header. `check-deps` records the crate at the user layer with `bhaskix-abi`,
+`bhaskix-net` and `bhaskix-rand` and nothing else; `unsafe_budget = 99`, measured, no headroom.
+
+**RFC 0021's refusal is running, not promised.** The first thing `bin/tcpd` does is draw a 128-bit
+secret through `bhaskix-rand`; on a machine that cannot supply one it reports `NO_ENTROPY` and
+serves nothing. The boot gate was **watched failing on exactly this**: a build whose draw always
+refuses fails the harness. On the harness's machine the report reads `state 0xf` —
+attached/keyed/configured/serving — and *keyed* means the first sequence-number secret this system
+has ever minted was drawn in ring 3 by the program that needs it.
+
+**The demonstration drives the state machine over the real rings.** `tcpd` opens a connection to
+the gateway's discard port: an ISN from RFC 6528's construction, a `SYN` from step 2's writer,
+handed to `ipd`, and retransmitted on RFC 0019 deadlines fired in ring 3 — the report's "out" count
+climbs with each firing, which makes the retransmission machinery observable from a boot log.
+QEMU's `restrict=on` network answers nothing, so the steady state is `SynSent`, outcome pending; a
+machine with no network reports "no network to demonstrate against" and exits. Both are gated, and
+step 5's `guestfwd` peer is what turns pending into an echo.
+
+**Not in this step: connection capabilities for other programs.** The endpoint answers `LATER` — an
+honest not-yet a caller can tell from a missing service. Minting is exactly what step 5's client
+exercises, and dead code in ring 3 proves nothing.
+
+**Building it surfaced a latent kernel bug with nothing TCP about it.** Adding the domain shifted
+the image, and the iommu boot began failing with `iommu FAULT 00:03.0 read 0xffd9000, reason 0x06`
+— deterministic per layout, gone when the layout shifted back, and **provoked by code that never
+ran**: a bisect with every new path inert still faulted, and 12 KiB of dead rodata did not. The
+mechanism, once instrumentation replaced theory: **the firmware drives every bootable virtio disk
+while deciding what to boot, and leaves its rings live at physical addresses.** The kernel has
+known this for its own disk since RFC 0012 — `init_mapped`'s comment calls the result "a fault
+nobody owns" and resets before enabling translation — and the bring-up even clears one expected
+transition fault. But nobody reset the **delegated** disk, so the firmware's ring stayed live
+behind the new translation, and its second stray access arrived mid-boot on a schedule set by
+image layout. `virtio::quiesce_delegated` now resets it before translation exists; `bin/blkd`
+still does its own full reset when it claims the device, exactly as before. Faults per boot: zero,
+where the harness previously did not even gate on the line — a fault could sit in a green log.
+
+**The eleventh-program gate caught its ninth addition.** The vfs self-test's `bin == 10` — "exact
+rather than at least, so adding an eleventh without noticing this line is a failure" — went red the
+moment `bin/tcpd` entered the initrd, while the DMA fault was being hunted two lines up in the same
+log. Both the kernel's count and the harness's grep now say eleven.
+
+**One `make test` run of this change failed on a shell-test timeout and two passed**, including
+the one that ran first. The failing mode (`shell-test.sh kernel`) passed three consecutive standalone
+runs immediately after, the code delta between the passing and failing full runs was five lines that
+cannot execute on this machine, and the host had been running QEMU nearly continuously for hours.
+Recorded as an observation of the same tick-landing sensitivity `make soak` exists for — beside
+today's measured 5.5% `sync.rs` host flake — rather than silently re-run away: two flaky harnesses
+in one file is a pattern, and the next person to see a red shell test should know it has form.
+
+**A debugging day's honest accounting.** Most of the hunt's cost was self-inflicted: a bisect guard
+(`if false` around the spawn) survived into the "restored" build because the file had been saved
+with the guard in, and the success print below it — printed unconditionally — said the domain had
+started when nothing had been spawned. The give-away, when it finally surfaced, was a thread table
+with no `tcpd` in it. The print now follows the spawn it describes only because the spawn is
+unconditional again; the general lesson — a success message printed on a path that cannot see the
+success — is one this file already records for counters, and it holds for prints.
+
+### 2026-08-14, last (RFC 0020 step 3: the state machine, and the fuzz target that earned its keep in a hundred seconds)
+
+**The connection exists, as a pure function.** `net/src/tcp/state.rs`:
+`step(tcb, event, now) → (tcb, actions)` — no I/O, no clock, no allocation, no knowledge that
+domains or capabilities exist, which is the decision RFC 0020's whole design section rests on and
+is now code rather than intention. The eleven states, the handshake from both ends, simultaneous
+open and simultaneous close, retransmission with exponential backoff and Karn's algorithm, a peer
+abandoned after its bounded attempts, zero-window probing, delayed acknowledgements by RFC 1122's
+every-second-segment rule, `RST` validated against the window in every synchronised state, and
+`TIME_WAIT` entered and left. **154 host tests in `bhaskix-net`**, 38 of them over the machine,
+driven by a simulated peer that is thirty lines long *because* the time is an argument — a
+two-minute `TIME_WAIT` costs one addition to a `u64`.
+
+**The state-machine fuzz target found a real bug within a hundred seconds of first being run.**
+`Actions` — the bounded list a `step` returns — overflowed its eight slots. The comment beside the
+constant had reasoned out a worst case and the reasoning was wrong: it counted segments and forgot
+timers. One arriving segment can acknowledge data, complete a close, deliver data, and touch three
+timers on the way through. This is the target RFC 0020's testing plan called "the one that
+matters", doing exactly what it was specified to do, on its first campaign.
+
+**The fix is de-duplication, not a bigger number — and which one did the work was measured rather
+than asserted.** `Actions::push` now replaces a timer instruction already present in the same step:
+arming a timer twice in one step is one decision taken twice, not two instructions, and only the
+last would survive at the caller anyway. With the de-duplication in place, a list deliberately put
+back to eight slots survived **9.8 million fuzz executions** without overflowing. `MAX_ACTIONS` is
+sixteen anyway, and the constant's comment now says plainly that sixteen is headroom and not a
+derived figure — because the previous derived figure is the thing that was just proven wrong. A
+unit test pins the de-duplication itself and goes red if it is removed.
+
+**An invariant the testing plan did not name, and the first version of the machine failed it:**
+`snd.nxt` must never run past the bytes the program supplied. A violation is not bookkeeping — it
+is `bin/tcpd` being told to read past what the program wrote and put it on the wire, a disclosure.
+Both fuzz harnesses assert it. The initial `Connect` handler left `snd_avail` one behind `snd_nxt`
+(the `SYN` occupies a sequence number; the data starts after it), so `unsent()` wrapped and the
+machine's first segment claimed four billion bytes. Caught by the unit tests on their first run;
+`unsent()` and `in_flight()` now refuse to wrap regardless.
+
+**One divergence from RFC 0020's design text, recorded in the document where the design lives.**
+Its out-of-order paragraph says a segment beyond the expected sequence number "is discarded and not
+acknowledged" — right for a segment *ahead* of the stream, wrong for one *behind* it. An old
+duplicate means the peer never saw the acknowledgement for data this end already took; silence
+leaves it retransmitting until it abandons a connection that works. Duplicates are acknowledged,
+futures are dropped silently, and each behaviour is a test.
+
+**Watched failing, nine ways.** Among them: the disclosure invariant (six tests red, both
+harnesses), Karn's algorithm removed, a `RST` believed without its window check, the `FIN` counted
+as a byte of the program's ring, `TIME_WAIT` entered without its deadline, the delayed
+acknowledgement never delayed, and the timer de-duplication removed. Two earlier breaks went red on
+nothing and both were defects in the *tests*, fixed before this entry: a break aimed at the window
+check bypassed a copy of it rather than the check, and the de-duplication had no test until its
+removal was watched changing nothing.
+
+Fuzz campaigns: `tcp_state` 17.0M executions in 241 s clean after the fix (1,767 corpus units);
+`tcp_parse` unchanged. Steps 4 to 6 — the domain, a real peer through `guestfwd`, and the
+measurement — are what remain.
+
+### 2026-08-14, last (the host suite has been 5.5% flaky, and the cause is the tests sharing a CPU)
+
+**Found by `make test` failing on a change that could not have caused it**, which is the only reason
+it was looked at rather than re-run. The failure was a stack overflow reported against
+`wait::tests::removing_a_waiter_that_is_not_queued_is_harmless` — a test whose entire body is a
+32-entry array — in `bhaskix-kernel`, from a change confined to `bhaskix-net`. `cargo tree` says the
+kernel does not depend on `bhaskix-net`, so the two were unrelated and the question became how long
+this had been happening.
+
+**Measured rather than estimated: 11 failures in 200 runs of the same test binary, 5.5%.** The
+`make test` gate hits it about one run in eighteen, which is frequent enough that it will have been
+seen before and rare enough to be re-run away.
+
+**The failures are not one test.** Across 120 further runs they were spread over
+`sync::tests::a_lock_is_never_held_while_the_cpu_claims_nothing`,
+`a_failed_try_lock_leaves_no_hold_behind`, `releasing_out_of_order_leaves_the_set_correct`,
+`releasing_and_retaking_one_rank_is_not_a_violation` and
+`holding_a_rank_still_blocks_preemption_after_its_bit_is_cleared` — every one of them in
+`kernel/src/sync.rs`, and every one of them asserting on the lock-rank bookkeeping.
+
+**The cause, and it is proved rather than proposed.** `HELD` and `HOLDS` (`kernel/src/sync.rs:282`
+and `:324`) are `static` arrays indexed by CPU. On the host there is one CPU, so every test thread
+shares slot zero — and libtest runs tests in parallel, eight at a time on this machine. A test that
+calls `set_held_mask(0)` and then asserts `held_mask() == 0` is asserting about a global another
+test is concurrently taking a lock in. **The same binary, 200 runs with `--test-threads=1`: zero
+failures.** Parallel 11/200, serial 0/200, same build, same machine.
+
+**Not fixed here, and deliberately so.** The fix has a design choice in it — serialise these tests
+against each other, or give the host build a per-thread notion of which CPU it is — and the second
+is the one that would also make future SMP-shaped tests honest, which makes it a decision about
+`kernel/src/sync.rs` rather than a tidy-up to fold into a networking change. Recorded with the
+measurement so that whoever takes it does not have to rediscover the rate.
+
+**What this does *not* mean.** The lock-rank *mechanism* is not implicated: `M4-08`'s claim rests on
+the boot test's count of ~7,400 checked acquisitions with zero violations, which runs on a real
+machine with real per-CPU slots and is untouched by this. What is implicated is five host tests that
+have been checking a global they do not own.
+
+### 2026-08-14, last (RFC 0020 step 2: the first parser in this project with a loop in it)
+
+**The TCP segment, parsed and built.** `net/src/tcp/segment.rs`: the twenty-byte header, the six
+control bits, the option walk, the pseudo-header checksum, and a writer. **116 host tests in
+`bhaskix-net`**, up from 94, plus a seeded-mutation entry and a libFuzzer target. Still nothing that
+boots — the state machine is step 3 and the domain is step 4.
+
+**Every parser this project has written until now reads a fixed layout.** Check a length, take a
+slice, return. A TCP option list is different in kind: it is a walk whose **stride comes out of the
+packet**, because an option states its own length and the walk believes it in order to find the
+next one. An option claiming a length of **zero does not advance the walk**. That is not a misparse
+— it is a service that stops answering, permanently, for two bytes from anyone who can reach the
+port. One comparison guards it and it is the most load-bearing line in the file.
+
+**Watched failing, and the failure is a hang rather than a red test.** Deleting that guard does not
+turn anything red; the suite stops. Confirmed under a timeout rather than asserted, because "it
+would hang" is exactly the kind of claim this file exists to stop people making. **And the libFuzzer
+target finds it independently**: run against a build with the guard removed, it reported
+`ERROR: libFuzzer: timeout after 5 seconds` and wrote the artifact. That is `coding-style.md` §8's
+own standard for a harness — not working until a deliberately reintroduced bug of the kind it hunts
+actually fails it — met by demonstration, for both harnesses, rather than inherited from the six
+targets that came before.
+
+Seven further breaks each turned exactly the expected tests red: the data offset's lower bound
+(caught by a unit test **and** by the mutation harness), the checksum, an option reaching past the
+header, the `ACK` bit taken from the flags rather than from the number behind it, a `FIN` uncounted
+in the sequence space, and an unknown option skipped by one byte instead of its own length.
+
+**An eighth break went red on nothing, and this time the code was wrong rather than the test.** An
+explicit `header_length > bytes.len()` check could be deleted with the whole suite still green,
+because `bytes.get(..header_length)` had been enforcing that bound since the line was typed. Two
+checks doing one job means one of them is never observed working, which is this file's own
+definition of not being a gate at all. The redundant one is gone; the comment in its place says why
+the upper bound needs no check of ours, so that the next reader does not helpfully re-add it. The
+lower bound stays and *is* observable.
+
+**A test was wrong too, and its correction is a fact about TCP worth keeping.** A data offset of six
+words against a twenty-four byte segment is not past the end — it is a header-only segment whose
+option area is the four bytes that had been the payload, and the walk then refuses those bytes on
+their own merits. The boundary is at the segment length, one word lower than it looks. The
+assertion now pins both sides of it.
+
+**Three decisions the RFC left to this step:**
+
+- **The acknowledgement number is an `Option<Sequence>`, not a number.** RFC 793 §3.1 makes the
+  field significant only under `ACK`, so a state machine that read it unconditionally would believe
+  four bytes the peer never meant to send. The writer derives the flag from the field rather than
+  trusting a caller to set both — one fact, one place, and the disagreement that matters (the bit
+  set with nothing behind it) becomes unrepresentable.
+- **The reserved bits are carried, not refused.** §3.1 says they must be zero; RFC 3168 took two of
+  them for congestion notification twenty years later (September 1981, September 2001). A parser written to the older sentence
+  refuses every segment from a modern peer, so the bits round-trip and nothing acts on them. Being
+  spec-literal here would be wrong against the network that exists.
+- **A malformed option refuses the segment rather than quietly ending the walk.** Stopping early
+  makes a maximum segment size sitting behind a broken option *silently absent*, which is
+  indistinguishable from a peer that never sent one — a defect that surfaces months later as
+  mysteriously small segments and no error anywhere.
+
+**Fuzzing, and the doorway problem again.** Both harnesses repair the checksum on half their inputs.
+Everything worth reaching in a TCP header — the data offset, and the entire option walk behind it —
+sits *after* the checksum test, so an unrepaired campaign reports clean coverage of a closed door.
+`DMAR` taught this project that lesson and it costs more here than it did there. Smoke run:
+**21.1 million executions in 121 seconds, no crash, 220 new corpus units.**
+
+### 2026-08-14, last (RFC 0020 step 1: a sequence number that cannot be guessed, and the hash it needed)
+
+**The first TCP code in the tree, and it is the piece that had a prerequisite outside it.**
+`net/src/tcp/isn.rs` computes RFC 6528's `ISN = M + F(localip, localport, remoteip, remoteport,
+secretkey)`; `net/src/tcp.rs` carries the `Sequence` and `FourTuple` types steps 2 and 3 will both
+need; `net/src/siphash.rs` is `F`. **73 host tests in `bhaskix-net` became 94.** No device, no
+domain, no clock, no IPC, and nothing that boots — which is what step 1 was defined to be, exactly
+as RFC 0018 step 1 was.
+
+**RFC 0020 said "a keyed function of the four-tuple" and did not say which, so this step chose
+one.** SipHash-2-4, and the choice is against the hash RFC 6528 itself names. That RFC says MD5
+"would be a good choice" and then, in the same paragraph, says implementations "should consider the
+trade-offs involved in using functions with stronger security properties, and employ them if it is
+deemed appropriate". The requirement being met is a pseudorandom function over **thirteen bytes**,
+not a message digest, so MD5's lost collision resistance is beside the point while its size is not;
+SipHash is four 64-bit words of add-rotate-xor that fits a crate which `forbid`s `unsafe`; and its
+key length is exactly the 128 bits RFC 6528 asks for. **`unsafe_budget` is still 0.**
+
+**The test compares against arithmetic this project did not write.** All 64 published vectors for
+SipHash-2-4-64 are in the test module, converted from the reference implementation's own
+`vectors.h`, with its `test.c` read to confirm the key and the message convention rather than
+recalled. They pin every constant, every rotation, the block order, the length byte and the
+finalization at once. This is the standard `checksum` is held to against RFC 1071's worked example,
+and for the stated reason: a round trip through one implementation proves only that it is
+self-consistent.
+
+**A keyed hash is an exception to RFC 0021's "no cryptographic API", and it is argued rather than
+smuggled in.** A draw from `RDRAND` is unpredictable and useless here, because `F` must be a
+*function*: the same four-tuple at the same instant has to give the same number, or a reincarnated
+connection loses the protection against old duplicates that is the whole reason an ISN is a
+sequence number and not a nonce. `bhaskix-rand` is unchanged — still two `asm!` blocks and a retry
+loop — and the hash lives in the crate with the one caller.
+
+**`bhaskix-net` cannot depend on `bhaskix-rand`, and that was read rather than assumed.** Both sit
+at layer −2 in `tools/check-deps.py`, so neither may reach the other. It is the right shape and not
+an obstacle worked around: the secret is an argument, every function in the module is pure, and
+`Key::draw` is generic over its source — which is what allows a host test to drive a processor that
+answers once and then refuses, a machine no runner here has.
+
+**Watched failing eight ways, and the eighth is why the rule exists.** Seven deliberate breaks went
+red immediately — the length byte dropped from the final block, the key never mixed into the state,
+one compression round instead of two, the second key word taken from the first, a plain `<` for the
+wrapping sequence comparison, the remote port dropped from the four-tuple, and the clock term
+dropped from the sum. The eighth, **substituting a millisecond for RFC 6528's four-microsecond
+tick, left every test in the file green.** Both tests of the tick computed their expectations from
+the constant they were checking, so the constant could be anything. The defect was in the tests, it
+was found by the rule and not by reading them, and the fix is a literal `4_000` written out beside a
+note saying why it is not `TICK_NANOS`. Recorded because a test that takes its expectation from the
+code under test is invisible to review: it reads exactly like a correct one, and only breaking the
+thing it claims to check tells the two apart.
+
+**`Sequence` deliberately does not derive `PartialOrd`.** Sequence numbers live on a circle where
+`0xffff_ffff` precedes `0`, so a derive would put the wrong answer behind the ordinary `<` operator
+where nobody would look for it. RFC 0020's testing plan names that exact substitution as a failure
+to watch for; the type makes it something that has to be typed out rather than defaulted into.
+
+**And one claim in that same doc comment was written before it was checked, and was wrong.** It said
+that two sequence numbers exactly 2³¹ apart would make `precedes` and `follows` *both false*. They
+make both **true**: the two ways round the circle are the same length, and the signed difference
+reads as `i32::MIN` from either end. The comment now says so, and there is a test asserting it —
+which is the useful outcome, because the degenerate case is unreachable for real sequence pairs and
+would otherwise have sat there as a plausible sentence nobody could disprove by reading it.
+
+**What is not done, and is not being counted as done.** Step 1's other half is `bin/tcpd` refusing
+to start on a machine that cannot be unpredictable. `Key::draw` returns `None` when either draw
+fails and no path turns that into a number, so the refusal is unavoidable by construction — but the
+domain that would perform it is step 4, and a typed obligation is not a running one. Steps 2 to 6 —
+the segment parser and its fuzz target, the state machine, the domain, a real peer through
+`guestfwd`, and the measurement — are unstarted.
+
+**The stale figures in this file's header are still not being guessed at.** The previous entry
+recorded that "601 suite checks" and "346 host assertions" are not comparable with what a run prints
+today, because nobody has written down what counts as a check. That is unchanged, and adding twenty-one
+host tests to one crate does not resolve it. The one number stated above — 73 to 94 — is a count of
+`#[test]` functions in `bhaskix-net`, which is a definition anyone can re-run.
 
 ### 2026-08-14, last (RFC 0021 built: the machine can be unpredictable, and proves it every boot)
 

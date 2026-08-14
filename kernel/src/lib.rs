@@ -3232,7 +3232,12 @@ const NETD_PROGRAM: &[u8] = b"bin/netd";
 
 /// Where the protocol service's domain keeps its stack.
 const IPD_STACK: u64 = 0x0000_0000_1300_0000;
-const IPD_STACK_PAGES: u64 = 4;
+// Eight pages since RFC 0020 step 4. The TCP back-ring drain puts two
+// frame-sized buffers on `serve`'s stack on top of the demonstration's, and
+// four pages put the deepest path a few hundred bytes past the guard — found
+// as a #PF at 0x12fffed8, the guard page doing exactly its job, presenting as
+// a service that answered one caller and vanished.
+const IPD_STACK_PAGES: u64 = 8;
 
 /// Where the protocol service's program is.
 const IPD_PROGRAM: &[u8] = b"bin/ipd";
@@ -3249,6 +3254,18 @@ const DHCPD_MARKER: u64 = 0x3145_4e4f_5044_4844;
 
 /// The page `bin/dhcp` leaves its findings in.
 static DHCP_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+const TCPD_STACK: u64 = 0x0000_0000_1600_0000;
+const TCPD_STACK_PAGES: u64 = 4;
+const TCPD_PROGRAM: &[u8] = b"bin/tcpd";
+const TCPD_MARKER: u64 = 0x3144_5043_5444_0a54;
+static TCP_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static TCP_CONFIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static IP_INBOX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+const IP_TCP_BADGE: u64 = 1 << 2;
+const TCP_TIMER_BADGE: u64 = 1 << 0;
+const TCP_FRAME_BADGE: u64 = 1 << 1;
 
 /// Bytes in the ring between `bin/netd` and `bin/ipd`.
 ///
@@ -4060,6 +4077,10 @@ fn start_ip_domain(
     // wake it is supposed to be sending.
     let inbox = crate::notify::create().ok();
     if let Some(inbox) = inbox {
+        IP_INBOX.store(
+            u64::from(inbox.index()) | (u64::from(inbox.generation()) << 32) | 1 << 63,
+            core::sync::atomic::Ordering::Release,
+        );
         let for_service = crate::notify::name(inbox).ok().and_then(|root| {
             cap::with_arena(|arena| arena.derive(root, cap::Rights::READ, 0).ok())
         });
@@ -4121,6 +4142,31 @@ fn start_ip_domain(
         return Err("the doorbell capability would not install");
     }
 
+    // **Before `ipd` is spawned — capability before program, and this order
+    // was abandoned once and reinstated with a correction worth recording.**
+    // `start_tcp_domain` installs `ipd`'s ring slots, and installing them
+    // after the spawn lost a race to `ipd`'s first attaches on every boot.
+    // Moving the call here was tried on 2026-08-14 and rolled back, because
+    // boots started stranding callers and losing wakes — which looked like
+    // this order's fault and was not: the strandings were the notified-
+    // receive blocked-mark bug (`sched::clear_blocked_mark` carries that
+    // story), taking its coin toss under the changed timing. With that bug
+    // fixed, the rolled-back order came back for a second reason too: running
+    // this function *concurrently with a just-started `ipd`* — the rolled-
+    // forward arrangement — intermittently deadlocked the boot thread against
+    // `ipd`'s startup system calls, one boot in a handful, hanging bring-up
+    // before `netd` existed. Setup first, program second, ends both races.
+    // `ipd` still retries its attaches, which now merely tolerates a slower
+    // install rather than papering over a lost one.
+    let tcp_cpu = if bhaskix_arch::percpu::online_count() >= 4 {
+        cpu.saturating_sub(2)
+    } else {
+        cpu
+    };
+    if let Err(reason) = start_tcp_domain(tcp_cpu, hhdm_base, realm, keeper) {
+        println!("\x1b[91m    tcp domain     FAILED: {reason}\x1b[0m");
+    }
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -4135,6 +4181,225 @@ fn start_ip_domain(
         NET_RING_BYTES / 1024
     );
     Ok(())
+}
+
+/// Creates the rings between `bin/ipd` and `bin/tcpd`, and starts `bin/tcpd`.
+///
+/// [RFC 0020](../../docs/rfc/0020-tcp.md) step 4: a third network domain,
+/// because TCP is the largest remote-driven *stateful* parser this system will
+/// contain and a bug in it must not take down the domain holding the machine's
+/// address and every UDP socket. The shape is `start_ip_domain`'s exactly —
+/// two rings owned by the keeper, a config page, a report page, an endpoint,
+/// and an inbox rung by a doorbell — because that shape has now carried two
+/// services and is the thing RFC 0013 promised would be repeatable.
+///
+/// # Errors
+///
+/// Any capability that would not be created or installed. Every one leaves the
+/// machine bootable, for the reason `start_ip_domain` gives.
+fn start_tcp_domain(
+    cpu: u32,
+    hhdm_base: u64,
+    ip: domain::DomainId,
+    keeper: domain::DomainId,
+) -> Result<(), &'static str> {
+    let realm = domain::create("tcp", domain::ResourceEnvelope::new())
+        .map_err(|_| "the tcp domain would not be created")?;
+
+    // The forward ring: `ipd` produces TCP payloads into it, `tcpd` consumes.
+    let forward = shared::create(keeper, NET_RING_BYTES)
+        .map_err(|_| "the tcp forward ring would not be created")?;
+    let for_producer =
+        shared::name(forward).map_err(|_| "the tcp forward ring would not be named")?;
+    let for_consumer =
+        shared::name(forward).map_err(|_| "the tcp forward ring would not be named twice")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(0, for_consumer).is_ok()
+    }) != Some(true)
+    {
+        return Err("the tcp forward ring would not install in the tcp domain");
+    }
+    if domain::with(ip, |owner| owner.cspace.install_at(7, for_producer).is_ok()) != Some(true) {
+        return Err("the tcp forward ring would not install in the ip domain");
+    }
+
+    // The back ring: `tcpd` produces segments, `ipd` wraps and transmits them.
+    let back = shared::create(keeper, NET_RING_BYTES)
+        .map_err(|_| "the tcp back ring would not be created")?;
+    let back_producer = shared::name(back).map_err(|_| "the tcp back ring would not be named")?;
+    let back_consumer =
+        shared::name(back).map_err(|_| "the tcp back ring would not be named twice")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(2, back_producer).is_ok()
+    }) != Some(true)
+    {
+        return Err("the tcp back ring would not install in the tcp domain");
+    }
+    if domain::with(ip, |owner| {
+        owner.cspace.install_at(8, back_consumer).is_ok()
+    }) != Some(true)
+    {
+        return Err("the tcp back ring would not install in the ip domain");
+    }
+
+    // One page for what `tcpd` finds, read by the kernel like every report.
+    let report = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the tcp report page would not be created")?;
+    let named = shared::name(report).map_err(|_| "the tcp report would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(1, named).is_ok()) != Some(true) {
+        return Err("the tcp report would not install");
+    }
+
+    // What interface this machine is. Read-only, filled by
+    // `publish_net_config` once the driver has read the address — the same
+    // page format `ipd` waits on, written by the same code.
+    let config = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the tcp config page would not be created")?;
+    let config_root = shared::name(config).map_err(|_| "the tcp config would not be named")?;
+    let config_named =
+        cap::with_arena(|arena| arena.derive(config_root, cap::Rights::READ, 0).ok())
+            .ok_or("the tcp config capability would not derive")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(3, config_named).is_ok()
+    }) != Some(true)
+    {
+        return Err("the tcp config would not install");
+    }
+    TCP_CONFIG.store(config.as_u64(), core::sync::atomic::Ordering::Release);
+
+    // The endpoint programs will reach TCP through, unbadged and the
+    // service's own. Step 5 hands out badged, weaker capabilities to it.
+    let endpoint = ipc::create().map_err(|_| "no endpoint for the tcp service")?;
+    let serving = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the tcp endpoint capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(4, serving).is_ok()) != Some(true) {
+        return Err("the tcp endpoint capability would not install");
+    }
+
+    // `tcpd`'s inbox: a deadline it arms fires through the same word `ipd`'s
+    // doorbell rings, so one blocking receive wakes for a caller, a frame or a
+    // timer — the loop RFC 0010 spent two questions arguing towards, in its
+    // third service.
+    let inbox = crate::notify::create().map_err(|_| "the tcp inbox would not be created")?;
+    let for_service = crate::notify::name(inbox).ok().and_then(|root| {
+        cap::with_arena(|arena| {
+            arena
+                .derive(
+                    root,
+                    cap::Rights::READ.union(cap::Rights::WRITE),
+                    TCP_TIMER_BADGE,
+                )
+                .ok()
+        })
+    });
+    let for_ip = crate::notify::name(inbox).ok().and_then(|root| {
+        cap::with_arena(|arena| arena.derive(root, cap::Rights::WRITE, TCP_FRAME_BADGE).ok())
+    });
+    match (for_service, for_ip) {
+        (Some(service), Some(bell))
+            if domain::with(realm, |owner| owner.cspace.install_at(6, service).is_ok())
+                == Some(true)
+                && domain::with(ip, |owner| owner.cspace.install_at(9, bell).is_ok())
+                    == Some(true) => {}
+        _ => {
+            crate::notify::destroy(inbox);
+            return Err("the tcp inbox would not install");
+        }
+    }
+
+    // `tcpd`'s doorbell onto `ipd`'s inbox: a third bit in a word two senders
+    // already share, which is the badge-as-bitmask working at the scale it was
+    // designed for. Write-only, so a bug in `tcpd` cannot eat a wake.
+    let doorbell = {
+        use core::sync::atomic::Ordering;
+        let raw = IP_INBOX.load(Ordering::Acquire);
+        if raw & (1 << 63) == 0 {
+            None
+        } else {
+            let id = crate::notify::NotificationId::from_parts(
+                raw as u32,
+                (raw >> 32) as u32 & 0x7fff_ffff,
+            );
+            crate::notify::name(id).ok().and_then(|root| {
+                cap::with_arena(|arena| arena.derive(root, cap::Rights::WRITE, IP_TCP_BADGE).ok())
+            })
+        }
+    };
+    if let Some(doorbell) = doorbell
+        && domain::with(realm, |owner| owner.cspace.install_at(5, doorbell).is_ok()) != Some(true)
+    {
+        return Err("the tcp doorbell would not install");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(cpu, "tcpd", tcp_domain_entry, hhdm_base, hhdm_base, options)
+        .map_err(|_| "the tcp domain would not spawn")?;
+
+    TCP_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
+
+    println!(
+        "    tcp domain     bin/tcpd started: two rings to ipd, an endpoint, a timer, and no \
+         device"
+    );
+    Ok(())
+}
+
+/// Loads `bin/tcpd` into a fresh address space and enters it.
+///
+/// The same steps `ip_domain_entry` takes, for the same reasons, with one
+/// addition borrowed from the DHCP client: the cycle counter's rate goes in as
+/// the entry argument, because the TCP service arms deadlines and a deadline
+/// is a duration times a rate — the one fact about the clock that cannot
+/// arrive through a CSpace.
+extern "C" fn tcp_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    tcp domain     FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(TCPD_PROGRAM) else {
+        stop("bin/tcpd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/tcpd is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(TCPD_STACK), TCPD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/tcpd would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = TCPD_STACK + TCPD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("tcp domain", entry, rsp, [hertz, 0]) }
 }
 
 /// The page `bin/ipd` leaves its findings in.
@@ -4340,6 +4605,21 @@ fn publish_net_config(hhdm: u64, mac: u64) -> bool {
         }
         core::sync::atomic::fence(Ordering::SeqCst);
         core::ptr::write_volatile((hhdm + frames[0]) as *mut u64, words[0]);
+    }
+
+    let raw = TCP_CONFIG.load(Ordering::Acquire);
+    if raw != u64::MAX
+        && let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw))
+        && count > 0
+    {
+        // SAFETY: as above, on the tcp domain's page.
+        unsafe {
+            for (index, word) in words.iter().enumerate().skip(1) {
+                core::ptr::write_volatile((hhdm + frames[0] + index as u64 * 8) as *mut u64, *word);
+            }
+            core::sync::atomic::fence(Ordering::SeqCst);
+            core::ptr::write_volatile((hhdm + frames[0]) as *mut u64, words[0]);
+        }
     }
     true
 }
@@ -5245,6 +5525,10 @@ fn report_net_after_exchange(hhdm: u64) {
         return;
     }
     println!(
+        "    ipd state      {:#x} (send/configured/tcp-rings)",
+        ipd[7]
+    );
+    println!(
         "    ipd after      {} frames taken, {} refused, {} datagrams delivered to a socket; \
          last refusal reason {}, on a frame of {} bytes with ethertype {:#06x}; ring head {} tail {}; \
          {} empty looks at the ring, longest run {}; woken by a frame {} times",
@@ -5260,6 +5544,42 @@ fn report_net_after_exchange(hhdm: u64) {
         ipd[19],
         ipd[20]
     );
+
+    // The demonstration runs on its own clock — a handshake, an echo and a
+    // close against the emulator's peer — and reading its page at whatever
+    // instant the boot happens to reach this line reported whichever moment
+    // that was: `pending, 1 out` on a boot that would have echoed fine a
+    // second later. Waited for, bounded, exactly as the driver's report is:
+    // the loop ends the moment the outcome is terminal, so a working boot
+    // pays a second or two and only a broken one pays the bound — five
+    // seconds, sized so that a boot already stretched by suite load does not
+    // cross the harness's own timeout on the days the wake loss stalls the
+    // demonstration.
+    for _ in 0..50u32 {
+        let raw = TCP_REPORT.load(core::sync::atomic::Ordering::Acquire);
+        if raw == u64::MAX {
+            break;
+        }
+        let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+            break;
+        };
+        if count == 0 {
+            break;
+        }
+        // SAFETY: a frame this object owns, through the direct map.
+        let (marker, outcome) = unsafe {
+            (
+                core::ptr::read_volatile((hhdm + pages[0]) as *const u64),
+                core::ptr::read_volatile((hhdm + pages[0] + 16) as *const u64),
+            )
+        };
+        // Terminal: anything but "pending" and "established, echo owed".
+        if marker == TCPD_MARKER && outcome != 0 && outcome != 3 {
+            break;
+        }
+        wait_millis(100);
+    }
+    report_tcp_domain(hhdm);
 
     // RFC 0018 step 7: what the boundary cost, counted rather than argued.
     //
@@ -5281,6 +5601,58 @@ fn report_net_after_exchange(hhdm: u64) {
             ipd[13]
         );
     }
+}
+
+/// What `bin/tcpd` reported, in one line the boot test can hold.
+///
+/// The state word is bits — attached, keyed, configured, serving — and the
+/// outcome is the demonstration connection's end. "keyed" is RFC 0021's
+/// deliverable consumed: the service drew a 128-bit secret from the hardware,
+/// and on a machine that could not supply one the outcome reads 4 and nothing
+/// was attempted, which is the refusal working.
+fn report_tcp_domain(hhdm: u64) {
+    use core::sync::atomic::Ordering;
+
+    let raw = TCP_REPORT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return;
+    }
+    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    let mut words = [0u64; 7];
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // seven little-endian words the service wrote there.
+    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 56) };
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    if words[0] != TCPD_MARKER {
+        println!("    tcpd           left no report");
+        return;
+    }
+    let outcome = match words[2] {
+        0 => "still pending",
+        1 => "refused by the network",
+        2 => "unanswered until the bounded retransmissions ran out",
+        3 => "established, echo not yet back",
+        4 => "refused by this service: the machine cannot be unpredictable",
+        5 => "no network to demonstrate against",
+        6 => "the payload came back unchanged and the close is under way",
+        7 => "echoed, closed in order, and TIME_WAIT expired",
+        8 => "the peer answered with bytes that were not the payload sent",
+        _ => "an outcome this kernel does not know",
+    };
+    println!(
+        "    tcpd           state {:#x} (attached/keyed/configured/serving), outcome {}: {}; \
+         {} segments in, {} out, {} refused, machine ended in state {}",
+        words[1], words[2], outcome, words[3], words[4], words[5], words[6]
+    );
 }
 
 /// RFC 0019 step 2: a deadline fires, and not before it is due.
@@ -7288,6 +7660,44 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // same shape: step 3's ring installed after its consumer had started,
         // step 5's capability installed before the service existed, and this.
         // Each time the symptom appeared somewhere other than the cause.
+        // **And the fourth ordering bug, same shape, fixed by readiness
+        // rather than by reordering.** A `Call` to a service that has not yet
+        // reached its blocking receive queues the caller — correctly, that is
+        // the rendezvous — but a boot cannot bound how long `ipd`'s
+        // demonstration keeps it from receiving, so the client's first bind
+        // stranded on the boots where the demonstration ran short. The
+        // service now reports the moment it is serving (state bit 3), and
+        // the client is held back until it does: not a sleep, a condition.
+        // Bounded, because a service that never serves must not hang the
+        // boot; the client then strands exactly as before, and the report
+        // says which happened. Bounded at five seconds for the same
+        // suite-timeout arithmetic as the demonstration wait below.
+        if NET_CONTAINED.load(core::sync::atomic::Ordering::Acquire) {
+            for _ in 0..50u32 {
+                let raw = NET_RING_REPORT.load(core::sync::atomic::Ordering::Acquire);
+                if raw == u64::MAX {
+                    break;
+                }
+                let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw))
+                else {
+                    break;
+                };
+                if count == 0 {
+                    break;
+                }
+                // SAFETY: a frame this object owns, through the direct map.
+                let (marker, state) = unsafe {
+                    (
+                        core::ptr::read_volatile((hhdm + pages[0]) as *const u64),
+                        core::ptr::read_volatile((hhdm + pages[0] + 56) as *const u64),
+                    )
+                };
+                if marker == IPD_MARKER && state & (1 << 3) != 0 {
+                    break;
+                }
+                wait_millis(100);
+            }
+        }
         if let Some(endpoint) = net_service_endpoint()
             && let Err(reason) = start_dhcp_client(cpu, hhdm, net_keeper(), endpoint)
         {
@@ -10107,19 +10517,19 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Ten programs in /bin: the ring 3 probe, the user-mode shell,
-            // both services as programs, the block driver (RFC 0013 steps 3, 4
-            // and 6), the filesystem (RFC 0016 step 3), the supervisor
-            // (RFC 0017 question 2), the network driver and the protocol
-            // service (RFC 0018 steps 2 and 3), and the DHCP client (step 6).
-            // Exact rather than "at least", so adding an eleventh without noticing
-            // this line is a failure rather than a silently weaker test --
-            // which it has now been, seven times, once per program added. It
-            // is the cheapest assertion in the repository, and it caught the
-            // seventh the same day it was written and the eighth the moment
-            // `bin/netd` appeared.
+            // Eleven programs in /bin: the ring 3 probe, the user-mode
+            // shell, both services as programs, the block driver (RFC 0013
+            // steps 3, 4 and 6), the filesystem (RFC 0016 step 3), the
+            // supervisor (RFC 0017 question 2), the network driver and the
+            // protocol service (RFC 0018 steps 2 and 3), the DHCP client
+            // (step 6), and the TCP service (RFC 0020 step 4). Exact rather
+            // than "at least", so adding a twelfth without noticing this line
+            // is a failure rather than a silently weaker test -- which it has
+            // now been for every program added, most recently `bin/tcpd`,
+            // whose arrival this line duly caught while a real DMA fault was
+            // being hunted two lines up in the same log.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 10,
+            entries >= 3 && bin == 11,
         ),
         (
             "the user program is an ELF the loader accepts",

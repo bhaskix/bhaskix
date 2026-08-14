@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The TCP service, in a domain with no device.
+#
+# Not a member of the root workspace, for the reason user/netd/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+[workspace]
+
+[package]
+name = "bhaskix-user-tcpd"
+description = "The TCP service, in a domain with no device."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "tcpd"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+# RFC 0020 step 4. It links the protocol code under the rule check-deps.py
+# states for bin/ipd: a program linking `bhaskix-net` may hold no writable
+# device authority, and this one holds two rings, a report page, a
+# configuration page and an endpoint -- no device, no DMA window, no interrupt.
+# TCP is the largest remote-driven *stateful* parser this system will contain,
+# which is why it gets a domain of its own rather than a place inside ipd.
+bhaskix-net = { path = "../../net" }
+# RFC 0021's single deliverable, used for what it was built for: the secret
+# behind the initial sequence number. This program is *the caller that
+# refuses* -- on a machine that cannot be unpredictable it reports why and
+# serves nothing, which is that RFC's policy running rather than promised.
+bhaskix-rand = { path = "../../rand" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 99, measured, with no headroom -- the same standard bhaskix-rand set. Ring
+# copies in and out, volatile reads of headers another domain writes, the
+# report and configuration pages, and the syscall blocks. No device register
+# anywhere in it, which is the argument for this domain existing.
+unsafe_budget = 99
