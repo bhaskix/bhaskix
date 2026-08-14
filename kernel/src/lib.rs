@@ -5313,6 +5313,9 @@ fn deadline_self_test() -> bool {
         println!("\x1b[91m    deadline       FAILED: the table would not take it\x1b[0m");
         return false;
     }
+    // The same second half of arming the `ARM` system call does. Arming the
+    // table alone records a deadline nothing has been asked to deliver.
+    time::arm_no_later_than(armed_at + wait);
 
     // Polled rather than waited on, because this is the boot thread and it has
     // other things to start. What is being tested is the kernel's expiry, not
@@ -5339,11 +5342,40 @@ fn deadline_self_test() -> bool {
         );
         return false;
     }
+    // **And not absurdly late, which until 2026-08-14 it always was.**
+    //
+    // Half of a timer is that it does not fire early, and that is checked
+    // above. The other half is that the deadline has any bearing on when it
+    // does fire, and nothing checked that — so for two days a 20 ms deadline
+    // woke after 150 to 193 ms and every gate in this project was content.
+    //
+    // Twenty-five milliseconds of lateness is the bound, chosen to sit an order
+    // of magnitude below what the unfixed path produced and two above what the
+    // fixed one does: 0.331 ms on the boot that first passed it. A bound tight
+    // enough to be interesting on a loaded host would fail for being on a
+    // loaded host, and a gate whose answer depends on the machine is not a
+    // gate.
+    let late = took.saturating_sub(wait);
+    let late_micros = late.saturating_mul(1_000_000) / hertz.max(1);
     let micros = took.saturating_mul(1_000_000) / hertz.max(1);
+    if late_micros > 25_000 {
+        println!(
+            "\x1b[91m    deadline       FAILED: armed for 20 ms and woke after {}.{:03} ms — late \
+             by {}.{:03} ms, so the deadline is not reaching the hardware\x1b[0m",
+            micros / 1000,
+            micros % 1000,
+            late_micros / 1000,
+            late_micros % 1000
+        );
+        return false;
+    }
     println!(
-        "    deadline       armed for 20 ms, woke after {}.{:03} ms, never early",
+        "    deadline       armed for 20 ms, woke after {}.{:03} ms, never early and late by \
+         {}.{:03} ms",
         micros / 1000,
-        micros % 1000
+        micros % 1000,
+        late_micros / 1000,
+        late_micros % 1000
     );
     true
 }
@@ -5484,6 +5516,11 @@ fn measure_deadlines(handoff: &Handoff, when: &str) -> bool {
             if notify::arm(notification, due, BADGE).is_err() {
                 break;
             }
+            // Exactly what the `ARM` system call does after the table takes it,
+            // and it must stay exactly that: a measurement that armed
+            // differently from the callers would be measuring something no
+            // caller can ask for.
+            time::arm_no_later_than(due);
 
             let mut fired_at = None;
             loop {
@@ -7479,6 +7516,20 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             service::VFS_PLACEMENT
         );
     }
+    // What arming a deadline did to the hardware, reported on every boot rather
+    // than only under `timers=measure`.
+    //
+    // Both halves are needed and the second is the one that would go wrong
+    // quietly. Moves alone cannot distinguish "deadlines are being honoured"
+    // from "every arming re-programs the timer whether or not it needs to",
+    // which would be a program's way of taking a processor's timer away from
+    // the scheduler. A healthy machine does some of each.
+    let (hastened, already) = time::hastened();
+    println!(
+        "    deadline arms  {hastened} brought this cpu's next interrupt forward, {already} were \
+         already soon enough"
+    );
+
     // RFC 0019 step 4, the second half: the same measurement on a machine with
     // its services running. The first ran during bring-up, where a tickless
     // CPU can be silent for most of a second; this one is the machine every

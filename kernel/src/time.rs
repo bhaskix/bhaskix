@@ -150,6 +150,25 @@ static TICKLESS_IDLES: AtomicU64 = AtomicU64::new(0);
 /// Times the timer was armed for a real deadline rather than a fixed period.
 static ARMED: AtomicU64 = AtomicU64::new(0);
 
+/// The absolute TSC deadline each CPU's timer is currently programmed for.
+///
+/// Zero means "not known" — either nothing has programmed it yet, or it was
+/// armed through [`arm_default`], which runs when there is no calibrated clock
+/// to express a deadline in.
+///
+/// Written only by the CPU it belongs to, and only with interrupts masked or
+/// from the timer interrupt itself, so a read on that CPU cannot see a half of
+/// it. It exists so [`arm_no_later_than`] can tell whether it has anything to
+/// do: without it, every arming would re-program the timer, and a program
+/// arming a deadline further away than the next tick would push that tick out.
+static PROGRAMMED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Times [`arm_no_later_than`] moved a CPU's timer earlier.
+static HASTENED: AtomicU64 = AtomicU64::new(0);
+
+/// Times it was asked and the timer was already going to fire in time.
+static ALREADY_SOON_ENOUGH: AtomicU64 = AtomicU64::new(0);
+
 /// Why each CPU last armed its timer, counted per reason.
 ///
 /// `[slice, timer, backstop]`. A CPU that will not go tickless is arming for
@@ -403,7 +422,10 @@ pub unsafe fn rearm_this_cpu() {
 unsafe fn rearm(cpu: usize, now: u64) {
     let Some(hertz) = bhaskix_arch::apic::timer_hertz() else {
         // Uncalibrated: nothing can be computed, so fall back to the fixed
-        // period rather than leaving the CPU un-armed.
+        // period rather than leaving the CPU un-armed. What it is now armed for
+        // cannot be said on a scale a deadline uses, so it is recorded as not
+        // known rather than left saying something stale.
+        forget_programmed(cpu);
         // SAFETY: per the caller.
         unsafe { arm_default() };
         return;
@@ -462,18 +484,58 @@ unsafe fn rearm(cpu: usize, now: u64) {
         // see `IDLE_BACKSTOP_MS`.
         TICKLESS_IDLES.fetch_add(1, Ordering::Relaxed);
         let backstop = u64::from(hertz).saturating_mul(IDLE_BACKSTOP_MS).max(1_000) / 1_000;
+        // Recorded on the same scale as every other deadline, so that a
+        // program arming one *later* than the backstop is declined rather than
+        // allowed to defer the safety net. Without a calibrated TSC there is no
+        // such scale, and zero says so.
+        if let Some(programmed) = PROGRAMMED.get(cpu) {
+            programmed.store(
+                tsc::from_micros(IDLE_BACKSTOP_MS.saturating_mul(1_000))
+                    .map_or(0, |ticks| now.saturating_add(ticks)),
+                Ordering::Relaxed,
+            );
+        }
         // SAFETY: per the caller.
         unsafe { bhaskix_arch::apic::arm_oneshot(backstop.min(u64::from(u32::MAX)) as u32) };
         return;
     };
 
+    // SAFETY: per the caller.
+    if !unsafe { program(cpu, now, deadline, hertz) } {
+        forget_programmed(cpu);
+        // SAFETY: per the caller.
+        unsafe { arm_default() };
+    }
+}
+
+/// Records that what this CPU's timer is armed for is not expressible as a
+/// deadline, so [`arm_no_later_than`] does not compare against a stale one.
+fn forget_programmed(cpu: usize) {
+    if let Some(programmed) = PROGRAMMED.get(cpu) {
+        programmed.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Programs this CPU's one-shot timer to fire at `deadline`, and records it.
+///
+/// Answers whether it could: `false` means there is no calibrated TSC to
+/// express the interval in, and the caller wants [`arm_default`] instead.
+///
+/// Shared by the tick's own re-arming and by [`arm_no_later_than`], because
+/// two copies of the conversion below would be two chances to round it the
+/// wrong way.
+///
+/// # Safety
+///
+/// The APIC must be initialised, `cpu` must be the CPU this is running on, and
+/// nothing may preempt onto another CPU between the two — the caller either
+/// runs in an interrupt handler or has masked interrupts.
+unsafe fn program(cpu: usize, now: u64, deadline: u64, hertz: u32) -> bool {
     // Convert a TSC deadline into APIC timer counts. The two run at different
     // rates, so this is a ratio rather than a subtraction.
     let remaining_tsc = deadline.saturating_sub(now);
     let Some(tsc_hertz) = tsc::hertz() else {
-        // SAFETY: per the caller.
-        unsafe { arm_default() };
-        return;
+        return false;
     };
     // Rounded *up*. A timer must not fire before its deadline, and rounding
     // down means every slice is delivered a little short — which is not the
@@ -491,8 +553,87 @@ unsafe fn rearm(cpu: usize, now: u64) {
         .clamp(1, u64::from(u32::MAX));
 
     ARMED.fetch_add(1, Ordering::Relaxed);
+    if let Some(programmed) = PROGRAMMED.get(cpu) {
+        programmed.store(deadline, Ordering::Relaxed);
+    }
     // SAFETY: per the caller.
     unsafe { bhaskix_arch::apic::arm_oneshot(count as u32) };
+    true
+}
+
+/// Brings this CPU's next timer interrupt forward to `deadline`, if it is not
+/// already going to fire by then.
+///
+/// **This is what makes a deadline a deadline.** Everything else in this module
+/// decides when to tick from what the *kernel* has to do — a slice to end, a
+/// sleeping thread to wake — and re-decides it only when a tick happens. A
+/// deadline armed between two ticks was therefore not considered until the next
+/// one arrived for some other reason, which is why RFC 0019 step 4 measured a
+/// deadline as late by `C − d`: the wake instant did not depend on the deadline
+/// at all. The fix is this function, called where a deadline is armed.
+///
+/// **It only ever moves the interrupt earlier**, which is what makes it safe to
+/// call from a system call. Programming the one-shot counter restarts it, so a
+/// caller naming a *later* deadline would push out the tick that was already
+/// due — a slice that never ends, or an idle CPU's backstop deferred by a
+/// program that asked to be woken next week. [`PROGRAMMED`] is what lets that
+/// case be recognised and declined.
+///
+/// Answers whether the timer was moved, which is how the boot report can say
+/// this is doing anything at all.
+pub fn arm_no_later_than(deadline: u64) -> bool {
+    // Interrupts masked for the whole of it. This reads which CPU it is on and
+    // then writes *that* CPU's timer; preempted in between, it would program
+    // one CPU's APIC on another CPU's behalf, and the deadline would be armed
+    // where nobody was waiting for it.
+    let enabled = bhaskix_arch::cpu::interrupts_enabled();
+    if enabled {
+        // SAFETY: re-enabled below on every path out.
+        unsafe { bhaskix_arch::cpu::disable_interrupts() };
+    }
+
+    let moved = 'moved: {
+        let cpu = percpu::cpu_id() as usize;
+        if cpu >= MAX_CPUS {
+            break 'moved false;
+        }
+        let Some(hertz) = bhaskix_arch::apic::timer_hertz() else {
+            break 'moved false;
+        };
+
+        // Already due to fire by then. Zero means nothing has recorded a
+        // deadline for this CPU, which is not the same as "it will fire soon"
+        // and so is not treated as it.
+        let programmed = PROGRAMMED[cpu].load(Ordering::Relaxed);
+        if programmed != 0 && deadline >= programmed {
+            ALREADY_SOON_ENOUGH.fetch_add(1, Ordering::Relaxed);
+            break 'moved false;
+        }
+
+        // SAFETY: interrupts are masked, so `cpu` is still this CPU; the APIC
+        // is initialised because `timer_hertz` answered.
+        let done = unsafe { program(cpu, now(), deadline, hertz) };
+        if done {
+            HASTENED.fetch_add(1, Ordering::Relaxed);
+        }
+        done
+    };
+
+    if enabled {
+        // SAFETY: restoring the caller's state.
+        unsafe { bhaskix_arch::cpu::enable_interrupts() };
+    }
+    moved
+}
+
+/// How often a deadline moved this machine's next timer interrupt earlier, and
+/// how often it was already soon enough.
+#[must_use]
+pub fn hastened() -> (u64, u64) {
+    (
+        HASTENED.load(Ordering::Relaxed),
+        ALREADY_SOON_ENOUGH.load(Ordering::Relaxed),
+    )
 }
 
 /// Arms the timer for one period of the fixed tick rate.

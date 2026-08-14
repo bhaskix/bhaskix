@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **Accepted 2026-08-14**, with all four steps implemented: the deadline table, `ARM`/`DISARM` and expiry, `bin/dhcp` waiting on a duration instead of a loop count, and the measurement. **Its own open question 2 is answered against it** — a deadline is honoured to the millisecond in the direction correctness depends on, never early, and to nothing better than a third of a second in the direction usefulness depends on, because nothing re-programs the timer when a deadline is armed. That is recorded below rather than presented as a resolution. Questions 1 and 3 stay open. |
+| **Status** | ✅ **Accepted 2026-08-14**, with all four steps implemented: the deadline table, `ARM`/`DISARM` and expiry, `bin/dhcp` waiting on a duration instead of a loop count, and the measurement. **Its open question 2 was answered against it and then closed by fixing it.** The measurement found that the deadline had no effect on the wake instant at all — nothing re-programmed the timer when one was armed — and `ARM` now does, which took a 20 ms deadline from 150–193 ms to 20.3 ms. Both the finding and the fix are recorded under question 2 rather than edited into a document that always knew. Questions 1 and 3 stay open, and 1 is sharper for this. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`notify`, `time`, `syscall`) |
 | **Milestone** | Phase 2 — required before TCP (RFC 0020), and before any service that must give up waiting |
@@ -229,6 +229,40 @@ of the machine's own timers instead of locking to one point in it.
    is exactly the workload `M4-10b`'s wheel is waiting for. **Step 4's measurement is what justifies
    it**, and the justification is not the median: it is that the deadline currently has no effect on
    the wake at all.
+
+   **Done, 2026-08-14.** `time::arm_no_later_than` brings this CPU's next interrupt forward when the
+   deadline just armed beats what it was going to fire for, and the `ARM` system call calls it. The
+   same measurement, three runs:
+
+   ```
+     0.100 ms deadline: late by 0.032 / 0.065 / 0.089 ms (min/median/max), 16 samples
+     1.000 ms deadline: late by 0.064 / 0.087 / 0.133 ms
+     5.000 ms deadline: late by 0.097 / 0.134 / 0.183 ms
+    20.000 ms deadline: late by 0.100 / 0.143 / 0.184 ms
+   100.000 ms deadline: late by 0.114 / 0.150 / 0.192 ms
+   ```
+
+   **`C − d` is gone**, which is the result rather than the medians: the lateness now *grows* with
+   the deadline instead of shrinking by exactly what the deadline gained, so the wake instant is the
+   deadline's rather than the machine's. About **2,000× better at the median**, and the worst sample
+   across three runs is 0.819 ms against a previous median of a third of a second.
+
+   **It only ever moves the interrupt earlier.** Programming the one-shot counter restarts it, so
+   arming for a *later* deadline would push out a tick already due — a slice that never ends, or an
+   idle CPU's backstop deferred by a program asking to be woken next week. The CPU records what it is
+   armed for and declines when it is already soon enough; a boot exercises both branches, and says
+   so.
+
+   **What this promises is still not a bound.** The residual is interrupt delivery and the rounding
+   of a TSC deadline into APIC counts, and neither is guaranteed. The promise remains "not before the
+   deadline"; what has changed is that "not long after it" is now true rather than hoped for, and a
+   boot gate fails if a 20 ms deadline is more than 25 ms late.
+
+   **Question 1 gets sharper because of this.** A floor on deadlines mattered little while arming did
+   nothing to the hardware; now a program can ask this processor's timer to fire as soon as it likes,
+   as often as it likes. It is still bounded to that processor, and it is still the spin this system
+   already permits — but the fuse is shorter, and the argument for deferring is now weaker than it
+   was.
 3. **Does a timer survive being handed on?** A notification capability can be derived and passed;
    whether an armed deadline is a property of the object or of the granting is not decided, and
    nothing needs it yet.

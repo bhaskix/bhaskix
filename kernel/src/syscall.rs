@@ -1080,7 +1080,17 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             return Outcome::ok(u64::from(crate::notify::disarm(id)));
         }
         return match crate::notify::arm(id, frame.arg0, resolved.badge) {
-            Ok(()) => Outcome::ok(0),
+            Ok(()) => {
+                // Bring this processor's next timer interrupt forward, if the
+                // deadline just armed is sooner than whatever it was going to
+                // fire for. Without this the deadline is recorded and then
+                // waited on by nothing: expiry runs in the timer interrupt, and
+                // nothing had asked the timer to arrive. RFC 0019 step 4
+                // measured what that costs — the wake instant did not depend on
+                // the deadline at all.
+                crate::time::arm_no_later_than(frame.arg0);
+                Outcome::ok(0)
+            }
             // Every slot is armed for somebody else. A refusal rather than
             // taking one from whoever holds it.
             Err(crate::notify::NotifyError::Exhausted) => Outcome::err(Status::Congested),

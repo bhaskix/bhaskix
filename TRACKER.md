@@ -742,6 +742,74 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-14, last (the ARM path re-programs the timer, and a deadline starts meaning something)
+
+**RFC 0019's open question 2, closed by fixing it rather than by writing it down again.**
+`time::arm_no_later_than` brings this CPU's next interrupt forward when the deadline just armed
+beats what it was going to fire for, and the `ARM` system call calls it after the table takes the
+deadline. Same measurement, same machine, three runs:
+
+```
+    deadline       armed for 20 ms, woke after 20.388 ms, never early and late by 0.388 ms
+    timer delay    bring-up,   0.100 ms deadline: late by 0.032 / 0.065 / 0.089 ms (min/median/max)
+    timer delay    bring-up,   1.000 ms deadline: late by 0.064 / 0.087 / 0.133 ms
+    timer delay    bring-up,   5.000 ms deadline: late by 0.097 / 0.134 / 0.183 ms
+    timer delay    bring-up,  20.000 ms deadline: late by 0.100 / 0.143 / 0.184 ms
+    timer delay    bring-up, 100.000 ms deadline: late by 0.114 / 0.150 / 0.192 ms
+```
+
+**The result is not the medians, it is that `C − d` is gone.** Yesterday's lateness *fell* by
+exactly what the deadline gained, which is what "the wake instant has nothing to do with the
+deadline" looks like in a table. It now *rises* with the deadline — a floor of about 0.07 ms plus a
+small term that grows with the interval, which is interrupt delivery and the rounding of a TSC
+deadline into APIC counts. The wake instant is the deadline's now. About **2,000× better at the
+median**, worst sample across three runs 0.819 ms against a previous median of a third of a second.
+The whole 80-sample measurement fell from 26.6 seconds to 2.68.
+
+**It only ever moves the interrupt earlier, and that is the part that had to be got right.**
+Programming the one-shot counter restarts it, so arming for a *later* deadline would push out a tick
+already due — a slice that never ends, or an idle CPU's backstop deferred by a program asking to be
+woken next week. Each CPU records what it is armed for and declines when it is already soon enough.
+Both branches run on every boot and the boot says so: `81 brought this cpu's next interrupt forward,
+147 were already soon enough`. The 147 are `bin/dhcp`'s, and they are declined because the CPU it
+runs on already had a slice ending sooner — the guard is not decoration.
+
+**Interrupts are masked across it.** It reads which CPU it is on and then writes that CPU's timer;
+preempted between the two it would arm one processor's APIC on another's behalf, and the deadline
+would be programmed where nobody was waiting for it.
+
+**A resolution gate exists now, and it did not before.** The self-test checked only that the wake
+was not *early* — so for two days a 20 ms deadline woke after 150 to 193 ms and every gate in this
+project was content. It now also fails if the wake is more than 25 ms late: an order of magnitude
+below what the unfixed path produced, two above what the fixed one does. **Watched failing**:
+removing the one call makes it red with `armed for 20 ms and woke after 186.292 ms — late by
+166.292 ms, so the deadline is not reaching the hardware`, and `FAILED` is fatal to every harness
+here.
+
+**And it is not a flaky one**, which is the risk a timing gate carries: `make soak` ran **40 boots,
+two at a time, with no self-test failing**, slowest 27 s against a 120 s cap. The soak fails on
+`FAILED` like every other harness, so a resolution bound that could not survive a contended host
+would have shown there rather than in somebody else's CI.
+
+**What is not fixed, and is now named.** `time::wake_at` and `time::sleep_micros` — the kernel's own
+sleeps — register a thread timer and do not re-program either, so they still wait for a tick that
+was going to happen anyway. Same defect, same one-line remedy, not done here because nothing asked
+for it and their timing is load-bearing in boot self-tests. And RFC 0019's open question 1, a floor
+on deadlines, is sharper for this change: a program can now ask this processor's timer to fire as
+soon as it likes, as often as it likes. Still bounded to that processor, still the spin this system
+already permits, but the fuse is shorter.
+
+**A host test failed on the way, and it is not this change.** `sync::tests::a_failed_try_lock_
+leaves_no_hold_behind` failed once, then passed 30 consecutive runs on the same tree. **Diagnosed
+rather than shrugged at**: `HELD` and `HOLDS` are indexed by `percpu::cpu_id()`, which is 0 for
+every thread on the host, so all of `cargo test`'s parallel threads share slot 0. A test asserting
+`!holds_any()` after dropping its own guard is asserting something another test's live guard can
+falsify. That is the same cause as the `sync::tests::holding_a_rank_still_blocks_preemption_after_
+its_bit_is_cleared` flake recorded on 2026-08-13, and it is a test-isolation defect rather than a
+kernel one. Not fixed here: the interfering set is every test in the crate that holds a `SpinLock`,
+not just `sync`'s own, so the remedy is per-thread slots on the host build rather than a mutex
+around a few tests.
+
 ### 2026-08-14 (RFC 0019 step 4: the measurement, and the deadline turns out not to matter)
 
 **RFC 0019 is accepted, and its own open question 2 is answered against it.** Sixteen samples at

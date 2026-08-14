@@ -183,7 +183,15 @@ workspace = true
 # back to ring 3, to check the thread about to run owns the space that is
 # loaded. Reading `CR3` at CPL 0 has no side effects; the cost is the check, and
 # the boot cost did not move (7677 ms against 7678 before it).
-unsafe_budget = 1159
+# 1166 at RFC 0019's question 2, closing it: the `ARM` path re-programs this
+# CPU's timer. Seven lines, and none of them a new capability -- the arming
+# itself is `apic::arm_oneshot`, which the tick already calls, moved into a
+# `program` helper the tick and the new path share so the deadline-to-count
+# conversion has one copy rather than two. The rest is masking and restoring
+# interrupts around it, which is the `frames::with_reserve` idiom: this reads
+# which CPU it is on and then writes that CPU's timer, and preempted between
+# the two it would arm the wrong processor's.
+unsafe_budget = 1166
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
