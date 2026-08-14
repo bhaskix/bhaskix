@@ -43,6 +43,11 @@ members = [
     # Phase 2 — RFC 0018 step 1. Host-testable protocol arithmetic, with no
     # device, no domain and no IPC under it. `netd` and `ipd` are steps 2 and 4.
     "net",
+
+    # Phase 2 — RFC 0021. The system's only source of unpredictability, which it
+    # did not have at all until TCP needed one. Depends on nothing, so that the
+    # kernel, a ring 3 service and a host test can all reach it.
+    "rand",
 ]
 
 # The negative fixture for `tools/check-placements.sh`: a service that reaches

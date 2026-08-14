@@ -1410,6 +1410,25 @@ else
     status=1
 fi
 
+# RFC 0021: the machine can be unpredictable, and proved it rather than
+# reporting a feature bit.
+#
+# A positive gate as well as the `FAILED` marker, for the reason the marker list
+# gives: `FAILED` catches a self-test that ran and failed, and only a positive
+# assertion catches one that stopped running at all. This one is easy to lose --
+# it lives inside a feature report that would go on printing perfectly well
+# without it.
+#
+# Asserted against the machine this harness boots, which is `-cpu max` and has
+# `RDRAND`. A machine without it warns and boots, deliberately, and is a
+# different machine from the one this gate is about.
+if grep -qF "unpredictable  two draws differ" "$LOG"; then
+    pass "the machine can produce an unpredictable number, demonstrated not declared"
+else
+    fail "no source of unpredictability was demonstrated -- RFC 0021, and TCP depends on it"
+    status=1
+fi
+
 # The handoff must have been validated, not skipped.
 if grep -qF "handoff version 2" "$LOG"; then
     pass "handoff accepted"

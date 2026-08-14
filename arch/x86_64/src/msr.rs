@@ -135,6 +135,14 @@ pub struct Features {
     pub la57: bool,
     /// Invariant TSC: the timestamp counter does not vary with power state.
     pub invariant_tsc: bool,
+    /// `RDRAND`: the machine can produce an unpredictable number.
+    ///
+    /// **RFC 0021**, and it is load-bearing in a way the others are not: this
+    /// is the *only* source of unpredictability in the system. Without it a TCP
+    /// sequence number is guessable, so `bin/tcpd` refuses to start rather than
+    /// running with a weakness nobody can see. The machine still boots — a
+    /// filesystem, a shell and a supervisor need no unpredictability at all.
+    pub rdrand: bool,
 }
 
 /// Probes the features in [`Features`].
@@ -154,5 +162,8 @@ pub fn features() -> Features {
         umip: leaf7.ecx & (1 << 2) != 0,
         la57: leaf7.ecx & (1 << 16) != 0,
         invariant_tsc: power.edx & (1 << 8) != 0,
+        // Asked of the crate that uses it rather than tested here, so the bit
+        // position exists once. See this crate's manifest.
+        rdrand: bhaskix_rand::available(),
     }
 }

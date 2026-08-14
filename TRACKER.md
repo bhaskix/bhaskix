@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-14 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. No TCP, no libc, no sockets API beyond UDP |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
 
 ### How far along is this, in numbers
 
@@ -122,7 +122,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **NW1** | Network stack | ✅ **Accepted** 2026-08-13 | **Outside the kernel, in three domains.** A virtio-net driver (`bin/netd`) that holds the device and understands no protocol, a protocol service (`bin/ipd`) that parses remote input and holds no device, and a client (`bin/dhcp`) holding a socket and a page and nothing else. A **socket is not an object kind** — it is a property of a capability the program already holds, which was this document's own claim corrected by building it. Accepted with all seven steps, six fuzz targets, and **three of its own claims proved wrong in the process**, including its performance headline. Open questions 2, 3 and 4 stay open. | [RFC 0018](docs/rfc/0018-networking.md) |
 | **TM1** | Time and timers | ✅ **Accepted** 2026-08-14 | **A deadline is a property of a notification, not a new object.** `Invoke(notification, ARM, deadline)` asks the kernel to signal it later; the program waits through RFC 0010's machinery, so a service handles callers, frames and expiring timers in one loop with one blocking call. Absolute deadlines, because a duration read before being descheduled becomes a lie. **Reading time is deliberately not a capability**: `rdtsc` is unprivileged on this machine and a `Clock` object would guard nothing — being *woken* is the scarce thing. Accepted with all four steps, and its open question 2 answered against it and then fixed: the measurement found the deadline had no effect on the wake instant at all, and arming now re-programs the timer. Questions 1 and 3 stay open, and 1 is sharper for the fix. | [RFC 0019](docs/rfc/0019-time-and-timers.md) |
 | **NW2** | TCP | ⬜ Draft | **A state machine that can be tested without a network.** `bin/tcpd` in its own domain, and a **pure transition function** in `bhaskix-net` — no I/O, no clock, no allocation — so loss, reordering, backoff and close are host tests against a virtual clock rather than things a live network refuses to reproduce. A connection's **stream lives in the program's pages**, so the receive window *is* the program's free space and a connection costs the memory of whoever opened it. Minimal but correct, with every absence named: no congestion control, window scaling, SACK, timestamps, PMTU discovery, keepalive or urgent data. Found a prerequisite it could not write around — **the system has no source of randomness at all**, and a TCP initial sequence number must be unpredictable. | [RFC 0020](docs/rfc/0020-tcp.md) |
-| **R1** | A source of unpredictability | ⬜ Draft | **The system cannot produce an unpredictable number, and nothing had noticed until RFC 0020 needed one.** No `RDRAND`, no `RDSEED`, no pool; even KASLR's slide is the bootloader's. The proposal is deliberately small because **`RDRAND` is unprivileged** — so there is no capability to design and no syscall to add, the same finding RFC 0019 made about `rdtsc`. What is left is a shared implementation that gets the failure mode right (the carry flag, a bounded retry, and `None` that is never turned into a number), a boot-time probe beside `nx`/`smep`/`smap`, and a policy: **the caller refuses**, not the kernel. Found on the way that `bin/ipd` hands out ephemeral ports as `49152 + index`, and that `security.md` claims a heap-base randomisation the system does not perform. | [RFC 0021](docs/rfc/0021-unpredictability.md) |
+| **R1** | A source of unpredictability | ✅ **Accepted** 2026-08-14 | **The system cannot produce an unpredictable number, and nothing had noticed until RFC 0020 needed one.** No `RDRAND`, no `RDSEED`, no pool; even KASLR's slide is the bootloader's. The proposal is deliberately small because **`RDRAND` is unprivileged** — so there is no capability to design and no syscall to add, the same finding RFC 0019 made about `rdtsc`. What is left is a shared implementation that gets the failure mode right (the carry flag, a bounded retry, and `None` that is never turned into a number), a boot-time probe beside `nx`/`smep`/`smap`, and a policy: **the caller refuses**, not the kernel. Found on the way that `bin/ipd` hands out ephemeral ports as `49152 + index`, and that `security.md` claims a heap-base randomisation the system does not perform. | [RFC 0021](docs/rfc/0021-unpredictability.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
@@ -752,6 +752,63 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-14, last (RFC 0021 built: the machine can be unpredictable, and proves it every boot)
+
+**RFC 0021 accepted, single step implemented.** `bhaskix-rand` exists — the system's first and only
+source of unpredictability — and the boot draws two values and asserts they differ.
+
+```
+    features       apic yes  x2apic  NO  nx yes  smep yes  smap yes
+                   umip  NO  la57 yes  invariant-tsc  NO  rdrand yes
+    unpredictable  two draws differ, and the machine reports rdrand
+```
+
+**The crate is small because the difficulty is not the instruction.** `RDRAND` reports through the
+carry flag whether its answer is usable, and on some parts a declined attempt leaves zero in the
+register — so the classic bug is a stream of zeroes that looks like a number. Everything that
+decides anything therefore lives in safe functions: `interpret` believes the flag or does not,
+`draw` retries a bounded ten times and returns `None`, and the two `asm!` blocks do nothing but
+execute and report both halves. `unsafe_budget = 21`, set to exactly what they cost with no
+headroom.
+
+**Watched failing, and the shape of the failure is the interesting part.** Deleting the carry-flag
+check turns **exactly three of seven** host tests red — the refused attempt, the processor that
+never answers, and the off-by-one on the last attempt — and leaves the other four green. That is the
+right answer rather than a weak one: the other four do not exercise the failure path, and a
+breakage that turned everything red would mean the tests were not testing separate things.
+
+**Both machines were run, not just the convenient one.** Under `-cpu max` the boot reports `rdrand
+yes` and demonstrates it. Under `-cpu qemu64` — no `RDRAND` — it reports `rdrand  NO`, prints
+`unpredictable  NO: this machine has no source of randomness, so anything needing one refuses rather
+than guessing`, **and still boots to the milestone**. That is RFC 0021's policy working rather than
+being asserted: a machine without unpredictability is limited, not broken, so the refusal belongs at
+the caller that needs it and not in a kernel that would deny an operator their shell over it.
+
+**A positive gate as well as the `FAILED` marker.** The marker catches a self-test that ran and
+failed; only a positive assertion catches one that stopped running, and this one lives inside a
+feature report that would go on printing perfectly happily without it. Breaking the draw to return
+the same value twice fails both, which was checked.
+
+**And `security.md` is corrected where the wrong claim lived.** Its mitigation table said KASLR
+randomises *"kernel image and heap base"*. The heap base is not randomised at all — the heap is in
+the direct map, and every boot reports `hhdm base 0xffff800000000000` — and the image is slid by
+**Limine**, with the kernel computing the slide it was handed rather than choosing one. The row now
+says what happens, with the correction written underneath rather than the old text quietly deleted.
+Randomising the heap base is RFC 0021's open question 2, not a follow-up nobody wrote down.
+
+**What is still true and uncomfortable**: this depends on a hardware generator nobody can audit from
+outside. Mature systems mix `RDRAND` with other sources for exactly that reason and this system has
+nothing to mix with. Open question 1, unresolved on purpose.
+
+**A number in this file's own header is stale and is not being guessed at.** The progress line says
+"601 suite checks". A passing run today prints 655 lines matching the harnesses' success marker, and
+this change adds another gate on top. The two figures are not comparable without a definition of
+what counts as a check — host assertions, boot gates, and the same gate run once per placement are
+all candidates — and nobody has written that definition down. Recorded here rather than replaced
+with a number that would look derived and would not be.
+
+**RFC 0020 step 1 is now unblocked.**
 
 ### 2026-08-14, last (RFC 0021 drafted: this system cannot produce an unpredictable number)
 

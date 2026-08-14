@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The system's only source of unpredictability.
+#
+# Depends on nothing, for the reason `bhaskix-net` and `bhaskix-fs` depend on
+# nothing: it must be reachable from the kernel, from a service in a domain and
+# from a host test, and anything it depended on would have to be reachable from
+# all three as well. In particular it must **not** depend on
+# `bhaskix-arch-x86-64`, even though that crate has a perfectly good `cpuid` —
+# a ring 3 program that depended on `arch` would be a category error rather
+# than a layering violation, and `bin/tcpd` is a ring 3 program.
+#
+# `arch` depends on *this* instead, and reports the feature through `Features`
+# beside `nx` and `smep`. That way the detection exists once, in the crate the
+# users of it can all reach, rather than twice in two directions.
+[package]
+name = "bhaskix-rand"
+description = "Unpredictable numbers from the hardware, or none at all."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_rand"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Two instructions, and nothing else in the crate is `unsafe` at all.
+#
+# It is small deliberately. RFC 0021's argument is that the difficulty here is
+# not the instruction but the *failure mode* — `RDRAND` reports through the
+# carry flag whether its answer is usable, and code that ignores that gets
+# whatever was in the register. So everything that decides anything lives in
+# safe, host-tested functions, and the `unsafe` is reduced to "execute the
+# instruction and report both what it produced and whether it worked".
+#
+# A third `unsafe` block here should be a conversation, which is what this
+# number is for — so it is set to exactly what the two cost, with no headroom.
+# 21 measured: eleven lines for `cpuid`, ten for `rdrand` and its `setc`.
+unsafe_budget = 21

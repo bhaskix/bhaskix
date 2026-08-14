@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | ✅ **Accepted 2026-08-14**, with its single step implemented. `bhaskix-rand` exists, `Features::rdrand` is probed and printed, and a boot draws two values and asserts they differ. **Both machines were run, not just the convenient one**: `-cpu max` reports `rdrand yes` and demonstrates it; `-cpu qemu64` reports `rdrand  NO`, prints the warning, and **still boots**, which is the policy this document argued for working rather than being asserted. Open questions 1, 2 and 3 stay open. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `arch`, kernel, a new `bhaskix-rand` crate |
 | **Milestone** | Phase 2 — required before [RFC 0020](0020-tcp.md) step 1 |
@@ -202,3 +202,12 @@ One step, which is the point of a short RFC.
 1. **`bhaskix-rand`**, its host tests including the watched failures, `Features::rdrand` and the
    boot line, the `security.md` rows — the new one and the KASLR correction — and `check-deps.py`'s
    layer entry. RFC 0020 step 1 then consumes it.
+
+   **Done 2026-08-14.** Seven host tests; deleting the carry-flag check in `interpret` turns exactly
+   three of them red — the refused attempt, the processor that never answers, and the off-by-one on
+   the last attempt — and leaves the other four green, which is the right answer rather than a
+   coincidence: they do not exercise the failure path. A boot draws twice and asserts the values
+   differ, with a positive gate in `boot-test.sh` as well as the `FAILED` marker, because the marker
+   catches a self-test that ran and failed and only a positive gate catches one that stopped running.
+   Breaking the draw to return the same value twice fails both. `unsafe_budget = 21`, set to exactly
+   what the two `asm!` blocks cost, with no headroom.

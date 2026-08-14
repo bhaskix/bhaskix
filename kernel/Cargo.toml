@@ -19,6 +19,10 @@ bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-mm = { path = "../mm" }
 bhaskix-device = { path = "../device" }
 bhaskix-fs = { path = "../fs" }
+# RFC 0021. The kernel does not need unpredictability itself yet -- randomising
+# the heap base is that RFC's open question 2 -- but it is the thing that boots,
+# so it is where "the instruction actually works on this machine" is checked.
+bhaskix-rand = { path = "../rand" }
 # RFC 0013: the framework, and the services placed in the nucleus. The arrow
 # points this way and only this way -- a service crate never depends back.
 bhaskix-service = { path = "../service" }

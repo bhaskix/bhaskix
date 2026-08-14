@@ -10491,11 +10491,46 @@ fn report_cpu_features() {
         mark(f.smap)
     );
     println!(
-        "                   umip {}  la57 {}  invariant-tsc {}",
+        "                   umip {}  la57 {}  invariant-tsc {}  rdrand {}",
         mark(f.umip),
         mark(f.la57),
-        mark(f.invariant_tsc)
+        mark(f.invariant_tsc),
+        mark(f.rdrand)
     );
+    // **RFC 0021.** Said in words as well as in the table, because this one is
+    // not a degraded guarantee — it is the difference between the machine being
+    // able to be unpredictable at all and not. An operator reading `rdrand  NO`
+    // in a row of yeses would have to know what depends on it; this says.
+    if !f.rdrand {
+        println!(
+            "\x1b[93m    unpredictable  NO: this machine has no source of randomness, so anything \
+             needing one refuses rather than guessing\x1b[0m"
+        );
+        return;
+    }
+
+    // **RFC 0021, and the half the host tests cannot reach.** They drive the
+    // retry logic through a stub, which proves the decisions and nothing about
+    // the instruction: whether `rdrand` and its `setc` assemble, execute, and
+    // report a usable answer in *this* build, on *this* machine, in ring 0.
+    //
+    // Two draws, because one proves only that something was returned. Equal
+    // draws are the exact signature of the failure this crate is built around —
+    // a carry flag ignored on a part that leaves the register alone — so they
+    // are a failure here rather than an improbability worth shrugging at.
+    match (bhaskix_rand::u64(), bhaskix_rand::u64()) {
+        (Some(first), Some(second)) if first != second => {
+            println!("    unpredictable  two draws differ, and the machine reports rdrand");
+        }
+        (Some(_), Some(_)) => println!(
+            "\x1b[91m    unpredictable  FAILED: two draws were identical, which is what a carry \
+             flag nobody tested looks like\x1b[0m"
+        ),
+        _ => println!(
+            "\x1b[91m    unpredictable  FAILED: rdrand is reported present and would not \
+             answer\x1b[0m"
+        ),
+    }
 }
 
 /// Confirms timer interrupts are actually being delivered.

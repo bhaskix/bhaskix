@@ -63,6 +63,12 @@ LAYERS = {
     # depend on none of them. Layer 4 would have permitted a dependency on the
     # kernel, which is the one thing this crate must never acquire.
     "bhaskix-net": -2,
+    # The system's only source of unpredictability, RFC 0021, and the same
+    # argument a third time: it must be reachable from the kernel, from a ring 3
+    # service and from a host test, so it depends on nothing. `arch` depends on
+    # *it* rather than the other way round -- a layer above may reach down, and
+    # a ring 3 program that depended on `arch` would be a category error.
+    "bhaskix-rand": -2,
     "bhaskix-service": -1,
     "bhaskix-service-domain": 0,
     "bhaskix-service-console": 0,

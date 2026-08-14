@@ -197,10 +197,20 @@ load-bearing:
 | UMIP | User mode cannot read descriptor-table registers | Warn |
 | CET (shadow stack, IBT) | Control-flow integrity | Enable when present; not required |
 | IOMMU (VT-d / AMD-Vi) | DMA containment | **Boot in degraded mode, printed at boot and recorded in attestation.** T3 and T4 are not mitigated without it. |
-| KASLR | Randomise kernel image and heap base | Always on; `nokaslr` is a debug-build-only option |
+| KASLR | Randomise the kernel image | Always on; `nokaslr` is a debug-build-only option |
+| `RDRAND` | The machine's only source of unpredictability ([RFC 0021](rfc/0021-unpredictability.md)) | **Boot, warn loudly, and let the caller refuse.** A machine with no `RDRAND` still has a filesystem, a shell and a supervisor, none of which need to be unpredictable — but `bin/tcpd` does not start, because a guessable TCP sequence number is an off-path injection nobody can see. Reported in the `features` line every boot. |
 
 The "refuse to boot" entries are deliberate. Booting with a silently broken guarantee is worse than
 not booting, because the operator believes they have protection they do not have.
+
+> **Correction, 2026-08-14.** The KASLR row read *"Randomise kernel image and heap base"* until
+> [RFC 0021](rfc/0021-unpredictability.md) went looking for the randomness that would do it. **The
+> heap base is not randomised at all**: the heap lives in the direct map, and this machine reports
+> `hhdm base 0xffff800000000000` on every boot. The kernel image *is* slid — by **Limine**, not by
+> us; `kernel/src/lib.rs` computes the slide it was handed rather than choosing one. Half that row
+> was a claim about work nothing performed, and it was unperformable, because until RFC 0021 this
+> system had no source of unpredictability to perform it with. Randomising the heap base is a
+> separate change with its own risk to the direct map, and it is RFC 0021's open question 2.
 
 ---
 

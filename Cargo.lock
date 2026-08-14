@@ -9,6 +9,9 @@ version = "0.0.0"
 [[package]]
 name = "bhaskix-arch-x86-64"
 version = "0.0.0"
+dependencies = [
+ "bhaskix-rand",
+]
 
 [[package]]
 name = "bhaskix-boot"
@@ -41,6 +44,7 @@ dependencies = [
  "bhaskix-device",
  "bhaskix-fs",
  "bhaskix-mm",
+ "bhaskix-rand",
  "bhaskix-service",
  "bhaskix-service-console",
  "bhaskix-service-vfs",
@@ -55,6 +59,10 @@ dependencies = [
 
 [[package]]
 name = "bhaskix-net"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-rand"
 version = "0.0.0"
 
 [[package]]

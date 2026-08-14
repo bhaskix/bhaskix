@@ -12,6 +12,16 @@ license.workspace = true
 name = "bhaskix_arch"
 path = "src/lib.rs"
 
+# RFC 0021. One boolean — whether this processor can be unpredictable — and it
+# comes from the crate that uses it rather than being computed a second time
+# here. `features()` is a table of bit tests, and a bit constant written twice
+# in two crates is a bit constant that drifts in one of them.
+#
+# The direction is fine: `bhaskix-rand` depends on nothing at all, which is what
+# lets a ring 3 service reach it as well as this crate.
+[dependencies]
+bhaskix-rand = { path = "../../rand" }
+
 [lints]
 workspace = true
 
