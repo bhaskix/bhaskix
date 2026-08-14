@@ -43,12 +43,17 @@
 //! inherit this paragraph's conclusion.
 
 use crate::{
-    addr::{Ipv4Addr, MacAddr, Port},
+    addr::{Address, Ipv4Addr, MacAddr, Port},
     arp::ArpPacket,
     checksum,
     eth::{self, EthFrame, EtherType},
     icmp,
-    ipv4::{self, Ipv4Header, Reassembly},
+    ipv4::{self, Ipv4Header, Protocol, Reassembly},
+    tcp::{
+        FourTuple, Sequence,
+        segment::{self, Flags, Options, Segment},
+        state::{self, Actions, Event, Tcb, Timer},
+    },
     udp::{self, UdpDatagram},
 };
 
@@ -332,6 +337,224 @@ fn reassembly_never_panics_and_never_exceeds_its_table() {
                 table.release(index);
             }
             assert!(table.in_flight() <= 4, "the table grew past its capacity");
+        }
+    }
+}
+
+/// Recomputes a TCP checksum in place, over the pseudo-header and the segment.
+///
+/// **Without this the campaign fuzzes the checksum and nothing else.** Every
+/// interesting field in a TCP header — the data offset, and the whole option
+/// walk behind it — sits after the checksum test, so a mutated segment that is
+/// not repaired is refused at the door. The same lesson `DMAR` taught and
+/// `ipv4` records above, and it costs more here than anywhere else in this file
+/// because what is behind the door is a loop.
+fn repair_tcp(bytes: &mut [u8]) {
+    if bytes.len() < segment::HEADER {
+        return;
+    }
+    let mut pseudo = [0u8; 12];
+    pseudo[0..4].copy_from_slice(&HERE.octets());
+    pseudo[4..8].copy_from_slice(&THERE.octets());
+    pseudo[9] = Protocol::TCP.0;
+    let length = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+    pseudo[10..12].copy_from_slice(&length.to_be_bytes());
+    bytes[16..18].copy_from_slice(&[0, 0]);
+    let sum = checksum(&[&pseudo, bytes]);
+    bytes[16..18].copy_from_slice(&sum.to_be_bytes());
+}
+
+#[test]
+fn tcp_never_panics() {
+    // The option walk is the reason this target exists. Every other parser in
+    // this crate reads a fixed layout; this one loops with a stride a remote
+    // party chooses, and a stride of zero is a hang rather than a misparse.
+    //
+    // So the seed alternates between a plain segment and one carrying options,
+    // and the mutator is pointed at the option area as well as the header —
+    // otherwise the walk is reached with the same four well-formed bytes every
+    // time and the loop is never driven at all.
+    let (first, iterations) = campaign();
+    for seed in first..first.saturating_add(iterations) {
+        let mut rng = rng_for(seed);
+
+        let payload = [0xf0u8; 16];
+        let mut template = Segment {
+            source: Port(49152),
+            destination: Port(80),
+            sequence: Sequence(0x1000_0000),
+            acknowledgement: Some(Sequence(0x2000_0000)),
+            flags: Flags::PSH,
+            window: 4096,
+            options: Options::default(),
+            payload: &payload,
+        };
+        if seed & 2 == 0 {
+            template.options.mss = Some(1460);
+        }
+        let mut bytes = vec![0u8; segment::HEADER + 8 + payload.len()];
+        let written = segment::write(&mut bytes, &template, HERE, THERE).unwrap();
+        bytes.truncate(written);
+
+        let count = 1 + rng.below(6);
+        mutate(&mut rng, &mut bytes, count);
+        // Byte 12's top nibble is the data offset, and it decides both where
+        // the payload begins and how much of the segment the option walk reads.
+        // A general mutator lands on it about one time in twenty; this makes it
+        // one time in three, because it is the field everything else derives
+        // from.
+        if rng.below(3) == 0 && bytes.len() > 12 {
+            bytes[12] = (rng.next() as u8) & 0xf0;
+        }
+        // Half the seeds repair, so the fields behind the checksum are
+        // reachable at all; the other half exercise the check itself.
+        if seed & 1 == 0 {
+            repair_tcp(&mut bytes);
+        }
+        maybe_truncate(&mut rng, &mut bytes);
+
+        if let Ok(parsed) = Segment::parse(&bytes, HERE, THERE) {
+            // A payload cannot exceed the segment it was cut from, and the data
+            // offset is the only thing that decides where it starts -- so this
+            // is what a mis-checked offset would break while still returning
+            // `Ok`.
+            assert!(parsed.payload.len() + segment::HEADER <= bytes.len());
+            // A SYN and a FIN each occupy a number, so this is bounded by the
+            // payload plus two and can never be less than the payload.
+            let space = parsed.sequence_length();
+            assert!(space >= parsed.payload.len() as u32);
+            assert!(space <= parsed.payload.len() as u32 + 2);
+            // The flag and the field agree in both directions, which is the
+            // invariant `parse` establishes and `write` preserves.
+            assert_eq!(
+                parsed.acknowledgement.is_some(),
+                parsed.flags.contains(Flags::ACK)
+            );
+        }
+    }
+}
+
+/// Everything that must be true of a control block after any event whatsoever.
+///
+/// RFC 0020's testing plan names three; the other two are here because they are
+/// free once the harness exists.
+fn invariants(tcb: &Tcb, actions: &Actions) {
+    assert!(!actions.overflowed(), "the action list overflowed");
+    assert!(
+        !tcb.snd_una.follows(tcb.snd_nxt),
+        "snd.una ran ahead of snd.nxt: {:?}",
+        tcb
+    );
+    assert!(
+        tcb.rcv_wnd <= tcb.rcv_capacity,
+        "the window advertised more room than the program's ring holds"
+    );
+    // **The machine must never name bytes the program did not supply.** One
+    // past `snd_avail` is the `FIN`, which occupies a sequence number and is
+    // not a byte of the ring. Anything beyond that is `bin/tcpd` being told to
+    // read past what the program wrote and put it on the wire — a disclosure,
+    // not a bookkeeping error, which is why this is asserted rather than
+    // assumed from `snd_nxt`'s arithmetic looking right.
+    assert!(
+        !tcb.snd_nxt.follows(tcb.snd_avail.wrapping_add(1)),
+        "snd.nxt ran past the bytes the program supplied: {tcb:?}"
+    );
+    assert!(
+        (state::MIN_RTO_US..=state::MAX_RTO_US).contains(&tcb.rto_us),
+        "the retransmission timeout left its bounds: {}",
+        tcb.rto_us
+    );
+    assert!(tcb.retransmits <= state::MAX_RETRANSMITS);
+}
+
+#[test]
+fn the_tcp_state_machine_never_panics_and_holds_its_invariants() {
+    // **The target RFC 0020 says matters**, and the one that is different in
+    // kind from every other harness here: the others forget each input as they
+    // finish with it, and this one carries state between inputs that a remote
+    // party chose. A segment is only interesting in the light of the twenty
+    // before it.
+    //
+    // The sequence numbers are drawn *near* `rcv_nxt` half the time rather than
+    // uniformly, for the same reason the checksum is repaired elsewhere in this
+    // file: a uniform 32-bit draw is outside the receive window essentially
+    // always, so an unbiased campaign would test the acceptability check and
+    // nothing behind it. That is the doorway lesson for a third time, in the
+    // one place where the door leads to a state machine.
+    let (first, iterations) = campaign();
+    let payload = [0x5au8; 600];
+
+    for seed in first..first.saturating_add(iterations / 2).max(first + 1) {
+        let mut rng = rng_for(seed);
+        let connection = FourTuple {
+            local: Address::V4(HERE),
+            local_port: Port(49152),
+            remote: Address::V4(THERE),
+            remote_port: Port(80),
+        };
+        let mut tcb = Tcb::new(connection);
+        let mut now = 0u64;
+
+        let opening = if seed & 1 == 0 {
+            Event::Connect {
+                iss: Sequence(rng.next() as u32),
+                window: rng.edged16(),
+            }
+        } else {
+            Event::Listen {
+                iss: Sequence(rng.next() as u32),
+                window: rng.edged16(),
+            }
+        };
+        let (next, actions) = state::step(tcb, opening, now);
+        tcb = next;
+        invariants(&tcb, &actions);
+
+        for _ in 0..24 {
+            now = now.saturating_add(u64::from(rng.edged16()) * 1_000_000);
+            let event = match rng.below(8) {
+                0 => Event::Wrote(u32::from(rng.edged16())),
+                1 => Event::Read(u32::from(rng.edged16())),
+                2 => Event::Shutdown,
+                3 => Event::Expired(
+                    [
+                        Timer::Retransmit,
+                        Timer::DelayedAck,
+                        Timer::Probe,
+                        Timer::TimeWait,
+                    ][rng.below(4)],
+                ),
+                // Abort is deliberately rare: it closes the connection, and a
+                // run that aborts on its second event tests almost nothing.
+                4 if rng.below(8) == 0 => Event::Abort,
+                _ => {
+                    // Half plausible, half arbitrary.
+                    let sequence = if rng.next() & 1 == 0 {
+                        tcb.rcv_nxt.wrapping_add(rng.below(8) as u32)
+                    } else {
+                        Sequence(rng.next() as u32)
+                    };
+                    let acknowledgement = match rng.below(4) {
+                        0 => None,
+                        1 => Some(Sequence(rng.next() as u32)),
+                        _ => Some(tcb.snd_nxt.wrapping_add(rng.below(4) as u32)),
+                    };
+                    let length = rng.below(payload.len() + 1);
+                    Event::Arrived(Segment {
+                        source: Port(80),
+                        destination: Port(49152),
+                        sequence,
+                        acknowledgement,
+                        flags: Flags(rng.next() as u8),
+                        window: rng.edged16(),
+                        options: Options::default(),
+                        payload: &payload[..length],
+                    })
+                }
+            };
+            let (next, actions) = state::step(tcb, event, now);
+            tcb = next;
+            invariants(&tcb, &actions);
         }
     }
 }

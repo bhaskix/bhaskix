@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "bhaskix-net"
-description = "Ethernet, ARP, IPv4 and UDP, as arithmetic over a byte slice."
+description = "Ethernet, ARP, IPv4, UDP and the beginnings of TCP, as arithmetic over a byte slice."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

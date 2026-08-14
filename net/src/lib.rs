@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Ethernet, ARP, IPv4 and UDP, as arithmetic over a byte slice.
+//! Ethernet, ARP, IPv4, UDP and the beginnings of TCP, as arithmetic over a
+//! byte slice.
 //!
-//! [RFC 0018](../../docs/rfc/0018-networking.md) step 1. This is the whole of
-//! the protocol code, and deliberately none of the machinery around it: no
-//! device, no domain, no IPC, no clock. A caller supplies bytes and, where
-//! something ages, the current time; everything here is a pure function or a
-//! fixed table.
+//! [RFC 0018](../../docs/rfc/0018-networking.md) step 1, and
+//! [RFC 0020](../../docs/rfc/0020-tcp.md) step 1. This is the whole of the
+//! protocol code, and deliberately none of the machinery around it: no device,
+//! no domain, no IPC, no clock. A caller supplies bytes and, where something
+//! ages, the current time; everything here is a pure function or a fixed table.
+//!
+//! TCP is one module deep so far — [`tcp::isn`], the initial sequence number,
+//! which came first because it was the piece that turned out to have a
+//! prerequisite the system did not have. The segment parser and the state
+//! machine are RFC 0020's steps 2 and 3 and are not here yet.
 //!
 //! # This is the most exposed code in the system
 //!
@@ -53,6 +59,8 @@ pub mod dhcp;
 pub mod eth;
 pub mod icmp;
 pub mod ipv4;
+pub mod siphash;
+pub mod tcp;
 pub mod udp;
 
 #[cfg(test)]
@@ -64,6 +72,7 @@ pub use dhcp::Offer;
 pub use eth::{EthFrame, EtherType};
 pub use icmp::Echo;
 pub use ipv4::{Ipv4Header, Protocol, Reassembly};
+pub use tcp::{FourTuple, Sequence};
 pub use udp::UdpDatagram;
 
 /// Everything that can be wrong with a packet.
@@ -126,6 +135,23 @@ pub enum NetError {
     Exhausted {
         /// Which table.
         table: &'static str,
+    },
+    /// A TCP option's length octet cannot be believed.
+    ///
+    /// Distinct from every other length error here because of what it costs. A
+    /// TCP option list is the only place in this crate where a remotely-chosen
+    /// number is the *stride of a loop*: a length below two does not advance
+    /// the walk, so believing it is not a misparse but a hang. Two bytes, and
+    /// the service stops answering.
+    ///
+    /// Also carried when a recognised option arrives at a length its
+    /// specification does not allow — a four-byte maximum segment size that
+    /// claims six.
+    BadOptionLength {
+        /// The option kind, as carried.
+        kind: u8,
+        /// The length octet, as carried.
+        length: u8,
     },
 }
 
