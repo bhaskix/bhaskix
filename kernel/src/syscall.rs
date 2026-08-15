@@ -864,6 +864,33 @@ const fn ipc_status(error: crate::ipc::IpcError) -> Status {
         // status for authority that was good and has been taken away, which is
         // what a reply obligation becomes the moment its holder dies.
         crate::ipc::IpcError::ServerGone => Status::Revoked,
+        // RFC 0022 step 2: the rendezvous refused a call whose staged gift
+        // could not be completed, and the refusal's own status travels — "the
+        // service never declared" and "your capability lacked GRANT" are
+        // different mistakes, and only one of them is the caller's.
+        crate::ipc::IpcError::Refused(_) => Status::SlotUnavailable,
+    }
+}
+
+/// The `Status` a gift refusal was made with, from its stored raw value.
+///
+/// [`complete_gift`] runs on the server thread and the refusal travels to the
+/// caller through a `u32` in its thread entry; this turns it back into the
+/// variant it was, so the caller is told the actual mistake. Anything
+/// unrecognised collapses to the commonest cause rather than inventing one.
+fn refusal_status(raw: u32) -> Status {
+    const RIGHTS: u32 = Status::InsufficientRights as u32;
+    const QUOTA: u32 = Status::QuotaExceeded as u32;
+    const NO_CAP: u32 = Status::NoSuchCapability as u32;
+    const REVOKED: u32 = Status::Revoked as u32;
+    const NO_DOMAIN: u32 = Status::NoDomain as u32;
+    match raw {
+        RIGHTS => Status::InsufficientRights,
+        QUOTA => Status::QuotaExceeded,
+        NO_CAP => Status::NoSuchCapability,
+        REVOKED => Status::Revoked,
+        NO_DOMAIN => Status::NoDomain,
+        _ => Status::SlotUnavailable,
     }
 }
 
@@ -1471,6 +1498,9 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                     frame.arg3 = reply.args[3];
                     return Outcome::ok(reply.args[0]);
                 }
+                Err(crate::ipc::IpcError::Refused(raw)) => {
+                    return Outcome::err(refusal_status(raw));
+                }
                 Err(error) => return Outcome::err(ipc_status(error)),
             }
         }
@@ -2052,6 +2082,110 @@ fn start_program(frame: &SyscallFrame) -> Outcome {
 /// server's, then install into the caller's — and if the install fails, the
 /// derived capability is destroyed rather than left in the arena charged to a
 /// domain that cannot name it.
+/// Completes a staged gift at the rendezvous, or refuses the call.
+///
+/// RFC 0022 step 2, run **on the server thread** inside its receive path —
+/// the one place both parties are known — for either way the match happened:
+/// a sender finding a waiting receiver, or a receiver picking up a queued
+/// sender. `Ok(false)` is the common case: the caller staged nothing, and
+/// nothing here has any effect. `Ok(true)` is a completed transfer. `Err` is
+/// a refusal the caller must be told about, because its call was never
+/// delivered and no reply is coming; the receive path does the telling.
+///
+/// The checks are `hand`'s, mirrored: the *giver* must hold the capability
+/// and hold it with `GRANT`, the rights and badge must be monotone under the
+/// derive rules, the recipient pays the quota, and where it lands is the one
+/// slot the recipient declared. On any failure both declarations are put
+/// back — the caller's staged gift (so a retry loop stages once, the draft
+/// answer to the RFC's open question 3) and the server's declared slot (a
+/// service asked for something this caller could not give is still owed its
+/// next legitimate capability).
+pub(crate) fn complete_gift(caller: u32, endpoint: u32, server: u32) -> Result<bool, u32> {
+    let Some(gift) = crate::sched::take_staged_gift(caller, endpoint) else {
+        return Ok(false);
+    };
+
+    let Some(destination) = crate::sched::take_receive_slot(server, endpoint) else {
+        // The service never declared. The security half of the design: a
+        // caller cannot fill a service's slots uninvited, so the call is
+        // refused rather than delivered bare.
+        crate::sched::restore_staged_gift(caller, gift);
+        return Err(Status::SlotUnavailable as u32);
+    };
+    let restore = |gift| {
+        crate::sched::restore_staged_gift(caller, gift);
+        crate::sched::set_receive_slot(server, Some((destination, endpoint)));
+    };
+
+    let Some(giver) = crate::sched::domain_of(caller) else {
+        restore(gift);
+        return Err(Status::NoDomain as u32);
+    };
+    let Some(recipient) = crate::sched::domain_of(server) else {
+        restore(gift);
+        return Err(Status::NoDomain as u32);
+    };
+
+    // Stage one: derive from the giver's CSpace, charged to the recipient,
+    // exactly as `hand` does it and with its checks in its order.
+    let rights = crate::cap::Rights::from_bits(gift.rights);
+    let derived = domain::with(giver, |owner| {
+        let cspace = core::mem::take(&mut owner.cspace);
+        let result = cap::with_arena(|arena| {
+            let index = gift.from_slot as usize;
+            let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
+            let (_, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            // Holding a capability is not permission to pass it on.
+            if !held.contains(crate::cap::Rights::GRANT) {
+                return Err(Status::InsufficientRights);
+            }
+            arena
+                .derive_owned(slot, rights, gift.badge, recipient.as_u32())
+                .map_err(|error| match error {
+                    crate::cap::CapError::RightsNotMonotone
+                    | crate::cap::CapError::DeriveNotPermitted
+                    | crate::cap::CapError::BadgeNotMonotone => Status::InsufficientRights,
+                    _ => Status::QuotaExceeded,
+                })
+        });
+        owner.cspace = cspace;
+        result
+    });
+    let derived = match derived {
+        Some(Ok(derived)) => derived,
+        Some(Err(status)) => {
+            restore(gift);
+            return Err(status as u32);
+        }
+        None => {
+            restore(gift);
+            return Err(Status::NoDomain as u32);
+        }
+    };
+
+    // Stage two: install in the recipient, and charge the recipient.
+    let installed = domain::with(recipient, |owner| {
+        if owner.charge_capability().is_err() {
+            return Err(Status::QuotaExceeded);
+        }
+        owner
+            .cspace
+            .install_at(destination as usize, derived)
+            .map_err(|_| Status::SlotUnavailable)
+    });
+    match installed {
+        Some(Ok(())) => Ok(true),
+        Some(Err(status)) => {
+            restore(gift);
+            Err(status as u32)
+        }
+        None => {
+            restore(gift);
+            Err(Status::NoDomain as u32)
+        }
+    }
+}
+
 fn hand(frame: &SyscallFrame) -> Outcome {
     let Ok(resolved) = resolve_for_ipc(frame.capability, ObjectKind::Endpoint) else {
         return Outcome::err(Status::WrongObject);

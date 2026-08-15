@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft. **Step 1 implemented 2026-08-15** — the staging record and the caller-side `HAND`, inert until step 2's rendezvous transfer. |
+| **Status** | Draft. **Steps 1 and 2 implemented 2026-08-15** — a staged capability crosses at the rendezvous, refusals refuse the call whole and restore what they could not use. Step 3 (revocation gate) and step 4 (`CONNECT`'s rings) remain. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel, ABI |
 | **Milestone** | Phase 2 — required before [RFC 0020](0020-tcp.md)'s connection capabilities |
@@ -214,6 +214,19 @@ connection-setup path, never per segment or per datagram. Measured, not predicte
    a later, unrelated call. Both are defensible; the implementation should pick after writing the
    retry loops RFC 0020's client actually needs.
 
+   *Step 2 status:* retained. Every refusal path restores the gift before flagging the caller, so
+   a retry after fixing the cause — or after the service declares — needs no second `HAND`. The
+   self-test drops its refused gift explicitly, which is what any caller that decides *not* to
+   retry must do. Revisit if step 4's client shows the stale-gift hazard is real rather than
+   theoretical.
+4. **One declaration per thread is one declaration per thread.** The `EXPECT` slot is per-thread
+   state, and a gift consumes the *service thread's* declaration — the same declaration that
+   thread would use as a caller expecting a capability in a reply from its own upstream. A service
+   that both accepts gifts and calls upstream with `EXPECT` on the same thread is therefore
+   juggling one cell for two conversations. Today's services do neither or one; if step 4's
+   `tcpd` (which accepts ring gifts *and* may someday expect capabilities from `ipd`) trips over
+   this, the declaration wants to be per-(thread, endpoint) like the staging record already is.
+
 ## Implementation plan
 
 Each step leaves the tree green.
@@ -235,6 +248,20 @@ Each step leaves the tree green.
 2. **The transfer at rendezvous**: declaration lookup, derive with `hand()`'s checks, install,
    refusal matrix with restoration — the atomicity property tested on the host, the end-to-end
    hand-map-write gate in QEMU.
+
+   **Done 2026-08-15.** The transfer runs on the **service thread**, inside `recv_either`'s two
+   match points — the only places a rendezvous completes — so the caller's `Call` path needed no
+   change at all. Refusal is a flag on the caller's thread entry (`refuse_call`), read where the
+   caller checks for its answer; the refused status crosses as a raw `u32` and is mapped back to
+   the variant it was. A refused rendezvous consumed the server's queue entry, so the server loops
+   back to `rendezvous_recv` and re-queues — the alternative strands every later caller. The
+   refusal matrix is a six-phase kernel self-test with a domained service and client (sanity,
+   landed-where-declared, consumed-by-its-ride, refused-whole-without-GRANT, declaration restored
+   by the refusal, refused-undeclared rather than delivered bare), gated in the boot test and watched failing twice: transfer stubbed out reddens
+   the landing phases, the GRANT check deleted reddens the refusal phase — and showed the missing
+   refusal also eats the next phase's declaration, which is the deafness the restoration rule
+   exists to prevent. One finding recorded as open question 4: the declaration cell is per-thread,
+   and a gift spends the same cell a service's own upstream `EXPECT` would use.
 3. **The revocation gate**: a lending ended by domain death, observed from the service.
 4. **RFC 0020 step 4's consumer**: `CONNECT` carries two rings, `bin/tcpd` maps them, and the
    connection capability comes back in the reply — both directions of RFC 0016's mechanism in one

@@ -296,11 +296,15 @@ pub mod method {
     /// copy, `arg2` = its badge. Where it lands comes from the caller's
     /// [`EXPECT`] and not from here.
     ///
-    /// **And the other direction, RFC 0022 step 1**: a thread that is *not*
+    /// **And the other direction, RFC 0022**: a thread that is *not*
     /// answering anybody stages instead — `arg0` = its slot, `arg1` = rights,
     /// `arg2` = badge — one gift per thread, replaced by a second staging,
-    /// to be consumed by its next `Call` on this endpoint. Until the
-    /// rendezvous consumes gifts (step 2), a staged gift is inert.
+    /// consumed by its next `Call` on this endpoint. The transfer happens at
+    /// the rendezvous, atomically with the message: no [`EXPECT`] declared by
+    /// the service's thread means the *call is refused* rather than delivered
+    /// bare, and every refusal — no declaration, no `GRANT`, rights or badge
+    /// not monotone — restores the staged gift, so a retry needs no second
+    /// `HAND`.
     pub const HAND: u64 = 47;
     /// Give a derived capability to the domain this capability names.
     ///

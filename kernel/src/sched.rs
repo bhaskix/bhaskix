@@ -300,6 +300,16 @@ pub struct Thread {
     /// this thread will *accept* one, this says which one it will *send*.
     /// Dies with the thread, exactly as the declaration does.
     pub staged_gift: Option<StagedGift>,
+    /// A call this thread made was refused at the rendezvous, with this
+    /// status.
+    ///
+    /// RFC 0022 step 2. Set by the *server's* receive path when a staged
+    /// gift cannot be completed — no declaration, no `GRANT`, rights not
+    /// monotone — because the caller is already blocked awaiting a reply
+    /// that must now never come, and it has to be told with the status the
+    /// refusal actually had. Checked in [`take_message_or_block`] beside
+    /// [`Self::answer_lost`], which is the same shape of news.
+    pub call_refused: Option<u32>,
 
     /// The domain this thread belongs to, or `u32::MAX` for none.
     ///
@@ -762,6 +772,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         reply_to: None,
         receive_slot: None,
         staged_gift: None,
+        call_refused: None,
         domain: u32::MAX,
         dying: false,
         answer_lost: false,
@@ -962,6 +973,7 @@ pub fn spawn_on_with(
         reply_to: None,
         receive_slot: None,
         staged_gift: None,
+        call_refused: None,
         domain: options.domain,
         dying: false,
         answer_lost: false,
@@ -1405,6 +1417,30 @@ pub fn take_staged_gift(thread: u32, endpoint: u32) -> Option<StagedGift> {
     None
 }
 
+/// Refuses a call `thread` is blocked in, with `status`, and wakes it.
+///
+/// RFC 0022 step 2's other half: the server's receive path decides the
+/// refusal, and the caller — already blocked awaiting a reply — has to be
+/// told. The flag is read under the same runqueue-lock hold that decides
+/// whether to keep blocking, so the mark-first discipline covers it: a flag
+/// set before the caller's check is found by it, and one set after finds a
+/// blocked thread for the wake below.
+pub fn refuse_call(thread: u32, status: u32) -> bool {
+    let mut found = false;
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            target.call_refused = Some(status);
+            found = true;
+            break;
+        }
+    }
+    if found {
+        let _ = wake(thread);
+    }
+    found
+}
+
 /// Puts a taken gift back, for a refusal that retains it.
 ///
 /// RFC 0022's draft answer to its open question 3: a refused call leaves the
@@ -1488,6 +1524,16 @@ pub fn take_message_or_block(
                 target.state = State::Running;
                 return Delivery::Revoked;
             }
+            // A refused call, RFC 0022 step 2: the server's receive path
+            // could not complete this thread's staged gift, so the call was
+            // never delivered and no reply is coming. Carried with the status
+            // the refusal actually had, because "your gift lacked GRANT" and
+            // "the service never declared" are different mistakes and only
+            // one of them is the caller's.
+            if let Some(status) = target.call_refused.take() {
+                target.state = State::Running;
+                return Delivery::Refused(status);
+            }
             // A thread told to stop must not go back to sleep here.
             //
             // This is the third place that decides to block, and it was missed
@@ -1527,6 +1573,10 @@ pub enum Delivery<T> {
     /// and "the program you called has gone" are different facts, and a caller
     /// that retried the first would be right to and the second would not.
     Revoked,
+    /// The call was refused at the rendezvous — RFC 0022 step 2, a staged
+    /// gift that could not be completed — with the status of the refusal.
+    /// The thread is running and its message was never delivered.
+    Refused(u32),
 }
 
 /// Clears a blocked mark this thread set on itself and then decided against.
@@ -3390,6 +3440,7 @@ mod tests {
             reply_to: None,
             receive_slot: None,
             staged_gift: None,
+            call_refused: None,
             dying: false,
             answer_lost: false,
             domain: u32::MAX,

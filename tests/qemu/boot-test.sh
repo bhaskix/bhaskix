@@ -1365,6 +1365,28 @@ else
     status=1
 fi
 
+# RFC 0022 step 2. The whole transfer, exercised by the kernel's own
+# self-test with a domained service and a domained client: a capability
+# crossed at a rendezvous and landed in the slot the service had declared and
+# nowhere else; the staged gift was consumed by the call that carried it; a
+# call with no gift was untouched by the machinery; a gift the client lacked
+# GRANT for refused the *call* -- the message was never delivered, the caller
+# saw `InsufficientRights` -- and the service's declaration was restored, so
+# the very next gift landed in it without a second declaration.
+#
+# The line is matched on its tail because the interesting clause is the last
+# one: restoration is the part a simpler implementation silently gets wrong,
+# by consuming the declaration on the failure path and leaving the service
+# one failed caller away from deafness.
+if grep -qE "gift .*restored the declaration it could not use" "$LOG"; then
+    pass "a capability crossed in a call, and a refusal restored what it could not use"
+elif grep -qE "gift +skipped" "$LOG"; then
+    pass "gift self-test skipped on this machine, too few cpus"
+else
+    fail "the gift self-test did not report RFC 0022 step 2's properties"
+    status=1
+fi
+
 # RFC 0016 step 1. A badge says who the *granter* said a caller is. Until this
 # was fixed a holder could derive itself a different one and call a service as
 # somebody else, and the probe below demonstrated it as though it were a

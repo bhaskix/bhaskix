@@ -124,7 +124,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **TM1** | Time and timers | ✅ **Accepted** 2026-08-14 | **A deadline is a property of a notification, not a new object.** `Invoke(notification, ARM, deadline)` asks the kernel to signal it later; the program waits through RFC 0010's machinery, so a service handles callers, frames and expiring timers in one loop with one blocking call. Absolute deadlines, because a duration read before being descheduled becomes a lie. **Reading time is deliberately not a capability**: `rdtsc` is unprivileged on this machine and a `Clock` object would guard nothing — being *woken* is the scarce thing. Accepted with all four steps, and its open question 2 answered against it and then fixed: the measurement found the deadline had no effect on the wake instant at all, and arming now re-programs the timer. Questions 1 and 3 stay open, and 1 is sharper for the fix. | [RFC 0019](docs/rfc/0019-time-and-timers.md) |
 | **NW2** | TCP | ⬜ Draft | **A state machine that can be tested without a network.** `bin/tcpd` in its own domain, and a **pure transition function** in `bhaskix-net` — no I/O, no clock, no allocation — so loss, reordering, backoff and close are host tests against a virtual clock rather than things a live network refuses to reproduce. A connection's **stream lives in the program's pages**, so the receive window *is* the program's free space and a connection costs the memory of whoever opened it. Minimal but correct, with every absence named: no congestion control, window scaling, SACK, timestamps, PMTU discovery, keepalive or urgent data. Found a prerequisite it could not write around — **the system has no source of randomness at all**, and a TCP initial sequence number must be unpredictable. | [RFC 0020](docs/rfc/0020-tcp.md) |
 | **R1** | A source of unpredictability | ✅ **Accepted** 2026-08-14 | **The system cannot produce an unpredictable number, and nothing had noticed until RFC 0020 needed one.** No `RDRAND`, no `RDSEED`, no pool; even KASLR's slide is the bootloader's. The proposal is deliberately small because **`RDRAND` is unprivileged** — so there is no capability to design and no syscall to add, the same finding RFC 0019 made about `rdtsc`. What is left is a shared implementation that gets the failure mode right (the carry flag, a bounded retry, and `None` that is never turned into a number), a boot-time probe beside `nx`/`smep`/`smap`, and a policy: **the caller refuses**, not the kernel. Found on the way that `bin/ipd` hands out ephemeral ports as `49152 + index`, and that `security.md` claims a heap-base randomisation the system does not perform. | [RFC 0021](docs/rfc/0021-unpredictability.md) |
-| **CR2** | A capability in a call | ⬜ Draft | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
+| **CR2** | A capability in a call | ⬜ Draft — steps 1–2 implemented 2026-08-15 | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
@@ -754,6 +754,37 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-15 (RFC 0022 step 2: the transfer at the rendezvous, and a refusal that restores)
+
+**A capability now crosses in a call.** The transfer runs on the **service thread**, inside
+`recv_either`'s two match points — the only places a rendezvous completes — so the caller's `Call`
+path needed no change: the caller stages, calls, and either the message *and* the capability
+arrive together or neither does. Refusal is a flag on the caller's thread entry
+(`sched::refuse_call`), read exactly where a caller checks for its answer; the status crosses as a
+raw `u32` and is mapped back to the variant it was. A refused rendezvous has already consumed the
+server's receive-queue entry, so the server loops back to `rendezvous_recv` and re-queues —
+anything less strands every later caller, which is the strander `ipc.rs` already documents twice.
+
+**Every refusal restores the staged gift before flagging the caller** — open question 3 answered
+retained-on-refusal, so a retry needs no second `HAND`. The six-phase kernel self-test (a domained
+service and a domained client) gates it in the boot test: a gift lands only where declared and is
+consumed by its ride; a giftless call is untouched; a gift with no declaration refuses the call rather than delivering it bare; a gift without `GRANT` refuses the *call whole*
+— the service never sees the message, the caller sees `InsufficientRights` — and the refusal
+restores the service's declaration, so the very next gift lands with no second `EXPECT`. **Watched
+failing both ways**: the transfer stubbed out reddens the landing phases; the `GRANT` check deleted
+reddens the refusal phase — and demonstrated that the missing refusal also *consumes the next
+phase's declaration*, which is precisely the deafness the restoration rule exists to prevent.
+
+Two findings recorded rather than fixed. **Open question 4** (RFC 0022): the declaration cell is
+per-thread, and a gift spends the same cell the service's own upstream `EXPECT` would use — fine
+for every service that exists, a collision waiting for one that does both on one thread. **A
+pre-existing host-test flake**, found by twenty-six suite runs while verifying this change: on the
+host target `percpu::cpu_id()` is always 0, so every parallel test thread shares `HELD[0]` and
+`HOLDS[0]`, and `sync`'s tests race each other — `holding_a_rank_still_blocks_preemption_after_its
+_bit_is_cleared` failed twice in twenty-six runs, alone it cannot fail. Not this change's to fix:
+the fix (thread-local held state under `cfg(test)`, or `--test-threads=1` for `sync`) deserves its
+own entry rather than a rider on this one.
 
 ### 2026-08-15 (RFC 0022 step 1: the staging record, and a `HAND` that knows which way it is facing)
 

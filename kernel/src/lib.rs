@@ -457,6 +457,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    ipc            FAILED\x1b[0m");
     }
+    if !gift_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    gift           FAILED\x1b[0m");
+    }
     if !ring3_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -1026,7 +1032,17 @@ extern "C" fn ipc_service(_argument: u64) -> ! {
             // merely slow: the caller blocks, the counters stay put, and the
             // test says "reached a service" without saying what stopped it.
             Err(error) => {
-                RING3_RECV_ERROR.store(error as u64 + 1, Ordering::Release);
+                // A discriminant by hand, because `IpcError` stopped being
+                // field-less when RFC 0022 gave refusals a status to carry.
+                let code = match error {
+                    ipc::IpcError::NoSuchEndpoint => 1,
+                    ipc::IpcError::Congested => 2,
+                    ipc::IpcError::Exhausted => 3,
+                    ipc::IpcError::NoSuchCaller => 4,
+                    ipc::IpcError::ServerGone => 5,
+                    ipc::IpcError::Refused(_) => 6,
+                };
+                RING3_RECV_ERROR.store(code, Ordering::Release);
                 sched::exit()
             }
         }
@@ -1192,6 +1208,265 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
     );
     println!("==================================================================");
     sched::exit()
+}
+
+/// The phase the gift self-test is in. See `gift_self_test`.
+static GIFT_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The gift endpoint, for the two test threads.
+static GIFT_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// What the client's calls returned, one nibble per phase (status + 1).
+static GIFT_CLIENT_SAW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many messages the service actually received, and how many of its
+/// declared slots were filled when it looked.
+static GIFT_SERVED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GIFT_LANDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The service half of `gift_self_test`. Declares when the phase says to,
+/// receives, checks its own CSpace, replies.
+extern "C" fn gift_service(_argument: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let endpoint = ipc::EndpointId::from_u32(GIFT_ENDPOINT.load(Ordering::Acquire) as u32);
+    let me = sched::current_thread_id().unwrap_or(0);
+    let my_domain = sched::current_domain();
+
+    // One declaration before serving, consumed by phase 2's gift; **not**
+    // renewed before phase 3, which is the no-declaration refusal; renewed at
+    // slot 6 for phase 4, whose no-GRANT refusal must *restore* it, so that
+    // phase 5's gift lands in it without another declaration. The restoration
+    // is the property under test there — a declaration eaten by a refused
+    // gift would leave every service one failed caller away from deafness.
+    sched::set_receive_slot(me, Some((5, endpoint.as_u32())));
+
+    loop {
+        let Ok((message, caller)) = ipc::recv(endpoint) else {
+            sched::exit()
+        };
+        GIFT_SERVED.fetch_add(1, Ordering::Relaxed);
+        // Which declared slot this phase's gift should have landed in, if any.
+        let slot = message.args[0] as usize;
+        let landed = my_domain
+            .and_then(|domain| domain::with(domain, |owner| owner.cspace.get(slot).is_some()))
+            == Some(true);
+        if landed {
+            GIFT_LANDED.fetch_add(1, Ordering::Relaxed);
+        }
+        // Phase 4's declaration, made *between* phase 3's calls: from here a
+        // gift may land at slot 6.
+        if message.method == 2 {
+            sched::set_receive_slot(me, Some((6, endpoint.as_u32())));
+        }
+        let _ = ipc::reply(
+            caller,
+            ipc::Message {
+                method: message.method,
+                args: [u64::from(landed), 0, 0, 0],
+                badge: 0,
+            },
+        );
+        // The closing call, answered and then obeyed. An exit keyed to a
+        // phase flag instead was a race: the flag could be read either side
+        // of the closing call's arrival, and one side left it undelivered.
+        if message.method == 99 {
+            sched::exit();
+        }
+    }
+}
+
+/// The client half: stages (or does not), calls, records what came back.
+extern "C" fn gift_client(_argument: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    let endpoint = ipc::EndpointId::from_u32(GIFT_ENDPOINT.load(Ordering::Acquire) as u32);
+    let me = sched::current_thread_id().unwrap_or(0);
+
+    let record = |phase: u32, status: u64| {
+        GIFT_CLIENT_SAW.fetch_or((status + 1) << (phase * 8), Ordering::Release);
+    };
+    let stage = |from_slot: u32| {
+        sched::stage_gift(
+            me,
+            sched::StagedGift {
+                from_slot,
+                rights: cap::Rights::READ.bits(),
+                badge: 0,
+                endpoint: endpoint.as_u32(),
+            },
+        );
+    };
+
+    // Phase 1: no gift staged. The plain rendezvous must be untouched by any
+    // of this machinery — `complete_gift` returning "no gift" has no effect.
+    let sanity = ipc::call(endpoint, 0, 1, [5, 0, 0, 0]);
+    record(1, u64::from(sanity.is_err()));
+
+    // Phase 2: a gift the client may give (slot 2 holds GRANT), into the
+    // service's declared slot 5. The reply's args[0] says whether the service
+    // found it there.
+    stage(2);
+    let gifted = ipc::call(endpoint, 0, 2, [5, 0, 0, 0]);
+    let landed = matches!(&gifted, Ok(reply) if reply.args[0] == 1);
+    record(2, u64::from(!landed));
+    // And the staged gift must be consumed: a second call carries nothing.
+    let consumed = sched::take_staged_gift(me, endpoint.as_u32()).is_none();
+    record(3, u64::from(!consumed));
+
+    // Phase 3: staged, but the service's declaration was consumed by phase 2
+    // and method 2 re-declared at slot 6 — wait: it did. So the *true*
+    // no-declaration case needs the declaration spent first. Spend it with a
+    // no-GRANT refusal instead — phase 4 first, deliberately out of order:
+    // slot 3 holds the same object *without* GRANT, so the derive refuses
+    // with InsufficientRights, the call is never delivered, and the
+    // declaration is restored.
+    stage(3);
+    let refused = ipc::call(endpoint, 0, 3, [6, 0, 0, 0]);
+    let right_refusal = matches!(
+        refused,
+        Err(ipc::IpcError::Refused(raw))
+            if raw == syscall::Status::InsufficientRights as u32
+    );
+    record(4, u64::from(!right_refusal));
+    // The refused gift is retained (open question 3's draft answer): drop it
+    // so it cannot ride a later call of this test.
+    let _ = sched::take_staged_gift(me, endpoint.as_u32());
+
+    // Phase 5: the declaration survived the refusal, so this gift lands at
+    // slot 6 with no further declaration — the restoration property.
+    stage(2);
+    let restored = ipc::call(endpoint, 0, 3, [6, 0, 0, 0]);
+    let landed = matches!(&restored, Ok(reply) if reply.args[0] == 1);
+    record(5, u64::from(!landed));
+
+    // Phase 6: that landing consumed the declaration, so the service now has
+    // none — and a gift with nowhere to land refuses the *call*, rather than
+    // delivering it bare. The security half of the design: a caller cannot
+    // fill a service's slots uninvited, and cannot slip past by arriving
+    // while the service is not expecting.
+    stage(2);
+    let undeclared = ipc::call(endpoint, 0, 3, [7, 0, 0, 0]);
+    let right_refusal = matches!(
+        undeclared,
+        Err(ipc::IpcError::Refused(raw))
+            if raw == syscall::Status::SlotUnavailable as u32
+    );
+    record(6, u64::from(!right_refusal));
+    // The refusal restored the gift; drop it, or it rides the closing call —
+    // which, with no declaration, would itself be refused and strand the
+    // teardown.
+    let _ = sched::take_staged_gift(me, endpoint.as_u32());
+
+    // One last plain call, which the service answers and then exits on; only
+    // after it returns is the harness told everything has happened.
+    let _ = ipc::call(endpoint, 0, 99, [63, 0, 0, 0]);
+    GIFT_PHASE.store(90, Ordering::Release);
+    sched::exit()
+}
+
+/// RFC 0022 step 2: a capability crosses in a call, refusals refuse whole,
+/// and a refusal restores what it could not use.
+fn gift_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 3 {
+        println!("\x1b[93m    gift           skipped, needs cpus for both parties\x1b[0m");
+        return true;
+    }
+
+    let Ok(endpoint) = ipc::create() else {
+        println!("\x1b[91m    gift           FAILED to create an endpoint\x1b[0m");
+        return false;
+    };
+    GIFT_ENDPOINT.store(u64::from(endpoint.as_u32()), Ordering::Release);
+
+    let (Ok(server_side), Ok(client_side)) = (
+        domain::create("gift-svc", domain::ResourceEnvelope::new()),
+        domain::create("gift-cli", domain::ResourceEnvelope::new()),
+    ) else {
+        println!("\x1b[91m    gift           FAILED to create the domains\x1b[0m");
+        return false;
+    };
+
+    // The client's slot 2 holds a giftable object **with** GRANT; slot 3
+    // holds the same object **without** it. A notification stands in for the
+    // Memory object the real consumer gifts — what is under test is the
+    // transfer, and any object kind rides it the same way.
+    let Ok(parcel) = crate::notify::create() else {
+        println!("\x1b[91m    gift           FAILED to create the parcel\x1b[0m");
+        return false;
+    };
+    let installed = crate::notify::name(parcel).ok().and_then(|root| {
+        cap::with_arena(|arena| {
+            // Both parcels carry DERIVE, because the transfer *derives* the
+            // recipient's copy and the arena checks that right itself. The
+            // difference between them is GRANT alone, so the refusal the test
+            // watches is the GRANT check and nothing adjacent to it.
+            let giftable = cap::Rights::READ
+                .union(cap::Rights::DERIVE)
+                .union(cap::Rights::GRANT);
+            let with_grant = arena.derive(root, giftable, 0).ok()?;
+            let without = arena
+                .derive(root, cap::Rights::READ.union(cap::Rights::DERIVE), 0)
+                .ok()?;
+            Some((with_grant, without))
+        })
+    });
+    let Some((with_grant, without)) = installed else {
+        println!("\x1b[91m    gift           FAILED to derive the parcels\x1b[0m");
+        return false;
+    };
+    if domain::with(client_side, |owner| {
+        owner.cspace.install_at(2, with_grant).is_ok()
+            && owner.cspace.install_at(3, without).is_ok()
+    }) != Some(true)
+    {
+        println!("\x1b[91m    gift           FAILED to install the parcels\x1b[0m");
+        return false;
+    }
+
+    let svc = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(server_side.as_u32());
+    let cli = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(client_side.as_u32());
+    if sched::spawn_on_with(1, "gift-svc", gift_service, 0, hhdm_base, svc).is_err()
+        || sched::spawn_on_with(2, "gift-cli", gift_client, 0, hhdm_base, cli).is_err()
+    {
+        println!("\x1b[91m    gift           FAILED to spawn the participants\x1b[0m");
+        return false;
+    }
+
+    wait_until(|| GIFT_PHASE.load(Ordering::Acquire) >= 90, 8_000);
+    wait_millis(100);
+    let _ = ipc::destroy(endpoint);
+    domain::destroy(server_side);
+    domain::destroy(client_side);
+    crate::notify::destroy(parcel);
+
+    let saw = GIFT_CLIENT_SAW.load(Ordering::Acquire);
+    let served = GIFT_SERVED.load(Ordering::Relaxed);
+    let landed = GIFT_LANDED.load(Ordering::Relaxed);
+    // Every recorded byte must be 1 — the phase ran and its check passed.
+    // Phases: 1 sanity, 2 gifted, 3 consumed, 4 no-GRANT refusal,
+    // 5 restoration, 6 no-declaration refusal.
+    let ok = (1..=6u32).all(|phase| (saw >> (phase * 8)) & 0xff == 1)
+        // The refused calls were never delivered: three delivered calls
+        // carried gifts or sanity (phases 1, 2, 5) plus the closing call —
+        // the refusals of phases 4 and 6 must not appear as served messages.
+        && served == 4
+        && landed == 2;
+    if ok {
+        println!(
+            "    gift           a capability crossed in a call, landed only where declared, was \
+             consumed by its ride; a giftless call was untouched; no declaration refused the \
+             call rather than delivering it bare; no GRANT refused the call whole and restored \
+             the declaration it could not use"
+        );
+    } else {
+        println!(
+            "\x1b[91m    gift           FAILED: phases {saw:#x}, served {served}, landed \
+             {landed}\x1b[0m"
+        );
+    }
+    ok
 }
 
 fn ipc_self_test(hhdm_base: u64, cpus: u32) -> bool {

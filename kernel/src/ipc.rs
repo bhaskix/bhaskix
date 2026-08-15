@@ -229,6 +229,12 @@ pub enum IpcError {
     /// and the endpoint may be served again by something else. What was lost is
     /// the obligation, which lived in one thread.
     ServerGone,
+    /// The rendezvous refused this call: a staged gift could not be
+    /// completed, and the message was never delivered. RFC 0022 step 2.
+    /// Carries the refusal's own status, raw, because "the service never
+    /// declared" and "your capability lacked `GRANT`" are different mistakes
+    /// and only one of them is the caller's.
+    Refused(u32),
 }
 
 /// A rendezvous point.
@@ -516,6 +522,9 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
             // thread. RFC 0013's unresolved question 1.
             sched::Delivery::Revoked => return Err(IpcError::ServerGone),
             sched::Delivery::Abandoned => return Err(IpcError::NoSuchEndpoint),
+            // The server's receive path could not complete this thread's
+            // staged gift; the message was never delivered. RFC 0022 step 2.
+            sched::Delivery::Refused(status) => return Err(IpcError::Refused(status)),
             sched::Delivery::Blocked => sched::block_self(),
         }
     }
@@ -578,78 +587,117 @@ pub fn recv_either(id: EndpointId) -> Result<Received, IpcError> {
         return Ok(Received::Notified(waiting));
     }
 
-    match rendezvous_recv(id, me)? {
-        // A sender was already waiting; its message is in hand.
-        Rendezvous::Matched { partner, message } => {
-            RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
-            sched::set_reply_target(me, partner);
-            Ok(Received::Message(message, partner))
-        }
-
-        // Queued as a receiver. A sender that arrives writes the message into
-        // this thread's mailbox *before* waking it, so a wake with an empty
-        // mailbox is spurious rather than an empty answer — which is why this
-        // rechecks rather than trusting the wake.
-        // Mark first, check second — see `call` for why the other order loses
-        // messages.
-        Rendezvous::Queued => loop {
-            match sched::take_message_or_block(me, || live(id)) {
-                sched::Delivery::Message((message, from)) => {
-                    RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
-                    trace(Event::RecvTook, me, from);
-                    sched::set_reply_target(me, from);
-                    return Ok(Received::Message(message, from));
-                }
-                // The endpoint was destroyed under us. Leaving the queue entry
-                // behind would have a later rendezvous deliver to a thread that
-                // has gone.
-                // Either the endpoint was destroyed under us, or this thread
-                // has been told to stop. Both leave the same duty: take the
-                // queue entry out, or a later rendezvous delivers to a thread
-                // that has gone.
-                sched::Delivery::Abandoned | sched::Delivery::Revoked => {
-                    cancel(id, me);
-                    ABANDONED_RECVS.fetch_add(1, Ordering::Relaxed);
-                    return Err(IpcError::NoSuchEndpoint);
-                }
-                sched::Delivery::Blocked => {
-                    // **Message first, notification second.** `take_message_or_
-                    // block` has just marked this thread blocked and found no
-                    // message; only now is the bound notification read. A thread
-                    // that looked at the notification first, and cancelled on
-                    // finding bits, could throw away a message a sender had
-                    // already written into its mailbox -- stranding that sender
-                    // for ever.
-                    //
-                    // The mark-blocked-then-check order is what makes the read
-                    // safe against a signal arriving right here: the signaller
-                    // wakes this thread, so `block_self` returns at once and the
-                    // loop looks again.
-                    let bits = crate::notify::take_bound(me);
-                    if bits != 0 {
-                        // **The blocked mark must come off before this
-                        // returns.** `take_message_or_block` marked this
-                        // thread blocked — that is what makes reading the
-                        // notification race-free — and a thread that returns
-                        // still carrying the mark runs only until the next
-                        // reschedule believes it, switches away, and never
-                        // comes back: the wake that would have corrected the
-                        // mark is the one this line just consumed. Whether
-                        // the thread survived used to depend on whether the
-                        // signaller's wake landed before or after the mark —
-                        // a coin toss taken on every notified receive, and
-                        // RFC 0020 step 5's one-in-three stall.
-                        sched::clear_blocked_mark(me);
-                        // Out of the receive queue, or a later rendezvous
-                        // delivers to a thread that has stopped waiting.
-                        cancel(id, me);
-                        return Ok(Received::Notified(bits));
+    // The outer loop exists for one reason: a refused gift. RFC 0022 step 2
+    // completes a caller's staged gift here, **on the server thread**, at
+    // whichever of the two match points the rendezvous took — and when the
+    // gift cannot be completed, the caller is refused and this thread must go
+    // back to *being a receiver*, which its match consumed. Continuing the
+    // outer loop re-runs `rendezvous_recv`, which re-queues it; anything less
+    // leaves a server absent from the receive queue with every later caller
+    // stranded, which is the strander this file already documents twice.
+    loop {
+        match rendezvous_recv(id, me)? {
+            // A sender was already waiting; its message is in hand.
+            Rendezvous::Matched { partner, message } => {
+                match crate::syscall::complete_gift(partner, id.as_u32(), me) {
+                    Ok(_) => {}
+                    Err(status) => {
+                        sched::refuse_call(partner, status);
+                        continue;
                     }
-                    RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
-                    sched::block_self();
                 }
+                RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
+                sched::set_reply_target(me, partner);
+                return Ok(Received::Message(message, partner));
             }
-        },
+
+            // Queued as a receiver. A sender that arrives writes the message
+            // into this thread's mailbox *before* waking it, so a wake with an
+            // empty mailbox is spurious rather than an empty answer — which is
+            // why this rechecks rather than trusting the wake.
+            // Mark first, check second — see `call` for why the other order
+            // loses messages.
+            Rendezvous::Queued => loop {
+                match sched::take_message_or_block(me, || live(id)) {
+                    sched::Delivery::Message((message, from)) => {
+                        // The sender matched this thread while it was blocked
+                        // and delivered into its mailbox; its gift completes
+                        // now, before the server sees the message — a service
+                        // must never observe a message whose capability half
+                        // was dropped. On refusal the caller is told and this
+                        // thread rejoins the receive queue via the outer loop:
+                        // its queue entry was consumed by the very match that
+                        // delivered this mailbox.
+                        match crate::syscall::complete_gift(from, id.as_u32(), me) {
+                            Ok(_) => {}
+                            Err(status) => {
+                                sched::refuse_call(from, status);
+                                break;
+                            }
+                        }
+                        RECV_RETURNED.fetch_add(1, Ordering::Relaxed);
+                        trace(Event::RecvTook, me, from);
+                        sched::set_reply_target(me, from);
+                        return Ok(Received::Message(message, from));
+                    }
+                    // Either the endpoint was destroyed under us, or this
+                    // thread has been told to stop. Both leave the same duty:
+                    // take the queue entry out, or a later rendezvous delivers
+                    // to a thread that has gone.
+                    sched::Delivery::Abandoned | sched::Delivery::Revoked => {
+                        cancel(id, me);
+                        ABANDONED_RECVS.fetch_add(1, Ordering::Relaxed);
+                        return Err(IpcError::NoSuchEndpoint);
+                    }
+                    // Refusals are flagged on callers by servers; a thread
+                    // blocked in *receive* is never flagged. Defensive rather
+                    // than reachable, and treated as the abandonment it would
+                    // have to be if it ever were.
+                    sched::Delivery::Refused(_) => {
+                        cancel(id, me);
+                        ABANDONED_RECVS.fetch_add(1, Ordering::Relaxed);
+                        return Err(IpcError::NoSuchEndpoint);
+                    }
+                    sched::Delivery::Blocked => {
+                        // **Message first, notification second.** `take_message_
+                        // or_block` has just marked this thread blocked and
+                        // found no message; only now is the bound notification
+                        // read. A thread that looked at the notification first,
+                        // and cancelled on finding bits, could throw away a
+                        // message a sender had already written into its mailbox
+                        // -- stranding that sender for ever.
+                        //
+                        // The mark-blocked-then-check order is what makes the
+                        // read safe against a signal arriving right here: the
+                        // signaller wakes this thread, so `block_self` returns
+                        // at once and the loop looks again.
+                        let bits = crate::notify::take_bound(me);
+                        if bits != 0 {
+                            // **The blocked mark must come off before this
+                            // returns.** `take_message_or_block` marked this
+                            // thread blocked — that is what makes reading the
+                            // notification race-free — and a thread that
+                            // returns still carrying the mark runs only until
+                            // the next reschedule believes it, switches away,
+                            // and never comes back: the wake that would have
+                            // corrected the mark is the one this line just
+                            // consumed. Whether the thread survived used to
+                            // depend on whether the signaller's wake landed
+                            // before or after the mark — a coin toss taken on
+                            // every notified receive, and RFC 0020 step 5's
+                            // one-in-three stall.
+                            sched::clear_blocked_mark(me);
+                            // Out of the receive queue, or a later rendezvous
+                            // delivers to a thread that has stopped waiting.
+                            cancel(id, me);
+                            return Ok(Received::Notified(bits));
+                        }
+                        RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
+                        sched::block_self();
+                    }
+                }
+            },
+        }
     }
 }
 
