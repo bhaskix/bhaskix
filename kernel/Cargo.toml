@@ -201,7 +201,12 @@ workspace = true
 # stops the firmware's rings being live behind a translation; and two bounded
 # readiness waits that poll a report page each -- for the TCP demonstration's
 # terminal outcome, and for ipd's serving bit before the DHCP client starts.
-unsafe_budget = 1193
+#
+# 1209 at RFC 0022 step 4: starting bin/tcpc costs the same shapes every
+# program start costs -- an address-space install, the ring transition, and
+# the client's report page read through the direct map for the outcome wait
+# and the printer. Nothing new in kind, sixteen lines in count.
+unsafe_budget = 1209
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

@@ -3634,6 +3634,22 @@ const TCPD_STACK_PAGES: u64 = 4;
 const TCPD_PROGRAM: &[u8] = b"bin/tcpd";
 const TCPD_MARKER: u64 = 0x3144_5043_5444_0a54;
 static TCP_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The TCP demonstration client, RFC 0022 step 4: the first program to open
+/// a connection with rings its own domain owns.
+const TCPC_STACK: u64 = 0x0000_0000_1700_0000;
+const TCPC_STACK_PAGES: u64 = 4;
+const TCPC_PROGRAM: &[u8] = b"bin/tcpc";
+/// "TCPC_RPT", little-endian, as `bin/tcpc` writes it.
+const TCPC_MARKER: u64 = 0x5450_525f_4350_4354;
+/// Bytes in each stream ring the client owns. One frame is enough for a
+/// sixteen-byte demonstration and small enough to see mistakes in.
+const TCPC_RING_BYTES: u64 = 4 * bhaskix_mm::FRAME_SIZE;
+/// The badge the client's capability to the TCP service carries.
+const TCPC_BADGE: u64 = 0x7C_C1;
+static TCPC_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// The TCP service's endpoint, for minting client capabilities to it.
+static TCP_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 static TCP_CONFIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 static IP_INBOX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -4539,6 +4555,8 @@ fn start_ip_domain(
     };
     if let Err(reason) = start_tcp_domain(tcp_cpu, hhdm_base, realm, keeper) {
         println!("\x1b[91m    tcp domain     FAILED: {reason}\x1b[0m");
+    } else if let Err(reason) = start_tcp_client_domain(tcp_cpu, hhdm_base, keeper) {
+        println!("\x1b[91m    tcp client     FAILED: {reason}\x1b[0m");
     }
 
     let options = sched::SpawnOptions::new()
@@ -4657,6 +4675,10 @@ fn start_tcp_domain(
     if domain::with(realm, |owner| owner.cspace.install_at(4, serving).is_ok()) != Some(true) {
         return Err("the tcp endpoint capability would not install");
     }
+    TCP_ENDPOINT.store(
+        u64::from(endpoint.as_u32()),
+        core::sync::atomic::Ordering::Release,
+    );
 
     // `tcpd`'s inbox: a deadline it arms fires through the same word `ipd`'s
     // doorbell rings, so one blocking receive wakes for a caller, a frame or a
@@ -5955,6 +5977,33 @@ fn report_net_after_exchange(hhdm: u64) {
     }
     report_tcp_domain(hhdm);
 
+    // The demonstration client's exchange, bounded the same way: outcome 0
+    // is "still working", everything else is terminal.
+    for _ in 0..50u32 {
+        let raw = TCPC_REPORT.load(core::sync::atomic::Ordering::Acquire);
+        if raw == u64::MAX {
+            break;
+        }
+        let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+            break;
+        };
+        if count == 0 {
+            break;
+        }
+        // SAFETY: a frame this object owns, through the direct map.
+        let (marker, outcome) = unsafe {
+            (
+                core::ptr::read_volatile((hhdm + pages[0]) as *const u64),
+                core::ptr::read_volatile((hhdm + pages[0] + 16) as *const u64),
+            )
+        };
+        if marker == TCPC_MARKER && outcome != 0 {
+            break;
+        }
+        wait_millis(100);
+    }
+    report_tcp_client(hhdm);
+
     // RFC 0018 step 7: what the boundary cost, counted rather than argued.
     //
     // The RFC claims the split costs "two copies and two domain crossings per
@@ -5984,6 +6033,202 @@ fn report_net_after_exchange(hhdm: u64) {
 /// deliverable consumed: the service drew a 128-bit secret from the hardware,
 /// and on a machine that could not supply one the outcome reads 4 and nothing
 /// was attempted, which is the refusal working.
+/// Creates the TCP demonstration client's domain: two stream rings **it
+/// owns**, a badged capability to the TCP service, a report page — and
+/// nothing wired to the service by the kernel at all.
+///
+/// RFC 0022 step 4. The absence is the design: every earlier ring in this
+/// file is installed into both ends by boot code, and this pair is installed
+/// into one. The other end receives them the way every future program's
+/// service will — handed across `CONNECT`, moved by the kernel at a
+/// rendezvous, landing where the service declared. Ownership matters as much
+/// as transport: the rings belong to the client's domain, so RFC 0022
+/// step 3 makes the service's copies die with the client.
+fn start_tcp_client_domain(
+    cpu: u32,
+    hhdm_base: u64,
+    keeper: domain::DomainId,
+) -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+
+    let raw = TCP_ENDPOINT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return Err("no tcp endpoint to hand the client");
+    }
+
+    let realm = domain::create("tcpc", domain::ResourceEnvelope::new())
+        .map_err(|_| "the tcp client domain would not be created")?;
+
+    // The client's capability to the service: badged, so the service can key
+    // the handover by who is calling, and carrying no GRANT — holding a
+    // service is not permission to pass it on.
+    let root = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, raw),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the tcp client endpoint capability would not be created")?;
+    let client_cap = cap::with_arena(|arena| {
+        arena
+            .derive(
+                root,
+                cap::Rights::READ.union(cap::Rights::WRITE),
+                TCPC_BADGE,
+            )
+            .ok()
+    })
+    .ok_or("the tcp client endpoint capability would not derive")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(0, client_cap).is_ok()
+    }) != Some(true)
+    {
+        return Err("the tcp client endpoint capability would not install");
+    }
+
+    // The report page, owned by the keeper like every report: it must
+    // outlive the client to be read after it exits.
+    let report = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the tcp client report page would not be created")?;
+    let named = shared::name(report).map_err(|_| "the tcp client report would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(1, named).is_ok()) != Some(true) {
+        return Err("the tcp client report would not install");
+    }
+
+    // The rings, owned by the *client's* domain. `Rights::ALL` from `name`
+    // is what a creator holds over its own object — including the GRANT and
+    // DERIVE the gift needs.
+    for (slot, label) in [(2usize, "send"), (3usize, "receive")] {
+        let ring = shared::create(realm, TCPC_RING_BYTES)
+            .map_err(|_| "a tcp client ring would not be created")?;
+        let ring_cap = shared::name(ring).map_err(|_| "a tcp client ring would not be named")?;
+        let _ = label;
+        if domain::with(realm, |owner| {
+            owner.cspace.install_at(slot, ring_cap).is_ok()
+        }) != Some(true)
+        {
+            return Err("a tcp client ring would not install");
+        }
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        cpu,
+        "tcpc",
+        tcpc_domain_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the tcp client would not spawn")?;
+
+    TCPC_REPORT.store(report.as_u64(), Ordering::Release);
+    println!(
+        "    tcp client     bin/tcpc started: two rings its domain owns, a badged capability to \
+         the service, and nothing wired between them by the kernel"
+    );
+    Ok(())
+}
+
+/// Loads `bin/tcpc` into a fresh address space and enters it.
+///
+/// The same steps `tcp_domain_entry` takes; no entry argument, because this
+/// program arms no deadlines and owns no clock.
+extern "C" fn tcpc_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    tcp client     FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(TCPC_PROGRAM) else {
+        stop("bin/tcpc is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/tcpc is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(TCPC_STACK), TCPC_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/tcpc would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = TCPC_STACK + TCPC_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("tcp client", entry, rsp, [0, 0]) }
+}
+
+/// Prints what `bin/tcpc` reported: how far the ring handover went.
+fn report_tcp_client(hhdm: u64) {
+    let raw = TCPC_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if raw == u64::MAX {
+        return;
+    }
+    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        println!("\x1b[91m    tcp client     report page gone\x1b[0m");
+        return;
+    };
+    if count == 0 {
+        println!("\x1b[91m    tcp client     report page empty\x1b[0m");
+        return;
+    }
+    // SAFETY: a frame this object owns, through the direct map.
+    let (marker, step, outcome, detail) = unsafe {
+        (
+            core::ptr::read_volatile((hhdm + pages[0]) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 8) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 16) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 24) as *const u64),
+        )
+    };
+    if marker != TCPC_MARKER {
+        println!("\x1b[91m    tcp client     no report: the client never wrote its page\x1b[0m");
+        return;
+    }
+    let said = match outcome {
+        0 => "still mid-exchange, which after the wait above means stuck",
+        1 => "rings accepted, connection capability still owed",
+        2 => {
+            "handed both rings across CONNECT and holds the connection capability the service \
+             minted back -- both directions of the mechanism in one exchange, kernel-wired \
+             nothing"
+        }
+        3 => "a handover leg was refused",
+        4 => "gave up: the service kept answering LATER",
+        5 => "the reply said yes but the declared slot stayed empty",
+        _ => "an outcome this kernel does not know",
+    };
+    if outcome == 2 {
+        println!("    tcp client     {said}");
+    } else {
+        println!(
+            "\x1b[91m    tcp client     FAILED at step {step}: {said} (detail {detail:#x})\
+\x1b[0m"
+        );
+    }
+}
+
 fn report_tcp_domain(hhdm: u64) {
     use core::sync::atomic::Ordering;
 
@@ -10893,19 +11138,20 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Eleven programs in /bin: the ring 3 probe, the user-mode
+            // Twelve programs in /bin: the ring 3 probe, the user-mode
             // shell, both services as programs, the block driver (RFC 0013
             // steps 3, 4 and 6), the filesystem (RFC 0016 step 3), the
             // supervisor (RFC 0017 question 2), the network driver and the
             // protocol service (RFC 0018 steps 2 and 3), the DHCP client
-            // (step 6), and the TCP service (RFC 0020 step 4). Exact rather
-            // than "at least", so adding a twelfth without noticing this line
-            // is a failure rather than a silently weaker test -- which it has
-            // now been for every program added, most recently `bin/tcpd`,
-            // whose arrival this line duly caught while a real DMA fault was
-            // being hunted two lines up in the same log.
+            // (step 6), the TCP service (RFC 0020 step 4), and the TCP
+            // demonstration client (RFC 0022 step 4). Exact rather
+            // than "at least", so adding a thirteenth without noticing this
+            // line is a failure rather than a silently weaker test -- which
+            // it has now been for every program added, most recently
+            // `bin/tcpc`, whose arrival this line duly caught, as designed,
+            // exactly as it caught `bin/tcpd` before it.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 11,
+            entries >= 3 && bin == 12,
         ),
         (
             "the user program is an ELF the loader accepts",

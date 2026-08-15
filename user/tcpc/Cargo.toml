@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The TCP demonstration client: the first program to open a connection the
+# way every program will -- rings it owns, handed across CONNECT.
+#
+# Not a member of the root workspace, for the reason user/netd/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+[workspace]
+
+[package]
+name = "bhaskix-user-tcpc"
+description = "The TCP demonstration client, supplying its own rings."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "tcpc"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 19, measured, no headroom: the syscall block, the report-page writes, and
+# the deliberate ud2 in the panic handler. This program holds two rings it
+# never touches by address in step 4a -- the bytes ride them in step 4b,
+# which is when this number moves.
+unsafe_budget = 19

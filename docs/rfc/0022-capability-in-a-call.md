@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft. **Steps 1–3 implemented 2026-08-15** — a staged capability crosses at the rendezvous, refusals refuse the call whole and restore what they could not use, and a lender's death unmaps, destroys and unnames what it had lent. Step 4 (`CONNECT`'s rings) remains. |
+| **Status** | Draft. **Steps 1–3 and 4a implemented 2026-08-15** — a staged capability crosses at the rendezvous, refusals refuse whole and restore, a lender's death unmaps and unnames, and `bin/tcpc` hands two rings across `CONNECT` and receives the connection capability back, kernel-wired nothing. Step 4b (the stream rides the gifted rings) remains. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel, ABI |
 | **Milestone** | Phase 2 — required before [RFC 0020](0020-tcp.md)'s connection capabilities |
@@ -282,3 +282,22 @@ Each step leaves the tree green.
 4. **RFC 0020 step 4's consumer**: `CONNECT` carries two rings, `bin/tcpd` maps them, and the
    connection capability comes back in the reply — both directions of RFC 0016's mechanism in one
    exchange, which is the sentence this RFC exists to make true.
+
+   **Step 4a done 2026-08-15** — the exchange itself, end to end from ring 3. A new program,
+   `bin/tcpc`, holds two `Memory` rings its own domain owns and a badged capability to the TCP
+   service; the kernel wires *nothing* between the two programs. `CONNECT` is three legs
+   (`args[2]`), one capability per call as the alternatives table records: leg 0 hands the send
+   ring, leg 1 the receive ring — `bin/tcpd` declares with `EXPECT` before every receive and maps
+   what lands — and leg 2's reply carries the connection capability back into the slot the client
+   declared. The service now serves the handover even on a machine with no network (the old
+   no-network path exited, leaving the endpoint dead and every future caller queued against it
+   for ever), which makes the boot gate unconditional. Watched failing in both directions:
+   service-replies-yes-but-hands-nothing reddens the client's landing probe;
+   client-calls-without-staging reddens leg 0 with the service's `BARE` refusal. Two probe
+   lessons worth keeping: `INFO` is not implemented for `Memory` or `Endpoint` capabilities, so
+   occupancy is probed by *refusal shape* — an empty slot fails to resolve
+   (`NO_SUCH_CAPABILITY`), an occupied one reaches method dispatch and is refused differently.
+
+   **Step 4b remains**: the stream rides the gifted rings — `SEND`/`RECV` against the mapped
+   pages, the demonstration moves out of the service into `bin/tcpc`, and the service's internal
+   kernel-wired connection retires.

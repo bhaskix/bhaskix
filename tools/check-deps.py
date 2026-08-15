@@ -137,6 +137,12 @@ LAYERS = {
     # *stateful* parser this system will contain, which is exactly why it is a
     # separate program with this short a capability list.
     "bhaskix-user-tcpd": -1,
+    # The TCP demonstration client, RFC 0022 step 4: the first program to
+    # open a connection with rings its own domain owns, handed across
+    # CONNECT. It links nothing but the ABI, and that absence is the claim --
+    # what it demonstrates is the *exchange*, and an exchange that needed
+    # protocol code on the client side would be the wrong exchange.
+    "bhaskix-user-tcpc": -1,
     # The supervisor places no service: it creates domains, starts programs in
     # them and reaps them, all through capability invocations. So it belongs
     # here with the other plain programs rather than in PLACEMENTS -- and that

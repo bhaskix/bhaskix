@@ -657,8 +657,13 @@ pub mod tcp {
     /// Open a connection.
     ///
     /// Invoked on a capability to the TCP service's endpoint. `arg0` is the
-    /// destination address, `arg1` the destination port. Blocks until the
-    /// handshake completes or fails, and the reply carries an outcome below.
+    /// destination address, `arg1` the destination port, and `arg2` the
+    /// **leg**: RFC 0022 moves one capability per call, so `CONNECT` is
+    /// three. Leg 0 carries the send ring as a staged gift ([`method::HAND`]
+    /// then this call), leg 1 the receive ring, and leg 2 asks for the
+    /// connection capability, which rides the reply into the slot the caller
+    /// declared with [`method::EXPECT`]. Each leg replies with an outcome
+    /// below; a leg missing its ring is told [`BARE`].
     pub const CONNECT: u64 = 58;
 
     /// Listen on a local port. Replies with a *listener* capability.
@@ -712,6 +717,17 @@ pub mod tcp {
     /// arrives with step 5. An honest "not yet" is distinguishable from a
     /// missing service, which is the difference between waiting and giving up.
     pub const LATER: u64 = 7;
+    /// A `CONNECT` leg arrived without the ring it was supposed to carry,
+    /// or out of order — the handover protocol misused, not the network.
+    ///
+    /// RFC 0022 step 4: `CONNECT` is three calls. Leg 0 (`args[2]` = 0)
+    /// carries the send ring as a staged gift, leg 1 the receive ring, and
+    /// leg 2 asks for the connection capability, which rides the reply into
+    /// the slot the caller declared with [`method::EXPECT`]. One capability
+    /// per call, as RFC 0022's alternatives table records; a caller that
+    /// skips a leg is told so with this, and the reply's second word says
+    /// which expectation was disappointed.
+    pub const BARE: u64 = 8;
 
     /// Packs a connection's identity into the badge a capability carries.
     ///

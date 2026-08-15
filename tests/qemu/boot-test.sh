@@ -473,7 +473,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 11 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 12 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -1051,6 +1051,26 @@ elif grep -qE "tcpd +state 0x3 \(attached/keyed/configured/serving\), outcome 5"
 else
     fail "the tcp demonstration did not complete against the deterministic peer"
     grep -E "tcpd|tcp domain" "$LOG" || true
+    status=1
+fi
+
+# RFC 0022 step 4: the exchange the RFC exists for, from ring 3, end to end.
+#
+# bin/tcpc holds two Memory rings its own domain owns and a badged capability
+# to the TCP service -- the kernel wires *nothing* between the two programs.
+# The client hands one ring across each of two CONNECT calls (one capability
+# per call, as the RFC's alternatives table records), then declares a slot
+# with EXPECT and asks; the connection capability the service minted rides
+# the reply into that slot. The gate demands the terminal success, and it is
+# unconditional: the handover needs no network, and the service now serves it
+# even on a machine that has none -- which is itself part of the change,
+# because the old no-network path exited and left the endpoint dead with
+# every future caller queued against it.
+if grep -qE "tcp client +handed both rings across CONNECT and holds the connection capability" "$LOG"; then
+    pass "two rings crossed in calls and the connection capability came back where EXPECT said"
+else
+    fail "the ring handover did not complete"
+    grep -E "tcp client" "$LOG" || true
     status=1
 fi
 

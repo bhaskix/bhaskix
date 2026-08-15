@@ -40,7 +40,7 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{method, ring, status, syscall, tcp};
+use bhaskix_abi::{method, rights, ring, status, syscall, tcp};
 use bhaskix_net::siphash::Key;
 use bhaskix_net::tcp::{
     FourTuple, isn,
@@ -66,11 +66,22 @@ const DOORBELL: u64 = 5;
 /// bits, which is RFC 0010's badge-as-bitmask doing what it was designed for.
 const INBOX: u64 = 6;
 
+/// Where a caller's gifted send ring lands (RFC 0022): declared with
+/// `EXPECT` before every receive while unfilled, consumed by the gift that
+/// arrives with `CONNECT` leg 0.
+const GIFT_SEND: u64 = 8;
+/// The receive ring's slot, filled by leg 1.
+const GIFT_RECV: u64 = 9;
+
 /// Where this program maps what it holds.
 const FWD_AT: u64 = 0x2300_0000;
 const REPORT_AT: u64 = 0x2310_0000;
 const BACK_AT: u64 = 0x2320_0000;
 const CONFIG_AT: u64 = 0x2330_0000;
+/// Where a caller's gifted rings map. The stream rides them in step 4b; in
+/// step 4a mapping them is the proof the handover happened.
+const SENDR_AT: u64 = 0x2340_0000;
+const RECVR_AT: u64 = 0x2350_0000;
 
 /// Bytes in each ring, matching what the kernel granted.
 const RING_BYTES: usize = 16 * 4096;
@@ -650,6 +661,128 @@ fn publish_tail(tail: u64) {
     }
 }
 
+/// One caller's ring handover, RFC 0022 step 4a.
+///
+/// One handover today, exactly as the demonstration is one connection: the
+/// mechanism first, the table when a second caller exists to need it. A
+/// multi-caller service keys this by the badge on the call; the fields are
+/// what the table's rows will be.
+struct Handover {
+    send_mapped: bool,
+    recv_mapped: bool,
+    /// The badge the connection capability was minted under, once handed.
+    handle: u64,
+}
+
+/// Declares where the next gifted ring may land, if one is still owed.
+///
+/// Before *every* receive, because the declaration is one-shot: the gift
+/// that lands consumes it, and a service that forgets to renew is deaf to
+/// the next caller. Declaring the same slot twice replaces, which makes
+/// this safe to call unconditionally.
+fn declare_gift_slot(handover: &Handover) {
+    let slot = if !handover.send_mapped {
+        GIFT_SEND
+    } else if !handover.recv_mapped {
+        GIFT_RECV
+    } else {
+        // Nothing owed: leave no declaration, so an uninvited gift refuses
+        // its call rather than landing somewhere this service will not look.
+        return;
+    };
+    let _ = call(syscall::INVOKE, ENDPOINT, method::EXPECT, [slot, 0, 0, 0]);
+}
+
+/// Answers one `CONNECT` leg. Returns what to reply: `(outcome, detail)`.
+///
+/// Legs 0 and 1 each carry one ring, because RFC 0022 moves one capability
+/// per call — its alternatives table records why. Leg 2 is the other
+/// direction: the connection capability rides the reply, RFC 0016 unchanged.
+fn connect_leg(handover: &mut Handover, leg: u64) -> (u64, u64) {
+    match leg {
+        0 | 1 => {
+            let (slot, at) = if leg == 0 {
+                (GIFT_SEND, SENDR_AT)
+            } else {
+                (GIFT_RECV, RECVR_AT)
+            };
+            let mapped = if leg == 0 {
+                &mut handover.send_mapped
+            } else {
+                &mut handover.recv_mapped
+            };
+            if *mapped {
+                // A retried leg is answered, not punished: the ring is here.
+                return (tcp::OK, 0);
+            }
+            // The map is the probe. The kernel refuses a gifted call when no
+            // slot is declared, so a leg that arrives *delivered* but with
+            // this slot empty is a caller that called without staging —
+            // `ATTACH` then fails with `NO_SUCH_CAPABILITY`, told apart from
+            // a ring that arrived and would not map.
+            match call(syscall::INVOKE, slot, method::ATTACH, [at, 1, 0, 0]).0 {
+                s if s == status::OK => {
+                    *mapped = true;
+                    (tcp::OK, 0)
+                }
+                s if s == status::NO_SUCH_CAPABILITY => (tcp::BARE, leg),
+                other => (tcp::BARE, 0x100 | other << 4 | leg),
+            }
+        }
+        2 => {
+            if !(handover.send_mapped && handover.recv_mapped) {
+                return (tcp::BARE, 2);
+            }
+            if handover.handle == 0 {
+                handover.handle = tcp::handle(0, 1, false);
+            }
+            // The reply direction: derived from this service's own endpoint
+            // capability, badged with the connection's identity, landing
+            // where the caller's `EXPECT` said. Where it lands is not this
+            // service's to choose.
+            let handed = call(
+                syscall::INVOKE,
+                ENDPOINT,
+                method::HAND,
+                [ENDPOINT, rights::READ | rights::WRITE, handover.handle, 0],
+            );
+            if handed.0 != status::OK {
+                return (tcp::BARE, 0x20 | handed.0);
+            }
+            (tcp::OK, handover.handle)
+        }
+        _ => (tcp::BARE, 3),
+    }
+}
+
+/// Serves ring handovers and nothing else, on a machine with no network.
+///
+/// The exchange RFC 0022 step 4 exists for needs no wire: rings cross, the
+/// connection capability comes back, and what that connection cannot do
+/// without a network is its own report to make when asked. Exiting instead —
+/// which this program did — left the endpoint dead and every caller queued
+/// against it for ever.
+fn serve_handover_only() -> ! {
+    let mut handover = Handover {
+        send_mapped: false,
+        recv_mapped: false,
+        handle: 0,
+    };
+    loop {
+        declare_gift_slot(&handover);
+        let (status_in, _badge, method_in, args) = receive();
+        if status_in != status::OK {
+            continue;
+        }
+        if method_in == tcp::CONNECT {
+            let (outcome_word, detail) = connect_leg(&mut handover, args[2]);
+            reply(outcome_word, detail, 0);
+        } else {
+            reply(tcp::LATER, 0, 0);
+        }
+    }
+}
+
 /// Leaves the findings where the kernel granted memory for them.
 fn report(state_bits: u64, outcome: u64, taken: u64, sent: u64, refused: u64, tcb_state: u64) {
     let words = [MARKER, state_bits, outcome, taken, sent, refused, tcb_state];
@@ -721,9 +854,12 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     if !networked {
         // No rings to a protocol service means no network, which is a state
         // rather than a failure: the machine boots, and this page says what
-        // this program could not do.
+        // this program could not do. What it *can* still do is accept rings
+        // and mint connections — the handover needs no wire, and exiting
+        // here would leave the endpoint dead with every caller queued
+        // against it for ever.
         report(bits, outcome::NO_NETWORK, 0, 0, 0, 0);
-        exit()
+        serve_handover_only()
     }
 
     // What this interface is, written by the kernel once the driver has read
@@ -754,7 +890,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     }
     if me == Ipv4Addr::UNSPECIFIED {
         report(bits, outcome::NO_NETWORK, 0, 0, 0, 0);
-        exit()
+        serve_handover_only()
     }
     bits |= state_bits::CONFIGURED;
 
@@ -798,6 +934,12 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     call(syscall::INVOKE, INBOX, method::BIND_SELF, [0; 4]);
     bits |= state_bits::SERVING;
 
+    let mut handover = Handover {
+        send_mapped: false,
+        recv_mapped: false,
+        handle: 0,
+    };
+
     loop {
         // The demonstration's one-shot events, driven by what the machine has
         // reached rather than by a schedule.
@@ -829,7 +971,8 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             state_number(&service.tcb),
         );
 
-        let (status_in, _badge, method_in, _args) = receive();
+        declare_gift_slot(&handover);
+        let (status_in, _badge, method_in, args) = receive();
         if status_in == status::NOTIFIED {
             // A frame, a deadline, or both — the word does not say which
             // deadline, so both halves are checked. Cheap: one is a ring header
@@ -842,10 +985,16 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         if status_in != status::OK {
             continue;
         }
-        // A caller. Connections for other programs are step 5; an honest
-        // "not yet" is distinguishable from a missing service.
-        let _ = method_in;
-        reply(tcp::LATER, 0, 0);
+        // A caller. RFC 0022 step 4a: `CONNECT` legs carry the rings across
+        // and the connection capability back. The stream does not ride the
+        // gifted rings yet — that is step 4b — so every other method is an
+        // honest "not yet", distinguishable from a missing service.
+        if method_in == tcp::CONNECT {
+            let (outcome_word, detail) = connect_leg(&mut handover, args[2]);
+            reply(outcome_word, detail, 0);
+        } else {
+            reply(tcp::LATER, 0, 0);
+        }
     }
 }
 
