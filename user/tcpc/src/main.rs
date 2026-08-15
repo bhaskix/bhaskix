@@ -45,6 +45,11 @@ const L_RECV_RING: u64 = 6;
 /// does.
 const LISTENER: u64 = 7;
 const INBOUND: u64 = 8;
+/// The wakes (RFC 0023): one notification per handover, this domain's own,
+/// gifted so the service can ring them and waited on so this program stops
+/// spinning.
+const WAKE: u64 = 9;
+const L_WAKE: u64 = 10;
 
 /// Where the report page maps in this program's space.
 const REPORT_AT: u64 = 0x2300_0000;
@@ -184,14 +189,24 @@ fn report(step: u64, outcome: u64, detail: u64) {
 /// reads exactly like the sentence it implements. Retried while the service
 /// answers `SLOT_UNAVAILABLE`, because the service declares where a gift may
 /// land just before it listens, and this program may call first.
-fn leg(verb: u64, a0: u64, a1: u64, gift_slot: Option<u64>, leg_number: u64) -> (u64, u64, u64) {
+fn leg(
+    verb: u64,
+    a0: u64,
+    a1: u64,
+    gift_slot: Option<(u64, u64)>,
+    leg_number: u64,
+) -> (u64, u64, u64) {
     for _ in 0..50_000 {
-        if let Some(slot) = gift_slot {
+        if let Some((slot, badge)) = gift_slot {
+            // The badge travels with the gift, and for the wakes it must:
+            // their capabilities are badged, badges are one-way, and a
+            // signal ORs the badge into the word — zero would OR nothing
+            // and ring nobody.
             let (staged, _, _) = call(
                 syscall::INVOKE,
                 SERVICE,
                 method::HAND,
-                [slot, rights::READ | rights::WRITE, 0, 0],
+                [slot, rights::READ | rights::WRITE, badge, 0],
             );
             if staged != status::OK {
                 return (0xFFFF, staged, 0);
@@ -226,6 +241,23 @@ fn rdtsc() -> u64 {
         core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
     }
     (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Blocks until the service rings `wake_slot`, or a tenth of a second
+/// passes — RFC 0023's whole point on the first arm, and the second is what
+/// keeps a lost wake a slowdown rather than a hang: the deadline rides the
+/// same notification (RFC 0019), so `WAIT` returns either way and the
+/// caller re-reads the only truth, which is `RECV`'s reply. On a machine
+/// with no calibrated counter there is no deadline to arm, and a yield is
+/// what is left.
+fn wait_for_news(wake_slot: u64, hertz: u64) {
+    if hertz == 0 {
+        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        return;
+    }
+    let deadline = rdtsc().wrapping_add(hertz / 10);
+    let _ = call(syscall::INVOKE, wake_slot, method::ARM, [deadline, 0, 0, 0]);
+    let _ = call(syscall::INVOKE, wake_slot, method::WAIT, [0; 4]);
 }
 
 /// One `RECV` poll on the outbound connection: `(state, delivered)`.
@@ -271,7 +303,7 @@ fn stream_send(count: u64, step: u64) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn tcpc_main() -> ! {
+extern "C" fn tcpc_main(hertz: u64) -> ! {
     // The report page first, so every later failure has somewhere to be seen.
     if call(
         syscall::INVOKE,
@@ -323,8 +355,13 @@ extern "C" fn tcpc_main() -> ! {
     // `HAND` and one `CONNECT`, and each ring is a `Memory` object this
     // domain owns — which is what makes RFC 0022 step 3 mean something here:
     // if this program dies mid-connection, the service's copies die with it.
-    let (status_0, value_0, detail_0) =
-        leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, Some(SEND_RING), 0);
+    let (status_0, value_0, detail_0) = leg(
+        tcp::CONNECT,
+        u64::from(PEER),
+        PEER_PORT,
+        Some((SEND_RING, 0)),
+        0,
+    );
     if status_0 == STUCK_STATUS {
         report(1, outcome::STUCK, 0);
         exit();
@@ -338,8 +375,13 @@ extern "C" fn tcpc_main() -> ! {
         exit();
     }
 
-    let (status_1, value_1, detail_1) =
-        leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, Some(RECV_RING), 1);
+    let (status_1, value_1, detail_1) = leg(
+        tcp::CONNECT,
+        u64::from(PEER),
+        PEER_PORT,
+        Some((RECV_RING, 0)),
+        1,
+    );
     if status_1 == STUCK_STATUS {
         report(2, outcome::STUCK, 0);
         exit();
@@ -368,6 +410,23 @@ extern "C" fn tcpc_main() -> ! {
         report(3, outcome::REFUSED, declared << 8);
         exit();
     }
+    // The listener's rings cross now too, and then both wakes — the order
+    // is the service's declaration order (rings before wakes, RFC 0022 open
+    // question 4's one-declaration constraint), and the wakes land before
+    // the connection opens so no news is ever produced unrung.
+    let (l0, v0, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some((L_SEND_RING, 0)), 0);
+    let (l1, v1, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some((L_RECV_RING, 0)), 1);
+    if l0 != status::OK || v0 != tcp::OK || l1 != status::OK || v1 != tcp::OK {
+        report(2, outcome::REFUSED, l0 << 48 | v0 << 32 | l1 << 16 | v1);
+        exit();
+    }
+    let (c3, cv3, _) = leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, Some((WAKE, 1)), 3);
+    let (l3, lv3, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some((L_WAKE, 2)), 3);
+    if c3 != status::OK || cv3 != tcp::OK || l3 != status::OK || lv3 != tcp::OK {
+        report(2, outcome::REFUSED, c3 << 48 | cv3 << 32 | l3 << 16 | lv3);
+        exit();
+    }
+
     // The handshake clock starts here: leg 2 is what makes the SYN leave.
     let handshake_started = rdtsc();
     let (status_2, value_2, detail_2) = leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, None, 2);
@@ -412,11 +471,11 @@ extern "C" fn tcpc_main() -> ! {
             break;
         }
         bounded += 1;
-        if bounded > 50_000 {
+        if bounded > 300 {
             report(5, outcome::STUCK, state);
             exit();
         }
-        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        wait_for_news(WAKE, hertz);
     }
     report_word(4, rdtsc().wrapping_sub(handshake_started));
 
@@ -451,11 +510,11 @@ extern "C" fn tcpc_main() -> ! {
                 break;
             }
             waited += 1;
-            if waited > 50_000 {
+            if waited > 300 {
                 report(6, outcome::STUCK, delivered);
                 exit();
             }
-            let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+            wait_for_news(WAKE, hertz);
         }
         *sample = rdtsc().wrapping_sub(begun);
     }
@@ -497,11 +556,11 @@ extern "C" fn tcpc_main() -> ! {
                 break;
             }
             waited += 1;
-            if waited > 200_000 {
+            if waited > 600 {
                 report(7, outcome::STUCK, delivered);
                 exit();
             }
-            let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+            wait_for_news(WAKE, hertz);
         }
         for offset in 0..CHUNK {
             let at = (sent_bytes + offset) % ring;
@@ -522,11 +581,11 @@ extern "C" fn tcpc_main() -> ! {
             break;
         }
         waited += 1;
-        if waited > 200_000 {
+        if waited > 600 {
             report(7, outcome::STUCK, delivered);
             exit();
         }
-        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        wait_for_news(WAKE, hertz);
     }
     report_word(8, rdtsc().wrapping_sub(bulk_started));
     report_word(9, CHUNKS * CHUNK);
@@ -553,26 +612,19 @@ extern "C" fn tcpc_main() -> ! {
             break;
         }
         waited += 1;
-        if waited > 50_000 {
+        if waited > 300 {
             report(8, outcome::STUCK, state);
             exit();
         }
-        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        wait_for_news(WAKE, hertz);
     }
 
     report(8, outcome::ECHOED, state);
 
-    // RFC 0020 step 5's inbound half. The same handover toward a *listener*:
-    // two rings this domain owns cross `LISTEN`'s legs, the listener
-    // capability comes back, and then `ACCEPT` is polled — the connection it
-    // eventually carries was initiated by the harness's host-side driver,
-    // which is the direction nothing in this system has ever served before.
-    let (l0, v0, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some(L_SEND_RING), 0);
-    let (l1, v1, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some(L_RECV_RING), 1);
-    if l0 != status::OK || v0 != tcp::OK || l1 != status::OK || v1 != tcp::OK {
-        report(9, outcome::REFUSED, l0 << 48 | v0 << 32 | l1 << 16 | v1);
-        exit();
-    }
+    // RFC 0020 step 5's inbound half. The rings and the wake crossed before
+    // the outbound stream began; what remains is asking for the listener
+    // capability and then waiting — no longer polling — for the connection
+    // the harness's host-side driver initiates.
     let (declared, _, _) = call(
         syscall::INVOKE,
         SERVICE,
@@ -596,7 +648,7 @@ extern "C" fn tcpc_main() -> ! {
         exit();
     }
     let mut accepted = false;
-    for _ in 0..100_000u32 {
+    for _ in 0..100u32 {
         let (called, word, _) = call(syscall::CALL, LISTENER, tcp::ACCEPT, [0; 4]);
         if called != status::OK {
             report(10, outcome::REFUSED, called << 16);
@@ -614,7 +666,7 @@ extern "C" fn tcpc_main() -> ! {
             report(10, outcome::REFUSED, word << 16);
             exit();
         }
-        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        wait_for_news(L_WAKE, hertz);
     }
     if !accepted {
         report(10, outcome::NOBODY, 0);
@@ -626,7 +678,7 @@ extern "C" fn tcpc_main() -> ! {
     // its own pages, and tell the service. Then wait for the peer's close,
     // which only arrives after the reply reached it — the causal proof.
     let mut served = false;
-    for _ in 0..100_000u32 {
+    for _ in 0..300u32 {
         let (called, word, packed) = call(syscall::CALL, INBOUND, tcp::RECV, [0, 0, 0, 0]);
         if called != status::OK || word != tcp::OK {
             report(11, outcome::REFUSED, called << 16 | word);
@@ -637,7 +689,7 @@ extern "C" fn tcpc_main() -> ! {
             served = true;
             break;
         }
-        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        wait_for_news(L_WAKE, hertz);
     }
     if !served {
         report(11, outcome::STUCK, 0);
@@ -662,7 +714,7 @@ extern "C" fn tcpc_main() -> ! {
         exit();
     }
     let mut closed = false;
-    for _ in 0..100_000u32 {
+    for _ in 0..300u32 {
         let (called, word, packed) = call(syscall::CALL, INBOUND, tcp::RECV, [0, 0, 0, 0]);
         if called != status::OK || word != tcp::OK {
             report(12, outcome::REFUSED, called << 16 | word);
@@ -672,7 +724,7 @@ extern "C" fn tcpc_main() -> ! {
             closed = true;
             break;
         }
-        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        wait_for_news(L_WAKE, hertz);
     }
     if !closed {
         report(12, outcome::STUCK, 0);

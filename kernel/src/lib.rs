@@ -6126,6 +6126,28 @@ fn start_tcp_client_domain(
         }
     }
 
+    // The wakes, RFC 0023: one notification per handover, owned by the
+    // client's domain like its rings — minted here because no program can
+    // create one yet, gifted by the client because a connection costs the
+    // objects of whoever opened it.
+    // Badged, and the badge is load-bearing: a signal ORs the signaller's
+    // badge into the word, and a zero badge ORs nothing — a wake rung with
+    // one is a wake nobody feels. The client's copy carries the badge, so
+    // its gifted derivations must carry the same one (badges are one-way),
+    // and the deadline it arms expires through the same nonzero word.
+    for (slot, badge) in [(9usize, 1u64), (10usize, 2u64)] {
+        let wake = crate::notify::create().map_err(|_| "a tcp client wake would not be created")?;
+        let root = crate::notify::name(wake).map_err(|_| "a tcp client wake would not be named")?;
+        let wake_cap = cap::with_arena(|arena| arena.derive(root, cap::Rights::ALL, badge).ok())
+            .ok_or("a tcp client wake would not derive")?;
+        if domain::with(realm, |owner| {
+            owner.cspace.install_at(slot, wake_cap).is_ok()
+        }) != Some(true)
+        {
+            return Err("a tcp client wake would not install");
+        }
+    }
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -6141,7 +6163,7 @@ fn start_tcp_client_domain(
 
     TCPC_REPORT.store(report.as_u64(), Ordering::Release);
     println!(
-        "    tcp client     bin/tcpc started: four rings its domain owns, a badged capability to \
+        "    tcp client     bin/tcpc started: four rings and two wakes its domain owns, a badged capability to \
          the service, and nothing wired between them by the kernel"
     );
     Ok(())
@@ -6185,10 +6207,11 @@ extern "C" fn tcpc_domain_entry(hhdm_base: u64) -> ! {
     unsafe { vm::install(space) };
 
     let rsp = TCPC_STACK + TCPC_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
     // SAFETY: `entry` is inside a user-executable segment of the space just
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
-    unsafe { enter_user("tcp client", entry, rsp, [0, 0]) }
+    unsafe { enter_user("tcp client", entry, rsp, [hertz, 0]) }
 }
 
 /// Prints what `bin/tcpc` reported: how far the ring handover went.

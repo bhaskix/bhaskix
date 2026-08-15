@@ -125,7 +125,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **NW2** | TCP | ⬜ Draft | **A state machine that can be tested without a network.** `bin/tcpd` in its own domain, and a **pure transition function** in `bhaskix-net` — no I/O, no clock, no allocation — so loss, reordering, backoff and close are host tests against a virtual clock rather than things a live network refuses to reproduce. A connection's **stream lives in the program's pages**, so the receive window *is* the program's free space and a connection costs the memory of whoever opened it. Minimal but correct, with every absence named: no congestion control, window scaling, SACK, timestamps, PMTU discovery, keepalive or urgent data. Found a prerequisite it could not write around — **the system has no source of randomness at all**, and a TCP initial sequence number must be unpredictable. | [RFC 0020](docs/rfc/0020-tcp.md) |
 | **R1** | A source of unpredictability | ✅ **Accepted** 2026-08-14 | **The system cannot produce an unpredictable number, and nothing had noticed until RFC 0020 needed one.** No `RDRAND`, no `RDSEED`, no pool; even KASLR's slide is the bootloader's. The proposal is deliberately small because **`RDRAND` is unprivileged** — so there is no capability to design and no syscall to add, the same finding RFC 0019 made about `rdtsc`. What is left is a shared implementation that gets the failure mode right (the carry flag, a bounded retry, and `None` that is never turned into a number), a boot-time probe beside `nx`/`smep`/`smap`, and a policy: **the caller refuses**, not the kernel. Found on the way that `bin/ipd` hands out ephemeral ports as `49152 + index`, and that `security.md` claims a heap-base randomisation the system does not perform. | [RFC 0021](docs/rfc/0021-unpredictability.md) |
 | **CR2** | A capability in a call | ⬜ Draft — **fully implemented 2026-08-15**, steps 1–4; ready for acceptance review | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
-| **NW3** | A wake for a connection | ⬜ Draft | **A connection may carry a notification, and the service rings it** — one more gift on `CONNECT`/`LISTEN` (RFC 0022's leg 3), signalled on `Delivered`, `Acknowledged` and state change, so the client blocks in `WAIT` instead of the yield-spin RFC 0020 step 6 measured as the round-trip floor's named cause. The state machine has produced the wake since it was written; `bin/tcpd` discards it with a comment saying a notification belongs there. Drafted from the measurement, not a guess. | [RFC 0023](docs/rfc/0023-a-wake-for-a-connection.md) |
+| **NW3** | A wake for a connection | ⬜ Draft — **implemented 2026-08-15**, all three steps, with a verdict the draft did not predict | **A connection may carry a notification, and the service rings it** — one more gift on `CONNECT`/`LISTEN` (RFC 0022's leg 3), signalled on `Delivered`, `Acknowledged` and state change, so the client blocks in `WAIT` instead of the yield-spin RFC 0020 step 6 measured as the round-trip floor's named cause. The state machine has produced the wake since it was written; `bin/tcpd` discards it with a comment saying a notification belongs there. Drafted from the measurement, not a guess. | [RFC 0023](docs/rfc/0023-a-wake-for-a-connection.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
@@ -755,6 +755,30 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-15 (RFC 0023 implemented: the wake works, and the measurement said something the draft did not predict)
+
+**All three steps landed, every gate green in both boot modes — and the honest result first: the
+round trip got *slower*.** Wake-driven median 1.4–3.1 ms against polling's 0.5–2.2 ms, same min,
+same max, same bulk. The win is the one the round-trip metric never priced: the client's
+scheduler activity fell from **87,584 runs to 296** — three hundred times less burn. Both threads
+are pinned to one CPU, where a yield between the only two runnable threads is nearly free and a
+wake pays the full block-signal-reschedule path; polling was only cheap because nothing else
+wanted the processor. The 1–3 ms wake-to-run latency is now a **named scheduler number** — the
+next thing worth measuring lives in the wake path and M4-10b's timer wheel, not in TCP.
+
+**The watched red was a hang with a lesson in it: a zero badge rings nobody.** A signal ORs the
+signaller's badge into the notification word, and so does a deadline's expiry — so a wake gifted
+unbadged, armed through an unbadged capability, sets nothing and wakes no one. The first
+wake-driven boot hung on both wake sources at once. The client's wake capabilities now carry
+badges minted by the kernel, the gift carries the same badge because badges are one-way (the
+monotonicity rule refused the mismatched gift with `InsufficientRights`, precisely as designed),
+and the ABI doc states the rule where `CONNECT` is defined.
+
+**And RFC 0022 open question 4 has its second witness**: one `EXPECT` declaration per thread means
+gift slots are declared in a fixed order, so an *optional* gift must be declared last — a polling
+caller that never sends leg 3 would otherwise block every gift behind it for ever. Rings first,
+wakes last, and the constraint is documented at the declaration site and in both RFCs.
 
 ### 2026-08-15 (RFC 0023 drafted: a wake for a connection, from the measurement and not a guess)
 

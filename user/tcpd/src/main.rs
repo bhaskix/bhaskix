@@ -75,6 +75,10 @@ const GIFT_RECV: u64 = 9;
 /// The listener's ring slots, filled by `LISTEN` legs 0 and 1.
 const GIFT_L_SEND: u64 = 10;
 const GIFT_L_RECV: u64 = 11;
+/// The wakes, RFC 0023: one notification per handover, gifted at leg 3,
+/// signalled whenever the connection has news.
+const GIFT_NOTIFY: u64 = 12;
+const GIFT_L_NOTIFY: u64 = 13;
 
 /// Where this program maps what it holds.
 const FWD_AT: u64 = 0x2300_0000;
@@ -450,6 +454,10 @@ struct Connection {
     delivered: u64,
     /// The badge its connection capability carries.
     handle: u64,
+    /// The CSpace slot of the caller's gifted wake, if it sent one (RFC
+    /// 0023), and whether the last step produced news worth ringing it for.
+    notify_slot: Option<u64>,
+    wake_owed: bool,
 }
 
 /// A port with a caller waiting behind it: RFC 0020's `LISTEN`, existing
@@ -462,6 +470,8 @@ struct Listener {
     handle: u64,
     sendr_at: u64,
     recvr_at: u64,
+    /// The gifted wake the accepted connection inherits (RFC 0023).
+    notify_slot: Option<u64>,
 }
 
 /// Everything the serve loop carries.
@@ -544,10 +554,12 @@ fn perform(
             }
             Action::Arm { timer, at } => connection.deadlines.arm(timer, at),
             Action::Cancel(timer) => connection.deadlines.cancel(timer),
-            // The caller polls rather than sleeps, so nothing to wake; the
-            // counters stand in. A notification per connection is the next
-            // step's work if polling ever shows up in a measurement.
-            Action::Delivered(_) | Action::Acknowledged(_) => {}
+            // RFC 0023: news. The wake itself is rung once per step, after
+            // every action is performed, because two deliveries in one step
+            // are one piece of news and the notification coalesces anyway.
+            Action::Delivered(_) | Action::Acknowledged(_) => {
+                connection.wake_owed = true;
+            }
             Action::Closed(ended) => {
                 if index == OUTBOUND {
                     service.outcome = match ended {
@@ -574,10 +586,24 @@ fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
     let Some(mut connection) = service.connections[index].take() else {
         return;
     };
+    let before = connection.tcb.state;
     let now = now_nanos(service.hertz);
     let (tcb, actions) = state::step(connection.tcb, event, now);
     connection.tcb = tcb;
     perform(service, &mut connection, index, &actions);
+    // RFC 0023: ring the caller's wake if this step left it news — bytes
+    // delivered, send space freed, or the machine in a new state. One
+    // signal per step: the notification coalesces, and a holder that was
+    // not waiting finds the word set when it next looks.
+    if connection.tcb.state != before {
+        connection.wake_owed = true;
+    }
+    if connection.wake_owed
+        && let Some(slot) = connection.notify_slot
+    {
+        let _ = call(syscall::INVOKE, slot, method::SIGNAL, [0; 4]);
+        connection.wake_owed = false;
+    }
     service.connections[index] = Some(connection);
 }
 
@@ -788,6 +814,8 @@ fn accept_syn(
         recvr_at: listener.recvr_at,
         delivered: 0,
         handle: tcp::handle(ACCEPTED as u32, 1, false),
+        notify_slot: listener.notify_slot,
+        wake_owed: false,
     });
     drive_at(
         service,
@@ -818,23 +846,29 @@ struct Handover {
     slots: (u64, u64),
     /// Where the rings map once landed.
     at: (u64, u64),
+    /// Where a gifted wake lands (RFC 0023 leg 3), if the caller sends one.
+    notify_slot: u64,
     /// Whether leg 2 mints a listener capability (badge bit 63) rather than
     /// a connection's.
     listener: bool,
     send_mapped: bool,
     recv_mapped: bool,
+    /// Whether leg 3's notification arrived.
+    notified: bool,
     /// The badge the capability was minted under, once handed.
     handle: u64,
 }
 
 impl Handover {
-    const fn new(slots: (u64, u64), at: (u64, u64), listener: bool) -> Self {
+    const fn new(slots: (u64, u64), at: (u64, u64), notify_slot: u64, listener: bool) -> Self {
         Self {
             slots,
             at,
+            notify_slot,
             listener,
             send_mapped: false,
             recv_mapped: false,
+            notified: false,
             handle: 0,
         }
     }
@@ -847,11 +881,20 @@ impl Handover {
 /// the next caller. Declaring the same slot twice replaces, which makes
 /// this safe to call unconditionally.
 fn declare_gift_slot(connect: &Handover, listen: &Handover) {
+    // Rings before wakes, both handovers' rings before either's wake, and
+    // the order is load-bearing: one declaration exists per thread, so a
+    // slot declared for a gift the caller never sends blocks every gift
+    // behind it. A polling caller never sends leg 3 — with a wake slot
+    // declared mid-list, its `LISTEN` rings would refuse for ever. This is
+    // RFC 0022 open question 4's collision wearing new clothes, and its
+    // second recorded witness.
     let owed = [
         (!connect.send_mapped).then_some(connect.slots.0),
         (!connect.recv_mapped).then_some(connect.slots.1),
         (!listen.send_mapped).then_some(listen.slots.0),
         (!listen.recv_mapped).then_some(listen.slots.1),
+        (!connect.notified).then_some(connect.notify_slot),
+        (!listen.notified).then_some(listen.notify_slot),
     ];
     let Some(slot) = owed.into_iter().flatten().next() else {
         // Nothing owed: leave no declaration, so an uninvited gift refuses
@@ -897,6 +940,23 @@ fn connect_leg(handover: &mut Handover, leg: u64) -> (u64, u64) {
                 other => (tcp::BARE, 0x100 | other << 4 | leg),
             }
         }
+        3 => {
+            // RFC 0023: the wake. Probed by refusal shape, as every gift
+            // is — `PEEK` answers on a notification and on nothing else, so
+            // an empty slot and a wrong-kind gift are both told apart from
+            // the wake this leg promises.
+            if handover.notified {
+                return (tcp::OK, 0);
+            }
+            match call(syscall::INVOKE, handover.notify_slot, method::PEEK, [0; 4]).0 {
+                s if s == status::OK => {
+                    handover.notified = true;
+                    (tcp::OK, 0)
+                }
+                s if s == status::NO_SUCH_CAPABILITY => (tcp::BARE, 3),
+                other => (tcp::BARE, 0x30 | other),
+            }
+        }
         2 => {
             if !(handover.send_mapped && handover.recv_mapped) {
                 return (tcp::BARE, 2);
@@ -939,7 +999,16 @@ fn connect_leg_serving(
     args: [u64; 4],
 ) -> (u64, u64) {
     if args[2] != 2 {
-        return connect_leg(handover, args[2]);
+        let answer = connect_leg(handover, args[2]);
+        // A wake that lands after leg 2 still reaches the live connection:
+        // the handover is where gifts arrive, the table is where they act.
+        if args[2] == 3
+            && handover.notified
+            && let Some(connection) = service.connections[OUTBOUND].as_mut()
+        {
+            connection.notify_slot = Some(handover.notify_slot);
+        }
+        return answer;
     }
     if !(handover.send_mapped && handover.recv_mapped) {
         return (tcp::BARE, 2);
@@ -959,6 +1028,8 @@ fn connect_leg_serving(
             recvr_at: handover.at.1,
             delivered: 0,
             handle: tcp::handle(OUTBOUND as u32, 1, false),
+            notify_slot: handover.notified.then_some(handover.notify_slot),
+            wake_owed: false,
         });
         drive_at(
             service,
@@ -999,7 +1070,14 @@ fn listen_leg_serving(
     args: [u64; 4],
 ) -> (u64, u64) {
     if args[2] != 2 {
-        return connect_leg(handover, args[2]);
+        let answer = connect_leg(handover, args[2]);
+        if args[2] == 3
+            && handover.notified
+            && let Some(listener) = service.listener.as_mut()
+        {
+            listener.notify_slot = Some(handover.notify_slot);
+        }
+        return answer;
     }
     if !(handover.send_mapped && handover.recv_mapped) {
         return (tcp::BARE, 2);
@@ -1010,6 +1088,7 @@ fn listen_leg_serving(
             handle: tcp::handle(0, 1, true),
             sendr_at: handover.at.0,
             recvr_at: handover.at.1,
+            notify_slot: handover.notified.then_some(handover.notify_slot),
         });
     }
     if handover.handle == 0 {
@@ -1035,9 +1114,18 @@ fn listen_leg_serving(
 /// which this program did — left the endpoint dead and every caller queued
 /// against it for ever.
 fn serve_handover_only() -> ! {
-    let mut connect_handover = Handover::new((GIFT_SEND, GIFT_RECV), (SENDR_AT, RECVR_AT), false);
-    let mut listen_handover =
-        Handover::new((GIFT_L_SEND, GIFT_L_RECV), (L_SENDR_AT, L_RECVR_AT), true);
+    let mut connect_handover = Handover::new(
+        (GIFT_SEND, GIFT_RECV),
+        (SENDR_AT, RECVR_AT),
+        GIFT_NOTIFY,
+        false,
+    );
+    let mut listen_handover = Handover::new(
+        (GIFT_L_SEND, GIFT_L_RECV),
+        (L_SENDR_AT, L_RECVR_AT),
+        GIFT_L_NOTIFY,
+        true,
+    );
     loop {
         declare_gift_slot(&connect_handover, &listen_handover);
         let (status_in, badge, method_in, args) = receive();
@@ -1197,9 +1285,18 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     call(syscall::INVOKE, INBOX, method::BIND_SELF, [0; 4]);
     bits |= state_bits::SERVING;
 
-    let mut connect_handover = Handover::new((GIFT_SEND, GIFT_RECV), (SENDR_AT, RECVR_AT), false);
-    let mut listen_handover =
-        Handover::new((GIFT_L_SEND, GIFT_L_RECV), (L_SENDR_AT, L_RECVR_AT), true);
+    let mut connect_handover = Handover::new(
+        (GIFT_SEND, GIFT_RECV),
+        (SENDR_AT, RECVR_AT),
+        GIFT_NOTIFY,
+        false,
+    );
+    let mut listen_handover = Handover::new(
+        (GIFT_L_SEND, GIFT_L_RECV),
+        (L_SENDR_AT, L_RECVR_AT),
+        GIFT_L_NOTIFY,
+        true,
+    );
 
     loop {
         if service.outcome == outcome::PENDING

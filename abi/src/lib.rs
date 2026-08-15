@@ -663,7 +663,12 @@ pub mod tcp {
     /// then this call), leg 1 the receive ring, and leg 2 asks for the
     /// connection capability, which rides the reply into the slot the caller
     /// declared with [`method::EXPECT`]. Each leg replies with an outcome
-    /// below; a leg missing its ring is told [`BARE`].
+    /// below; a leg missing its ring is told [`BARE`]. Leg 3 (optional,
+    /// after every ring the caller intends) gifts a badged `Notification`
+    /// the service signals whenever the connection has news — bytes
+    /// delivered, send space freed, state changed — so the caller can block
+    /// in `WAIT` instead of polling. The badge must be nonzero: a signal
+    /// ORs the badge into the word, and zero rings nobody.
     pub const CONNECT: u64 = 58;
 
     /// Listen on a local port. The same three-leg handover as [`CONNECT`],

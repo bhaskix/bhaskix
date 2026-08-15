@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Draft, **implemented 2026-08-15** (all three steps) — and the measurement returned a verdict the draft did not predict; see the implementation notes. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `bin/tcpd`, `bin/tcpc`, ABI |
 | **Milestone** | Phase 2 — the first thing [RFC 0020](0020-tcp.md) step 6's numbers ask for |
@@ -40,10 +40,13 @@ stands.
 
 ### One more gift, same exchange
 
-`CONNECT` and `LISTEN` gain **leg 3**: `HAND` a `Notification` capability derived with `WRITE` and
-a badge of the caller's choosing, then call with `args[2] = 3`. The service maps nothing — it holds
-the capability and invokes `SIGNAL` on it. Leg 3 is optional and accepted at any point before or
-after leg 2; a handover with no leg 3 is today's polling connection, refused nothing.
+`CONNECT` and `LISTEN` gain **leg 3**: `HAND` a `Notification` capability carrying `READ` and
+`WRITE` — `WRITE` to ring it, `READ` because the service probes the landed gift with `PEEK`, the
+refusal-shape test every gift gets — and a **nonzero** badge of the caller's choosing, then call
+with `args[2] = 3`. The service maps nothing — it holds the capability and invokes `SIGNAL` on it.
+Leg 3 is optional and comes **after every ring the caller intends to gift** (the service declares
+gift slots in a fixed order, rings first — see the implementation notes); a handover with no leg 3
+is today's polling connection, refused nothing.
 
 One notification per handover, replace-not-accumulate, exactly as the rings behave. The badge is
 the caller's own affair: a program juggling several connections gives each a different badge and
@@ -95,8 +98,8 @@ to the accepted connection together, which is the transfer the rings already mak
 
 ## Security implications
 
-The service holds a `WRITE`-only derivation: it can wake the holder and nothing else — not read
-the word, not signal any other object. A malicious service can over-ring (a spurious-wake denial
+The service holds a `READ`+`WRITE` derivation of one notification: it can wake the holder and
+peek that one word, and nothing else — not signal any other object, not name any other. A malicious service can over-ring (a spurious-wake denial
 of the holder's own time, bounded by the holder's willingness to `WAIT` again) and under-ring
 (indistinguishable from a quiet connection, which polling `RECV` still detects — a suspicious
 program keeps a coarse deadline armed, RFC 0019's job). The caller's badge crosses under RFC
@@ -131,3 +134,34 @@ Each step leaves the tree green.
    and TRACKER records the before and after.
 3. **The listener wake**: `ACCEPT` via `WAIT`, the host-driver gate unchanged — it must pass
    against a client that never spins.
+
+---
+
+**Implementation notes, 2026-08-15 — all three steps landed, and the measurement said something
+the draft did not predict.**
+
+The wake works: every gate green in both boot modes, the client's scheduler activity down from
+**87,584 runs to 296** — a three-hundred-fold reduction in burn, which is the real win and the one
+the round-trip metric never priced. But the round trip itself **got slower**: the wake-driven
+median is 1.4–3.1 ms against polling's 0.5–2.2 ms, same min, same max, same bulk. The reason is
+the topology this measures on: `bin/tcpc` and `bin/tcpd` are pinned to the same CPU, where a
+yield is a near-free handoff between the only two runnable threads, while a wake pays the full
+block-signal-reschedule path. Polling was only cheap because nothing else wanted the processor —
+on a machine with real load the 87,584 runs are the cost that matters — but the 1–3 ms
+wake-to-run latency is now a **named scheduler number**, and it, not TCP, is the next thing worth
+measuring (M4-10b's timer wheel and the wake path are where it lives).
+
+Two mechanism findings, both kept:
+
+- **A zero badge rings nobody.** A signal ORs the signaller's badge into the word, so a wake
+  gifted unbadged — and a deadline armed on an unbadged capability — sets nothing and wakes
+  no one. The first wake-driven boot hung in exactly this way, on both wake sources at once,
+  which was this change's watched red: the client's capabilities now carry badges, the gift
+  carries the same badge because badges are one-way, and the ABI doc states the rule.
+- **Rings before wakes, in the declaration order.** One `EXPECT` declaration exists per thread
+  (RFC 0022 open question 4), so the service declares gift slots in a fixed order and an optional
+  gift must come last — a polling caller that never sends leg 3 would otherwise block every gift
+  declared behind it, for ever. Open question 4 gains its second recorded witness.
+
+Open question 1 (`SEND` without a reply) stays open, now with a sharper prior: the reply is not
+the bottleneck, the wake path is.
