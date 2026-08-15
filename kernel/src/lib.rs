@@ -1125,9 +1125,14 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
     for cpu in 0..bhaskix_arch::percpu::online_count() as usize {
         let holds = crate::sync::holds_on(cpu);
         if holds != 0 {
+            // The mask names the lit ranks; a zero mask beside a nonzero
+            // count says the leaked guard came from a `try_lock`, which
+            // takes no rank -- either way, a file to open rather than a
+            // number to stare at.
             println!(
-                "    cpu {cpu} HOLDS {holds} lock(s) by its count -- preemption is vetoed there, \
-                 and if this line appears in a stall, the leak is the stall"
+                "    cpu {cpu} HOLDS {holds} lock(s) by its count, rank mask {:#x} -- preemption \
+                 is vetoed there, and if this line appears in a stall, the leak is the stall",
+                crate::sync::held_on(cpu),
             );
         }
     }
@@ -6375,10 +6380,21 @@ fn report_tcp_pipeline(hhdm: u64) {
         // attribution would be worse than none.
         return;
     }
-    if !stamps.windows(2).all(|pair| pair[0] <= pair[1]) {
+    // Strict order through the wire; the last two legs may interleave. The
+    // client detects the echo by reading its own ring, so it can see the
+    // bytes the instant the service's copy lands — *before* the service
+    // finishes its delivery loop and stamps. That race is the optimisation
+    // working, not the instrument failing, and deliver-to-seen saturates to
+    // zero when the client wins it.
+    let ordered = [sent, emitted, to_wire, from_wire];
+    if !ordered.windows(2).all(|pair| pair[0] <= pair[1])
+        || seen < from_wire
+        || delivered < from_wire
+    {
         println!(
             "\x1b[93m    tcp pipeline   stamps out of order; the first payload did not take the \
-             path this instrument assumes\x1b[0m"
+             path this instrument assumes ({sent} {emitted} {to_wire} {from_wire} {delivered} \
+             {seen})\x1b[0m"
         );
         return;
     }
@@ -6394,7 +6410,7 @@ fn report_tcp_pipeline(hhdm: u64) {
         micros(to_wire - emitted),
         micros(from_wire - to_wire),
         micros(delivered - from_wire),
-        micros(seen - delivered),
+        micros(seen.saturating_sub(delivered)),
         micros(seen - sent),
     );
 }

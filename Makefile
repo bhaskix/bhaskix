@@ -551,6 +551,7 @@ gates:
 # real harnesses are correct, so the only way to see this go red is to keep a
 # wrong one -- making a real harness wrong to watch it fail is a change somebody
 # forgets to undo.
+	@mkdir -p build
 	@if tools/check-one-machine.sh tests/fixtures/qemu >build/one-machine-fixture.log 2>&1; then \
 	    echo "  FAIL  the machine check accepted a harness building its own device list"; \
 	    exit 1; \

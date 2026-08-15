@@ -37,7 +37,8 @@ opt-level = "s"
 # not take faults beside the attach that claimed it did, not deep in the
 # serve. Owning four rings is the whole point.
 #
-# 41 at RFC 0020 step 6: the measurement writes its samples and its bulk
-# pattern through the same rings, and reads the cycle counter -- rdtsc is
-# one asm line, the rest are the ring writes the instrument is made of.
-unsafe_budget = 41
+# 45 at the memory-side wait: the awaited byte is read out of this
+# program's own receive ring -- one volatile read in the wait loop that
+# replaced three IPC calls per iteration, and the whole point of the
+# change.
+unsafe_budget = 45

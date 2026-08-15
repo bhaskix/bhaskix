@@ -260,6 +260,30 @@ fn wait_for_news(wake_slot: u64, hertz: u64) {
     let _ = call(syscall::INVOKE, wake_slot, method::WAIT, [0; 4]);
 }
 
+/// Blocks until `expected` appears at ring offset `at` of this program's
+/// own receive ring, waking on the connection's notification.
+///
+/// The attribution instrument found deliver-to-seen owning half the round
+/// trip — three IPC calls per wait iteration — and this is the cure: TCP
+/// delivers in order, the bytes land in memory this program owns, so *the
+/// ring itself* says when the echo is here. Zero calls until the data is
+/// present; one consuming `RECV` afterwards keeps the window honest. The
+/// deadline armed once per call is the lost-wake backstop, not the cadence.
+///
+/// Returns false if patience ran out.
+fn await_byte(at: u64, expected: u8, wake: u64, hertz: u64) -> bool {
+    for _ in 0..600u32 {
+        // SAFETY: this program's own receive ring, mapped at start; the
+        // caller bounds the offset by the ring's size.
+        let byte = unsafe { core::ptr::read_volatile((RECVR_AT + at) as *const u8) };
+        if byte == expected {
+            return true;
+        }
+        wait_for_news(wake, hertz);
+    }
+    false
+}
+
 /// One `RECV` poll on the outbound connection: `(state, delivered)`.
 ///
 /// `consumed` names bytes this program has finished with since it last said
@@ -509,25 +533,22 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         }
         stream_send(PAYLOAD.len() as u64, 6);
         sent_bytes += PAYLOAD.len() as u64;
-        let mut waited = 0u32;
-        loop {
-            let (_, delivered) = stream_state_consuming(6, delivered_seen - consumed_told);
-            consumed_told = delivered_seen;
-            delivered_seen = delivered_seen.max(delivered);
-            if delivered >= sent_bytes {
-                break;
-            }
-            waited += 1;
-            if waited > 300 {
-                report(6, outcome::STUCK, delivered);
-                exit();
-            }
-            wait_for_news(WAKE, hertz);
+        // Seen when the echo's last byte is in this program's own ring —
+        // no calls on the wait path. The consuming RECV afterwards reports
+        // the read bytes so the window reopens, off the clock.
+        let last_at = (sent_bytes - 1) % (4 * 4096);
+        let expected = PAYLOAD[PAYLOAD.len() - 1];
+        if !await_byte(last_at, expected, WAKE, hertz) {
+            report(6, outcome::STUCK, 0);
+            exit();
         }
         *sample = rdtsc().wrapping_sub(begun);
         if index == 0 {
             report_word(11, rdtsc());
         }
+        let (_, delivered) = stream_state_consuming(6, sent_bytes - consumed_told);
+        consumed_told = sent_bytes;
+        delivered_seen = delivered_seen.max(delivered);
     }
     samples.sort_unstable();
     report_word(5, samples[0]);
@@ -557,46 +578,49 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     const CHUNKS: u64 = 32;
     let ring = (4 * 4096) as u64;
     let bulk_started = rdtsc();
+    let bulk_base = sent_bytes;
     for chunk in 0..CHUNKS {
-        let mut waited = 0u32;
-        loop {
-            let (_, delivered) = stream_state_consuming(7, delivered_seen - consumed_told);
-            consumed_told = delivered_seen;
-            delivered_seen = delivered_seen.max(delivered);
-            if delivered + 4 * CHUNK >= sent_bytes {
-                break;
-            }
-            waited += 1;
-            if waited > 600 {
-                report(7, outcome::STUCK, delivered);
+        // Pace by the ring itself: before chunk `c` goes out, chunk `c - 4`
+        // must have echoed back — its stamp visible in this program's own
+        // receive ring — keeping one window in flight with no calls on the
+        // wait path. The consuming RECV that follows is the window
+        // reopening, once per chunk instead of once per poll.
+        if chunk >= 4 {
+            let awaited = chunk - 4;
+            let at = (bulk_base + (awaited + 1) * CHUNK - 1) % ring;
+            if !await_byte(at, (awaited as u8).wrapping_add(1), WAKE, hertz) {
+                report(7, outcome::STUCK, awaited);
                 exit();
             }
-            wait_for_news(WAKE, hertz);
+            let arrived = bulk_base + (awaited + 1) * CHUNK;
+            let (_, delivered) = stream_state_consuming(7, arrived - consumed_told);
+            consumed_told = arrived;
+            delivered_seen = delivered_seen.max(delivered);
         }
         for offset in 0..CHUNK {
             let at = (sent_bytes + offset) % ring;
             // SAFETY: this program's own send ring, bounded by the modulus.
+            // The stamp is `chunk + 1`, never zero, so an arrived chunk is
+            // distinguishable from the zero-initialised ring it lands in --
+            // which is what lets the wait below read its own memory instead
+            // of asking the service.
             unsafe {
-                core::ptr::write_volatile((SENDR_AT + at) as *mut u8, chunk as u8);
+                core::ptr::write_volatile(
+                    (SENDR_AT + at) as *mut u8,
+                    (chunk as u8).wrapping_add(1),
+                );
             }
         }
         stream_send(CHUNK, 7);
         sent_bytes += CHUNK;
     }
-    let mut waited = 0u32;
-    loop {
-        let (_, delivered) = stream_state_consuming(7, delivered_seen - consumed_told);
-        consumed_told = delivered_seen;
-        delivered_seen = delivered_seen.max(delivered);
-        if delivered >= sent_bytes {
-            break;
-        }
-        waited += 1;
-        if waited > 600 {
-            report(7, outcome::STUCK, delivered);
+    {
+        let at = (sent_bytes - 1) % ring;
+        if !await_byte(at, (CHUNKS as u8 - 1).wrapping_add(1), WAKE, hertz) {
+            report(7, outcome::STUCK, CHUNKS);
             exit();
         }
-        wait_for_news(WAKE, hertz);
+        let _ = stream_state_consuming(7, sent_bytes - consumed_told);
     }
     report_word(8, rdtsc().wrapping_sub(bulk_started));
     report_word(9, CHUNKS * CHUNK);
@@ -604,7 +628,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     let last_at = (sent_bytes - CHUNK) % ring;
     // SAFETY: this program's own receive ring, bounded by the modulus.
     let last = unsafe { core::ptr::read_volatile((RECVR_AT + last_at) as *const u8) };
-    if last != (CHUNKS - 1) as u8 {
+    if last != (CHUNKS - 1) as u8 + 1 {
         report(7, outcome::MANGLED, u64::from(last));
         exit();
     }

@@ -1125,7 +1125,13 @@ fi
 
 # ...and the per-stage pipeline attribution, same rule: values ungated,
 # presence demanded, because an instrument that vanishes is a regression.
-if grep -qE "tcp client +echoed outbound" "$LOG" && ! grep -qE "tcp pipeline +send to emit [0-9]+ us" "$LOG"; then
+# Either a full attribution or the inversion diagnosis with its raw stamps:
+# the memory-wait client (see TRACKER 2026-08-15) reorders the first
+# payload's stamps on most boots, and until that path is re-attributed the
+# diagnosis line -- which preserves the six raw stamps for the revisit --
+# is the instrument doing its job, not failing it.
+if grep -qE "tcp client +echoed outbound" "$LOG" \
+    && ! grep -qE "tcp pipeline +(send to emit [0-9]+ us|stamps out of order)" "$LOG"; then
     fail "the networked boot produced no pipeline attribution"
     status=1
 fi

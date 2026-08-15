@@ -432,6 +432,18 @@ pub fn holds_on(cpu: usize) -> u32 {
     HOLDS[if cpu < MAX_CPUS { cpu } else { 0 }].load(Ordering::Relaxed)
 }
 
+/// The rank mask of a *named* CPU, for the same dump.
+///
+/// The count says a lock is leaking; the mask says which ranks are lit, and
+/// a rank is a name in [`Rank`] — the difference between "something leaks"
+/// and a file to open. An unranked `try_lock` hold lights no bit, so a
+/// nonzero count beside a zero mask is itself an answer: the leak is in a
+/// `try_lock` guard.
+#[must_use]
+pub fn held_on(cpu: usize) -> u64 {
+    HELD[if cpu < MAX_CPUS { cpu } else { 0 }].load(Ordering::Relaxed)
+}
+
 /// How many locks this CPU holds, for the context switch to save.
 ///
 /// The count belongs to the *thread*, exactly as the rank mask does — see

@@ -757,6 +757,46 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (the watchdog convicts on first firing: the hang is a leaked hold count, and it now names ranks)
+
+**The enriched dump caught the very next hang, and the conviction line printed itself**: `cpu 0
+HOLDS 2 lock(s)` and `cpu 1 HOLDS 2 lock(s)` on the two stalled CPUs — preemption vetoed for
+ever, exactly the mechanism the instrument was armed for. The boot thread spins its bounded waits
+undeschedulable on cpu 0; `ipd` spins its ring-3 loop on cpu 1 with a kernel hold count that
+should be zero between system calls; fresh threads starve at zero runs. The count is real and
+anonymous, so the dump now also prints each vetoing CPU's **rank mask** — a lit rank is a name in
+`Rank` and a file to open, and a zero mask beside a nonzero count says the leaked guard came
+from a `try_lock`, which takes no rank. Thirty-six `try_lock` sites exist; the next firing
+narrows them to one.
+
+**A second, independent finding from the same dump**: fresh threads tie the runner's virtual
+deadline *exactly* — spawn clamps vruntime to the queue floor and adds the same slice, and
+`pick_next`'s strict `<` keeps the incumbent on a tie. Harmless while preemption works (the tick
+re-evaluates constantly), but it means a fresh thread never displaces an equal-deadline runner,
+and under the hold-count veto it turned starvation permanent. Recorded for the scheduler's next
+design pass: a tie should prefer the thread that has never run.
+
+### 2026-08-15 (the biggest hop halved by reading one's own memory, and the instrument caught its own limits)
+
+**Deliver-to-seen fell from 2,046 µs to about 100.** The attribution named the client's
+poll-cycle structure as the round trip's owner, and the cure is the design's own logic taken
+seriously: TCP delivers in order, and the stream lands in memory the client owns — so the wait
+loop now reads *its own receive ring* for the awaited byte and makes **zero IPC calls until the
+data is present**, with one consuming `RECV` afterwards to reopen the window, once per chunk
+instead of once per poll. The bulk's chunk stamps became `chunk + 1` so an arrived chunk is
+distinguishable from the zero-initialised ring it lands in. Echo medians across six boots:
+polling-era 1.4–3.1 ms, wake-era-with-memory-wait **0.5–2.0 ms**, with the good boots' whole
+first echo at ~2 ms fully attributed (send→emit ~300 µs, emit→wire ~180, wire-and-peer ~470,
+wire→deliver ~900, deliver→seen ~100).
+
+**And the client now sometimes sees the echo before the service finishes stamping it** — the
+optimisation outrunning the instrument, handled by letting the last two legs interleave. What is
+*not* yet explained: on most boots under the new client, the first payload's emit and to-wire
+stamps invert by hundreds of microseconds, which the stamp order should not allow. The diagnosis
+line preserves all six raw stamps for the revisit, the gate accepts it as the instrument working,
+and the attribution of the memory-wait client's path is recorded here as owed rather than
+quietly dropped.
+
 ### 2026-08-15 (the echo's milliseconds attributed: six stamps, five hops, one owner)
 
 **The per-stage instrument RFC 0024's closure note asked for exists, and the first attribution
