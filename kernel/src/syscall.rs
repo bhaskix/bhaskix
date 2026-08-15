@@ -1676,6 +1676,17 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     if crate::sched::should_die() {
         crate::sched::exit()
     }
+
+    // The hold-leak canary. A thread returning to ring 3 holds no kernel
+    // lock -- every guard the dispatch took has dropped by here -- so a
+    // nonzero hold count on this CPU is a leak, and a leaked count vetoes
+    // preemption on this CPU for ever: the captured one-in-fifteen boot
+    // hang, whose watchdog dump showed exactly such counts. The watchdog
+    // fires forty-five seconds after the fact; this fires on the leaking
+    // system call, and names it.
+    if crate::sync::holds_any() {
+        crate::sched::note_hold_leak(frame.kind, frame.method);
+    }
 }
 
 /// Creates a domain and gives the caller a capability to it.

@@ -8747,6 +8747,17 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
          already soon enough"
     );
 
+    let (leaks, first_leak) = sched::hold_leaks();
+    if leaks > 0 {
+        println!(
+            "\x1b[91m    hold leaks     {} syscalls returned to ring 3 with a nonzero hold \
+             count; the first was kind {} method {}\x1b[0m",
+            leaks,
+            first_leak >> 32,
+            first_leak & 0xffff_ffff,
+        );
+    }
+
     // The scheduler's share of a wake's latency, measured because RFC 0023
     // priced a wake-driven wait above a poll and the schedule's own gap is
     // the first suspect to convict or clear. Stamped by the waker, read at

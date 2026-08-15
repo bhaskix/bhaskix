@@ -600,6 +600,17 @@ impl RunQueue {
         }
 
         // --- Fair: earliest virtual deadline. -------------------------------
+        //
+        // Ties go to the next thread in rotation, and that is already the
+        // right answer: `slots_from` starts one past `from`, so a fresh
+        // thread tying the runner's deadline is found first and wins. The
+        // captured boot hang's dump made this look broken — two fresh
+        // threads starving at a deadline tie — and a test written to pin
+        // the suspicion refuted it: the starvation was the hold-count veto
+        // alone, which kept this function from running at all. Written down
+        // here because the wrong claim briefly lived in TRACKER, and the
+        // rotation deserves its alibi in the place someone would next
+        // suspect it.
         let mut best: Option<(u64, usize)> = None;
         for slot in self.slots_from(from) {
             if let Some(thread) = self.schedulable(slot)
@@ -704,6 +715,41 @@ pub const RESCHEDULE_VECTOR: u8 = 0x41;
 
 /// Reschedule interrupts sent to other CPUs.
 static RESCHEDULE_IPIS: AtomicU64 = AtomicU64::new(0);
+
+/// A kernel hold count found nonzero where it must be zero, with the system
+/// call that left it that way. See the canary in `syscall.rs`; printed once
+/// per boot in full and counted after, because the first leak is the story
+/// and a leaking hot path would otherwise flood the console it needs.
+static HOLD_LEAKS: AtomicU64 = AtomicU64::new(0);
+static FIRST_LEAK: AtomicU64 = AtomicU64::new(0);
+
+/// Records a hold leak at syscall exit. `kind` and `method` name the call.
+pub fn note_hold_leak(kind: u64, method: u64) {
+    let count = HOLD_LEAKS.fetch_add(1, Ordering::Relaxed);
+    if count == 0 {
+        FIRST_LEAK.store(kind << 32 | (method & 0xffff_ffff), Ordering::Relaxed);
+        let cpu = percpu::cpu_id() as usize;
+        crate::println!(
+            "\x1b[91m  HOLD LEAK: returning to ring 3 with cpu {}'s hold count nonzero, rank \
+             mask {:#x}, after syscall kind {} method {}. This count vetoes preemption on this \
+             cpu until it returns to zero, which nothing will now do -- this is the boot hang, \
+             caught at the door it leaked through.\x1b[0m",
+            cpu,
+            crate::sync::held_on(cpu),
+            kind,
+            method,
+        );
+    }
+}
+
+/// The hold-leak tally and the first leak's `(kind << 32) | method`.
+#[must_use]
+pub fn hold_leaks() -> (u64, u64) {
+    (
+        HOLD_LEAKS.load(Ordering::Relaxed),
+        FIRST_LEAK.load(Ordering::Relaxed),
+    )
+}
 
 /// Wake-to-dispatch, in cycles: how long woken threads sat ready before a
 /// CPU ran them. The scheduler's own share of RFC 0023's measured latency.
@@ -3883,6 +3929,27 @@ mod tests {
         let queue = classes(&[rt(20, RtPolicy::RoundRobin), rt(20, RtPolicy::RoundRobin)]);
         assert_eq!(queue.pick_next(0), 1);
         assert_eq!(queue.pick_next(1), 0);
+    }
+
+    #[test]
+    fn a_deadline_tie_rotates_rather_than_entrenching() {
+        // Written to pin a suspicion from the captured boot hang -- two
+        // fresh threads starving at a deadline tie -- and it refuted the
+        // suspicion instead: `slots_from` starts one past `from`, so a tie
+        // goes to the next thread in rotation and a fresh spawn tying the
+        // runner is found first. The starvation in that hang was the
+        // hold-count veto keeping the pick from running at all. The test
+        // stays, because the rotation is now the documented alibi in the
+        // place someone would next suspect.
+        let mut queue = classes(&[Policy::fair(), Policy::fair()]);
+        queue.threads[0].as_mut().unwrap().deadline = 100;
+        queue.threads[0].as_mut().unwrap().runs = 7;
+        queue.threads[1].as_mut().unwrap().deadline = 100;
+        queue.threads[1].as_mut().unwrap().runs = 0;
+        assert_eq!(queue.pick_next(0), 1, "a tie leaves the incumbent");
+
+        // And symmetrically: from the other side, the tie comes back.
+        assert_eq!(queue.pick_next(1), 0, "rotation, not entrenchment");
     }
 
     #[test]

@@ -1492,6 +1492,17 @@ else
     status=1
 fi
 
+# The hold-leak canary must never fire. A nonzero kernel hold count at a
+# return to ring 3 vetoes preemption on that CPU until it returns to zero,
+# which nothing will then do -- it is the captured boot hang, and the canary
+# names the leaking system call the moment it happens instead of forty-five
+# seconds later.
+if grep -q "HOLD LEAK" "$LOG"; then
+    fail "a system call returned to ring 3 holding a kernel lock count"
+    grep -E "HOLD LEAK|hold leaks" "$LOG" | head -3
+    status=1
+fi
+
 # The scheduler's wake-to-dispatch measurement must exist on every boot:
 # wakes happen on all of them, and an instrument that vanishes is a
 # regression even when nothing gates its values.

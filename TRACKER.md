@@ -757,6 +757,24 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (the hold-leak canary: the hang's next appearance is caught at the door, mid-leak)
+
+**Every return to ring 3 now checks that this CPU's kernel hold count is zero** — one relaxed
+load on the fast path — and a nonzero count prints, once, the leaking system call's kind and
+method, the CPU, and its rank mask, then counts. The watchdog names the ranks forty-five seconds
+after the fact; the canary names the *call* the moment it leaks, which is the difference between
+a stall to decode and a line to read. The boot summary carries the tally, and every boot mode's
+gate goes red on any leak — watched red with a cry-wolf mutation that fired the canary
+unconditionally.
+
+**And the deadline-tie suspicion is refuted by its own test.** The pin-it-down test written for
+"fresh threads tie the runner and strict `<` entrenches the incumbent" proved the opposite:
+`pick_next`'s iteration starts one past the current slot, so ties rotate and a fresh spawn tying
+the runner is found first and wins. The wrong claim is corrected in the earlier entry, the
+refuting test stays in `sched.rs` as the rotation's documented alibi, and the captured hang's
+starvation is attributed wholly to the hold-count veto. The hunt for the leaking guard continues
+with the canary armed; suite-load loops are its habitat.
+
 ### 2026-08-15 (the watchdog convicts on first firing: the hang is a leaked hold count, and it now names ranks)
 
 **The enriched dump caught the very next hang, and the conviction line printed itself**: `cpu 0
@@ -769,12 +787,13 @@ anonymous, so the dump now also prints each vetoing CPU's **rank mask** — a li
 from a `try_lock`, which takes no rank. Thirty-six `try_lock` sites exist; the next firing
 narrows them to one.
 
-**A second, independent finding from the same dump**: fresh threads tie the runner's virtual
-deadline *exactly* — spawn clamps vruntime to the queue floor and adds the same slice, and
-`pick_next`'s strict `<` keeps the incumbent on a tie. Harmless while preemption works (the tick
-re-evaluates constantly), but it means a fresh thread never displaces an equal-deadline runner,
-and under the hold-count veto it turned starvation permanent. Recorded for the scheduler's next
-design pass: a tie should prefer the thread that has never run.
+**A second suspicion from the same dump, and the test written to pin it refuted it**: fresh
+threads do tie the runner's virtual deadline exactly — but `pick_next`'s iteration starts one
+past the current slot, so a tie goes to the *next thread in rotation* and a fresh spawn tying
+the runner is found first and wins. The claim that a strict `<` entrenches the incumbent was
+wrong, briefly lived here, and is corrected in place; the refuting test stays in `sched.rs` as
+the rotation's documented alibi. The starvation in the captured hang is the hold-count veto
+alone, which keeps the pick from running at all.
 
 ### 2026-08-15 (the biggest hop halved by reading one's own memory, and the instrument caught its own limits)
 
