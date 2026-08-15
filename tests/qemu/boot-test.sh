@@ -234,7 +234,7 @@ rm -f "$INBOUND_VERDICT"
 (
     payload='bhaskix-tcp-in-1'
     for _ in $(seq 1 "$TIMEOUT"); do
-        if exec 3<>/dev/tcp/127.0.0.1/45557 2>/dev/null; then
+        if { exec 3<>/dev/tcp/127.0.0.1/45557; } 2>/dev/null; then
             printf '%s' "$payload" >&3
             reply=$(dd bs=1 count=16 <&3 2>/dev/null || true)
             exec 3>&- 3<&- || true
@@ -1114,6 +1114,15 @@ fi
 # either alone can lie: a guest that believes it served proves nothing about
 # what crossed the boundary, and a lucky reply with a wedged guest report
 # would hide a real stall.
+# RFC 0020 step 6: the measurement must have happened on a networked boot.
+# The numbers are recorded, not gated -- a slow host is not a broken kernel --
+# but a networked boot that produced none measured nothing, and that is a
+# failure of the instrument.
+if grep -qE "tcp client +echoed outbound" "$LOG" && ! grep -qE "tcp measure +handshake [0-9]+ us" "$LOG"; then
+    fail "the networked boot produced no TCP measurement"
+    status=1
+fi
+
 if grep -qE "tcp client +echoed outbound through rings it owns, then listened, accepted" "$LOG"; then
     if [[ -f "$INBOUND_VERDICT" ]]; then
         pass "both directions: outbound echoed, and a host-initiated connection was accepted and served"

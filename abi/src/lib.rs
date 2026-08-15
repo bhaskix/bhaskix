@@ -689,9 +689,10 @@ pub mod tcp {
     /// On a connection: how far has the peer's stream reached? The reply's
     /// second word packs the machine's state (high 32 bits) over the
     /// cumulative bytes delivered into the gifted receive ring (low 32).
-    /// `arg0` (bytes consumed) is accepted and not yet used: the advertised
-    /// window is fixed below the ring's size, and window-follows-free-space
-    /// arrives with the connection table.
+    /// `arg0` is the bytes this program has consumed since it last said so,
+    /// and saying so matters: the receive window *is* the free space in the
+    /// program's ring — it shrinks as bytes land and reopens only on this
+    /// word, so a program that stops reporting stops the peer.
     pub const RECV: u64 = 62;
 
     /// Half-close: no more data this way. The other direction keeps working,

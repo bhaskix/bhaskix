@@ -5979,9 +5979,12 @@ fn report_net_after_exchange(hhdm: u64) {
     }
     report_tcp_domain(hhdm);
 
-    // The demonstration client's exchange, bounded the same way: outcome 0
-    // is "still working", everything else is terminal.
-    for _ in 0..50u32 {
+    // The demonstration client's exchange. Fifteen seconds rather than the
+    // five every other wait gets, because step 6's bulk measurement is real
+    // traffic on real time — thirty-two KiB echoed at one window in flight —
+    // and a wait that gives up mid-measurement reports an instrument as a
+    // failure.
+    for _ in 0..150u32 {
         let raw = TCPC_REPORT.load(core::sync::atomic::Ordering::Acquire);
         if raw == u64::MAX {
             break;
@@ -6239,6 +6242,43 @@ fn report_tcp_client(hhdm: u64) {
         }
         _ => "an outcome this kernel does not know",
     };
+    // RFC 0020 step 6: the numbers, converted here because the client only
+    // subtracts cycle counts and the kernel is what knows the rate. Printed
+    // before the verdict so a failed run still shows what it measured.
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    let micros = |ticks: u64| -> u64 {
+        if hertz == 0 {
+            return 0;
+        }
+        (u128::from(ticks) * 1_000_000 / u128::from(hertz)) as u64
+    };
+    // SAFETY: the same frame as above, words four to nine.
+    let (handshake, rtt_min, rtt_med, rtt_max, bulk_ticks, bulk_bytes) = unsafe {
+        (
+            core::ptr::read_volatile((hhdm + pages[0] + 32) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 40) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 48) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 56) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 64) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 72) as *const u64),
+        )
+    };
+    if handshake != 0 && hertz != 0 {
+        let bulk_micros = micros(bulk_ticks).max(1);
+        // KiB/s of payload each way: the bytes went out and came back.
+        let through = bulk_bytes.saturating_mul(1_000_000) / bulk_micros / 1024;
+        println!(
+            "    tcp measure    handshake {} us; 16-byte echo round trip min/median/max \
+             {}/{}/{} us over 8; {} KiB echoed in {} ms, {} KiB/s each way",
+            micros(handshake),
+            micros(rtt_min),
+            micros(rtt_med),
+            micros(rtt_max),
+            bulk_bytes / 1024,
+            bulk_micros / 1000,
+            through,
+        );
+    }
     if outcome == 9 || outcome == 8 || outcome == 10 {
         println!("    tcp client     {said}");
     } else {

@@ -1255,14 +1255,20 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                     reply(tcp::OK, 0, 0);
                 }
                 tcp::RECV => {
-                    // "How far has the peer's stream reached?" The reply
-                    // carries the cumulative bytes delivered into the
-                    // caller's receive ring, and the machine's state, packed
-                    // into one word. `args[0]` (bytes consumed) is accepted
-                    // and unused: the advertised window is fixed at less
-                    // than the ring, so consumption cannot yet widen it —
-                    // window-follows-free-space is still the debt recorded
-                    // here.
+                    // "I have consumed `args[0]` bytes; how far has the
+                    // peer's stream reached?" The consumption is RFC 0020's
+                    // flow-control design running: the machine's receive
+                    // window *is* the free space in the caller's ring — it
+                    // shrinks as bytes are delivered and reopens only when
+                    // the caller says it has read them. Until this drove
+                    // `Event::Read`, a bulk echo deadlocked at one window:
+                    // the peer stopped sending into a window that never
+                    // reopened, so the echo stalled, so the caller's own
+                    // sends stalled behind the peer's full buffers.
+                    if args[0] > 0 {
+                        drive_at(&mut service, index, Event::Read(args[0] as u32));
+                        arm_nearest(&service);
+                    }
                     let packed = service.connections[index].as_ref().map_or(0, |connection| {
                         state_number(&connection.tcb) << 32 | connection.delivered
                     });

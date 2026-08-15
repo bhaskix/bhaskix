@@ -214,6 +214,62 @@ fn leg(verb: u64, a0: u64, a1: u64, gift_slot: Option<u64>, leg_number: u64) -> 
 /// status space, so it cannot be mistaken for an answer.
 const STUCK_STATUS: u64 = 0xFFFE;
 
+/// Reads the cycle counter. Unprivileged: `CR4.TSD` is clear on this
+/// machine, and the kernel converts ticks to time — this program only ever
+/// subtracts them.
+fn rdtsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: reads a counter and touches no memory. RFC 0019 records that
+    // this is readable at every privilege level here.
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// One `RECV` poll on the outbound connection: `(state, delivered)`.
+///
+/// `consumed` names bytes this program has finished with since it last said
+/// so — the service reopens the receive window by exactly that much, which
+/// is RFC 0020's window-follows-free-space running from the caller's side.
+/// Refusals and darkness end the run here, reported under `step`, because
+/// every caller would have written the same four lines.
+fn stream_state_consuming(step: u64, consumed: u64) -> (u64, u64) {
+    let (called, word, packed) = call(syscall::CALL, CONNECTION, tcp::RECV, [consumed, 0, 0, 0]);
+    if called != status::OK {
+        report(step, outcome::REFUSED, called << 16);
+        exit();
+    }
+    if word == tcp::UNREACHABLE {
+        // No wire on this machine. The capability answered — that was step
+        // 4a's claim — and the truthful end of the stream's story here is
+        // that there is nobody to stream to.
+        report(step, outcome::DARK, 0);
+        exit();
+    }
+    if word != tcp::OK {
+        report(step, outcome::REFUSED, word << 16);
+        exit();
+    }
+    (packed >> 32, packed & 0xffff_ffff)
+}
+
+/// A poll that consumes nothing.
+fn stream_state(step: u64) -> (u64, u64) {
+    stream_state_consuming(step, 0)
+}
+
+/// Tells the service `count` more bytes are in the send ring, or ends the
+/// run under `step`.
+fn stream_send(count: u64, step: u64) {
+    let (sent, _, _) = call(syscall::CALL, CONNECTION, tcp::SEND, [count, 0, 0, 0]);
+    if sent != status::OK {
+        report(step, outcome::REFUSED, sent << 8);
+        exit();
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn tcpc_main() -> ! {
     // The report page first, so every later failure has somewhere to be seen.
@@ -312,6 +368,8 @@ extern "C" fn tcpc_main() -> ! {
         report(3, outcome::REFUSED, declared << 8);
         exit();
     }
+    // The handshake clock starts here: leg 2 is what makes the SYN leave.
+    let handshake_started = rdtsc();
     let (status_2, value_2, detail_2) = leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, None, 2);
     if status_2 == STUCK_STATUS {
         report(3, outcome::STUCK, 0);
@@ -340,93 +398,168 @@ extern "C" fn tcpc_main() -> ! {
     }
     report(4, outcome::CONNECTED, kind ^ value_2);
 
-    // RFC 0022 step 4b: the stream. The payload is already in the send ring
-    // (written before the rings were gifted); wait for establishment, tell
-    // the service the bytes exist, wait for the echo, read it back out of
-    // memory this program owns, and say what came.
-    let mut echoed = false;
-    let mut state = 0u64;
-    for stage in 0..3u64 {
-        let mut done = false;
-        for _ in 0..50_000u32 {
-            let (called, word, packed) = call(syscall::CALL, CONNECTION, tcp::RECV, [0, 0, 0, 0]);
-            if called != status::OK {
-                report(5 + stage, outcome::REFUSED, called << 16);
-                exit();
+    // RFC 0022 step 4b's stream, run as RFC 0020 step 6's instrument. The
+    // same exchange as before — establish, echo, close — but timed, repeated
+    // and widened, because the numbers are what tell the next RFC whether it
+    // is congestion control or reassembly. Raw cycle counts go in the report;
+    // the kernel owns the conversion to time.
+    let mut state;
+    let mut bounded = 0u32;
+    loop {
+        let (s, _) = stream_state(5);
+        state = s;
+        if state == STATE_ESTABLISHED {
+            break;
+        }
+        bounded += 1;
+        if bounded > 50_000 {
+            report(5, outcome::STUCK, state);
+            exit();
+        }
+        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+    report_word(4, rdtsc().wrapping_sub(handshake_started));
+
+    // Eight echoed round trips of sixteen bytes, each written at its own
+    // stream offset, each timed from "the service was told" to "the echo is
+    // in this program's ring". Eight, because a distribution needs more than
+    // one and the boot has better things to do than a thousand.
+    let mut samples = [0u64; 8];
+    let mut sent_bytes = 0u64;
+    // What has come back, and how much of it this program has told the
+    // service it is done with. Everything seen is consumed at once: the
+    // checks below read only the freshest window of the ring.
+    let mut delivered_seen = 0u64;
+    let mut consumed_told = 0u64;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        for (offset, byte) in PAYLOAD.iter().enumerate() {
+            let at = (index * PAYLOAD.len() + offset) % (4 * 4096);
+            // SAFETY: this program's own send ring, bounded by the modulus.
+            unsafe {
+                core::ptr::write_volatile((SENDR_AT + at as u64) as *mut u8, *byte);
             }
-            if word == tcp::UNREACHABLE {
-                // No wire on this machine. The capability answered — that
-                // was step 4a's claim — and the truthful end of the stream's
-                // story here is that there is nobody to stream to.
-                report(5 + stage, outcome::DARK, 0);
-                exit();
-            }
-            if word != tcp::OK {
-                report(5 + stage, outcome::REFUSED, word << 16);
-                exit();
-            }
-            state = packed >> 32;
-            let available = packed & 0xffff_ffff;
-            done = match stage {
-                // Stage 0: the handshake. Stage 1: the echo's return.
-                // Stage 2: the close acknowledged — any state past
-                // `Established` will do; the full `TIME_WAIT` lifetime is
-                // the service's report to make, on real time.
-                0 => state == STATE_ESTABLISHED,
-                1 => available >= PAYLOAD.len() as u64,
-                _ => state != STATE_ESTABLISHED,
-            };
-            if done {
+        }
+        let begun = rdtsc();
+        stream_send(PAYLOAD.len() as u64, 6);
+        sent_bytes += PAYLOAD.len() as u64;
+        let mut waited = 0u32;
+        loop {
+            let (_, delivered) = stream_state_consuming(6, delivered_seen - consumed_told);
+            consumed_told = delivered_seen;
+            delivered_seen = delivered_seen.max(delivered);
+            if delivered >= sent_bytes {
                 break;
+            }
+            waited += 1;
+            if waited > 50_000 {
+                report(6, outcome::STUCK, delivered);
+                exit();
             }
             let _ = call(syscall::YIELD, 0, 0, [0; 4]);
         }
-        if !done {
-            report(5 + stage, outcome::STUCK, state);
-            exit();
-        }
-        match stage {
-            0 => {
-                let (sent, _, _) = call(
-                    syscall::CALL,
-                    CONNECTION,
-                    tcp::SEND,
-                    [PAYLOAD.len() as u64, 0, 0, 0],
-                );
-                if sent != status::OK {
-                    report(5, outcome::REFUSED, sent << 8);
-                    exit();
-                }
-            }
-            1 => {
-                // The echo, read from pages this program owns. This is the
-                // sentence the whole RFC chain exists for: the peer's bytes
-                // are *here*, in memory no kernel wired and no service
-                // allocated.
-                echoed = (0..PAYLOAD.len()).all(|index| {
-                    // SAFETY: this program's own receive ring, mapped
-                    // read-write at RECVR_AT before the exchange began.
-                    let byte =
-                        unsafe { core::ptr::read_volatile((RECVR_AT + index as u64) as *const u8) };
-                    byte == PAYLOAD[index]
-                });
-                if !echoed {
-                    report(6, outcome::MANGLED, 0);
-                    exit();
-                }
-                let (closed, _, _) = call(syscall::CALL, CONNECTION, tcp::SHUTDOWN, [0; 4]);
-                if closed != status::OK {
-                    report(6, outcome::REFUSED, closed << 8);
-                    exit();
-                }
-            }
-            _ => {}
-        }
+        *sample = rdtsc().wrapping_sub(begun);
     }
+    samples.sort_unstable();
+    report_word(5, samples[0]);
+    report_word(6, samples[samples.len() / 2]);
+    report_word(7, samples[samples.len() - 1]);
+
+    // The first sample's echo, byte for byte, from pages this program owns.
+    // This is the sentence the whole RFC chain exists for: the peer's bytes
+    // are *here*, in memory no kernel wired and no service allocated.
+    let echoed = (0..PAYLOAD.len()).all(|index| {
+        // SAFETY: this program's own receive ring, mapped before anything
+        // was gifted; the index is bounded.
+        let byte = unsafe { core::ptr::read_volatile((RECVR_AT + index as u64) as *const u8) };
+        byte == PAYLOAD[index]
+    });
     if !echoed {
-        report(8, outcome::MANGLED, state);
+        report(6, outcome::MANGLED, 0);
         exit();
     }
+
+    // Bulk: thirty-two KiB out and thirty-two echoed back, through a
+    // sixteen-KiB ring — the wrap is the point — paced no more than four
+    // KiB (one window) ahead of the echo so the un-acknowledged bytes
+    // retransmission would need are never overwritten. Each chunk is stamped with its own
+    // number, spot-checked after the wrap.
+    const CHUNK: u64 = 1024;
+    const CHUNKS: u64 = 32;
+    let ring = (4 * 4096) as u64;
+    let bulk_started = rdtsc();
+    for chunk in 0..CHUNKS {
+        let mut waited = 0u32;
+        loop {
+            let (_, delivered) = stream_state_consuming(7, delivered_seen - consumed_told);
+            consumed_told = delivered_seen;
+            delivered_seen = delivered_seen.max(delivered);
+            if delivered + 4 * CHUNK >= sent_bytes {
+                break;
+            }
+            waited += 1;
+            if waited > 200_000 {
+                report(7, outcome::STUCK, delivered);
+                exit();
+            }
+            let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        }
+        for offset in 0..CHUNK {
+            let at = (sent_bytes + offset) % ring;
+            // SAFETY: this program's own send ring, bounded by the modulus.
+            unsafe {
+                core::ptr::write_volatile((SENDR_AT + at) as *mut u8, chunk as u8);
+            }
+        }
+        stream_send(CHUNK, 7);
+        sent_bytes += CHUNK;
+    }
+    let mut waited = 0u32;
+    loop {
+        let (_, delivered) = stream_state_consuming(7, delivered_seen - consumed_told);
+        consumed_told = delivered_seen;
+        delivered_seen = delivered_seen.max(delivered);
+        if delivered >= sent_bytes {
+            break;
+        }
+        waited += 1;
+        if waited > 200_000 {
+            report(7, outcome::STUCK, delivered);
+            exit();
+        }
+        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+    report_word(8, rdtsc().wrapping_sub(bulk_started));
+    report_word(9, CHUNKS * CHUNK);
+    // The last chunk's first byte, read back across the wrap.
+    let last_at = (sent_bytes - CHUNK) % ring;
+    // SAFETY: this program's own receive ring, bounded by the modulus.
+    let last = unsafe { core::ptr::read_volatile((RECVR_AT + last_at) as *const u8) };
+    if last != (CHUNKS - 1) as u8 {
+        report(7, outcome::MANGLED, u64::from(last));
+        exit();
+    }
+
+    // Close in order, and see it acknowledged.
+    let (closed, _, _) = call(syscall::CALL, CONNECTION, tcp::SHUTDOWN, [0; 4]);
+    if closed != status::OK {
+        report(8, outcome::REFUSED, closed << 8);
+        exit();
+    }
+    let mut waited = 0u32;
+    loop {
+        let (s, _) = stream_state(8);
+        state = s;
+        if state != STATE_ESTABLISHED {
+            break;
+        }
+        waited += 1;
+        if waited > 50_000 {
+            report(8, outcome::STUCK, state);
+            exit();
+        }
+        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+
     report(8, outcome::ECHOED, state);
 
     // RFC 0020 step 5's inbound half. The same handover toward a *listener*:
