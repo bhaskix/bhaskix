@@ -127,7 +127,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **CR2** | A capability in a call | ⬜ Draft — **fully implemented 2026-08-15**, steps 1–4; ready for acceptance review | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
 | **SC1** | Preemption on wake | ❎ **Closed without shipping** 2026-08-15 — built, measured as a no-op, reverted; the RFC's closure note is the deliverable | **A wake may end the running thread's slice.** Remote wakes already IPI-and-preempt; a same-CPU wake waits out the runner's 3 ms slice — the measured mean 414 µs to 1 ms gap that RFC 0023's instrument convicted the scheduler of. Narrow policy (rt always wins; fair wins after a 500 µs grant floor, by vruntime), acted on at the safe points that already exist. M4-10b's wheel is deferred *with its trigger written down* rather than left waiting. Target stated before the work: mean under 50 µs. | [RFC 0024](docs/rfc/0024-preemption-on-wake.md) |
 | **NW3** | A wake for a connection | ⬜ Draft — **implemented 2026-08-15**, all three steps, with a verdict the draft did not predict | **A connection may carry a notification, and the service rings it** — one more gift on `CONNECT`/`LISTEN` (RFC 0022's leg 3), signalled on `Delivered`, `Acknowledged` and state change, so the client blocks in `WAIT` instead of the yield-spin RFC 0020 step 6 measured as the round-trip floor's named cause. The state machine has produced the wake since it was written; `bin/tcpd` discards it with a comment saying a notification belongs there. Drafted from the measurement, not a guess. | [RFC 0023](docs/rfc/0023-a-wake-for-a-connection.md) |
-| **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
+| **A5** | 5-level paging (LA57) | ⬜ Draft — **answered by RFC 0025, 2026-08-15**, pending acceptance | **Four-level, on purpose, with the refusal shipped**: every walk and half-split in the tree is a bit-47 statement, so bring-up now reads `CR4.LA57` and halts with a sentence rather than corrupting addresses silently under a bootloader whose default changed. The boot report states capability beside choice. Five-level gets built against a written trigger — an address-space or physical-memory need no current machine has — not an open wait. | [RFC 0025](docs/rfc/0025-four-level-paging-on-purpose.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -756,6 +756,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-15 (fourth capture: the leak lives in the running threads, and the ledger will read out its line numbers)
+
+**The named-thread dump fired and narrowed the field to two.** Every thread's *saved* hold
+fields were clean — the phantom counts live in the running threads' live CPU counters: `boot`
+carrying `Heap + TlbSender`, `ipd` carrying `AddressSpace + Heap`, both STEADY. Reasoning from
+construction has now failed three times to find the acquires whose releases never land (every
+save/restore site balances on inspection; `try_lock_for_switch`'s uncounted design even
+documents this exact symptom as the failure it prevents — which says a *counted* guard is
+crossing a switch somewhere the inspection missed). So the fourth instrument generation is a
+ledger: every counted acquisition and every release records the acquisition site's
+file-and-line into a per-CPU ring of the last sixteen events — guards now carry their birth
+`Location`, releases pair with it — and the stall dump prints the ring for any vetoing CPU. An
+acquire with no matching release is the leak, and the next capture prints its source line
+directly. Atomics only; recording takes no locks; host tests and both boot modes green with the
+ledger recording on every lock in the kernel.
+
+### 2026-08-15 (RFC 0025: four-level paging on purpose, and A5 — the last open architecture question — is answered)
+
+**A5 asked whether to support LA57; the answer is a refusal with a trigger, and the dangerous
+half shipped with the document.** The kernel's address arithmetic is four-level everywhere —
+`>> 39` at the top of every walk, the kernel half at PML4 index 256, bit-47 canonicality
+throughout — and nothing had ever *verified* that against the machine: the bootstrap path never
+read `CR4.LA57`, and the boot shim makes no paging-mode request, so the four-level world rested
+on a bootloader default nobody had written down. Bring-up now reads `CR4` before touching any
+paging structure and halts with a sentence if five-level paging is live — RFC 0021's
+refuse-loudly posture applied to paging — and the boot report prints capability beside choice
+("la57 stays a capability, not a mode"), so no reader infers the second from the first's
+silence. The decision is a pure function of the register value, host-tested against the exact
+bit and both neighbours, watched failing on the wrong bit. Five-level gets built when a written
+trigger fires — an address space past 128 TiB a half, physical memory past the direct map, or
+a paging-mode need the IOMMU's own 57-bit device tables (independent, already modelled) cannot
+cover — and not before. With A1–A4 settled by earlier RFCs, **no architecture question remains
+open**, pending this RFC's acceptance.
 
 ### 2026-08-15 (the stamp inversion resolved: a ring write is a hand-over, and the consumer can outrun the producer's next instruction)
 

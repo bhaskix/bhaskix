@@ -175,8 +175,12 @@ CI enforces this with a grep.
 | `0xFFFF_A000_0000_0000` + | Per-CPU areas, kernel stacks (guard-paged) |
 | `0xFFFF_FFFF_8000_0000` + | Kernel image (text/rodata/data/bss) |
 
-KASLR shifts the kernel image base and the heap base at boot. LA57 (5-level) support is detected and
-the layout is parameterised, but 4-level is the tested path. Details: [memory.md](memory.md).
+KASLR shifts the kernel image base and the heap base at boot. Paging is **four-level, on
+purpose** ([RFC 0025](rfc/0025-four-level-paging-on-purpose.md)): the layout above is a bit-47
+statement throughout, bring-up refuses a machine entered with `CR4.LA57` live rather than
+corrupting addresses silently, and five-level support waits on a written trigger. This sentence
+previously claimed the layout was parameterised for LA57; it never was, and the claim is
+corrected here rather than deleted. Details: [memory.md](memory.md).
 
 ---
 
@@ -599,10 +603,10 @@ These are unresolved and should not be silently settled in code. Each needs an R
 | # | Decision | Notes |
 |---|---|---|
 | ~~A1~~ | ~~License~~ | ✅ **Resolved 2026-08-02: Apache-2.0.** Permissive for enterprise and government adoption, with the explicit patent grant that MIT lacks. See [RFC 0001](rfc/0001-license-apache-2.0.md) for the rejected alternatives. |
-| A2 | Syscall ABI shape | Capability-invocation only (seL4-like, small and uniform) vs a broader numbered syscall table (familiar, easier to port software to). |
-| A3 | IPC style | Synchronous rendezvous (simple, fast, easy to reason about) vs async channels with buffering (better for `async` services, harder to bound memory). Likely both, but which is primitive? |
-| A4 | Userspace ABI | Our own from scratch vs POSIX-shaped in `libc/`. Determines how much existing software can ever be ported. |
-| A5 | 5-level paging | Support LA57 from day one, or assume 4-level and parameterise later? |
+| ~~A2~~ | ~~Syscall ABI shape~~ | ✅ **Resolved 2026-08-04: capability invocation**, six syscall kinds, all authority arriving as a capability argument ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md)). |
+| ~~A3~~ | ~~IPC style~~ | ✅ **Resolved 2026-08-04: synchronous rendezvous is primitive**; async is shared memory plus a notification, one layer up ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md)). |
+| ~~A4~~ | ~~Userspace ABI~~ | ✅ **Resolved 2026-08-04 by refusing the premise**: the native ABI *is* A2's syscall interface, so there is no separate document and no native libc; POSIX belongs to the Linux personality ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](rfc/0005-linux-abi-compatibility.md)). |
+| A5 | 5-level paging | **Answered 2026-08-15, pending acceptance: four-level on purpose**, with the boot-time refusal shipped and five-level waiting on a written trigger ([RFC 0025](rfc/0025-four-level-paging-on-purpose.md)). |
 
 ---
 

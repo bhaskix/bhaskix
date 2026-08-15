@@ -121,6 +121,25 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
 
     banner();
 
+    // RFC 0025: this kernel speaks four-level paging, on purpose, and every
+    // walk, canonical check and half-split in the tree says so at bit 47. A
+    // boot entered with five-level paging live would corrupt addresses
+    // silently — so the one register read that can tell runs here, before
+    // any paging structure is touched, and refuses with a sentence instead.
+    // SAFETY: reading CR4 at CPL 0.
+    let cr4 = unsafe { bhaskix_arch::cpu::read_cr4() };
+    if bhaskix_arch::cpu::five_level_paging_live(cr4) {
+        println!(
+            "  FATAL: this machine entered the kernel with five-level paging (CR4.LA57) live, \
+             and this kernel's address arithmetic is four-level everywhere. Refusing to run is \
+             deliberate -- RFC 0025 -- because running would corrupt addresses with no line of \
+             output pointing anywhere."
+        );
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
     // Descriptor tables before anything else can fault. Until the IDT is
     // loaded, any exception is a triple fault and a silent reboot -- which is
     // the single worst position to debug from, so this comes first.
@@ -1161,6 +1180,26 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
             );
         }
     }
+    // The ledger: a vetoing CPU's recent lock events, oldest first. An
+    // acquire (>) with no later release (<) at the same site is the leak,
+    // and the site is a file and line.
+    for cpu in 0..bhaskix_arch::percpu::online_count() as usize {
+        if crate::sync::holds_on(cpu) == 0 {
+            continue;
+        }
+        println!("  cpu {cpu}'s last lock events, oldest first (> acquire, < release):");
+        crate::sync::for_each_lock_event(cpu, |at, rank, acquire, count_after| {
+            println!(
+                "    {} rank {:3}  count now {}  {}:{}",
+                if acquire { ">" } else { "<" },
+                rank,
+                count_after,
+                at.file(),
+                at.line(),
+            );
+        });
+    }
+
     let (shootdowns, timed_out) = crate::tlb::statistics();
     println!(
         "    tlb shootdowns {shootdowns} completed, {timed_out} timed out -- a large timeout \
@@ -11799,6 +11838,10 @@ fn report_cpu_features() {
         mark(f.invariant_tsc),
         mark(f.rdrand)
     );
+    // Capability beside choice (RFC 0025): the line above says what the CPU
+    // can do; this one says what this kernel does, so a log reader never
+    // infers the second from the first's silence.
+    println!("    paging         4-level, on purpose; la57 stays a capability, not a mode");
     // **RFC 0021.** Said in words as well as in the table, because this one is
     // not a degraded guarantee — it is the difference between the machine being
     // able to be unpredictable at all and not. An operator reading `rdrand  NO`

@@ -390,6 +390,71 @@ pub fn held_mask() -> u64 {
 /// is given up before it, and neither has to compromise for the other.
 static HOLDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
+/// The last lock events per CPU, for the stall dump and nothing else.
+///
+/// Three captures of the boot hang showed steady phantom hold counts on the
+/// running threads' CPUs, and reasoning from construction failed three times
+/// to find the pair of acquires whose releases never land. So the ledger:
+/// every counted acquisition and every release records the acquisition
+/// site's `Location` into a per-CPU ring, and the stall dump prints the ring
+/// for a vetoing CPU. An acquire whose release never appears is the leak,
+/// named by file and line. Atomics only — recording must not take locks.
+const LOCK_EVENTS: usize = 16;
+
+struct LockEventRing {
+    /// `&'static Location` as a pointer; null = empty slot.
+    at: [core::sync::atomic::AtomicUsize; LOCK_EVENTS],
+    /// Rank byte (255 = unranked try_lock), bit 8 = acquire, bit 9 = the
+    /// count after the event (low bits 16..24), packed small on purpose.
+    meta: [AtomicU32; LOCK_EVENTS],
+    next: core::sync::atomic::AtomicUsize,
+}
+
+impl LockEventRing {
+    const fn new() -> Self {
+        Self {
+            at: [const { core::sync::atomic::AtomicUsize::new(0) }; LOCK_EVENTS],
+            meta: [const { AtomicU32::new(0) }; LOCK_EVENTS],
+            next: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+static LOCK_EVENTS_PER_CPU: [LockEventRing; MAX_CPUS] = [const { LockEventRing::new() }; MAX_CPUS];
+
+fn record_lock_event(at: &'static core::panic::Location<'static>, rank: u8, acquire: bool) {
+    let cpu = percpu::cpu_id() as usize;
+    let ring = &LOCK_EVENTS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
+    let slot = ring.next.fetch_add(1, Ordering::Relaxed) % LOCK_EVENTS;
+    let count = holds_slot().load(Ordering::Relaxed).min(0xff);
+    ring.at[slot].store(at as *const _ as usize, Ordering::Relaxed);
+    ring.meta[slot].store(
+        u32::from(rank) | (u32::from(acquire) << 8) | (count << 16),
+        Ordering::Relaxed,
+    );
+}
+
+/// Walks a CPU's recent lock events, oldest first: `(location, rank byte,
+/// acquire?, hold count just after)`. For the stall dump.
+pub fn for_each_lock_event(
+    cpu: usize,
+    mut f: impl FnMut(&'static core::panic::Location<'static>, u8, bool, u32),
+) {
+    let ring = &LOCK_EVENTS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
+    let next = ring.next.load(Ordering::Relaxed);
+    for offset in 0..LOCK_EVENTS {
+        let slot = (next + offset) % LOCK_EVENTS;
+        let raw = ring.at[slot].load(Ordering::Relaxed);
+        if raw == 0 {
+            continue;
+        }
+        let meta = ring.meta[slot].load(Ordering::Relaxed);
+        // SAFETY: only `&'static Location`s are ever stored.
+        let at = unsafe { &*(raw as *const core::panic::Location<'static>) };
+        f(at, meta as u8, meta & (1 << 8) != 0, (meta >> 16) & 0xff);
+    }
+}
+
 fn holds_slot() -> &'static AtomicU32 {
     &HOLDS[effective_cpu()]
 }
@@ -610,6 +675,7 @@ impl<T> SpinLock<T> {
     /// **It does count towards [`holds_any`]**, which is a different
     /// question from ranking and was for a long time answered by accident. The
     /// order it takes is nothing; the lock it holds is real.
+    #[track_caller]
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         // Counted *before* the attempt, and given back if it fails. After a
         // winning exchange there is a window -- however short -- in which this
@@ -627,10 +693,13 @@ impl<T> SpinLock<T> {
             return None;
         }
         self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
+        let at = core::panic::Location::caller();
+        record_lock_event(at, 255, true);
         Some(SpinLockGuard {
             lock: self,
             ranked: false,
             counted: true,
+            at,
         })
     }
 
@@ -648,6 +717,7 @@ impl<T> SpinLock<T> {
     ///
     /// Safe to leave uncounted because the two callers hold it only with
     /// interrupts masked, and release it before the switch itself.
+    #[track_caller]
     pub fn try_lock_for_switch(&self) -> Option<SpinLockGuard<'_, T>> {
         self.locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -658,6 +728,7 @@ impl<T> SpinLock<T> {
                     lock: self,
                     ranked: false,
                     counted: false,
+                    at: core::panic::Location::caller(),
                 }
             })
     }
@@ -710,10 +781,13 @@ impl<T> SpinLock<T> {
             }
         }
         self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
+        let at = core::panic::Location::caller();
+        record_lock_event(at, self.rank as u8, true);
         SpinLockGuard {
             lock: self,
             ranked: true,
             counted: true,
+            at,
         }
     }
 }
@@ -728,6 +802,9 @@ pub struct SpinLockGuard<'a, T> {
     /// Whether acquisition was counted towards [`holds_any`], and so must be
     /// given back. False only for [`SpinLock::try_lock_for_switch`].
     counted: bool,
+    /// Where the acquisition happened, so the release event pairs with it in
+    /// the per-CPU ledger — the instrument three hang captures asked for.
+    at: &'static core::panic::Location<'static>,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -771,6 +848,18 @@ impl<T> Drop for SpinLockGuard<'_, T> {
         // erase a live owner -- the lock reading unheld while somebody holds
         // it, wrong in the one case the field exists for.
         self.lock.owner.store(NO_OWNER, Ordering::Relaxed);
+
+        if self.counted {
+            record_lock_event(
+                self.at,
+                if self.ranked {
+                    self.lock.rank as u8
+                } else {
+                    255
+                },
+                false,
+            );
+        }
 
         // Release ordering pairs with the Acquire in `lock`, so everything
         // written under the lock is visible to the next holder.

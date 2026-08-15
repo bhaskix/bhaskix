@@ -129,6 +129,20 @@ const CR4_SMEP: u64 = 1 << 20;
 /// `CR4.SMAP` — supervisor mode access prevention.
 const CR4_SMAP: u64 = 1 << 21;
 
+/// Whether five-level paging is live in a `CR4` value — bit 12, `LA57`.
+///
+/// A pure function of the register value so the host can test the decision
+/// (RFC 0025): the kernel's address arithmetic is four-level everywhere —
+/// bit-47 canonicality, the half split at PML4 index 256 — and a boot
+/// entered in five-level mode must refuse loudly rather than corrupt
+/// addresses silently. Capability is not mode: a CPU may advertise `la57`
+/// while the machine runs four-level, and only this bit says which world
+/// the walks are in.
+#[must_use]
+pub const fn five_level_paging_live(cr4: u64) -> bool {
+    cr4 & (1 << 12) != 0
+}
+
 /// Reads `CR4`.
 ///
 /// # Safety
@@ -205,4 +219,24 @@ pub unsafe fn stac() {
 pub unsafe fn clac() {
     // SAFETY: as `stac`.
     unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::five_level_paging_live;
+
+    #[test]
+    fn the_paging_mode_decision_reads_exactly_bit_twelve() {
+        // RFC 0025's whole check, as a pure function: the mode bit alone
+        // decides, and no neighbouring bit may masquerade as it. Watched
+        // failing by testing bit 11 and bit 13 explicitly -- an off-by-one
+        // here is a kernel that refuses healthy machines or serves
+        // five-level ones.
+        assert!(five_level_paging_live(1 << 12));
+        assert!(five_level_paging_live(!0));
+        assert!(!five_level_paging_live(0));
+        assert!(!five_level_paging_live(1 << 11));
+        assert!(!five_level_paging_live(1 << 13));
+        assert!(!five_level_paging_live(!(1u64 << 12)));
+    }
 }

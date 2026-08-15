@@ -213,7 +213,13 @@ workspace = true
 #
 # 1220 at the pipeline attribution: one more report-page word read through
 # the direct map, the same shape as every report word above.
-unsafe_budget = 1220
+#
+# 1221 at RFC 0025: one CR4 read at bring-up, the register that says which
+# paging world the walks are in.
+#
+# 1222 at the lock-event ledger: one cast from the stored pointer back to
+# the &'static Location it always was, in the stall dump's walk.
+unsafe_budget = 1222
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
