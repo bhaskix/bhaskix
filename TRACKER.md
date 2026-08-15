@@ -757,6 +757,25 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (fifth capture: the ledger read out one culprit's line, and the open-guards table will read out the rest)
+
+**The lock ledger fired on its first hunt and named a line.** On the stalled `ipd` CPU the ring
+reads straight through: the address-space table lock acquired at `vm.rs:623` — `with_active`'s
+`SPACES.lock()` — with **no release ever following**, then the shared arena and the heap nested
+beneath it. `ATTACH` holds the *entire* SPACES table across `map_into`, including its waits on
+the heap; the fault handler takes the same table, so a long hold there stalls page-fault
+handling machine-wide. One edge of the deadlock, named to the line by an instrument rather than
+argued.
+
+**The other CPU's culprits had rotated out of the sixteen-event ring** — only tick-time traffic
+cycling on a steady baseline of two, which itself proves the leaked pair are single long-lived
+acquisitions from before the window. So the fifth instrument generation: an **open-guards
+table** — every counted guard claims a slot with its acquisition site on creation and clears it
+on drop (O(1) via a remembered index, with a cross-CPU scan fallback for guards that migrate
+mid-hold, which is exactly the case under suspicion) — and the stall dump prints, for a vetoing
+CPU, *what is held right now, by file and line*. The next capture reads out `boot`'s two
+unreleased sites directly, and the fix finally has an address.
+
 ### 2026-08-15 (fourth capture: the leak lives in the running threads, and the ledger will read out its line numbers)
 
 **The named-thread dump fired and narrowed the field to two.** Every thread's *saved* hold

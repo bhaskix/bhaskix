@@ -422,6 +422,97 @@ impl LockEventRing {
 
 static LOCK_EVENTS_PER_CPU: [LockEventRing; MAX_CPUS] = [const { LockEventRing::new() }; MAX_CPUS];
 
+/// The guards currently open per CPU: acquisition site and rank, cleared on
+/// release. The ring above shows *recent* traffic and rotated the culprits
+/// out on the fourth capture; this table shows *what is held right now*, so
+/// a steady phantom count reads out as the exact unreleased lines.
+const OPEN_GUARDS: usize = 8;
+
+struct OpenGuards {
+    at: [core::sync::atomic::AtomicUsize; OPEN_GUARDS],
+    rank: [AtomicU32; OPEN_GUARDS],
+}
+
+impl OpenGuards {
+    const fn new() -> Self {
+        Self {
+            at: [const { core::sync::atomic::AtomicUsize::new(0) }; OPEN_GUARDS],
+            rank: [const { AtomicU32::new(0) }; OPEN_GUARDS],
+        }
+    }
+}
+
+static OPEN_GUARDS_PER_CPU: [OpenGuards; MAX_CPUS] = [const { OpenGuards::new() }; MAX_CPUS];
+
+/// Claims an open-guard slot; returns its index, or `OPEN_GUARDS` when the
+/// table is full (eight simultaneous holds on one CPU is already a story the
+/// rank mask tells without this table's help).
+fn open_guard(at: &'static core::panic::Location<'static>, rank: u8) -> usize {
+    let cpu = percpu::cpu_id() as usize;
+    let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
+    for slot in 0..OPEN_GUARDS {
+        if table.at[slot]
+            .compare_exchange(
+                0,
+                at as *const _ as usize,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            table.rank[slot].store(u32::from(rank), Ordering::Relaxed);
+            return slot;
+        }
+    }
+    OPEN_GUARDS
+}
+
+/// Releases an open-guard slot claimed by [`open_guard`].
+///
+/// Tries the remembered slot on the current CPU first; a guard released on
+/// a different CPU than it was taken on — a thread that blocked holding,
+/// migrated, and resumed, which is exactly the case being hunted — falls
+/// back to scanning every CPU's table for the matching site.
+fn close_guard(slot: usize, at: &'static core::panic::Location<'static>) {
+    let key = at as *const _ as usize;
+    if slot < OPEN_GUARDS {
+        let cpu = percpu::cpu_id() as usize;
+        let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
+        if table.at[slot]
+            .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+    for table in &OPEN_GUARDS_PER_CPU {
+        for slot in 0..OPEN_GUARDS {
+            if table.at[slot]
+                .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
+
+/// Walks the guards currently open on `cpu`: `(site, rank byte)`.
+pub fn for_each_open_guard(
+    cpu: usize,
+    mut f: impl FnMut(&'static core::panic::Location<'static>, u8),
+) {
+    let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
+    for slot in 0..OPEN_GUARDS {
+        let raw = table.at[slot].load(Ordering::Relaxed);
+        if raw != 0 {
+            // SAFETY: only `&'static Location`s are ever stored.
+            let at = unsafe { &*(raw as *const core::panic::Location<'static>) };
+            f(at, table.rank[slot].load(Ordering::Relaxed) as u8);
+        }
+    }
+}
+
 fn record_lock_event(at: &'static core::panic::Location<'static>, rank: u8, acquire: bool) {
     let cpu = percpu::cpu_id() as usize;
     let ring = &LOCK_EVENTS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
@@ -695,11 +786,13 @@ impl<T> SpinLock<T> {
         self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
         let at = core::panic::Location::caller();
         record_lock_event(at, 255, true);
+        let open_slot = open_guard(at, 255);
         Some(SpinLockGuard {
             lock: self,
             ranked: false,
             counted: true,
             at,
+            open_slot,
         })
     }
 
@@ -729,6 +822,7 @@ impl<T> SpinLock<T> {
                     ranked: false,
                     counted: false,
                     at: core::panic::Location::caller(),
+                    open_slot: OPEN_GUARDS,
                 }
             })
     }
@@ -783,11 +877,13 @@ impl<T> SpinLock<T> {
         self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
         let at = core::panic::Location::caller();
         record_lock_event(at, self.rank as u8, true);
+        let open_slot = open_guard(at, self.rank as u8);
         SpinLockGuard {
             lock: self,
             ranked: true,
             counted: true,
             at,
+            open_slot,
         }
     }
 }
@@ -805,6 +901,8 @@ pub struct SpinLockGuard<'a, T> {
     /// Where the acquisition happened, so the release event pairs with it in
     /// the per-CPU ledger — the instrument three hang captures asked for.
     at: &'static core::panic::Location<'static>,
+    /// This guard's slot in the open-guards table, for O(1) close.
+    open_slot: usize,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -859,6 +957,7 @@ impl<T> Drop for SpinLockGuard<'_, T> {
                 },
                 false,
             );
+            close_guard(self.open_slot, self.at);
         }
 
         // Release ordering pairs with the Acquire in `lock`, so everything

@@ -1187,6 +1187,10 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
         if crate::sync::holds_on(cpu) == 0 {
             continue;
         }
+        println!("  cpu {cpu}'s open guards -- held right now, by acquisition site:");
+        crate::sync::for_each_open_guard(cpu, |at, rank| {
+            println!("    rank {:3}  {}:{}", rank, at.file(), at.line());
+        });
         println!("  cpu {cpu}'s last lock events, oldest first (> acquire, < release):");
         crate::sync::for_each_lock_event(cpu, |at, rank, acquire, count_after| {
             println!(
