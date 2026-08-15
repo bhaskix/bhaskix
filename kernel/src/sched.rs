@@ -2607,7 +2607,7 @@ pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64, &'sta
 /// assumes. This walk prints both, so the next occurrence answers instead of
 /// taunting: per thread the deadline and vruntime the pick compares, and per
 /// CPU the hold count that can veto the pick from ever running.
-pub fn for_each_verdict(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64)) {
+pub fn for_each_verdict(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64, u32, u64)) {
     for (cpu, queue) in QUEUES
         .iter()
         .enumerate()
@@ -2624,6 +2624,8 @@ pub fn for_each_verdict(mut f: impl FnMut(u32, u32, &'static str, State, u64, u6
                 thread.state,
                 thread.deadline,
                 thread.vruntime,
+                thread.held_count,
+                thread.held_locks,
             );
         }
     }

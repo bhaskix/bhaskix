@@ -757,6 +757,27 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (second capture, ranks decoded — and the ranks disproved the simple story)
+
+**The third hunt suite caught the hang again, this time with rank masks**: cpu 0 lit
+`Heap + TlbSender`, cpu 1 lit `AddressSpace + Heap`. The masks disproved the simple leak story
+in the act of confirming a problem: **two CPUs cannot both hold the one global heap lock**, so
+the two reads — taken sequentially — are instants of live lock traffic, not a frozen pair, and
+a single sample per CPU cannot tell a leaked guard from a machine grinding through real work.
+The lit ranks are the unmap-and-shootdown machinery (`shared::revoke`'s page loop under the
+heap, `tlb::shootdown`'s sender slot; the `AddressSpace + Heap` pair is `ATTACH`'s `map_into`)
+— exactly the paths RFC 0022 step 3 began exercising per-boot this morning, which fits the
+hang's first appearance mid-day today. The suspect is now a **shootdown or revocation storm
+under suite load** — each timed-out shootdown burns tens of milliseconds with the heap held —
+rather than a single leaked guard; the ring-3 canary stayed silent through the capture, which
+is consistent (a storm leaks nothing; the boot thread never crosses the canary anyway).
+
+**The dump now settles leak-versus-storm on its next firing**: each vetoing CPU's hold count is
+sampled ten times over a second and printed as STEADY (a guard that will never drop — the leak
+is the stall) or fluctuating (live traffic — the stall lives somewhere else), and the shootdown
+completed/timed-out counters print beside it, because a large timeout count is a CPU not
+answering IPIs, named as such.
+
 ### 2026-08-15 (the hold-leak canary: the hang's next appearance is caught at the door, mid-leak)
 
 **Every return to ring 3 now checks that this CPU's kernel hold count is zero** — one relaxed

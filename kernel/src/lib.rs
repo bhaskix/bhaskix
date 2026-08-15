@@ -1114,28 +1114,59 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
     // virtual-deadline makes impossible unless the deadlines are not what
     // the rule assumes, or preemption is vetoed. Both suspects print here.
     println!("  What the fair pick compares, and what can veto it:");
-    sched::for_each_verdict(|cpu, id, name, state, deadline, vruntime| {
-        if !matches!(state, sched::State::Finished) {
-            println!(
-                "    cpu {cpu}  thread {id}  {name}  {state:?}  deadline {deadline}  vruntime \
-                 {vruntime}"
-            );
-        }
-    });
+    sched::for_each_verdict(
+        |cpu, id, name, state, deadline, vruntime, held_count, held_locks| {
+            if !matches!(state, sched::State::Finished) {
+                // The saved hold bookkeeping travels with the thread, and the
+                // CPU's steady leaked count is some thread's context — for the
+                // running thread it lives in the CPU counters, for the others
+                // in these saved fields. A nonzero pair here names the thread
+                // that leaked, which names the code path that leaked it.
+                println!(
+                    "    cpu {cpu}  thread {id}  {name}  {state:?}  deadline {deadline}  vruntime \
+                 {vruntime}  saved holds {held_count} mask {held_locks:#x}"
+                );
+            }
+        },
+    );
+    // Sampled over a second, because one read cannot tell a leak from live
+    // traffic: a count *stuck* at the same nonzero for every sample is a
+    // guard that will never drop -- the veto is permanent and the leak is
+    // the stall -- while a fluctuating count is real work under load, and
+    // the stall lives somewhere else. The first captured mask pair (Heap on
+    // two CPUs at once, which one global lock cannot be) taught that single
+    // reads across CPUs are instants, not a moment.
     for cpu in 0..bhaskix_arch::percpu::online_count() as usize {
-        let holds = crate::sync::holds_on(cpu);
-        if holds != 0 {
-            // The mask names the lit ranks; a zero mask beside a nonzero
-            // count says the leaked guard came from a `try_lock`, which
-            // takes no rank -- either way, a file to open rather than a
-            // number to stare at.
+        let mut steady = true;
+        let first = crate::sync::holds_on(cpu);
+        for _ in 0..10 {
+            wait_millis(100);
+            if crate::sync::holds_on(cpu) != first {
+                steady = false;
+                break;
+            }
+        }
+        if first != 0 {
             println!(
-                "    cpu {cpu} HOLDS {holds} lock(s) by its count, rank mask {:#x} -- preemption \
-                 is vetoed there, and if this line appears in a stall, the leak is the stall",
+                "    cpu {cpu} HOLDS {first} lock(s), rank mask {:#x}, {} over ten samples in a \
+                 second -- {}",
                 crate::sync::held_on(cpu),
+                if steady { "STEADY" } else { "fluctuating" },
+                if steady {
+                    "a guard that will never drop; preemption is vetoed for ever and the leak \
+                     is the stall"
+                } else {
+                    "live lock traffic under load; the stall lives somewhere else"
+                },
             );
         }
     }
+    let (shootdowns, timed_out) = crate::tlb::statistics();
+    println!(
+        "    tlb shootdowns {shootdowns} completed, {timed_out} timed out -- a large timeout \
+         count is a CPU not answering IPIs, and each timeout burns tens of milliseconds with \
+         the heap held"
+    );
 
     // Said out loud, because the walk above cannot say it. `for_each` skips a
     // CPU whose runqueue it cannot read, and says nothing about the skip -- so
