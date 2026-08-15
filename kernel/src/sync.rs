@@ -295,11 +295,78 @@ static ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
 /// deliberately, so the expected report does not read like a real failure.
 static REPORT: AtomicBool = AtomicBool::new(true);
 
+/// Which per-CPU cell this thread's holds live in.
+///
+/// On the machine: the CPU. Under the host test harness: a **leased slot per
+/// test thread**, because `percpu::cpu_id()` answers 0 for every host thread
+/// -- per-CPU data is never installed there -- so every parallel test shared
+/// `HELD[0]` and `HOLDS[0]`, and tests of this module raced each other: one
+/// thread's `set_held_mask(0)` erased another's live hold, about twice in
+/// twenty-six full runs. A lease per thread is not a test convenience, it is
+/// the semantics: on the machine a thread's holds live with the CPU it
+/// occupies alone, and a test thread is the only occupant of its slot.
+fn effective_cpu() -> usize {
+    #[cfg(test)]
+    {
+        test_cpu::id()
+    }
+    #[cfg(not(test))]
+    {
+        let cpu = percpu::cpu_id() as usize;
+        // Before per-CPU data exists, `cpu_id` answers 0 -- which is correct,
+        // since everything that early runs on the bootstrap CPU.
+        if cpu < MAX_CPUS { cpu } else { 0 }
+    }
+}
+
+/// Per-test-thread slot leases. See [`effective_cpu`].
+#[cfg(test)]
+mod test_cpu {
+    use super::MAX_CPUS;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// One bit per leased slot. `MAX_CPUS` is 64, which is what makes a
+    /// single word the whole allocator.
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+
+    struct Lease(usize);
+
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            TAKEN.fetch_and(!(1 << self.0), Ordering::Relaxed);
+        }
+    }
+
+    fn take() -> Lease {
+        loop {
+            let current = TAKEN.load(Ordering::Relaxed);
+            let free = (!current).trailing_zeros() as usize;
+            assert!(free < MAX_CPUS, "more live test threads than per-cpu slots");
+            if TAKEN
+                .compare_exchange(
+                    current,
+                    current | 1 << free,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Lease(free);
+            }
+        }
+    }
+
+    std::thread_local! {
+        static ID: Lease = take();
+    }
+
+    pub fn id() -> usize {
+        ID.with(|lease| lease.0)
+    }
+}
+
 fn slot() -> &'static AtomicU64 {
-    let cpu = percpu::cpu_id() as usize;
-    // Before per-CPU data exists, `cpu_id` answers 0 -- which is correct, since
-    // everything that early runs on the bootstrap CPU.
-    &HELD[if cpu < MAX_CPUS { cpu } else { 0 }]
+    &HELD[effective_cpu()]
 }
 
 /// The ranks this CPU currently holds.
@@ -324,8 +391,7 @@ pub fn held_mask() -> u64 {
 static HOLDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 fn holds_slot() -> &'static AtomicU32 {
-    let cpu = percpu::cpu_id() as usize;
-    &HOLDS[if cpu < MAX_CPUS { cpu } else { 0 }]
+    &HOLDS[effective_cpu()]
 }
 
 /// Whether this CPU holds any lock taken with [`SpinLock::try_lock`].

@@ -755,6 +755,30 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (two debts paid: a revocation returns quota, and the host sync tests stop racing)
+
+**`REVOKE` now releases the quota of every owner it reached.** The syscall collected a per-owner
+tally from `revoke_tallied` and dropped it — flagged in the step-3 entry below — so no owner but
+the invoker ever got its capability quota back from a userspace revocation: a service accepting a
+capability per client was spent to death by clients that granted and revoked. The tally now
+threads out of `invoke_capability`; the invoker's share is released inside its table entry
+(net of what the CSpace-slot removal already released, so nothing double-counts), and every other
+owner's after it, because `domain::with` holds the one domain table and cannot nest. Test-first:
+`a_revocation_returns_quota_to_every_owner_it_reached` — a holder with an envelope of exactly one,
+full, must be chargeable again after the granter revokes — watched red before the fix, green
+after. Kernel host tests: 153 become 154.
+
+**The host `sync` tests stop sharing one CPU's slot.** On the host target `percpu::cpu_id()`
+answers 0 for every thread — per-CPU data is never installed there — so every parallel test
+shared `HELD[0]`/`HOLDS[0]` and the `sync` tests raced each other, roughly twice in twenty-six
+full runs (flagged in the step-2 entry below). Under `cfg(test)` the cell index is now a **leased
+slot per test thread**, released on thread exit, which is not a convenience but the semantics: on
+the machine a thread's holds live with the CPU it alone occupies, and a test thread is now the
+only occupant of its slot. The watch here is statistical, and both directions were run: thirty
+suite runs with the lease, zero failures; thirty with the lease bypassed back to shared slot 0,
+the race reappeared at its historical rate. Machine code is untouched — `effective_cpu()`
+compiles to exactly the old expression outside tests.
+
 ### 2026-08-15 (RFC 0022 step 4b: the stream lives in the program's pages)
 
 **RFC 0020's echo now rides rings the client owns, and RFC 0022's purpose is discharged.**

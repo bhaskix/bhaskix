@@ -518,6 +518,7 @@ fn invoke_capability(
     owner: u32,
     cspace: &mut CSpace,
     arena: &mut Arena,
+    revoked: &mut [u32; crate::cap::MAX_OWNERS],
 ) -> Outcome {
     let index = match usize::try_from(frame.capability) {
         Ok(index) => index,
@@ -572,8 +573,14 @@ fn invoke_capability(
         }
 
         method::REVOKE => {
-            let mut tally = [0u32; crate::cap::MAX_OWNERS];
-            match arena.revoke_tallied(slot, &mut tally) {
+            // The tally goes back to the caller of this function, because
+            // releasing it needs the *other* owners' table entries and this
+            // runs with the invoker's held. It was collected and dropped
+            // here from RFC 0014 until 2026-08-15: no owner but the invoker
+            // ever got its quota back from a revocation, so a service
+            // accepting a capability per client was spent to death by
+            // clients that granted and revoked.
+            match arena.revoke_tallied(slot, revoked) {
                 Ok(destroyed) => {
                     // The revoked capability's own slot is now a dead
                     // reference. Clearing it is not required for safety --
@@ -2318,10 +2325,13 @@ fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
     }
 
     let owner = id.as_u32();
-    domain::with(id, |domain| {
+    let mut revoked = [0u32; cap::MAX_OWNERS];
+    let outcome = domain::with(id, |domain| {
         let mut cspace = core::mem::take(&mut domain.cspace);
         let before = cspace.occupied();
-        let outcome = cap::with_arena(|arena| invoke_capability(frame, owner, &mut cspace, arena));
+        let outcome = cap::with_arena(|arena| {
+            invoke_capability(frame, owner, &mut cspace, arena, &mut revoked)
+        });
         let after = cspace.occupied();
 
         // Charge or release the quota by what the operation actually did,
@@ -2337,10 +2347,40 @@ fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
             }
         }
 
+        // A revocation's tally, for this domain: the slot removal above
+        // already released the entries that left the CSpace, so only what
+        // the tally counted *beyond* that is released here -- derived
+        // children this domain was charged for that sat in nobody's slots,
+        // or in slots that stay occupied by dead references.
+        let index = owner as usize;
+        if index < revoked.len() {
+            let counted = revoked[index];
+            let already = (before.saturating_sub(after)) as u32;
+            for _ in 0..counted.saturating_sub(already) {
+                domain.release_capability();
+            }
+            revoked[index] = 0;
+        }
+
         domain.cspace = cspace;
         outcome
     })
-    .unwrap_or(Outcome::err(Status::NoDomain))
+    .unwrap_or(Outcome::err(Status::NoDomain));
+
+    // The rest of a revocation's tally: every *other* owner whose derived
+    // capabilities the subtree destruction reached, released after the
+    // invoker's table entry is given up -- `domain::with` holds the one
+    // domain table, so this cannot run inside it.
+    for (charged, count) in revoked.iter().enumerate() {
+        if *count > 0 && charged as u32 != owner {
+            domain::with(domain::DomainId::from_u32(charged as u32), |other| {
+                for _ in 0..*count {
+                    other.release_capability();
+                }
+            });
+        }
+    }
+    outcome
 }
 
 /// Gives a derived capability to another domain.
@@ -2446,6 +2486,77 @@ mod tests {
             capability,
             ..SyscallFrame::default()
         }
+    }
+
+    #[test]
+    fn a_revocation_returns_quota_to_every_owner_it_reached() {
+        // The leak this guards against: `REVOKE` destroys nodes across many
+        // domains' holdings, collects a per-owner tally -- and dropped it,
+        // so no owner but the invoker (whose CSpace slot removal is counted
+        // separately) ever got its capability quota back. A service accepting
+        // a capability per client was spent to death by clients that granted
+        // and revoked.
+        use crate::domain::{self, ResourceEnvelope};
+
+        let granter =
+            domain::create("quota-granter", ResourceEnvelope::new().max_capabilities(4)).unwrap();
+        // An envelope of exactly one, so "was the quota returned" is the
+        // difference between a charge that succeeds and one that is refused.
+        let holder =
+            domain::create("quota-holder", ResourceEnvelope::new().max_capabilities(1)).unwrap();
+
+        let root = crate::cap::with_arena(|arena| {
+            arena.insert_root_owned(
+                ObjectRef::new(crate::cap::ObjectKind::Notification, 7077),
+                Rights::ALL,
+                0,
+                granter.as_u32(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            domain::with(granter, |d| {
+                d.charge_capability().unwrap();
+                d.cspace.install_at(0, root).is_ok()
+            }),
+            Some(true)
+        );
+        // A derivation charged to the holder, exactly as a grant charges the
+        // recipient; the holder is now at its limit.
+        let _child = crate::cap::with_arena(|arena| {
+            arena.derive_owned(root, Rights::READ, 0, holder.as_u32())
+        })
+        .unwrap();
+        assert_eq!(
+            domain::with(holder, |d| d.charge_capability().is_ok()),
+            Some(true),
+            "the holder pays for its copy, as a grant would make it"
+        );
+        assert_eq!(
+            domain::with(holder, |d| d.charge_capability().is_err()),
+            Some(true),
+            "the holder must start full for the release to be observable"
+        );
+
+        let mut f = frame(Kind::Invoke as u64, 0);
+        f.method = method::REVOKE;
+        let outcome = invoke(granter, &mut f);
+        assert_eq!(outcome.status, Status::Ok, "the revoke itself must work");
+
+        assert_eq!(
+            domain::with(holder, |d| {
+                let freed = d.charge_capability().is_ok();
+                if freed {
+                    d.release_capability();
+                }
+                freed
+            }),
+            Some(true),
+            "the holder's quota was not released by the revocation that destroyed its capability"
+        );
+
+        domain::destroy(granter);
+        domain::destroy(holder);
     }
 
     #[test]
@@ -2720,7 +2831,8 @@ mod tests {
                 arg3: rng.interesting(),
                 ..SyscallFrame::default()
             };
-            let _ = invoke_capability(&f, 0, &mut cspace, &mut arena);
+            let mut revoked = [0u32; crate::cap::MAX_OWNERS];
+            let _ = invoke_capability(&f, 0, &mut cspace, &mut arena, &mut revoked);
 
             // The invariant that matters. A frame may legitimately *derive* a
             // capability -- that is what `Invoke` is for -- but every one it
