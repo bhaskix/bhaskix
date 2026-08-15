@@ -300,6 +300,15 @@ pub struct Thread {
     /// this thread will *accept* one, this says which one it will *send*.
     /// Dies with the thread, exactly as the declaration does.
     pub staged_gift: Option<StagedGift>,
+    /// When [`wake`] marked this thread ready, as a cycle count, or zero.
+    ///
+    /// The other half of a measurement: RFC 0023 priced a wake-driven wait
+    /// at one to three milliseconds more than a poll, and this is what says
+    /// whether the scheduler's wake-to-dispatch gap is the cost or an alibi.
+    /// Stamped by the waker, read and cleared at dispatch, accumulated into
+    /// the counters the boot report prints.
+    pub woken_at: u64,
+
     /// A call this thread made was refused at the rendezvous, with this
     /// status.
     ///
@@ -696,6 +705,22 @@ pub const RESCHEDULE_VECTOR: u8 = 0x41;
 /// Reschedule interrupts sent to other CPUs.
 static RESCHEDULE_IPIS: AtomicU64 = AtomicU64::new(0);
 
+/// Wake-to-dispatch, in cycles: how long woken threads sat ready before a
+/// CPU ran them. The scheduler's own share of RFC 0023's measured latency.
+static WAKE_TO_RUN_SUM: AtomicU64 = AtomicU64::new(0);
+static WAKE_TO_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
+static WAKE_TO_RUN_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// The wake-to-dispatch tallies: `(count, total cycles, worst cycles)`.
+#[must_use]
+pub fn wake_to_run() -> (u64, u64, u64) {
+    (
+        WAKE_TO_RUN_COUNT.load(Ordering::Relaxed),
+        WAKE_TO_RUN_SUM.load(Ordering::Relaxed),
+        WAKE_TO_RUN_MAX.load(Ordering::Relaxed),
+    )
+}
+
 /// Threads that actually went to sleep.
 static BLOCKS: AtomicU64 = AtomicU64::new(0);
 
@@ -772,6 +797,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         reply_to: None,
         receive_slot: None,
         staged_gift: None,
+        woken_at: 0,
         call_refused: None,
         domain: u32::MAX,
         dying: false,
@@ -973,6 +999,7 @@ pub fn spawn_on_with(
         reply_to: None,
         receive_slot: None,
         staged_gift: None,
+        woken_at: 0,
         call_refused: None,
         domain: options.domain,
         dying: false,
@@ -2154,6 +2181,13 @@ pub fn preempt() {
             thread.state = State::Running;
             thread.runs += 1;
             thread.last_start = now;
+            if thread.woken_at != 0 {
+                let waited = now.saturating_sub(thread.woken_at);
+                thread.woken_at = 0;
+                WAKE_TO_RUN_SUM.fetch_add(waited, Ordering::Relaxed);
+                WAKE_TO_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+                WAKE_TO_RUN_MAX.fetch_max(waited, Ordering::Relaxed);
+            }
         }
         // A new thread starts a new quantum.
         if let Some((slice, stack)) = queue.threads[next]
@@ -3012,6 +3046,7 @@ fn wake_with(id: u32, from_interrupt: bool) -> WakeResult {
             for thread in queue.threads.iter_mut().flatten() {
                 if thread.id == id && thread.state == State::Blocked {
                     thread.state = State::Ready;
+                    thread.woken_at = tsc::read();
                     if matches!(thread.policy, Policy::Fair { .. }) {
                         thread.vruntime = thread.vruntime.max(floor);
                         thread.charge(0);
@@ -3440,6 +3475,7 @@ mod tests {
             reply_to: None,
             receive_slot: None,
             staged_gift: None,
+            woken_at: 0,
             call_refused: None,
             dying: false,
             answer_lost: false,

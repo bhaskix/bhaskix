@@ -8644,6 +8644,23 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
          already soon enough"
     );
 
+    // The scheduler's share of a wake's latency, measured because RFC 0023
+    // priced a wake-driven wait above a poll and the schedule's own gap is
+    // the first suspect to convict or clear. Stamped by the waker, read at
+    // dispatch; the mean says what the path usually costs, and the worst
+    // says what it can cost.
+    let (wakes, wake_cycles, wake_worst) = sched::wake_to_run();
+    let wake_hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    if wakes > 0 && wake_hertz != 0 {
+        let micros = |ticks: u64| (u128::from(ticks) * 1_000_000 / u128::from(wake_hertz)) as u64;
+        println!(
+            "    wake to run    {} wakes; mean {} us, worst {} us from marked ready to dispatched",
+            wakes,
+            micros(wake_cycles / wakes),
+            micros(wake_worst),
+        );
+    }
+
     // RFC 0019 step 4, the second half: the same measurement on a machine with
     // its services running. The first ran during bring-up, where a tickless
     // CPU can be silent for most of a second; this one is the machine every

@@ -756,6 +756,24 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (wake-to-dispatch measured: the scheduler is convicted, not suspected)
+
+**The 1–3 ms RFC 0023 priced on wakes now has an owner.** Every `wake` stamps the thread with the
+cycle counter; dispatch reads and clears the stamp; the boot report prints the tallies, and a
+presence gate keeps the instrument from quietly vanishing (watched red by silencing it). The
+numbers: **mean 414 µs ready-to-dispatched over 16,906 wakes** on the IOMMU boot, ~1 ms mean on
+BIOS — the scheduler's own gap accounts for the bulk of the wake-versus-poll delta. The cause is
+visible in the mechanism: waking a thread marks it ready and, on its own CPU, *nothing preempts
+the thread already running* — the woken one waits out the remainder of the runner's slice. The
+worst cases (seconds, during bring-up) are threads woken while boot work holds their CPU, the
+same effect at full scale.
+
+**What this buys the next design**: wake-preemption — letting a wake shorten or end the running
+thread's slice when the woken one should run — is now a change with a number attached on both
+sides, and it belongs in the same future RFC as M4-10b's timer wheel, where slice policy already
+lives. Recorded here rather than built, because a scheduler default is not a thing to change as a
+rider on an instrumentation commit.
+
 ### 2026-08-15 (RFC 0023 implemented: the wake works, and the measurement said something the draft did not predict)
 
 **All three steps landed, every gate green in both boot modes — and the honest result first: the

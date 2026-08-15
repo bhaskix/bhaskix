@@ -1479,6 +1479,16 @@ else
     status=1
 fi
 
+# The scheduler's wake-to-dispatch measurement must exist on every boot:
+# wakes happen on all of them, and an instrument that vanishes is a
+# regression even when nothing gates its values.
+if grep -qE "wake to run +[0-9]+ wakes; mean [0-9]+ us" "$LOG"; then
+    pass "wake-to-dispatch is measured, not guessed"
+else
+    fail "the wake-to-dispatch measurement is missing"
+    status=1
+fi
+
 # RFC 0016 step 1. A badge says who the *granter* said a caller is. Until this
 # was fixed a holder could derive itself a different one and call a service as
 # somebody else, and the probe below demonstrated it as though it were a
