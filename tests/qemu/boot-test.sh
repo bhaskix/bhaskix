@@ -1378,8 +1378,8 @@ fi
 # one: restoration is the part a simpler implementation silently gets wrong,
 # by consuming the declaration on the failure path and leaving the service
 # one failed caller away from deafness.
-if grep -qE "gift .*restored the declaration it could not use" "$LOG"; then
-    pass "a capability crossed in a call, and a refusal restored what it could not use"
+if grep -qE "gift .*unmapped, destroyed and unnamed what it had lent" "$LOG"; then
+    pass "a capability crossed in a call; a refusal restored; a lender's death revoked"
 elif grep -qE "gift +skipped" "$LOG"; then
     pass "gift self-test skipped on this machine, too few cpus"
 else

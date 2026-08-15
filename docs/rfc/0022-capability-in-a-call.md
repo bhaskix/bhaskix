@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft. **Steps 1 and 2 implemented 2026-08-15** — a staged capability crosses at the rendezvous, refusals refuse the call whole and restore what they could not use. Step 3 (revocation gate) and step 4 (`CONNECT`'s rings) remain. |
+| **Status** | Draft. **Steps 1–3 implemented 2026-08-15** — a staged capability crosses at the rendezvous, refusals refuse the call whole and restore what they could not use, and a lender's death unmaps, destroys and unnames what it had lent. Step 4 (`CONNECT`'s rings) remains. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel, ABI |
 | **Milestone** | Phase 2 — required before [RFC 0020](0020-tcp.md)'s connection capabilities |
@@ -263,6 +263,22 @@ Each step leaves the tree green.
    exists to prevent. One finding recorded as open question 4: the declaration cell is per-thread,
    and a gift spends the same cell a service's own upstream `EXPECT` would use.
 3. **The revocation gate**: a lending ended by domain death, observed from the service.
+
+   **Done 2026-08-15.** Domain teardown now *revokes* its `Memory` objects rather than destroying
+   them — `shared::destroy_owned_by` goes through `revoke`, so the pages come out of every address
+   space and device window before the frames are freed. Destroying alone was the exact failure
+   `revoke`'s own comment names: frames gone from the allocator's books and still writable from
+   another domain — latent until this RFC, because nothing mapped an object owned by a domain that
+   could die first. Then the object's death reaches its names: a new arena sweep
+   (`revoke_roots_naming`) destroys every root naming the dead object and each derivation those
+   roots ever handed out, tallied per owner so the *recipient's* quota charge is released — a
+   service accepting a gift per connection would otherwise be spent to death by clients that
+   connect and die. The QEMU gate is the self-test's lending phase: the client creates and gifts a
+   `Memory` object it owns, the harness maps it as a recipient would, the client thread's exit
+   ends its domain — the program-dies-holding-a-connection story, nothing staged — and afterwards
+   the mapping is removed *by revocation*, the object is gone, and the service's copy resolves to
+   nothing. Watched failing both ways: teardown-destroys-without-revoking reddens the unmap and
+   the unnaming; revoke-without-sweep reddens the unnaming alone.
 4. **RFC 0020 step 4's consumer**: `CONNECT` carries two rings, `bin/tcpd` maps them, and the
    connection capability comes back in the reply — both directions of RFC 0016's mechanism in one
    exchange, which is the sentence this RFC exists to make true.

@@ -124,7 +124,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **TM1** | Time and timers | ✅ **Accepted** 2026-08-14 | **A deadline is a property of a notification, not a new object.** `Invoke(notification, ARM, deadline)` asks the kernel to signal it later; the program waits through RFC 0010's machinery, so a service handles callers, frames and expiring timers in one loop with one blocking call. Absolute deadlines, because a duration read before being descheduled becomes a lie. **Reading time is deliberately not a capability**: `rdtsc` is unprivileged on this machine and a `Clock` object would guard nothing — being *woken* is the scarce thing. Accepted with all four steps, and its open question 2 answered against it and then fixed: the measurement found the deadline had no effect on the wake instant at all, and arming now re-programs the timer. Questions 1 and 3 stay open, and 1 is sharper for the fix. | [RFC 0019](docs/rfc/0019-time-and-timers.md) |
 | **NW2** | TCP | ⬜ Draft | **A state machine that can be tested without a network.** `bin/tcpd` in its own domain, and a **pure transition function** in `bhaskix-net` — no I/O, no clock, no allocation — so loss, reordering, backoff and close are host tests against a virtual clock rather than things a live network refuses to reproduce. A connection's **stream lives in the program's pages**, so the receive window *is* the program's free space and a connection costs the memory of whoever opened it. Minimal but correct, with every absence named: no congestion control, window scaling, SACK, timestamps, PMTU discovery, keepalive or urgent data. Found a prerequisite it could not write around — **the system has no source of randomness at all**, and a TCP initial sequence number must be unpredictable. | [RFC 0020](docs/rfc/0020-tcp.md) |
 | **R1** | A source of unpredictability | ✅ **Accepted** 2026-08-14 | **The system cannot produce an unpredictable number, and nothing had noticed until RFC 0020 needed one.** No `RDRAND`, no `RDSEED`, no pool; even KASLR's slide is the bootloader's. The proposal is deliberately small because **`RDRAND` is unprivileged** — so there is no capability to design and no syscall to add, the same finding RFC 0019 made about `rdtsc`. What is left is a shared implementation that gets the failure mode right (the carry flag, a bounded retry, and `None` that is never turned into a number), a boot-time probe beside `nx`/`smep`/`smap`, and a policy: **the caller refuses**, not the kernel. Found on the way that `bin/ipd` hands out ephemeral ports as `49152 + index`, and that `security.md` claims a heap-base randomisation the system does not perform. | [RFC 0021](docs/rfc/0021-unpredictability.md) |
-| **CR2** | A capability in a call | ⬜ Draft — steps 1–2 implemented 2026-08-15 | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
+| **CR2** | A capability in a call | ⬜ Draft — steps 1–3 implemented 2026-08-15 | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
@@ -754,6 +754,34 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-15 (RFC 0022 step 3: a lender's death ends the lending — unmapped, destroyed, unnamed)
+
+**Domain teardown now revokes its `Memory` objects instead of destroying them.** The difference is
+the whole point: `destroy` frees the frames and leaves every mapping other domains hold standing —
+pages gone from the allocator's books and still writable from another address space, which is the
+exact failure `shared::revoke`'s own comment names ("a revoked capability whose pages are still
+mapped is not revoked, it is renamed"). Latent until RFC 0022, because nothing mapped an object
+owned by a domain that could die first; a gifted ring is precisely that. `destroy_owned_by` now
+goes through `revoke` — every address space, every device window, then the frames.
+
+**And the object's death reaches its names.** `cap::Arena::revoke_roots_naming` destroys every
+root naming the dead object and each derivation those roots handed out, tallied per owner so the
+recipient's quota charge is released — without it, a service accepting a gift per connection is
+spent to death by clients that connect and die, one stale arena node at a time. Host-tested
+(two roots, a lent derivation, an untouched bystander; watched failing by a first-root-only
+mutation). The QEMU gate is the gift self-test's lending phase: the client creates and gifts an
+object it owns, the harness maps it as a ring-3 recipient would, and the client thread's exit —
+the last thread leaving ends the domain, nothing staged about it — must leave the mapping removed
+*by revocation*, the object gone, and the service's copy resolving to nothing. Watched failing
+both ways: teardown-destroys-without-revoking reddens the unmap and the unnaming;
+revoke-without-sweep reddens the unnaming alone, through a convergent wait that times out red
+rather than reading in the destroy-to-sweep gap.
+
+**Found and flagged, not fixed here:** the `REVOKE` syscall collects its per-owner tally from
+`revoke_tallied` and then drops it — no owner's capability quota is released by a userspace
+revocation, a slow leak in every envelope. The teardown path added today releases its tally
+properly; the syscall's fix deserves its own change with its own watched-failing test.
 
 ### 2026-08-15 (RFC 0022 step 2: the transfer at the rendezvous, and a refusal that restores)
 

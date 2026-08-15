@@ -602,6 +602,43 @@ impl Arena {
         Ok(destroyed)
     }
 
+    /// Revokes every root naming one object, tallying per owner.
+    ///
+    /// For the death of the *object*: when the domain owning a `Memory`
+    /// object dies, every capability naming that object — the owner's root,
+    /// and every derivation it ever handed to anybody — must go, or each
+    /// holder keeps a live arena node charged against its envelope for an
+    /// object that no longer exists. Stale nodes confer nothing (the
+    /// generation in the identity sees to that); what they cost is quota,
+    /// and a service accepting a gift per connection would be spent to death
+    /// by clients that connect and die.
+    ///
+    /// Only *roots* are matched, because derivation copies the `ObjectRef`:
+    /// every node naming the object sits in a tree whose root names it too,
+    /// so destroying those subtrees is destroying them all. This is not a
+    /// revocation a holder performs — no rights are checked — it is the
+    /// object's own death reaching its names, which is why it lives beside
+    /// [`Arena::revoke_unchecked`] and not [`Arena::revoke_tallied`]'s
+    /// permission gate.
+    pub fn revoke_roots_naming(
+        &mut self,
+        object: ObjectRef,
+        tally: &mut [u32; MAX_OWNERS],
+    ) -> usize {
+        self.tally = Some(*tally);
+        let mut destroyed = 0;
+        for index in 0..MAX_CAPABILITIES {
+            let node = self.nodes[index];
+            if node.live && node.parent.is_none() && node.object == object {
+                destroyed += self.destroy_subtree(index);
+            }
+        }
+        if let Some(collected) = self.tally.take() {
+            *tally = collected;
+        }
+        destroyed
+    }
+
     fn destroy_subtree(&mut self, root: usize) -> usize {
         let mut destroyed = 0;
 
@@ -820,6 +857,37 @@ mod tests {
             arena.derive(parent, Rights::READ, 0),
             Err(CapError::DeriveNotPermitted)
         );
+    }
+
+    #[test]
+    fn an_objects_death_reaches_every_name_it_was_given() {
+        // RFC 0022 step 3. Two roots naming the same object -- an owner may
+        // name an object more than once -- one with a derivation handed to
+        // somebody else, and an unrelated tree naming a different object.
+        // The object's death destroys both roots and the handed-out child,
+        // tallied to whoever was charged, and touches nothing else.
+        let mut arena = Arena::new();
+        let dying = ObjectRef::new(ObjectKind::Memory, 7);
+        let first = arena.insert_root_owned(dying, Rights::ALL, 0, 1).unwrap();
+        let second = arena.insert_root_owned(dying, Rights::ALL, 0, 1).unwrap();
+        let lent = arena.derive_owned(first, Rights::READ, 9, 2).unwrap();
+        let other = ObjectRef::new(ObjectKind::Memory, 8);
+        let bystander = arena.insert_root_owned(other, Rights::ALL, 0, 3).unwrap();
+
+        let mut tally = [0u32; MAX_OWNERS];
+        let destroyed = arena.revoke_roots_naming(dying, &mut tally);
+
+        assert_eq!(destroyed, 3, "both roots and the lending");
+        assert!(arena.lookup(first).is_none(), "the first root is gone");
+        assert!(arena.lookup(second).is_none(), "the second root is gone");
+        assert!(arena.lookup(lent).is_none(), "the recipient holds nothing");
+        assert!(
+            arena.lookup(bystander).is_some(),
+            "the other object is untouched"
+        );
+        assert_eq!(tally[1], 2, "the owner is tallied for its roots");
+        assert_eq!(tally[2], 1, "the recipient is tallied for its copy");
+        assert_eq!(tally[3], 0, "the bystander is not");
     }
 
     #[test]

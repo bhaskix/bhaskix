@@ -377,7 +377,41 @@ pub fn destroy_owned_by(owner: DomainId) -> usize {
         })
     };
 
-    names.iter().flatten().filter(|id| destroy(**id)).count()
+    // **Revoked, not merely destroyed — this is what ends a lending.** RFC
+    // 0022 step 3: an object the dead domain gifted away may be *mapped* in
+    // the recipient's address space, and `destroy` alone frees the frames
+    // while those mappings stand — pages gone from the allocator's books and
+    // still writable from another domain, which is the exact failure
+    // `revoke`'s comment names. So: mappings out of every address space and
+    // device window first, then the object, then every capability naming it —
+    // the owner's root and each derivation it handed out — with the quota
+    // released to whichever surviving domain was charged. The recipient of a
+    // gift is left holding nothing, which is the truth.
+    names
+        .iter()
+        .flatten()
+        .filter(|id| {
+            let identity = u64::from(id.index) | (u64::from(id.generation) << 32);
+            let was_live = live(**id);
+            let removed = revoke(**id);
+            let _ = removed;
+            let mut tally = [0u32; crate::cap::MAX_OWNERS];
+            let object = crate::cap::ObjectRef::new(crate::cap::ObjectKind::Memory, identity);
+            let swept =
+                crate::cap::with_arena(|arena| arena.revoke_roots_naming(object, &mut tally));
+            for (charged, count) in tally.iter().enumerate() {
+                if *count > 0 && charged as u32 != owner.as_u32() {
+                    crate::domain::with(DomainId::from_u32(charged as u32), |domain| {
+                        for _ in 0..*count {
+                            domain.release_capability();
+                        }
+                    });
+                }
+            }
+            let _ = swept;
+            was_live
+        })
+        .count()
 }
 
 fn resolve(arena: &Arena, id: MemoryId) -> Option<Object> {

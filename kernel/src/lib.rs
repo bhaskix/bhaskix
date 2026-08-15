@@ -1220,6 +1220,11 @@ static GIFT_CLIENT_SAW: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// declared slots were filled when it looked.
 static GIFT_SERVED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static GIFT_LANDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The lending verdict, one bit per property, for the failure report.
+static GIFT_LENDING_BITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The `Memory` object the client lends in the revocation phase, as its
+/// packed identity, or `u64::MAX` while there is none.
+static GIFT_OBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// The service half of `gift_self_test`. Declares when the phase says to,
 /// receives, checks its own CSpace, replies.
@@ -1250,10 +1255,11 @@ extern "C" fn gift_service(_argument: u64) -> ! {
         if landed {
             GIFT_LANDED.fetch_add(1, Ordering::Relaxed);
         }
-        // Phase 4's declaration, made *between* phase 3's calls: from here a
-        // gift may land at slot 6.
-        if message.method == 2 {
-            sched::set_receive_slot(me, Some((6, endpoint.as_u32())));
+        // A caller may ask for the *next* declaration in `args[1]` — how the
+        // client scripts which slot each later gift may land in without the
+        // service knowing the plot.
+        if message.args[1] != 0 {
+            sched::set_receive_slot(me, Some((message.args[1] as u32, endpoint.as_u32())));
         }
         let _ = ipc::reply(
             caller,
@@ -1266,7 +1272,14 @@ extern "C" fn gift_service(_argument: u64) -> ! {
         // The closing call, answered and then obeyed. An exit keyed to a
         // phase flag instead was a race: the flag could be read either side
         // of the closing call's arrival, and one side left it undelivered.
+        // Obeying means *lingering*: this thread's exit would end its domain
+        // and take the CSpace with it, and the harness still has to look at
+        // that CSpace to see the lending end while the service holds its
+        // side of it. Phase 92 is the harness saying it has looked.
         if message.method == 99 {
+            while GIFT_PHASE.load(Ordering::Acquire) < 92 {
+                core::hint::spin_loop();
+            }
             sched::exit();
         }
     }
@@ -1302,7 +1315,7 @@ extern "C" fn gift_client(_argument: u64) -> ! {
     // service's declared slot 5. The reply's args[0] says whether the service
     // found it there.
     stage(2);
-    let gifted = ipc::call(endpoint, 0, 2, [5, 0, 0, 0]);
+    let gifted = ipc::call(endpoint, 0, 2, [5, 6, 0, 0]);
     let landed = matches!(&gifted, Ok(reply) if reply.args[0] == 1);
     record(2, u64::from(!landed));
     // And the staged gift must be consumed: a second call carries nothing.
@@ -1353,10 +1366,40 @@ extern "C" fn gift_client(_argument: u64) -> ! {
     // teardown.
     let _ = sched::take_staged_gift(me, endpoint.as_u32());
 
+    // Phase 7: a real lending — a `Memory` object this domain *owns*, gifted
+    // away, for the harness to end by killing this domain. The gift is the
+    // same mechanism phase 2 proved; what phase 7 stages is the object whose
+    // death step 3 is about.
+    let lent = sched::current_domain().and_then(|domain| {
+        let id = shared::create(domain, bhaskix_mm::FRAME_SIZE).ok()?;
+        let root = shared::name(id).ok()?;
+        domain::with(domain, |owner| owner.cspace.install_at(4, root).is_ok())
+            .filter(|installed| *installed)
+            .map(|_| id)
+    });
+    let mut lent_landed = false;
+    if lent.is_some() {
+        // Ask the service to declare slot 7, then gift into it.
+        let _ = ipc::call(endpoint, 0, 1, [63, 7, 0, 0]);
+        stage(4);
+        let carried = ipc::call(endpoint, 0, 3, [7, 0, 0, 0]);
+        lent_landed = matches!(&carried, Ok(reply) if reply.args[0] == 1);
+    }
+    record(7, u64::from(!lent_landed));
+    GIFT_OBJECT.store(lent.map_or(u64::MAX, |id| id.as_u64()), Ordering::Release);
+
     // One last plain call, which the service answers and then exits on; only
     // after it returns is the harness told everything has happened.
     let _ = ipc::call(endpoint, 0, 99, [63, 0, 0, 0]);
     GIFT_PHASE.store(90, Ordering::Release);
+    // And then this thread *waits to die*. Its exit is the event under test:
+    // the last thread leaving ends the domain, and ending the domain is what
+    // must end the lending — so the harness first observes the world with
+    // the lending alive, then releases this thread, and its exit is the
+    // program-dies-holding-a-connection story with nothing staged about it.
+    while GIFT_PHASE.load(Ordering::Acquire) < 91 {
+        core::hint::spin_loop();
+    }
     sched::exit()
 }
 
@@ -1436,6 +1479,59 @@ fn gift_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     wait_until(|| GIFT_PHASE.load(Ordering::Acquire) >= 90, 8_000);
     wait_millis(100);
+
+    // RFC 0022 step 3: the lender's death ends the lending. The harness
+    // stands in for the recipient's address space — it maps the lent object
+    // exactly as a ring-3 service would map a gifted ring — and then kills
+    // the lending domain. Three things must be true afterwards, each a
+    // different half-life the teardown could get wrong: the *mapping* is
+    // removed by revocation (freed frames still mapped elsewhere would be
+    // pages another domain reads after reuse); the *object* is gone; and the
+    // *capability* the service was gifted resolves to nothing, its quota
+    // charge released, because a name for a dead object is a slot the
+    // service can never use and was still paying for.
+    let mut lending_ended = false;
+    let identity = GIFT_OBJECT.load(Ordering::Acquire);
+    if identity != u64::MAX
+        && let Ok(mut space) = vm::AddressSpace::new(hhdm_base)
+    {
+        let id = shared::MemoryId::from_u64(identity);
+        let at = bhaskix_boot::VirtAddr(0x0000_0000_2100_0000);
+        let mapped =
+            shared::map_into(id, &mut space, at, bhaskix_mm::Protection::ReadWrite).is_ok();
+        let held = domain::with(server_side, |owner| owner.cspace.get(7)).flatten();
+        let resolves = |slot| cap::with_arena(|arena| arena.lookup(slot).is_some());
+        let named_before = held.is_some_and(resolves);
+        let unmapped_before = shared::revocations();
+
+        // Release the client; its exit is the last thread leaving, which
+        // ends the domain, which must end the lending.
+        GIFT_PHASE.store(91, Ordering::Release);
+        wait_until(|| !shared::live(id), 4_000);
+
+        let unmapped = shared::revocations() == unmapped_before + 1;
+        let object_gone = !shared::live(id);
+        // The object's death and the sweep of its names happen in that order
+        // under different locks, and `live` flips between them — so a single
+        // read here can land in the gap. The claim is that the sweep
+        // *happens*, not that no instruction separates it from the destroy;
+        // the wait converges at once when it does and times out red when it
+        // does not.
+        wait_until(|| !held.is_some_and(resolves), 2_000);
+        let named_after = held.is_some_and(resolves);
+        GIFT_PHASE.store(92, Ordering::Release);
+        space.destroy();
+        GIFT_LENDING_BITS.store(
+            u32::from(mapped)
+                | u32::from(named_before) << 1
+                | u32::from(unmapped) << 2
+                | u32::from(object_gone) << 3
+                | u32::from(!named_after) << 4,
+            Ordering::Release,
+        );
+        lending_ended = mapped && named_before && unmapped && object_gone && !named_after;
+    }
+
     let _ = ipc::destroy(endpoint);
     domain::destroy(server_side);
     domain::destroy(client_side);
@@ -1446,24 +1542,27 @@ fn gift_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let landed = GIFT_LANDED.load(Ordering::Relaxed);
     // Every recorded byte must be 1 — the phase ran and its check passed.
     // Phases: 1 sanity, 2 gifted, 3 consumed, 4 no-GRANT refusal,
-    // 5 restoration, 6 no-declaration refusal.
-    let ok = (1..=6u32).all(|phase| (saw >> (phase * 8)) & 0xff == 1)
-        // The refused calls were never delivered: three delivered calls
-        // carried gifts or sanity (phases 1, 2, 5) plus the closing call —
+    // 5 restoration, 6 no-declaration refusal, 7 a memory object lent.
+    let ok = (1..=7u32).all(|phase| (saw >> (phase * 8)) & 0xff == 1)
+        // The refused calls were never delivered: five delivered calls
+        // (phases 1, 2, 5, 7's declare-then-gift pair) plus the closing one —
         // the refusals of phases 4 and 6 must not appear as served messages.
-        && served == 4
-        && landed == 2;
+        && served == 6
+        && landed == 3
+        && lending_ended;
     if ok {
         println!(
             "    gift           a capability crossed in a call, landed only where declared, was \
              consumed by its ride; a giftless call was untouched; no declaration refused the \
              call rather than delivering it bare; no GRANT refused the call whole and restored \
-             the declaration it could not use"
+             the declaration it could not use; and the lender's death unmapped, destroyed and \
+             unnamed what it had lent"
         );
     } else {
+        let bits = GIFT_LENDING_BITS.load(Ordering::Acquire);
         println!(
             "\x1b[91m    gift           FAILED: phases {saw:#x}, served {served}, landed \
-             {landed}\x1b[0m"
+             {landed}, lending ended {lending_ended} (bits {bits:#07b})\x1b[0m"
         );
     }
     ok
