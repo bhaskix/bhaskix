@@ -546,11 +546,12 @@ fn perform(
                     continue;
                 };
                 if let Ok(written) = segment::write(&mut bytes, &built, service.me, destination) {
+                    let before_handover = rdtsc();
                     // SAFETY: the back ring is mapped writable at BACK_AT.
                     if unsafe { send_entry(service.me, destination, &bytes[..written]) } {
                         service.sent += 1;
                         if length > 0 {
-                            stamp_once(7);
+                            stamp_once_at(7, before_handover);
                         }
                     }
                 }
@@ -1164,12 +1165,24 @@ fn serve_handover_only() -> ! {
 /// because a "last" would be overwritten by whatever traffic came after the
 /// exchange being attributed.
 fn stamp_once(index: u64) {
+    stamp_once_at(index, rdtsc());
+}
+
+/// The same, with a moment captured earlier by the caller.
+///
+/// The emit stamp needs this: the ring write *is* the hand-over, and the
+/// consumer on the other CPU — woken by the doorbell inside it — can take
+/// and stamp the segment before this program's next instruction runs. A
+/// stamp taken after the write therefore lands after the consumer's on most
+/// boots, and the attribution called itself out of order. Captured before,
+/// recorded after success, the stamp is both early enough and honest.
+fn stamp_once_at(index: u64, moment: u64) {
     // SAFETY: this program's own report page, mapped writable at start; the
     // words above 6 belong to this instrument alone.
     unsafe {
         let at = (REPORT_AT + index * 8) as *mut u64;
         if core::ptr::read_volatile(at) == 0 {
-            core::ptr::write_volatile(at, rdtsc());
+            core::ptr::write_volatile(at, moment);
         }
     }
 }

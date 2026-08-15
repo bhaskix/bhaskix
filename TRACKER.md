@@ -757,6 +757,22 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (the stamp inversion resolved: a ring write is a hand-over, and the consumer can outrun the producer's next instruction)
+
+**The owed re-attribution is paid, and the lesson is a concurrency one worth keeping.** The
+pipeline's emit stamp was taken *after* `send_entry` — but the ring write is the hand-over
+itself, and the doorbell inside it wakes the consumer on another CPU, which can take and stamp
+the segment before the producer's next instruction runs. On most boots it did, by hundreds of
+microseconds, and the attribution rightly called itself out of order. The moment is now captured
+*before* the hand-over and recorded after success — early enough to order, honest enough to
+mean "emit". Four consecutive boots attribute cleanly.
+
+**What the ordered first-echo attribution now shows**: deliver-to-seen holds at 100–140 µs (the
+memory-wait optimisation standing), and the cold first echo's cost lives in **emit-to-wire at
+2.4–5.7 ms** — the protocol service's cold-path cadence — versus steady-state medians of
+0.5–2 ms. A first-echo instrument prices the cold path by construction; the medians price the
+steady state; both are now labelled as what they are.
+
 ### 2026-08-15 (second capture, ranks decoded — and the ranks disproved the simple story)
 
 **The third hunt suite caught the hang again, this time with rank masks**: cpu 0 lit
