@@ -40,6 +40,20 @@ const CONNECTION: u64 = 4;
 
 /// Where the report page maps in this program's space.
 const REPORT_AT: u64 = 0x2300_0000;
+/// Where this program maps its own rings. It owns them; mapping is not a
+/// grant, and the same pages are mapped by the service once gifted — that
+/// double mapping *is* the shared stream.
+const SENDR_AT: u64 = 0x2400_0000;
+const RECVR_AT: u64 = 0x2410_0000;
+
+/// What the demonstration sends, and must receive back unchanged. Sixteen
+/// bytes, one segment: SYN, SYN·ACK, ACK, data, echo, FIN, FIN — every arrow
+/// of the diagram every TCP text draws, and now the data rides rings this
+/// program owns.
+const PAYLOAD: &[u8] = b"bhaskix-tcp-0001";
+
+/// The machine-state numbers the service packs into `RECV` replies.
+const STATE_ESTABLISHED: u64 = 4;
 
 /// First eight bytes of the report: "TCPC_RPT" says the mapping worked.
 const MARKER: u64 = 0x5450_525f_4350_4354;
@@ -67,6 +81,16 @@ mod outcome {
     /// The reply said the rings arrived, but the declared slot is empty —
     /// the reply-carried half of the exchange failed.
     pub const UNLANDED: u64 = 5;
+    /// The payload went out through the send ring and came back through the
+    /// receive ring byte-for-byte. Terminal success: RFC 0020's echo, in
+    /// RFC 0022's rings, asserted by the program that owns them.
+    pub const ECHOED: u64 = 6;
+    /// Bytes came back, and they were not the bytes sent.
+    pub const MANGLED: u64 = 7;
+    /// The connection capability works but the machine has no network: the
+    /// service answered `UNREACHABLE` when asked to stream. Terminal, and
+    /// the truthful ending on a machine with no wire.
+    pub const DARK: u64 = 8;
 }
 
 #[panic_handler]
@@ -185,6 +209,35 @@ extern "C" fn tcpc_main() -> ! {
     report_word(0, MARKER);
     report(0, outcome::STARTING, 0);
 
+    // The rings are this program's own; map them and put the payload in the
+    // send ring *before* gifting — the bytes are in place before the service
+    // ever sees the pages, which is the ownership story told in the right
+    // order.
+    if call(
+        syscall::INVOKE,
+        SEND_RING,
+        method::ATTACH,
+        [SENDR_AT, 1, 0, 0],
+    )
+    .0 != status::OK
+        || call(
+            syscall::INVOKE,
+            RECV_RING,
+            method::ATTACH,
+            [RECVR_AT, 1, 0, 0],
+        )
+        .0 != status::OK
+    {
+        report(0, outcome::REFUSED, 0xA);
+        exit();
+    }
+    for (index, byte) in PAYLOAD.iter().enumerate() {
+        // SAFETY: this program's own send ring, just mapped read-write.
+        unsafe {
+            core::ptr::write_volatile((SENDR_AT + index as u64) as *mut u8, *byte);
+        }
+    }
+
     // Leg 0: the send ring crosses. Leg 1: the receive ring. Each is one
     // `HAND` and one `CONNECT`, and each ring is a `Memory` object this
     // domain owns — which is what makes RFC 0022 step 3 mean something here:
@@ -256,9 +309,102 @@ extern "C" fn tcpc_main() -> ! {
     let (landed, kind, _) = call(syscall::INVOKE, CONNECTION, method::INFO, [0; 4]);
     if landed == status::NO_SUCH_CAPABILITY {
         report(4, outcome::UNLANDED, landed);
-    } else {
-        report(4, outcome::CONNECTED, kind ^ value_2);
+        exit();
     }
+    report(4, outcome::CONNECTED, kind ^ value_2);
+
+    // RFC 0022 step 4b: the stream. The payload is already in the send ring
+    // (written before the rings were gifted); wait for establishment, tell
+    // the service the bytes exist, wait for the echo, read it back out of
+    // memory this program owns, and say what came.
+    let mut echoed = false;
+    let mut state = 0u64;
+    for stage in 0..3u64 {
+        let mut done = false;
+        for _ in 0..50_000u32 {
+            let (called, word, packed) = call(syscall::CALL, CONNECTION, tcp::RECV, [0, 0, 0, 0]);
+            if called != status::OK {
+                report(5 + stage, outcome::REFUSED, called << 16);
+                exit();
+            }
+            if word == tcp::UNREACHABLE {
+                // No wire on this machine. The capability answered — that
+                // was step 4a's claim — and the truthful end of the stream's
+                // story here is that there is nobody to stream to.
+                report(5 + stage, outcome::DARK, 0);
+                exit();
+            }
+            if word != tcp::OK {
+                report(5 + stage, outcome::REFUSED, word << 16);
+                exit();
+            }
+            state = packed >> 32;
+            let available = packed & 0xffff_ffff;
+            done = match stage {
+                // Stage 0: the handshake. Stage 1: the echo's return.
+                // Stage 2: the close acknowledged — any state past
+                // `Established` will do; the full `TIME_WAIT` lifetime is
+                // the service's report to make, on real time.
+                0 => state == STATE_ESTABLISHED,
+                1 => available >= PAYLOAD.len() as u64,
+                _ => state != STATE_ESTABLISHED,
+            };
+            if done {
+                break;
+            }
+            let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+        }
+        if !done {
+            report(5 + stage, outcome::STUCK, state);
+            exit();
+        }
+        match stage {
+            0 => {
+                let (sent, _, _) = call(
+                    syscall::CALL,
+                    CONNECTION,
+                    tcp::SEND,
+                    [PAYLOAD.len() as u64, 0, 0, 0],
+                );
+                if sent != status::OK {
+                    report(5, outcome::REFUSED, sent << 8);
+                    exit();
+                }
+            }
+            1 => {
+                // The echo, read from pages this program owns. This is the
+                // sentence the whole RFC chain exists for: the peer's bytes
+                // are *here*, in memory no kernel wired and no service
+                // allocated.
+                echoed = (0..PAYLOAD.len()).all(|index| {
+                    // SAFETY: this program's own receive ring, mapped
+                    // read-write at RECVR_AT before the exchange began.
+                    let byte =
+                        unsafe { core::ptr::read_volatile((RECVR_AT + index as u64) as *const u8) };
+                    byte == PAYLOAD[index]
+                });
+                if !echoed {
+                    report(6, outcome::MANGLED, 0);
+                    exit();
+                }
+                let (closed, _, _) = call(syscall::CALL, CONNECTION, tcp::SHUTDOWN, [0; 4]);
+                if closed != status::OK {
+                    report(6, outcome::REFUSED, closed << 8);
+                    exit();
+                }
+            }
+            _ => {}
+        }
+    }
+    report(
+        8,
+        if echoed {
+            outcome::ECHOED
+        } else {
+            outcome::MANGLED
+        },
+        state,
+    );
     exit()
 }
 

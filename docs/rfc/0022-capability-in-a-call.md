@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft. **Steps 1–3 and 4a implemented 2026-08-15** — a staged capability crosses at the rendezvous, refusals refuse whole and restore, a lender's death unmaps and unnames, and `bin/tcpc` hands two rings across `CONNECT` and receives the connection capability back, kernel-wired nothing. Step 4b (the stream rides the gifted rings) remains. |
+| **Status** | Draft, **fully implemented 2026-08-15** (steps 1–4) — a staged capability crosses at the rendezvous, refusals refuse whole and restore, a lender's death unmaps and unnames, and RFC 0020's echo now rides rings the client owns and gifted across `CONNECT`, with the connection capability minted back in the reply. Ready for acceptance review. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel, ABI |
 | **Milestone** | Phase 2 — required before [RFC 0020](0020-tcp.md)'s connection capabilities |
@@ -298,6 +298,21 @@ Each step leaves the tree green.
    occupancy is probed by *refusal shape* — an empty slot fails to resolve
    (`NO_SUCH_CAPABILITY`), an occupied one reaches method dispatch and is refused differently.
 
-   **Step 4b remains**: the stream rides the gifted rings — `SEND`/`RECV` against the mapped
-   pages, the demonstration moves out of the service into `bin/tcpc`, and the service's internal
-   kernel-wired connection retires.
+   **Step 4b done 2026-08-15** — the stream rides the gifted rings, and the RFC's purpose is
+   discharged. `CONNECT` leg 2 now *opens the connection*: tuple from the leg's arguments, initial
+   sequence number from RFC 6528 over the secret drawn at start, `SYN` on the wire before the
+   reply. The state machine's `Emit`s read stream bytes out of the caller's send ring (offset
+   `k % ring`, still there for retransmission because the tail advances on `ACK`); delivered
+   bytes are written into the caller's receive ring at the mirrored offset; `SEND` is
+   `Event::Wrote`, `RECV` answers `(state, delivered)` packed in a word, `SHUTDOWN` is the
+   half-close. The demonstration moved out of the service into `bin/tcpc`, which writes the
+   payload into its own send ring *before* gifting, and asserts the echo by reading its own
+   receive ring — the peer's bytes arrive in memory no kernel wired and no service allocated.
+   The service's kernel-wired internal connection is retired; its outcomes 6 (`ECHOED`) and 8
+   (`MANGLED`) are retired numbers, because whether the payload came back is the caller's finding
+   now. On a no-network machine the connection capability answers `UNREACHABLE`, and the client
+   ends with that truth. Watched failing both ways through the data path: emit-zeros-not-the-ring
+   turns the client's echo `MANGLED`; never-deliver leaves it stuck waiting for bytes that never
+   reach the ring. Debt recorded in the code and `RECV`'s ABI doc: the advertised window is fixed
+   below the ring's size, and RFC 0020's window-follows-free-space arrives with the connection
+   table.

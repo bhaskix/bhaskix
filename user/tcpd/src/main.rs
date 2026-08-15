@@ -99,35 +99,28 @@ const MARKER: u64 = 0x3144_5043_5444_0a54;
 /// written by the same kernel code.
 const CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
 
-/// The address this program's demonstration connects to.
-///
-/// RFC 0020 step 5: the harness's `guestfwd` peer, a host-side `cat` behind
-/// `10.0.2.100:9` that echoes the stream until EOF. Deterministic on every
-/// boot, which is what a live network never is — a hardcoded address is
-/// acceptable in a demonstration for the same reason `bin/ipd` pings a
-/// hardcoded gateway, and a configured route stays the honest general answer
-/// nothing here can read yet.
-const PEER: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 100);
+/// Bytes in a caller's gifted stream ring. The stream's byte `k` lives at
+/// offset `k % STREAM_RING_BYTES`; with a window no wider than the ring,
+/// unacknowledged bytes are never overwritten by the wrap.
+const STREAM_RING_BYTES: usize = 4 * 4096;
 
-/// The port the echo peer answers on. Nine is `discard` by tradition; here it
-/// is whatever the harness forwarded, and the number matters only in that both
-/// ends agree.
-const DEMO_PORT: u16 = 9;
+/// The largest payload one `Emit` is honoured for. The machine bounds emits
+/// by the peer's window, not by this program's buffers; an emit wider than
+/// this is refused and counted rather than truncated, because a truncated
+/// stream is corruption with extra steps. The demonstration sends sixteen
+/// bytes; this bound is for the machine's future, not its present.
+const MAX_EMIT: usize = 1024;
 
-/// What the demonstration sends, and must receive back unchanged.
-///
-/// Sixteen bytes, so it fits one segment and the whole exchange is
-/// SYN, SYN·ACK, ACK, data, echo, FIN, FIN — every arrow of the diagram every
-/// TCP text draws, produced by a state machine that was host-tested against a
-/// simulated peer and is now talking to a real one.
-const DEMO_PAYLOAD: &[u8] = b"bhaskix-tcp-0001";
+/// The local port a connection uses. One connection, one port; a port
+/// allocator arrives with the connection table. Above the well-known range,
+/// and fixed so the report is deterministic.
+const LOCAL_PORT: u16 = 49999;
 
-/// The local port the demonstration uses. Above the well-known range, and
-/// fixed so the report is deterministic.
-const DEMO_LOCAL: u16 = 49999;
-
-/// The receive window the demonstration advertises: what a page holds.
-const DEMO_WINDOW: u16 = 4096;
+/// The receive window a connection advertises: what a page holds. Narrower
+/// than the client's ring on purpose — the ring bounds what can be stored,
+/// the window what the peer may send, and the window must never exceed the
+/// ring or the wrap overwrites bytes the client has not read.
+const WINDOW: u16 = 4096;
 
 /// There is nothing to unwind and nowhere to print to.
 #[panic_handler]
@@ -354,38 +347,20 @@ mod outcome {
     /// Retransmissions ran out. The `SYN`s went to the ring; whether anything
     /// beyond `ipd` heard them, this machine cannot say.
     pub const UNREACHABLE: u64 = 2;
-    /// The connection opened and the payload has been sent; the echo is not
-    /// back yet. The steady state only if the peer swallows data it accepted.
+    /// A caller's connection opened. The stream is the caller's story now —
+    /// RFC 0022 step 4b moved the bytes into rings the caller owns — so for
+    /// this service the steady state is exactly this.
     pub const ESTABLISHED: u64 = 3;
     /// The machine cannot be unpredictable, so nothing was attempted.
     pub const NO_ENTROPY: u64 = 4;
     /// There is no network to demonstrate against.
     pub const NO_NETWORK: u64 = 5;
-    /// The payload came back byte-for-byte and the close is under way.
-    /// With the connection in `TIME_WAIT`, this is RFC 0020 step 5's gate:
-    /// connect, echo, orderly close, all through three domains and a wire.
-    pub const ECHOED: u64 = 6;
+    // 6 was ECHOED, retired by RFC 0022 step 4b: whether the payload came
+    // back is the *caller's* finding now, asserted against rings it owns.
+    // The number is left unassigned so old logs still read unambiguously.
     /// `TIME_WAIT` was entered **and left**: the full lifetime of a
     /// connection, first byte to freed control block, on real time.
     pub const ORDERLY: u64 = 7;
-    /// Something came back that was not the payload sent. Distinct from
-    /// silence, because a peer that corrupts is a different finding from a
-    /// peer that is absent.
-    pub const MANGLED: u64 = 8;
-}
-
-/// Where the demonstration has got to. Drives the one-shot events — write
-/// once, shut down once — that the state machine must not be handed twice.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Demo {
-    /// Waiting for the handshake to complete.
-    Opening,
-    /// The payload is written into the machine; watching for the echo.
-    Sent,
-    /// The echo matched and `Shutdown` has been driven.
-    Closing,
-    /// Nothing more to do.
-    Done,
 }
 
 /// One armed deadline per timer, as absolute nanoseconds.
@@ -463,14 +438,13 @@ struct Service {
     sent: u64,
     /// Entries refused before they reached the machine.
     refused: u64,
-    /// Which one-shot demonstration events have been driven.
-    demo: Demo,
-    /// What the peer has echoed back, in order. Step 5 stands in for the
-    /// program's receive ring; the machine only ever reported *counts*, and
-    /// these are the bytes those counts were about.
-    echo: [u8; DEMO_PAYLOAD.len()],
-    /// How many of those bytes have arrived.
-    echoed: usize,
+    /// Whether a caller's connection is live: rings mapped, `Connect`
+    /// driven. Until then the machine is `Closed` and the stream offsets
+    /// mean nothing.
+    streaming: bool,
+    /// Bytes of the peer's stream written into the caller's receive ring,
+    /// cumulative. What `RECV` answers with.
+    delivered: u64,
 }
 
 /// Performs what one `step` asked for.
@@ -480,21 +454,38 @@ fn perform(service: &mut Service, actions: &state::Actions) {
             Action::Emit(emit) => {
                 // An `Emit` names a *range of the stream*, not bytes — the
                 // design that keeps the machine pure — and this is where the
-                // range becomes bytes. The demonstration's send stream is
-                // [`DEMO_PAYLOAD`], standing in for the program ring a real
-                // client supplies; byte `k` of the stream carries sequence
-                // `iss + 1 + k`, the `+ 1` being the `SYN`'s own number.
+                // range becomes bytes. RFC 0022 step 4b: the send stream
+                // lives in the ring the caller gifted, mapped at `SENDR_AT`;
+                // byte `k` of the stream carries sequence `iss + 1 + k`, the
+                // `+ 1` being the `SYN`'s own number, and sits at offset
+                // `k % STREAM_RING_BYTES`. Retransmission is the same read:
+                // the tail of the ring advances on `ACK`, not transmission,
+                // so the bytes are still there.
+                let length = usize::from(emit.length);
+                if length > MAX_EMIT || (length > 0 && !service.streaming) {
+                    // Refused and counted rather than truncated: a truncated
+                    // stream is corruption with extra steps. A zero-length
+                    // emit — pure `ACK`, `SYN`, `FIN` — carries no stream
+                    // bytes and rides regardless.
+                    service.refused += 1;
+                    continue;
+                }
                 let offset = emit
                     .sequence
                     .0
                     .wrapping_sub(service.tcb.iss.0.wrapping_add(1))
                     as usize;
-                let payload = DEMO_PAYLOAD
-                    .get(offset..)
-                    .and_then(|from| from.get(..usize::from(emit.length)))
-                    .unwrap_or(&[]);
-                let built = emit.segment(service.tcb.connection, payload);
-                let mut bytes = [0u8; segment::MAX_HEADER + DEMO_PAYLOAD.len()];
+                let mut payload = [0u8; MAX_EMIT];
+                for (index, slot) in payload.iter_mut().enumerate().take(length) {
+                    let at = (offset + index) % STREAM_RING_BYTES;
+                    // SAFETY: the caller's send ring, mapped readable at
+                    // `SENDR_AT` before `streaming` was set; `at` stays
+                    // within it by the modulus.
+                    *slot =
+                        unsafe { core::ptr::read_volatile((SENDR_AT + at as u64) as *const u8) };
+                }
+                let built = emit.segment(service.tcb.connection, &payload[..length]);
+                let mut bytes = [0u8; segment::MAX_HEADER + MAX_EMIT];
                 let Some(destination) = service.tcb.connection.remote.v4() else {
                     continue;
                 };
@@ -640,14 +631,23 @@ fn drain_forward(service: &mut Service) {
         let advanced = service.tcb.rcv_nxt.0.wrapping_sub(before.0) as usize;
         let fin_took = usize::from(service.tcb.fin_received && !fin_before);
         let delivered = advanced.saturating_sub(fin_took);
-        if delivered > 0 {
+        if delivered > 0 && service.streaming {
+            // Byte `k` of the peer's stream is sequence `irs + 1 + k`,
+            // mirroring the send side, and lands at `k % STREAM_RING_BYTES`
+            // of the ring the caller gifted for exactly this. The window
+            // advertised is narrower than the ring, so the wrap cannot
+            // overwrite bytes the caller has not read.
             let at = before.0.wrapping_sub(service.tcb.irs.0.wrapping_add(1)) as usize;
             for (index, byte) in parsed.payload.iter().take(delivered).enumerate() {
-                if let Some(slot) = service.echo.get_mut(at + index) {
-                    *slot = *byte;
+                let slot = (at + index) % STREAM_RING_BYTES;
+                // SAFETY: the caller's receive ring, mapped writable at
+                // `RECVR_AT` before `streaming` was set; the modulus keeps
+                // the offset within it.
+                unsafe {
+                    core::ptr::write_volatile((RECVR_AT + slot as u64) as *mut u8, *byte);
                 }
             }
-            service.echoed = service.echoed.max((at + delivered).min(service.echo.len()));
+            service.delivered += delivered as u64;
         }
     }
 }
@@ -755,6 +755,61 @@ fn connect_leg(handover: &mut Handover, leg: u64) -> (u64, u64) {
     }
 }
 
+/// Answers one `CONNECT` leg on a machine that has a network.
+///
+/// Legs 0 and 1 are [`connect_leg`] unchanged. Leg 2 is where step 4b
+/// diverges from 4a: with both rings mapped, asking for the connection
+/// capability now also *opens the connection* — the tuple comes from the
+/// leg's own arguments, the initial sequence number from RFC 6528's
+/// construction over the secret drawn at start, and the `SYN` goes to the
+/// wire before the reply goes to the caller. The caller polls the returned
+/// capability for establishment; this thread must not block on a handshake
+/// while other work arrives.
+fn connect_leg_serving(
+    handover: &mut Handover,
+    service: &mut Service,
+    args: [u64; 4],
+) -> (u64, u64) {
+    if args[2] != 2 {
+        return connect_leg(handover, args[2]);
+    }
+    if !(handover.send_mapped && handover.recv_mapped) {
+        return (tcp::BARE, 2);
+    }
+    if !service.streaming {
+        let connection = FourTuple {
+            local: Address::V4(service.me),
+            local_port: Port(LOCAL_PORT),
+            remote: Address::V4(Ipv4Addr(args[0] as u32)),
+            remote_port: Port(args[1] as u16),
+        };
+        service.tcb = Tcb::new(connection);
+        let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
+        drive(
+            service,
+            Event::Connect {
+                iss,
+                window: WINDOW,
+            },
+        );
+        arm_nearest(service);
+        service.streaming = true;
+    }
+    if handover.handle == 0 {
+        handover.handle = tcp::handle(0, 1, false);
+    }
+    let handed = call(
+        syscall::INVOKE,
+        ENDPOINT,
+        method::HAND,
+        [ENDPOINT, rights::READ | rights::WRITE, handover.handle, 0],
+    );
+    if handed.0 != status::OK {
+        return (tcp::BARE, 0x20 | handed.0);
+    }
+    (tcp::OK, handover.handle)
+}
+
 /// Serves ring handovers and nothing else, on a machine with no network.
 ///
 /// The exchange RFC 0022 step 4 exists for needs no wire: rings cross, the
@@ -770,11 +825,17 @@ fn serve_handover_only() -> ! {
     };
     loop {
         declare_gift_slot(&handover);
-        let (status_in, _badge, method_in, args) = receive();
+        let (status_in, badge, method_in, args) = receive();
         if status_in != status::OK {
             continue;
         }
-        if method_in == tcp::CONNECT {
+        if handover.handle != 0 && badge == handover.handle {
+            // A stream method on the connection this machine minted but
+            // cannot serve: without a wire the peer is unreachable, and
+            // saying so is what lets the caller end with the truth rather
+            // than a timeout.
+            reply(tcp::UNREACHABLE, 0, 0);
+        } else if method_in == tcp::CONNECT {
             let (outcome_word, detail) = connect_leg(&mut handover, args[2]);
             reply(outcome_word, detail, 0);
         } else {
@@ -894,40 +955,31 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     }
     bits |= state_bits::CONFIGURED;
 
-    // The demonstration connection: this machine to the harness's echo peer.
-    // The initial sequence number is RFC 6528's construction over the key
-    // drawn above — the first sequence number this system has ever minted
-    // that an off-path attacker cannot predict.
-    let connection = FourTuple {
+    // No connection yet, and that is RFC 0022 step 4b: connections are
+    // *opened by callers*, whose `CONNECT` legs gift the rings the stream
+    // will live in. The machine starts `Closed` under a placeholder tuple
+    // that matches no segment; `connect_leg` replaces it when a caller has
+    // handed both rings and asks.
+    let placeholder = FourTuple {
         local: Address::V4(me),
-        local_port: Port(DEMO_LOCAL),
-        remote: Address::V4(PEER),
-        remote_port: Port(DEMO_PORT),
+        local_port: Port(LOCAL_PORT),
+        remote: Address::V4(Ipv4Addr::UNSPECIFIED),
+        remote_port: Port(0),
     };
     let mut service = Service {
         key,
         hertz,
         me,
-        tcb: Tcb::new(connection),
+        tcb: Tcb::new(placeholder),
         deadlines: Deadlines::new(),
         tail: 0,
         outcome: outcome::PENDING,
         taken: 0,
         sent: 0,
         refused: 0,
-        demo: Demo::Opening,
-        echo: [0u8; DEMO_PAYLOAD.len()],
-        echoed: 0,
+        streaming: false,
+        delivered: 0,
     };
-    let iss = isn::initial_sequence(&service.key, connection, now_nanos(hertz));
-    drive(
-        &mut service,
-        Event::Connect {
-            iss,
-            window: DEMO_WINDOW,
-        },
-    );
-    arm_nearest(&service);
 
     // Bind the inbox to this thread, so `receive` wakes for a caller, a frame
     // or a deadline — whichever comes first — and says which.
@@ -941,26 +993,11 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     };
 
     loop {
-        // The demonstration's one-shot events, driven by what the machine has
-        // reached rather than by a schedule.
-        if service.tcb.state == state::State::Established && service.demo == Demo::Opening {
+        if service.streaming
+            && service.tcb.state == state::State::Established
+            && service.outcome == outcome::PENDING
+        {
             service.outcome = outcome::ESTABLISHED;
-            service.demo = Demo::Sent;
-            drive(&mut service, Event::Wrote(DEMO_PAYLOAD.len() as u32));
-            arm_nearest(&service);
-        }
-        if service.demo == Demo::Sent && service.echoed >= DEMO_PAYLOAD.len() {
-            if &service.echo[..] == DEMO_PAYLOAD {
-                // The whole point of the boot: sixteen bytes out through
-                // three domains, sixteen back, unchanged. Close in order.
-                service.outcome = outcome::ECHOED;
-                service.demo = Demo::Closing;
-                drive(&mut service, Event::Shutdown);
-                arm_nearest(&service);
-            } else {
-                service.outcome = outcome::MANGLED;
-                service.demo = Demo::Done;
-            }
         }
         report(
             bits,
@@ -972,7 +1009,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         );
 
         declare_gift_slot(&handover);
-        let (status_in, _badge, method_in, args) = receive();
+        let (status_in, badge, method_in, args) = receive();
         if status_in == status::NOTIFIED {
             // A frame, a deadline, or both — the word does not say which
             // deadline, so both halves are checked. Cheap: one is a ring header
@@ -985,12 +1022,42 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         if status_in != status::OK {
             continue;
         }
-        // A caller. RFC 0022 step 4a: `CONNECT` legs carry the rings across
-        // and the connection capability back. The stream does not ride the
-        // gifted rings yet — that is step 4b — so every other method is an
-        // honest "not yet", distinguishable from a missing service.
-        if method_in == tcp::CONNECT {
-            let (outcome_word, detail) = connect_leg(&mut handover, args[2]);
+        // A caller, told apart by badge: the service capability carries the
+        // caller's badge and answers `CONNECT`; the connection capability
+        // carries the handle this service minted, and answers the stream.
+        if handover.handle != 0 && badge == handover.handle {
+            match method_in {
+                tcp::SEND => {
+                    // "I have written `args[0]` more bytes into the send
+                    // ring." No payload in the message — the ring is where
+                    // the bytes are, and the `Emit`s this drives read them
+                    // from it.
+                    drive(&mut service, Event::Wrote(args[0] as u32));
+                    arm_nearest(&service);
+                    reply(tcp::OK, 0, 0);
+                }
+                tcp::RECV => {
+                    // "How far has the peer's stream reached?" The reply
+                    // carries the cumulative bytes delivered into the
+                    // caller's receive ring, and the machine's state, packed
+                    // into one word. `args[0]` (bytes consumed) is accepted
+                    // and unused: the advertised window is fixed at less
+                    // than the ring, so consumption cannot yet widen it —
+                    // RFC 0020's window-follows-free-space is owed by the
+                    // connection table's step, and this comment is the debt
+                    // recorded.
+                    let packed = state_number(&service.tcb) << 32 | service.delivered;
+                    reply(tcp::OK, packed, 0);
+                }
+                tcp::SHUTDOWN => {
+                    drive(&mut service, Event::Shutdown);
+                    arm_nearest(&service);
+                    reply(tcp::OK, 0, 0);
+                }
+                _ => reply(tcp::LATER, 0, 0),
+            }
+        } else if method_in == tcp::CONNECT {
+            let (outcome_word, detail) = connect_leg_serving(&mut handover, &mut service, args);
             reply(outcome_word, detail, 0);
         } else {
             reply(tcp::LATER, 0, 0);

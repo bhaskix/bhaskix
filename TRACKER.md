@@ -124,7 +124,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **TM1** | Time and timers | ✅ **Accepted** 2026-08-14 | **A deadline is a property of a notification, not a new object.** `Invoke(notification, ARM, deadline)` asks the kernel to signal it later; the program waits through RFC 0010's machinery, so a service handles callers, frames and expiring timers in one loop with one blocking call. Absolute deadlines, because a duration read before being descheduled becomes a lie. **Reading time is deliberately not a capability**: `rdtsc` is unprivileged on this machine and a `Clock` object would guard nothing — being *woken* is the scarce thing. Accepted with all four steps, and its open question 2 answered against it and then fixed: the measurement found the deadline had no effect on the wake instant at all, and arming now re-programs the timer. Questions 1 and 3 stay open, and 1 is sharper for the fix. | [RFC 0019](docs/rfc/0019-time-and-timers.md) |
 | **NW2** | TCP | ⬜ Draft | **A state machine that can be tested without a network.** `bin/tcpd` in its own domain, and a **pure transition function** in `bhaskix-net` — no I/O, no clock, no allocation — so loss, reordering, backoff and close are host tests against a virtual clock rather than things a live network refuses to reproduce. A connection's **stream lives in the program's pages**, so the receive window *is* the program's free space and a connection costs the memory of whoever opened it. Minimal but correct, with every absence named: no congestion control, window scaling, SACK, timestamps, PMTU discovery, keepalive or urgent data. Found a prerequisite it could not write around — **the system has no source of randomness at all**, and a TCP initial sequence number must be unpredictable. | [RFC 0020](docs/rfc/0020-tcp.md) |
 | **R1** | A source of unpredictability | ✅ **Accepted** 2026-08-14 | **The system cannot produce an unpredictable number, and nothing had noticed until RFC 0020 needed one.** No `RDRAND`, no `RDSEED`, no pool; even KASLR's slide is the bootloader's. The proposal is deliberately small because **`RDRAND` is unprivileged** — so there is no capability to design and no syscall to add, the same finding RFC 0019 made about `rdtsc`. What is left is a shared implementation that gets the failure mode right (the carry flag, a bounded retry, and `None` that is never turned into a number), a boot-time probe beside `nx`/`smep`/`smap`, and a policy: **the caller refuses**, not the kernel. Found on the way that `bin/ipd` hands out ephemeral ports as `49152 + index`, and that `security.md` claims a heap-base randomisation the system does not perform. | [RFC 0021](docs/rfc/0021-unpredictability.md) |
-| **CR2** | A capability in a call | ⬜ Draft — steps 1–3 and 4a implemented 2026-08-15 | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
+| **CR2** | A capability in a call | ⬜ Draft — **fully implemented 2026-08-15**, steps 1–4; ready for acceptance review | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
@@ -754,6 +754,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-15 (RFC 0022 step 4b: the stream lives in the program's pages)
+
+**RFC 0020's echo now rides rings the client owns, and RFC 0022's purpose is discharged.**
+`CONNECT` leg 2 opens the connection for real — tuple from the leg's arguments, initial sequence
+number from RFC 6528 over the secret drawn at start, `SYN` on the wire before the reply reaches
+the caller. The state machine's `Emit`s read stream bytes out of the caller's gifted send ring
+(byte `k` at `k % ring`, still there for retransmission because the ring's tail advances on `ACK`
+and not on transmission — RFC 0020's no-second-copy claim, now running); delivered bytes go into
+the gifted receive ring at the mirrored offset. `SEND` is `Event::Wrote`; `RECV` answers
+`(state, delivered)` packed in a word; `SHUTDOWN` is the half-close. On the wire: five segments
+each way, the machine through `TIME_WAIT`, every boot.
+
+**The demonstration moved out of the service into `bin/tcpc`**, which writes the payload into
+its own send ring *before* gifting — the bytes are in place before the service ever sees the
+pages — and asserts the echo by reading its own receive ring: the peer's bytes arrive in memory
+no kernel wired and no service allocated. The service's kernel-wired internal connection is
+retired, with its `ECHOED`/`MANGLED` outcomes: whether the payload came back is the caller's
+finding now, which is where RFC 0020 always said it belonged. On a machine with no network the
+connection capability answers `UNREACHABLE` and the client ends with that truth — both boot
+modes gated, both arms honest.
+
+**Watched failing through the data path, not the control path**: emit-zeros-instead-of-the-ring
+turns the client's echo `MANGLED` (the payload that came back was never faked from service
+memory); never-deliver leaves the client stuck waiting for bytes that never reached its ring
+(`delivered` counts real ring writes, not machine progress). Debt recorded in code and ABI doc:
+the advertised window is fixed below the ring's size; window-follows-free-space arrives with the
+connection table, alongside `LISTEN`/`ACCEPT` (RFC 0020 step 5's inbound half) and a port
+allocator.
 
 ### 2026-08-15 (RFC 0022 step 4a: two rings cross in calls, and the connection capability comes back)
 

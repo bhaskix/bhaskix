@@ -5969,8 +5969,10 @@ fn report_net_after_exchange(hhdm: u64) {
                 core::ptr::read_volatile((hhdm + pages[0] + 16) as *const u64),
             )
         };
-        // Terminal: anything but "pending" and "established, echo owed".
-        if marker == TCPD_MARKER && outcome != 0 && outcome != 3 {
+        // Terminal for this wait: anything but "pending". Established counts,
+        // because the stream that used to complete inside this service now
+        // completes in the caller — whose own bounded wait follows this one.
+        if marker == TCPD_MARKER && outcome != 0 {
             break;
         }
         wait_millis(100);
@@ -5997,7 +5999,7 @@ fn report_net_after_exchange(hhdm: u64) {
                 core::ptr::read_volatile((hhdm + pages[0] + 16) as *const u64),
             )
         };
-        if marker == TCPC_MARKER && outcome != 0 {
+        if marker == TCPC_MARKER && outcome >= 3 {
             break;
         }
         wait_millis(100);
@@ -6209,17 +6211,23 @@ fn report_tcp_client(hhdm: u64) {
     let said = match outcome {
         0 => "still mid-exchange, which after the wait above means stuck",
         1 => "rings accepted, connection capability still owed",
-        2 => {
-            "handed both rings across CONNECT and holds the connection capability the service \
-             minted back -- both directions of the mechanism in one exchange, kernel-wired \
-             nothing"
-        }
+        2 => "connected, stream still in flight",
         3 => "a handover leg was refused",
         4 => "gave up: the service kept answering LATER",
         5 => "the reply said yes but the declared slot stayed empty",
+        6 => {
+            "handed both rings across CONNECT, took the connection capability the service minted \
+             back, and the payload went out through its own send ring and came back through its \
+             own receive ring unchanged -- the stream lives in the program's pages"
+        }
+        7 => "bytes came back through the ring, and they were not the bytes sent",
+        8 => {
+            "holds a working connection capability on a machine with no network; the service \
+             said unreachable when asked to stream, which is this machine's truthful ending"
+        }
         _ => "an outcome this kernel does not know",
     };
-    if outcome == 2 {
+    if outcome == 6 || outcome == 8 {
         println!("    tcp client     {said}");
     } else {
         println!(
@@ -6259,12 +6267,12 @@ fn report_tcp_domain(hhdm: u64) {
         0 => "still pending",
         1 => "refused by the network",
         2 => "unanswered until the bounded retransmissions ran out",
-        3 => "established, echo not yet back",
+        3 => "a caller's connection is open; the stream is the caller's story",
         4 => "refused by this service: the machine cannot be unpredictable",
-        5 => "no network to demonstrate against",
-        6 => "the payload came back unchanged and the close is under way",
-        7 => "echoed, closed in order, and TIME_WAIT expired",
-        8 => "the peer answered with bytes that were not the payload sent",
+        5 => "no network; serving ring handovers only",
+        6 => "retired outcome 6 from before the stream moved to the caller",
+        7 => "closed in order, and TIME_WAIT expired",
+        8 => "retired outcome 8 from before the stream moved to the caller",
         _ => "an outcome this kernel does not know",
     };
     println!(

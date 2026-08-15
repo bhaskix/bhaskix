@@ -674,11 +674,17 @@ pub mod tcp {
     pub const ACCEPT: u64 = 60;
 
     /// On a connection: "I have written `arg0` bytes into the send ring."
-    /// No payload crosses in the message; the ring is where the bytes are.
+    /// No payload crosses in the message; the ring is where the bytes are —
+    /// the `Memory` object the program gifted at `CONNECT` leg 0, whose byte
+    /// `k` of the stream sits at `k` modulo the ring's size.
     pub const SEND: u64 = 61;
 
-    /// On a connection: "I have consumed `arg0` bytes." The reply says how
-    /// many are available.
+    /// On a connection: how far has the peer's stream reached? The reply's
+    /// second word packs the machine's state (high 32 bits) over the
+    /// cumulative bytes delivered into the gifted receive ring (low 32).
+    /// `arg0` (bytes consumed) is accepted and not yet used: the advertised
+    /// window is fixed below the ring's size, and window-follows-free-space
+    /// arrives with the connection table.
     pub const RECV: u64 = 62;
 
     /// Half-close: no more data this way. The other direction keeps working,

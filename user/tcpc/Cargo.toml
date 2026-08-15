@@ -29,8 +29,8 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-# 19, measured, no headroom: the syscall block, the report-page writes, and
-# the deliberate ud2 in the panic handler. This program holds two rings it
-# never touches by address in step 4a -- the bytes ride them in step 4b,
-# which is when this number moves.
-unsafe_budget = 19
+# 23, measured, no headroom: the syscall block, the report-page writes, the
+# deliberate ud2 in the panic handler -- and, since step 4b, the payload
+# written into this program's own send ring and the echo read back out of
+# its own receive ring, which is the whole point of owning them.
+unsafe_budget = 23

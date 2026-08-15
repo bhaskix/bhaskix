@@ -1044,12 +1044,17 @@ fi
 # marked blocked (sched::clear_blocked_mark is the fix and carries the story),
 # and with it fixed the demonstration completes on every boot that completes.
 # A stall here is a regression now, not weather.
-if grep -qE "tcpd +state 0xf \(attached/keyed/configured/serving\), outcome (6|7): " "$LOG"; then
-    pass "tcp connected to the echo peer, the payload came back unchanged, and the close is orderly"
+# RFC 0022 step 4b moved the echo assertion out of this service: whether the
+# payload came back is bin/tcpc's finding now, made against rings it owns and
+# gated below. What this service still owes every networked boot is the
+# connection itself -- outcome 3, a caller's connection open, or 7 if the
+# boot lasted long enough to see TIME_WAIT expire.
+if grep -qE "tcpd +state 0xf \(attached/keyed/configured/serving\), outcome (3|7): " "$LOG"; then
+    pass "tcp opened a caller's connection against the deterministic peer"
 elif grep -qE "tcpd +state 0x3 \(attached/keyed/configured/serving\), outcome 5" "$LOG"; then
     pass "the tcp domain drew its secret, found no network, and said so"
 else
-    fail "the tcp demonstration did not complete against the deterministic peer"
+    fail "the tcp service did not open the caller's connection"
     grep -E "tcpd|tcp domain" "$LOG" || true
     status=1
 fi
@@ -1066,10 +1071,17 @@ fi
 # even on a machine that has none -- which is itself part of the change,
 # because the old no-network path exited and left the endpoint dead with
 # every future caller queued against it.
-if grep -qE "tcp client +handed both rings across CONNECT and holds the connection capability" "$LOG"; then
-    pass "two rings crossed in calls and the connection capability came back where EXPECT said"
+# Step 4b: the gate's success arm is the stream, not just the handover. On a
+# networked boot the payload must leave through the client's own send ring
+# and return through its own receive ring unchanged; on a machine with no
+# network the connection capability must still answer, saying unreachable --
+# the truthful ending there, and still proof the whole exchange worked.
+if grep -qE "tcp client +handed both rings across CONNECT, took the connection capability" "$LOG"; then
+    pass "the stream lives in the program's pages: echoed through rings the client owns"
+elif grep -qE "tcp client +holds a working connection capability on a machine with no network" "$LOG"; then
+    pass "no network, but the handover completed and the connection capability answered honestly"
 else
-    fail "the ring handover did not complete"
+    fail "the ring handover or the stream through it did not complete"
     grep -E "tcp client" "$LOG" || true
     status=1
 fi
