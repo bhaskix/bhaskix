@@ -549,6 +549,9 @@ fn perform(
                     // SAFETY: the back ring is mapped writable at BACK_AT.
                     if unsafe { send_entry(service.me, destination, &bytes[..written]) } {
                         service.sent += 1;
+                        if length > 0 {
+                            stamp_once(7);
+                        }
                     }
                 }
             }
@@ -766,6 +769,7 @@ fn drain_forward(service: &mut Service) {
             if let Some(connection) = service.connections[index].as_mut() {
                 connection.delivered += delivered as u64;
             }
+            stamp_once(8);
         }
     }
 }
@@ -1148,6 +1152,24 @@ fn serve_handover_only() -> ! {
             reply(outcome_word, detail, 0);
         } else {
             reply(tcp::LATER, 0, 0);
+        }
+    }
+}
+
+/// Stamps the cycle counter into report word `index`, first time only.
+///
+/// The pipeline attribution instrument: the first payload emit and the first
+/// payload delivery each leave one timestamp, and the kernel lines them up
+/// with the client's and the protocol service's after boot. First-only,
+/// because a "last" would be overwritten by whatever traffic came after the
+/// exchange being attributed.
+fn stamp_once(index: u64) {
+    // SAFETY: this program's own report page, mapped writable at start; the
+    // words above 6 belong to this instrument alone.
+    unsafe {
+        let at = (REPORT_AT + index * 8) as *mut u64;
+        if core::ptr::read_volatile(at) == 0 {
+            core::ptr::write_volatile(at, rdtsc());
         }
     }
 }

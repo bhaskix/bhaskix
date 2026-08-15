@@ -58,4 +58,6 @@ opt-level = "s"
 # 131 at RFC 0020 step 4: the forward and back rings to bin/tcpd -- two more
 # regions another domain shares, read and written through the same one pair of
 # copy routines as before, which is why seventeen lines buys two rings.
-unsafe_budget = 131
+# Nine more at the pipeline attribution: the rdtsc read and the stamp-once
+# report words for the first data segment out and in.
+unsafe_budget = 140

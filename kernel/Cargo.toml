@@ -210,7 +210,10 @@ workspace = true
 # 1219 at RFC 0020 step 6: the client's six measurement words, read out of
 # its report page through the direct map for the printer -- the same shape
 # as every report word above, ten lines in count.
-unsafe_budget = 1219
+#
+# 1220 at the pipeline attribution: one more report-page word read through
+# the direct map, the same shape as every report word above.
+unsafe_budget = 1220
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

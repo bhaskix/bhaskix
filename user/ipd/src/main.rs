@@ -710,6 +710,9 @@ unsafe fn forward_tcp(source: Ipv4Addr, destination: Ipv4Addr, segment: &[u8]) -
         TCP_FORWARDED.load(core::sync::atomic::Ordering::Relaxed) + 1,
         core::sync::atomic::Ordering::Relaxed,
     );
+    if segment.len() > 32 {
+        stamp_once(22);
+    }
     true
 }
 
@@ -782,6 +785,13 @@ fn drain_tcp_back(me: (MacAddr, Ipv4Addr), gateway: MacAddr, tail: &mut u64) {
                 TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed) + 1,
                 core::sync::atomic::Ordering::Relaxed,
             );
+            // Only a payload-bearing segment: the first thing through here
+            // is the handshake's SYN, and the stamp must line up with the
+            // first *data* the other stamps time. Thirty-two bytes clears
+            // every header-plus-options shape the handshake produces.
+            if body_length > 32 {
+                stamp_once(21);
+            }
         }
     }
 }
@@ -1881,6 +1891,34 @@ fn report(
         slot.store(value, core::sync::atomic::Ordering::Relaxed);
     }
     write_report(words);
+}
+
+/// Reads the cycle counter, for the pipeline stamps. Unprivileged:
+/// `CR4.TSD` is clear on this machine.
+fn rdtsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: reads a counter and touches no memory.
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Stamps the cycle counter into report word `index`, first time only.
+///
+/// The pipeline attribution instrument: the first TCP segment out to the
+/// wire and the first one forwarded inward each leave a timestamp, and the
+/// kernel lines them up with the TCP service's and the client's after boot.
+fn stamp_once(index: u64) {
+    // SAFETY: this program's own report page; the words above twenty belong
+    // to this instrument alone.
+    unsafe {
+        let at = (REPORT_AT + index * 8) as *mut u64;
+        if core::ptr::read_volatile(at) == 0 {
+            core::ptr::write_volatile(at, rdtsc());
+        }
+    }
 }
 
 /// Puts ten words on the report page.

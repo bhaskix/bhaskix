@@ -757,6 +757,41 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (the echo's milliseconds attributed: six stamps, five hops, one owner)
+
+**The per-stage instrument RFC 0024's closure note asked for exists, and the first attribution
+is in.** Four programs each stamp their own report page with the cycle counter as the boot's
+first echoed payload passes through them — the client's send and seen, the TCP service's first
+payload emit and first delivery, the protocol service's first data segment out to the wire and
+first forwarded in — stamped once, so later traffic cannot overwrite the exchange being
+attributed, with the protocol service's stamps guarded to payload-bearing sizes so the
+handshake's `SYN` does not masquerade as data. The kernel lines the six stamps up after boot
+(one counter, every CPU, so subtraction is attribution), prints the five hops, refuses to print
+a half-attribution, and the boot gate demands the line's presence on networked boots.
+
+**First reading, whole echo 3,800 µs**: send→emit 355, emit→wire 170, wire-and-peer 711,
+wire→deliver 516, **deliver→seen 2,046 — one hop owns 54 %**, and it is not the scheduler
+(wake-to-dispatch p50 is 54 µs): it is the client's poll-cycle structure between the service
+delivering bytes and the client observing them — up to three IPC round trips per wait iteration
+(the consuming `RECV`, the `ARM`, the `WAIT`), each costing the ~350–500 µs that every hop shows
+as its base unit. The recurring unit itself — an IPC call plus a serve-loop pass — is now the
+named quantity, visible in three of the five hops. Where this points next: fewer calls per wait
+(fold the consume into the wake-up `RECV`), and the IPC round trip's own cost as a measured
+target — with the instrument now in place to price any attempt.
+
+One process lesson, recorded because it cost three boots today: **two QEMUs cannot share the
+harness** — the second fails to bind the fixed `hostfwd` port and dies with an empty serial log,
+and a background boot-hunt invalidates itself the moment the foreground rebuilds the ISO it
+boots. Hunts run alone, on a committed image.
+
+And one load-flake named while validating this change: under full-suite load the deterministic
+peer stopped being deterministic — slirp's `cat` stalled past the ~2.5 s the eight backed-off
+retransmissions cover, `bin/tcpd` correctly declared the connection `UNREACHABLE` mid-bulk, and
+the suite went red for a boot doing exactly what RFC 0020 specifies when a peer dies. Seen once;
+the rerun was green. If it recurs, the choice is the harness's (a less loadable peer) or the
+policy's (more patience before `UNREACHABLE`), and it should be made against a count of
+occurrences, not this single one.
+
 ### 2026-08-15 (the one-in-fifteen boot hang is finally captured, and the next one will explain itself)
 
 **The transient that failed four suite runs today without ever leaving a log left one.** A BIOS

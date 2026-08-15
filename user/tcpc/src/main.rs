@@ -499,6 +499,14 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             }
         }
         let begun = rdtsc();
+        if index == 0 {
+            // The pipeline attribution's first stamp (RFC 0020 step 6's
+            // follow-on instrument): the services each stamp their first
+            // payload hop once, and the kernel lines the stamps up after
+            // boot. First-echo-only, because later traffic — the bulk, the
+            // inbound serve — would overwrite a "last" into meaninglessness.
+            report_word(10, begun);
+        }
         stream_send(PAYLOAD.len() as u64, 6);
         sent_bytes += PAYLOAD.len() as u64;
         let mut waited = 0u32;
@@ -517,6 +525,9 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             wait_for_news(WAKE, hertz);
         }
         *sample = rdtsc().wrapping_sub(begun);
+        if index == 0 {
+            report_word(11, rdtsc());
+        }
     }
     samples.sort_unstable();
     report_word(5, samples[0]);

@@ -49,4 +49,6 @@ opt-level = "s"
 # step 4b, the caller's gifted stream rings: emits read from the send ring,
 # deliveries written into the receive ring. No device register anywhere in
 # it, which is the argument for this domain existing.
-unsafe_budget = 105
+# 114 at the pipeline attribution: the stamp-once report words for the
+# first payload emit and the first delivery.
+unsafe_budget = 114

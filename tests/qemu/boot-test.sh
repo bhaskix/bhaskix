@@ -1123,6 +1123,13 @@ if grep -qE "tcp client +echoed outbound" "$LOG" && ! grep -qE "tcp measure +han
     status=1
 fi
 
+# ...and the per-stage pipeline attribution, same rule: values ungated,
+# presence demanded, because an instrument that vanishes is a regression.
+if grep -qE "tcp client +echoed outbound" "$LOG" && ! grep -qE "tcp pipeline +send to emit [0-9]+ us" "$LOG"; then
+    fail "the networked boot produced no pipeline attribution"
+    status=1
+fi
+
 if grep -qE "tcp client +echoed outbound through rings it owns, then listened, accepted" "$LOG"; then
     if [[ -f "$INBOUND_VERDICT" ]]; then
         pass "both directions: outbound echoed, and a host-initiated connection was accepted and served"
