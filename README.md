@@ -31,9 +31,10 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > capabilities it holds and nothing else — the block driver, the console, and the filesystem each
 > run as services in their own domains, outside the kernel.
 >
-> **What is not here.** Networking reaches UDP and stops: a virtio-net driver, a protocol service
-> and a DHCP client, each in its own domain, obtain an address from the network and return a ping's
-> payload unchanged — but there is no TCP, no IPv6, and no sockets API beyond UDP. No package
+> **What is not here.** No IPv6, and no sockets API beyond UDP and TCP's own — networking itself
+> is real as of 2026-08-15: a virtio-net driver, a protocol service and a TCP service, each in its
+> own domain, carry a byte stream both directions through rings the connecting *program* owns and
+> hands over as capabilities, with the cost measured rather than argued about. No package
 > management, no libc, no self-hosting. The ELF
 > loader has had its 24 hours of fuzzing, as of 2026-08-13, with no crash and no artifact. **Nothing has ever booted on physical hardware** —
 > every claim above is QEMU, and M1-17 is blocked on a machine, not on code. Nothing here should run

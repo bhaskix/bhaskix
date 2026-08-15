@@ -149,7 +149,7 @@ physical hardware, and the ELF loader has not had its 24 hours of fuzzing.
 Order within the phase is flexible; dependencies are noted. Done so far — see
 [TRACKER.md](../TRACKER.md) §4 for the detail: shared memory and notifications, the service
 framework, IOMMU discovery and per-device domains, the driver framework, the full VFS, and process
-management. Networking runs as far as UDP. What remains is TCP and a sockets API above it, the
+management. Networking runs through TCP, both directions, measured. What remains is a sockets API worth the name, the
 telemetry plane, `bhaskixboot.efi`, package management, and libc.
 
 - ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
@@ -191,18 +191,19 @@ telemetry plane, `bhaskixboot.efi`, package management, and libc.
   plan: the second driver — `bin/blkd`, in a domain — cost three bugs the first one had already
   learned and written down in comments, and a framework is the difference between a lesson recorded
   and a lesson enforced
-- 🟡 **Networking** — `PARTIAL`. [RFC 0018](rfc/0018-networking.md) is **accepted, all seven steps**:
-  virtio-net in a domain, Ethernet, ARP, IPv4, ICMP and UDP in a `no_std` crate with six fuzz
-  targets, a socket that is a badged capability rather than a descriptor, and the folded-domain
-  measurement that priced the boundary. A ring 3 program holding a socket and a page obtains an
-  address by DHCP, which is this roadmap's "does useful network I/O" met by demonstration.
-  **Not done:** TCP — [RFC 0020](rfc/0020-tcp.md), **drafted 2026-08-14**. ~~It waits on RFC 0019
-  because nothing in this system can yet wait for a length of time~~ — that was true until
-  2026-08-14, when [RFC 0019](rfc/0019-time-and-timers.md) was accepted and a deadline became
-  something a program can be woken by. It now waits on
-  [RFC 0021](rfc/0021-unpredictability.md) instead, because a TCP sequence number must be
-  unpredictable and this system cannot yet produce an unpredictable number. Also not done: IPv6, and
-  any sockets API above UDP
+- 🟢 **Networking** — `DONE within its RFCs`, 2026-08-15. [RFC 0018](rfc/0018-networking.md)
+  (accepted, all seven steps): virtio-net in a domain, Ethernet, ARP, IPv4, ICMP and UDP in a
+  `no_std` crate with six fuzz targets, a socket that is a badged capability rather than a
+  descriptor, DHCP by demonstration. [RFC 0020](rfc/0020-tcp.md) (implemented, all six steps): a
+  pure host-tested state machine in `bin/tcpd`, RFC 6528 initial sequence numbers from
+  [RFC 0021](rfc/0021-unpredictability.md)'s hardware draw, and a client program — `bin/tcpc` —
+  that echoes sixteen bytes and thirty-two KiB both directions through **rings its own domain
+  owns and hands over as capabilities** ([RFC 0022](rfc/0022-capability-in-a-call.md),
+  implemented), outbound against a deterministic peer and inbound from a host-initiated
+  connection, with handshake, round trip and throughput measured as distributions and every wait
+  wake-driven ([RFC 0023](rfc/0023-a-wake-for-a-connection.md), implemented). The four TCP-era
+  RFCs await acceptance review. **Not done:** IPv6, reassembly, congestion control, and a sockets
+  API above what the services themselves speak
 - ⬜ **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing
   tool
 - ⬜ **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
