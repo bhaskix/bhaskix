@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | **Closed without shipping, 2026-08-15** — built, measured, refuted by its own pre-stated target's instrument, and reverted. The record below is the deliverable. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`sched`, `trap`) |
 | **Milestone** | Phase 2 — the change wake-to-dispatch's numbers ask for, and the home M4-10b's slice-policy questions were waiting on |
@@ -135,3 +135,33 @@ Each step leaves the tree green.
    under 50 µs, watched red by disabling the flag.
 3. **The re-measurement**: RFC 0023's distribution rerun, before/after in TRACKER, and the
    switch-count delta recorded beside it.
+
+---
+
+**Closure note, 2026-08-15.** Steps 1 and 2 were built — a per-CPU resched flag set by local
+wakes, consumed by `preempt()`, acted on at the syscall-return and claimed-interrupt exits — and
+step 3's measurement refuted the premise before the mechanism shipped, in two moves:
+
+1. **The mean was the wrong statistic.** The wake-to-dispatch instrument gained a log₂ histogram,
+   and the percentiles it revealed — **p50 54 µs, p99 218 µs** — showed the 414 µs "mean" was a
+   handful of seconds-long bring-up outliers spread across sixteen thousand fast wakes. One
+   four-second wake alone contributes ~240 µs of mean.
+2. **The mechanism changed nothing.** With the flag disabled the percentiles are identical:
+   p50 54 µs, p99 218 µs. The common wakers already hand over promptly — a service that signals
+   returns to its receive and blocks within microseconds, and every interrupt-context wake exits
+   through arms that already preempt. There was no gap for the flag to close.
+
+So the scheduler is **exonerated**, this document's motivation dissolves, and the mechanism was
+reverted rather than shipped as reassurance code — the same rule that keeps data structures from
+being built without customers keeps preemption hooks from being kept without effects. What
+survives: the percentile instrument (now the boot line the gate demands), and a sharpened
+question with its suspect list — RFC 0023's wake-driven round-trip median of 1.4–3.1 ms is *not*
+scheduler latency, so it lives in the event pipeline between the wire and the wake: the protocol
+service's own serve loop, its fallback deadline cadence, or slirp. Attributing it needs
+per-stage timestamps, which is a future instrument, not this RFC.
+
+The grant-floor policy table in the design above also did not survive contact with the code: this
+scheduler is EEVDF — `pick_next` chooses by real-time priority then earliest virtual deadline,
+with no slice protection to override — so the anti-ping-pong policy the table proposed already
+exists as the deadline arithmetic. Kept as drafted for the record of what was believed before
+measuring.

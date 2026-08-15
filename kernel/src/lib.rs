@@ -1109,6 +1109,29 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
         println!("    cpu {cpu}  thread {id}  {name}  {class}  {state:?}  {runs} runs");
     });
 
+    // The pick's own inputs, because a captured hang showed Ready threads
+    // with zero runs starving behind a fair runner -- which earliest-
+    // virtual-deadline makes impossible unless the deadlines are not what
+    // the rule assumes, or preemption is vetoed. Both suspects print here.
+    println!("  What the fair pick compares, and what can veto it:");
+    sched::for_each_verdict(|cpu, id, name, state, deadline, vruntime| {
+        if !matches!(state, sched::State::Finished) {
+            println!(
+                "    cpu {cpu}  thread {id}  {name}  {state:?}  deadline {deadline}  vruntime \
+                 {vruntime}"
+            );
+        }
+    });
+    for cpu in 0..bhaskix_arch::percpu::online_count() as usize {
+        let holds = crate::sync::holds_on(cpu);
+        if holds != 0 {
+            println!(
+                "    cpu {cpu} HOLDS {holds} lock(s) by its count -- preemption is vetoed there, \
+                 and if this line appears in a stall, the leak is the stall"
+            );
+        }
+    }
+
     // Said out loud, because the walk above cannot say it. `for_each` skips a
     // CPU whose runqueue it cannot read, and says nothing about the skip -- so
     // an unreadable CPU contributes no lines and looks exactly like a CPU with
@@ -8654,8 +8677,11 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     if wakes > 0 && wake_hertz != 0 {
         let micros = |ticks: u64| (u128::from(ticks) * 1_000_000 / u128::from(wake_hertz)) as u64;
         println!(
-            "    wake to run    {} wakes; mean {} us, worst {} us from marked ready to dispatched",
+            "    wake to run    {} wakes; p50 {} us, p99 {} us, mean {} us, worst {} us from \
+             marked ready to dispatched",
             wakes,
+            micros(sched::wake_to_run_percentile(50)),
+            micros(sched::wake_to_run_percentile(99)),
             micros(wake_cycles / wakes),
             micros(wake_worst),
         );

@@ -125,7 +125,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **NW2** | TCP | ⬜ Draft | **A state machine that can be tested without a network.** `bin/tcpd` in its own domain, and a **pure transition function** in `bhaskix-net` — no I/O, no clock, no allocation — so loss, reordering, backoff and close are host tests against a virtual clock rather than things a live network refuses to reproduce. A connection's **stream lives in the program's pages**, so the receive window *is* the program's free space and a connection costs the memory of whoever opened it. Minimal but correct, with every absence named: no congestion control, window scaling, SACK, timestamps, PMTU discovery, keepalive or urgent data. Found a prerequisite it could not write around — **the system has no source of randomness at all**, and a TCP initial sequence number must be unpredictable. | [RFC 0020](docs/rfc/0020-tcp.md) |
 | **R1** | A source of unpredictability | ✅ **Accepted** 2026-08-14 | **The system cannot produce an unpredictable number, and nothing had noticed until RFC 0020 needed one.** No `RDRAND`, no `RDSEED`, no pool; even KASLR's slide is the bootloader's. The proposal is deliberately small because **`RDRAND` is unprivileged** — so there is no capability to design and no syscall to add, the same finding RFC 0019 made about `rdtsc`. What is left is a shared implementation that gets the failure mode right (the carry flag, a bounded retry, and `None` that is never turned into a number), a boot-time probe beside `nx`/`smep`/`smap`, and a policy: **the caller refuses**, not the kernel. Found on the way that `bin/ipd` hands out ephemeral ports as `49152 + index`, and that `security.md` claims a heap-base randomisation the system does not perform. | [RFC 0021](docs/rfc/0021-unpredictability.md) |
 | **CR2** | A capability in a call | ⬜ Draft — **fully implemented 2026-08-15**, steps 1–4; ready for acceptance review | **The symmetric half of RFC 0016**, drafted because the missing direction has now blocked two accepted designs: RFC 0015's file handles (worked around by reply-lending) and RFC 0020's connection rings (not workable around — the buffered alternative is the one RFC 0020's own table rejects). One rule stated twice: `EXPECT` declares where an incoming capability may land, `HAND` attaches one to the next outgoing message, and the direction comes from what the thread holds rather than from a new method pair. The caller's `HAND` **stages**; the transfer completes at the rendezvous, atomically with the message — no declaration, no delivery, so a caller cannot fill a service's slots uninvited. Chosen over buffered streams with the user on 2026-08-15. | [RFC 0022](docs/rfc/0022-capability-in-a-call.md) |
-| **SC1** | Preemption on wake | ⬜ Draft | **A wake may end the running thread's slice.** Remote wakes already IPI-and-preempt; a same-CPU wake waits out the runner's 3 ms slice — the measured mean 414 µs to 1 ms gap that RFC 0023's instrument convicted the scheduler of. Narrow policy (rt always wins; fair wins after a 500 µs grant floor, by vruntime), acted on at the safe points that already exist. M4-10b's wheel is deferred *with its trigger written down* rather than left waiting. Target stated before the work: mean under 50 µs. | [RFC 0024](docs/rfc/0024-preemption-on-wake.md) |
+| **SC1** | Preemption on wake | ❎ **Closed without shipping** 2026-08-15 — built, measured as a no-op, reverted; the RFC's closure note is the deliverable | **A wake may end the running thread's slice.** Remote wakes already IPI-and-preempt; a same-CPU wake waits out the runner's 3 ms slice — the measured mean 414 µs to 1 ms gap that RFC 0023's instrument convicted the scheduler of. Narrow policy (rt always wins; fair wins after a 500 µs grant floor, by vruntime), acted on at the safe points that already exist. M4-10b's wheel is deferred *with its trigger written down* rather than left waiting. Target stated before the work: mean under 50 µs. | [RFC 0024](docs/rfc/0024-preemption-on-wake.md) |
 | **NW3** | A wake for a connection | ⬜ Draft — **implemented 2026-08-15**, all three steps, with a verdict the draft did not predict | **A connection may carry a notification, and the service rings it** — one more gift on `CONNECT`/`LISTEN` (RFC 0022's leg 3), signalled on `Delivered`, `Acknowledged` and state change, so the client blocks in `WAIT` instead of the yield-spin RFC 0020 step 6 measured as the round-trip floor's named cause. The state machine has produced the wake since it was written; `bin/tcpd` discards it with a comment saying a notification belongs there. Drafted from the measurement, not a guess. | [RFC 0023](docs/rfc/0023-a-wake-for-a-connection.md) |
 | **A5** | 5-level paging (LA57) | ⬜ Open | Support from day one, or assume 4-level and parameterise? | **Did not block M3, and that is the problem.** M3 is complete and shipped with 4-level paging, so the decision was made *by default in code* — which is precisely what Phase 0 exists to prevent. It is recorded as open rather than back-dated to "accepted": nobody weighed it. The cost of deciding it properly rises with every address-space path written against a fixed depth |
 
@@ -757,6 +757,49 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-15 (the one-in-fifteen boot hang is finally captured, and the next one will explain itself)
+
+**The transient that failed four suite runs today without ever leaving a log left one.** A BIOS
+boot wedged past the 120-second harness cap, and the 45-second watchdog's dump survived into the
+suite log. The snapshot, decoded: the boot thread `Running` on cpu 0 with 4,233 dispatches while
+`tcpd` and `tcpc` sat `Ready` with **zero runs** on the same CPU for tens of seconds; `ipd`
+`Running` on cpu 1 with one dispatch, consistent with its ring-3 attach-retry loop spinning
+without ever succeeding; every runqueue readable, no cross-CPU holds, no lost wakes, no dropped
+messages. The impossible part is the starvation: a fresh fair thread spawns with virtual
+deadline zero, and the earliest-virtual-deadline pick makes zero win — so either something vetoed
+preemption on cpu 0 the whole time (a leaked per-CPU hold count would: `preempt` refuses to
+deschedule a holder), or the deadlines were not what the rule assumes.
+
+Rather than guess, the watchdog dump now prints the pick's own inputs: per thread the deadline
+and vruntime the fair rule compares, and per CPU the hold count that can veto the pick — with
+the line itself saying "if this appears in a stall, the leak is the stall". The next occurrence
+answers instead of taunting. Recorded at roughly one boot in fifteen under suite load, never
+reproduced across ten deliberately logged boots in a row; the hang predates everything shipped
+today (its first two sightings came before the wake work existed).
+
+### 2026-08-15 (RFC 0024 closed without shipping: the scheduler is exonerated by percentiles)
+
+**Built, measured, refuted, reverted — and the refutation is the deliverable.** The wake-resched
+mechanism (a per-CPU flag set by local wakes, consumed by `preempt()` at the syscall-return and
+claimed-interrupt exits) went in cleanly, and step 3's measurement dissolved the premise in two
+moves. First, **the mean was the wrong statistic**: the wake-to-dispatch instrument gained a log₂
+histogram, and the percentiles read **p50 54 µs, p99 218 µs** — the "mean 414 µs" was a handful
+of seconds-long bring-up outliers spread across sixteen thousand fast wakes (one four-second wake
+contributes ~240 µs of mean by itself). Second, **the mechanism changed nothing**: with the flag
+disabled, p50 and p99 are identical. The common wakers already hand over promptly — a service
+that signals returns to its receive and blocks within microseconds, and interrupt-context wakes
+exit through arms that already preempt. There was no gap to close, so the mechanism was reverted
+rather than shipped as reassurance code; the percentile instrument stays, and its boot line is
+what the gate now demands.
+
+**Yesterday's "the scheduler is convicted" is therefore corrected**, in that entry and here: the
+scheduler is exonerated, and RFC 0023's wake-driven round-trip median of 1.4–3.1 ms lives
+somewhere in the event pipeline between the wire and the wake — the protocol service's serve
+loop, its fallback deadline cadence, or slirp. Attributing it needs per-stage timestamps, a
+future instrument. The grant-floor policy the draft proposed also did not survive contact with
+the code: this scheduler is EEVDF, and the anti-ping-pong policy already exists as the deadline
+arithmetic. The draft is kept as written, as the record of what was believed before measuring.
+
 ### 2026-08-15 (RFC 0024 drafted: preemption on wake, with its target stated before the work)
 
 The wake-to-dispatch conviction written down as a design. A wake that ought to win — rt over
@@ -771,6 +814,12 @@ time with the trigger written down: the wheel gets built when `arm_nearest`'s wa
 the lines this project already prints.
 
 ### 2026-08-15 (wake-to-dispatch measured: the scheduler is convicted, not suspected)
+
+**[Corrected the same day, one entry up: the conviction was wrong.** The mean this entry leans on
+was a bring-up-outlier artifact; the percentile instrument that followed shows p50 54 µs, and the
+mechanism built on this entry's conclusion measured as a no-op and was reverted. The entry stands
+as written because it is what was believed, and the correction stands beside it because that is
+the rule.]
 
 **The 1–3 ms RFC 0023 priced on wakes now has an owner.** Every `wake` stamps the thread with the
 cycle counter; dispatch reads and clears the stamp; the boot report prints the tallies, and a

@@ -710,6 +710,12 @@ static RESCHEDULE_IPIS: AtomicU64 = AtomicU64::new(0);
 static WAKE_TO_RUN_SUM: AtomicU64 = AtomicU64::new(0);
 static WAKE_TO_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAKE_TO_RUN_MAX: AtomicU64 = AtomicU64::new(0);
+/// Power-of-two buckets of the same delays, because a mean is the wrong
+/// statistic for a distribution with bring-up in it: one four-second outlier
+/// contributes hundreds of microseconds of mean across sixteen thousand
+/// wakes, and the median it buries is the number the design decisions need.
+/// Bucket `i` holds delays in `[2^i, 2^(i+1))` cycles.
+static WAKE_TO_RUN_BUCKETS: [AtomicU64; 48] = [const { AtomicU64::new(0) }; 48];
 
 /// The wake-to-dispatch tallies: `(count, total cycles, worst cycles)`.
 #[must_use]
@@ -719,6 +725,31 @@ pub fn wake_to_run() -> (u64, u64, u64) {
         WAKE_TO_RUN_SUM.load(Ordering::Relaxed),
         WAKE_TO_RUN_MAX.load(Ordering::Relaxed),
     )
+}
+
+/// The delay, in cycles, below which `percent` of wakes dispatched.
+///
+/// Answered from the histogram's bucket upper bounds, so the answer is at
+/// most a factor of two above the truth — plenty for the question being
+/// asked, which is "microseconds or milliseconds".
+#[must_use]
+pub fn wake_to_run_percentile(percent: u64) -> u64 {
+    let total: u64 = WAKE_TO_RUN_BUCKETS
+        .iter()
+        .map(|bucket| bucket.load(Ordering::Relaxed))
+        .sum();
+    if total == 0 {
+        return 0;
+    }
+    let want = (total * percent).div_ceil(100);
+    let mut seen = 0;
+    for (index, bucket) in WAKE_TO_RUN_BUCKETS.iter().enumerate() {
+        seen += bucket.load(Ordering::Relaxed);
+        if seen >= want {
+            return 1u64 << (index + 1);
+        }
+    }
+    WAKE_TO_RUN_MAX.load(Ordering::Relaxed)
 }
 
 /// Threads that actually went to sleep.
@@ -2187,6 +2218,8 @@ pub fn preempt() {
                 WAKE_TO_RUN_SUM.fetch_add(waited, Ordering::Relaxed);
                 WAKE_TO_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
                 WAKE_TO_RUN_MAX.fetch_max(waited, Ordering::Relaxed);
+                let bucket = (63 - waited.max(1).leading_zeros() as usize).min(47);
+                WAKE_TO_RUN_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
             }
         }
         // A new thread starts a new quantum.
@@ -2512,6 +2545,39 @@ pub fn for_each(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64, &'sta
                 thread.runs,
                 thread.migrations,
                 thread.policy.tag(),
+            );
+        }
+    }
+}
+
+/// The scheduling verdict's inputs, for the stall dump and nobody else.
+///
+/// Added after a captured one-in-fifteen bring-up hang whose snapshot could
+/// not be explained: two `Ready` threads with zero runs sat thirty-five
+/// seconds on a CPU whose fair runner kept being picked, which the earliest-
+/// virtual-deadline rule should make impossible — a fresh thread's deadline
+/// is zero and zero wins. Either something vetoes preemption on that CPU for
+/// ever (a leaked hold count would), or the deadlines are not what the rule
+/// assumes. This walk prints both, so the next occurrence answers instead of
+/// taunting: per thread the deadline and vruntime the pick compares, and per
+/// CPU the hold count that can veto the pick from ever running.
+pub fn for_each_verdict(mut f: impl FnMut(u32, u32, &'static str, State, u64, u64)) {
+    for (cpu, queue) in QUEUES
+        .iter()
+        .enumerate()
+        .take(percpu::online_count() as usize)
+    {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        for thread in queue.threads.iter().flatten() {
+            f(
+                cpu as u32,
+                thread.id,
+                thread.name,
+                thread.state,
+                thread.deadline,
+                thread.vruntime,
             );
         }
     }

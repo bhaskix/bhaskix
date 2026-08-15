@@ -419,6 +419,19 @@ pub fn holds_any() -> bool {
     holds_slot().load(Ordering::Relaxed) != 0
 }
 
+/// The hold count of a *named* CPU, for the stall dump.
+///
+/// A nonzero count on a CPU that is spinning through bounded waits is a
+/// leaked hold: `preempt` refuses to deschedule a holder, so a count that
+/// never returns to zero vetoes preemption on that CPU for ever, and every
+/// fresh thread pinned there starves at zero runs — the exact silhouette of
+/// a captured one-in-fifteen bring-up hang. Reading another CPU's count is
+/// racy and fine: the dump wants "stuck at nonzero", not an instant.
+#[must_use]
+pub fn holds_on(cpu: usize) -> u32 {
+    HOLDS[if cpu < MAX_CPUS { cpu } else { 0 }].load(Ordering::Relaxed)
+}
+
 /// How many locks this CPU holds, for the context switch to save.
 ///
 /// The count belongs to the *thread*, exactly as the rank mask does — see

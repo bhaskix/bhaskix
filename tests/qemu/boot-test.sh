@@ -1482,7 +1482,7 @@ fi
 # The scheduler's wake-to-dispatch measurement must exist on every boot:
 # wakes happen on all of them, and an instrument that vanishes is a
 # regression even when nothing gates its values.
-if grep -qE "wake to run +[0-9]+ wakes; mean [0-9]+ us" "$LOG"; then
+if grep -qE "wake to run +[0-9]+ wakes; p50 [0-9]+ us, p99 [0-9]+ us" "$LOG"; then
     pass "wake-to-dispatch is measured, not guessed"
 else
     fail "the wake-to-dispatch measurement is missing"
