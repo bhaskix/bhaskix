@@ -29,8 +29,11 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-# 23, measured, no headroom: the syscall block, the report-page writes, the
-# deliberate ud2 in the panic handler -- and, since step 4b, the payload
-# written into this program's own send ring and the echo read back out of
-# its own receive ring, which is the whole point of owning them.
-unsafe_budget = 23
+# 31, measured, no headroom: the syscall block, the report-page writes, the
+# deliberate ud2 in the panic handler, the payload written into this
+# program's own send ring and the echo read back out of its own receive
+# ring -- and, since RFC 0020 step 5, the inbound echo copied between the
+# listener's pair, plus a startup touch of every ring so a mapping that did
+# not take faults beside the attach that claimed it did, not deep in the
+# serve. Owning four rings is the whole point.
+unsafe_budget = 31

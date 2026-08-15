@@ -220,8 +220,38 @@ fi
 rm -f "$REPO_ROOT/build/domain-disk.img"
 make -C "$REPO_ROOT" build/domain-disk.img >/dev/null 2>&1 || true
 
+# RFC 0020 step 5's inbound driver: a host-side client that connects *into*
+# the guest through hostfwd, sends sixteen bytes, and demands them back.
+# Retried for the whole boot, because the guest's listener arms only after
+# its outbound demonstration completes; each attempt is cheap and the loop
+# dies with the boot. `/dev/tcp` is bash itself, so the harness needs no new
+# tool. The verdict lands in a file, because the driver is a background job
+# and its exit status would be lost. On a machine with no network the
+# connection is never accepted, the file stays absent, and the gate's dark
+# arm expects exactly that.
+INBOUND_VERDICT=$(mktemp)
+rm -f "$INBOUND_VERDICT"
+(
+    payload='bhaskix-tcp-in-1'
+    for _ in $(seq 1 "$TIMEOUT"); do
+        if exec 3<>/dev/tcp/127.0.0.1/45557 2>/dev/null; then
+            printf '%s' "$payload" >&3
+            reply=$(dd bs=1 count=16 <&3 2>/dev/null || true)
+            exec 3>&- 3<&- || true
+            if [[ "$reply" == "$payload" ]]; then
+                echo "echoed" > "$INBOUND_VERDICT"
+                exit 0
+            fi
+        fi
+        sleep 1
+    done
+) &
+INBOUND_DRIVER=$!
+
 echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
+kill "$INBOUND_DRIVER" 2>/dev/null || true
+wait "$INBOUND_DRIVER" 2>/dev/null || true
 
 status=0
 
@@ -1076,15 +1106,36 @@ fi
 # and return through its own receive ring unchanged; on a machine with no
 # network the connection capability must still answer, saying unreachable --
 # the truthful ending there, and still proof the whole exchange worked.
-if grep -qE "tcp client +handed both rings across CONNECT, took the connection capability" "$LOG"; then
-    pass "the stream lives in the program's pages: echoed through rings the client owns"
+# ...and step 5's whole answer: on a networked boot the client must have
+# echoed outbound AND accepted the host driver's inbound connection, served
+# its echo, and seen the peer close -- with the *host side* agreeing, through
+# the verdict file its driver wrote only if the sixteen bytes came back
+# byte-for-byte. Guest-side and host-side are asserted together because
+# either alone can lie: a guest that believes it served proves nothing about
+# what crossed the boundary, and a lucky reply with a wedged guest report
+# would hide a real stall.
+if grep -qE "tcp client +echoed outbound through rings it owns, then listened, accepted" "$LOG"; then
+    if [[ -f "$INBOUND_VERDICT" ]]; then
+        pass "both directions: outbound echoed, and a host-initiated connection was accepted and served"
+        rm -f "$INBOUND_VERDICT"
+    else
+        fail "the guest says it served the inbound echo; the host driver never got its bytes back"
+        status=1
+    fi
 elif grep -qE "tcp client +holds a working connection capability on a machine with no network" "$LOG"; then
-    pass "no network, but the handover completed and the connection capability answered honestly"
+    if [[ -f "$INBOUND_VERDICT" ]]; then
+        fail "a machine reporting no network answered the host driver anyway"
+        rm -f "$INBOUND_VERDICT"
+        status=1
+    else
+        pass "no network, but the handover completed and the connection capability answered honestly"
+    fi
 else
     fail "the ring handover or the stream through it did not complete"
     grep -E "tcp client" "$LOG" || true
     status=1
 fi
+rm -f "$INBOUND_VERDICT" 2>/dev/null || true
 
 # RFC 0013 step 6: a block driver in ring 3, driving a device of its own.
 #

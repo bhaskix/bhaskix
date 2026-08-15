@@ -36,10 +36,11 @@ use crate::sync::{Rank, SpinLock};
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 /// Memory objects that can exist at once.
-pub const MAX_OBJECTS: usize = 24;
-// Raised from 16 on 2026-08-12, and **this one was measured full before it was
-// raised** -- `peak_live` below reported 16 of 16 on a boot that then refused
-// to create the DHCP client's memory.
+pub const MAX_OBJECTS: usize = 32;
+// Raised from 16 on 2026-08-12, and from 24 on 2026-08-15, both **measured
+// full before being raised**: 16 of 16 on the boot that refused the DHCP
+// client's memory, 24 of 24 on the boot that refused the TCP client's
+// listener rings (RFC 0020 step 5 gives it four).
 //
 // Worth contrasting with `MAX_DOMAINS` on the same day, which was raised from
 // 32 to 64 on a misread failure and measured 9 of 64 when somebody finally

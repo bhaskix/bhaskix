@@ -666,11 +666,18 @@ pub mod tcp {
     /// below; a leg missing its ring is told [`BARE`].
     pub const CONNECT: u64 = 58;
 
-    /// Listen on a local port. Replies with a *listener* capability.
+    /// Listen on a local port. The same three-leg handover as [`CONNECT`],
+    /// because it is the same exchange: legs 0 and 1 gift the rings the
+    /// accepted connection's stream will live in, and leg 2 (`arg0` = the
+    /// port) replies with a *listener* capability — its badge carrying
+    /// bit 63, which is what makes a listener a different capability rather
+    /// than a differently-documented one.
     pub const LISTEN: u64 = 59;
 
-    /// On a listener: block until a connection is established. The reply
-    /// carries it.
+    /// On a listener: poll for an established connection. `LATER` until a
+    /// `SYN` has arrived and completed its handshake; then the reply carries
+    /// the connection capability into the slot the caller declared with
+    /// [`method::EXPECT`], exactly as `CONNECT` leg 2 does.
     pub const ACCEPT: u64 = 60;
 
     /// On a connection: "I have written `arg0` bytes into the send ring."

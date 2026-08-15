@@ -5999,7 +5999,9 @@ fn report_net_after_exchange(hhdm: u64) {
                 core::ptr::read_volatile((hhdm + pages[0] + 16) as *const u64),
             )
         };
-        if marker == TCPC_MARKER && outcome >= 3 {
+        // Six — outbound echoed — is on the way to nine on a networked
+        // machine, not an end.
+        if marker == TCPC_MARKER && outcome >= 3 && outcome != 6 {
             break;
         }
         wait_millis(100);
@@ -6103,7 +6105,12 @@ fn start_tcp_client_domain(
     // The rings, owned by the *client's* domain. `Rights::ALL` from `name`
     // is what a creator holds over its own object — including the GRANT and
     // DERIVE the gift needs.
-    for (slot, label) in [(2usize, "send"), (3usize, "receive")] {
+    for (slot, label) in [
+        (2usize, "send"),
+        (3usize, "receive"),
+        (5usize, "listener send"),
+        (6usize, "listener receive"),
+    ] {
         let ring = shared::create(realm, TCPC_RING_BYTES)
             .map_err(|_| "a tcp client ring would not be created")?;
         let ring_cap = shared::name(ring).map_err(|_| "a tcp client ring would not be named")?;
@@ -6131,7 +6138,7 @@ fn start_tcp_client_domain(
 
     TCPC_REPORT.store(report.as_u64(), Ordering::Release);
     println!(
-        "    tcp client     bin/tcpc started: two rings its domain owns, a badged capability to \
+        "    tcp client     bin/tcpc started: four rings its domain owns, a badged capability to \
          the service, and nothing wired between them by the kernel"
     );
     Ok(())
@@ -6215,19 +6222,24 @@ fn report_tcp_client(hhdm: u64) {
         3 => "a handover leg was refused",
         4 => "gave up: the service kept answering LATER",
         5 => "the reply said yes but the declared slot stayed empty",
-        6 => {
-            "handed both rings across CONNECT, took the connection capability the service minted \
-             back, and the payload went out through its own send ring and came back through its \
-             own receive ring unchanged -- the stream lives in the program's pages"
-        }
+        6 => "outbound echoed, but the inbound half never finished",
         7 => "bytes came back through the ring, and they were not the bytes sent",
         8 => {
             "holds a working connection capability on a machine with no network; the service \
              said unreachable when asked to stream, which is this machine's truthful ending"
         }
+        9 => {
+            "echoed outbound through rings it owns, then listened, accepted a connection the \
+             host initiated, served the echo back from its own pages, and saw the peer close -- \
+             both directions of RFC 0020, both through RFC 0022's rings"
+        }
+        10 => {
+            "echoed outbound, listened, and nobody called -- which is a state, not a failure: \
+             only the boot test runs a host-side caller"
+        }
         _ => "an outcome this kernel does not know",
     };
-    if outcome == 6 || outcome == 8 {
+    if outcome == 9 || outcome == 8 || outcome == 10 {
         println!("    tcp client     {said}");
     } else {
         println!(

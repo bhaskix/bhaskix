@@ -72,6 +72,9 @@ const INBOX: u64 = 6;
 const GIFT_SEND: u64 = 8;
 /// The receive ring's slot, filled by leg 1.
 const GIFT_RECV: u64 = 9;
+/// The listener's ring slots, filled by `LISTEN` legs 0 and 1.
+const GIFT_L_SEND: u64 = 10;
+const GIFT_L_RECV: u64 = 11;
 
 /// Where this program maps what it holds.
 const FWD_AT: u64 = 0x2300_0000;
@@ -82,6 +85,10 @@ const CONFIG_AT: u64 = 0x2330_0000;
 /// step 4a mapping them is the proof the handover happened.
 const SENDR_AT: u64 = 0x2340_0000;
 const RECVR_AT: u64 = 0x2350_0000;
+/// And where the listener's pair maps, taken over by the connection a `SYN`
+/// births.
+const L_SENDR_AT: u64 = 0x2360_0000;
+const L_RECVR_AT: u64 = 0x2370_0000;
 
 /// Bytes in each ring, matching what the kernel granted.
 const RING_BYTES: usize = 16 * 4096;
@@ -421,13 +428,47 @@ impl Deadlines {
     }
 }
 
+/// Live connections at once. Two: one a caller opens outbound, one a
+/// listener accepts. A table refusing at its size is this project's posture;
+/// a third caller is told `CONGESTED` rather than growing anything.
+const MAX_CONNECTIONS: usize = 2;
+
+/// The outbound connection's slot in the table, and the accepted one's.
+const OUTBOUND: usize = 0;
+const ACCEPTED: usize = 1;
+
+/// One live connection: the machine, its timers, and the rings its stream
+/// lives in — RFC 0022's gifts, mapped where the handover put them.
+struct Connection {
+    tcb: Tcb,
+    deadlines: Deadlines,
+    /// Where the caller's send ring is mapped in this program.
+    sendr_at: u64,
+    /// And its receive ring.
+    recvr_at: u64,
+    /// Bytes of the peer's stream written into the receive ring, cumulative.
+    delivered: u64,
+    /// The badge its connection capability carries.
+    handle: u64,
+}
+
+/// A port with a caller waiting behind it: RFC 0020's `LISTEN`, existing
+/// only once its rings crossed. The rings' addresses live here because the
+/// connection a `SYN` births takes them; a listener with spent rings can
+/// birth nothing more until the table's next step adds re-arming.
+struct Listener {
+    port: u16,
+    /// The badge on the listener capability, bit 63 set.
+    handle: u64,
+    sendr_at: u64,
+    recvr_at: u64,
+}
+
 /// Everything the serve loop carries.
 struct Service {
     key: Key,
     hertz: u64,
     me: Ipv4Addr,
-    tcb: Tcb,
-    deadlines: Deadlines,
     /// Where this program has read the forward ring up to.
     tail: u64,
     /// The demonstration's outcome, for the report.
@@ -438,17 +479,21 @@ struct Service {
     sent: u64,
     /// Entries refused before they reached the machine.
     refused: u64,
-    /// Whether a caller's connection is live: rings mapped, `Connect`
-    /// driven. Until then the machine is `Closed` and the stream offsets
-    /// mean nothing.
-    streaming: bool,
-    /// Bytes of the peer's stream written into the caller's receive ring,
-    /// cumulative. What `RECV` answers with.
-    delivered: u64,
+    connections: [Option<Connection>; MAX_CONNECTIONS],
+    listener: Option<Listener>,
 }
 
-/// Performs what one `step` asked for.
-fn perform(service: &mut Service, actions: &state::Actions) {
+/// Performs what one `step` asked for, against one connection's rings.
+///
+/// `index` says which table slot the connection came out of, because one
+/// duty is not the connection's own: the report's outcome word narrates the
+/// outbound demonstration, and only slot `OUTBOUND` writes it.
+fn perform(
+    service: &mut Service,
+    connection: &mut Connection,
+    index: usize,
+    actions: &state::Actions,
+) {
     for action in actions.iter() {
         match action {
             Action::Emit(emit) => {
@@ -462,7 +507,7 @@ fn perform(service: &mut Service, actions: &state::Actions) {
                 // the tail of the ring advances on `ACK`, not transmission,
                 // so the bytes are still there.
                 let length = usize::from(emit.length);
-                if length > MAX_EMIT || (length > 0 && !service.streaming) {
+                if length > MAX_EMIT {
                     // Refused and counted rather than truncated: a truncated
                     // stream is corruption with extra steps. A zero-length
                     // emit — pure `ACK`, `SYN`, `FIN` — carries no stream
@@ -473,20 +518,21 @@ fn perform(service: &mut Service, actions: &state::Actions) {
                 let offset = emit
                     .sequence
                     .0
-                    .wrapping_sub(service.tcb.iss.0.wrapping_add(1))
+                    .wrapping_sub(connection.tcb.iss.0.wrapping_add(1))
                     as usize;
                 let mut payload = [0u8; MAX_EMIT];
-                for (index, slot) in payload.iter_mut().enumerate().take(length) {
-                    let at = (offset + index) % STREAM_RING_BYTES;
-                    // SAFETY: the caller's send ring, mapped readable at
-                    // `SENDR_AT` before `streaming` was set; `at` stays
-                    // within it by the modulus.
-                    *slot =
-                        unsafe { core::ptr::read_volatile((SENDR_AT + at as u64) as *const u8) };
+                for (at_index, slot) in payload.iter_mut().enumerate().take(length) {
+                    let at = (offset + at_index) % STREAM_RING_BYTES;
+                    // SAFETY: the caller's send ring, mapped readable at the
+                    // address the handover recorded before this connection
+                    // existed; `at` stays within it by the modulus.
+                    *slot = unsafe {
+                        core::ptr::read_volatile((connection.sendr_at + at as u64) as *const u8)
+                    };
                 }
-                let built = emit.segment(service.tcb.connection, &payload[..length]);
+                let built = emit.segment(connection.tcb.connection, &payload[..length]);
                 let mut bytes = [0u8; segment::MAX_HEADER + MAX_EMIT];
-                let Some(destination) = service.tcb.connection.remote.v4() else {
+                let Some(destination) = connection.tcb.connection.remote.v4() else {
                     continue;
                 };
                 if let Ok(written) = segment::write(&mut bytes, &built, service.me, destination) {
@@ -496,39 +542,54 @@ fn perform(service: &mut Service, actions: &state::Actions) {
                     }
                 }
             }
-            Action::Arm { timer, at } => service.deadlines.arm(timer, at),
-            Action::Cancel(timer) => service.deadlines.cancel(timer),
-            // The demonstration has no program behind it to wake; the counters
-            // stand in. Step 5 signals the holder's notification here.
+            Action::Arm { timer, at } => connection.deadlines.arm(timer, at),
+            Action::Cancel(timer) => connection.deadlines.cancel(timer),
+            // The caller polls rather than sleeps, so nothing to wake; the
+            // counters stand in. A notification per connection is the next
+            // step's work if polling ever shows up in a measurement.
             Action::Delivered(_) | Action::Acknowledged(_) => {}
             Action::Closed(ended) => {
-                service.outcome = match ended {
-                    state::Ended::Refused => outcome::REFUSED,
-                    state::Ended::Unreachable => outcome::UNREACHABLE,
-                    // The good ending, reached only through `TIME_WAIT`'s
-                    // 2×MSL — a real minute of real time, so most boots end
-                    // while the state is still `TIME_WAIT` and the outcome
-                    // still `ECHOED`. Both are gated.
-                    state::Ended::Orderly => outcome::ORDERLY,
-                    state::Ended::Aborted => service.outcome,
-                    state::Ended::Reset => outcome::REFUSED,
-                };
+                if index == OUTBOUND {
+                    service.outcome = match ended {
+                        state::Ended::Refused => outcome::REFUSED,
+                        state::Ended::Unreachable => outcome::UNREACHABLE,
+                        // The good ending, reached only through `TIME_WAIT`'s
+                        // 2×MSL — a real minute of real time, so most boots
+                        // end while the state is still `TIME_WAIT`.
+                        state::Ended::Orderly => outcome::ORDERLY,
+                        state::Ended::Aborted => service.outcome,
+                        state::Ended::Reset => outcome::REFUSED,
+                    };
+                }
             }
         }
     }
 }
 
-/// Drives one event into the machine and performs what it asks.
-fn drive(service: &mut Service, event: Event<'_>) {
+/// Drives one event into the table's `index`-th machine.
+///
+/// Take-out, step, put-back: the connection leaves the table for the length
+/// of the step so `perform` can hold it and the service's counters at once.
+fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
+    let Some(mut connection) = service.connections[index].take() else {
+        return;
+    };
     let now = now_nanos(service.hertz);
-    let (tcb, actions) = state::step(service.tcb, event, now);
-    service.tcb = tcb;
-    perform(service, &actions);
+    let (tcb, actions) = state::step(connection.tcb, event, now);
+    connection.tcb = tcb;
+    perform(service, &mut connection, index, &actions);
+    service.connections[index] = Some(connection);
 }
 
-/// Arms the inbox for the nearest deadline, or disarms it.
+/// Arms the inbox for the nearest deadline of any connection, or disarms it.
 fn arm_nearest(service: &Service) {
-    match service.deadlines.nearest() {
+    let nearest = service
+        .connections
+        .iter()
+        .flatten()
+        .filter_map(|connection| connection.deadlines.nearest())
+        .min();
+    match nearest {
         Some(at) => {
             let tsc = nanos_to_tsc(at, service.hertz);
             call(syscall::INVOKE, INBOX, method::ARM, [tsc, 0, 0, 0]);
@@ -539,14 +600,19 @@ fn arm_nearest(service: &Service) {
     }
 }
 
-/// Fires every deadline that has passed.
+/// Fires every deadline that has passed, in every connection.
 fn fire_due(service: &mut Service) {
-    loop {
-        let now = now_nanos(service.hertz);
-        let Some(timer) = service.deadlines.due(now) else {
-            break;
-        };
-        drive(service, Event::Expired(timer));
+    for index in 0..MAX_CONNECTIONS {
+        loop {
+            let now = now_nanos(service.hertz);
+            let Some(timer) = service.connections[index]
+                .as_mut()
+                .and_then(|connection| connection.deadlines.due(now))
+            else {
+                break;
+            };
+            drive_at(service, index, Event::Expired(timer));
+        }
     }
 }
 
@@ -598,27 +664,50 @@ fn drain_forward(service: &mut Service) {
             service.refused += 1;
             continue;
         };
-        // One connection today: the demonstration's. A segment for any other
-        // four-tuple has nobody to belong to. Step 5 looks the tuple up in a
-        // table here instead.
-        let expected = service.tcb.connection;
-        let matches = Address::V4(source) == expected.remote
-            && Address::V4(destination) == expected.local
-            && parsed.source == expected.remote_port
-            && parsed.destination == expected.local_port;
-        if !matches {
-            service.refused += 1;
-            continue;
+        // The table lookup RFC 0020 promised where one connection used to
+        // be assumed: a segment belongs to the connection whose four-tuple
+        // it names, or — if it is a `SYN` to a port somebody is listening
+        // on — it births the accepted connection, or it has nobody.
+        let mut index = None;
+        for (candidate, connection) in service.connections.iter().enumerate() {
+            if let Some(connection) = connection {
+                let expected = connection.tcb.connection;
+                if Address::V4(source) == expected.remote
+                    && Address::V4(destination) == expected.local
+                    && parsed.source == expected.remote_port
+                    && parsed.destination == expected.local_port
+                {
+                    index = Some(candidate);
+                    break;
+                }
+            }
         }
+        let index = match index {
+            Some(index) => index,
+            None => {
+                let born = accept_syn(service, &parsed, source, destination);
+                let Some(index) = born else {
+                    service.refused += 1;
+                    continue;
+                };
+                index
+            }
+        };
         // What the machine takes, it reports as a count; the bytes behind the
         // count are captured here — `rcv_nxt` before and after telling how
         // many, with the peer's `FIN`, which occupies a number and is not a
         // byte, subtracted back out. Byte `k` of the peer's stream is sequence
         // `irs + 1 + k`, mirroring the send side.
-        let before = service.tcb.rcv_nxt;
-        let fin_before = service.tcb.fin_received;
-        let synchronised = service.tcb.state.can_receive();
-        drive(service, Event::Arrived(parsed));
+        let Some(connection) = service.connections[index].as_ref() else {
+            continue;
+        };
+        let before = connection.tcb.rcv_nxt;
+        let fin_before = connection.tcb.fin_received;
+        let synchronised = connection.tcb.state.can_receive();
+        drive_at(service, index, Event::Arrived(parsed));
+        let Some(connection) = service.connections[index].as_ref() else {
+            continue;
+        };
         // Only a synchronised connection's advance is data. A `SYN·ACK` moves
         // `rcv_nxt` from its initial zero to `irs + 1` — a wrap-sized jump that
         // read as four billion delivered bytes, whose wrapped offset then
@@ -628,28 +717,87 @@ fn drain_forward(service: &mut Service) {
         if !synchronised {
             continue;
         }
-        let advanced = service.tcb.rcv_nxt.0.wrapping_sub(before.0) as usize;
-        let fin_took = usize::from(service.tcb.fin_received && !fin_before);
+        let advanced = connection.tcb.rcv_nxt.0.wrapping_sub(before.0) as usize;
+        let fin_took = usize::from(connection.tcb.fin_received && !fin_before);
         let delivered = advanced.saturating_sub(fin_took);
-        if delivered > 0 && service.streaming {
+        if delivered > 0 {
             // Byte `k` of the peer's stream is sequence `irs + 1 + k`,
             // mirroring the send side, and lands at `k % STREAM_RING_BYTES`
             // of the ring the caller gifted for exactly this. The window
             // advertised is narrower than the ring, so the wrap cannot
             // overwrite bytes the caller has not read.
-            let at = before.0.wrapping_sub(service.tcb.irs.0.wrapping_add(1)) as usize;
-            for (index, byte) in parsed.payload.iter().take(delivered).enumerate() {
-                let slot = (at + index) % STREAM_RING_BYTES;
-                // SAFETY: the caller's receive ring, mapped writable at
-                // `RECVR_AT` before `streaming` was set; the modulus keeps
-                // the offset within it.
+            let at = before.0.wrapping_sub(connection.tcb.irs.0.wrapping_add(1)) as usize;
+            let recvr_at = connection.recvr_at;
+            for (byte_index, byte) in parsed.payload.iter().take(delivered).enumerate() {
+                let slot = (at + byte_index) % STREAM_RING_BYTES;
+                // SAFETY: the caller's receive ring, mapped writable at the
+                // address the handover recorded; the modulus keeps the
+                // offset within it.
                 unsafe {
-                    core::ptr::write_volatile((RECVR_AT + slot as u64) as *mut u8, *byte);
+                    core::ptr::write_volatile((recvr_at + slot as u64) as *mut u8, *byte);
                 }
             }
-            service.delivered += delivered as u64;
+            if let Some(connection) = service.connections[index].as_mut() {
+                connection.delivered += delivered as u64;
+            }
         }
     }
+}
+
+/// Births the accepted connection, if this segment is the `SYN` a listener
+/// has been waiting for. Returns its table slot.
+///
+/// RFC 0020's passive open, driven exactly as the state machine's host tests
+/// drive it: a fresh machine, `Event::Listen`, then the `SYN` — two steps,
+/// so the initial sequence number can be minted for the *full* four-tuple,
+/// which RFC 6528 requires and which does not exist until the `SYN` says who
+/// is calling.
+fn accept_syn(
+    service: &mut Service,
+    parsed: &Segment<'_>,
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+) -> Option<usize> {
+    use bhaskix_net::tcp::segment::Flags;
+
+    let listener = service.listener.as_ref()?;
+    if !parsed.flags.contains(Flags::SYN)
+        || parsed.acknowledgement.is_some()
+        || parsed.destination != Port(listener.port)
+        || Address::V4(destination) != Address::V4(service.me)
+    {
+        return None;
+    }
+    if service.connections[ACCEPTED].is_some() {
+        // The one accepted slot is taken. `CONGESTED` is the table's word
+        // for this, and the refusal is silent at this layer -- the peer
+        // retries its `SYN`, and if the slot has freed by then, it lands.
+        return None;
+    }
+    let connection = FourTuple {
+        local: Address::V4(service.me),
+        local_port: Port(listener.port),
+        remote: Address::V4(source),
+        remote_port: parsed.source,
+    };
+    let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
+    service.connections[ACCEPTED] = Some(Connection {
+        tcb: Tcb::new(connection),
+        deadlines: Deadlines::new(),
+        sendr_at: listener.sendr_at,
+        recvr_at: listener.recvr_at,
+        delivered: 0,
+        handle: tcp::handle(ACCEPTED as u32, 1, false),
+    });
+    drive_at(
+        service,
+        ACCEPTED,
+        Event::Listen {
+            iss,
+            window: WINDOW,
+        },
+    );
+    Some(ACCEPTED)
 }
 
 /// Tells the producer how far this program has read.
@@ -661,17 +809,35 @@ fn publish_tail(tail: u64) {
     }
 }
 
-/// One caller's ring handover, RFC 0022 step 4a.
-///
-/// One handover today, exactly as the demonstration is one connection: the
-/// mechanism first, the table when a second caller exists to need it. A
-/// multi-caller service keys this by the badge on the call; the fields are
-/// what the table's rows will be.
+/// One ring handover, RFC 0022 step 4: two gifts and then a capability
+/// back. `CONNECT` runs one toward the outbound connection; `LISTEN` runs
+/// another toward the listener. A multi-caller service keys these by the
+/// badge on the call; the fields are what that table's rows will be.
 struct Handover {
+    /// Which CSpace slots the gifts land in, declared in this order.
+    slots: (u64, u64),
+    /// Where the rings map once landed.
+    at: (u64, u64),
+    /// Whether leg 2 mints a listener capability (badge bit 63) rather than
+    /// a connection's.
+    listener: bool,
     send_mapped: bool,
     recv_mapped: bool,
-    /// The badge the connection capability was minted under, once handed.
+    /// The badge the capability was minted under, once handed.
     handle: u64,
+}
+
+impl Handover {
+    const fn new(slots: (u64, u64), at: (u64, u64), listener: bool) -> Self {
+        Self {
+            slots,
+            at,
+            listener,
+            send_mapped: false,
+            recv_mapped: false,
+            handle: 0,
+        }
+    }
 }
 
 /// Declares where the next gifted ring may land, if one is still owed.
@@ -680,12 +846,14 @@ struct Handover {
 /// that lands consumes it, and a service that forgets to renew is deaf to
 /// the next caller. Declaring the same slot twice replaces, which makes
 /// this safe to call unconditionally.
-fn declare_gift_slot(handover: &Handover) {
-    let slot = if !handover.send_mapped {
-        GIFT_SEND
-    } else if !handover.recv_mapped {
-        GIFT_RECV
-    } else {
+fn declare_gift_slot(connect: &Handover, listen: &Handover) {
+    let owed = [
+        (!connect.send_mapped).then_some(connect.slots.0),
+        (!connect.recv_mapped).then_some(connect.slots.1),
+        (!listen.send_mapped).then_some(listen.slots.0),
+        (!listen.recv_mapped).then_some(listen.slots.1),
+    ];
+    let Some(slot) = owed.into_iter().flatten().next() else {
         // Nothing owed: leave no declaration, so an uninvited gift refuses
         // its call rather than landing somewhere this service will not look.
         return;
@@ -702,9 +870,9 @@ fn connect_leg(handover: &mut Handover, leg: u64) -> (u64, u64) {
     match leg {
         0 | 1 => {
             let (slot, at) = if leg == 0 {
-                (GIFT_SEND, SENDR_AT)
+                (handover.slots.0, handover.at.0)
             } else {
-                (GIFT_RECV, RECVR_AT)
+                (handover.slots.1, handover.at.1)
             };
             let mapped = if leg == 0 {
                 &mut handover.send_mapped
@@ -734,7 +902,7 @@ fn connect_leg(handover: &mut Handover, leg: u64) -> (u64, u64) {
                 return (tcp::BARE, 2);
             }
             if handover.handle == 0 {
-                handover.handle = tcp::handle(0, 1, false);
+                handover.handle = tcp::handle(0, 1, handover.listener);
             }
             // The reply direction: derived from this service's own endpoint
             // capability, badged with the connection's identity, landing
@@ -776,27 +944,76 @@ fn connect_leg_serving(
     if !(handover.send_mapped && handover.recv_mapped) {
         return (tcp::BARE, 2);
     }
-    if !service.streaming {
+    if service.connections[OUTBOUND].is_none() {
         let connection = FourTuple {
             local: Address::V4(service.me),
             local_port: Port(LOCAL_PORT),
             remote: Address::V4(Ipv4Addr(args[0] as u32)),
             remote_port: Port(args[1] as u16),
         };
-        service.tcb = Tcb::new(connection);
         let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
-        drive(
+        service.connections[OUTBOUND] = Some(Connection {
+            tcb: Tcb::new(connection),
+            deadlines: Deadlines::new(),
+            sendr_at: handover.at.0,
+            recvr_at: handover.at.1,
+            delivered: 0,
+            handle: tcp::handle(OUTBOUND as u32, 1, false),
+        });
+        drive_at(
             service,
+            OUTBOUND,
             Event::Connect {
                 iss,
                 window: WINDOW,
             },
         );
         arm_nearest(service);
-        service.streaming = true;
     }
     if handover.handle == 0 {
-        handover.handle = tcp::handle(0, 1, false);
+        handover.handle = tcp::handle(OUTBOUND as u32, 1, false);
+    }
+    let handed = call(
+        syscall::INVOKE,
+        ENDPOINT,
+        method::HAND,
+        [ENDPOINT, rights::READ | rights::WRITE, handover.handle, 0],
+    );
+    if handed.0 != status::OK {
+        return (tcp::BARE, 0x20 | handed.0);
+    }
+    (tcp::OK, handover.handle)
+}
+
+/// Answers one `LISTEN` leg on a machine that has a network.
+///
+/// The same three-leg shape as `CONNECT`, because it is the same handover:
+/// two rings across, a capability back. Leg 2 (`args[0]` = the port)
+/// registers the listener — from then on a `SYN` to that port births the
+/// accepted connection out of these rings — and hands back a capability
+/// whose badge carries bit 63, which is what makes a listener a different
+/// capability rather than a differently-documented one.
+fn listen_leg_serving(
+    handover: &mut Handover,
+    service: &mut Service,
+    args: [u64; 4],
+) -> (u64, u64) {
+    if args[2] != 2 {
+        return connect_leg(handover, args[2]);
+    }
+    if !(handover.send_mapped && handover.recv_mapped) {
+        return (tcp::BARE, 2);
+    }
+    if service.listener.is_none() {
+        service.listener = Some(Listener {
+            port: args[0] as u16,
+            handle: tcp::handle(0, 1, true),
+            sendr_at: handover.at.0,
+            recvr_at: handover.at.1,
+        });
+    }
+    if handover.handle == 0 {
+        handover.handle = tcp::handle(0, 1, true);
     }
     let handed = call(
         syscall::INVOKE,
@@ -818,25 +1035,28 @@ fn connect_leg_serving(
 /// which this program did — left the endpoint dead and every caller queued
 /// against it for ever.
 fn serve_handover_only() -> ! {
-    let mut handover = Handover {
-        send_mapped: false,
-        recv_mapped: false,
-        handle: 0,
-    };
+    let mut connect_handover = Handover::new((GIFT_SEND, GIFT_RECV), (SENDR_AT, RECVR_AT), false);
+    let mut listen_handover =
+        Handover::new((GIFT_L_SEND, GIFT_L_RECV), (L_SENDR_AT, L_RECVR_AT), true);
     loop {
-        declare_gift_slot(&handover);
+        declare_gift_slot(&connect_handover, &listen_handover);
         let (status_in, badge, method_in, args) = receive();
         if status_in != status::OK {
             continue;
         }
-        if handover.handle != 0 && badge == handover.handle {
-            // A stream method on the connection this machine minted but
-            // cannot serve: without a wire the peer is unreachable, and
-            // saying so is what lets the caller end with the truth rather
-            // than a timeout.
+        let minted =
+            badge != 0 && (badge == connect_handover.handle || badge == listen_handover.handle);
+        if minted {
+            // A stream method on a capability this machine minted but cannot
+            // serve: without a wire the peer is unreachable, and saying so
+            // is what lets the caller end with the truth rather than a
+            // timeout.
             reply(tcp::UNREACHABLE, 0, 0);
         } else if method_in == tcp::CONNECT {
-            let (outcome_word, detail) = connect_leg(&mut handover, args[2]);
+            let (outcome_word, detail) = connect_leg(&mut connect_handover, args[2]);
+            reply(outcome_word, detail, 0);
+        } else if method_in == tcp::LISTEN {
+            let (outcome_word, detail) = connect_leg(&mut listen_handover, args[2]);
             reply(outcome_word, detail, 0);
         } else {
             reply(tcp::LATER, 0, 0);
@@ -956,29 +1176,20 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     bits |= state_bits::CONFIGURED;
 
     // No connection yet, and that is RFC 0022 step 4b: connections are
-    // *opened by callers*, whose `CONNECT` legs gift the rings the stream
-    // will live in. The machine starts `Closed` under a placeholder tuple
-    // that matches no segment; `connect_leg` replaces it when a caller has
-    // handed both rings and asks.
-    let placeholder = FourTuple {
-        local: Address::V4(me),
-        local_port: Port(LOCAL_PORT),
-        remote: Address::V4(Ipv4Addr::UNSPECIFIED),
-        remote_port: Port(0),
-    };
+    // *opened by callers* — outbound when `CONNECT` legs gift the rings,
+    // inbound when a `SYN` reaches a port a `LISTEN` armed. The table
+    // starts empty.
     let mut service = Service {
         key,
         hertz,
         me,
-        tcb: Tcb::new(placeholder),
-        deadlines: Deadlines::new(),
         tail: 0,
         outcome: outcome::PENDING,
         taken: 0,
         sent: 0,
         refused: 0,
-        streaming: false,
-        delivered: 0,
+        connections: [None, None],
+        listener: None,
     };
 
     // Bind the inbox to this thread, so `receive` wakes for a caller, a frame
@@ -986,16 +1197,15 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     call(syscall::INVOKE, INBOX, method::BIND_SELF, [0; 4]);
     bits |= state_bits::SERVING;
 
-    let mut handover = Handover {
-        send_mapped: false,
-        recv_mapped: false,
-        handle: 0,
-    };
+    let mut connect_handover = Handover::new((GIFT_SEND, GIFT_RECV), (SENDR_AT, RECVR_AT), false);
+    let mut listen_handover =
+        Handover::new((GIFT_L_SEND, GIFT_L_RECV), (L_SENDR_AT, L_RECVR_AT), true);
 
     loop {
-        if service.streaming
-            && service.tcb.state == state::State::Established
-            && service.outcome == outcome::PENDING
+        if service.outcome == outcome::PENDING
+            && service.connections[OUTBOUND]
+                .as_ref()
+                .is_some_and(|connection| connection.tcb.state == state::State::Established)
         {
             service.outcome = outcome::ESTABLISHED;
         }
@@ -1005,10 +1215,12 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             service.taken,
             service.sent,
             service.refused,
-            state_number(&service.tcb),
+            service.connections[OUTBOUND]
+                .as_ref()
+                .map_or(0, |connection| state_number(&connection.tcb)),
         );
 
-        declare_gift_slot(&handover);
+        declare_gift_slot(&connect_handover, &listen_handover);
         let (status_in, badge, method_in, args) = receive();
         if status_in == status::NOTIFIED {
             // A frame, a deadline, or both — the word does not say which
@@ -1023,16 +1235,22 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             continue;
         }
         // A caller, told apart by badge: the service capability carries the
-        // caller's badge and answers `CONNECT`; the connection capability
-        // carries the handle this service minted, and answers the stream.
-        if handover.handle != 0 && badge == handover.handle {
+        // caller's badge and answers `CONNECT` and `LISTEN`; a connection
+        // capability carries the handle this service minted and answers the
+        // stream; a listener capability carries bit 63 and answers `ACCEPT`.
+        let connection_index = service.connections.iter().position(|connection| {
+            connection
+                .as_ref()
+                .is_some_and(|connection| connection.handle != 0 && connection.handle == badge)
+        });
+        if let Some(index) = connection_index {
             match method_in {
                 tcp::SEND => {
                     // "I have written `args[0]` more bytes into the send
                     // ring." No payload in the message — the ring is where
                     // the bytes are, and the `Emit`s this drives read them
                     // from it.
-                    drive(&mut service, Event::Wrote(args[0] as u32));
+                    drive_at(&mut service, index, Event::Wrote(args[0] as u32));
                     arm_nearest(&service);
                     reply(tcp::OK, 0, 0);
                 }
@@ -1043,21 +1261,59 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                     // into one word. `args[0]` (bytes consumed) is accepted
                     // and unused: the advertised window is fixed at less
                     // than the ring, so consumption cannot yet widen it —
-                    // RFC 0020's window-follows-free-space is owed by the
-                    // connection table's step, and this comment is the debt
-                    // recorded.
-                    let packed = state_number(&service.tcb) << 32 | service.delivered;
+                    // window-follows-free-space is still the debt recorded
+                    // here.
+                    let packed = service.connections[index].as_ref().map_or(0, |connection| {
+                        state_number(&connection.tcb) << 32 | connection.delivered
+                    });
                     reply(tcp::OK, packed, 0);
                 }
                 tcp::SHUTDOWN => {
-                    drive(&mut service, Event::Shutdown);
+                    drive_at(&mut service, index, Event::Shutdown);
                     arm_nearest(&service);
                     reply(tcp::OK, 0, 0);
                 }
                 _ => reply(tcp::LATER, 0, 0),
             }
+        } else if service
+            .listener
+            .as_ref()
+            .is_some_and(|listener| listener.handle == badge)
+        {
+            if method_in == tcp::ACCEPT {
+                // Poll-shaped for the same reason `CONNECT` is: one reply
+                // obligation per thread. The accepted connection's
+                // capability rides the reply that says yes, into the slot
+                // the caller declared.
+                let established = service.connections[ACCEPTED]
+                    .as_ref()
+                    .is_some_and(|connection| connection.tcb.state == state::State::Established);
+                if established {
+                    let handle = tcp::handle(ACCEPTED as u32, 1, false);
+                    let handed = call(
+                        syscall::INVOKE,
+                        ENDPOINT,
+                        method::HAND,
+                        [ENDPOINT, rights::READ | rights::WRITE, handle, 0],
+                    );
+                    if handed.0 == status::OK {
+                        reply(tcp::OK, handle, 0);
+                    } else {
+                        reply(tcp::BARE, 0x20 | handed.0, 0);
+                    }
+                } else {
+                    reply(tcp::LATER, 0, 0);
+                }
+            } else {
+                reply(tcp::LATER, 0, 0);
+            }
         } else if method_in == tcp::CONNECT {
-            let (outcome_word, detail) = connect_leg_serving(&mut handover, &mut service, args);
+            let (outcome_word, detail) =
+                connect_leg_serving(&mut connect_handover, &mut service, args);
+            reply(outcome_word, detail, 0);
+        } else if method_in == tcp::LISTEN {
+            let (outcome_word, detail) =
+                listen_leg_serving(&mut listen_handover, &mut service, args);
             reply(outcome_word, detail, 0);
         } else {
             reply(tcp::LATER, 0, 0);

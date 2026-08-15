@@ -37,6 +37,14 @@ const SEND_RING: u64 = 2;
 const RECV_RING: u64 = 3;
 /// Where the connection capability may land, declared with `EXPECT`.
 const CONNECTION: u64 = 4;
+/// The listener's rings: two more `Memory` objects this domain owns, gifted
+/// across `LISTEN` the way the first pair crossed `CONNECT`.
+const L_SEND_RING: u64 = 5;
+const L_RECV_RING: u64 = 6;
+/// Where the listener capability lands, and where the accepted connection's
+/// does.
+const LISTENER: u64 = 7;
+const INBOUND: u64 = 8;
 
 /// Where the report page maps in this program's space.
 const REPORT_AT: u64 = 0x2300_0000;
@@ -45,6 +53,14 @@ const REPORT_AT: u64 = 0x2300_0000;
 /// double mapping *is* the shared stream.
 const SENDR_AT: u64 = 0x2400_0000;
 const RECVR_AT: u64 = 0x2410_0000;
+const L_SENDR_AT: u64 = 0x2420_0000;
+const L_RECVR_AT: u64 = 0x2430_0000;
+
+/// The port this program listens on, and the harness forwards to. Seven is
+/// `echo` by tradition, and this program is exactly that for one caller.
+const LISTEN_PORT: u64 = 7;
+/// How many bytes the host-side driver sends, and must get back.
+const INBOUND_LEN: usize = 16;
 
 /// What the demonstration sends, and must receive back unchanged. Sixteen
 /// bytes, one segment: SYN, SYN·ACK, ACK, data, echo, FIN, FIN — every arrow
@@ -91,6 +107,16 @@ mod outcome {
     /// service answered `UNREACHABLE` when asked to stream. Terminal, and
     /// the truthful ending on a machine with no wire.
     pub const DARK: u64 = 8;
+    /// The whole of RFC 0020 step 5: outbound echoed through owned rings,
+    /// then a listener armed, a host-initiated connection accepted, its
+    /// bytes read out of this program's ring and sent back — and the peer's
+    /// close arrived, which only happens after the reply reached it.
+    pub const SERVED: u64 = 9;
+    /// Listened, and nobody called. A state rather than a failure: only the
+    /// boot test's harness runs a host-side driver, and every other boot of
+    /// this machine — the shell test's, a hand-started one — has a listener
+    /// with an honest nothing to accept.
+    pub const NOBODY: u64 = 10;
 }
 
 #[panic_handler]
@@ -158,7 +184,7 @@ fn report(step: u64, outcome: u64, detail: u64) {
 /// reads exactly like the sentence it implements. Retried while the service
 /// answers `SLOT_UNAVAILABLE`, because the service declares where a gift may
 /// land just before it listens, and this program may call first.
-fn leg(gift_slot: Option<u64>, leg_number: u64) -> (u64, u64, u64) {
+fn leg(verb: u64, a0: u64, a1: u64, gift_slot: Option<u64>, leg_number: u64) -> (u64, u64, u64) {
     for _ in 0..50_000 {
         if let Some(slot) = gift_slot {
             let (staged, _, _) = call(
@@ -171,12 +197,7 @@ fn leg(gift_slot: Option<u64>, leg_number: u64) -> (u64, u64, u64) {
                 return (0xFFFF, staged, 0);
             }
         }
-        let (called, value, second) = call(
-            syscall::CALL,
-            SERVICE,
-            tcp::CONNECT,
-            [u64::from(PEER), PEER_PORT, leg_number, 0],
-        );
+        let (called, value, second) = call(syscall::CALL, SERVICE, verb, [a0, a1, leg_number, 0]);
         // The service has not declared yet (its `EXPECT` races this call), or
         // has not started serving. Both answer with a status that a later
         // try can change, so yield and try again.
@@ -213,21 +234,15 @@ extern "C" fn tcpc_main() -> ! {
     // send ring *before* gifting — the bytes are in place before the service
     // ever sees the pages, which is the ownership story told in the right
     // order.
-    if call(
-        syscall::INVOKE,
-        SEND_RING,
-        method::ATTACH,
-        [SENDR_AT, 1, 0, 0],
-    )
-    .0 != status::OK
-        || call(
-            syscall::INVOKE,
-            RECV_RING,
-            method::ATTACH,
-            [RECVR_AT, 1, 0, 0],
-        )
-        .0 != status::OK
-    {
+    let attached = [
+        (SEND_RING, SENDR_AT),
+        (RECV_RING, RECVR_AT),
+        (L_SEND_RING, L_SENDR_AT),
+        (L_RECV_RING, L_RECVR_AT),
+    ]
+    .into_iter()
+    .all(|(slot, at)| call(syscall::INVOKE, slot, method::ATTACH, [at, 1, 0, 0]).0 == status::OK);
+    if !attached {
         report(0, outcome::REFUSED, 0xA);
         exit();
     }
@@ -237,12 +252,23 @@ extern "C" fn tcpc_main() -> ! {
             core::ptr::write_volatile((SENDR_AT + index as u64) as *mut u8, *byte);
         }
     }
+    // Touch every ring once, now, so a mapping that did not take faults here
+    // -- two lines from the attach that claimed it did -- rather than deep in
+    // the inbound serve with the interesting state a page fault destroys.
+    for base in [RECVR_AT, L_SENDR_AT, L_RECVR_AT] {
+        // SAFETY: this program's own rings, just mapped read-write.
+        unsafe {
+            let probe = core::ptr::read_volatile(base as *const u8);
+            core::ptr::write_volatile(base as *mut u8, probe);
+        }
+    }
 
     // Leg 0: the send ring crosses. Leg 1: the receive ring. Each is one
     // `HAND` and one `CONNECT`, and each ring is a `Memory` object this
     // domain owns — which is what makes RFC 0022 step 3 mean something here:
     // if this program dies mid-connection, the service's copies die with it.
-    let (status_0, value_0, detail_0) = leg(Some(SEND_RING), 0);
+    let (status_0, value_0, detail_0) =
+        leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, Some(SEND_RING), 0);
     if status_0 == STUCK_STATUS {
         report(1, outcome::STUCK, 0);
         exit();
@@ -256,7 +282,8 @@ extern "C" fn tcpc_main() -> ! {
         exit();
     }
 
-    let (status_1, value_1, detail_1) = leg(Some(RECV_RING), 1);
+    let (status_1, value_1, detail_1) =
+        leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, Some(RECV_RING), 1);
     if status_1 == STUCK_STATUS {
         report(2, outcome::STUCK, 0);
         exit();
@@ -285,7 +312,7 @@ extern "C" fn tcpc_main() -> ! {
         report(3, outcome::REFUSED, declared << 8);
         exit();
     }
-    let (status_2, value_2, detail_2) = leg(None, 2);
+    let (status_2, value_2, detail_2) = leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, None, 2);
     if status_2 == STUCK_STATUS {
         report(3, outcome::STUCK, 0);
         exit();
@@ -396,15 +423,130 @@ extern "C" fn tcpc_main() -> ! {
             _ => {}
         }
     }
-    report(
-        8,
-        if echoed {
-            outcome::ECHOED
-        } else {
-            outcome::MANGLED
-        },
-        state,
+    if !echoed {
+        report(8, outcome::MANGLED, state);
+        exit();
+    }
+    report(8, outcome::ECHOED, state);
+
+    // RFC 0020 step 5's inbound half. The same handover toward a *listener*:
+    // two rings this domain owns cross `LISTEN`'s legs, the listener
+    // capability comes back, and then `ACCEPT` is polled — the connection it
+    // eventually carries was initiated by the harness's host-side driver,
+    // which is the direction nothing in this system has ever served before.
+    let (l0, v0, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some(L_SEND_RING), 0);
+    let (l1, v1, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some(L_RECV_RING), 1);
+    if l0 != status::OK || v0 != tcp::OK || l1 != status::OK || v1 != tcp::OK {
+        report(9, outcome::REFUSED, l0 << 48 | v0 << 32 | l1 << 16 | v1);
+        exit();
+    }
+    let (declared, _, _) = call(
+        syscall::INVOKE,
+        SERVICE,
+        method::EXPECT,
+        [LISTENER, 0, 0, 0],
     );
+    if declared != status::OK {
+        report(9, outcome::REFUSED, declared << 8);
+        exit();
+    }
+    let (l2, v2, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, None, 2);
+    if l2 != status::OK || v2 != tcp::OK {
+        report(9, outcome::REFUSED, l2 << 16 | v2);
+        exit();
+    }
+
+    // Accept: poll the listener until the host's connection is established.
+    let (declared, _, _) = call(syscall::INVOKE, SERVICE, method::EXPECT, [INBOUND, 0, 0, 0]);
+    if declared != status::OK {
+        report(10, outcome::REFUSED, declared << 8);
+        exit();
+    }
+    let mut accepted = false;
+    for _ in 0..100_000u32 {
+        let (called, word, _) = call(syscall::CALL, LISTENER, tcp::ACCEPT, [0; 4]);
+        if called != status::OK {
+            report(10, outcome::REFUSED, called << 16);
+            exit();
+        }
+        if word == tcp::OK {
+            accepted = true;
+            break;
+        }
+        if word == tcp::UNREACHABLE {
+            report(10, outcome::DARK, 0);
+            exit();
+        }
+        if word != tcp::LATER {
+            report(10, outcome::REFUSED, word << 16);
+            exit();
+        }
+        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+    if !accepted {
+        report(10, outcome::NOBODY, 0);
+        exit();
+    }
+
+    // Serve the echo: wait for the driver's bytes, copy them from the ring
+    // the peer's stream lands in to the ring this program sends from, both
+    // its own pages, and tell the service. Then wait for the peer's close,
+    // which only arrives after the reply reached it — the causal proof.
+    let mut served = false;
+    for _ in 0..100_000u32 {
+        let (called, word, packed) = call(syscall::CALL, INBOUND, tcp::RECV, [0, 0, 0, 0]);
+        if called != status::OK || word != tcp::OK {
+            report(11, outcome::REFUSED, called << 16 | word);
+            exit();
+        }
+        let available = packed & 0xffff_ffff;
+        if available >= INBOUND_LEN as u64 {
+            served = true;
+            break;
+        }
+        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+    if !served {
+        report(11, outcome::STUCK, 0);
+        exit();
+    }
+    for index in 0..INBOUND_LEN {
+        // SAFETY: both rings are this program's own, mapped read-write at
+        // fixed addresses before anything was gifted; the index is bounded.
+        unsafe {
+            let byte = core::ptr::read_volatile((L_RECVR_AT + index as u64) as *const u8);
+            core::ptr::write_volatile((L_SENDR_AT + index as u64) as *mut u8, byte);
+        }
+    }
+    let (sent, _, _) = call(
+        syscall::CALL,
+        INBOUND,
+        tcp::SEND,
+        [INBOUND_LEN as u64, 0, 0, 0],
+    );
+    if sent != status::OK {
+        report(12, outcome::REFUSED, sent << 8);
+        exit();
+    }
+    let mut closed = false;
+    for _ in 0..100_000u32 {
+        let (called, word, packed) = call(syscall::CALL, INBOUND, tcp::RECV, [0, 0, 0, 0]);
+        if called != status::OK || word != tcp::OK {
+            report(12, outcome::REFUSED, called << 16 | word);
+            exit();
+        }
+        if packed >> 32 != STATE_ESTABLISHED {
+            closed = true;
+            break;
+        }
+        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+    if !closed {
+        report(12, outcome::STUCK, 0);
+        exit();
+    }
+    let (_, _, _) = call(syscall::CALL, INBOUND, tcp::SHUTDOWN, [0; 4]);
+    report(13, outcome::SERVED, 0);
     exit()
 }
 

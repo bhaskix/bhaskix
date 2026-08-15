@@ -40,10 +40,13 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-# 103, measured, with no headroom -- the same standard bhaskix-rand set. Ring
+# 105, measured, with no headroom: two more lines when the stream rings
+# became per-connection fields read through the table.
+#
+# Previously 103, measured, with no headroom -- the same standard bhaskix-rand set. Ring
 # copies in and out, volatile reads of headers another domain writes, the
 # report and configuration pages, the syscall blocks -- and, since RFC 0022
 # step 4b, the caller's gifted stream rings: emits read from the send ring,
 # deliveries written into the receive ring. No device register anywhere in
 # it, which is the argument for this domain existing.
-unsafe_budget = 103
+unsafe_budget = 105
