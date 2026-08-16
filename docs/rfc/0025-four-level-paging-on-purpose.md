@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | ✅ **Accepted 2026-08-16**, its single step implemented 2026-08-15 with the document itself: bring-up reads `CR4.LA57` before touching any paging structure and halts with a sentence rather than corrupting addresses silently, the boot report prints capability beside choice, and the decision is a pure function of the register value — host-tested against the exact bit and both neighbours, watched failing on the wrong bit. **A5 is closed**, and with it the last open architecture question. Five-level paging gets built when one of the written triggers fires, not before. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | arch, boot |
 | **Milestone** | Phase 2 — closes **A5**, the last open architecture question |

@@ -606,7 +606,7 @@ These are unresolved and should not be silently settled in code. Each needs an R
 | ~~A2~~ | ~~Syscall ABI shape~~ | ✅ **Resolved 2026-08-04: capability invocation**, six syscall kinds, all authority arriving as a capability argument ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md)). |
 | ~~A3~~ | ~~IPC style~~ | ✅ **Resolved 2026-08-04: synchronous rendezvous is primitive**; async is shared memory plus a notification, one layer up ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md)). |
 | ~~A4~~ | ~~Userspace ABI~~ | ✅ **Resolved 2026-08-04 by refusing the premise**: the native ABI *is* A2's syscall interface, so there is no separate document and no native libc; POSIX belongs to the Linux personality ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](rfc/0005-linux-abi-compatibility.md)). |
-| A5 | 5-level paging | **Answered 2026-08-15, pending acceptance: four-level on purpose**, with the boot-time refusal shipped and five-level waiting on a written trigger ([RFC 0025](rfc/0025-four-level-paging-on-purpose.md)). |
+| ~~A5~~ | ~~5-level paging~~ | ✅ **Resolved 2026-08-16: four-level on purpose**, with the boot-time refusal shipped and five-level waiting on a written trigger ([RFC 0025](rfc/0025-four-level-paging-on-purpose.md)). No architecture question in this table remains open. |
 
 ---
 
