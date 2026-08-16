@@ -12245,6 +12245,23 @@ static RT_WORST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// Wakeups the probe completed.
 static RT_ROUNDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Which wakeup (1-based, as counted by [`RT_ROUNDS`]) set [`RT_WORST`].
+///
+/// The worst sits at 442–447 µs·1000 on every boot of 2026-08-16 — clustered
+/// too tightly to be load — and a worst with no round number cannot say
+/// whether the same round is slow every boot. That question is this static.
+static RT_WORST_ROUND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// TSC at the probe's first instruction, stored once.
+///
+/// The first read-out said the whole 444 ms lives in wakeup 1 — which cannot
+/// distinguish "the wake was slow" from "the probe had never run". Against
+/// the spawn stamp the waker keeps, this answers it.
+static RT_FIRST_RAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The CPU the probe first found itself on, against the one it was pinned to.
+static RT_FIRST_CPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// A real-time thread that sleeps, and measures how long waking it took.
 ///
 /// The number this produces is the one `docs/scheduler.md` §4 puts a budget
@@ -12252,6 +12269,13 @@ static RT_ROUNDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// latency nobody meets.
 extern "C" fn rt_probe(_argument: u64) -> ! {
     use core::sync::atomic::Ordering;
+    let _ = RT_FIRST_RAN.compare_exchange(
+        0,
+        bhaskix_arch::tsc::read(),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    RT_FIRST_CPU.store(u64::from(bhaskix_arch::percpu::cpu_id()), Ordering::Relaxed);
     loop {
         RT_GATE.wait_until(|| {
             RT_RELEASED.load(Ordering::Acquire) || PHASE.load(Ordering::Acquire) > PHASE_CLASS
@@ -12263,8 +12287,10 @@ extern "C" fn rt_probe(_argument: u64) -> ! {
         // First instruction after being scheduled. The difference from the
         // timestamp the waker took is wakeup-to-run.
         let delay = bhaskix_arch::tsc::read().saturating_sub(RT_WAKE_AT.load(Ordering::Acquire));
-        RT_WORST.fetch_max(delay, Ordering::Relaxed);
-        RT_ROUNDS.fetch_add(1, Ordering::Relaxed);
+        let round = RT_ROUNDS.fetch_add(1, Ordering::Relaxed) + 1;
+        if delay > RT_WORST.fetch_max(delay, Ordering::Relaxed) {
+            RT_WORST_ROUND.store(round, Ordering::Relaxed);
+        }
 
         RT_RELEASED.store(false, Ordering::Release);
     }
@@ -12543,6 +12569,36 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
         },
         4_000,
     );
+
+    // The capture, armed 2026-08-16: this check failed 3 times in 500 JOBS=1
+    // boots and once in a suite run, always beside a green `burners_gone` --
+    // and a bare FAILED cannot say which of three stories is true: a late end
+    // (a scheduling delay and nothing more), a lost last-exit check (the
+    // try_lock skip in `threads_in_domain_except` telling the genuinely last
+    // thread it is not), or a burner that never really exited. One captured
+    // boot with this block prints the discriminant.
+    if !ended_themselves {
+        let live = |id| matches!(domain::state_of(id), Ok(None));
+        println!(
+            "    domains        CAPTURE lonely {} with {} threads counted; crowded {} with {} \
+             threads counted",
+            if live(lonely) { "LIVE" } else { "over" },
+            sched::threads_in_domain(lonely.as_u32()),
+            if live(crowded) { "LIVE" } else { "over" },
+            sched::threads_in_domain(crowded.as_u32()),
+        );
+        let late = wait_until(|| !live(lonely) && !live(crowded), 8_000);
+        println!(
+            "    domains        CAPTURE verdict: {}; {} except-scans were blinded by a busy \
+             runqueue this boot",
+            if late {
+                "ended late -- a delay, not a loss"
+            } else {
+                "still live 8 s on -- the last exit's check was lost for good"
+            },
+            sched::domain_scan_skips(),
+        );
+    }
 
     // `destroy` answers false for a domain that has already ended, and since
     // 2026-08-11 the last thread to exit ends it -- so by the time this runs
@@ -12823,6 +12879,7 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
         .slice_us(200)
         .pinned();
 
+    let spawned_at = bhaskix_arch::tsc::read();
     if let Err(error) = sched::spawn_on_with(cpu, "rt-probe", rt_probe, 0, hhdm_base, options) {
         println!("\x1b[91m    rt latency     FAILED to spawn the probe: {error:?}\x1b[0m");
         return false;
@@ -12832,7 +12889,16 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
     wait_millis(50);
 
     const ROUNDS: u64 = 50;
-    for _ in 0..ROUNDS {
+    // Which rounds the waker gave up on -- the spin bound expiring with the
+    // probe still owing its consumption. The 2026-08-16 soaks measured a
+    // worst clustered at 442-447 ms on every boot; a give-up is the only way
+    // this loop can leave a stamp un-restamped long enough to age that much,
+    // so counting them (and naming the first) is half the diagnosis.
+    let mut gave_up = 0u64;
+    let mut first_give_up = 0u64;
+    let ticks_before = trap::ticks_on(cpu);
+    let loop_start = bhaskix_arch::tsc::read();
+    for round in 1..=ROUNDS {
         RT_WAKE_AT.store(bhaskix_arch::tsc::read(), Ordering::Release);
         // Publish the condition before waking -- the invariant `wait` states.
         RT_RELEASED.store(true, Ordering::Release);
@@ -12844,10 +12910,19 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
             spins += 1;
             core::hint::spin_loop();
         }
+        if RT_RELEASED.load(Ordering::Acquire) {
+            gave_up += 1;
+            if first_give_up == 0 {
+                first_give_up = round;
+            }
+        }
     }
+    let loop_ticks = bhaskix_arch::tsc::read().saturating_sub(loop_start);
+    let timer_ticks_in_loop = trap::ticks_on(cpu).saturating_sub(ticks_before);
 
     let rounds = RT_ROUNDS.load(Ordering::Relaxed);
     let worst = RT_WORST.load(Ordering::Relaxed);
+    let worst_round = RT_WORST_ROUND.load(Ordering::Relaxed);
     let worst_ns = bhaskix_arch::tsc::to_nanos(worst);
 
     if rounds < ROUNDS / 2 {
@@ -12857,11 +12932,21 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
+    let first_ran = RT_FIRST_RAN.load(Ordering::Relaxed);
+    let spawn_to_first_run_us =
+        bhaskix_arch::tsc::to_nanos(first_ran.saturating_sub(spawned_at)).unwrap_or(0) / 1_000;
     match worst_ns {
         Some(nanos) => println!(
-            "    rt latency     {rounds} wakeups, worst {}.{:03} us on the waking cpu (target 50 us, docs/scheduler.md §4)",
+            "    rt latency     {rounds} wakeups, worst {}.{:03} us at wakeup {worst_round}; \
+             {gave_up} give-ups (first at round {first_give_up}), loop {} ms, \
+             spawn to first run {spawn_to_first_run_us} us, pinned to cpu {cpu}, first ran on \
+             cpu {}, waker now on cpu {}, {timer_ticks_in_loop} timer ticks on cpu {cpu} \
+             during the loop (target 50 us, docs/scheduler.md §4)",
             nanos / 1000,
-            nanos % 1000
+            nanos % 1000,
+            bhaskix_arch::tsc::to_nanos(loop_ticks).unwrap_or(0) / 1_000_000,
+            RT_FIRST_CPU.load(Ordering::Relaxed),
+            bhaskix_arch::percpu::cpu_id(),
         ),
         None => {
             println!("    rt latency     {rounds} wakeups, worst {worst} ticks (tsc uncalibrated)")

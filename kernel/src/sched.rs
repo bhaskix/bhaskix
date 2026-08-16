@@ -1105,8 +1105,21 @@ pub fn spawn_on_with(
     // another processor has to say so — otherwise the thread waits for the
     // idle backstop, which is a second. This one was missed at first and
     // presented as three worker threads that never ran.
+    //
+    // And the same rule, one CPU closer to home: a thread spawned onto the
+    // *calling* CPU is also made runnable on a processor that may have
+    // stopped its timer — this one, busy but alone, whose last tick decided
+    // no slice deadline was needed. The wake path ends in `resched` and never
+    // had this hole; spawn did, and it measured as a priority-90 probe
+    // waiting 446 ms for its first dispatch behind a spinning fair thread —
+    // every wakeup after the first taking 54 µs, because those went through
+    // `wake`. If the spawner holds a lock, `resched` declines and the spawnee
+    // waits for the next natural reschedule — narrower than the hole this
+    // closes, and a spawner that holds a lock across spawn is already rare.
     if cpu != percpu::cpu_id() {
         notify(cpu);
+    } else {
+        resched();
     }
 
     Ok(id)
@@ -3299,6 +3312,11 @@ pub fn threads_in_domain_except(domain: u32, except: u32) -> usize {
     let mut total = 0;
     for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
         let Some(queue) = queue.try_lock() else {
+            // A skipped queue counts as empty, which makes "am I the last
+            // thread of my domain" answerable wrongly in both directions.
+            // Counted here so the 2026-08-16 domain-test capture can say
+            // whether a blinded scan and a lost domain end coincide.
+            DOMAIN_SCAN_SKIPS.fetch_add(1, Ordering::Relaxed);
             continue;
         };
         total += queue
@@ -3311,6 +3329,16 @@ pub fn threads_in_domain_except(domain: u32, except: u32) -> usize {
             .count();
     }
     total
+}
+
+/// Except-scans that could not see into every runqueue (see the counter's
+/// bump site for why that is worth a number).
+static DOMAIN_SCAN_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times [`threads_in_domain_except`] was blinded by a busy queue.
+#[must_use]
+pub fn domain_scan_skips() -> u64 {
+    DOMAIN_SCAN_SKIPS.load(Ordering::Relaxed)
 }
 
 /// How many threads still exist in `domain`, in any state but `Finished`.

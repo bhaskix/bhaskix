@@ -466,6 +466,21 @@ else
     status=1
 fi
 
+# Spawn-to-first-dispatch, bounded. Unlike the 50 us wakeup target above, this
+# one IS asserted, with three orders of magnitude of headroom on either side:
+# with spawn requesting a reschedule it measures under a millisecond, and
+# without one it measured 446-500 *milliseconds* -- a priority-90 thread
+# waiting behind a spinning fair thread on a CPU whose timer had gone tickless
+# because it was busy but alone. The bound is 50 ms so no emulator slowness
+# can trip it, and no return of the hole can pass it.
+spawn_us=$(grep -aoE "spawn to first run [0-9]+ us" "$LOG" | grep -oE "[0-9]+" || echo "")
+if [[ -n "$spawn_us" && "$spawn_us" -lt 50000 ]]; then
+    pass "a spawned thread reaches its first dispatch promptly ($spawn_us us)"
+else
+    fail "spawn to first dispatch took ${spawn_us:-unmeasured} us -- the tickless spawn hole is back"
+    status=1
+fi
+
 # Tickless idle: an idle CPU must take far fewer ticks than a busy one. Asserted
 # as a *comparison* rather than a threshold, because the absolute counts depend
 # on how long the boot took.
