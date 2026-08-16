@@ -227,7 +227,10 @@ workspace = true
 # whole of syscall dispatch and disabled again for the exit stub -- the two
 # sti/cli calls that end the deafness which stretched one heap hold to
 # forty-two seconds.
-unsafe_budget = 1225
+#
+# 1226 at the longest-holds gauge: the same Location cast once more, in the
+# record holder's read-out.
+unsafe_budget = 1226
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

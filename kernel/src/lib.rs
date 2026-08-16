@@ -8844,6 +8844,58 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         );
     }
 
+    // The worst any lock rank was ever held, with the line that held it —
+    // the permanent form of the question every stall capture asked. Ranks
+    // that never crossed a tenth of a millisecond are left off the line:
+    // contention answers should name suspects, not list the innocent.
+    {
+        let names = [
+            "address-space",
+            "space-previous",
+            "dma-window",
+            "heap",
+            "tlb-sender",
+            "timers",
+            "domains",
+            "capabilities",
+            "endpoints",
+            "wait-queue",
+            "runqueue",
+            "notifications",
+            "shared-memory",
+            "irq-handlers",
+            "vectors",
+            "block",
+            "console",
+        ];
+        let hold_hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+        if hold_hertz != 0 {
+            let mut printed = false;
+            for (rank, name) in names.iter().enumerate() {
+                let (cycles, at) = crate::sync::longest_hold(rank);
+                let micros = (u128::from(cycles) * 1_000_000 / u128::from(hold_hertz)) as u64;
+                if micros >= 100 {
+                    if !printed {
+                        println!("    longest holds  ranks held past a tenth of a millisecond:");
+                        printed = true;
+                    }
+                    if let Some(at) = at {
+                        println!(
+                            "                   {name} {micros} us, by {}:{}",
+                            at.file(),
+                            at.line(),
+                        );
+                    }
+                }
+            }
+            if !printed {
+                println!(
+                    "    longest holds  no lock rank was ever held past a tenth of a millisecond"
+                );
+            }
+        }
+    }
+
     // The scheduler's share of a wake's latency, measured because RFC 0023
     // priced a wake-driven wait above a poll and the schedule's own gap is
     // the first suspect to convict or clear. Stamped by the waker, read at

@@ -5,10 +5,10 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 
 | | |
 |---|---|
-| **Last updated** | 2026-08-14 |
+| **Last updated** | 2026-08-16 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. **TCP is complete within its RFC** ([RFC 0020](docs/rfc/0020-tcp.md), all six steps: `bin/tcpc` opens connections with rings its own domain owns, echoes through them both directions, and the boundary is measured — RFC 0022's capability-in-a-call is the mechanism underneath); no libc, no sockets API beyond UDP and TCP's own |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 steps 1–5a of 6** (a real peer echoes sixteen bytes through the full stack on every boot that completes — the wake loss that made it intermittent is found and fixed; the inbound half and connection capabilities remain) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 COMPLETE** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · RFC 0022 and RFC 0023 implemented, awaiting acceptance review · RFC 0024 closed without shipping · RFC 0025 pending acceptance · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
 
 ### How far along is this, in numbers
 
@@ -756,6 +756,20 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-16 (the contention map: every rank's worst hold, named by line, on every boot)
+
+**The question every stall capture asked is now a line in every log.** The open-guards table's
+timestamps feed a per-rank gauge: the longest any lock rank was ever held, with the acquisition
+site of the record holder, printed in the boot report past a tenth-of-a-millisecond threshold
+and presence-gated like every instrument. The first read-out settles the one open design
+concern and draws the whole map: **`with_active`'s address-space table hold worst-cases at
+448 µs** — the machine-wide-stall worry is closed with a number, no surgery warranted — while
+the new known-worst is teardown's heap bursts at **16 ms** (`heap.rs:98`, the multi-page unmap
+with per-page shootdowns — down from 42.8 *seconds* before the deafness fix, and finite;
+chunking the unmap to release the heap between batches is the future optimisation *if the gauge
+ever says it matters*). Everything else lives under a millisecond. Contention questions now
+come pre-answered, which is the difference between this entry and the seven captures above it.
 
 ### 2026-08-16 (the boot hang, root-caused and fixed: every system call ran deaf)
 

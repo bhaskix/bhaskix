@@ -1503,6 +1503,13 @@ if grep -q "HOLD LEAK" "$LOG"; then
     status=1
 fi
 
+# The lock-contention gauge must exist on every boot, same rule as every
+# instrument: values ungated, presence demanded.
+if ! grep -qE "longest holds" "$LOG"; then
+    fail "the longest-holds gauge is missing"
+    status=1
+fi
+
 # The scheduler's wake-to-dispatch measurement must exist on every boot:
 # wakes happen on all of them, and an instrument that vanishes is a
 # regression even when nothing gates its values.

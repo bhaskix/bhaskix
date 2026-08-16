@@ -473,6 +473,49 @@ fn open_guard(at: &'static core::panic::Location<'static>, rank: u8) -> usize {
     OPEN_GUARDS
 }
 
+/// The longest any lock of each rank was ever held, in cycles, with the
+/// acquisition site of the record holder.
+///
+/// The permanent form of the question every stall capture asked: not "is
+/// something held right now" but "what is the worst this rank has ever
+/// been held, and by which line". Printed in the boot report, so contention
+/// answers come from a line in every log instead of an investigation.
+static LONGEST_HOLD: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+static LONGEST_HOLD_AT: [core::sync::atomic::AtomicUsize; 64] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 64];
+
+/// The longest recorded hold of `rank`: `(cycles, site)`, site `None` if
+/// the rank was never held.
+#[must_use]
+pub fn longest_hold(rank: usize) -> (u64, Option<&'static core::panic::Location<'static>>) {
+    if rank >= 64 {
+        return (0, None);
+    }
+    let cycles = LONGEST_HOLD[rank].load(Ordering::Relaxed);
+    let raw = LONGEST_HOLD_AT[rank].load(Ordering::Relaxed);
+    let at = if raw == 0 {
+        None
+    } else {
+        // SAFETY: only `&'static Location`s are ever stored.
+        Some(unsafe { &*(raw as *const core::panic::Location<'static>) })
+    };
+    (cycles, at)
+}
+
+fn note_hold_duration(table: &OpenGuards, slot: usize) {
+    let rank = table.rank[slot].load(Ordering::Relaxed) as usize;
+    if rank >= 64 {
+        // Unranked try_locks share bucket 63's neighbourhood nowhere; skip
+        // them — their story is the count, not the order.
+        return;
+    }
+    let since = table.since[slot].load(Ordering::Relaxed);
+    let held = bhaskix_arch::tsc::read().saturating_sub(since);
+    if held > LONGEST_HOLD[rank].fetch_max(held, Ordering::Relaxed) {
+        LONGEST_HOLD_AT[rank].store(table.at[slot].load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
 /// Releases an open-guard slot claimed by [`open_guard`].
 ///
 /// Tries the remembered slot on the current CPU first; a guard released on
@@ -484,6 +527,9 @@ fn close_guard(slot: usize, at: &'static core::panic::Location<'static>) {
     if slot < OPEN_GUARDS {
         let cpu = percpu::cpu_id() as usize;
         let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
+        if table.at[slot].load(Ordering::Relaxed) == key {
+            note_hold_duration(table, slot);
+        }
         if table.at[slot]
             .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
@@ -493,6 +539,9 @@ fn close_guard(slot: usize, at: &'static core::panic::Location<'static>) {
     }
     for table in &OPEN_GUARDS_PER_CPU {
         for slot in 0..OPEN_GUARDS {
+            if table.at[slot].load(Ordering::Relaxed) == key {
+                note_hold_duration(table, slot);
+            }
             if table.at[slot]
                 .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
