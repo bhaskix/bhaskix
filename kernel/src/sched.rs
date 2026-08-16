@@ -1062,6 +1062,17 @@ pub fn spawn_on_with(
     // and `entry` is typed as diverging so it cannot return.
     unsafe { context.prepare(guarded.top, entry, argument) };
 
+    // Counted *before* the thread becomes reachable below: once it sits on a
+    // queue another CPU may run it to `exit` immediately, and a departure
+    // recorded before its arrival would underflow the count and elect two
+    // last threads on the domain's real last exit. Every path from here to
+    // the insertion is infallible, so the count cannot leak on a failed
+    // spawn. The arrival half of the arithmetic that answers "am I my
+    // domain's last thread" in `exit`.
+    if options.domain != u32::MAX {
+        domain_thread_arrives(options.domain);
+    }
+
     let mut queue = QUEUES[cpu as usize].lock();
     queue.threads[slot] = Some(Thread {
         id,
@@ -2168,10 +2179,12 @@ pub fn preempt() {
     // here as "holds nothing", which does not follow -- a `try_lock` holder
     // holds the lock, and descheduling one strands every CPU that wants it.
     //
-    // `exit` reaches `domain_of_raw` and `threads_in_domain_except` with
-    // interrupts enabled, and both `try_lock` every runqueue there is. A tick
-    // landing in that scan could take the exiting thread off its CPU still
-    // holding a *remote* runqueue, which nothing would then release.
+    // `exit` used to reach `domain_of_raw` and `threads_in_domain_except`
+    // with interrupts enabled, both `try_lock`ing every runqueue there is —
+    // a tick landing in that scan could take the exiting thread off its CPU
+    // still holding a *remote* runqueue. Both scans are gone (2026-08-17,
+    // replaced by the per-domain thread count), but `ipc::cancel_all` still
+    // walks locked tables from `exit`, so the concern stands.
     //
     // **This was expected to end the bring-up stall and did not**: 3 boots in
     // 500 with it against 4 in 500 without, and one of those arrived with the
@@ -2296,10 +2309,11 @@ pub fn preempt() {
         // Testing whether an exiting thread can be switched out while holding
         // *another* CPU's runqueue lock. `held_mask` cannot answer it: a
         // `try_lock` deliberately never joins the held set, so the check above
-        // that keeps lock holders on their CPU cannot see one, and
-        // `domain_of_raw` and `threads_in_domain_except` -- both reached from
-        // `exit`, with interrupts enabled -- `try_lock` every runqueue there
-        // is, remote ones included.
+        // that keeps lock holders on their CPU cannot see one. The two `exit`
+        // scans that motivated this (`domain_of_raw`,
+        // `threads_in_domain_except`) were replaced by the per-domain thread
+        // count on 2026-08-17; the counter stays because the question is
+        // about *any* remote try_lock, and `threads_in_domain` still scans.
         //
         // The owner field answers it directly: if any queue but this one
         // records this CPU, the thread about to be descheduled is holding it.
@@ -2469,10 +2483,36 @@ pub fn exit() -> ! {
     // Done while this thread is still `Running`, it is an ordinary thread doing
     // ordinary work, and every one of those locks behaves as it does anywhere
     // else.
+    //
+    // "Am I the last?" is answered by arithmetic, not by a scan. The scan this
+    // replaced (`threads_in_domain_except`) could lose the answer two ways,
+    // and the 2026-08-17 soak captured it doing so: a thread preempted between
+    // its "not last" answer and marking itself `Finished` looked alive to the
+    // true last thread, so *both* concluded "not last" and the domain outlived
+    // every thread it had; and a `try_lock`-skipped queue counted as empty,
+    // which could elect the wrong thread outright. `fetch_sub` elects exactly
+    // one, and its decision survives preemption because it is a value in hand.
+    //
+    // The domain is read under this CPU's queue lock, blocking -- the same
+    // lesson `set_domain_weight` and `mark_domain_dying` state at their own
+    // scan sites: skipping a contended queue here would skip the decrement,
+    // and a skipped decrement is a domain that never ends. The lock is
+    // released before the ending runs, because ending takes the domain table
+    // (rank 6) and holding a runqueue (rank 10) across that is the inversion
+    // the ranking exists to catch.
     let me = current_thread_id();
-    if let Some(thread) = me
-        && let Some(domain) = domain_of_raw(thread)
-        && threads_in_domain_except(domain, thread) == 0
+    let my_domain = if cpu < MAX_CPUS {
+        let queue = QUEUES[cpu].lock();
+        let current = queue.current;
+        queue.threads[current]
+            .as_ref()
+            .map(|thread| thread.domain)
+            .filter(|domain| *domain != u32::MAX)
+    } else {
+        None
+    };
+    if let Some(domain) = my_domain
+        && domain_thread_departs(domain)
     {
         crate::domain::ended_by_last_thread(crate::domain::DomainId::from_u32(domain));
     }
@@ -3287,58 +3327,43 @@ pub fn mark_domain_dying(domain: u32) -> usize {
     marked
 }
 
-/// The domain a thread belongs to, read straight from the runqueues.
-fn domain_of_raw(thread: u32) -> Option<u32> {
-    let online = percpu::online_count() as usize;
-    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
-        let Some(queue) = queue.try_lock() else {
-            continue;
-        };
-        if let Some(target) = queue.threads.iter().flatten().find(|t| t.id == thread) {
-            return (target.domain != u32::MAX).then_some(target.domain);
-        }
-    }
-    None
-}
-
-/// How many threads of `domain` there are, not counting `except`.
-///
-/// The exclusion is what lets a thread ask "am I the last?" *before* marking
-/// itself finished — which it must, because what it does with the answer takes
-/// locks, and a finished thread may not queue for one.
-#[must_use]
-pub fn threads_in_domain_except(domain: u32, except: u32) -> usize {
-    let online = percpu::online_count() as usize;
-    let mut total = 0;
-    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
-        let Some(queue) = queue.try_lock() else {
-            // A skipped queue counts as empty, which makes "am I the last
-            // thread of my domain" answerable wrongly in both directions.
-            // Counted here so the 2026-08-16 domain-test capture can say
-            // whether a blinded scan and a lost domain end coincide.
-            DOMAIN_SCAN_SKIPS.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        total += queue
-            .threads
-            .iter()
-            .flatten()
-            .filter(|thread| {
-                thread.domain == domain && thread.state != State::Finished && thread.id != except
-            })
-            .count();
-    }
-    total
-}
-
-/// Except-scans that could not see into every runqueue (see the counter's
+/// Domain-scans that could not see into every runqueue (see the counter's
 /// bump site for why that is worth a number).
 static DOMAIN_SCAN_SKIPS: AtomicU64 = AtomicU64::new(0);
 
-/// How many times [`threads_in_domain_except`] was blinded by a busy queue.
+/// How many times a domain thread-scan was blinded by a busy queue.
 #[must_use]
 pub fn domain_scan_skips() -> u64 {
     DOMAIN_SCAN_SKIPS.load(Ordering::Relaxed)
+}
+
+/// Live threads per domain, counted by arithmetic instead of by scanning.
+///
+/// The 2026-08-17 soak capture proved the scan answer to "am I my domain's
+/// last thread" gets lost: `exit` asked it *before* marking `Finished`, so a
+/// tick landing between the two let the true last thread see its predecessor
+/// as still alive — both concluded "not last", and the domain outlived every
+/// thread it had with nobody left to ask (eight captures, every one "still
+/// live 8 s on", never "ended late"). A counter has no such window: joining
+/// increments, leaving decrements, and `fetch_sub` returning 1 elects exactly
+/// one thread — whose decision, once made, survives any preemption because it
+/// is a value in hand rather than a scan to re-run.
+static DOMAIN_LIVE_THREADS: [core::sync::atomic::AtomicU32; crate::domain::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::domain::MAX_DOMAINS];
+
+/// Records a thread joining `domain`, at spawn.
+fn domain_thread_arrives(domain: u32) {
+    if let Some(count) = DOMAIN_LIVE_THREADS.get(domain as usize) {
+        count.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Records a thread leaving `domain`, at exit: true exactly once — for the
+/// thread whose departure left the domain empty.
+fn domain_thread_departs(domain: u32) -> bool {
+    DOMAIN_LIVE_THREADS
+        .get(domain as usize)
+        .is_some_and(|count| count.fetch_sub(1, Ordering::AcqRel) == 1)
 }
 
 /// How many threads still exist in `domain`, in any state but `Finished`.
@@ -3353,6 +3378,12 @@ pub fn threads_in_domain(domain: u32) -> usize {
     let mut total = 0;
     for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
         let Some(queue) = queue.try_lock() else {
+            // A skipped queue counts as empty. Tolerable here — every caller
+            // polls in a loop, so a blinded pass is corrected by the next —
+            // and counted, so the domain-test capture can report it. The
+            // last-thread decision in `exit` deliberately does NOT use this
+            // function for exactly this reason.
+            DOMAIN_SCAN_SKIPS.fetch_add(1, Ordering::Relaxed);
             continue;
         };
         total += queue

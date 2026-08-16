@@ -12589,7 +12589,7 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         let late = wait_until(|| !live(lonely) && !live(crowded), 8_000);
         println!(
-            "    domains        CAPTURE verdict: {}; {} except-scans were blinded by a busy \
+            "    domains        CAPTURE verdict: {}; {} domain scans were blinded by a busy \
              runqueue this boot",
             if late {
                 "ended late -- a delay, not a loss"
