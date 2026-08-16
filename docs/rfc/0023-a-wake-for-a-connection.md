@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft, **implemented 2026-08-15** (all three steps) — and the measurement returned a verdict the draft did not predict; see the implementation notes. |
+| **Status** | ✅ **Accepted 2026-08-16**, all three steps implemented 2026-08-15 — and accepted *with* the verdict the draft did not predict, not despite it: the wake made the round-trip median slower (1.4–3.1 ms against polling's 0.5–2.2 ms), and the win is the one the round-trip metric never priced — client scheduler activity fell from 87,584 runs to 296. The mechanism is accepted for that burn and for turning the 1–3 ms wake-to-run latency into a named scheduler number; the round trip's next win lives in the wake path, not in TCP. Questions 1 and 2 stay open. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `bin/tcpd`, `bin/tcpc`, ABI |
 | **Milestone** | Phase 2 — the first thing [RFC 0020](0020-tcp.md) step 6's numbers ask for |

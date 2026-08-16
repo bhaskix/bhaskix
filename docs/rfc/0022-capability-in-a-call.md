@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft, **fully implemented 2026-08-15** (steps 1–4) — a staged capability crosses at the rendezvous, refusals refuse whole and restore, a lender's death unmaps and unnames, and RFC 0020's echo now rides rings the client owns and gifted across `CONNECT`, with the connection capability minted back in the reply. Ready for acceptance review. |
+| **Status** | ✅ **Accepted 2026-08-16**, all four steps implemented 2026-08-15 — a staged capability crosses at the rendezvous, refusals refuse whole and restore, a lender's death unmaps and unnames, and RFC 0020's echo now rides rings the client owns and gifted across `CONNECT`, with the connection capability minted back in the reply. Accepted after implementation and measurement rather than before, which is this project's order when the mechanism was the missing half of an already-accepted design. Question 3 was answered by step 2 (retained-on-refusal, with the finding recorded under the question); questions 1, 2 and 4 stay open — 2 with the conservative rule shipped in its place, 4 with two witnesses now on record and the per-(thread, endpoint) refinement named as the fix if a third arrives. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel, ABI |
 | **Milestone** | Phase 2 — required before [RFC 0020](0020-tcp.md)'s connection capabilities |
