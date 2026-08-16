@@ -122,6 +122,13 @@ mod outcome {
     /// this machine — the shell test's, a hand-started one — has a listener
     /// with an honest nothing to accept.
     pub const NOBODY: u64 = 10;
+    /// The connection capability works but the machine cannot be
+    /// unpredictable: the service answered `NO_ENTROPY` when asked to
+    /// stream. Terminal, and the truthful ending on a machine whose
+    /// sequence numbers would be guessable — [`DARK`]'s sibling, told
+    /// apart because the network may exist here and "unreachable" would
+    /// be a lie.
+    pub const NO_ENTROPY: u64 = 11;
 }
 
 #[panic_handler]
@@ -302,6 +309,13 @@ fn stream_state_consuming(step: u64, consumed: u64) -> (u64, u64) {
         // 4a's claim — and the truthful end of the stream's story here is
         // that there is nobody to stream to.
         report(step, outcome::DARK, 0);
+        exit();
+    }
+    if word == tcp::NO_ENTROPY {
+        // No unpredictability on this machine, so the service refuses to
+        // mint sequence numbers — RFC 0021's policy, heard from the caller's
+        // side. The capability answered; the stream is what cannot happen.
+        report(step, outcome::NO_ENTROPY, 0);
         exit();
     }
     if word != tcp::OK {

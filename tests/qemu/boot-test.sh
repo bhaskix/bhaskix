@@ -1064,10 +1064,13 @@ fi
 # "pending" stopped being weather when the network stopped being one.
 #
 # On a machine without a network the honest report is state 0x3 and outcome
-# 5: the key drawn, no network, said so, exited. A machine that cannot be
-# unpredictable would report outcome 4 and never serve, which no machine this
-# harness boots should ever do -- so it fails here rather than passing as a
-# variant.
+# 5: the key drawn, no network, said so, serving handovers only. On a machine
+# that cannot be unpredictable -- CI's `-cpu qemu64` lanes, which this
+# comment once claimed no machine this harness boots could be -- the honest
+# report is state 0x1 and outcome 4: never keyed, refusing streams, serving
+# handovers only. That arm is accepted *only* when the machine's own feature
+# line says `rdrand NO`; outcome 4 on a machine with RDRAND stays exactly the
+# failure it always was.
 # The echo is demanded outright. This gate briefly carried a third arm that
 # accepted a stall in SYN-SENT, while a one-in-three wake loss was being
 # hunted; the loss was a thread returning from a notified receive still
@@ -1083,6 +1086,9 @@ if grep -qE "tcpd +state 0xf \(attached/keyed/configured/serving\), outcome (3|7
     pass "tcp opened a caller's connection against the deterministic peer"
 elif grep -qE "tcpd +state 0x3 \(attached/keyed/configured/serving\), outcome 5" "$LOG"; then
     pass "the tcp domain drew its secret, found no network, and said so"
+elif grep -qE "rdrand +NO" "$LOG" \
+    && grep -qE "tcpd +state 0x1 \(attached/keyed/configured/serving\), outcome 4" "$LOG"; then
+    pass "the tcp domain refused to be predictable and said so, still serving handovers"
 else
     fail "the tcp service did not open the caller's connection"
     grep -E "tcpd|tcp domain" "$LOG" || true
@@ -1151,6 +1157,19 @@ elif grep -qE "tcp client +holds a working connection capability on a machine wi
         status=1
     else
         pass "no network, but the handover completed and the connection capability answered honestly"
+    fi
+elif grep -qE "rdrand +NO" "$LOG" \
+    && grep -qE "tcp client +holds a working connection capability on a machine that cannot be unpredictable" "$LOG"; then
+    # The second dark arm, keyed like the service's: only a machine whose own
+    # feature line says `rdrand NO` may end this way, and it must not have
+    # served the host driver -- a service refusing to mint sequence numbers
+    # has no business completing a connection.
+    if [[ -f "$INBOUND_VERDICT" ]]; then
+        fail "a machine refusing entropy answered the host driver anyway"
+        rm -f "$INBOUND_VERDICT"
+        status=1
+    else
+        pass "no unpredictability, but the handover completed and the connection refused its stream honestly"
     fi
 else
     fail "the ring handover or the stream through it did not complete"
@@ -1590,10 +1609,27 @@ else
     status=1
 fi
 
-if grep -qE "supervisor +smep on +smap on" "$LOG"; then
-    pass "SMEP and SMAP enabled"
+# Conditioned on the machine's own feature report, because this script boots
+# two machines: `-cpu max` has SMEP and SMAP and must have enabled them, and
+# CI's `-cpu qemu64` has neither and must say so with dashes rather than
+# claiming protection it does not have. Either machine printing the other's
+# line is the failure.
+if grep -qE "features .*smep yes" "$LOG"; then
+    if grep -qE "supervisor +smep on +smap on" "$LOG"; then
+        pass "SMEP and SMAP enabled"
+    else
+        fail "the machine has SMEP/SMAP and they were not enabled"
+        status=1
+    fi
+elif grep -qE "features .*smep +NO" "$LOG"; then
+    if grep -qE "supervisor +smep -- +smap --" "$LOG"; then
+        pass "no SMEP/SMAP on this machine, and the report says so honestly"
+    else
+        fail "a machine without SMEP/SMAP claimed something else"
+        status=1
+    fi
 else
-    fail "SMEP/SMAP not enabled"
+    fail "the features line never said whether SMEP exists"
     status=1
 fi
 
@@ -1614,13 +1650,33 @@ fi
 # it lives inside a feature report that would go on printing perfectly well
 # without it.
 #
-# Asserted against the machine this harness boots, which is `-cpu max` and has
-# `RDRAND`. A machine without it warns and boots, deliberately, and is a
-# different machine from the one this gate is about.
-if grep -qF "unpredictable  two draws differ" "$LOG"; then
-    pass "the machine can produce an unpredictable number, demonstrated not declared"
+# Conditioned on the machine's own `rdrand` report, because this script boots
+# two machines and each owes a different sentence. `-cpu max` has RDRAND and
+# must demonstrate it -- two draws that differ. CI's `-cpu qemu64` has none
+# and must print RFC 0021's honest refusal instead, which is the policy the
+# RFC's acceptance watched working on exactly that machine. A comment here
+# used to say a machine without RDRAND "is a different machine from the one
+# this gate is about" -- written as if the harness only ever booted `-cpu
+# max`, while CI had been booting qemu64 through this same script since the
+# APIC matrix existed. Both machines are this gate's business now, and a
+# bright machine printing the dark line fails just as a dark one printing
+# nothing does.
+if grep -qE "rdrand yes" "$LOG"; then
+    if grep -qF "unpredictable  two draws differ" "$LOG"; then
+        pass "the machine can produce an unpredictable number, demonstrated not declared"
+    else
+        fail "no source of unpredictability was demonstrated -- RFC 0021, and TCP depends on it"
+        status=1
+    fi
+elif grep -qE "rdrand +NO" "$LOG"; then
+    if grep -qF "unpredictable  NO: this machine has no source of randomness" "$LOG"; then
+        pass "no unpredictability on this machine, refused honestly rather than guessed"
+    else
+        fail "a machine without RDRAND neither demonstrated nor refused -- RFC 0021's policy is absent"
+        status=1
+    fi
 else
-    fail "no source of unpredictability was demonstrated -- RFC 0021, and TCP depends on it"
+    fail "the features line never said whether RDRAND exists"
     status=1
 fi
 

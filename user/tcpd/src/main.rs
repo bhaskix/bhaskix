@@ -24,9 +24,12 @@
 //! A TCP initial sequence number must be unpredictable, or an off-path attacker
 //! injects into connections without seeing a packet. This program draws its
 //! 128-bit secret from `bhaskix-rand` **before doing anything else**, and on a
-//! machine that cannot be unpredictable it reports why and serves nothing.
-//! That is RFC 0021's policy — *the caller refuses* — with this program as the
-//! caller it was written about.
+//! machine that cannot be unpredictable it reports why and serves only ring
+//! handovers — connections are minted but refuse their streams with
+//! [`tcp::NO_ENTROPY`], because the handover needs no key and an endpoint
+//! with no receiver strands every caller for ever. That is RFC 0021's policy
+//! — *the caller refuses* — with this program as the caller it was written
+//! about.
 //!
 //! # What step 4 does and does not demonstrate
 //!
@@ -362,7 +365,8 @@ mod outcome {
     /// RFC 0022 step 4b moved the bytes into rings the caller owns — so for
     /// this service the steady state is exactly this.
     pub const ESTABLISHED: u64 = 3;
-    /// The machine cannot be unpredictable, so nothing was attempted.
+    /// The machine cannot be unpredictable, so no connection was attempted.
+    /// Ring handovers are still served — see [`serve_handover_only`].
     pub const NO_ENTROPY: u64 = 4;
     /// There is no network to demonstrate against.
     pub const NO_NETWORK: u64 = 5;
@@ -1123,14 +1127,20 @@ fn listen_leg_serving(
     (tcp::OK, handover.handle)
 }
 
-/// Serves ring handovers and nothing else, on a machine with no network.
+/// Serves ring handovers and nothing else, on a machine this service cannot
+/// open connections for.
 ///
-/// The exchange RFC 0022 step 4 exists for needs no wire: rings cross, the
-/// connection capability comes back, and what that connection cannot do
-/// without a network is its own report to make when asked. Exiting instead —
-/// which this program did — left the endpoint dead and every caller queued
-/// against it for ever.
-fn serve_handover_only() -> ! {
+/// Two machines end up here, and `dark` is the truth each one's minted
+/// connections must tell: [`tcp::UNREACHABLE`] where there is no network,
+/// [`tcp::NO_ENTROPY`] where there is no unpredictability to mint sequence
+/// numbers from — the network may exist there, so claiming unreachable
+/// would be a lie. The exchange RFC 0022 step 4 exists for needs neither
+/// wire nor key: rings cross, the connection capability comes back, and
+/// what that connection cannot do is its own report to make when asked.
+/// Exiting instead — which this program did on both dark arms, one after
+/// the other — left the endpoint dead and every caller queued against it
+/// for ever.
+fn serve_handover_only(dark: u64) -> ! {
     let mut connect_handover = Handover::new(
         (GIFT_SEND, GIFT_RECV),
         (SENDR_AT, RECVR_AT),
@@ -1153,10 +1163,9 @@ fn serve_handover_only() -> ! {
             badge != 0 && (badge == connect_handover.handle || badge == listen_handover.handle);
         if minted {
             // A stream method on a capability this machine minted but cannot
-            // serve: without a wire the peer is unreachable, and saying so
-            // is what lets the caller end with the truth rather than a
-            // timeout.
-            reply(tcp::UNREACHABLE, 0, 0);
+            // serve: saying which truth — unreachable, or unkeyable — is
+            // what lets the caller end with it rather than a timeout.
+            reply(dark, 0, 0);
         } else if method_in == tcp::CONNECT {
             let (outcome_word, detail) = connect_leg(&mut connect_handover, args[2]);
             reply(outcome_word, detail, 0);
@@ -1261,8 +1270,13 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     // which is RFC 0021's policy running, not a fallback quietly seeding from
     // something guessable.
     let Some(key) = Key::draw(bhaskix_rand::u64) else {
+        // Not `exit()`: that left the endpoint alive and receiver-less, and
+        // every caller's first CONNECT leg queued and blocked for ever — the
+        // exact bug the no-network arm below had already found and fixed.
+        // The handover needs no key; only a sequence number does, and the
+        // minted connection says so when asked.
         report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0);
-        exit()
+        serve_handover_only(tcp::NO_ENTROPY)
     };
     bits |= state_bits::KEYED;
     report(bits, outcome::PENDING, 0, 0, 0, 0);
@@ -1275,7 +1289,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // here would leave the endpoint dead with every caller queued
         // against it for ever.
         report(bits, outcome::NO_NETWORK, 0, 0, 0, 0);
-        serve_handover_only()
+        serve_handover_only(tcp::UNREACHABLE)
     }
 
     // What this interface is, written by the kernel once the driver has read
@@ -1306,7 +1320,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     }
     if me == Ipv4Addr::UNSPECIFIED {
         report(bits, outcome::NO_NETWORK, 0, 0, 0, 0);
-        serve_handover_only()
+        serve_handover_only(tcp::UNREACHABLE)
     }
     bits |= state_bits::CONFIGURED;
 

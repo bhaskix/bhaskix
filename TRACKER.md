@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-16 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. **TCP is complete and its RFC accepted 2026-08-16** ([RFC 0020](docs/rfc/0020-tcp.md), all six steps: `bin/tcpc` opens connections with rings its own domain owns, echoes through them both directions, and the boundary is measured — RFC 0022's capability-in-a-call is the mechanism underneath); no libc, no sockets API beyond UDP and TCP's own |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed — no architecture question open) · CI green · 601 suite checks · 46 boot gates per placement (4 placements), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed — no architecture question open) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 46 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
 
 ### How far along is this, in numbers
 
@@ -27,7 +27,7 @@ What can be counted honestly, with how to recount it:
 | Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
 | TCP, within RFC 0020 | **All six steps — both directions echo on every networked boot, guest and host agreeing, and the boundary is measured rather than argued about** | its implementation plan. `bin/tcpd` boots in its own domain, draws its secret and refuses without one; `bin/tcpc` supplies the rings, holds the connections, and is the instrument. The measured verdict: wake-by-notification and a wider window before congestion control or reassembly |
 | Tasks in defined milestones | **92 `DONE`, 4 `TODO`** | `grep -c` on the milestone tables in §3 |
-| Suite | 601 checks, 346 host assertions, 4 placements | §6 |
+| Suite | 601 checks, 346 host assertions, 5 placements | §6 |
 
 **Three exit criteria are unmet, and no task count reaches them.** They are the honest answer to
 "how far along":
@@ -756,6 +756,38 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-16 (the qemu64 lanes were red for two days, and the dark machine now has its arms)
+
+**CI's `boot (bios, qemu64)` and `boot (uefi, qemu64)` lanes had been red since the previous
+push (2026-08-14, `83ab701`) while every local run was green and this file said "CI green".**
+Three failures compounded: the local suite never boots `-cpu qemu64`, so nothing here could see
+it; the CI-log-access blocker (§3) reduces the lanes to unread pass/fail; and the header
+repeated "CI green" on faith. `project invariants` was red at `83ab701` too, and one of the 32
+commits since fixed it without anyone knowing — a fix nobody can point to is the same failure
+shape from the other side.
+
+**The kernel was never at fault — the harness demanded bright-machine lines from a dark
+machine, and one userspace path stranded its callers.** On qemu64 (no RDRAND, no SMEP/SMAP)
+the kernel does what RFC 0021 designed: refuses honestly, reports `smep -- smap --`, and
+`bin/tcpd` refuses to mint guessable sequence numbers. But tcpd's no-entropy path `exit()`ed —
+leaving its kernel-created endpoint alive and receiver-less, every caller's first `CONNECT` leg
+queued and blocked for ever, which is the *same bug its own no-network path had already found,
+fixed and documented*. `bin/tcpc` therefore hung at step 0 and the 15-second wait printed the
+`FAILED` marker.
+
+**The fix, in both layers.** `serve_handover_only` is parameterized by the truth its minted
+connections must tell — `UNREACHABLE` where there is no wire, `NO_ENTROPY` (already in the ABI,
+never sent until now) where there is no key, because the network may exist there and
+"unreachable" would be a lie. The no-entropy path now serves instead of exiting; `tcpc` maps
+the refusal to a new outcome 11 and the kernel prints it without the marker. Four gates gained
+their dark arms, each keyed to the machine's *own* feature report (`rdrand NO`, `smep NO`) so a
+bright machine printing a dark line still fails: unpredictability, SMEP/SMAP, the tcpd verdict
+(outcome 4, only under `rdrand NO`), and the client verdict. All four dark arms watched firing
+by name on qemu64; one watched red (the client arm's pattern broken deliberately, the gate
+failing, the break reverted). `make test` gains a `test-boot-qemu64` placement so the lane that
+was never run locally always is — the regression tests are that lane, both CI lanes, and the
+gates' negative arms.
 
 ### 2026-08-16 (RFC 0025 accepted: A5 is closed, and no architecture question remains open)
 

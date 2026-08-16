@@ -6378,6 +6378,10 @@ fn report_tcp_client(hhdm: u64) {
             "echoed outbound, listened, and nobody called -- which is a state, not a failure: \
              only the boot test runs a host-side caller"
         }
+        11 => {
+            "holds a working connection capability on a machine that cannot be unpredictable; \
+             the service said so when asked to stream, which is this machine's truthful ending"
+        }
         _ => "an outcome this kernel does not know",
     };
     // RFC 0020 step 6: the numbers, converted here because the client only
@@ -6417,7 +6421,7 @@ fn report_tcp_client(hhdm: u64) {
             through,
         );
     }
-    if outcome == 9 || outcome == 8 || outcome == 10 {
+    if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 {
         println!("    tcp client     {said}");
     } else {
         println!(
@@ -6532,7 +6536,10 @@ fn report_tcp_domain(hhdm: u64) {
         1 => "refused by the network",
         2 => "unanswered until the bounded retransmissions ran out",
         3 => "a caller's connection is open; the stream is the caller's story",
-        4 => "refused by this service: the machine cannot be unpredictable",
+        4 => {
+            "refused by this service: the machine cannot be unpredictable; serving ring \
+             handovers only"
+        }
         5 => "no network; serving ring handovers only",
         6 => "retired outcome 6 from before the stream moved to the caller",
         7 => "closed in order, and TIME_WAIT expired",

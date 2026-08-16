@@ -145,7 +145,7 @@ OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
-        test-boot-iommu-off test-placements mkfs \
+        test-boot-iommu-off test-boot-qemu64 test-placements mkfs \
         test-shell test-faults fmt clippy gates clean distclean help
 
 all: iso
@@ -378,7 +378,7 @@ run-uefi: $(ISO)
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
-      test-placements test-shell test-faults
+      test-boot-qemu64 test-placements test-shell test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -441,6 +441,15 @@ test-boot-iommu: $(ISO)
 # then that it never worked is the worst possible time.
 test-boot-iommu-off: $(ISO)
 	tests/qemu/boot-test.sh iommu-off
+
+# The dark machine: no RDRAND, no SMEP/SMAP, xAPIC only. CI has booted it
+# since the APIC matrix existed, but the local suite never did -- which is
+# exactly how its lanes stayed red from 2026-08-14 to 2026-08-16 while every
+# local run was green, invisible behind the CI-log-access blocker. One
+# placement here, BIOS, because the dark arms being tested are CPU-model
+# facts and the firmware axis is already covered above.
+test-boot-qemu64: $(ISO)
+	QEMU_CPU=qemu64 tests/qemu/boot-test.sh bios
 
 
 # Types at the machine over the serial line and asserts on the replies. The
