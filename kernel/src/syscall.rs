@@ -1635,6 +1635,24 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     // SAFETY: the caller guarantees the pointer, and the frame lives on this
     // CPU's kernel stack for the duration of the call.
     let frame = unsafe { &mut *frame };
+
+    // Interrupts on, for the whole of dispatch. SYSCALL's mask cleared `IF`
+    // so the entry stub could `swapgs` and switch stacks atomically, and for
+    // want of this line the mask then covered *everything*: every system
+    // call ran deaf, and a syscall that spun -- a heap wait under
+    // contention -- deafened its whole CPU. No tick, no wake IPI, no TLB
+    // shootdown ack. The seventh capture of the boot hang read the bill out
+    // in milliseconds: every one of a teardown's per-page shootdowns burned
+    // its full timeout waiting for an ack a masked CPU could never send,
+    // stretching one heap hold to forty-two seconds; the seconds-long
+    // wake-to-dispatch outliers were the same deafness. The frame is built
+    // and this is the kernel's stack and `GS`, which is everything the mask
+    // was protecting.
+    //
+    // SAFETY: the IDT has been installed since bring-up; every vector has a
+    // handler.
+    unsafe { bhaskix_arch::cpu::enable_interrupts() };
+
     let outcome = dispatch(frame);
 
     // Every system call returns to ring 3, so this needs no condition. See
@@ -1676,6 +1694,14 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     if crate::sched::should_die() {
         crate::sched::exit()
     }
+
+    // Interrupts off again for the exit stub, which mirrors the entry: it
+    // restores the user stack pointer and `swapgs`, and an interrupt landing
+    // between those two is the same exploit the entry mask exists for.
+    //
+    // SAFETY: masking before the unwind is exactly the state the stub's exit
+    // sequence assumes.
+    unsafe { bhaskix_arch::cpu::disable_interrupts() };
 
     // The hold-leak canary. A thread returning to ring 3 holds no kernel
     // lock -- every guard the dispatch took has dropped by here -- so a

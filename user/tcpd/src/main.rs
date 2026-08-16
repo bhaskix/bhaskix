@@ -574,7 +574,19 @@ fn perform(
                         // end while the state is still `TIME_WAIT`.
                         state::Ended::Orderly => outcome::ORDERLY,
                         state::Ended::Aborted => service.outcome,
-                        state::Ended::Reset => outcome::REFUSED,
+                        // A reset *before* establishment is the peer refusing.
+                        // After it — a stray segment into TIME_WAIT, answered
+                        // with RST by whoever holds the port now — the
+                        // connection this report narrates already happened,
+                        // and erasing that fact mis-gated a boot whose echo
+                        // had succeeded end to end.
+                        state::Ended::Reset => {
+                            if service.outcome == outcome::PENDING {
+                                outcome::REFUSED
+                            } else {
+                                service.outcome
+                            }
+                        }
                     };
                 }
             }

@@ -431,6 +431,10 @@ const OPEN_GUARDS: usize = 8;
 struct OpenGuards {
     at: [core::sync::atomic::AtomicUsize; OPEN_GUARDS],
     rank: [AtomicU32; OPEN_GUARDS],
+    /// Cycle count at acquisition, so the dump can print each hold's age —
+    /// the difference between "a long teardown" and "a loop that will never
+    /// end" is a number, and the sixth capture needed it.
+    since: [AtomicU64; OPEN_GUARDS],
 }
 
 impl OpenGuards {
@@ -438,6 +442,7 @@ impl OpenGuards {
         Self {
             at: [const { core::sync::atomic::AtomicUsize::new(0) }; OPEN_GUARDS],
             rank: [const { AtomicU32::new(0) }; OPEN_GUARDS],
+            since: [const { AtomicU64::new(0) }; OPEN_GUARDS],
         }
     }
 }
@@ -461,6 +466,7 @@ fn open_guard(at: &'static core::panic::Location<'static>, rank: u8) -> usize {
             .is_ok()
         {
             table.rank[slot].store(u32::from(rank), Ordering::Relaxed);
+            table.since[slot].store(bhaskix_arch::tsc::read(), Ordering::Relaxed);
             return slot;
         }
     }
@@ -500,7 +506,7 @@ fn close_guard(slot: usize, at: &'static core::panic::Location<'static>) {
 /// Walks the guards currently open on `cpu`: `(site, rank byte)`.
 pub fn for_each_open_guard(
     cpu: usize,
-    mut f: impl FnMut(&'static core::panic::Location<'static>, u8),
+    mut f: impl FnMut(&'static core::panic::Location<'static>, u8, u64),
 ) {
     let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
     for slot in 0..OPEN_GUARDS {
@@ -508,7 +514,11 @@ pub fn for_each_open_guard(
         if raw != 0 {
             // SAFETY: only `&'static Location`s are ever stored.
             let at = unsafe { &*(raw as *const core::panic::Location<'static>) };
-            f(at, table.rank[slot].load(Ordering::Relaxed) as u8);
+            f(
+                at,
+                table.rank[slot].load(Ordering::Relaxed) as u8,
+                table.since[slot].load(Ordering::Relaxed),
+            );
         }
     }
 }

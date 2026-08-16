@@ -757,6 +757,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-16 (the boot hang, root-caused and fixed: every system call ran deaf)
+
+**Seven captures, six instrument generations, one line of truth: `IA32_FMASK` clears `IF` and
+nothing ever set it again — the whole of every system call dispatch ran with interrupts
+masked.** The entry stub needs the mask for exactly three instructions (`swapgs`, park the user
+stack, take the kernel's); for want of a `sti` after them, the mask covered everything, and a
+system call that *spun* — `bin/ipd`'s heap wait under contention — deafened its entire CPU: no
+timer tick, no wake IPI, no TLB-shootdown ack. The seventh capture read the bill out in
+numbers the instruments were built to produce: the open-guards table showed one `heap::with`
+closure held for **42.8 seconds** at `heap.rs:98` beside a live shootdown aged **184 ms** —
+which is precisely the shootdown wait's 20-million-spin timeout — while `ipd` held the
+address-space table 42.8 seconds at `with_active`. The teardown's every per-page shootdown
+burned its full timeout waiting for an ack a masked CPU could never send; a few hundred pages
+stretched one heap hold across the whole watchdog window; preemption was vetoed on cpu 0 by the
+genuinely-held locks; fresh threads starved at zero runs. The seconds-long wake-to-dispatch
+outliers were the same deafness wearing a different line.
+
+**The fix is two instructions in the right place**: interrupts enabled at the top of
+`bhaskix_syscall_dispatch` — the frame is built, the stack and `GS` are the kernel's, which is
+everything the mask protected — and disabled again after the die-check, before the exit stub
+whose unwind mirrors the entry. The die-check stays inside the enabled window because `exit()`
+on a masked CPU would spin unswitchable for ever. Every dispatch now takes ticks, wakes and
+shootdown IPIs mid-call; `preempt`'s lock-holder refusal was always the real guard and remains
+it.
+
+**Validation, stated as what it is**: the mechanism is removed by construction and was measured
+directly before the fix; four full suites since show zero hangs against a recent rate of about
+one in two. One secondary mis-gate fell out of the changed timing and is fixed beside it: a
+stray segment answered with `RST` after the demonstration's orderly shutdown overwrote `tcpd`'s
+outcome word from established to refused, failing a boot whose echo had succeeded end to end —
+a reset now only claims the outcome if the connection never established. Every instrument the
+hunt built stays armed in CI: the syscall-exit canary, both lock ledgers with ages, the sampled
+stall verdict, the unmap-runaway tripwire.
+
 ### 2026-08-15 (fifth capture: the ledger read out one culprit's line, and the open-guards table will read out the rest)
 
 **The lock ledger fired on its first hunt and named a line.** On the stalled `ipd` CPU the ring

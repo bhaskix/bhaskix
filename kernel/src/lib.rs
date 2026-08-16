@@ -1188,8 +1188,20 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
             continue;
         }
         println!("  cpu {cpu}'s open guards -- held right now, by acquisition site:");
-        crate::sync::for_each_open_guard(cpu, |at, rank| {
-            println!("    rank {:3}  {}:{}", rank, at.file(), at.line());
+        let now = bhaskix_arch::tsc::read();
+        let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+        crate::sync::for_each_open_guard(cpu, |at, rank, since| {
+            let held_ms = if hertz == 0 {
+                0
+            } else {
+                (u128::from(now.saturating_sub(since)) * 1_000 / u128::from(hertz)) as u64
+            };
+            println!(
+                "    rank {:3}  held {held_ms} ms  {}:{}",
+                rank,
+                at.file(),
+                at.line(),
+            );
         });
         println!("  cpu {cpu}'s last lock events, oldest first (> acquire, < release):");
         crate::sync::for_each_lock_event(cpu, |at, rank, acquire, count_after| {

@@ -222,7 +222,12 @@ workspace = true
 #
 # 1223 at the open-guards table: the same cast, in the walk over what is
 # held right now.
-unsafe_budget = 1223
+#
+# 1225 at the fix the seven captures were for: interrupts enabled for the
+# whole of syscall dispatch and disabled again for the exit stub -- the two
+# sti/cli calls that end the deafness which stretched one heap hold to
+# forty-two seconds.
+unsafe_budget = 1225
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

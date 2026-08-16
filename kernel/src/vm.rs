@@ -243,6 +243,22 @@ impl AddressSpace {
         let hhdm = self.hhdm_base;
         let active = self.is_active();
 
+        // The sixth stall capture found this function's heap closure held
+        // for the whole of a boot hang, shooting down page after page — and
+        // every wait inside the loop is bounded, so the one way it runs for
+        // seconds is a count that is wrong by orders of magnitude. Say so
+        // *before* the loop, because inside it this CPU is undeschedulable:
+        // sixteen million pages is sixty-four gigabytes of virtual range,
+        // which nothing on this machine legitimately unmaps in one call.
+        if count > (1 << 24) {
+            crate::println!(
+                "\x1b[91m  UNMAP RUNAWAY: asked to unmap {count} pages at {:#x} -- a count \
+                 this size is bookkeeping gone wrong, and the loop below would hold the heap \
+                 and the shootdown sender for its whole duration\x1b[0m",
+                range.start.as_u64(),
+            );
+        }
+
         heap::with(|heap| {
             let pmm = heap.pmm_mut();
             for page in range.pages_iter().take(count as usize) {
