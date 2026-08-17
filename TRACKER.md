@@ -711,7 +711,7 @@ what is actually ahead.
 | Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets. **And the duration is met as of 2026-08-13**: three campaigns of a full twenty-four hours each, 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`, 52 million over `ustar`. No crash, no hang, no artifact |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1 — ✅ **answered by step 3** on 2026-08-07, and this row said only that the RFC *found* it until 2026-08-12, when that omission misled the author of RFC 0018 into calling it open. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | 🟨 **in progress** | ~~Gated on the driver framework rather than on anything network-shaped.~~ **The note above was stale from 2026-08-13, when RFC 0018 was accepted and this row was not touched** — precisely the failure the paragraph over this table describes, one row down from where it describes it. What is true: virtio-net, Ethernet, ARP, IPv4, ICMP, UDP and sockets are **done** and a DHCP client obtains an address (RFC 0018, seven steps). **TCP is [RFC 0020](docs/rfc/0020-tcp.md), all six steps done** — outbound and inbound echo through rings the client program owns, guest and host agreeing byte-for-byte, and the cost is measured: round trips at 4–10× UDP's, 1–2.6 MiB/s each way — a rate the 2026-08-17 window widening (one page → the whole 16-KiB ring) left unchanged, which convicts the per-chunk serve-loop unit rather than the window (§7). Wake-by-notification landed as RFC 0023. **IPv6 is not started and is not in RFC 0020's scope.** This row said "the bullet stays open until TCP does" — TCP closed 2026-08-16 and the bullet is still open, because the bullet names IPv6 and a sockets API that do not exist; what it waits on changed, and the row now says so |
-| Telemetry plane | 🟨 **in progress** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) drafted 2026-08-17, **steps 1–4 and 6 done the same day; step 5 remains** | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
+| Telemetry plane | 🟨 **all six steps implemented 2026-08-17** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) drafted and built the same day; the RFC awaits acceptance review, and the bullet stays open until it has one | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
 
 ---
 
@@ -759,6 +759,68 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-17 (the run-312 family's third sighting, and the rebuilt report's first catch)
+
+**One boot of the step-5 suite's placement matrix (`console=domain vfs=nucleus`, BIOS) wedged
+with the known banner** — `UNEXPECTED INTERRUPT on vector 65` — and this time the densest line
+printed first, exactly as the rebuilt report was built to do: `cpu 1 thread Some(12); frame at
+0xffffa000000edd10; error 0x0 cr2 0x246 cr3 0xff33000`. The frame address sits in the kernel
+stacks region and the error code is zero, consistent with the ghost-frame reading; the serial
+log ends at that line, so the 120-second cap or the wedge itself still swallowed the register
+dump — the dense line survived where run-312's did not, which is the improvement working and
+its limit named. The crash lands in scheduling-self-test territory, **before `telemetry::init`
+runs**: every RFC 0026 producer was dormant behind the zero mask at that point, so this is the
+pre-existing disease at its recorded ~2-in-1100 rate, not a regression — the same family the
+hunt paused on this morning. Log preserved at
+`/root/bhaskix-soak-artifacts/2026-08-17-run312-family-third-sighting-placement-lane.log`.
+
+**The next suite wedged too — silently, `shell=kernel` lane, same phase**: the serial log ends
+after the migration line, inside `wait_queue_self_test`'s wake/sleep stress, no banner at all.
+Two wedges in two consecutive suites is far above the recorded background, so the day's own
+changes went under suspicion and were checked rather than defended: both wedges sit **before
+`telemetry::init`**, where every RFC 0026 producer is dormant behind the zero mask and step 5's
+whole contribution to the hot path is one mask-check early-return and one relaxed store per
+switch. Both lanes passed on immediate re-run, and a **40-boot soak of the step-5 build came
+back 40 for 40** — at the two-in-a-suite rate roughly three failures were expected, so the
+amplification theory is disfavored at about the 4% level, not refuted. What is true: the wedge
+phase is the wake/sleep stress where the save/restore disease lives, the host was carrying this
+session's build load during both failing suites (the soak harness's own header names host load
+as how it lies), and the running total for the family is now **four sightings, two with no
+marker at all**. The hunt stays paused on its stated criterion, two specimens richer; if the
+suite wedges again on an idle host, the JOBS=1 A/B soak — this commit against its parent — is
+the next discriminating instrument, written down here before it is needed.
+
+### 2026-08-17 (RFC 0026 step 5: the crossings become events, and the pipeline stamps die with one loss stated)
+
+**Three producers, one per kind of kernel crossing, all riding the `Syscall` class.** Every
+system call emits at its exit, where the status is known — kind, method, slot, status; `Exit`
+diverges and never appears, said rather than discovered. Every rendezvous event emits from
+`ipc`'s existing trace point, the one funnel all seven event kinds already pass through. Every
+notification signal emits, legal from interrupt context because emit is. **None of the three
+may ask the scheduler who is running** — `current_domain()` takes the runqueue lock, which
+`signal()` must never block on from a handler and which the trace point may reach with an
+endpoint held — so the switch path keeps a lock-free per-CPU domain hint beside its dispatch
+event, briefly stale around a switch and documented as a hint. `bin/traced` became the live
+consumer: validate each ring once, drain every pass, publish cumulative per-class counts,
+sleep on an armed deadline between passes — the RFC's deferred blocking-reader question
+answered the way every service answers it. The round-trip gate now also demands nonzero sched
+and syscall events seen through the granted rings.
+
+**The pipeline stamps are retired, and the record says exactly what died with them.** Removed:
+the client's two stamp words, `stamp_once` in `bin/tcpd` and `bin/ipd` (eighteen budget lines
+returned, both manifests tightened to match), the kernel's `report_tcp_pipeline`, and the
+boot-test's attribution check. What replaces them is general where they were bespoke: the
+crossings every hop rides are now events any consumer can stream, not six words a first echo
+writes once. **What is lost, stated rather than hidden**: deliver-to-seen — the hop the
+2026-08-15 attribution showed owning 54% before the memory-wait fix — was an in-program
+memory poll, and no kernel crossing can see it; its bound survives only as the wake-to-
+next-syscall gap. The two open threads attached to the old instrument — the unexplained
+emit/wire stamp inversion and the owed re-attribution of the memory-wait client — close *by
+retirement, not by answer*: the instrument that posed them no longer exists, and a future
+attribution over the stream starts fresh. The RFC's step 5 sketched a `Net`-class TCP
+re-expression; what landed is general instead, and the draft was edited to match before
+acceptance rather than diverging silently after it.
 
 ### 2026-08-17 (RFC 0026 step 6: the A/B, and what a disabled class actually costs)
 

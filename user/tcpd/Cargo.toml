@@ -51,4 +51,6 @@ opt-level = "s"
 # it, which is the argument for this domain existing.
 # 114 at the pipeline attribution: the stamp-once report words for the
 # first payload emit and the first delivery.
-unsafe_budget = 114
+# 105 after RFC 0026 step 5 retired the pipeline stamps: stamp_once_at
+# and its first-write check were nine lines of unsafe now gone.
+unsafe_budget = 105

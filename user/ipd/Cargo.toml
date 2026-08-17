@@ -60,4 +60,6 @@ opt-level = "s"
 # copy routines as before, which is why seventeen lines buys two rings.
 # Nine more at the pipeline attribution: the rdtsc read and the stamp-once
 # report words for the first data segment out and in.
-unsafe_budget = 140
+# 131 after RFC 0026 step 5 retired the pipeline stamps: stamp_once and
+# its rdtsc were nine lines of unsafe this program no longer contains.
+unsafe_budget = 131

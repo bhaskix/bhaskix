@@ -149,6 +149,13 @@ LAYERS = {
     # what it demonstrates is the *exchange*, and an exchange that needed
     # protocol code on the client side would be the wrong exchange.
     "bhaskix-user-tcpc": -1,
+    # The telemetry reader, RFC 0026 steps 3-5. It links the ABI for its
+    # calls and `bhaskix-telemetry` for everything about the bytes -- the
+    # same registry the kernel hashed into the ring headers, which is what
+    # lets a mismatched build refuse to decode. It holds no device and no
+    # network, and everything it observes arrives through two read-mostly
+    # grants; a wider dependency list here should be a conversation.
+    "bhaskix-user-traced": -1,
     # The supervisor places no service: it creates domains, starts programs in
     # them and reaps them, all through capability invocations. So it belongs
     # here with the other plain programs rather than in PLACEMENTS -- and that

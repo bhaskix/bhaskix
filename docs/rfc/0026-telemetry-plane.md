@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Draft — all six steps implemented 2026-08-17, awaiting acceptance review. Step 5 landed differently than sketched, and the plan below was edited to match before acceptance rather than after: the crossings ride the `Syscall` class as three general schemas (syscall exit, rendezvous event, signal) rather than a bespoke `Net` re-expression, `bin/traced` became the live deadline-woken consumer, and the pipeline stamps were retired with one measurement knowingly lost — deliver-to-seen, an in-program memory poll no kernel crossing can see; TRACKER's changelog has the full account |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel, tools, ABI |
 | **Milestone** | Phase 2 — the roadmap's "telemetry plane" bullet, [ai-native.md](../ai-native.md) §2 made real |
@@ -263,9 +263,15 @@ Measured, not hoped:
    the marked-events round trip, watched red by withholding the grant.
 4. **`bin/traced` v0**: drains, merges, decodes, reports through the console service; the boot
    gate line.
-5. **Producers that earn their keep**: syscall entry/exit and IPC rendezvous events; then the
-   TCP pipeline stamps re-expressed as `Net`-class events — the moment the special case dies
-   and the serve-loop hunt gets its streaming instrument.
+5. **Producers that earn their keep**: one event per syscall at its exit, one per rendezvous
+   event through `ipc`'s existing trace funnel, one per notification signal — the kernel
+   crossings, all riding the `Syscall` class as general schemas rather than the `Net`-class
+   TCP re-expression first sketched here, because the crossings are what every hop of every
+   pipeline rides and a TCP-shaped schema would have rebuilt the special case one layer up.
+   `bin/traced` becomes the live consumer the stream needs — validating once, draining every
+   pass, sleeping on an armed deadline between passes. Then the pipeline stamps die, with one
+   loss stated rather than hidden: deliver-to-seen was an in-program memory poll, and no
+   kernel crossing can see it; its bound survives as the wake-to-next-syscall gap.
 6. **The overhead measurement**: the A/B emit-cost line in the boot report, the drop-rate row,
    and the CI assertion that the existing latency gates hold with default classes on.
 

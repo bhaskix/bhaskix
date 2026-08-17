@@ -537,14 +537,6 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             }
         }
         let begun = rdtsc();
-        if index == 0 {
-            // The pipeline attribution's first stamp (RFC 0020 step 6's
-            // follow-on instrument): the services each stamp their first
-            // payload hop once, and the kernel lines the stamps up after
-            // boot. First-echo-only, because later traffic — the bulk, the
-            // inbound serve — would overwrite a "last" into meaninglessness.
-            report_word(10, begun);
-        }
         stream_send(PAYLOAD.len() as u64, 6);
         sent_bytes += PAYLOAD.len() as u64;
         // Seen when the echo's last byte is in this program's own ring —
@@ -557,9 +549,6 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             exit();
         }
         *sample = rdtsc().wrapping_sub(begun);
-        if index == 0 {
-            report_word(11, rdtsc());
-        }
         let (_, delivered) = stream_state_consuming(6, sent_bytes - consumed_told);
         consumed_told = sent_bytes;
         delivered_seen = delivered_seen.max(delivered);

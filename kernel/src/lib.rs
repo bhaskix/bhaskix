@@ -6162,7 +6162,6 @@ fn report_net_after_exchange(hhdm: u64) {
         wait_millis(100);
     }
     report_tcp_client(hhdm);
-    report_tcp_pipeline(hhdm);
 
     // RFC 0018 step 7: what the boundary cost, counted rather than argued.
     //
@@ -6684,80 +6683,6 @@ fn report_tcp_client(hhdm: u64) {
 \x1b[0m"
         );
     }
-}
-
-/// Lines up the pipeline stamps the first echoed payload left behind.
-///
-/// Four programs each stamped their own report page with the cycle counter
-/// as sample zero's sixteen bytes passed through them — the client's send
-/// and seen, the TCP service's emit and deliver, the protocol service's
-/// out-to-wire and in-from-wire. Same counter, every CPU, so subtraction is
-/// attribution: this is the instrument RFC 0024's closure note said the
-/// 1.4–3.1 ms round-trip median needed, printed once per boot and gated by
-/// presence on networked boots.
-fn report_tcp_pipeline(hhdm: u64) {
-    use core::sync::atomic::Ordering;
-
-    let word_of = |raw: u64, index: u64| -> u64 {
-        if raw == u64::MAX {
-            return 0;
-        }
-        let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
-            return 0;
-        };
-        if count == 0 {
-            return 0;
-        }
-        // SAFETY: a frame this object owns, through the direct map.
-        unsafe { core::ptr::read_volatile((hhdm + pages[0] + index * 8) as *const u64) }
-    };
-
-    let sent = word_of(TCPC_REPORT.load(Ordering::Acquire), 10);
-    let emitted = word_of(TCP_REPORT.load(Ordering::Acquire), 7);
-    let to_wire = word_of(NET_RING_REPORT.load(Ordering::Acquire), 21);
-    let from_wire = word_of(NET_RING_REPORT.load(Ordering::Acquire), 22);
-    let delivered = word_of(TCP_REPORT.load(Ordering::Acquire), 8);
-    let seen = word_of(TCPC_REPORT.load(Ordering::Acquire), 11);
-
-    let stamps = [sent, emitted, to_wire, from_wire, delivered, seen];
-    if stamps.contains(&0) {
-        // No echo ran on this boot — a dark machine — and half an
-        // attribution would be worse than none.
-        return;
-    }
-    // Strict order through the wire; the last two legs may interleave. The
-    // client detects the echo by reading its own ring, so it can see the
-    // bytes the instant the service's copy lands — *before* the service
-    // finishes its delivery loop and stamps. That race is the optimisation
-    // working, not the instrument failing, and deliver-to-seen saturates to
-    // zero when the client wins it.
-    let ordered = [sent, emitted, to_wire, from_wire];
-    if !ordered.windows(2).all(|pair| pair[0] <= pair[1])
-        || seen < from_wire
-        || delivered < from_wire
-    {
-        println!(
-            "\x1b[93m    tcp pipeline   stamps out of order; the first payload did not take the \
-             path this instrument assumes ({sent} {emitted} {to_wire} {from_wire} {delivered} \
-             {seen})\x1b[0m"
-        );
-        return;
-    }
-    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
-    if hertz == 0 {
-        return;
-    }
-    let micros = |ticks: u64| (u128::from(ticks) * 1_000_000 / u128::from(hertz)) as u64;
-    println!(
-        "    tcp pipeline   send to emit {} us, emit to wire {} us, wire and peer {} us, wire to \
-         deliver {} us, deliver to seen {} us; whole first echo {} us",
-        micros(emitted - sent),
-        micros(to_wire - emitted),
-        micros(from_wire - to_wire),
-        micros(delivered - from_wire),
-        micros(seen.saturating_sub(delivered)),
-        micros(seen - sent),
-    );
 }
 
 fn report_tcp_domain(hhdm: u64) {
