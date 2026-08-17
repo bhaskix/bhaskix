@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The telemetry plane's first consumer -- RFC 0026 steps 3 and 4. It holds
+# exactly the two authorities the RFC names: the rings, read-only, and the
+# tails, read-write; everything it knows about their contents comes from
+# `bhaskix-telemetry`, the same arithmetic the kernel emitted through.
+#
+# Not a member of the root workspace, for the reason user/netd/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a
+# workspace member cannot have its own `rustflags`.
+[workspace]
+
+[package]
+name = "bhaskix-user-traced"
+description = "The telemetry reader: drains the per-CPU rings through capabilities and proves the round trip."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "traced"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-telemetry = { path = "../../telemetry" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 21, measured, no headroom: the syscall block, the report-page writes, the
+# deliberate ud2 in the panic handler, and the volatile reads of memory this
+# program mapped itself -- ring headers, slots, and its own tail words. Every
+# decision about those bytes is bhaskix-telemetry's safe arithmetic; the
+# unsafe here is the loads.
+unsafe_budget = 21

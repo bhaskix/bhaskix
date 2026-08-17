@@ -51,6 +51,7 @@ IPD_DIR      := user/ipd
 DHCPD_DIR    := user/dhcp
 TCPD_DIR     := user/tcpd
 TCPC_DIR     := user/tcpc
+TRACED_DIR   := user/traced
 FSD_DIR      := user/fsd
 SUP_DIR      := user/sup
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
@@ -63,6 +64,7 @@ USER_IPD     := $(IPD_DIR)/target/$(TARGET)/release/ipd
 USER_DHCPD   := $(DHCPD_DIR)/target/$(TARGET)/release/dhcp
 USER_TCPD    := $(TCPD_DIR)/target/$(TARGET)/release/tcpd
 USER_TCPC    := $(TCPC_DIR)/target/$(TARGET)/release/tcpc
+USER_TRACED  := $(TRACED_DIR)/target/$(TARGET)/release/traced
 USER_FSD     := $(FSD_DIR)/target/$(TARGET)/release/fsd
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
@@ -92,6 +94,8 @@ TCPD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(TCPD_DIR)/link.ld
 TCPC_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(TCPC_DIR)/link.ld
+TRACED_FLAGS := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(TRACED_DIR)/link.ld
 FSD_FLAGS    := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(FSD_DIR)/link.ld
 
@@ -205,7 +209,7 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_TCPD) $(USER_TCPC) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
@@ -219,6 +223,7 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USE
 	cp $(USER_DHCPD) $(INITRD_ROOT)/bin/dhcp
 	cp $(USER_TCPD) $(INITRD_ROOT)/bin/tcpd
 	cp $(USER_TCPC) $(INITRD_ROOT)/bin/tcpc
+	cp $(USER_TRACED) $(INITRD_ROOT)/bin/traced
 	cp $(USER_FSD) $(INITRD_ROOT)/bin/fsd
 	cp $(USER_SUP) $(INITRD_ROOT)/bin/sup
 	cp $(FS_IMAGE) $(INITRD_ROOT)/fs.img
@@ -321,6 +326,17 @@ $(USER_TCPD): $(TCPD_DIR)/src/main.rs $(TCPD_DIR)/link.ld $(TCPD_DIR)/Cargo.toml
 $(USER_TCPC): $(TCPC_DIR)/src/main.rs $(TCPC_DIR)/link.ld $(TCPC_DIR)/Cargo.toml \
               $(wildcard abi/src/*.rs)
 	cd $(TCPC_DIR) && RUSTFLAGS="$(TCPC_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+
+# The telemetry reader -- RFC 0026 steps 3 and 4. The ABI for the calls, and
+# the telemetry crate for everything about the bytes: the same registry the
+# kernel hashed into the ring headers, so a mismatched build refuses to
+# decode instead of misreading structurally.
+$(USER_TRACED): $(TRACED_DIR)/src/main.rs $(TRACED_DIR)/link.ld $(TRACED_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs) $(wildcard telemetry/src/*.rs)
+	cd $(TRACED_DIR) && RUSTFLAGS="$(TRACED_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
@@ -510,6 +526,7 @@ fmt:
 	cd $(DHCPD_DIR) && $(CARGO) fmt --all --check
 	cd $(TCPD_DIR) && $(CARGO) fmt --all --check
 	cd $(TCPC_DIR) && $(CARGO) fmt --all --check
+	cd $(TRACED_DIR) && $(CARGO) fmt --all --check
 	cd $(FSD_DIR) && $(CARGO) fmt --all --check
 	cd $(SUP_DIR) && $(CARGO) fmt --all --check
 
@@ -539,6 +556,8 @@ clippy:
 	cd $(TCPD_DIR) && RUSTFLAGS="$(TCPD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(TCPC_DIR) && RUSTFLAGS="$(TCPC_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(TRACED_DIR) && RUSTFLAGS="$(TRACED_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings

@@ -244,7 +244,11 @@ workspace = true
 # guard, and init's zeroing. Every decision behind those stores is safe,
 # host-tested arithmetic in bhaskix-telemetry, which is the split the RFC
 # promised and this number holds it to.
-unsafe_budget = 1240
+#
+# 1248 at steps 3-4: the round trip's kernel half -- the probe burst's tail
+# write, and the traced report page read out through the direct map, the
+# same shape every report reader pays.
+unsafe_budget = 1248
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

@@ -184,6 +184,59 @@ pub fn enable(class: EventClass) {
     MASK.fetch_or(class.bit(), Ordering::Relaxed);
 }
 
+/// The identity of `cpu`'s ring object, for the grant (step 3).
+pub fn ring_identity(cpu: usize) -> Option<u64> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    match RING_IDS[cpu].load(Ordering::Relaxed) {
+        u64::MAX => None,
+        identity => Some(identity),
+    }
+}
+
+/// The identity of the tails object, for the grant (step 3).
+pub fn tails_identity() -> Option<u64> {
+    match TAILS_ID.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        identity => Some(identity),
+    }
+}
+
+/// The payload mark the round-trip probes carry: `b"TRACEPRB"`. Distinct
+/// from the boot report's own instrument probes, so `bin/traced`'s count
+/// means "the marked set" and nothing else.
+pub const PROBE_MARK: u64 = u64::from_le_bytes(*b"TRACEPRB");
+
+/// Empties the calling CPU's ring and emits `count` marked probes into it.
+///
+/// The self-test's per-CPU half: run on each CPU in turn (emit writes only
+/// the caller's own ring), it guarantees the probes are admitted — the ring
+/// was just emptied and holds 512 — so `bin/traced` reading back fewer than
+/// `count` convicts the path, not the pressure. Writing the tail from here
+/// is sound for the same reason the report instrument's write is: it
+/// happens before the consumer is spawned, while the kernel is still the
+/// only party.
+pub fn probe_here(count: u64) {
+    if SLOTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let cpu_index = percpu::cpu_id() as usize;
+    let head = header_word(cpu_index, ring::HEAD_OFFSET);
+    let at = HHDM.load(Ordering::Relaxed)
+        + TAILS_FRAME.load(Ordering::Relaxed)
+        + ring::tail_offset(cpu_index) as u64;
+    // SAFETY: the tails frame, through the direct map; no consumer holds
+    // the grant yet, so the kernel is the only writer.
+    unsafe { core::ptr::write_volatile(at as *mut u64, head) };
+    for sequence in 0..count {
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&PROBE_MARK.to_le_bytes());
+        payload[8..].copy_from_slice(&sequence.to_le_bytes());
+        emit(EventClass::Sched, schema::PROBE.id, u32::MAX, &payload);
+    }
+}
+
 /// Creates the rings and the tails page, and arms the plane.
 ///
 /// One ring per online CPU, each a `Memory` object a keeper domain owns —

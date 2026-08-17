@@ -3783,6 +3783,19 @@ const TCPC_BADGE: u64 = 0x7C_C1;
 static TCPC_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 /// The TCP service's endpoint, for minting client capabilities to it.
 static TCP_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The telemetry reader, RFC 0026 steps 3–4: the first program to hold the
+/// rings read-only and the tails read-write, and prove the round trip.
+const TRACED_STACK: u64 = 0x0000_0000_1800_0000;
+const TRACED_STACK_PAGES: u64 = 4;
+const TRACED_PROGRAM: &[u8] = b"bin/traced";
+/// "TRACED01", little-endian, as `bin/traced` writes it.
+const TRACED_MARKER: u64 = u64::from_le_bytes(*b"TRACED01");
+/// Marked probes each CPU emits for the round trip.
+const TRACED_PROBES_EACH: u64 = 8;
+static TRACED_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// How many CPUs have finished their probe burst.
+static TRACED_PROBES_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static TCP_CONFIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 static IP_INBOX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -6348,6 +6361,206 @@ extern "C" fn tcpc_domain_entry(hhdm_base: u64) -> ! {
     unsafe { enter_user("tcp client", entry, rsp, [hertz, 0]) }
 }
 
+/// One CPU's half of RFC 0026's round-trip self-test: empty the local ring,
+/// emit the marked probes, say so, leave.
+extern "C" fn traced_probe_entry(count: u64) -> ! {
+    telemetry::probe_here(count);
+    TRACED_PROBES_DONE.fetch_add(1, core::sync::atomic::Ordering::Release);
+    sched::exit()
+}
+
+/// RFC 0026 steps 3 and 4: the grant, and the reader it is granted to.
+///
+/// Creates the `traced` domain; installs its report page, the tails object
+/// **read-write**, and every CPU's ring **read-only** — derivation is what
+/// narrows them, so a writable mapping of a ring is refused by rights, not
+/// by convention. Then every CPU emits [`TRACED_PROBES_EACH`] marked probes
+/// into its own freshly emptied ring, and `bin/traced` is spawned to read
+/// the marked set back through pages it mapped itself.
+fn start_traced(hhdm_base: u64) -> Result<(), &'static str> {
+    if telemetry::tails_identity().is_none() {
+        return Err("the telemetry plane never initialised");
+    }
+    let realm = domain::create("traced", domain::ResourceEnvelope::new())
+        .map_err(|_| "the traced domain would not be created")?;
+
+    // The report page belongs to a keeper, not to `traced`: the reader does
+    // its one pass and exits, its domain ends with its last thread, and a
+    // realm-owned page would be reclaimed in that teardown — the kernel
+    // read "report page gone" on the first boot that tried it. The keeper
+    // runs nothing, so nothing ends it.
+    let keeper = domain::create("traced-keeper", domain::ResourceEnvelope::new())
+        .map_err(|_| "the traced keeper would not be created")?;
+    let report = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the traced report page would not be created")?;
+    let named = shared::name(report).map_err(|_| "the traced report would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(1, named).is_ok()) != Some(true) {
+        return Err("the traced report would not install");
+    }
+
+    let tails = telemetry::tails_identity().ok_or("the tails object is gone")?;
+    let tails_root = shared::name(shared::MemoryId::from_u64(tails))
+        .map_err(|_| "the tails object would not be named")?;
+    let tails_cap = cap::with_arena(|arena| {
+        arena
+            .derive(tails_root, cap::Rights::READ.union(cap::Rights::WRITE), 0)
+            .ok()
+    })
+    .ok_or("the tails capability would not derive")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(7, tails_cap).is_ok()) != Some(true) {
+        return Err("the tails capability would not install");
+    }
+
+    let online = bhaskix_arch::percpu::online_count();
+    for cpu in 0..online {
+        let identity = telemetry::ring_identity(cpu as usize).ok_or("a ring object is missing")?;
+        let root = shared::name(shared::MemoryId::from_u64(identity))
+            .map_err(|_| "a ring object would not be named")?;
+        let ring_cap = cap::with_arena(|arena| arena.derive(root, cap::Rights::READ, 0).ok())
+            .ok_or("a ring capability would not derive")?;
+        if domain::with(realm, |owner| {
+            owner.cspace.install_at(8 + cpu as usize, ring_cap).is_ok()
+        }) != Some(true)
+        {
+            return Err("a ring capability would not install");
+        }
+    }
+
+    // The marked set, one CPU at a time on the CPU itself, because only the
+    // owning CPU may write its ring. The wait is bounded: a probe thread
+    // that never runs is a scheduler defect this test exists to catch, not
+    // to hang on.
+    TRACED_PROBES_DONE.store(0, core::sync::atomic::Ordering::Release);
+    for cpu in 0..online {
+        sched::spawn_on_with(
+            cpu,
+            "telemetry-probe",
+            traced_probe_entry,
+            TRACED_PROBES_EACH,
+            hhdm_base,
+            sched::SpawnOptions::new().pinned(),
+        )
+        .map_err(|_| "a probe thread would not spawn")?;
+    }
+    let mut waited = 0u32;
+    while TRACED_PROBES_DONE.load(core::sync::atomic::Ordering::Acquire) < online {
+        wait_millis(10);
+        waited += 1;
+        if waited > 500 {
+            return Err("the probe threads never finished");
+        }
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        0,
+        "traced",
+        traced_domain_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the traced reader would not spawn")?;
+    TRACED_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Loads `bin/traced` into a fresh address space and enters it, telling it
+/// how many rings it was granted.
+extern "C" fn traced_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    traced         FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(TRACED_PROGRAM) else {
+        stop("bin/traced is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/traced is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(TRACED_STACK), TRACED_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/traced would not load")
+    };
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+    let rsp = TRACED_STACK + TRACED_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    let cpus = u64::from(bhaskix_arch::percpu::online_count());
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space,
+    // and `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("traced", entry, rsp, [cpus, 0]) }
+}
+
+/// Prints what `bin/traced` read back, and gates the round trip.
+fn report_traced(hhdm: u64) {
+    let raw = TRACED_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if raw == u64::MAX {
+        return;
+    }
+    let expected = TRACED_PROBES_EACH * u64::from(bhaskix_arch::percpu::online_count());
+    let mut words = [0u64; 7];
+    let mut settled = false;
+    for _ in 0..100u32 {
+        let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+            println!("\x1b[91m    traced         report page gone\x1b[0m");
+            return;
+        };
+        if count == 0 {
+            println!("\x1b[91m    traced         report page empty\x1b[0m");
+            return;
+        }
+        for (index, word) in words.iter_mut().enumerate() {
+            // SAFETY: a frame this object owns, through the direct map.
+            *word = unsafe {
+                core::ptr::read_volatile((hhdm + pages[0] + index as u64 * 8) as *const u64)
+            };
+        }
+        if words[0] == TRACED_MARKER && words[1] != 0 {
+            settled = true;
+            break;
+        }
+        wait_millis(100);
+    }
+    let (probes, decoded, refused, bad_rings, wrong_cpu) =
+        (words[2], words[3], words[4], words[5], words[6]);
+    if settled
+        && words[1] == 1
+        && probes == expected
+        && bad_rings == 0
+        && wrong_cpu == 0
+        && refused == 0
+    {
+        println!(
+            "    traced         all {expected} probe events read back through granted rings; \
+             {decoded} events decoded, {refused} refused"
+        );
+    } else {
+        println!(
+            "\x1b[91m    traced         FAILED: outcome {} — {probes} of {expected} probes, \
+             {decoded} decoded, {refused} refused, {bad_rings} bad rings, {wrong_cpu} wrong-cpu\
+\x1b[0m",
+            words[1]
+        );
+    }
+}
+
 /// Prints what `bin/tcpc` reported: how far the ring handover went.
 fn report_tcp_client(hhdm: u64) {
     let raw = TCPC_REPORT.load(core::sync::atomic::Ordering::Acquire);
@@ -8654,6 +8867,14 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             println!("\x1b[91m    dhcp client    FAILED\x1b[0m");
         }
         report_net_after_exchange(hhdm);
+    }
+
+    // RFC 0026 steps 3 and 4, on every boot networked or not: the grant,
+    // the marked probes, and the reader — the round trip that makes the
+    // telemetry plane's counters somebody's rather than nobody's.
+    match start_traced(hhdm) {
+        Ok(()) => report_traced(hhdm),
+        Err(why) => println!("\x1b[91m    traced         FAILED: {why}\x1b[0m"),
     }
 
     // The network, at slot 16, and only if there is one. **A program either
@@ -11519,20 +11740,22 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             vfs::open(b"etc").err() == Some(vfs::VfsError::NotAFile),
         ),
         (
-            // Twelve programs in /bin: the ring 3 probe, the user-mode
+            // Thirteen programs in /bin: the ring 3 probe, the user-mode
             // shell, both services as programs, the block driver (RFC 0013
             // steps 3, 4 and 6), the filesystem (RFC 0016 step 3), the
             // supervisor (RFC 0017 question 2), the network driver and the
             // protocol service (RFC 0018 steps 2 and 3), the DHCP client
-            // (step 6), the TCP service (RFC 0020 step 4), and the TCP
-            // demonstration client (RFC 0022 step 4). Exact rather
-            // than "at least", so adding a thirteenth without noticing this
+            // (step 6), the TCP service (RFC 0020 step 4), the TCP
+            // demonstration client (RFC 0022 step 4), and the telemetry
+            // reader (RFC 0026 steps 3-4). Exact rather
+            // than "at least", so adding a fourteenth without noticing this
             // line is a failure rather than a silently weaker test -- which
             // it has now been for every program added, most recently
-            // `bin/tcpc`, whose arrival this line duly caught, as designed,
-            // exactly as it caught `bin/tcpd` before it.
+            // `bin/traced`, whose arrival this line duly caught, as
+            // designed, exactly as it caught `bin/tcpc` and `bin/tcpd`
+            // before it.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 12,
+            entries >= 3 && bin == 13,
         ),
         (
             "the user program is an ELF the loader accepts",

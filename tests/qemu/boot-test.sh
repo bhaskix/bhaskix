@@ -468,6 +468,18 @@ else
     status=1
 fi
 
+# RFC 0026 steps 3-4: the round trip. Marked probe events emitted on every CPU
+# must all come back through bin/traced -- a ring 3 program holding the rings
+# read-only and the tails read-write, and nothing else. The kernel compares
+# the counts and prints "all N ... read back" only on exact agreement, with
+# zero refused decodes and zero mis-attributed CPUs behind it.
+if grep -qE "traced +all [1-9][0-9]* probe events read back through granted rings; [1-9][0-9]* events decoded, 0 refused" "$LOG"; then
+    pass "telemetry round trip: the marked set came back through capabilities"
+else
+    fail "bin/traced did not read back the marked set"
+    status=1
+fi
+
 # Wakeup latency. **The target is not asserted** and that is deliberate: §10's
 # figure is unmet under an interpreting emulator and TRACKER says so. What is
 # asserted is that the measurement happened, so the day it is taken on hardware
@@ -531,7 +543,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 12 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 13 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
