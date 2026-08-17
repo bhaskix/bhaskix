@@ -130,6 +130,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **A5** | 5-level paging (LA57) | ✅ **Accepted** 2026-08-16 — answered by RFC 0025, implemented 2026-08-15 with the document; **the last open architecture question is closed** | **Four-level, on purpose, with the refusal shipped**: every walk and half-split in the tree is a bit-47 statement, so bring-up now reads `CR4.LA57` and halts with a sentence rather than corrupting addresses silently under a bootloader whose default changed. The boot report states capability beside choice. Five-level gets built against a written trigger — an address-space or physical-memory need no current machine has — not an open wait. | [RFC 0025](docs/rfc/0025-four-level-paging-on-purpose.md) |
 | **TE1** | Telemetry plane | ✅ **Accepted 2026-08-17** — drafted, implemented (all six steps) and accepted the same day, on the working demonstration: two boot gates per placement, one negative-armed, the emit priced from both sides | **A 64-byte typed event, one lock-free drop-newest ring per CPU, two capabilities to read them.** [ai-native.md](docs/ai-native.md) §2 built as specified, with three narrownesses stated in the draft rather than discovered later: per-domain enable bits deferred to their first consumer (per-class now), the `Audit` class reserved but refused (best-effort audit is false assurance — backpressure is its own RFC on this foundation), and the domain field carrying the id without the generation. Rejects the `TelemetryChannel`-per-domain sketch in `architecture.md` — the producer is a CPU, often in interrupt context, not a domain. Partially answers RFC 0008's Q4: a capability is named (domain, slot, kind) for tracing; audit-grade naming stays open | [RFC 0026](docs/rfc/0026-telemetry-plane.md) |
 | **SK1** | A sockets API worth the name | ✅ **Accepted 2026-08-17** — drafted, implemented (steps 1–4) and accepted the same day, on the ports: `bin/dhcp` 28 → 10 `unsafe` lines, `bin/tcpc` 45 → 12, the crate carries 20 once; every gate unchanged, the measure A/B'd neutral. Question 2 answered by the port (the leg order stays the caller's); questions 1 (the shell) and 3 (a user-rt crate) stay open with their triggers written | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
+| **BB1** | `bhaskixboot.efi` | ⬜ **Draft** 2026-08-17 | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -760,6 +761,22 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-17 (RFC 0028 drafted: `bhaskixboot.efi`, and sovereignty measured in gates)
+
+**The roadmap's next bullet opens with a draft.** [RFC 0028](docs/rfc/0028-bhaskixboot.md)
+proposes the native UEFI loader as the shim boundary cashed in: no new wire format — the
+native boot protocol *is* `bhaskix_boot::Handoff`, entered through a second front door in the
+shim beside the Limine one, with the entry contract written down. Firmware bindings are
+hand-rolled like `limine.rs`'s (the empty external allowlist holds, and a boot loader is the
+worst place for its first exception); every firmware answer is hostile input; the kernel ELF
+is parsed by the same fuzz-hardened parser the kernel runs, extracted to a leaf crate in a
+step of its own. **Sovereignty is graduated and the graduation is written down**: the native
+OVMF lane's gate list at any moment is the honest statement of how far it has come, the two
+persistent reductions (secondary CPUs, KASLR) are named in the draft rather than discovered,
+and the roadmap bullet — half of Phase 2's exit criterion — closes only when the native lane
+runs the same 48 gates as Limine's lanes. Decision log row **BB1**. Seven steps; 1–3 touch
+nothing outside `boot/` and the harness.
 
 ### 2026-08-17 (RFC 0027 accepted: the sockets API is the crate, and the networking bullet narrows to IPv6)
 
