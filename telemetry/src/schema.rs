@@ -47,9 +47,41 @@ pub const DISPATCH: Schema = Schema {
     name: "sched-dispatch",
 };
 
+/// A system call, emitted at its exit (RFC 0026 step 5): the raw kind, the
+/// method, the capability slot it named, and the status it returned — four
+/// little-endian `u32`s. `Exit` never returns and so never appears; `Yield`
+/// does. The caller's domain and the moment are the event's own header.
+pub const SYSCALL: Schema = Schema {
+    id: 3,
+    version: 1,
+    size: 16,
+    name: "syscall",
+};
+
+/// One rendezvous event (RFC 0026 step 5): what happened — matched, queued,
+/// took, replied, refused, as `kernel/src/ipc.rs` numbers them — then the
+/// two thread ids it happened between, three little-endian `u32`s.
+pub const RENDEZVOUS: Schema = Schema {
+    id: 4,
+    version: 1,
+    size: 12,
+    name: "ipc-rendezvous",
+};
+
+/// A notification signalled (RFC 0026 step 5): the notification's index,
+/// four bytes of padding, then the badge ORed into it — the doorbells and
+/// wakes every cross-domain hop rides, which is what makes hop attribution
+/// a query over the stream instead of a bespoke stamp.
+pub const SIGNAL: Schema = Schema {
+    id: 5,
+    version: 1,
+    size: 16,
+    name: "notify-signal",
+};
+
 /// Every schema this build knows. Extended in place as producers arrive
 /// (RFC 0026 steps 2 and 5); ids are append-only.
-pub static SCHEMAS: &[Schema] = &[PROBE, DISPATCH];
+pub static SCHEMAS: &[Schema] = &[PROBE, DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL];
 
 /// The table is checked at compile time: no payload wider than a slot's
 /// payload field, no duplicate ids. A build that violates either does not
@@ -140,34 +172,27 @@ mod tests {
             }
             hash
         }
-        let base = [PROBE, DISPATCH];
+        let base = [PROBE, DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL];
         assert_eq!(hash_of(&base), registry_hash(), "same table, same hash");
 
         // Each variation changes exactly one field of one entry, keeping the
         // table's shape — so a differing hash convicts the field, not the
         // length.
-        let bumped_version = [
-            Schema {
-                version: 2,
-                ..base[0]
-            },
-            DISPATCH,
-        ];
-        let widened = [
-            Schema {
-                size: 17,
-                ..base[0]
-            },
-            DISPATCH,
-        ];
-        let renamed = [
-            Schema {
-                name: "probf",
-                ..base[0]
-            },
-            DISPATCH,
-        ];
-        let renumbered = [Schema { id: 3, ..base[0] }, DISPATCH];
+        let rest = [DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL];
+        let vary = |first: Schema| [first, rest[0], rest[1], rest[2], rest[3]];
+        let bumped_version = vary(Schema {
+            version: 2,
+            ..base[0]
+        });
+        let widened = vary(Schema {
+            size: 17,
+            ..base[0]
+        });
+        let renamed = vary(Schema {
+            name: "probf",
+            ..base[0]
+        });
+        let renumbered = vary(Schema { id: 6, ..base[0] });
         assert_ne!(hash_of(&bumped_version), hash_of(&base));
         assert_ne!(hash_of(&widened), hash_of(&base));
         assert_ne!(hash_of(&renamed), hash_of(&base));

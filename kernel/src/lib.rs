@@ -392,7 +392,13 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // class on, and nothing else has a producer yet. A failure here is a red
     // line, not a halt: a machine without telemetry boots.
     match telemetry::init(handoff.hhdm_base.as_u64()) {
-        Ok(()) => telemetry::enable(bhaskix_telemetry::EventClass::Sched),
+        Ok(()) => {
+            telemetry::enable(bhaskix_telemetry::EventClass::Sched);
+            // Step 5's producers: the syscall exits, the rendezvous events
+            // and the signals all ride this class — the kernel crossings,
+            // which is what makes hop attribution a query over the stream.
+            telemetry::enable(bhaskix_telemetry::EventClass::Syscall);
+        }
         Err(why) => println!("\x1b[91m    telemetry      FAILED: {why}\x1b[0m"),
     }
 
@@ -6411,6 +6417,20 @@ fn start_traced(hhdm_base: u64) -> Result<(), &'static str> {
         return Err("the tails capability would not install");
     }
 
+    // The reader's wake, RFC 0026's deferred "blocking readers" question
+    // answered the way every service answers it: a notification it arms
+    // deadlines on, so the drain loop sleeps between passes instead of
+    // spinning a CPU for the life of the boot. Badge 1, nonzero because a
+    // zero badge ORs nothing and a deadline expiring through it would be a
+    // wake nobody feels.
+    let wake = crate::notify::create().map_err(|_| "the traced wake would not be created")?;
+    let wake_root = crate::notify::name(wake).map_err(|_| "the traced wake would not be named")?;
+    let wake_cap = cap::with_arena(|arena| arena.derive(wake_root, cap::Rights::ALL, 1).ok())
+        .ok_or("the traced wake would not derive")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(2, wake_cap).is_ok()) != Some(true) {
+        return Err("the traced wake would not install");
+    }
+
     let online = bhaskix_arch::percpu::online_count();
     for cpu in 0..online {
         let identity = telemetry::ring_identity(cpu as usize).ok_or("a ring object is missing")?;
@@ -6502,10 +6522,11 @@ extern "C" fn traced_domain_entry(hhdm_base: u64) -> ! {
     unsafe { vm::install(space) };
     let rsp = TRACED_STACK + TRACED_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
     let cpus = u64::from(bhaskix_arch::percpu::online_count());
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
     // SAFETY: `entry` is inside a user-executable segment of the space just
     // installed, `rsp` is one past user-writable memory in the same space,
     // and `RSP0` was set before this thread was spawned.
-    unsafe { enter_user("traced", entry, rsp, [cpus, 0]) }
+    unsafe { enter_user("traced", entry, rsp, [cpus, hertz]) }
 }
 
 /// Prints what `bin/traced` read back, and gates the round trip.
@@ -6515,7 +6536,7 @@ fn report_traced(hhdm: u64) {
         return;
     }
     let expected = TRACED_PROBES_EACH * u64::from(bhaskix_arch::percpu::online_count());
-    let mut words = [0u64; 7];
+    let mut words = [0u64; 10];
     let mut settled = false;
     for _ in 0..100u32 {
         let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
@@ -6540,6 +6561,7 @@ fn report_traced(hhdm: u64) {
     }
     let (probes, decoded, refused, bad_rings, wrong_cpu) =
         (words[2], words[3], words[4], words[5], words[6]);
+    let (sched, syscalls, passes) = (words[7], words[8], words[9]);
     if settled
         && words[1] == 1
         && probes == expected
@@ -6549,7 +6571,8 @@ fn report_traced(hhdm: u64) {
     {
         println!(
             "    traced         all {expected} probe events read back through granted rings; \
-             {decoded} events decoded, {refused} refused"
+             {decoded} events decoded, {refused} refused; {sched} sched + {syscalls} syscall \
+             events, {passes} passes"
         );
     } else {
         println!(

@@ -912,6 +912,22 @@ pub fn dispatch(frame: &mut SyscallFrame) -> Outcome {
     if outcome.status == Status::Revoked {
         REVOKED_CALLS.fetch_add(1, Ordering::Relaxed);
     }
+    // RFC 0026 step 5: one event per system call, at its exit, where the
+    // status is known. `Exit` diverges inside `dispatch_inner` and never
+    // appears here — the one call the stream cannot carry, said rather than
+    // discovered. One load and a predicted branch when the class is off.
+    let mut crossing = [0u8; 16];
+    crossing[..4].copy_from_slice(&(frame.kind as u32).to_le_bytes());
+    crossing[4..8].copy_from_slice(&(frame.method as u32).to_le_bytes());
+    crossing[8..12].copy_from_slice(&(frame.capability as u32).to_le_bytes());
+    crossing[12..].copy_from_slice(&(outcome.status as u32).to_le_bytes());
+    let domain = crate::telemetry::domain_hint();
+    crate::telemetry::emit(
+        bhaskix_telemetry::EventClass::Syscall,
+        bhaskix_telemetry::schema::SYSCALL.id,
+        domain,
+        &crossing,
+    );
     outcome
 }
 

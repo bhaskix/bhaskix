@@ -32,9 +32,10 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-# 21, measured, no headroom: the syscall block, the report-page writes, the
-# deliberate ud2 in the panic handler, and the volatile reads of memory this
+# 24, measured, no headroom: the syscall block, rdtsc for the deadline, the
+# report-page writes, the deliberate ud2 in the panic handler, and the
+# volatile reads of memory this
 # program mapped itself -- ring headers, slots, and its own tail words. Every
 # decision about those bytes is bhaskix-telemetry's safe arithmetic; the
 # unsafe here is the loads.
-unsafe_budget = 21
+unsafe_budget = 24

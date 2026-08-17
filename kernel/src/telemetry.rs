@@ -68,6 +68,34 @@ static RING_IDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MA
 /// The tails object's identity, for step 3's grant.
 static TAILS_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Each CPU's current domain, kept by the switch path for producers that
+/// must not ask the scheduler: `sched::current_domain()` takes the runqueue
+/// lock, which `notify::signal` — legal from interrupt context — must never
+/// block on, and which `ipc`'s trace point may already sit inside another
+/// lock to reach. A *hint*, briefly stale around a switch, and said so.
+static DOMAIN_HINT: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+
+/// Records the domain now running on the calling CPU. Called by the switch
+/// path with interrupts off, beside the dispatch event.
+pub fn note_domain(domain: u32) {
+    let cpu_index = percpu::cpu_id() as usize;
+    if cpu_index < MAX_CPUS {
+        DOMAIN_HINT[cpu_index].store(domain, Ordering::Relaxed);
+    }
+}
+
+/// The domain most recently noted for this CPU — the lock-free answer
+/// producers stamp into their events. `u32::MAX` is "none or unknown".
+#[must_use]
+pub fn domain_hint() -> u32 {
+    let cpu_index = percpu::cpu_id() as usize;
+    if cpu_index < MAX_CPUS {
+        DOMAIN_HINT[cpu_index].load(Ordering::Relaxed)
+    } else {
+        u32::MAX
+    }
+}
+
 /// Where `offset` within `cpu`'s ring region lives in the direct map.
 ///
 /// Slots are 64 bytes and frames 4,096, so 64 divides 4,096 and no slot or

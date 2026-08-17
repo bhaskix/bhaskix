@@ -2418,6 +2418,7 @@ pub fn preempt() {
         // emit takes no lock and must not gain one by accident of position;
         // interrupts are already off on this path, so emit's own guard is a
         // no-op re-entry.
+        crate::telemetry::note_domain(to_domain);
         let mut handover = [0u8; 8];
         handover[..4].copy_from_slice(&from_id.to_le_bytes());
         handover[4..].copy_from_slice(&to_id.to_le_bytes());
@@ -2983,6 +2984,7 @@ pub fn block_self() {
                 // RFC 0026 step 2's producer, on the block path for the same
                 // reasons as on preempt's: after the guard, no lock,
                 // interrupts already off.
+                crate::telemetry::note_domain(to_domain);
                 let mut handover = [0u8; 8];
                 handover[..4].copy_from_slice(&from_id.to_le_bytes());
                 handover[4..].copy_from_slice(&to_id.to_le_bytes());

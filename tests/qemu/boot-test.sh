@@ -473,7 +473,7 @@ fi
 # read-only and the tails read-write, and nothing else. The kernel compares
 # the counts and prints "all N ... read back" only on exact agreement, with
 # zero refused decodes and zero mis-attributed CPUs behind it.
-if grep -qE "traced +all [1-9][0-9]* probe events read back through granted rings; [1-9][0-9]* events decoded, 0 refused" "$LOG"; then
+if grep -qE "traced +all [1-9][0-9]* probe events read back through granted rings; [1-9][0-9]* events decoded, 0 refused; [1-9][0-9]* sched \+ [1-9][0-9]* syscall events, [1-9][0-9]* passes" "$LOG"; then
     pass "telemetry round trip: the marked set came back through capabilities"
 else
     fail "bin/traced did not read back the marked set"

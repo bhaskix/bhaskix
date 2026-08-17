@@ -223,6 +223,20 @@ pub fn signal(id: NotificationId, badge: u64) -> Result<(), NotifyError> {
     slot.pending.fetch_or(badge, Ordering::Release);
     SIGNALS.fetch_add(1, Ordering::Relaxed);
 
+    // RFC 0026 step 5: every signal is a crossing — the doorbells and wakes
+    // each cross-domain hop rides — and emit is legal here even from
+    // interrupt context, which signalling explicitly is.
+    let mut crossing = [0u8; 16];
+    crossing[..4].copy_from_slice(&id.index().to_le_bytes());
+    crossing[8..].copy_from_slice(&badge.to_le_bytes());
+    let domain = crate::telemetry::domain_hint();
+    crate::telemetry::emit(
+        bhaskix_telemetry::EventClass::Syscall,
+        bhaskix_telemetry::schema::SIGNAL.id,
+        domain,
+        &crossing,
+    );
+
     // The bound thread, if any, is blocked on an *endpoint* and wants waking for
     // this. Woken before the direct waiter is looked at, and by the same
     // lock-free call, because a lock here would have to be `try_lock` and a

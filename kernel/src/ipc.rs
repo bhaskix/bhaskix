@@ -129,9 +129,25 @@ enum Event {
 }
 
 fn trace(event: Event, who: u32, with: u32) {
+    let what = event as u64;
     let slot = TRACE_AT.fetch_add(1, Ordering::Relaxed) as usize % TRACE_LEN;
-    let packed = (event as u64) << 56 | u64::from(who) << 28 | u64::from(with);
+    let packed = what << 56 | u64::from(who) << 28 | u64::from(with);
     TRACE[slot].store(packed, Ordering::Relaxed);
+    // RFC 0026 step 5: the same record, onto the plane. Every rendezvous
+    // event already funnels through here, which is what makes this the one
+    // emission point rather than seven. Emit takes no lock, so calling it
+    // with an endpoint held is sound.
+    let mut pairing = [0u8; 12];
+    pairing[..4].copy_from_slice(&(what as u32).to_le_bytes());
+    pairing[4..8].copy_from_slice(&who.to_le_bytes());
+    pairing[8..].copy_from_slice(&with.to_le_bytes());
+    let domain = crate::telemetry::domain_hint();
+    crate::telemetry::emit(
+        bhaskix_telemetry::EventClass::Syscall,
+        bhaskix_telemetry::schema::RENDEZVOUS.id,
+        domain,
+        &pairing,
+    );
 }
 
 /// Replays the trace ring, oldest first, as `(event name, who, with)`.
