@@ -324,7 +324,7 @@ $(USER_TCPD): $(TCPD_DIR)/src/main.rs $(TCPD_DIR)/link.ld $(TCPD_DIR)/Cargo.toml
 # exchange that needed protocol code on the client side would be the wrong
 # exchange.
 $(USER_TCPC): $(TCPC_DIR)/src/main.rs $(TCPC_DIR)/link.ld $(TCPC_DIR)/Cargo.toml \
-              $(wildcard abi/src/*.rs)
+              $(wildcard abi/src/*.rs) $(wildcard sock/src/*.rs)
 	cd $(TCPC_DIR) && RUSTFLAGS="$(TCPC_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"

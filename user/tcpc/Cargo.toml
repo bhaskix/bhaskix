@@ -23,6 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 bhaskix-abi = { path = "../../abi" }
+bhaskix-sock = { path = "../../sock" }
 
 [profile.release]
 panic = "abort"
@@ -41,4 +42,8 @@ opt-level = "s"
 # program's own receive ring -- one volatile read in the wait loop that
 # replaced three IPC calls per iteration, and the whole point of the
 # change.
-unsafe_budget = 45
+# 12 since RFC 0027 step 4: the syscall stub, the counter read, the
+# memory-wait's volatile poll and every ring access moved into
+# bhaskix-sock, reviewed once there. What remains is the panic ud2 and
+# the report-page writes.
+unsafe_budget = 12

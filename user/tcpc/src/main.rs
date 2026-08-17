@@ -1,31 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-//! The TCP demonstration client — the first program to open a connection the
-//! way every program will.
+//! The TCP demonstration client: rings it owns, handed across `CONNECT`.
 //!
-//! RFC 0020 says a connection's stream lives in the *program's* pages: two
-//! `Memory` objects, supplied at `CONNECT`, mapped by the service. RFC 0022
-//! is the mechanism that makes the sentence sayable — a capability crosses in
-//! a call — and this program is the sentence said. It holds two rings its own
-//! domain owns, hands one across each of two `CONNECT` calls, and receives
-//! the connection capability in the reply of a third, landing in the slot it
-//! declared with `EXPECT`. Both directions of RFC 0016's mechanism in one
-//! exchange, from ring 3, with nothing wired by the kernel but the
-//! capabilities this program starts with.
-//!
-//! Step 4a carries the *capabilities*; the bytes still ride the service's
-//! demonstration connection. Step 4b moves the stream onto these rings and
-//! retires that demonstration. The split is why this program asserts that the
-//! rings were accepted and the connection capability landed — not yet that
-//! data flowed through them.
+//! RFC 0022 step 4's caller, RFC 0020 step 6's instrument, and RFC 0020
+//! step 5's server for one connection. It opens a connection the way every
+//! program will: two rings its own domain owns cross as staged gifts, a
+//! wake crosses after them, and the connection capability rides a reply
+//! into a slot this program declared. Then it echoes — sixteen bytes eight
+//! times, timed; thirty-two KiB through the ring's wrap, paced by its own
+//! memory — listens, accepts a connection the harness's host driver
+//! initiates, and serves the echo back from pages it owns before the data
+//! flowed through them.
 //!
 //! What lands in the report page is read by the kernel after boot and gated
 //! in `tests/qemu/boot-test.sh`, like every service report.
+//!
+//! # The second program ported onto `bhaskix-sock`
+//!
+//! RFC 0027 step 4. The exchange — the staged legs and their bounded
+//! retries, the `EXPECT` declarations, the refusal decoding, the stream
+//! verbs, the memory-wait — is the crate's now; what remains here is what
+//! is genuinely this program's: the demonstration's order, the instrument's
+//! clocks, and the report it leaves. The leg *interleaving* stays local on
+//! purpose: the service declares where gifts may land in its own order, and
+//! the crate's primitive is what makes that expressible (RFC 0027 open
+//! question 2, answered by this port).
 
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{method, rights, status, syscall, tcp};
+use bhaskix_abi::{syscall, tcp as abi_tcp};
+use bhaskix_sock::call::{attach, call};
+use bhaskix_sock::ring::RingView;
+use bhaskix_sock::tcp::{self, AcceptPoll, LegError, StreamPoll};
+use bhaskix_sock::time::{Pace, now};
+use bhaskix_sock::wait::news;
 
 /// The capability to the TCP service's endpoint, badged as this client.
 const SERVICE: u64 = 0;
@@ -60,6 +68,9 @@ const SENDR_AT: u64 = 0x2400_0000;
 const RECVR_AT: u64 = 0x2410_0000;
 const L_SENDR_AT: u64 = 0x2420_0000;
 const L_RECVR_AT: u64 = 0x2430_0000;
+
+/// Bytes in each stream ring this program owns.
+const RING_BYTES: u64 = 4 * 4096;
 
 /// The port this program listens on, and the harness forwards to. Seven is
 /// `echo` by tradition, and this program is exactly that for one caller.
@@ -138,37 +149,9 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
 }
 
-/// Issues one system call, and returns `(status, value, second)` — the
-/// status, the reply's first word, and its second, which the handover
-/// protocol uses for detail.
-fn call(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> (u64, u64, u64) {
-    let status: u64;
-    let mut value = args[0];
-    let mut second = args[1];
-    // SAFETY: the system call convention from RFC 0008. Nothing is
-    // dereferenced on this side, and every argument register is declared as an
-    // output because the kernel writes the whole frame back on the way out.
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") kind => status,
-            inlateout("rdi") capability => _,
-            inlateout("rsi") method => _,
-            inlateout("rdx") value,
-            inlateout("r10") second,
-            inlateout("r8") args[2] => _,
-            inlateout("r9") args[3] => _,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    (status, value, second)
-}
-
 /// Ends this program. Never returns.
 fn exit() -> ! {
-    call(syscall::EXIT, 0, 0, [0; 4]);
+    let _ = call(syscall::EXIT, 0, 0, [0; 4]);
     #[allow(clippy::empty_loop)]
     loop {}
 }
@@ -189,140 +172,70 @@ fn report(step: u64, outcome: u64, detail: u64) {
     report_word(3, detail);
 }
 
-/// One `CONNECT` leg, with a staged gift if `gift_slot` names one.
-///
-/// Staging and calling are two invocations by design — RFC 0022's `HAND`
-/// attaches one capability to the *next* call on that endpoint, so the pair
-/// reads exactly like the sentence it implements. Retried while the service
-/// answers `SLOT_UNAVAILABLE`, because the service declares where a gift may
-/// land just before it listens, and this program may call first.
-fn leg(
+/// One handover leg, or the end of the run under `step` — the crate keeps
+/// every raw word a refusal carried, and this packs them the way this
+/// program's report has always packed them.
+fn leg_or_die(
     verb: u64,
     a0: u64,
     a1: u64,
-    gift_slot: Option<(u64, u64)>,
+    gift: Option<(u64, u64)>,
     leg_number: u64,
-) -> (u64, u64, u64) {
-    for _ in 0..50_000 {
-        if let Some((slot, badge)) = gift_slot {
-            // The badge travels with the gift, and for the wakes it must:
-            // their capabilities are badged, badges are one-way, and a
-            // signal ORs the badge into the word — zero would OR nothing
-            // and ring nobody.
-            let (staged, _, _) = call(
-                syscall::INVOKE,
-                SERVICE,
-                method::HAND,
-                [slot, rights::READ | rights::WRITE, badge, 0],
-            );
-            if staged != status::OK {
-                return (0xFFFF, staged, 0);
-            }
+    step: u64,
+) -> u64 {
+    match tcp::leg(SERVICE, verb, a0, a1, gift, leg_number) {
+        Ok(detail) => detail,
+        Err(LegError::Stuck) => {
+            report(step, outcome::STUCK, 0);
+            exit()
         }
-        let (called, value, second) = call(syscall::CALL, SERVICE, verb, [a0, a1, leg_number, 0]);
-        // The service has not declared yet (its `EXPECT` races this call), or
-        // has not started serving. Both answer with a status that a later
-        // try can change, so yield and try again.
-        if called == status::SLOT_UNAVAILABLE || value == tcp::LATER {
-            let _ = call(syscall::YIELD, 0, 0, [0; 4]);
-            continue;
+        Err(LegError::HandRefused(status)) => {
+            report(step, outcome::REFUSED, 0xFFFF << 32 | status << 16);
+            exit()
         }
-        return (called, value, second);
-    }
-    (STUCK_STATUS, 0, 0)
-}
-
-/// The status `leg` invents for "patience ran out" — outside the kernel's
-/// status space, so it cannot be mistaken for an answer.
-const STUCK_STATUS: u64 = 0xFFFE;
-
-/// Reads the cycle counter. Unprivileged: `CR4.TSD` is clear on this
-/// machine, and the kernel converts ticks to time — this program only ever
-/// subtracts them.
-fn rdtsc() -> u64 {
-    let low: u32;
-    let high: u32;
-    // SAFETY: reads a counter and touches no memory. RFC 0019 records that
-    // this is readable at every privilege level here.
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
-    }
-    (u64::from(high) << 32) | u64::from(low)
-}
-
-/// Blocks until the service rings `wake_slot`, or a tenth of a second
-/// passes — RFC 0023's whole point on the first arm, and the second is what
-/// keeps a lost wake a slowdown rather than a hang: the deadline rides the
-/// same notification (RFC 0019), so `WAIT` returns either way and the
-/// caller re-reads the only truth, which is `RECV`'s reply. On a machine
-/// with no calibrated counter there is no deadline to arm, and a yield is
-/// what is left.
-fn wait_for_news(wake_slot: u64, hertz: u64) {
-    if hertz == 0 {
-        let _ = call(syscall::YIELD, 0, 0, [0; 4]);
-        return;
-    }
-    let deadline = rdtsc().wrapping_add(hertz / 10);
-    let _ = call(syscall::INVOKE, wake_slot, method::ARM, [deadline, 0, 0, 0]);
-    let _ = call(syscall::INVOKE, wake_slot, method::WAIT, [0; 4]);
-}
-
-/// Blocks until `expected` appears at ring offset `at` of this program's
-/// own receive ring, waking on the connection's notification.
-///
-/// The attribution instrument found deliver-to-seen owning half the round
-/// trip — three IPC calls per wait iteration — and this is the cure: TCP
-/// delivers in order, the bytes land in memory this program owns, so *the
-/// ring itself* says when the echo is here. Zero calls until the data is
-/// present; one consuming `RECV` afterwards keeps the window honest. The
-/// deadline armed once per call is the lost-wake backstop, not the cadence.
-///
-/// Returns false if patience ran out.
-fn await_byte(at: u64, expected: u8, wake: u64, hertz: u64) -> bool {
-    for _ in 0..600u32 {
-        // SAFETY: this program's own receive ring, mapped at start; the
-        // caller bounds the offset by the ring's size.
-        let byte = unsafe { core::ptr::read_volatile((RECVR_AT + at) as *const u8) };
-        if byte == expected {
-            return true;
+        Err(LegError::Refused {
+            status,
+            value,
+            detail,
+        }) => {
+            report(step, outcome::REFUSED, status << 32 | value << 16 | detail);
+            exit()
         }
-        wait_for_news(wake, hertz);
     }
-    false
 }
 
 /// One `RECV` poll on the outbound connection: `(state, delivered)`.
 ///
 /// `consumed` names bytes this program has finished with since it last said
-/// so — the service reopens the receive window by exactly that much, which
-/// is RFC 0020's window-follows-free-space running from the caller's side.
+/// so — the service reopens the receive window by exactly that much.
 /// Refusals and darkness end the run here, reported under `step`, because
 /// every caller would have written the same four lines.
 fn stream_state_consuming(step: u64, consumed: u64) -> (u64, u64) {
-    let (called, word, packed) = call(syscall::CALL, CONNECTION, tcp::RECV, [consumed, 0, 0, 0]);
-    if called != status::OK {
-        report(step, outcome::REFUSED, called << 16);
-        exit();
+    match tcp::recv(CONNECTION, consumed) {
+        StreamPoll::Ready { state, delivered } => (state, delivered),
+        StreamPoll::Unreachable => {
+            // No wire on this machine. The capability answered — that was
+            // step 4a's claim — and the truthful end of the stream's story
+            // here is that there is nobody to stream to.
+            report(step, outcome::DARK, 0);
+            exit()
+        }
+        StreamPoll::NoEntropy => {
+            // No unpredictability on this machine, so the service refuses
+            // to mint sequence numbers — RFC 0021's policy, heard from the
+            // caller's side.
+            report(step, outcome::NO_ENTROPY, 0);
+            exit()
+        }
+        StreamPoll::ServiceSaid(word) => {
+            report(step, outcome::REFUSED, word << 16);
+            exit()
+        }
+        StreamPoll::KernelSaid(status) => {
+            report(step, outcome::REFUSED, status << 16);
+            exit()
+        }
     }
-    if word == tcp::UNREACHABLE {
-        // No wire on this machine. The capability answered — that was step
-        // 4a's claim — and the truthful end of the stream's story here is
-        // that there is nobody to stream to.
-        report(step, outcome::DARK, 0);
-        exit();
-    }
-    if word == tcp::NO_ENTROPY {
-        // No unpredictability on this machine, so the service refuses to
-        // mint sequence numbers — RFC 0021's policy, heard from the caller's
-        // side. The capability answered; the stream is what cannot happen.
-        report(step, outcome::NO_ENTROPY, 0);
-        exit();
-    }
-    if word != tcp::OK {
-        report(step, outcome::REFUSED, word << 16);
-        exit();
-    }
-    (packed >> 32, packed & 0xffff_ffff)
 }
 
 /// A poll that consumes nothing.
@@ -333,24 +246,17 @@ fn stream_state(step: u64) -> (u64, u64) {
 /// Tells the service `count` more bytes are in the send ring, or ends the
 /// run under `step`.
 fn stream_send(count: u64, step: u64) {
-    let (sent, _, _) = call(syscall::CALL, CONNECTION, tcp::SEND, [count, 0, 0, 0]);
-    if sent != status::OK {
-        report(step, outcome::REFUSED, sent << 8);
+    if let Err(status) = tcp::send(CONNECTION, count) {
+        report(step, outcome::REFUSED, status << 8);
         exit();
     }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn tcpc_main(hertz: u64) -> ! {
+    let pace = Pace::new(hertz);
     // The report page first, so every later failure has somewhere to be seen.
-    if call(
-        syscall::INVOKE,
-        REPORT,
-        method::ATTACH,
-        [REPORT_AT, 1, 0, 0],
-    )
-    .0 != status::OK
-    {
+    if !attach(REPORT, REPORT_AT, true) {
         exit();
     }
     report_word(0, MARKER);
@@ -367,133 +273,111 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         (L_RECV_RING, L_RECVR_AT),
     ]
     .into_iter()
-    .all(|(slot, at)| call(syscall::INVOKE, slot, method::ATTACH, [at, 1, 0, 0]).0 == status::OK);
+    .all(|(slot, at)| attach(slot, at, true));
     if !attached {
         report(0, outcome::REFUSED, 0xA);
         exit();
     }
+    // SAFETY: each ring was attached just above at its fixed address, and
+    // stays mapped for the life of this program — the one claim the views
+    // carry, made where the mapping was made.
+    let (send_view, recv_view, l_send_view, l_recv_view) = unsafe {
+        (
+            RingView::new(SENDR_AT, RING_BYTES),
+            RingView::new(RECVR_AT, RING_BYTES),
+            RingView::new(L_SENDR_AT, RING_BYTES),
+            RingView::new(L_RECVR_AT, RING_BYTES),
+        )
+    };
     for (index, byte) in PAYLOAD.iter().enumerate() {
-        // SAFETY: this program's own send ring, just mapped read-write.
-        unsafe {
-            core::ptr::write_volatile((SENDR_AT + index as u64) as *mut u8, *byte);
-        }
+        send_view.write(index as u64, *byte);
     }
     // Touch every ring once, now, so a mapping that did not take faults here
     // -- two lines from the attach that claimed it did -- rather than deep in
     // the inbound serve with the interesting state a page fault destroys.
-    for base in [RECVR_AT, L_SENDR_AT, L_RECVR_AT] {
-        // SAFETY: this program's own rings, just mapped read-write.
-        unsafe {
-            let probe = core::ptr::read_volatile(base as *const u8);
-            core::ptr::write_volatile(base as *mut u8, probe);
-        }
+    for view in [recv_view, l_send_view, l_recv_view] {
+        let probe = view.read(0);
+        view.write(0, probe);
     }
 
     // Leg 0: the send ring crosses. Leg 1: the receive ring. Each is one
     // `HAND` and one `CONNECT`, and each ring is a `Memory` object this
     // domain owns — which is what makes RFC 0022 step 3 mean something here:
     // if this program dies mid-connection, the service's copies die with it.
-    let (status_0, value_0, detail_0) = leg(
-        tcp::CONNECT,
+    let _ = leg_or_die(
+        abi_tcp::CONNECT,
         u64::from(PEER),
         PEER_PORT,
         Some((SEND_RING, 0)),
         0,
+        1,
     );
-    if status_0 == STUCK_STATUS {
-        report(1, outcome::STUCK, 0);
-        exit();
-    }
-    if status_0 != status::OK || value_0 != tcp::OK {
-        report(
-            1,
-            outcome::REFUSED,
-            status_0 << 32 | value_0 << 16 | detail_0,
-        );
-        exit();
-    }
-
-    let (status_1, value_1, detail_1) = leg(
-        tcp::CONNECT,
+    let _ = leg_or_die(
+        abi_tcp::CONNECT,
         u64::from(PEER),
         PEER_PORT,
         Some((RECV_RING, 0)),
         1,
+        2,
     );
-    if status_1 == STUCK_STATUS {
-        report(2, outcome::STUCK, 0);
-        exit();
-    }
-    if status_1 != status::OK || value_1 != tcp::OK {
-        report(
-            2,
-            outcome::REFUSED,
-            status_1 << 32 | value_1 << 16 | detail_1,
-        );
-        exit();
-    }
     report(2, outcome::RINGS_ACCEPTED, 0);
 
-    // Leg 2: the connection capability comes back. Declared before the call,
-    // one-shot and addressed to this endpoint, so a hostile service could not
-    // fill a slot this program was keeping empty — and this service, asked
-    // properly, can fill exactly the one it was offered.
-    let (declared, _, _) = call(
-        syscall::INVOKE,
-        SERVICE,
-        method::EXPECT,
-        [CONNECTION, 0, 0, 0],
-    );
-    if declared != status::OK {
-        report(3, outcome::REFUSED, declared << 8);
+    // Leg 2's landing: the connection capability comes back. Declared before
+    // the call, one-shot and addressed to this endpoint, so a hostile service
+    // could not fill a slot this program was keeping empty — and this
+    // service, asked properly, can fill exactly the one it was offered.
+    if let Err(status) = tcp::expect(SERVICE, CONNECTION) {
+        report(3, outcome::REFUSED, status << 8);
         exit();
     }
     // The listener's rings cross now too, and then both wakes — the order
     // is the service's declaration order (rings before wakes, RFC 0022 open
     // question 4's one-declaration constraint), and the wakes land before
     // the connection opens so no news is ever produced unrung.
-    let (l0, v0, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some((L_SEND_RING, 0)), 0);
-    let (l1, v1, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some((L_RECV_RING, 0)), 1);
-    if l0 != status::OK || v0 != tcp::OK || l1 != status::OK || v1 != tcp::OK {
-        report(2, outcome::REFUSED, l0 << 48 | v0 << 32 | l1 << 16 | v1);
-        exit();
-    }
-    let (c3, cv3, _) = leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, Some((WAKE, 1)), 3);
-    let (l3, lv3, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, Some((L_WAKE, 2)), 3);
-    if c3 != status::OK || cv3 != tcp::OK || l3 != status::OK || lv3 != tcp::OK {
-        report(2, outcome::REFUSED, c3 << 48 | cv3 << 32 | l3 << 16 | lv3);
-        exit();
-    }
+    let _ = leg_or_die(
+        abi_tcp::LISTEN,
+        LISTEN_PORT,
+        0,
+        Some((L_SEND_RING, 0)),
+        0,
+        2,
+    );
+    let _ = leg_or_die(
+        abi_tcp::LISTEN,
+        LISTEN_PORT,
+        0,
+        Some((L_RECV_RING, 0)),
+        1,
+        2,
+    );
+    let _ = leg_or_die(
+        abi_tcp::CONNECT,
+        u64::from(PEER),
+        PEER_PORT,
+        Some((WAKE, 1)),
+        3,
+        2,
+    );
+    let _ = leg_or_die(abi_tcp::LISTEN, LISTEN_PORT, 0, Some((L_WAKE, 2)), 3, 2);
 
     // The handshake clock starts here: leg 2 is what makes the SYN leave.
-    let handshake_started = rdtsc();
-    let (status_2, value_2, detail_2) = leg(tcp::CONNECT, u64::from(PEER), PEER_PORT, None, 2);
-    if status_2 == STUCK_STATUS {
-        report(3, outcome::STUCK, 0);
-        exit();
-    }
-    if status_2 != status::OK || value_2 != tcp::OK {
-        report(
-            3,
-            outcome::REFUSED,
-            status_2 << 32 | value_2 << 16 | detail_2,
-        );
-        exit();
-    }
+    let handshake_started = now();
+    let _ = leg_or_die(abi_tcp::CONNECT, u64::from(PEER), PEER_PORT, None, 2, 3);
+    // `leg_or_die` returns only when the service said yes, so the reply
+    // word the old detail XORed against is the constant it always was.
+    let value_2 = abi_tcp::OK;
 
     // The reply said yes; the slot says whether the capability truly landed.
     // Both halves are asserted because either alone can lie: a reply without
     // a landing is the exchange half-done, and a landing without a reply was
-    // never offered. The probe reads by *refusal shape*: an empty slot fails
-    // to resolve at all (`NO_SUCH_CAPABILITY`), while an occupied one reaches
-    // method dispatch — `INFO` is not a method on an endpoint, and that
-    // refusal is itself the proof something is there to refuse it.
-    let (landed, kind, _) = call(syscall::INVOKE, CONNECTION, method::INFO, [0; 4]);
-    if landed == status::NO_SUCH_CAPABILITY {
-        report(4, outcome::UNLANDED, landed);
+    // never offered. The probe reads by *refusal shape* — the crate's
+    // `occupied` is that idiom, kept.
+    let (landed, probe) = tcp::occupied(CONNECTION);
+    if !landed {
+        report(4, outcome::UNLANDED, probe.status);
         exit();
     }
-    report(4, outcome::CONNECTED, kind ^ value_2);
+    report(4, outcome::CONNECTED, probe.value ^ value_2);
 
     // RFC 0022 step 4b's stream, run as RFC 0020 step 6's instrument. The
     // same exchange as before — establish, echo, close — but timed, repeated
@@ -513,9 +397,9 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             report(5, outcome::STUCK, state);
             exit();
         }
-        wait_for_news(WAKE, hertz);
+        news(WAKE, &pace);
     }
-    report_word(4, rdtsc().wrapping_sub(handshake_started));
+    report_word(4, now().wrapping_sub(handshake_started));
 
     // Eight echoed round trips of sixteen bytes, each written at its own
     // stream offset, each timed from "the service was told" to "the echo is
@@ -530,25 +414,20 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     let mut consumed_told = 0u64;
     for (index, sample) in samples.iter_mut().enumerate() {
         for (offset, byte) in PAYLOAD.iter().enumerate() {
-            let at = (index * PAYLOAD.len() + offset) % (4 * 4096);
-            // SAFETY: this program's own send ring, bounded by the modulus.
-            unsafe {
-                core::ptr::write_volatile((SENDR_AT + at as u64) as *mut u8, *byte);
-            }
+            send_view.write((index * PAYLOAD.len() + offset) as u64, *byte);
         }
-        let begun = rdtsc();
+        let begun = now();
         stream_send(PAYLOAD.len() as u64, 6);
         sent_bytes += PAYLOAD.len() as u64;
         // Seen when the echo's last byte is in this program's own ring —
         // no calls on the wait path. The consuming RECV afterwards reports
         // the read bytes so the window reopens, off the clock.
-        let last_at = (sent_bytes - 1) % (4 * 4096);
         let expected = PAYLOAD[PAYLOAD.len() - 1];
-        if !await_byte(last_at, expected, WAKE, hertz) {
+        if !recv_view.wait_for(sent_bytes - 1, expected, WAKE, &pace, 600) {
             report(6, outcome::STUCK, 0);
             exit();
         }
-        *sample = rdtsc().wrapping_sub(begun);
+        *sample = now().wrapping_sub(begun);
         let (_, delivered) = stream_state_consuming(6, sent_bytes - consumed_told);
         consumed_told = sent_bytes;
         delivered_seen = delivered_seen.max(delivered);
@@ -561,12 +440,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // The first sample's echo, byte for byte, from pages this program owns.
     // This is the sentence the whole RFC chain exists for: the peer's bytes
     // are *here*, in memory no kernel wired and no service allocated.
-    let echoed = (0..PAYLOAD.len()).all(|index| {
-        // SAFETY: this program's own receive ring, mapped before anything
-        // was gifted; the index is bounded.
-        let byte = unsafe { core::ptr::read_volatile((RECVR_AT + index as u64) as *const u8) };
-        byte == PAYLOAD[index]
-    });
+    let echoed = (0..PAYLOAD.len()).all(|index| recv_view.read(index as u64) == PAYLOAD[index]);
     if !echoed {
         report(6, outcome::MANGLED, 0);
         exit();
@@ -579,16 +453,13 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // where chunk `c - 16` lived, and an echoed chunk is an acknowledged
     // chunk — its echo rode a segment whose `ACK` the service processed
     // before delivering the bytes this program polls for — so the bytes
-    // retransmission would need are never overwritten. This paced four KiB
-    // ahead while the window was one page; RFC 0020 step 6's measurement
-    // named the width as the win after the wake. Each chunk is stamped with
-    // its own number, spot-checked after the wrap.
+    // retransmission would need are never overwritten. Each chunk is stamped
+    // with its own number, spot-checked after the wrap.
     const CHUNK: u64 = 1024;
     const CHUNKS: u64 = 32;
-    let ring = (4 * 4096) as u64;
     // Chunks the ring holds, which is how far ahead of the echo to run.
-    let depth = ring / CHUNK;
-    let bulk_started = rdtsc();
+    let depth = RING_BYTES / CHUNK;
+    let bulk_started = now();
     let bulk_base = sent_bytes;
     for chunk in 0..CHUNKS {
         // Pace by the ring itself: before chunk `c` goes out, the chunk
@@ -602,8 +473,8 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         // per chunk instead of once per poll.
         if chunk >= depth {
             let awaited = chunk - depth;
-            let at = (bulk_base + (awaited + 1) * CHUNK - 1) % ring;
-            if !await_byte(at, (awaited as u8).wrapping_add(1), WAKE, hertz) {
+            let at = bulk_base + (awaited + 1) * CHUNK - 1;
+            if !recv_view.wait_for(at, (awaited as u8).wrapping_add(1), WAKE, &pace, 600) {
                 report(7, outcome::STUCK, awaited);
                 exit();
             }
@@ -613,45 +484,40 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             delivered_seen = delivered_seen.max(delivered);
         }
         for offset in 0..CHUNK {
-            let at = (sent_bytes + offset) % ring;
-            // SAFETY: this program's own send ring, bounded by the modulus.
             // The stamp is `chunk + 1`, never zero, so an arrived chunk is
             // distinguishable from the zero-initialised ring it lands in --
-            // which is what lets the wait below read its own memory instead
-            // of asking the service.
-            unsafe {
-                core::ptr::write_volatile(
-                    (SENDR_AT + at) as *mut u8,
-                    (chunk as u8).wrapping_add(1),
-                );
-            }
+            // which is what lets the wait read its own memory instead of
+            // asking the service.
+            send_view.write(sent_bytes + offset, (chunk as u8).wrapping_add(1));
         }
         stream_send(CHUNK, 7);
         sent_bytes += CHUNK;
     }
     {
-        let at = (sent_bytes - 1) % ring;
-        if !await_byte(at, (CHUNKS as u8 - 1).wrapping_add(1), WAKE, hertz) {
+        if !recv_view.wait_for(
+            sent_bytes - 1,
+            (CHUNKS as u8 - 1).wrapping_add(1),
+            WAKE,
+            &pace,
+            600,
+        ) {
             report(7, outcome::STUCK, CHUNKS);
             exit();
         }
         let _ = stream_state_consuming(7, sent_bytes - consumed_told);
     }
-    report_word(8, rdtsc().wrapping_sub(bulk_started));
+    report_word(8, now().wrapping_sub(bulk_started));
     report_word(9, CHUNKS * CHUNK);
     // The last chunk's first byte, read back across the wrap.
-    let last_at = (sent_bytes - CHUNK) % ring;
-    // SAFETY: this program's own receive ring, bounded by the modulus.
-    let last = unsafe { core::ptr::read_volatile((RECVR_AT + last_at) as *const u8) };
+    let last = recv_view.read(sent_bytes - CHUNK);
     if last != (CHUNKS - 1) as u8 + 1 {
         report(7, outcome::MANGLED, u64::from(last));
         exit();
     }
 
     // Close in order, and see it acknowledged.
-    let (closed, _, _) = call(syscall::CALL, CONNECTION, tcp::SHUTDOWN, [0; 4]);
-    if closed != status::OK {
-        report(8, outcome::REFUSED, closed << 8);
+    if let Err(status) = tcp::shutdown(CONNECTION) {
+        report(8, outcome::REFUSED, status << 8);
         exit();
     }
     let mut waited = 0u32;
@@ -666,7 +532,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             report(8, outcome::STUCK, state);
             exit();
         }
-        wait_for_news(WAKE, hertz);
+        news(WAKE, &pace);
     }
 
     report(8, outcome::ECHOED, state);
@@ -675,48 +541,38 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // the outbound stream began; what remains is asking for the listener
     // capability and then waiting — no longer polling — for the connection
     // the harness's host-side driver initiates.
-    let (declared, _, _) = call(
-        syscall::INVOKE,
-        SERVICE,
-        method::EXPECT,
-        [LISTENER, 0, 0, 0],
-    );
-    if declared != status::OK {
-        report(9, outcome::REFUSED, declared << 8);
+    if let Err(status) = tcp::expect(SERVICE, LISTENER) {
+        report(9, outcome::REFUSED, status << 8);
         exit();
     }
-    let (l2, v2, _) = leg(tcp::LISTEN, LISTEN_PORT, 0, None, 2);
-    if l2 != status::OK || v2 != tcp::OK {
-        report(9, outcome::REFUSED, l2 << 16 | v2);
-        exit();
-    }
+    let _ = leg_or_die(abi_tcp::LISTEN, LISTEN_PORT, 0, None, 2, 9);
 
     // Accept: poll the listener until the host's connection is established.
-    let (declared, _, _) = call(syscall::INVOKE, SERVICE, method::EXPECT, [INBOUND, 0, 0, 0]);
-    if declared != status::OK {
-        report(10, outcome::REFUSED, declared << 8);
+    if let Err(status) = tcp::expect(SERVICE, INBOUND) {
+        report(10, outcome::REFUSED, status << 8);
         exit();
     }
     let mut accepted = false;
     for _ in 0..100u32 {
-        let (called, word, _) = call(syscall::CALL, LISTENER, tcp::ACCEPT, [0; 4]);
-        if called != status::OK {
-            report(10, outcome::REFUSED, called << 16);
-            exit();
+        match tcp::accept(LISTENER) {
+            AcceptPoll::Accepted => {
+                accepted = true;
+                break;
+            }
+            AcceptPoll::Later => news(L_WAKE, &pace),
+            AcceptPoll::Unreachable => {
+                report(10, outcome::DARK, 0);
+                exit();
+            }
+            AcceptPoll::ServiceSaid(word) => {
+                report(10, outcome::REFUSED, word << 16);
+                exit();
+            }
+            AcceptPoll::KernelSaid(status) => {
+                report(10, outcome::REFUSED, status << 16);
+                exit();
+            }
         }
-        if word == tcp::OK {
-            accepted = true;
-            break;
-        }
-        if word == tcp::UNREACHABLE {
-            report(10, outcome::DARK, 0);
-            exit();
-        }
-        if word != tcp::LATER {
-            report(10, outcome::REFUSED, word << 16);
-            exit();
-        }
-        wait_for_news(L_WAKE, hertz);
     }
     if !accepted {
         report(10, outcome::NOBODY, 0);
@@ -729,58 +585,68 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // which only arrives after the reply reached it — the causal proof.
     let mut served = false;
     for _ in 0..300u32 {
-        let (called, word, packed) = call(syscall::CALL, INBOUND, tcp::RECV, [0, 0, 0, 0]);
-        if called != status::OK || word != tcp::OK {
-            report(11, outcome::REFUSED, called << 16 | word);
-            exit();
+        match tcp::recv(INBOUND, 0) {
+            StreamPoll::Ready { delivered, .. } => {
+                if delivered >= INBOUND_LEN as u64 {
+                    served = true;
+                    break;
+                }
+                news(L_WAKE, &pace);
+            }
+            StreamPoll::KernelSaid(status) => {
+                report(11, outcome::REFUSED, status << 16);
+                exit();
+            }
+            StreamPoll::Unreachable | StreamPoll::NoEntropy => {
+                report(11, outcome::REFUSED, 0);
+                exit();
+            }
+            StreamPoll::ServiceSaid(word) => {
+                report(11, outcome::REFUSED, word);
+                exit();
+            }
         }
-        let available = packed & 0xffff_ffff;
-        if available >= INBOUND_LEN as u64 {
-            served = true;
-            break;
-        }
-        wait_for_news(L_WAKE, hertz);
     }
     if !served {
         report(11, outcome::STUCK, 0);
         exit();
     }
-    for index in 0..INBOUND_LEN {
-        // SAFETY: both rings are this program's own, mapped read-write at
-        // fixed addresses before anything was gifted; the index is bounded.
-        unsafe {
-            let byte = core::ptr::read_volatile((L_RECVR_AT + index as u64) as *const u8);
-            core::ptr::write_volatile((L_SENDR_AT + index as u64) as *mut u8, byte);
-        }
+    for index in 0..INBOUND_LEN as u64 {
+        l_send_view.write(index, l_recv_view.read(index));
     }
-    let (sent, _, _) = call(
-        syscall::CALL,
-        INBOUND,
-        tcp::SEND,
-        [INBOUND_LEN as u64, 0, 0, 0],
-    );
-    if sent != status::OK {
-        report(12, outcome::REFUSED, sent << 8);
+    if let Err(status) = tcp::send(INBOUND, INBOUND_LEN as u64) {
+        report(12, outcome::REFUSED, status << 8);
         exit();
     }
     let mut closed = false;
     for _ in 0..300u32 {
-        let (called, word, packed) = call(syscall::CALL, INBOUND, tcp::RECV, [0, 0, 0, 0]);
-        if called != status::OK || word != tcp::OK {
-            report(12, outcome::REFUSED, called << 16 | word);
-            exit();
+        match tcp::recv(INBOUND, 0) {
+            StreamPoll::Ready { state, .. } => {
+                if state != STATE_ESTABLISHED {
+                    closed = true;
+                    break;
+                }
+                news(L_WAKE, &pace);
+            }
+            StreamPoll::KernelSaid(status) => {
+                report(12, outcome::REFUSED, status << 16);
+                exit();
+            }
+            StreamPoll::Unreachable | StreamPoll::NoEntropy => {
+                report(12, outcome::REFUSED, 0);
+                exit();
+            }
+            StreamPoll::ServiceSaid(word) => {
+                report(12, outcome::REFUSED, word);
+                exit();
+            }
         }
-        if packed >> 32 != STATE_ESTABLISHED {
-            closed = true;
-            break;
-        }
-        wait_for_news(L_WAKE, hertz);
     }
     if !closed {
         report(12, outcome::STUCK, 0);
         exit();
     }
-    let (_, _, _) = call(syscall::CALL, INBOUND, tcp::SHUTDOWN, [0; 4]);
+    let _ = tcp::shutdown(INBOUND);
     report(13, outcome::SERVED, 0);
     exit()
 }

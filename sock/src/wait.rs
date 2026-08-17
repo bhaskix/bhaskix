@@ -42,3 +42,24 @@ pub fn doze(timer_slot: u64, pace: &crate::time::Pace, ms: u64) {
         crate::call::yield_now();
     }
 }
+
+/// Blocks until the service rings `wake_slot`, or a tenth of a second
+/// passes — RFC 0023's whole point on the first arm, and the deadline is
+/// what keeps a lost wake a slowdown rather than a hang: it rides the same
+/// notification (RFC 0019), so `WAIT` returns either way and the caller
+/// re-reads the only truth, which is the next poll's reply. On a machine
+/// with no calibrated counter there is no deadline to arm, and a yield is
+/// what is left.
+pub fn news(wake_slot: u64, pace: &crate::time::Pace) {
+    if !pace.calibrated() {
+        crate::call::yield_now();
+        return;
+    }
+    let _ = call(
+        syscall::INVOKE,
+        wake_slot,
+        method::ARM,
+        [crate::time::now().wrapping_add(pace.cycles(100)), 0, 0, 0],
+    );
+    let _ = call(syscall::INVOKE, wake_slot, method::WAIT, [0; 4]);
+}

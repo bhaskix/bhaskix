@@ -18,6 +18,8 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod call;
+pub mod ring;
+pub mod tcp;
 pub mod time;
 pub mod udp;
 pub mod wait;

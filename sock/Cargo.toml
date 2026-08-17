@@ -29,8 +29,8 @@ bhaskix-abi = { path = "../abi" }
 workspace = true
 
 [package.metadata.bhaskix]
-# The centralisation this crate exists for: the syscall stub and the cycle
-# counter read, which every networked program used to carry its own copy
-# of. Measured, no headroom; the ring accesses arrive with the stream in
-# RFC 0027 step 3 and the budget grows to exactly what they cost, then.
-unsafe_budget = 18
+# The centralisation this crate exists for: the syscall stub, the cycle
+# counter read, and RingView's two volatile ring accesses -- the lines
+# every networked program used to carry its own copies of. Measured, no
+# headroom.
+unsafe_budget = 20

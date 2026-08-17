@@ -7,8 +7,16 @@ name = "bhaskix-abi"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-sock"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-abi",
+]
+
+[[package]]
 name = "bhaskix-user-tcpc"
 version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
+ "bhaskix-sock",
 ]
