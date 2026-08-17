@@ -2191,6 +2191,25 @@ pub fn preempt() {
     // very signature it should have made impossible. Kept because descheduling
     // a lock holder is wrong regardless, and left uncommented-out so nobody
     // rediscovers the unsoundness and assumes it was the fault all along.
+    // The state run-409's SAVED HOLDING implies: the rank mask says a lock is
+    // held while the count says nothing is — the only state in which this
+    // veto waves a genuine holder through to be switched out. It is also the
+    // shadow an underflow casts *before* the wedge: the count lost an
+    // increment the mask still remembers. Caught here because this is the
+    // decision the mismatch corrupts; printed once, because the condition
+    // repeats on every tick until the drop that will underflow.
+    if crate::sync::held_mask() != 0
+        && !crate::sync::holds_any()
+        && COUNT_MISMATCHES.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        crate::println!(
+            "    COUNT MISMATCH  cpu {cpu} rank mask {:#b} with a hold count of zero: a \
+             counted increment has been lost, and the next release of this guard will \
+             underflow",
+            crate::sync::held_mask(),
+        );
+    }
+
     if crate::sync::holds_any() {
         // Counted, because a veto that repeats is invisible otherwise: every
         // decline looks identical to "nothing to do" from outside, and the
@@ -3351,6 +3370,11 @@ static DOMAIN_SCAN_SKIPS: AtomicU64 = AtomicU64::new(0);
 pub fn domain_scan_skips() -> u64 {
     DOMAIN_SCAN_SKIPS.load(Ordering::Relaxed)
 }
+
+/// Times a CPU's rank mask read held while its hold count read zero — the
+/// pre-underflow mismatch, counted so the first is printed and the rest are
+/// a number.
+static COUNT_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Preemptions declined because this CPU's hold count read nonzero.
 static PREEMPT_VETO_HOLDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];

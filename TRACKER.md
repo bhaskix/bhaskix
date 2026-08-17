@@ -758,6 +758,22 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-17 (the underflow can no longer wedge, and its next occurrence names its own victim)
+
+**Two guards around the convicted disease, neither of which is yet the cure.** The release
+path's decrement now refuses to wrap: a drop that finds the count already at zero prints
+`COUNT UNDERFLOW` with the victim guard's acquisition site and saturates — one loud line and
+a boot that finishes its report, where yesterday there was a CPU vetoing every preemption for
+ever. Upstream of it, `preempt` now prints `COUNT MISMATCH` the first time a CPU's rank mask
+reads held while its count reads zero — the shadow the underflow casts before the wrap, and
+the state in which the veto waves a genuine holder through (run-409's `SAVED HOLDING`,
+explained). Both markers are boot-test failures, so the mitigation cannot quietly become the
+fix. Watched red by injection: a deliberately lost increment printed the underflow line
+naming the injection's own acquisition site, failed the gate — and the boot *completed*,
+which is the saturation doing the half of the job it can do. **The lost increment's own
+origin is still the open work**; what changed is that the next occurrence anywhere reports
+two named lines instead of hanging a soak boot.
+
 ### 2026-08-17 (the hunt soak names the disease: the hold count underflows, and one wedged CPU explains three failure families)
 
 **A 500-boot hunt returned six specimens, and an existing canary read the diagnosis out

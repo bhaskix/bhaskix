@@ -1036,10 +1036,56 @@ impl<T> Drop for SpinLockGuard<'_, T> {
         // Late is the safe direction. For these few instructions the CPU
         // claims a lock it has already dropped, and the cost is one skipped
         // preemption.
+        //
+        // And the decrement refuses to wrap. The 2026-08-17 hunt convicted a
+        // count at `u32::MAX` — an underflow — as the wedge behind three
+        // failure families: a CPU whose count reads −1 vetoes every
+        // preemption for ever. A release that finds the count already at
+        // zero is that underflow *happening*, and this is the only place it
+        // can be caught with the victim's name attached: the count lost a
+        // matching increment somewhere earlier, and the guard being dropped
+        // — acquired at the site printed — is the one paying for it. The
+        // compare-exchange loop costs the same as `fetch_sub` when nothing
+        // is wrong; saturating instead of wrapping turns a machine-wide
+        // wedge into one loud line and a boot that can finish its report.
         if self.counted {
-            holds_slot().fetch_sub(1, Ordering::Relaxed);
+            let slot = holds_slot();
+            let mut count = slot.load(Ordering::Relaxed);
+            loop {
+                if count == 0 {
+                    COUNT_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+                    crate::println!(
+                        "    COUNT UNDERFLOW  a release found this CPU's hold count already \
+                         zero; the guard acquired at {}:{} is paying for an increment lost \
+                         earlier (cpu {})",
+                        self.at.file(),
+                        self.at.line(),
+                        percpu::cpu_id(),
+                    );
+                    break;
+                }
+                match slot.compare_exchange_weak(
+                    count,
+                    count - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(seen) => count = seen,
+                }
+            }
         }
     }
+}
+
+/// Releases that found the hold count already at zero — each one an
+/// underflow caught in the act instead of a CPU wedged for ever.
+static COUNT_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+
+/// How many hold-count underflows have been caught at release.
+#[must_use]
+pub fn count_underflows() -> u64 {
+    COUNT_UNDERFLOWS.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

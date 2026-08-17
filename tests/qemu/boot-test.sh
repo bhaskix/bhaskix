@@ -1537,6 +1537,21 @@ if grep -q "HOLD LEAK" "$LOG"; then
     status=1
 fi
 
+# The hold-count underflow, caught at release, and its upstream shadow --
+# the mask-held/count-zero mismatch. Both used to wedge a CPU silently
+# (2026-08-17: three bring-up hangs, two silent-CPU boots, one count at
+# 4294967295); the saturating release now lets such a boot finish and
+# report, so the gate is what turns the survivable report back into a
+# failure nobody can miss.
+if grep -qa "COUNT UNDERFLOW" "$LOG"; then
+    fail "a hold-count underflow was caught at a release"
+    status=1
+fi
+if grep -qa "COUNT MISMATCH" "$LOG"; then
+    fail "a CPU's rank mask and hold count disagreed"
+    status=1
+fi
+
 # The lock-contention gauge must exist on every boot, same rule as every
 # instrument: values ungated, presence demanded.
 if ! grep -qE "longest holds" "$LOG"; then
