@@ -301,7 +301,7 @@ $(USER_IPD): $(IPD_DIR)/src/main.rs $(IPD_DIR)/link.ld $(IPD_DIR)/Cargo.toml \
 # The DHCP client. RFC 0018 step 6, and a program rather than a shell command
 # because it needs a socket and a page and should hold a socket and a page.
 $(USER_DHCPD): $(DHCPD_DIR)/src/main.rs $(DHCPD_DIR)/link.ld $(DHCPD_DIR)/Cargo.toml \
-               $(wildcard abi/src/*.rs) $(wildcard net/src/*.rs)
+               $(wildcard abi/src/*.rs) $(wildcard net/src/*.rs) $(wildcard sock/src/*.rs)
 	cd $(DHCPD_DIR) && RUSTFLAGS="$(DHCPD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"

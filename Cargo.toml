@@ -55,6 +55,12 @@ members = [
     # emits through it, `bin/traced` decodes through it, and a host test
     # drives both sides in one process.
     "telemetry",
+
+    # Phase 2 — RFC 0027 step 1. The client side of the network: the
+    # exchange shapes, the refusal decoding and the wait discipline that
+    # three programs used to hand-roll. Depends on the ABI and nothing
+    # else; programs depend on it.
+    "sock",
 ]
 
 # The negative fixture for `tools/check-placements.sh`: a service that reaches

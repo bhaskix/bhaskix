@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0027: a sockets API worth the name, which is a client crate. The UDP
+# calls, the TCP handover, the stream arithmetic, the window discipline and
+# the memory-wait, written once with one unsafe budget instead of copied
+# with local variations into every program that talks.
+#
+# Depends on the ABI and nothing else: everything here is parameterised by
+# slots the program already holds, and a crate that reached further would be
+# a runtime, which RFC 0027 explicitly refuses to be.
+[package]
+name = "bhaskix-sock"
+description = "The client side of the network: sockets, connections and streams over capabilities the program already holds."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_sock"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../abi" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# The centralisation this crate exists for: the syscall stub and the cycle
+# counter read, which every networked program used to carry its own copy
+# of. Measured, no headroom; the ring accesses arrive with the stream in
+# RFC 0027 step 3 and the budget grows to exactly what they cost, then.
+unsafe_budget = 18

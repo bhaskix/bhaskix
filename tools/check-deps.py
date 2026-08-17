@@ -38,7 +38,7 @@ LAYERS = {
     # The interface between the kernel and the programs it runs. Below
     # everything, because it is compiled into both sides: anything it depended
     # on would become part of the interface too.
-    "bhaskix-abi": -2,
+    "bhaskix-abi": -3,
 
     # The service framework, and the services compiled against it. Between the
     # ABI and everything else: a service crate may reach these two and nothing
@@ -49,11 +49,11 @@ LAYERS = {
     # Registers and their accessors. Below everything that drives hardware and
     # above nothing: it depends on no crate at all, because every driver
     # compiles against it -- in the kernel, in a domain, and in a host test.
-    "bhaskix-device": -2,
+    "bhaskix-device": -3,
     # The on-disk format: arithmetic over a byte slice, reachable from the
     # kernel, from a service in a domain, and from a host tool. Depends on
     # nothing, for the same reason the device crate does not.
-    "bhaskix-fs": -2,
+    "bhaskix-fs": -3,
     # The wire formats, and the same argument exactly. This entry read `4` from
     # M1 until 2026-08-12 -- a number reserved before there was a design, on the
     # assumption that a network stack sits above the kernel the way a driver
@@ -62,19 +62,25 @@ LAYERS = {
     # service, from a host test and from a fuzz target, and therefore able to
     # depend on none of them. Layer 4 would have permitted a dependency on the
     # kernel, which is the one thing this crate must never acquire.
-    "bhaskix-net": -2,
+    "bhaskix-net": -3,
     # The system's only source of unpredictability, RFC 0021, and the same
     # argument a third time: it must be reachable from the kernel, from a ring 3
     # service and from a host test, so it depends on nothing. `arch` depends on
     # *it* rather than the other way round -- a layer above may reach down, and
     # a ring 3 program that depended on `arch` would be a category error.
-    "bhaskix-rand": -2,
+    "bhaskix-rand": -3,
     # The telemetry plane's arithmetic, RFC 0026, and the same argument a
     # fourth time: the kernel emits through it, `bin/traced` decodes through
     # it, and a host test drives both sides of the ring protocol in one
     # process -- so it depends on nothing, and nothing it observes may ever
     # become something it links.
-    "bhaskix-telemetry": -2,
+    "bhaskix-telemetry": -3,
+    # RFC 0027: the client side of the network, the rung *between* the leaf
+    # crates and the programs -- it depends on the ABI, and programs depend
+    # on it. The leaf layer renumbered from -2 to -3 to make this rung
+    # exist; the checker compares, and the numbers carry no meaning beyond
+    # their order.
+    "bhaskix-sock": -2,
     "bhaskix-service": -1,
     "bhaskix-service-domain": 0,
     "bhaskix-service-console": 0,

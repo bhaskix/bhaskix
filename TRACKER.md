@@ -129,7 +129,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **NW3** | A wake for a connection | ✅ **Accepted** 2026-08-16 — implemented 2026-08-15, all three steps, and accepted *with* its measured verdict: slower round trip, three hundred times less scheduler burn | **A connection may carry a notification, and the service rings it** — one more gift on `CONNECT`/`LISTEN` (RFC 0022's leg 3), signalled on `Delivered`, `Acknowledged` and state change, so the client blocks in `WAIT` instead of the yield-spin RFC 0020 step 6 measured as the round-trip floor's named cause. The state machine has produced the wake since it was written; `bin/tcpd` discards it with a comment saying a notification belongs there. Drafted from the measurement, not a guess. | [RFC 0023](docs/rfc/0023-a-wake-for-a-connection.md) |
 | **A5** | 5-level paging (LA57) | ✅ **Accepted** 2026-08-16 — answered by RFC 0025, implemented 2026-08-15 with the document; **the last open architecture question is closed** | **Four-level, on purpose, with the refusal shipped**: every walk and half-split in the tree is a bit-47 statement, so bring-up now reads `CR4.LA57` and halts with a sentence rather than corrupting addresses silently under a bootloader whose default changed. The boot report states capability beside choice. Five-level gets built against a written trigger — an address-space or physical-memory need no current machine has — not an open wait. | [RFC 0025](docs/rfc/0025-four-level-paging-on-purpose.md) |
 | **TE1** | Telemetry plane | ✅ **Accepted 2026-08-17** — drafted, implemented (all six steps) and accepted the same day, on the working demonstration: two boot gates per placement, one negative-armed, the emit priced from both sides | **A 64-byte typed event, one lock-free drop-newest ring per CPU, two capabilities to read them.** [ai-native.md](docs/ai-native.md) §2 built as specified, with three narrownesses stated in the draft rather than discovered later: per-domain enable bits deferred to their first consumer (per-class now), the `Audit` class reserved but refused (best-effort audit is false assurance — backpressure is its own RFC on this foundation), and the domain field carrying the id without the generation. Rejects the `TelemetryChannel`-per-domain sketch in `architecture.md` — the producer is a CPU, often in interrupt context, not a domain. Partially answers RFC 0008's Q4: a capability is named (domain, slot, kind) for tracing; audit-grade naming stays open | [RFC 0026](docs/rfc/0026-telemetry-plane.md) |
-| **SK1** | A sockets API worth the name | ⬜ **Draft** 2026-08-17 | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
+| **SK1** | A sockets API worth the name | ⬜ **Draft** 2026-08-17, step 1 implemented the same day (`bhaskix-sock` + the `bin/dhcp` port, budget 28 → 10) | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -760,6 +760,28 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-17 (RFC 0027 step 1: `bhaskix-sock` exists, and `bin/dhcp` is the first invoice paid)
+
+**The crate**: `call` (the one syscall stub, all four reply words captured — the ported
+programs' copies each returned a different subset), `time::Pace` (milliseconds to cycle
+deadlines, saturating, honest about an uncalibrated machine, host-tested at the edges),
+`wait::doze` (sleep on an armed deadline, yield when the machine cannot), and `udp` — the
+`EXPECT` declaration, `bind` with both-sided refusal decoding (`Refusal::Kernel` versus
+`Refusal::Service`, raw words kept because report pages print exact numbers), `send_to`,
+`recv_from` with `Ok(None)` for an empty mailbox, `close`. Layer −2, a new rung: the leaf
+crates renumbered −2 → −3 so a program library could sit between them and the programs — the
+checker compares, and the numbers carry no meaning beyond their order.
+
+**The port**: `bin/dhcp` keeps what is genuinely its own — the DHCP payloads, the report page,
+the patience policy — and sheds the machinery. Its `unsafe` budget fell **28 → 10** (the stub,
+the counter read and the sleep gone; the panic `ud2`, the page view and the report writes
+remain); the crate carries 18 once, against the copies it replaces. Behaviour is bit-for-bit
+where it matters and the networked boot proves it: `dhcp client offered 10.0.2.15 by
+10.0.2.2, holding a socket and a page and nothing else`, on the same gate that has watched
+this exchange since RFC 0018 step 6. One deliberate widening on the way: the stub now returns
+the third reply word, so `recv_from` surfaces the source port the ABI always defined and every
+hand-rolled copy dropped. Steps 2–4 — the TCP handover, the stream, and `bin/tcpc` — are next.
 
 ### 2026-08-17 (RFC 0027 drafted: a sockets API worth the name, which is a crate and a refusal)
 

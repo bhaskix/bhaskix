@@ -32,6 +32,7 @@ bhaskix-abi = { path = "../../abi" }
 # The protocol code. This program holds no device, no DMA window and no
 # interrupt, which is the rule for linking it -- see tools/check-deps.py.
 bhaskix-net = { path = "../../net" }
+bhaskix-sock = { path = "../../sock" }
 
 [profile.release]
 panic = "abort"
@@ -45,4 +46,8 @@ opt-level = "s"
 # clock is readable at every privilege level here -- `CR4.TSD` is clear -- so
 # this program reads time without holding anything, and holds a capability only
 # for the thing that is actually scarce, which is being woken.
-unsafe_budget = 28
+# 10 since RFC 0027 step 1: the syscall stub, the cycle counter and the
+# sleep machinery moved into bhaskix-sock, reviewed once there instead of per
+# program. What remains is genuinely local -- the panic ud2, the page
+# view, and the report writes.
+unsafe_budget = 10
