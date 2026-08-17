@@ -552,6 +552,30 @@ fn close_guard(slot: usize, at: &'static core::panic::Location<'static>) {
     }
 }
 
+/// Prints every guard currently open on `cpu`, one line each — the
+/// acquisition site and the rank byte (255 = unranked `try_lock`). The
+/// count says something is held; this says *what*, which is the difference
+/// between "the count leaked" and a file to open. Called from the markers
+/// that fire when a count and reality disagree, so the specimen carries
+/// its suspects with it.
+pub fn dump_open_guards(cpu: usize) {
+    let mut any = false;
+    for_each_open_guard(cpu, |at, rank, _since| {
+        any = true;
+        crate::println!(
+            "      open guard   rank {} acquired at {}:{}",
+            rank,
+            at.file(),
+            at.line()
+        );
+    });
+    if !any {
+        crate::println!(
+            "      open guard   none -- the counted hold has no open guard, which is itself the answer"
+        );
+    }
+}
+
 /// Walks the guards currently open on `cpu`: `(site, rank byte)`.
 pub fn for_each_open_guard(
     cpu: usize,
@@ -1062,6 +1086,7 @@ impl<T> Drop for SpinLockGuard<'_, T> {
                         self.at.line(),
                         percpu::cpu_id(),
                     );
+                    dump_open_guards(percpu::cpu_id() as usize);
                     break;
                 }
                 match slot.compare_exchange_weak(

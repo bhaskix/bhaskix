@@ -1297,6 +1297,31 @@ fn note_saved_holding(id: u32, name: &'static str, mask: u64, where_: &'static s
     }
 }
 
+/// Records a thread being switched out with a **counted hold and no rank**
+/// — the poison signature the 2026-08-18 specimen implied but could not
+/// show: a nonzero count saved into a thread whose mask is clean rides
+/// with that thread and flags every later block it makes. Reported on
+/// first occurrence with the open guards attached, counted always.
+fn note_saved_count(id: u32, name: &'static str, count: u32, where_: &'static str) {
+    let first = SAVED_COUNT_ONLY.fetch_add(1, Ordering::Relaxed) == 0;
+    if first {
+        crate::println!(
+            "    SAVED COUNT    thread {id} ({name}) switched out via {where_} with {count} \
+             counted holds and an empty mask -- the count-side tear, mid-poison"
+        );
+        crate::sync::dump_open_guards(bhaskix_arch::percpu::cpu_id() as usize);
+    }
+}
+
+/// Switches that saved a nonzero count beside an empty mask.
+static SAVED_COUNT_ONLY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many switches saved a counted hold with no rank.
+#[must_use]
+pub fn saved_count_only() -> u64 {
+    SAVED_COUNT_ONLY.load(Ordering::Relaxed)
+}
+
 /// `(count, last mask, last thread)` for switches made carrying held ranks.
 #[must_use]
 pub fn saved_holding() -> (u64, u64, Option<u32>) {
@@ -2377,6 +2402,8 @@ pub fn preempt() {
             thread.held_count = crate::sync::holds_count();
             if thread.held_locks != 0 {
                 note_saved_holding(thread.id, thread.name, thread.held_locks, "preempt");
+            } else if thread.held_count != 0 {
+                note_saved_count(thread.id, thread.name, thread.held_count, "preempt");
             }
         }
         // RFC 0026's dispatch event, emitted here — under the lock, before
@@ -2882,6 +2909,12 @@ pub fn block_self() {
             site.file(),
             site.line()
         );
+        // The 2026-08-18 specimen fired this line six times with mask zero
+        // and count one and could name nothing further. The open guards are
+        // what it was missing: either one is listed here -- a file to open
+        // -- or none is, and a counted hold with no open guard convicts the
+        // count itself.
+        crate::sync::dump_open_guards(bhaskix_arch::percpu::cpu_id() as usize);
     }
 
     // Same reasoning as `preempt`: choosing and switching must be one step
@@ -2977,6 +3010,8 @@ pub fn block_self() {
                     thread.held_count = crate::sync::holds_count();
                     if thread.held_locks != 0 {
                         note_saved_holding(thread.id, thread.name, thread.held_locks, "block_self");
+                    } else if thread.held_count != 0 {
+                        note_saved_count(thread.id, thread.name, thread.held_count, "block_self");
                     }
                 }
                 crate::sync::set_held_mask(incoming_locks);
