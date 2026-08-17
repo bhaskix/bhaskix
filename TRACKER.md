@@ -762,6 +762,28 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (the courtship soak: 1 in 120, and the crash arm yields its first full-register specimen)
+
+**119 of 120 instrument-armed boots passed; the one that did not is the richest specimen the
+crash arm has produced.** run-85, cpu 1, the same phase as ever: a `#GP` from kernel mode with
+`thread None`, and this time the rebuilt report survived whole — every register, every control
+register. Two facts in it are new and discriminating: **the error code `0xab20` is a selector
+reference (index 0x1564 in the GDT) and equals the low sixteen bits of the live `rbx`**, and
+**the `ss` slot holds a kernel-half pointer** (`0xffffffffcda2bf90`) where a selector belongs.
+A `#GP` whose error code is a garbage selector is what **`IRETQ` raises when it pops a
+corrupted frame** — and a frame whose `ss` slot contains a pointer, with the error echoing a
+live register, reads as *something wrote register-shaped data over an in-flight exception
+frame*: two contexts sharing one stack region, which is the save/restore disease's shape seen
+from the stack side rather than the counter's. The stub table was audited on the way and
+exonerated — the error-code mask is exactly the architecture's set, and every stub fits its
+slot. The count-side markers did not fire in this boot: this is the crash family member, not
+the counter's, and the two continue to present as one disease wearing two masks. Specimen
+preserved at `/root/bhaskix-soak-artifacts/2026-08-18-run85-full-gp-frame-clobber-specimen.log`;
+family ledger: seven sightings, two now with dense reports. **The next instrument, written
+down before it is built**: the exception report should dump the raw qwords around the iret
+frame, so the clobber's *pattern* — which registers, what order — is visible and the writer
+can be identified by its fingerprint.
+
 ### 2026-08-18 (the hunt resumes: three instruments upgraded, each made to fire before being believed)
 
 **The specimens converged on wait.rs, so the hunt resumed — and its first move is making the
