@@ -164,6 +164,13 @@ pub unsafe fn enable(
 /// described: a null pointer in the shell stopped the console and the
 /// filesystem, which had done nothing wrong.
 fn handle(frame: &mut TrapFrame) {
+    // Snapshotted at dispatch, compared at report. The run-312 crash dump of
+    // 2026-08-17 printed "UNEXPECTED INTERRUPT on vector 65" from a path only
+    // reachable when the vector read below 32 -- so between this line and the
+    // report, either the frame mutated or the read went to different memory.
+    // A local copy makes that contradiction printable instead of inferable.
+    let dispatched = frame.vector;
+
     // Vectors below 32 are architectural exceptions; everything above is an
     // interrupt. The split matters because exceptions are faults in the
     // kernel's own execution and interrupts are not, so only one of them is
@@ -232,7 +239,7 @@ fn handle(frame: &mut TrapFrame) {
         }
     }
 
-    report_exception(frame);
+    report_exception(frame, dispatched);
 
     // A fault in ring 3 is the program's bug, not the machine's.
     if frame.from_user_mode() {
@@ -452,7 +459,7 @@ fn handle_interrupt(frame: &mut TrapFrame) {
 /// report is the most valuable thing this kernel produces when something goes
 /// wrong, and it should not get thinner because the fault turned out to be
 /// survivable.
-fn report_exception(frame: &mut TrapFrame) {
+fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
     println!();
     println!("==================================================================");
     match exception_name(frame.vector) {
@@ -460,6 +467,31 @@ fn report_exception(frame: &mut TrapFrame) {
         None => println!("  UNEXPECTED INTERRUPT on vector {}", frame.vector),
     }
     println!("==================================================================");
+
+    // The densest line first, and first on purpose: the run-312 specimen was
+    // cut off by the harness cap five lines into the report, and everything
+    // this line carries was in the part that never printed. CR2 is read
+    // unconditionally -- stale for a non-#PF, but a stale value beside the
+    // vector costs one word and the alternative cost a specimen.
+    {
+        let cpu = bhaskix_arch::percpu::cpu_id();
+        let thread = crate::sched::current_thread_id();
+        let cr2 = read_cr2();
+        // SAFETY: reading CR3 at CPL 0 has no side effects.
+        let cr3 = unsafe { bhaskix_arch::paging::active_page_table() };
+        println!(
+            "  cpu {cpu} thread {:?}; frame at {:p}; error {:#x} cr2 {:#x} cr3 {:#x}",
+            thread, frame as *const TrapFrame, frame.error_code, cr2, cr3,
+        );
+    }
+    if dispatched != frame.vector {
+        println!(
+            "  THE FRAME CHANGED UNDER THE HANDLER: dispatched as vector {dispatched}, the \
+             frame now says {} -- the report below describes memory that was not what the \
+             dispatch read",
+            frame.vector,
+        );
+    }
 
     println!(
         "  vector {:#04x}   from {} mode",

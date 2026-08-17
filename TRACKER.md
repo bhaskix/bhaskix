@@ -758,6 +758,29 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-17 (the run-312 crash decoded as far as one truncated specimen allows, and the report is rebuilt for the next one)
+
+**What the specimen says, read against this boot's KASLR slide**: the "UNEXPECTED INTERRUPT on
+vector 65" banner came from a path only reachable when the vector read *below 32* — so the
+frame changed between dispatch and report, or the two reads saw different memory. The frame's
+fields are individually impossible — `cs 0x0300` names no selector, `rip` sits inside a kernel
+stack — and collectively suggestive: three fields hold kernel-*text* addresses under the slide
+(stale return addresses), `rax` holds 14 (the page-fault vector), and the vector slot holds
+0x41, which is `RESCHEDULE_VECTOR` — the most frequently pushed IPI frame there is, since the
+spawn fix. No single frame-shift explains all of it; the reading that fits best is a **ghost
+frame** — the handler reading stale stack content where an earlier reschedule-IPI frame once
+lived, which would point at stack-mapping or TLB coherence. One truncated specimen cannot carry
+that conviction, and the truncation itself was the report's fault: the five lines that printed
+before the harness cap killed the boot were the least diagnostic five.
+
+**So the report is rebuilt for the next specimen.** The densest line now prints *first* — cpu,
+thread, the frame's own address, error code, CR2, CR3 — and `handle` snapshots the vector at
+dispatch so the report can print "THE FRAME CHANGED UNDER THE HANDLER: dispatched as N, the
+frame now says M" instead of leaving the contradiction to be inferred from which banner
+printed. Fault-injection gates pass unchanged. Rate: two sightings in ~1100 single-job boots
+plus one in 440 paired — a 500-boot soak is a coin flip for the next specimen, and every boot
+anywhere now carries the better report.
+
 ### 2026-08-17 (the counter fix is proven: 500 boots, zero captures — and two new specimens on the way out)
 
 **The proof soak returned clean where it mattered: zero domain-check failures and zero

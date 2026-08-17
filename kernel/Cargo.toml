@@ -230,7 +230,11 @@ workspace = true
 #
 # 1226 at the longest-holds gauge: the same Location cast once more, in the
 # record holder's read-out.
-unsafe_budget = 1226
+#
+# 1227 at the exception report's first line: one CR3 read, so the densest
+# diagnostics print before a harness cap can cut them off -- the lesson of
+# the run-312 specimen, which lost everything after its fifth line.
+unsafe_budget = 1227
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
