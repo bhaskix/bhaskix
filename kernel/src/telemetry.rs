@@ -345,15 +345,39 @@ pub fn report() {
     }
     let cycles = (tsc::read().wrapping_sub(before)) / SAMPLES;
 
+    // The other half of the A/B: the same loop through a class that is
+    // actually off, measured only if one is — a disabled class whose cost
+    // was measured while it was enabled would be the instrument lying about
+    // the claim it exists to check, that a disabled class costs one load
+    // and a predicted branch.
+    let mask = MASK.load(Ordering::Relaxed);
+    let off = [
+        EventClass::Net,
+        EventClass::Io,
+        EventClass::Memory,
+        EventClass::Fault,
+    ]
+    .into_iter()
+    .find(|class| !enabled(mask, *class));
+    let disabled_cycles = off.map(|class| {
+        let before = tsc::read();
+        for sample in 0..SAMPLES {
+            payload[8..].copy_from_slice(&sample.to_le_bytes());
+            emit(class, schema::PROBE.id, u32::MAX, &payload);
+        }
+        (tsc::read().wrapping_sub(before)) / SAMPLES
+    });
+
     crate::println!(
         "    telemetry      {} events across {} cpus, {} dropped, {} audit-refused; \
-         ~{} cycles/emit over {}; {} slots/cpu",
+         ~{} cycles/emit over {}, ~{} disabled; {} slots/cpu",
         events + SAMPLES,
         online,
         dropped,
         refused,
         cycles,
         SAMPLES,
+        disabled_cycles.unwrap_or(0),
         SLOTS.load(Ordering::Relaxed),
     );
 }

@@ -461,7 +461,7 @@ fi
 # is not), events must be nonzero (the scheduler emits on every switch, and a
 # boot performs thousands), and audit-refused must be zero, because nothing may
 # emit the reserved class until the audit RFC builds its backpressure ring.
-if grep -qE "telemetry +[1-9][0-9]* events across [1-9][0-9]* cpus, [0-9]+ dropped, 0 audit-refused; ~[0-9]+ cycles/emit over [0-9]+; [1-9][0-9]* slots/cpu" "$LOG"; then
+if grep -qE "telemetry +[1-9][0-9]* events across [1-9][0-9]* cpus, [0-9]+ dropped, 0 audit-refused; ~[0-9]+ cycles/emit over [0-9]+, ~[0-9]+ disabled; [1-9][0-9]* slots/cpu" "$LOG"; then
     pass "telemetry: events counted, drops said, the reserved class untouched"
 else
     fail "the telemetry report line is missing or malformed"
