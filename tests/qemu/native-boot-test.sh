@@ -16,6 +16,8 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOADER="$REPO_ROOT/boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi"
+KERNEL="$REPO_ROOT/target/x86_64-unknown-none/release/bhaskix"
+INITRD="$REPO_ROOT/build/initrd.tar"
 LOG="${BHASKIX_NATIVE_BOOT_LOG:-$(mktemp)}"
 TIMEOUT=30
 
@@ -29,6 +31,10 @@ fail() { printf '%sFAIL%s  %s\n' "$RED" "$RESET" "$1"; }
 
 if [[ ! -f "$LOADER" ]]; then
     fail "bhaskixboot.efi is not built; make it first"
+    exit 1
+fi
+if [[ ! -f "$KERNEL" || ! -f "$INITRD" ]]; then
+    fail "the payload (kernel, initrd) is not built; make iso first"
     exit 1
 fi
 
@@ -66,8 +72,35 @@ fi
 # firmware falls back to.
 ESP="$REPO_ROOT/build/native-esp"
 rm -rf "$ESP"
-mkdir -p "$ESP/EFI/BOOT"
+mkdir -p "$ESP/EFI/BOOT" "$ESP/bhaskix"
 cp "$LOADER" "$ESP/EFI/BOOT/BOOTX64.EFI"
+# The payload, staged where the loader's fixed paths expect it. The
+# configuration is one line today; it becomes the command line at the
+# entry step.
+cp "$KERNEL" "$ESP/bhaskix/kernel"
+cp "$INITRD" "$ESP/bhaskix/initrd.tar"
+printf 'cmdline=\n' > "$ESP/bhaskix/boot.conf"
+
+# The build's own checksums, computed independently of the loader by the
+# same stated arithmetic (FNV-1a 64), so the gate is two implementations
+# agreeing about the same bytes -- not the loader agreeing with itself.
+fnv() {
+    python3 - "$1" <<'PY'
+import sys
+h = 0xcbf29ce484222325
+with open(sys.argv[1], "rb") as f:
+    while chunk := f.read(65536):
+        for b in chunk:
+            h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+print(f"0x{h:016x}")
+PY
+}
+KERNEL_BYTES=$(stat -c %s "$ESP/bhaskix/kernel")
+KERNEL_FNV=$(fnv "$ESP/bhaskix/kernel")
+INITRD_BYTES=$(stat -c %s "$ESP/bhaskix/initrd.tar")
+INITRD_FNV=$(fnv "$ESP/bhaskix/initrd.tar")
+CONF_BYTES=$(stat -c %s "$ESP/bhaskix/boot.conf")
+CONF_FNV=$(fnv "$ESP/bhaskix/boot.conf")
 
 WRITABLE_VARS="$REPO_ROOT/build/OVMF_VARS_native.fd"
 cp "$OVMF_VARS" "$WRITABLE_VARS"
@@ -82,13 +115,11 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
     >/dev/null 2>&1 &
 QEMU_PID=$!
 
-# Poll for the banner rather than waiting the whole timeout: step 1's
-# loader returns to the firmware after speaking, and the firmware then
-# wanders into its own shell -- the banner is the event, not the exit.
-status=1
+# Poll for the last expected line rather than waiting the whole timeout:
+# the loader returns to the firmware after speaking, and the firmware then
+# wanders into its own shell -- the output is the event, not the exit.
 for _ in $(seq 1 "$TIMEOUT"); do
-    if grep -q "bhaskixboot 0.0.0: the machine entered through our own door" "$LOG" 2>/dev/null; then
-        status=0
+    if grep -q "bhaskixboot: payload conf " "$LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -96,10 +127,29 @@ done
 kill "$QEMU_PID" >/dev/null 2>&1
 wait "$QEMU_PID" 2>/dev/null
 
-if [[ "$status" -eq 0 ]]; then
+status=0
+if grep -q "bhaskixboot 0.0.0: the machine entered through our own door" "$LOG" 2>/dev/null; then
     pass "the firmware started our loader, and the first words on the wire were ours"
 else
     fail "the native loader's banner never appeared"
+    status=1
+fi
+
+# Step 2: the payload's integrity, byte for byte. The loader streamed each
+# file through FNV-1a and printed size and sum; the lines below were
+# computed here, from the staged files, by a second implementation of the
+# same arithmetic. Equality means the firmware served the build's bytes.
+for check in     "kernel $KERNEL_BYTES bytes fnv $KERNEL_FNV"     "initrd $INITRD_BYTES bytes fnv $INITRD_FNV"     "conf $CONF_BYTES bytes fnv $CONF_FNV"
+do
+    if grep -qF "bhaskixboot: payload $check" "$LOG" 2>/dev/null; then
+        pass "payload verified: $check"
+    else
+        fail "payload line missing or wrong: wanted '$check'"
+        status=1
+    fi
+done
+
+if [[ "$status" -ne 0 ]]; then
     echo "--- serial log ---"
     cat "$LOG" 2>/dev/null | head -30
 fi

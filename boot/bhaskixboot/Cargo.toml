@@ -33,4 +33,8 @@ opt-level = "s"
 # firmware table reads and the console call through them, and the panic
 # halt. Grows step by step with the loader, and every growth is a line in
 # this comment.
-unsafe_budget = 11
+#
+# 23 at step 2: the payload path -- HandleProtocol twice, OpenVolume, Open,
+# Read and Close through the transcribed tables, each behind a null check
+# and each able to refuse with a printed status.
+unsafe_budget = 23

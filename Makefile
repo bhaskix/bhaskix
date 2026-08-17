@@ -480,7 +480,7 @@ test-boot-qemu64: $(ISO)
 # RFC 0028's graduated lane: the native loader under OVMF. Its gate list is
 # the honest statement of how far sovereignty has come, and it grows a check
 # per implemented step until it runs what the Limine lanes run.
-test-boot-native: $(BOOTEFI)
+test-boot-native: $(BOOTEFI) $(ISO)
 	tests/qemu/native-boot-test.sh
 
 
