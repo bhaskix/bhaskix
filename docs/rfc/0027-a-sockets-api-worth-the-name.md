@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | ✅ **Accepted 2026-08-17**, on the ports — drafted, implemented (steps 1–4) and accepted the same day. The invoices are paid and printed: `bin/dhcp` fell 28 → 10 `unsafe` lines and `bin/tcpc` 45 → 12 against the crate's 20 carried once; every networked gate ran unchanged and green over both ports, and the measure line was A/B'd on the same hour's host (thirteen ported boots, median 33 ms bulk, against five pre-port at median 30 — neutral within the noise). Question 2 was answered by the `tcpc` port: the leg order stays the caller's, and the primitive is what makes the interleaving expressible — no `connect()` shape is imposed. Question 1 (whether the shell ports) and question 3 (a `bhaskix-user-rt` crate for the report-page and attach idioms) stay open, each waiting on its own trigger: the shell's budget sheet, and a third idiom-collection appearing |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (a crate), tools |
 | **Milestone** | Phase 2 — the networking bullet's named remaining scope, [roadmap.md](../roadmap.md) |

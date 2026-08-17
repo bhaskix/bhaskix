@@ -149,9 +149,10 @@ physical hardware, and the ELF loader has not had its 24 hours of fuzzing.
 Order within the phase is flexible; dependencies are noted. Done so far — see
 [TRACKER.md](../TRACKER.md) §4 for the detail: shared memory and notifications, the service
 framework, IOMMU discovery and per-device domains, the driver framework, the full VFS, and process
-management. Networking runs through TCP, both directions, measured. The telemetry plane runs —
-typed events, per-CPU rings, a live reader. What remains is a sockets API worth the name,
-`bhaskixboot.efi`, package management, and libc.
+management. Networking runs through TCP, both directions, measured, and programs speak it
+through `bhaskix-sock` rather than hand-rolled exchanges. The telemetry plane runs — typed
+events, per-CPU rings, a live reader. What remains is `bhaskixboot.efi`, package management,
+and libc.
 
 - ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
   M9-18 … M9-23. Capability-shaped rather than POSIX-shaped: no `fork` (it duplicates a capability
@@ -203,8 +204,10 @@ typed events, per-CPU rings, a live reader. What remains is a sockets API worth 
   implemented), outbound against a deterministic peer and inbound from a host-initiated
   connection, with handshake, round trip and throughput measured as distributions and every wait
   wake-driven ([RFC 0023](rfc/0023-a-wake-for-a-connection.md), implemented). The four TCP-era
-  RFCs await acceptance review. **Not done:** IPv6, reassembly, congestion control, and a sockets
-  API above what the services themselves speak
+  RFCs await acceptance review. **Not done:** IPv6, reassembly, and congestion control. The sockets API above what the
+  services themselves speak exists since [RFC 0027](rfc/0027-a-sockets-api-worth-the-name.md)
+  (accepted 2026-08-17): `bhaskix-sock`, the client crate `bin/dhcp` and `bin/tcpc` now speak
+  through
 - ✅ **Telemetry plane** — [RFC 0026](rfc/0026-telemetry-plane.md), accepted 2026-08-17,
   drafted and implemented the same day. [ai-native.md](ai-native.md) §2 as written: a 64-byte
   typed event, schema-versioned and never text; one lock-free drop-newest ring per CPU; a
