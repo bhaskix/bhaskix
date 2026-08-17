@@ -12851,6 +12851,21 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
             rt_cycles,
             if admission { "refused" } else { "ADMITTED" }
         );
+    } else {
+        // The capture for the run-123 family, armed 2026-08-17: one boot in
+        // ~1000 measures 0 vs 0 ticks here -- CPU 1 ran nothing it was handed
+        // for over two seconds, resched IPIs and all. Both of `preempt`'s
+        // declines are silent, so a failure without these numbers cannot say
+        // whether the CPU was vetoed (a stale hold count repeating), locked
+        // out of its own queue, or never asked at all.
+        for cpu in 0..(cpus.min(bhaskix_arch::percpu::MAX_CPUS as u32)) {
+            let (holds, busy) = sched::preempt_declines(cpu as usize);
+            let ticks = trap::ticks_on(cpu);
+            println!(
+                "    sched classes  CAPTURE cpu {cpu}: {holds} preemptions vetoed by a held \
+                 lock, {busy} declined on a busy queue, {ticks} timer ticks since boot"
+            );
+        }
     }
 
     ok

@@ -2192,6 +2192,16 @@ pub fn preempt() {
     // a lock holder is wrong regardless, and left uncommented-out so nobody
     // rediscovers the unsoundness and assumes it was the fault all along.
     if crate::sync::holds_any() {
+        // Counted, because a veto that repeats is invisible otherwise: every
+        // decline looks identical to "nothing to do" from outside, and the
+        // run-123 specimen (2026-08-17) is a CPU that ran nothing it was
+        // handed for two seconds while its resched IPIs arrived and, by some
+        // path, did nothing. If that path is this veto repeating on a stale
+        // hold count, the counter says so; if the counter stays low, this
+        // line is exonerated the same way.
+        if let Some(count) = PREEMPT_VETO_HOLDS.get(cpu) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     }
 
@@ -2224,6 +2234,11 @@ pub fn preempt() {
     // is a deadlock against itself.
     let switch = {
         let Some(mut queue) = QUEUES[cpu].try_lock_for_switch() else {
+            // The other silent decline, counted for the same reason as the
+            // holds veto above.
+            if let Some(count) = PREEMPT_QUEUE_BUSY.get(cpu) {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
             restore_interrupts(interrupts_were_enabled);
             return;
         };
@@ -3335,6 +3350,29 @@ static DOMAIN_SCAN_SKIPS: AtomicU64 = AtomicU64::new(0);
 #[must_use]
 pub fn domain_scan_skips() -> u64 {
     DOMAIN_SCAN_SKIPS.load(Ordering::Relaxed)
+}
+
+/// Preemptions declined because this CPU's hold count read nonzero.
+static PREEMPT_VETO_HOLDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Preemptions declined because this CPU's own queue lock was busy.
+static PREEMPT_QUEUE_BUSY: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// How often `preempt` declined on `cpu`: `(holds veto, queue busy)`.
+///
+/// Both declines are silent and look like "nothing to do" from outside; the
+/// counters exist so a decline that *repeats* — the shape run-123's silent
+/// CPU would leave — is a number in a capture instead of an inference.
+#[must_use]
+pub fn preempt_declines(cpu: usize) -> (u64, u64) {
+    (
+        PREEMPT_VETO_HOLDS
+            .get(cpu)
+            .map_or(0, |c| c.load(Ordering::Relaxed)),
+        PREEMPT_QUEUE_BUSY
+            .get(cpu)
+            .map_or(0, |c| c.load(Ordering::Relaxed)),
+    )
 }
 
 /// Live threads per domain, counted by arithmetic instead of by scanning.
