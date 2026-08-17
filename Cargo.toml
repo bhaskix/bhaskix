@@ -48,6 +48,13 @@ members = [
     # did not have at all until TCP needed one. Depends on nothing, so that the
     # kernel, a ring 3 service and a host test can all reach it.
     "rand",
+
+    # Phase 2 — RFC 0026 step 1. The telemetry plane's arithmetic: the
+    # 64-byte event, the schema registry and its build-time hash, and every
+    # ring decision as a pure function. Depends on nothing, so the kernel
+    # emits through it, `bin/traced` decodes through it, and a host test
+    # drives both sides in one process.
+    "telemetry",
 ]
 
 # The negative fixture for `tools/check-placements.sh`: a service that reaches

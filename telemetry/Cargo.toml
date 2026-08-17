@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0026 step 1: the telemetry plane's arithmetic. The event's wire format,
+# the schema registry and its build-time hash, and the ring protocol's every
+# decision — admit or drop, clamp a hostile tail, how much is readable — as
+# pure functions over integers and byte arrays.
+#
+# Depends on nothing, for the reason `bhaskix-net` and `bhaskix-rand` depend
+# on nothing: the kernel emits through this, `bin/traced` decodes through
+# this, and a host test drives both sides of the same protocol in one
+# process. Anything this depended on would have to be reachable from all
+# three.
+[package]
+name = "bhaskix-telemetry"
+description = "Typed kernel events: the 64-byte record, the schema registry, and the per-CPU ring protocol as arithmetic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_telemetry"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, enforced twice: this number, and `forbid(unsafe_code)` in the crate
+# root. Everything here is arithmetic; the volatile stores into mapped frames
+# belong to the kernel, and the mapping belongs to RFC 0009. A telemetry
+# crate that needed `unsafe` would be a ring protocol hiding a memory model
+# question, which is exactly what the pure-logic split exists to prevent.
+unsafe_budget = 0

@@ -69,6 +69,12 @@ LAYERS = {
     # *it* rather than the other way round -- a layer above may reach down, and
     # a ring 3 program that depended on `arch` would be a category error.
     "bhaskix-rand": -2,
+    # The telemetry plane's arithmetic, RFC 0026, and the same argument a
+    # fourth time: the kernel emits through it, `bin/traced` decodes through
+    # it, and a host test drives both sides of the ring protocol in one
+    # process -- so it depends on nothing, and nothing it observes may ever
+    # become something it links.
+    "bhaskix-telemetry": -2,
     "bhaskix-service": -1,
     "bhaskix-service-domain": 0,
     "bhaskix-service-console": 0,

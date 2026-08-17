@@ -711,7 +711,7 @@ what is actually ahead.
 | Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets. **And the duration is met as of 2026-08-13**: three campaigns of a full twenty-four hours each, 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`, 52 million over `ustar`. No crash, no hang, no artifact |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1 — ✅ **answered by step 3** on 2026-08-07, and this row said only that the RFC *found* it until 2026-08-12, when that omission misled the author of RFC 0018 into calling it open. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | 🟨 **in progress** | ~~Gated on the driver framework rather than on anything network-shaped.~~ **The note above was stale from 2026-08-13, when RFC 0018 was accepted and this row was not touched** — precisely the failure the paragraph over this table describes, one row down from where it describes it. What is true: virtio-net, Ethernet, ARP, IPv4, ICMP, UDP and sockets are **done** and a DHCP client obtains an address (RFC 0018, seven steps). **TCP is [RFC 0020](docs/rfc/0020-tcp.md), all six steps done** — outbound and inbound echo through rings the client program owns, guest and host agreeing byte-for-byte, and the cost is measured: round trips at 4–10× UDP's, 1–2.6 MiB/s each way — a rate the 2026-08-17 window widening (one page → the whole 16-KiB ring) left unchanged, which convicts the per-chunk serve-loop unit rather than the window (§7). Wake-by-notification landed as RFC 0023. **IPv6 is not started and is not in RFC 0020's scope.** This row said "the bullet stays open until TCP does" — TCP closed 2026-08-16 and the bullet is still open, because the bullet names IPv6 and a sockets API that do not exist; what it waits on changed, and the row now says so |
-| Telemetry plane | 🟨 **in progress** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) drafted 2026-08-17 | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; 1–2 (the host-tested crate, the kernel emit path) are worth doing alone; step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
+| Telemetry plane | 🟨 **in progress** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) drafted 2026-08-17, **step 1 done the same day** | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
 
 ---
 
@@ -759,6 +759,28 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-17 (RFC 0026 step 1: the plane's arithmetic, and a clamp that had to fail before it was believed)
+
+**`bhaskix-telemetry` exists: the event, the registry, and every ring decision as pure
+functions, `no_std`, zero `unsafe` twice over (budget 0 and `forbid` in the crate root), layer
+−2 in `check-deps.py` beside `net`, `fs` and `rand` for the same stated reason — the kernel
+emits through it, `bin/traced` will decode through it, and a host test drives both sides of the
+protocol in one process.** The wire format is defined by `to_bytes`/`from_bytes` rather than a
+`repr` attribute, so the contract is bytes and not a compiler's layout choice. The registry's
+FNV hash is proven to move when *any* field of *any* entry moves — id, version, size, name,
+four negative assertions — which is what lets a reader treat "hashes agree" as "we agree on how
+to read every event". Duplicate ids and oversized payloads are compile errors, not review
+comments.
+
+**The hostile-tail clamp was made to fail before it was believed**, per §8's rule that a
+harness is not working until a reintroduced bug of the kind it must catch actually fails it:
+with the future-tail guard deleted, both the targeted test and the edge-seeded storm harness
+went red at the exact underflow the clamp exists to prevent — then green with it restored. The
+storm harness seeds its edges (`u64::MAX` and neighbours, the sign bit, the 47-bit boundary)
+because M6-03 measured what uniform sampling is worth near overflow: nothing. Fourteen tests
+join the host set; fmt, clippy, budgets, layering and the full host suite are green. Step 2 —
+the kernel emit path — is next.
 
 ### 2026-08-17 (RFC 0026 drafted: the telemetry plane, and the special-case tax it exists to end)
 

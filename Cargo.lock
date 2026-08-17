@@ -95,3 +95,7 @@ dependencies = [
  "bhaskix-abi",
  "bhaskix-service",
 ]
+
+[[package]]
+name = "bhaskix-telemetry"
+version = "0.0.0"
