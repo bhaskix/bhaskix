@@ -758,6 +758,26 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-17 (the specimen soak: the guards held, the disease shifted shape, and the hunt pauses on its own criterion)
+
+**500 guard-armed boots: 499 completed, zero `COUNT UNDERFLOW`, zero `COUNT MISMATCH`.** The
+count-loss either did not occur in 500 boots or the guards' own timing moved the race — either
+way, the wedge that took 5 boots of the previous 500 took none of these, and the boot that did
+fail its gate failed *loudly and comprehensibly* instead. Two specimens on the way out, both
+preserved: **run-161**, the old disease's mirror — `LOCK ORDER blocking on wait::WaitQueue
+(rank 9) while holding mask 0b11000000000, at wait.rs:195`, a thread carrying phantom mask
+bits 9+10 (exactly a waker's transient pair) beside a healthy count, where every earlier
+specimen lost the count and kept the mask; and **run-354**, a hang whose log simply stops with
+no marker at all — a mechanism the guards do not see, or one that takes the console with it.
+
+**The hunt pauses here, on the criterion stated before the run**: the specimens did not
+converge on a site. What stands: the containment (an underflow cannot wedge, and both markers
+fail the gate), the instruments (decline counters, the capture, the self-naming release, the
+mismatch canary — all armed in CI), and the honest row. The rate over the last 500 is 2
+incidents against 6 in the 500 before the guards. The save/restore tearing — count-side and
+mask-side — is one bug wearing two masks, and it will name itself eventually on some boot
+somewhere; the machinery to hear it is now permanent. Roadmap work resumes.
+
 ### 2026-08-17 (the underflow can no longer wedge, and its next occurrence names its own victim)
 
 **Two guards around the convicted disease, neither of which is yet the cure.** The release
