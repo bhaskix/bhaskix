@@ -149,8 +149,9 @@ physical hardware, and the ELF loader has not had its 24 hours of fuzzing.
 Order within the phase is flexible; dependencies are noted. Done so far — see
 [TRACKER.md](../TRACKER.md) §4 for the detail: shared memory and notifications, the service
 framework, IOMMU discovery and per-device domains, the driver framework, the full VFS, and process
-management. Networking runs through TCP, both directions, measured. What remains is a sockets API worth the name, the
-telemetry plane, `bhaskixboot.efi`, package management, and libc.
+management. Networking runs through TCP, both directions, measured. The telemetry plane runs —
+typed events, per-CPU rings, a live reader. What remains is a sockets API worth the name,
+`bhaskixboot.efi`, package management, and libc.
 
 - ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
   M9-18 … M9-23. Capability-shaped rather than POSIX-shaped: no `fork` (it duplicates a capability
@@ -204,8 +205,17 @@ telemetry plane, `bhaskixboot.efi`, package management, and libc.
   wake-driven ([RFC 0023](rfc/0023-a-wake-for-a-connection.md), implemented). The four TCP-era
   RFCs await acceptance review. **Not done:** IPv6, reassembly, congestion control, and a sockets
   API above what the services themselves speak
-- ⬜ **Telemetry plane** ([ai-native.md](ai-native.md) §2) — built here, as the developer tracing
-  tool
+- ✅ **Telemetry plane** — [RFC 0026](rfc/0026-telemetry-plane.md), accepted 2026-08-17,
+  drafted and implemented the same day. [ai-native.md](ai-native.md) §2 as written: a 64-byte
+  typed event, schema-versioned and never text; one lock-free drop-newest ring per CPU; a
+  registry hash a stale tool refuses rather than misreads; producers at every kernel crossing
+  (dispatch, syscall exit, rendezvous, signal); and `bin/traced`, the developer tracing tool,
+  holding the rings read-only and the tails read-write, draining on an armed deadline for the
+  life of the boot. Two boot gates on every placement, one negative-armed. **Not done, by
+  stated decision:** per-domain enable bits (deferred to their first consumer), the `Audit`
+  class's backpressure ring (reserved and refused until the audit RFC), a flight-recorder
+  mode (one header bit, wanted by the next hang hunt), and the deliver-to-seen hop of the
+  retired pipeline stamps, which no kernel crossing can see
 - ⬜ **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
   sovereignty milestone the boot shim was designed to enable)
 - ⬜ **Package management** and image building

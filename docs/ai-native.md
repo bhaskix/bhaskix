@@ -52,6 +52,13 @@ telemetry plane properly.
 The foundation. Built in Phase 1–2, long before any model exists, because it is independently
 valuable for debugging, profiling, and audit.
 
+> **Built, 2026-08-17** — [RFC 0026](rfc/0026-telemetry-plane.md), accepted. The arithmetic
+> lives in the `telemetry` crate, the stores in `kernel/src/telemetry.rs`, and the first
+> consumer is `bin/traced`, which holds the rings read-only and the tails read-write and
+> drains for the life of the boot. Two boot gates hold it: the report line, and a marked
+> round trip that fails closed when the grant is withheld. Where this section and the built
+> thing differ, the divergence is stated inline below rather than left to be discovered.
+
 ### Design
 
 ```rust
@@ -76,9 +83,12 @@ pub struct Event {
 - **`Audit`-class events are the exception:** they apply backpressure rather than drop, and live in a
   separate ring so a debug-telemetry flood cannot evict a security record
   ([security.md](security.md) §8).
-- **Per-class, per-domain enable bits.** Disabled classes compile to a predicted-not-taken branch on
-  an atomic. Measured overhead target: **< 1% with all default classes enabled**, and it is a
-  benchmark in CI, not a hope.
+- **Per-class enable bits now, per-domain with their first consumer.** Disabled classes compile to
+  a predicted-not-taken branch on an atomic — measured, not hoped: the boot report prices both
+  sides of the emit on every boot. Per-domain filtering was deferred by RFC 0026, stated rather
+  than slipped: it costs a second load and mask on every emit, and no consumer exists yet that
+  filters by domain — the multi-tenant consumer that needs it arrives with the audit work, and
+  the emit path's check is shaped so the second mask drops in without touching call sites.
 
 ### Consumers
 
@@ -87,7 +97,7 @@ The same pipeline feeds all of these, which is why it is worth building well:
 ```
 per-CPU rings ──┬──► bhaskixd-ai        (Phase 4: models)
                 ├──► bhaskixd-audit     (Phase 3: tamper-evident log, attestation)
-                ├──► bhaskix-trace      (Phase 2: developer tracing/profiling tool)
+                ├──► bin/traced         (Phase 2: the developer tracing tool — exists)
                 └──► metrics export  (Phase 3: Prometheus/OTLP-shaped, in userspace)
 ```
 

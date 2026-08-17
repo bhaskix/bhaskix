@@ -280,6 +280,12 @@ The audit framework is **not a separate subsystem**. It is a consumer of the typ
 described in [ai-native.md](ai-native.md) §2. This is deliberate: one event pipeline, one schema,
 one place to get the semantics right.
 
+The plane exists as of [RFC 0026](rfc/0026-telemetry-plane.md) (accepted 2026-08-17), and the
+`Audit` class is **reserved and refused** in it: emitting the class is counted and dropped,
+because a best-effort audit event is false assurance with a checksum. The backpressure ring, the
+hash chain and audit-grade naming are a future RFC on that foundation, and this section is its
+requirements list.
+
 Audit-specific requirements on top of the telemetry plane:
 
 - **Tamper-evident.** Records are hash-chained; each entry commits to its predecessor. Removing or

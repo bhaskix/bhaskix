@@ -394,7 +394,10 @@ Domain {
     aspace:     AddressSpace,      // where it may touch it  (page table OR EPT/NPT)
     threads:    Vec<Thread>,
     envelope:   ResourceEnvelope,  // cpu shares, memory limit, io weight, latency class
-    telemetry:  TelemetryChannel,  // see ai-native.md
+    // No telemetry field, and its absence is a decision (RFC 0026): the
+    // producer of a telemetry event is a CPU, often in interrupt context,
+    // so the rings belong to CPUs. What a domain will eventually carry is
+    // per-class enable bits, when a consumer needs them filtered.
 }
 ```
 
@@ -428,7 +431,7 @@ flowchart TB
         NOT["notify: signal this notification when the domain ends"]
     end
 
-    MISSING["not yet: telemetry channel,<br/>I/O weight enforcement"]
+    MISSING["not yet: I/O weight enforcement<br/><i>telemetry left this list as per-CPU<br/>rings, not a domain field -- RFC 0026</i>"]
 
     DOM -.- MISSING
     classDef gap stroke-dasharray: 5 4
@@ -509,8 +512,11 @@ that nothing built in Phase 1 or 2 has to be undone to accommodate it.
 > `scheduler.md` §3's two-level runqueue: right in aggregate, and unable to prioritise within a
 > domain.
 >
-> **Not yet:** no telemetry channel, and no I/O weight enforcement. A domain has its own address
-> space, and destroying one stops its threads — both were listed here until 2026-08-11.
+> **Not yet:** no I/O weight enforcement. A domain has its own address space, and destroying one
+> stops its threads — both were listed here until 2026-08-11. The telemetry channel left this
+> list on 2026-08-17, and not by being built as sketched: [RFC 0026](rfc/0026-telemetry-plane.md)
+> put the rings on CPUs — the producer is a CPU, often in interrupt context, not a domain — and
+> what a domain will eventually carry is per-class enable bits, deferred to their first consumer.
 
 ---
 
