@@ -129,7 +129,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **NW3** | A wake for a connection | ✅ **Accepted** 2026-08-16 — implemented 2026-08-15, all three steps, and accepted *with* its measured verdict: slower round trip, three hundred times less scheduler burn | **A connection may carry a notification, and the service rings it** — one more gift on `CONNECT`/`LISTEN` (RFC 0022's leg 3), signalled on `Delivered`, `Acknowledged` and state change, so the client blocks in `WAIT` instead of the yield-spin RFC 0020 step 6 measured as the round-trip floor's named cause. The state machine has produced the wake since it was written; `bin/tcpd` discards it with a comment saying a notification belongs there. Drafted from the measurement, not a guess. | [RFC 0023](docs/rfc/0023-a-wake-for-a-connection.md) |
 | **A5** | 5-level paging (LA57) | ✅ **Accepted** 2026-08-16 — answered by RFC 0025, implemented 2026-08-15 with the document; **the last open architecture question is closed** | **Four-level, on purpose, with the refusal shipped**: every walk and half-split in the tree is a bit-47 statement, so bring-up now reads `CR4.LA57` and halts with a sentence rather than corrupting addresses silently under a bootloader whose default changed. The boot report states capability beside choice. Five-level gets built against a written trigger — an address-space or physical-memory need no current machine has — not an open wait. | [RFC 0025](docs/rfc/0025-four-level-paging-on-purpose.md) |
 | **TE1** | Telemetry plane | ✅ **Accepted 2026-08-17** — drafted, implemented (all six steps) and accepted the same day, on the working demonstration: two boot gates per placement, one negative-armed, the emit priced from both sides | **A 64-byte typed event, one lock-free drop-newest ring per CPU, two capabilities to read them.** [ai-native.md](docs/ai-native.md) §2 built as specified, with three narrownesses stated in the draft rather than discovered later: per-domain enable bits deferred to their first consumer (per-class now), the `Audit` class reserved but refused (best-effort audit is false assurance — backpressure is its own RFC on this foundation), and the domain field carrying the id without the generation. Rejects the `TelemetryChannel`-per-domain sketch in `architecture.md` — the producer is a CPU, often in interrupt context, not a domain. Partially answers RFC 0008's Q4: a capability is named (domain, slot, kind) for tracing; audit-grade naming stays open | [RFC 0026](docs/rfc/0026-telemetry-plane.md) |
-| **SK1** | A sockets API worth the name | ⬜ **Draft** 2026-08-17, step 1 implemented the same day (`bhaskix-sock` + the `bin/dhcp` port, budget 28 → 10) | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
+| **SK1** | A sockets API worth the name | ⬜ **Draft** 2026-08-17, steps 1–4 implemented the same day — both ports done (`bin/dhcp` 28 → 10, `bin/tcpc` 45 → 12, the crate carries 20 once), every gate unchanged, the measure A/B'd neutral. Question 1 (the shell) stays open; awaiting acceptance review | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -760,6 +760,57 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-17 (the third wedge names a suspect of mine, and the switch path gives back what it borrowed)
+
+**A third boot wedged at the same phase today** — the `qemu64` lane this time, a page fault the
+handler refused with "address space lock held", the serial log ending after the migration line
+exactly like the other two. Three wedges in one day at the wait-queue stress phase, against a
+morning rate of ~2-in-500, stopped being weather: something *of today's* was amplifying the
+resident disease, and the suspect audit found a real defect of mine. **The per-CPU domain hint
+was a packed `[AtomicU32; 64]`** — sixteen CPUs' hints per cache line, so every context switch
+on every CPU stored into lines every other CPU was storing into: cross-CPU cache traffic
+injected into the switch path itself, live since step 5a landed, which is when the wedge rate
+moved. The hint is now one cache line per CPU, and the comment on the padding says why it is
+load-bearing.
+
+**And the dispatch emit moved inside the runqueue lock**, before `switching` opens the
+registers-unsaved window: the plane's per-switch cost (~1400 TCG cycles with the Sched class
+on) now lengthens a lock hold the contention map can see, instead of the one window the
+save/restore disease lives in. Emit takes no lock, so holding one over it is sound. **Claimed
+as a repair of an amplifier, not a cure**: the disease predates the plane, the link is
+mechanism-plus-correlation rather than a captured conviction, and the honest test is the wedge
+rate of the suites that follow. The fault-refused specimen joins the family's ledger — five
+sightings today counting the morning soak's two.
+
+### 2026-08-17 (RFC 0027 steps 2–4: the TCP half, and `bin/tcpc` is the second invoice paid)
+
+**The crate grew its TCP half**: `tcp::leg` (the staged gift, the bounded retry while a
+service's declaration races the call, every raw refusal word kept), `expect`, `occupied` (the
+refusal-shape probe — an empty slot fails to resolve, an occupied one is refused at dispatch,
+and that refusal is the proof), the stream verbs (`recv` decoding `Unreachable`/`NoEntropy`/
+the packed state-and-delivered word, `send`, `shutdown`, `accept`), and `ring::RingView` — the
+program-owned ring as a value, one `unsafe` at construction where the mapping claim lives,
+every access after it safe and wrapped by the modulus, with `wait_for` as the memory-wait the
+attribution instrument proved. **Open question 2 answered by the port**: the leg order stays
+the caller's — `bin/tcpc` interleaves connection and listener legs to match the service's
+declaration order, and the primitive is what makes that expressible; no `connect()` shape is
+imposed.
+
+**The port**: `bin/tcpc` keeps the demonstration's order, the instrument's clocks and its
+report; the machinery is the crate's. Budget **45 → 12** (the stub, the counter, the
+memory-wait's poll and every ring access gone; the panic `ud2` and report writes remain).
+Across both ports the programs shed 51 `unsafe` lines against the crate's 20 — the sum the RFC
+promised to print. **Every networked gate is unchanged and green** — outbound echo, bulk
+through the wrap, listener, inbound serve, the close, the measure line — and the measurement
+was A/B'd rather than assumed: thirteen ported boots (median 33 ms for the bulk, 25–47) against
+five pre-port boots on the same hour's host (median 30, 20–37) — neutral within the noise of a
+host that has drifted ~25% slower over this session's build load. One ported boot echoed the
+bulk in **1363 ms** and still passed every gate; it did not recur in twelve further boots, its
+shape (per-chunk waits landing on the 100 ms lost-wake backstop) matches the documented
+second-scale wake-delay family on green boots, and its log is preserved at
+`/root/bhaskix-soak-artifacts/2026-08-17-bulk-1363ms-wake-family-ported-tcpc.log` for the row
+that owns that defect.
 
 ### 2026-08-17 (RFC 0027 step 1: `bhaskix-sock` exists, and `bin/dhcp` is the first invoice paid)
 

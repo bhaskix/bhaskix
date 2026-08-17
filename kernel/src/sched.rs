@@ -2379,6 +2379,26 @@ pub fn preempt() {
                 note_saved_holding(thread.id, thread.name, thread.held_locks, "preempt");
             }
         }
+        // RFC 0026's dispatch event, emitted here — under the lock, before
+        // `switching` opens the registers-unsaved window — so the plane's
+        // cost lengthens a lock hold the contention map can see, not the
+        // one window the save/restore disease lives in. Emit takes no lock,
+        // so holding one over it is sound.
+        if let (Some(from_thread), Some(to_thread)) = (
+            queue.threads[current].as_ref(),
+            queue.threads[next].as_ref(),
+        ) {
+            crate::telemetry::note_domain(to_thread.domain);
+            let mut handover = [0u8; 8];
+            handover[..4].copy_from_slice(&from_thread.id.to_le_bytes());
+            handover[4..].copy_from_slice(&to_thread.id.to_le_bytes());
+            crate::telemetry::emit(
+                bhaskix_telemetry::EventClass::Sched,
+                bhaskix_telemetry::schema::DISPATCH.id,
+                to_thread.domain,
+                &handover,
+            );
+        }
         crate::sync::set_held_mask(incoming_locks);
         crate::sync::set_holds_count(incoming_count);
 
@@ -2395,39 +2415,25 @@ pub fn preempt() {
         // point into *this CPU's own* queue. No other processor reads or writes
         // these threads, so there is nothing to race with rather than a race
         // that happens to be prevented.
-        let Some((from, from_id)) = queue.threads[current]
+        let Some(from) = queue.threads[current]
             .as_mut()
-            .map(|thread| (&raw mut thread.context, thread.id))
+            .map(|thread| &raw mut thread.context)
         else {
             restore_interrupts(interrupts_were_enabled);
             return;
         };
-        let Some((to, to_id, to_domain)) = queue.threads[next]
+        let Some(to) = queue.threads[next]
             .as_ref()
-            .map(|thread| (&raw const thread.context, thread.id, thread.domain))
+            .map(|thread| &raw const thread.context)
         else {
             restore_interrupts(interrupts_were_enabled);
             return;
         };
-        Some((from, to, from_id, to_id, to_domain))
+        Some((from, to))
     };
 
-    if let Some((from, to, from_id, to_id, to_domain)) = switch {
+    if let Some((from, to)) = switch {
         SWITCHES.fetch_add(1, Ordering::Relaxed);
-        // RFC 0026 step 2's first producer. After the queue guard, because
-        // emit takes no lock and must not gain one by accident of position;
-        // interrupts are already off on this path, so emit's own guard is a
-        // no-op re-entry.
-        crate::telemetry::note_domain(to_domain);
-        let mut handover = [0u8; 8];
-        handover[..4].copy_from_slice(&from_id.to_le_bytes());
-        handover[4..].copy_from_slice(&to_id.to_le_bytes());
-        crate::telemetry::emit(
-            bhaskix_telemetry::EventClass::Sched,
-            bhaskix_telemetry::schema::DISPATCH.id,
-            to_domain,
-            &handover,
-        );
         // SAFETY: both pointers address `Context` fields inside a static
         // runqueue, which outlives every thread. Both were taken from *this*
         // CPU's queue under its lock, and `switching` stops any other CPU
@@ -2946,6 +2952,24 @@ pub fn block_self() {
                 }
                 queue.current = next;
 
+                // RFC 0026's dispatch event, under the lock for the same
+                // reason as on preempt's path: the cost lands in a lock
+                // hold, not in the registers-unsaved window.
+                if let (Some(from_thread), Some(to_thread)) = (
+                    queue.threads[current].as_ref(),
+                    queue.threads[next].as_ref(),
+                ) {
+                    crate::telemetry::note_domain(to_thread.domain);
+                    let mut handover = [0u8; 8];
+                    handover[..4].copy_from_slice(&from_thread.id.to_le_bytes());
+                    handover[4..].copy_from_slice(&to_thread.id.to_le_bytes());
+                    crate::telemetry::emit(
+                        bhaskix_telemetry::EventClass::Sched,
+                        bhaskix_telemetry::schema::DISPATCH.id,
+                        to_thread.domain,
+                        &handover,
+                    );
+                }
                 let incoming_locks = queue.threads[next].as_ref().map_or(0, |t| t.held_locks);
                 let incoming_count = queue.threads[next].as_ref().map_or(0, |t| t.held_count);
                 if let Some(thread) = queue.threads[current].as_mut() {
@@ -2959,41 +2983,28 @@ pub fn block_self() {
                 crate::sync::set_holds_count(incoming_count);
                 queue.switching = true;
 
-                let Some((from, from_id)) = queue.threads[current]
+                let Some(from) = queue.threads[current]
                     .as_mut()
-                    .map(|thread| (&raw mut thread.context, thread.id))
+                    .map(|thread| &raw mut thread.context)
                 else {
                     restore_interrupts(interrupts_were_enabled);
                     return;
                 };
-                let Some((to, to_id, to_domain)) = queue.threads[next]
+                let Some(to) = queue.threads[next]
                     .as_ref()
-                    .map(|thread| (&raw const thread.context, thread.id, thread.domain))
+                    .map(|thread| &raw const thread.context)
                 else {
                     restore_interrupts(interrupts_were_enabled);
                     return;
                 };
-                Some((from, to, from_id, to_id, to_domain))
+                Some((from, to))
             }
         };
 
         match switch {
-            Some((from, to, from_id, to_id, to_domain)) => {
+            Some((from, to)) => {
                 SWITCHES.fetch_add(1, Ordering::Relaxed);
                 BLOCKS.fetch_add(1, Ordering::Relaxed);
-                // RFC 0026 step 2's producer, on the block path for the same
-                // reasons as on preempt's: after the guard, no lock,
-                // interrupts already off.
-                crate::telemetry::note_domain(to_domain);
-                let mut handover = [0u8; 8];
-                handover[..4].copy_from_slice(&from_id.to_le_bytes());
-                handover[4..].copy_from_slice(&to_id.to_le_bytes());
-                crate::telemetry::emit(
-                    bhaskix_telemetry::EventClass::Sched,
-                    bhaskix_telemetry::schema::DISPATCH.id,
-                    to_domain,
-                    &handover,
-                );
                 // SAFETY: as in `preempt` -- both contexts are in this CPU's
                 // own static runqueue, taken under its lock, and `switching`
                 // stops another CPU moving either out from under the switch.

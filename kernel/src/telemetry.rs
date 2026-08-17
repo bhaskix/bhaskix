@@ -68,19 +68,30 @@ static RING_IDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MA
 /// The tails object's identity, for step 3's grant.
 static TAILS_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// One CPU's domain hint, alone on its cache line.
+///
+/// The padding is load-bearing: the first version packed sixteen CPUs'
+/// hints into each line, so every context switch on every CPU stored into
+/// lines the others were storing into too — cross-CPU traffic injected
+/// into the switch path itself, which is the last place this machine can
+/// afford a perturbation it did not order.
+#[repr(align(64))]
+struct DomainHint(AtomicU32);
+
 /// Each CPU's current domain, kept by the switch path for producers that
 /// must not ask the scheduler: `sched::current_domain()` takes the runqueue
 /// lock, which `notify::signal` — legal from interrupt context — must never
 /// block on, and which `ipc`'s trace point may already sit inside another
 /// lock to reach. A *hint*, briefly stale around a switch, and said so.
-static DOMAIN_HINT: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+static DOMAIN_HINT: [DomainHint; MAX_CPUS] =
+    [const { DomainHint(AtomicU32::new(u32::MAX)) }; MAX_CPUS];
 
 /// Records the domain now running on the calling CPU. Called by the switch
 /// path with interrupts off, beside the dispatch event.
 pub fn note_domain(domain: u32) {
     let cpu_index = percpu::cpu_id() as usize;
     if cpu_index < MAX_CPUS {
-        DOMAIN_HINT[cpu_index].store(domain, Ordering::Relaxed);
+        DOMAIN_HINT[cpu_index].0.store(domain, Ordering::Relaxed);
     }
 }
 
@@ -90,7 +101,7 @@ pub fn note_domain(domain: u32) {
 pub fn domain_hint() -> u32 {
     let cpu_index = percpu::cpu_id() as usize;
     if cpu_index < MAX_CPUS {
-        DOMAIN_HINT[cpu_index].load(Ordering::Relaxed)
+        DOMAIN_HINT[cpu_index].0.load(Ordering::Relaxed)
     } else {
         u32::MAX
     }
