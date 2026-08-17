@@ -94,6 +94,12 @@ LAYERS = {
 
     "bhaskix-drivers": 4,
     "bhaskix-boot-shim": 5,    # the binary, top of the graph
+    # The native UEFI loader, RFC 0028: the other binary at the top, on its
+    # own target. It may reach the handoff types, the elf crate when that
+    # extraction lands, and rand for the KASLR draw -- leaf crates all --
+    # and nothing of the kernel's graph, because it runs before there is a
+    # kernel.
+    "bhaskixboot": 5,
 
     # The fuzz target, above everything because it drives the kernel's parsers
     # from outside. It is a host binary in its own workspace and no kernel build

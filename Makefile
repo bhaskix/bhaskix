@@ -65,6 +65,8 @@ USER_DHCPD   := $(DHCPD_DIR)/target/$(TARGET)/release/dhcp
 USER_TCPD    := $(TCPD_DIR)/target/$(TARGET)/release/tcpd
 USER_TCPC    := $(TCPC_DIR)/target/$(TARGET)/release/tcpc
 USER_TRACED  := $(TRACED_DIR)/target/$(TARGET)/release/traced
+BOOTEFI_DIR  := boot/bhaskixboot
+BOOTEFI      := $(BOOTEFI_DIR)/target/x86_64-unknown-uefi/release/bhaskixboot.efi
 USER_FSD     := $(FSD_DIR)/target/$(TARGET)/release/fsd
 # `RUSTFLAGS` in the environment *replaces* the workspace's `.cargo/config.toml`
 # flags rather than adding to them, which is exactly what is wanted here: the
@@ -340,6 +342,14 @@ $(USER_TRACED): $(TRACED_DIR)/src/main.rs $(TRACED_DIR)/link.ld $(TRACED_DIR)/Ca
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
+
+# The native UEFI loader -- RFC 0028 step 1. Its own target and its own
+# linker convention (PE, efi_main), so its own cargo invocation; no RUSTFLAGS
+# because the uefi target's defaults are the convention.
+$(BOOTEFI): $(BOOTEFI_DIR)/src/main.rs $(BOOTEFI_DIR)/Cargo.toml
+	cd $(BOOTEFI_DIR) && $(CARGO) build --release --target x86_64-unknown-uefi
+	@echo "built $@"
+
 # The filesystem as a program. It depends on `fs/` as well as the ABI, because
 # unlike the block driver this *is* the same code the kernel runs -- so a
 # change to the format rebuilds both, and the two can never be reading
@@ -394,7 +404,7 @@ run-uefi: $(ISO)
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
-      test-boot-qemu64 test-placements test-shell test-faults
+      test-boot-qemu64 test-boot-native test-placements test-shell test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -467,6 +477,12 @@ test-boot-iommu-off: $(ISO)
 test-boot-qemu64: $(ISO)
 	QEMU_CPU=qemu64 tests/qemu/boot-test.sh bios
 
+# RFC 0028's graduated lane: the native loader under OVMF. Its gate list is
+# the honest statement of how far sovereignty has come, and it grows a check
+# per implemented step until it runs what the Limine lanes run.
+test-boot-native: $(BOOTEFI)
+	tests/qemu/native-boot-test.sh
+
 
 # Types at the machine over the serial line and asserts on the replies. The
 # only tests here that write to the kernel rather than only reading from it,
@@ -527,6 +543,7 @@ fmt:
 	cd $(TCPD_DIR) && $(CARGO) fmt --all --check
 	cd $(TCPC_DIR) && $(CARGO) fmt --all --check
 	cd $(TRACED_DIR) && $(CARGO) fmt --all --check
+	cd $(BOOTEFI_DIR) && $(CARGO) fmt --all --check
 	cd $(FSD_DIR) && $(CARGO) fmt --all --check
 	cd $(SUP_DIR) && $(CARGO) fmt --all --check
 
@@ -559,6 +576,7 @@ clippy:
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(TRACED_DIR) && RUSTFLAGS="$(TRACED_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(BOOTEFI_DIR) && $(CARGO) clippy --release --target x86_64-unknown-uefi -- -D warnings
 	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 

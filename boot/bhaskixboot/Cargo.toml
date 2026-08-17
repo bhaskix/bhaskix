@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0028 step 1: the native UEFI loader's skeleton. The first code that
+# runs on a Bhaskix boot, once this lane graduates -- which is exactly why
+# it is in this tree, under this tree's rules, with no external crates: the
+# firmware bindings are hand-rolled the way boot/shim/src/limine.rs
+# hand-rolls Limine, and the empty dependency allowlist holds where it
+# matters most.
+#
+# Not a member of the root workspace: it targets x86_64-unknown-uefi, and a
+# workspace member cannot have its own target.
+[workspace]
+
+[package]
+name = "bhaskixboot"
+description = "The native UEFI loader: the machine enters through our own door."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "bhaskixboot"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 11, measured, no headroom: the serial port I/O, the signature-checked
+# firmware table reads and the console call through them, and the panic
+# halt. Grows step by step with the loader, and every growth is a line in
+# this comment.
+unsafe_budget = 11
