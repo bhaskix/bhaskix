@@ -762,6 +762,33 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (the disease names its site: `COUNT UNDERFLOW` at wait.rs:195, and the hunt's resumption criterion is met)
+
+**The catch the morning's instruments were built for.** A `shell disk`-lane boot wedged at the
+wait-queue stress phase, and this time the machinery heard it name itself: `COUNT UNDERFLOW —
+a release found this CPU's hold count already zero; the guard acquired at kernel/src/wait.rs:195
+is paying for an increment lost earlier (cpu 0)`, followed by six `BLOCK HOLDING — a thread
+blocked holding locks (mask 0b000000, 1 held), at kernel/src/wait.rs:221`. **The count/mask
+divergence is explicit in the capture** — count says one, mask says none — and the site
+converges with run-161's specimen on the same file and line. The specimen-soak entry paused
+the hunt "on its own criterion: the specimens did not converge on a site." **They now
+converge**, and the criterion for resuming is met.
+
+What the shape suggests, stated as hypothesis and not conviction: wait.rs:195 is the waiters
+lock, wait.rs:221 is `sched::block_self()` *after* the release scope — and (mask 0, count 1)
+is precisely the release window §7 documented on 2026-08-09, where the rank mask is given up
+before the count on purpose. A capture of that window surviving into `block_self`'s check, on
+the same thread, in program order *after* both halves of the release should have completed,
+points at the count's half of the release being lost or misapplied across a switch — the
+save/restore tearing, seen mid-tear for the first time. The hunt owns the next move; the
+specimen is preserved at
+`/root/bhaskix-soak-artifacts/2026-08-18-count-underflow-named-wait195-shell-disk-lane.log`.
+
+**And the amplifier claim weakens, honestly**: this is the first wedge in three suites since
+the domain-hint fix — better than the three-in-five before it, worse than the morning's
+background, and the specimen landed at the same phase as ever. Family ledger: six sightings
+across two days, and the first one that names its own line.
+
 ### 2026-08-17 (RFC 0028 step 1: the firmware starts our loader, and the first words on the wire are ours)
 
 **`bhaskixboot.efi` exists and boots.** A freestanding `x86_64-unknown-uefi` binary — the
