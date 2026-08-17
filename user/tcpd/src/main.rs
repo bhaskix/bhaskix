@@ -118,23 +118,30 @@ const CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
 /// unacknowledged bytes are never overwritten by the wrap.
 const STREAM_RING_BYTES: usize = 4 * 4096;
 
-/// The largest payload one `Emit` is honoured for. The machine bounds emits
-/// by the peer's window, not by this program's buffers; an emit wider than
-/// this is refused and counted rather than truncated, because a truncated
-/// stream is corruption with extra steps. The demonstration sends sixteen
-/// bytes; this bound is for the machine's future, not its present.
-const MAX_EMIT: usize = 1024;
+/// The largest payload one `Emit` is honoured for: the machine's own segment
+/// bound. The machine never builds a wider emit — it caps the peer's
+/// advertised MSS at [`state::DEFAULT_MSS`] on both open paths — so the
+/// refusal below guards against a machine bug rather than trimming honest
+/// traffic. It was 1024 until the window widened past a page: had unsent
+/// bytes ever pooled behind a closed peer window, the machine's next emit
+/// could have been MSS-sized, every attempt refused, and the retransmission
+/// that followed would have rebuilt the same too-wide emit for ever.
+const MAX_EMIT: usize = state::DEFAULT_MSS as usize;
 
 /// The local port a connection uses. One connection, one port; a port
 /// allocator arrives with the connection table. Above the well-known range,
 /// and fixed so the report is deterministic.
 const LOCAL_PORT: u16 = 49999;
 
-/// The receive window a connection advertises: what a page holds. Narrower
-/// than the client's ring on purpose — the ring bounds what can be stored,
-/// the window what the peer may send, and the window must never exceed the
-/// ring or the wrap overwrites bytes the client has not read.
-const WINDOW: u16 = 4096;
+/// The receive window a connection advertises: the client's whole ring. The
+/// ring bounds what can be stored, the window what the peer may send, and
+/// the window must never exceed the ring or the wrap overwrites bytes the
+/// client has not read. Equal is the widest the invariant allows, and it is
+/// exactly safe: unread bytes never exceed the capacity, so no two of them
+/// share an offset under the modulus. This was one page until RFC 0020
+/// step 6 measured the cost of the narrow window and named the wider one as
+/// the next win after the wake.
+const WINDOW: u16 = STREAM_RING_BYTES as u16;
 
 /// There is nothing to unwind and nowhere to print to.
 #[panic_handler]

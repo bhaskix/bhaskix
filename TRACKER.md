@@ -5,7 +5,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 
 | | |
 |---|---|
-| **Last updated** | 2026-08-16 |
+| **Last updated** | 2026-08-17 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. **TCP is complete and its RFC accepted 2026-08-16** ([RFC 0020](docs/rfc/0020-tcp.md), all six steps: `bin/tcpc` opens connections with rings its own domain owns, echoes through them both directions, and the boundary is measured — RFC 0022's capability-in-a-call is the mechanism underneath); no libc, no sockets API beyond UDP and TCP's own |
 | **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed — no architecture question open) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 46 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
@@ -25,7 +25,7 @@ What can be counted honestly, with how to recount it:
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **6 of 7 done** | §4 below; the seventh is networking |
 | Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
-| TCP, within RFC 0020 | **All six steps — both directions echo on every networked boot, guest and host agreeing, and the boundary is measured rather than argued about** | its implementation plan. `bin/tcpd` boots in its own domain, draws its secret and refuses without one; `bin/tcpc` supplies the rings, holds the connections, and is the instrument. The measured verdict: wake-by-notification and a wider window before congestion control or reassembly |
+| TCP, within RFC 0020 | **All six steps — both directions echo on every networked boot, guest and host agreeing, and the boundary is measured rather than argued about** | its implementation plan. `bin/tcpd` boots in its own domain, draws its secret and refuses without one; `bin/tcpc` supplies the rings, holds the connections, and is the instrument. The measured verdict named wake-by-notification and a wider window, in that order; the wake collected its win (RFC 0023), and the width — bought 2026-08-17, the whole ring advertised — moved nothing: the per-chunk serve-loop unit owns the bulk rate (§7) |
 | Tasks in defined milestones | **92 `DONE`, 4 `TODO`** | `grep -c` on the milestone tables in §3 |
 | Suite | 601 checks, 346 host assertions, 5 placements | §6 |
 
@@ -709,7 +709,7 @@ what is actually ahead.
 | Driver framework — PCIe/ECAM, `register_block!`, `Mmio<T>`, mock-MMIO harness | ✅ **done** — RFC 0014, M8 above | `bin/blkd` is a driver in a domain written by hand, and it cost three bugs the kernel's driver had already learned. The RFC's case is that invoice. It also asks something port I/O could not: with ECAM a function's configuration space is a *page*, so how much of it may a domain hold? BARs say not all of it |
 | Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets. **And the duration is met as of 2026-08-13**: three campaigns of a full twenty-four hours each, 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`, 52 million over `ustar`. No crash, no hang, no artifact |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1 — ✅ **answered by step 3** on 2026-08-07, and this row said only that the RFC *found* it until 2026-08-12, when that omission misled the author of RFC 0018 into calling it open. Six steps, and **step 1 is worth doing alone** |
-| Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | 🟨 **in progress** | ~~Gated on the driver framework rather than on anything network-shaped.~~ **The note above was stale from 2026-08-13, when RFC 0018 was accepted and this row was not touched** — precisely the failure the paragraph over this table describes, one row down from where it describes it. What is true: virtio-net, Ethernet, ARP, IPv4, ICMP, UDP and sockets are **done** and a DHCP client obtains an address (RFC 0018, seven steps). **TCP is [RFC 0020](docs/rfc/0020-tcp.md), all six steps done** — outbound and inbound echo through rings the client program owns, guest and host agreeing byte-for-byte, and the cost is measured: round trips at 4–10× UDP's, 1–2.6 MiB/s each way at one window, with wake-by-notification named as the next win. **IPv6 is not started and is not in RFC 0020's scope.** The bullet stays open until TCP does |
+| Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | 🟨 **in progress** | ~~Gated on the driver framework rather than on anything network-shaped.~~ **The note above was stale from 2026-08-13, when RFC 0018 was accepted and this row was not touched** — precisely the failure the paragraph over this table describes, one row down from where it describes it. What is true: virtio-net, Ethernet, ARP, IPv4, ICMP, UDP and sockets are **done** and a DHCP client obtains an address (RFC 0018, seven steps). **TCP is [RFC 0020](docs/rfc/0020-tcp.md), all six steps done** — outbound and inbound echo through rings the client program owns, guest and host agreeing byte-for-byte, and the cost is measured: round trips at 4–10× UDP's, 1–2.6 MiB/s each way — a rate the 2026-08-17 window widening (one page → the whole 16-KiB ring) left unchanged, which convicts the per-chunk serve-loop unit rather than the window (§7). Wake-by-notification landed as RFC 0023. **IPv6 is not started and is not in RFC 0020's scope.** This row said "the bullet stays open until TCP does" — TCP closed 2026-08-16 and the bullet is still open, because the bullet names IPv6 and a sockets API that do not exist; what it waits on changed, and the row now says so |
 
 ---
 
@@ -757,6 +757,39 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-17 (the wider window, bought and measured: the number did not move, and the verdict's second lever is refuted)
+
+**RFC 0020 step 6's verdict ordered the levers "wake-by-notification, then a wider window."
+The wake collected its win in RFC 0023. The width is now bought, and it bought nothing.**
+`bin/tcpd` advertises the client's whole stream ring — 16 KiB, where it advertised one page —
+which is the widest the wrap invariant allows and exactly safe: unread bytes never exceed the
+capacity, so no two of them share an offset under the modulus. `bin/tcpc` paces its bulk a
+full ring ahead of the echo instead of four KiB, sound because an echoed chunk is an
+acknowledged chunk — its echo rode a segment whose `ACK` the service processed before
+delivering the bytes the client polls for — so retransmission's bytes are never overwritten.
+
+**Six networked boots over the widening: 32 KiB echoed in 22–29 ms, 1093–1433 KiB/s each way
+— inside the recorded 12–30 ms and 1.0–2.6 MiB/s.** Four times the window, the same rate,
+which is a refutation and is recorded as one: neither 4 KiB nor 16 KiB was ever the binding
+constraint on this harness. The owner was named by the pipeline instrument on 2026-08-15 and
+the arithmetic agrees — the per-chunk unit of an IPC call plus a serve-loop pass, ~350–500 µs
+per hop, comes to ~700–800 µs per 1-KiB chunk, which *is* the measured throughput. The next
+lever is that unit itself — fewer serve-loop passes per chunk (batched sends, MSS-sized
+segments, a cheaper round trip) — priceable by the instrument already armed, and worth an RFC
+if it changes an interface. The widening stays: it is correct, and it becomes the binding
+constraint the moment the per-segment unit falls.
+
+**One latent wedge found on the way and closed: `MAX_EMIT` was 1024 against a machine that
+emits up to its MSS of 1460.** Had unsent bytes ever pooled behind a closed peer window — which
+the deeper pacing makes reachable — the machine's next emit could be MSS-sized, `bin/tcpd`
+would refuse it as too wide, and the retransmission that followed would rebuild the same
+too-wide emit for ever: a silent stall wearing a counter. `MAX_EMIT` is now defined *as* the
+machine's own bound (`state::DEFAULT_MSS`), so the refusal guards against a machine bug rather
+than lying in wait for honest traffic. The machine's side is pinned by a new regression test —
+a peer advertising a 9000-byte MSS is capped to 1460 and every emit stays within it — watched
+red with the cap removed, green with it restored. Suite: 601 checks and the full host set
+green; fmt, clippy, and six iommu-lane boots green.
 
 ### 2026-08-17 (the specimen soak: the guards held, the disease shifted shape, and the hunt pauses on its own criterion)
 

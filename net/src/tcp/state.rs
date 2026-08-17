@@ -1675,6 +1675,29 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_advertising_a_giant_mss_does_not_widen_the_segments() {
+        // `bin/tcpd` copies every emit through buffers sized to
+        // `DEFAULT_MSS` and refuses anything wider, so this cap is what
+        // makes every emit honourable: a peer may name any MSS it likes,
+        // and the machine takes the smaller of that and its own bound.
+        let mut link = Link::new();
+        link.drive(Event::Connect {
+            iss: ISS,
+            window: RING,
+        });
+        let mut syn_ack = from_peer(IRS.0, Some(ISS.0 + 1), Flags::SYN, u16::MAX, &[]);
+        syn_ack.options.mss = Some(9000);
+        link.drive(Event::Arrived(syn_ack));
+        assert_eq!(link.tcb.state, State::Established);
+        assert_eq!(link.tcb.mss, DEFAULT_MSS, "the advertisement is capped");
+        let sent = link.drive(Event::Wrote(10_000));
+        assert!(!sent.is_empty());
+        for emit in &sent {
+            assert!(emit.length <= DEFAULT_MSS, "{} bytes", emit.length);
+        }
+    }
+
+    #[test]
     fn nothing_is_sent_past_the_window_the_peer_advertised() {
         let mut link = Link::new();
         link.drive(Event::Connect {

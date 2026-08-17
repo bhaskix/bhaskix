@@ -584,23 +584,35 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     }
 
     // Bulk: thirty-two KiB out and thirty-two echoed back, through a
-    // sixteen-KiB ring — the wrap is the point — paced no more than four
-    // KiB (one window) ahead of the echo so the un-acknowledged bytes
-    // retransmission would need are never overwritten. Each chunk is stamped with its own
-    // number, spot-checked after the wrap.
+    // sixteen-KiB ring — the wrap is the point — paced one full ring ahead
+    // of the echo, which is one full window now that the service advertises
+    // the whole ring. The pacing constraint *is* the ring: chunk `c` lands
+    // where chunk `c - 16` lived, and an echoed chunk is an acknowledged
+    // chunk — its echo rode a segment whose `ACK` the service processed
+    // before delivering the bytes this program polls for — so the bytes
+    // retransmission would need are never overwritten. This paced four KiB
+    // ahead while the window was one page; RFC 0020 step 6's measurement
+    // named the width as the win after the wake. Each chunk is stamped with
+    // its own number, spot-checked after the wrap.
     const CHUNK: u64 = 1024;
     const CHUNKS: u64 = 32;
     let ring = (4 * 4096) as u64;
+    // Chunks the ring holds, which is how far ahead of the echo to run.
+    let depth = ring / CHUNK;
     let bulk_started = rdtsc();
     let bulk_base = sent_bytes;
     for chunk in 0..CHUNKS {
-        // Pace by the ring itself: before chunk `c` goes out, chunk `c - 4`
-        // must have echoed back — its stamp visible in this program's own
-        // receive ring — keeping one window in flight with no calls on the
-        // wait path. The consuming RECV that follows is the window
-        // reopening, once per chunk instead of once per poll.
-        if chunk >= 4 {
-            let awaited = chunk - 4;
+        // Pace by the ring itself: before chunk `c` goes out, the chunk
+        // whose ring bytes it overwrites must have echoed back — its stamp
+        // visible in this program's own receive ring — keeping a full ring
+        // in flight with no calls on the wait path. A stale byte cannot
+        // fake the stamp: stamps run 1..=32, the ring starts zeroed, the
+        // round-trip payload's bytes are all ASCII forty-five and up, and
+        // the previous lap's stamp at the same offset differs by sixteen.
+        // The consuming RECV that follows is the window reopening, once
+        // per chunk instead of once per poll.
+        if chunk >= depth {
+            let awaited = chunk - depth;
             let at = (bulk_base + (awaited + 1) * CHUNK - 1) % ring;
             if !await_byte(at, (awaited as u8).wrapping_add(1), WAKE, hertz) {
                 report(7, outcome::STUCK, awaited);
