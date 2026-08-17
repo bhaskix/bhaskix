@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-17 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. **TCP is complete and its RFC accepted 2026-08-16** ([RFC 0020](docs/rfc/0020-tcp.md), all six steps: `bin/tcpc` opens connections with rings its own domain owns, echoes through them both directions, and the boundary is measured — RFC 0022's capability-in-a-call is the mechanism underneath); no libc, no sockets API beyond UDP and TCP's own |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed — no architecture question open) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 46 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine), 53 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed — no architecture question open) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 47 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026 step 2's telemetry line became a gate), 54 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 346 host assertions |
 
 ### How far along is this, in numbers
 
@@ -711,7 +711,7 @@ what is actually ahead.
 | Full VFS — mount points, writable filesystem, journal, page cache | ✅ **done** — RFC 0015's six steps and RFC 0016's five, M9-01 … M9-17 | Three things, not one, and all three landed. The **ambient root is gone**: a directory is a badged endpoint capability to `bin/fsd`, `kernel/src/namespace.rs` is deleted, and there is no way up out of a directory. The journal's claim is tested by interrupting the machine at *every* write on the host, and once on a real disk through the block service. The cache came last because the journal decides when a dirty page may go home — and it now lends a page of itself to a caller, read-only, with nothing copied. What is **not** done: mount points, which nothing has needed yet. **The fuzzing is done** (2026-08-10) — all three parsers §8 names now have libFuzzer targets. **And the duration is met as of 2026-08-13**: three campaigns of a full twenty-four hours each, 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`, 52 million over `ustar`. No crash, no hang, no artifact |
 | Process management — capability-shaped fork/exec, process trees, reaping | ✅ **done** — RFC 0017 steps 1–6 | Nothing creates a domain except boot code — all 21 `domain::create` calls are in `kernel/src/lib.rs`, and it takes a `&'static str`, which is itself a statement that the caller is compiled in. Three more gaps the RFC found: a ring-3 fault **costs a processor permanently and leaks the domain** (M5's unmet criterion, above — ✅ closed by step 1 on 2026-08-07); `destroy` leaves a domain's threads running, which `domain.rs` documents against itself; and a caller whose service died blocks for ever, which is RFC 0013's question 1 — ✅ **answered by step 3** on 2026-08-07, and this row said only that the RFC *found* it until 2026-08-12, when that omission misled the author of RFC 0018 into calling it open. Six steps, and **step 1 is worth doing alone** |
 | Networking — virtio-net, Ethernet, IPv4/IPv6, UDP, TCP, sockets | 🟨 **in progress** | ~~Gated on the driver framework rather than on anything network-shaped.~~ **The note above was stale from 2026-08-13, when RFC 0018 was accepted and this row was not touched** — precisely the failure the paragraph over this table describes, one row down from where it describes it. What is true: virtio-net, Ethernet, ARP, IPv4, ICMP, UDP and sockets are **done** and a DHCP client obtains an address (RFC 0018, seven steps). **TCP is [RFC 0020](docs/rfc/0020-tcp.md), all six steps done** — outbound and inbound echo through rings the client program owns, guest and host agreeing byte-for-byte, and the cost is measured: round trips at 4–10× UDP's, 1–2.6 MiB/s each way — a rate the 2026-08-17 window widening (one page → the whole 16-KiB ring) left unchanged, which convicts the per-chunk serve-loop unit rather than the window (§7). Wake-by-notification landed as RFC 0023. **IPv6 is not started and is not in RFC 0020's scope.** This row said "the bullet stays open until TCP does" — TCP closed 2026-08-16 and the bullet is still open, because the bullet names IPv6 and a sockets API that do not exist; what it waits on changed, and the row now says so |
-| Telemetry plane | 🟨 **in progress** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) drafted 2026-08-17, **step 1 done the same day** | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
+| Telemetry plane | 🟨 **in progress** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) drafted 2026-08-17, **steps 1 and 2 done the same day** | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
 
 ---
 
@@ -759,6 +759,41 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-17 (RFC 0026 step 2: the kernel emits, the scheduler is the first producer, and the report line is a gate)
+
+**One ring per online CPU exists from just after `sched::start_all`, and every context switch
+on the preempt and block paths emits a `sched-dispatch` event** — outgoing thread, incoming
+thread, incoming domain, stamped with the raw TSC. The emit path is the RFC's bounded sequence:
+mask check (one load, one predicted branch), interrupts off, hostile-tail clamp, admit-or-drop,
+a 64-byte slot write, `head` published behind a release fence — no lock, no allocation, legal
+from interrupt context. Every decision is `bhaskix-telemetry`'s host-tested arithmetic; the
+kernel contributes stores, measured at 13 budget lines (1227 → 1240, the split the RFC
+promised). The rings live in `Memory` objects a `telemetry-keeper` domain owns — step 3's
+grant, already shaped — nine pages and 512 slots per CPU, sized against `MAX_FRAMES`'s
+sixteen-page bound rather than the RFC's sketched 1024 slots, revisited when the drop row says
+otherwise.
+
+**The boot report is a gate on every placement, the 47th**: `telemetry N events across P cpus,
+D dropped, 0 audit-refused; ~C cycles/emit over 256; 512 slots/cpu` — events must be nonzero,
+audit-refused must be zero (the reserved class, untouched), and the cycles figure prices the
+*write* path, because the instrument empties its own ring before measuring so no sample takes
+the cheaper drop exit. First green boot: 388 events, 0 dropped, ~1457 cycles/emit under TCG.
+
+**Two findings from the first boots, recorded over smoothed**: (1) placed before
+`scheduling_self_test`, the keeper domain and its rings turned the domain and shared-memory
+self-tests red — their clean-slate assertions (`domain::live() == 0`, every object revoked) are
+their point, so the plane moved to after them rather than the tests weakening to deltas;
+(2) with init early the same boot showed **1793 events, 68,535 dropped** — the drop-newest
+discipline and its counter working in vivo on the first try. The moved init's own numbers — 132
+real events plus the instrument's 256, zero dropped — are small for an honest reason checked
+rather than guessed: the window between init and the report holds only the light self-tests
+(the IPC check is 10 rendezvous, ring 3 is 37 syscalls), while the boot's ~35,000 switches land
+before init and after the report. Both switch sites emit — `block_self` is the rendezvous
+path's own exit — so coverage is the window's, not the mechanism's. *This entry briefly claimed
+the rendezvous path bypassed the producer; the two switch sites are the only two
+`bhaskix_context_switch` callers in the tree, and the claim was corrected here before it
+shipped.*
 
 ### 2026-08-17 (RFC 0026 step 1: the plane's arithmetic, and a clamp that had to fail before it was believed)
 

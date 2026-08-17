@@ -48,6 +48,7 @@ dependencies = [
  "bhaskix-service",
  "bhaskix-service-console",
  "bhaskix-service-vfs",
+ "bhaskix-telemetry",
 ]
 
 [[package]]

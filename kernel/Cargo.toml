@@ -23,6 +23,10 @@ bhaskix-fs = { path = "../fs" }
 # the heap base is that RFC's open question 2 -- but it is the thing that boots,
 # so it is where "the instruction actually works on this machine" is checked.
 bhaskix-rand = { path = "../rand" }
+# RFC 0026. The plane's arithmetic: the event's wire form, the schema
+# registry, and every ring decision. The kernel contributes the stores and
+# the interrupt discipline; the decisions stay host-tested in the crate.
+bhaskix-telemetry = { path = "../telemetry" }
 # RFC 0013: the framework, and the services placed in the nucleus. The arrow
 # points this way and only this way -- a service crate never depends back.
 bhaskix-service = { path = "../service" }
@@ -234,7 +238,13 @@ workspace = true
 # 1227 at the exception report's first line: one CR3 read, so the densest
 # diagnostics print before a harness cap can cut them off -- the lesson of
 # the run-312 specimen, which lost everything after its fifth line.
-unsafe_budget = 1227
+#
+# 1240 at RFC 0026 step 2: the telemetry emit path's volatile ring stores --
+# header words, the untrusted tail read, the slot write, the interrupt
+# guard, and init's zeroing. Every decision behind those stores is safe,
+# host-tested arithmetic in bhaskix-telemetry, which is the split the RFC
+# promised and this number holds it to.
+unsafe_budget = 1240
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

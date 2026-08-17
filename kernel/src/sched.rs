@@ -2395,25 +2395,38 @@ pub fn preempt() {
         // point into *this CPU's own* queue. No other processor reads or writes
         // these threads, so there is nothing to race with rather than a race
         // that happens to be prevented.
-        let Some(from) = queue.threads[current]
+        let Some((from, from_id)) = queue.threads[current]
             .as_mut()
-            .map(|thread| &raw mut thread.context)
+            .map(|thread| (&raw mut thread.context, thread.id))
         else {
             restore_interrupts(interrupts_were_enabled);
             return;
         };
-        let Some(to) = queue.threads[next]
+        let Some((to, to_id, to_domain)) = queue.threads[next]
             .as_ref()
-            .map(|thread| &raw const thread.context)
+            .map(|thread| (&raw const thread.context, thread.id, thread.domain))
         else {
             restore_interrupts(interrupts_were_enabled);
             return;
         };
-        Some((from, to))
+        Some((from, to, from_id, to_id, to_domain))
     };
 
-    if let Some((from, to)) = switch {
+    if let Some((from, to, from_id, to_id, to_domain)) = switch {
         SWITCHES.fetch_add(1, Ordering::Relaxed);
+        // RFC 0026 step 2's first producer. After the queue guard, because
+        // emit takes no lock and must not gain one by accident of position;
+        // interrupts are already off on this path, so emit's own guard is a
+        // no-op re-entry.
+        let mut handover = [0u8; 8];
+        handover[..4].copy_from_slice(&from_id.to_le_bytes());
+        handover[4..].copy_from_slice(&to_id.to_le_bytes());
+        crate::telemetry::emit(
+            bhaskix_telemetry::EventClass::Sched,
+            bhaskix_telemetry::schema::DISPATCH.id,
+            to_domain,
+            &handover,
+        );
         // SAFETY: both pointers address `Context` fields inside a static
         // runqueue, which outlives every thread. Both were taken from *this*
         // CPU's queue under its lock, and `switching` stops any other CPU
@@ -2945,28 +2958,40 @@ pub fn block_self() {
                 crate::sync::set_holds_count(incoming_count);
                 queue.switching = true;
 
-                let Some(from) = queue.threads[current]
+                let Some((from, from_id)) = queue.threads[current]
                     .as_mut()
-                    .map(|thread| &raw mut thread.context)
+                    .map(|thread| (&raw mut thread.context, thread.id))
                 else {
                     restore_interrupts(interrupts_were_enabled);
                     return;
                 };
-                let Some(to) = queue.threads[next]
+                let Some((to, to_id, to_domain)) = queue.threads[next]
                     .as_ref()
-                    .map(|thread| &raw const thread.context)
+                    .map(|thread| (&raw const thread.context, thread.id, thread.domain))
                 else {
                     restore_interrupts(interrupts_were_enabled);
                     return;
                 };
-                Some((from, to))
+                Some((from, to, from_id, to_id, to_domain))
             }
         };
 
         match switch {
-            Some((from, to)) => {
+            Some((from, to, from_id, to_id, to_domain)) => {
                 SWITCHES.fetch_add(1, Ordering::Relaxed);
                 BLOCKS.fetch_add(1, Ordering::Relaxed);
+                // RFC 0026 step 2's producer, on the block path for the same
+                // reasons as on preempt's: after the guard, no lock,
+                // interrupts already off.
+                let mut handover = [0u8; 8];
+                handover[..4].copy_from_slice(&from_id.to_le_bytes());
+                handover[4..].copy_from_slice(&to_id.to_le_bytes());
+                crate::telemetry::emit(
+                    bhaskix_telemetry::EventClass::Sched,
+                    bhaskix_telemetry::schema::DISPATCH.id,
+                    to_domain,
+                    &handover,
+                );
                 // SAFETY: as in `preempt` -- both contexts are in this CPU's
                 // own static runqueue, taken under its lock, and `switching`
                 // stops another CPU moving either out from under the switch.

@@ -53,6 +53,7 @@ pub mod smp;
 pub mod stack;
 pub mod sync;
 pub mod syscall;
+pub mod telemetry;
 pub mod time;
 pub mod tlb;
 pub mod trap;
@@ -381,6 +382,20 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // the system is never in once it is running.
     sched::start_all();
 
+    // RFC 0026 step 2. After `scheduling_self_test`, not before: that test's
+    // domain and shared-memory checks assert an *absolutely* clean slate --
+    // `domain::live() == 0`, every object revoked -- and the telemetry
+    // keeper and its rings are permanent residents. First placed before it,
+    // and both checks went red on the first boot; the assertions are the
+    // tests' point, so the plane moved rather than the tests weakening.
+    // Only the Sched class is on -- bring-up is the "something" that turns a
+    // class on, and nothing else has a producer yet. A failure here is a red
+    // line, not a halt: a machine without telemetry boots.
+    match telemetry::init(handoff.hhdm_base.as_u64()) {
+        Ok(()) => telemetry::enable(bhaskix_telemetry::EventClass::Sched),
+        Err(why) => println!("\x1b[91m    telemetry      FAILED: {why}\x1b[0m"),
+    }
+
     // Retire the class-phase threads before measuring idle CPUs, or the
     // "idle" window measures three spinning threads.
     PHASE.store(PHASE_TICKLESS, core::sync::atomic::Ordering::Release);
@@ -493,6 +508,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     }
     frames_report();
     tickless_report();
+    // Late on purpose: by here the self-tests above have poured real
+    // scheduler traffic through the rings, so the counters describe a
+    // working boot rather than an idle one.
+    telemetry::report();
 
     if !lock_ordering_self_test() {
         println!("\x1b[91m    lock order     FAILED\x1b[0m");

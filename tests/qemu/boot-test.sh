@@ -455,6 +455,19 @@ else
     status=1
 fi
 
+# RFC 0026 step 2: the telemetry plane's boot report. The values are not
+# asserted beyond sanity -- a slow host is not a broken kernel -- but the line
+# must exist (an instrument that measured nothing is a failure even where slow
+# is not), events must be nonzero (the scheduler emits on every switch, and a
+# boot performs thousands), and audit-refused must be zero, because nothing may
+# emit the reserved class until the audit RFC builds its backpressure ring.
+if grep -qE "telemetry +[1-9][0-9]* events across [1-9][0-9]* cpus, [0-9]+ dropped, 0 audit-refused; ~[0-9]+ cycles/emit over [0-9]+; [1-9][0-9]* slots/cpu" "$LOG"; then
+    pass "telemetry: events counted, drops said, the reserved class untouched"
+else
+    fail "the telemetry report line is missing or malformed"
+    status=1
+fi
+
 # Wakeup latency. **The target is not asserted** and that is deliberate: §10's
 # figure is unmet under an interpreting emulator and TRACKER says so. What is
 # asserted is that the measurement happened, so the day it is taken on hardware

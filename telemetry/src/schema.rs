@@ -37,9 +37,19 @@ pub const PROBE: Schema = Schema {
     name: "probe",
 };
 
+/// The scheduler's dispatch event, RFC 0026 step 2's first producer: the
+/// outgoing thread id, then the incoming, as two little-endian `u32`s. The
+/// event's own header carries when, which CPU, and the incoming domain.
+pub const DISPATCH: Schema = Schema {
+    id: 2,
+    version: 1,
+    size: 8,
+    name: "sched-dispatch",
+};
+
 /// Every schema this build knows. Extended in place as producers arrive
 /// (RFC 0026 steps 2 and 5); ids are append-only.
-pub static SCHEMAS: &[Schema] = &[PROBE];
+pub static SCHEMAS: &[Schema] = &[PROBE, DISPATCH];
 
 /// The table is checked at compile time: no payload wider than a slot's
 /// payload field, no duplicate ids. A build that violates either does not
@@ -130,27 +140,34 @@ mod tests {
             }
             hash
         }
-        let base = [Schema {
-            id: 1,
-            version: 1,
-            size: 16,
-            name: "probe",
-        }];
+        let base = [PROBE, DISPATCH];
         assert_eq!(hash_of(&base), registry_hash(), "same table, same hash");
 
-        let bumped_version = [Schema {
-            version: 2,
-            ..base[0]
-        }];
-        let widened = [Schema {
-            size: 17,
-            ..base[0]
-        }];
-        let renamed = [Schema {
-            name: "probf",
-            ..base[0]
-        }];
-        let renumbered = [Schema { id: 2, ..base[0] }];
+        // Each variation changes exactly one field of one entry, keeping the
+        // table's shape — so a differing hash convicts the field, not the
+        // length.
+        let bumped_version = [
+            Schema {
+                version: 2,
+                ..base[0]
+            },
+            DISPATCH,
+        ];
+        let widened = [
+            Schema {
+                size: 17,
+                ..base[0]
+            },
+            DISPATCH,
+        ];
+        let renamed = [
+            Schema {
+                name: "probf",
+                ..base[0]
+            },
+            DISPATCH,
+        ];
+        let renumbered = [Schema { id: 3, ..base[0] }, DISPATCH];
         assert_ne!(hash_of(&bumped_version), hash_of(&base));
         assert_ne!(hash_of(&widened), hash_of(&base));
         assert_ne!(hash_of(&renamed), hash_of(&base));
