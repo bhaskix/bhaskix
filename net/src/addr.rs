@@ -95,6 +95,12 @@ impl Ipv4Addr {
         self.0 >> 28 == 0b1110
     }
 
+    /// Whether this is `0.0.0.0`.
+    #[must_use]
+    pub const fn is_unspecified(self) -> bool {
+        self.0 == 0
+    }
+
     /// Whether this address is on `self`'s network given `prefix` bits.
     ///
     /// A prefix of zero puts everything on the same network and a prefix above
@@ -201,6 +207,67 @@ impl Ipv6Addr {
     pub const fn is_unspecified(self) -> bool {
         matches!(self.0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     }
+
+    /// The EUI-64 interface identifier of a MAC address: the six bytes with
+    /// `ff:fe` inserted in the middle and the universal/local bit inverted.
+    ///
+    /// The inversion is the specification's and is easy to drop without
+    /// noticing: a locally-administered MAC (QEMU's `52:54:...` is one)
+    /// yields an identifier starting `50:54`, and both ends of that
+    /// transformation appear in the tests so neither can quietly vanish.
+    #[must_use]
+    pub const fn interface_id(mac: MacAddr) -> [u8; 8] {
+        let m = mac.octets();
+        [m[0] ^ 0x02, m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]]
+    }
+
+    /// The link-local address of an interface with `mac` — `fe80::/64` plus
+    /// the EUI-64 identifier.
+    #[must_use]
+    pub const fn link_local_from(mac: MacAddr) -> Self {
+        Self::from_prefix(
+            Self([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Self::interface_id(mac),
+        )
+    }
+
+    /// An address from a /64 prefix and an interface identifier — SLAAC's
+    /// one arithmetic step.
+    ///
+    /// The prefix's low eight bytes are ignored rather than required zero,
+    /// because a router advertisement carries the prefix as a full address
+    /// whose tail is unspecified-by-construction.
+    #[must_use]
+    pub const fn from_prefix(prefix: Self, interface_id: [u8; 8]) -> Self {
+        let p = prefix.octets();
+        let i = interface_id;
+        Self([
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], i[0], i[1], i[2], i[3], i[4], i[5],
+            i[6], i[7],
+        ])
+    }
+
+    /// The solicited-node multicast address of this address —
+    /// `ff02::1:ff00:0/104` plus the low three bytes.
+    ///
+    /// Where a neighbour solicitation for this address is sent, so a node
+    /// hears questions about its own addresses without hearing everyone
+    /// else's.
+    #[must_use]
+    pub const fn solicited_node(self) -> Self {
+        let o = self.0;
+        Self([
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, o[13], o[14], o[15],
+        ])
+    }
+
+    /// The Ethernet address a v6 multicast destination is framed to:
+    /// `33:33` plus the low four bytes.
+    #[must_use]
+    pub const fn multicast_mac(self) -> MacAddr {
+        let o = self.0;
+        MacAddr([0x33, 0x33, o[12], o[13], o[14], o[15]])
+    }
 }
 
 impl fmt::Debug for Ipv6Addr {
@@ -288,6 +355,34 @@ impl Address {
         match self {
             Self::V4(_) => None,
             Self::V6(address) => Some(address),
+        }
+    }
+
+    /// Whether this is the family's "nobody yet" address.
+    #[must_use]
+    pub const fn is_unspecified(self) -> bool {
+        match self {
+            Self::V4(address) => address.is_unspecified(),
+            Self::V6(address) => address.is_unspecified(),
+        }
+    }
+
+    /// Whether this is a multicast address in its family.
+    #[must_use]
+    pub const fn is_multicast(self) -> bool {
+        match self {
+            Self::V4(address) => address.is_multicast(),
+            Self::V6(address) => address.is_multicast(),
+        }
+    }
+
+    /// Whether this is a broadcast address. Only v4 has one; v6 said no,
+    /// and the answer for a v6 address is honestly always `false`.
+    #[must_use]
+    pub const fn is_broadcast(self) -> bool {
+        match self {
+            Self::V4(address) => matches!(address.0, u32::MAX),
+            Self::V6(_) => false,
         }
     }
 }

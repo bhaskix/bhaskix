@@ -14,7 +14,9 @@
 //!
 //! What *is* in scope here is refusing to let a remote party choose how much
 //! memory it occupies, and refusing to learn from packets that give no reason
-//! to be believed — see [`ArpCache::learn`].
+//! to be believed — see [`crate::neighbour::NeighbourCache::learn`],
+//! where the cache this module used to own now lives, generalised over
+//! both families.
 
 use crate::{
     NetError,
@@ -159,161 +161,11 @@ impl ArpPacket {
     }
 }
 
-/// One learned mapping.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Entry {
-    protocol: Ipv4Addr,
-    hardware: MacAddr,
-    /// Monotonic nanoseconds after which this is no longer believed.
-    expires_at: u64,
-}
-
-/// A fixed-size ARP cache.
-///
-/// Generic over its capacity so that the service placing it chooses, rather
-/// than this crate choosing for every future caller. There is no allocation and
-/// no growth: the entries a remote party can create are bounded by `N` before
-/// the first packet arrives.
-///
-/// # Time is an argument, not a dependency
-///
-/// Every method that ages an entry takes `now` in monotonic nanoseconds. That
-/// keeps this crate free of a clock, which is what lets the whole cache be
-/// tested on the host — including expiry, which is otherwise the hardest thing
-/// here to test and the easiest to get wrong.
-#[derive(Debug)]
-pub struct ArpCache<const N: usize> {
-    entries: [Option<Entry>; N],
-    /// How long a learned mapping is believed, in nanoseconds.
-    lifetime: u64,
-}
-
-impl<const N: usize> ArpCache<N> {
-    /// A cache whose entries live for `lifetime` nanoseconds.
-    #[must_use]
-    pub const fn new(lifetime: u64) -> Self {
-        Self {
-            entries: [None; N],
-            lifetime,
-        }
-    }
-
-    /// The hardware address for `protocol`, if one is known and unexpired.
-    #[must_use]
-    pub fn lookup(&self, protocol: Ipv4Addr, now: u64) -> Option<MacAddr> {
-        self.entries
-            .iter()
-            .flatten()
-            .find(|entry| entry.protocol == protocol && entry.expires_at > now)
-            .map(|entry| entry.hardware)
-    }
-
-    /// Records that `protocol` is at `hardware`.
-    ///
-    /// Returns whether anything was stored.
-    ///
-    /// # What is refused, and why each one
-    ///
-    /// - **A group or broadcast hardware address.** Believing one would make
-    ///   this station send unicast traffic to every station on the segment,
-    ///   which is a redirection primitive handed over for free.
-    /// - **The unspecified protocol address.** `0.0.0.0` is what an ARP probe
-    ///   carries before it has an address; it names nobody and caching it maps
-    ///   a real address to the wrong station on the next lookup.
-    /// - **A multicast or broadcast protocol address.** These are not resolved
-    ///   by ARP, and an entry for one would shadow the derived address a sender
-    ///   is supposed to compute.
-    ///
-    /// # Replacement, which is where the honest limit is
-    ///
-    /// An existing entry for the same address is updated in place — including
-    /// by an unsolicited reply, because ARP cannot tell a legitimate update
-    /// from a forged one and pretending otherwise would be security theatre.
-    /// A caller that needs more than this needs a protocol that authenticates.
-    ///
-    /// With no free or expired slot, the entry closest to expiry is replaced.
-    /// **A flood can therefore churn the cache**, which costs a round trip per
-    /// evicted address and does not lose correctness. The alternative — refuse
-    /// to learn once full — trades that for an attacker being able to freeze
-    /// the cache permanently, which is worse. Neither is safe; this one fails
-    /// softer, and saying so is the point.
-    pub fn learn(&mut self, protocol: Ipv4Addr, hardware: MacAddr, now: u64) -> bool {
-        if hardware.is_group()
-            || protocol == Ipv4Addr::UNSPECIFIED
-            || protocol == Ipv4Addr::BROADCAST
-            || protocol.is_multicast()
-        {
-            return false;
-        }
-        let expires_at = now.saturating_add(self.lifetime);
-        let entry = Entry {
-            protocol,
-            hardware,
-            expires_at,
-        };
-
-        if let Some(slot) = self
-            .entries
-            .iter_mut()
-            .flatten()
-            .find(|slot| slot.protocol == protocol)
-        {
-            *slot = entry;
-            return true;
-        }
-        if let Some(slot) = self
-            .entries
-            .iter_mut()
-            .find(|slot| slot.is_none_or(|held| held.expires_at <= now))
-        {
-            *slot = Some(entry);
-            return true;
-        }
-        // Full, and nothing has expired. Replace whatever goes first.
-        if let Some(slot) = self
-            .entries
-            .iter_mut()
-            .flatten()
-            .min_by_key(|held| held.expires_at)
-        {
-            *slot = entry;
-            return true;
-        }
-        // Only reachable with `N == 0`, which is a caller's choice and not an
-        // error: a cache with no room stores nothing and every send resolves.
-        false
-    }
-
-    /// Forgets `protocol`, returning whether anything was held.
-    pub fn forget(&mut self, protocol: Ipv4Addr) -> bool {
-        let mut found = false;
-        for slot in &mut self.entries {
-            if slot.is_some_and(|held| held.protocol == protocol) {
-                *slot = None;
-                found = true;
-            }
-        }
-        found
-    }
-
-    /// How many entries are held and unexpired at `now`.
-    #[must_use]
-    pub fn live(&self, now: u64) -> usize {
-        self.entries
-            .iter()
-            .flatten()
-            .filter(|entry| entry.expires_at > now)
-            .count()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SENDER: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x11, 0x22, 0x33]);
-    const TARGET: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x44, 0x55, 0x66]);
-    const MINUTE: u64 = 60_000_000_000;
 
     fn request() -> ArpPacket {
         ArpPacket {
@@ -380,85 +232,5 @@ mod tests {
                 value: 3
             })
         );
-    }
-
-    #[test]
-    fn a_learned_entry_is_found_and_then_expires() {
-        let mut cache = ArpCache::<4>::new(MINUTE);
-        let address = Ipv4Addr::new(10, 0, 0, 2);
-        assert!(cache.learn(address, TARGET, 0));
-        assert_eq!(cache.lookup(address, 0), Some(TARGET));
-        assert_eq!(cache.lookup(address, MINUTE - 1), Some(TARGET));
-        // At the expiry instant it is gone: `expires_at > now` and not `>=`,
-        // so the boundary is checked in the direction that fails safe.
-        assert_eq!(cache.lookup(address, MINUTE), None);
-        assert_eq!(cache.live(MINUTE), 0);
-    }
-
-    #[test]
-    fn a_hardware_address_that_would_redirect_traffic_is_refused() {
-        let mut cache = ArpCache::<4>::new(MINUTE);
-        let address = Ipv4Addr::new(10, 0, 0, 2);
-        assert!(!cache.learn(address, MacAddr::BROADCAST, 0));
-        assert!(!cache.learn(address, MacAddr([0x01, 0, 0x5e, 0, 0, 1]), 0));
-        assert_eq!(cache.lookup(address, 0), None);
-    }
-
-    #[test]
-    fn protocol_addresses_that_name_nobody_are_refused() {
-        let mut cache = ArpCache::<4>::new(MINUTE);
-        assert!(!cache.learn(Ipv4Addr::UNSPECIFIED, TARGET, 0));
-        assert!(!cache.learn(Ipv4Addr::BROADCAST, TARGET, 0));
-        assert!(!cache.learn(Ipv4Addr::new(224, 0, 0, 1), TARGET, 0));
-        assert_eq!(cache.live(0), 0);
-    }
-
-    #[test]
-    fn a_full_cache_replaces_the_entry_closest_to_expiry() {
-        // The documented behaviour, tested because the alternative -- refusing
-        // to learn -- lets an attacker freeze the cache, and the two are one
-        // line apart.
-        let mut cache = ArpCache::<2>::new(MINUTE);
-        let first = Ipv4Addr::new(10, 0, 0, 1);
-        let second = Ipv4Addr::new(10, 0, 0, 2);
-        let third = Ipv4Addr::new(10, 0, 0, 3);
-        assert!(cache.learn(first, SENDER, 0));
-        assert!(cache.learn(second, TARGET, 10));
-        assert!(cache.learn(third, TARGET, 20));
-        // `first` expires soonest, so it is the one that went.
-        assert_eq!(cache.lookup(first, 20), None);
-        assert_eq!(cache.lookup(second, 20), Some(TARGET));
-        assert_eq!(cache.lookup(third, 20), Some(TARGET));
-        assert_eq!(cache.live(20), 2);
-    }
-
-    #[test]
-    fn relearning_updates_in_place_rather_than_consuming_a_slot() {
-        let mut cache = ArpCache::<2>::new(MINUTE);
-        let address = Ipv4Addr::new(10, 0, 0, 1);
-        assert!(cache.learn(address, SENDER, 0));
-        assert!(cache.learn(address, TARGET, 1));
-        assert_eq!(cache.lookup(address, 1), Some(TARGET));
-        assert_eq!(cache.live(1), 1);
-        // And the other slot is still free, which is what "in place" means.
-        assert!(cache.learn(Ipv4Addr::new(10, 0, 0, 2), SENDER, 1));
-        assert_eq!(cache.live(1), 2);
-    }
-
-    #[test]
-    fn a_cache_with_no_room_stores_nothing_and_does_not_panic() {
-        let mut cache = ArpCache::<0>::new(MINUTE);
-        assert!(!cache.learn(Ipv4Addr::new(10, 0, 0, 1), SENDER, 0));
-        assert_eq!(cache.live(0), 0);
-    }
-
-    #[test]
-    fn forgetting_removes_it() {
-        let mut cache = ArpCache::<2>::new(MINUTE);
-        let address = Ipv4Addr::new(10, 0, 0, 1);
-        cache.learn(address, SENDER, 0);
-        assert!(cache.forget(address));
-        assert!(!cache.forget(address));
-        assert_eq!(cache.lookup(address, 0), None);
     }
 }

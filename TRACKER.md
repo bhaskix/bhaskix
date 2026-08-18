@@ -763,6 +763,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (RFC 0029 step 2: the four messages that replaced ARP, and one table for both families)
+
+**NDP lands in `bhaskix-net`** — router solicitation and advertisement, neighbour solicitation
+and advertisement, ICMPv6 by format and ARP by role, all zero-`unsafe`. The option walk is the
+MADT walker's rule applied to the wire: a zero length refused (the classic infinite loop — the
+refusal watched red), a length past the buffer refused with both numbers, unknown types
+skipped by the length they declare. The RA parser takes the first prefix option and skips the
+rest (the first-I/O-APIC rule); the NDP hop-limit-255 requirement is stated as the caller's
+check, because the hop limit lives in a header this module never sees. The address
+derivations arrived with both ends pinned: EUI-64's universal/local inversion tested in both
+directions so it cannot quietly become set-always, plus solicited-node, `33:33` multicast
+MAC, link-local and prefix+IID — SLAAC's whole arithmetic, host-tested.
+
+**The ARP cache became the neighbour table.** `neighbour::NeighbourCache`, keyed on
+`Address`: one eviction discipline, two fill mechanisms, every refusal generalised through
+family-aware predicates (v6 has no broadcast, and the table says so honestly). The tests
+moved with it and grew the cases only two families can express: cross-family non-shadowing
+(a v4 address whose bytes appear inside a v6 address's tail), v6 name-nobody refusals
+(`::`, `ff02::1`, a solicited-node address), and mixed-family eviction. `bin/ipd` and the
+ARP fuzz target ported mechanically; behaviour identical, suite green.
+
+183 host tests; eleven fuzz targets (the NDP round-robin joined) at 300k seeds, clean. One
+process note for the record: a careless `git checkout` during a red-watch reverted the whole
+of `icmpv6.rs` mid-step and every edit had to be replayed from the session's history —
+red-watches now flip the guard by string and flip it back, never by checkout.
+
 ### 2026-08-18 (RFC 0029 step 1: the family exists, and the enum's promise is collected)
 
 **`bhaskix-net` speaks the second family** — as arithmetic, zero `unsafe`, like everything

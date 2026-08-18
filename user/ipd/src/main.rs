@@ -29,8 +29,8 @@
 
 use bhaskix_abi::{method, rights, ring, socket, status, syscall};
 use bhaskix_net::{
-    ArpCache, ArpOp, ArpPacket, EthFrame, EtherType, Ipv4Addr, Ipv4Header, MacAddr, Port, Protocol,
-    UdpDatagram, arp, eth, icmp, ipv4, udp,
+    Address, ArpOp, ArpPacket, EthFrame, EtherType, Ipv4Addr, Ipv4Header, MacAddr, NeighbourCache,
+    Port, Protocol, UdpDatagram, arp, eth, icmp, ipv4, udp,
 };
 
 /// Slot: the ring `bin/netd` writes frames into.
@@ -1202,7 +1202,7 @@ extern "C" fn ipd_main() -> ! {
     let mut built = 0u64;
     let mut buffer = [0u8; MAX_FRAME];
     let mut outgoing = [0u8; MAX_FRAME];
-    let mut cache = ArpCache::<8>::new(ARP_LIFETIME);
+    let mut cache = NeighbourCache::<8>::new(ARP_LIFETIME);
     // Stands in for a clock. See `ARP_LIFETIME`.
     let mut ticks = 0u64;
     let mut me = (MacAddr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED);
@@ -1342,7 +1342,7 @@ extern "C" fn ipd_main() -> ! {
         if can_send
             && !pinged
             && me.0 != MacAddr::UNSPECIFIED
-            && let Some(gateway) = cache.lookup(GATEWAY, ticks)
+            && let Some(gateway) = cache.lookup(Address::V4(GATEWAY), ticks)
         {
             let mut message = [0u8; icmp::HEADER + PING_PAYLOAD.len()];
             if let Ok(body) = icmp::write(&mut message, false, 0xbe57, 1, &PING_PAYLOAD)
@@ -1389,7 +1389,7 @@ extern "C" fn ipd_main() -> ! {
         // held instead — a measurement keeps everything constant except the
         // thing it is measuring.
         if burst_gateway.is_none()
-            && let Some(found) = cache.lookup(GATEWAY, ticks)
+            && let Some(found) = cache.lookup(Address::V4(GATEWAY), ticks)
         {
             burst_gateway = Some(found);
         }
@@ -1486,7 +1486,9 @@ extern "C" fn ipd_main() -> ! {
         // Slirp routes on the IP header and accepts a broadcast frame — the
         // DHCP exchange depends on that already.
         if can_tcp && me.0 != MacAddr::UNSPECIFIED {
-            let mac = cache.lookup(GATEWAY, ticks).unwrap_or(MacAddr::BROADCAST);
+            let mac = cache
+                .lookup(Address::V4(GATEWAY), ticks)
+                .unwrap_or(MacAddr::BROADCAST);
             drain_tcp_back(me, mac, &mut tcp_tail);
         }
 
@@ -1566,7 +1568,9 @@ extern "C" fn ipd_main() -> ! {
                         state(can_send, me.0, can_tcp),
                         pongs,
                     );
-                    let gateway = cache.lookup(GATEWAY, ticks).unwrap_or(MacAddr::BROADCAST);
+                    let gateway = cache
+                        .lookup(Address::V4(GATEWAY), ticks)
+                        .unwrap_or(MacAddr::BROADCAST);
                     // Bound before serving, not before the demonstration: the
                     // loop above polls deliberately and would be woken for
                     // nothing. Refused on a machine with no inbox, which is a
@@ -1763,7 +1767,11 @@ extern "C" fn ipd_main() -> ! {
                 // terms what should not be believed -- a group hardware
                 // address, an unspecified protocol address.
                 ArpOp::Reply => {
-                    cache.learn(packet.sender_protocol, packet.sender_hardware, ticks);
+                    cache.learn(
+                        Address::V4(packet.sender_protocol),
+                        packet.sender_hardware,
+                        ticks,
+                    );
                 }
                 // Somebody asked, and if they asked for us we answer. Written
                 // and host-tested; on this network nothing has a reason to ask
@@ -1842,7 +1850,7 @@ fn report(
         refused,
         // Frames this program *built* and handed back, and how many mappings
         // its cache holds. The first says the return path works from this end;
-        // the second is the `ArpCache` running outside a host test for the
+        // the second is the neighbour cache running outside a host test for the
         // first time since it was written.
         built,
         learned,

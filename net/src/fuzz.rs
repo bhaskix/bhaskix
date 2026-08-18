@@ -262,9 +262,13 @@ fn arp_never_panics() {
         if let Ok(parsed) = ArpPacket::parse(&bytes) {
             // Feed what parsed into the cache: `learn` has its own refusals and
             // they are reachable only from a packet that got this far.
-            let mut cache = crate::arp::ArpCache::<4>::new(1_000);
-            let _ = cache.learn(parsed.sender_protocol, parsed.sender_hardware, seed);
-            let _ = cache.lookup(parsed.sender_protocol, seed);
+            let mut cache = crate::neighbour::NeighbourCache::<4>::new(1_000);
+            let _ = cache.learn(
+                Address::V4(parsed.sender_protocol),
+                parsed.sender_hardware,
+                seed,
+            );
+            let _ = cache.lookup(Address::V4(parsed.sender_protocol), seed);
         }
     }
 }
@@ -587,6 +591,67 @@ fn ipv6_never_panics() {
             assert!(ipv6::HEADER + payload.len() <= bytes.len());
             assert!(!header.next_header.is_extension());
         }
+    }
+}
+
+#[test]
+fn ndp_never_panics() {
+    let (first, iterations) = campaign();
+    let source = Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 1]);
+    let destination = Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 2]);
+    let mac = MacAddr([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+    for seed in first..first.saturating_add(iterations) {
+        let mut rng = rng_for(seed);
+        // Rotate through the three parsed message kinds, so every parser
+        // sees every seed class over a long campaign.
+        let mut bytes = vec![0u8; 96];
+        let used = match seed % 3 {
+            0 => icmpv6::write_neighbour_advertisement(
+                &mut bytes,
+                source,
+                destination,
+                source,
+                true,
+                Some(mac),
+            ),
+            1 => icmpv6::write_neighbour_solicitation(
+                &mut bytes,
+                source,
+                destination,
+                destination,
+                Some(mac),
+            ),
+            _ => icmpv6::write_router_advertisement(
+                &mut bytes,
+                source,
+                destination,
+                1800,
+                Some(mac),
+                Some(icmpv6::PrefixInformation {
+                    prefix_length: 64,
+                    autonomous: true,
+                    valid_seconds: 86400,
+                    prefix: Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 0]),
+                }),
+            ),
+        }
+        .unwrap();
+        bytes.truncate(used);
+        let count = 1 + rng.below(6);
+        mutate(&mut rng, &mut bytes, count);
+        maybe_truncate(&mut rng, &mut bytes);
+        // Parsers only -- the assertions are "no panic" and "whatever
+        // parsed stayed inside the buffer", which the borrow checker
+        // already owns; a learned mapping additionally survives the cache's
+        // refusals.
+        let mut cache = crate::neighbour::NeighbourCache::<4>::new(1_000);
+        if let Ok(na) = icmpv6::NeighbourAdvertisement::parse(&bytes, source, destination)
+            && let Some(link) = na.target_link
+        {
+            let _ = cache.learn(Address::V6(na.target), link, seed);
+        }
+        let _ = icmpv6::NeighbourSolicitation::parse(&bytes, source, destination);
+        let _ = icmpv6::RouterAdvertisement::parse(&bytes, source, destination);
     }
 }
 

@@ -60,6 +60,7 @@ pub mod icmp;
 pub mod icmpv6;
 pub mod ipv4;
 pub mod ipv6;
+pub mod neighbour;
 pub mod siphash;
 pub mod tcp;
 pub mod udp;
@@ -68,12 +69,13 @@ pub mod udp;
 mod fuzz;
 
 pub use addr::{Address, Ipv4Addr, Ipv6Addr, MacAddr, Port};
-pub use arp::{ArpCache, ArpOp, ArpPacket};
+pub use arp::{ArpOp, ArpPacket};
 pub use dhcp::Offer;
 pub use eth::{EthFrame, EtherType};
 pub use icmp::Echo;
 pub use ipv4::{Ipv4Header, Protocol, Reassembly};
 pub use ipv6::{Ipv6Header, NextHeader};
+pub use neighbour::NeighbourCache;
 pub use tcp::{FourTuple, Sequence};
 pub use udp::UdpDatagram;
 
