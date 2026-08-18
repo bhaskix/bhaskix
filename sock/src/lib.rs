@@ -22,4 +22,5 @@ pub mod ring;
 pub mod tcp;
 pub mod time;
 pub mod udp;
+pub mod udp6;
 pub mod wait;

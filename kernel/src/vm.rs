@@ -657,6 +657,10 @@ pub enum FaultOutcome {
     Refused(&'static str),
     /// The fault is legal but could not be serviced right now.
     Unserviceable(&'static str),
+    /// Another CPU briefly holds a lock the service needs. Not an error at
+    /// all: returning lets the instruction re-fault, which is the natural
+    /// retry loop, and it ends the moment the holder releases.
+    Retry,
 }
 
 impl AddressSpace {
@@ -861,7 +865,19 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
     // an unserviceable fault is worse than servicing it and far better than a
     // silent lock-up.
     let Some(mut guard) = SPACES.try_lock() else {
-        return FaultOutcome::Unserviceable("address space lock held");
+        // Whose hold decides everything. A fault can interrupt the holder
+        // on its own CPU -- a genuine self-deadlock, reported loudly -- or
+        // merely coincide with another CPU's short hold, which is not a
+        // deadlock at all. The undiscriminated version killed on the
+        // coincidence: any program touching a lazy page while any other
+        // CPU held this table for a domain's bookkeeping lost its life to
+        // a lock it never contended, and in kernel mode the machine
+        // halted. Found when RFC 0029 step 4's second client doubled
+        // exactly that concurrency.
+        if SPACES.owner() == Some(bhaskix_arch::percpu::cpu_id()) {
+            return FaultOutcome::Unserviceable("address space lock held by this cpu");
+        }
+        return FaultOutcome::Retry;
     };
     // Whichever space is loaded *now*. Asked of the hardware rather than of
     // any bookkeeping, for the reason in this function's doc comment: the

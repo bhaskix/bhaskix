@@ -36,11 +36,13 @@ use crate::sync::{Rank, SpinLock};
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 /// Memory objects that can exist at once.
-pub const MAX_OBJECTS: usize = 32;
-// Raised from 16 on 2026-08-12, and from 24 on 2026-08-15, both **measured
-// full before being raised**: 16 of 16 on the boot that refused the DHCP
-// client's memory, 24 of 24 on the boot that refused the TCP client's
-// listener rings (RFC 0020 step 5 gives it four).
+pub const MAX_OBJECTS: usize = 40;
+// Raised from 16 on 2026-08-12, from 24 on 2026-08-15, and from 32 on
+// 2026-08-18, each **measured full before being raised**: 16 of 16 on the
+// boot that refused the DHCP client's memory, 24 of 24 on the boot that
+// refused the TCP client's listener rings (RFC 0020 step 5 gives it four),
+// and 32 of 32 on the shell-test's iommu machine when RFC 0029 step 4's
+// udp6 client asked for its two pages.
 //
 // Worth contrasting with `MAX_DOMAINS` on the same day, which was raised from
 // 32 to 64 on a misread failure and measured 9 of 64 when somebody finally

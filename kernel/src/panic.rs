@@ -29,6 +29,7 @@ use crate::println;
 /// message, and the operator sees only a boot loop with no cause — which is
 /// how a five-minute bug becomes a five-hour one.
 pub fn report(info: &PanicInfo<'_>) -> ! {
+    crate::console::enter_fatal();
     println!();
     println!("==================================================================");
     println!("  KERNEL PANIC");

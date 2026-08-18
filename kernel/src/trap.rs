@@ -236,6 +236,14 @@ fn handle(frame: &mut TrapFrame) {
                 println!();
                 println!("  the fault was legal but could not be serviced: {reason}");
             }
+            crate::vm::FaultOutcome::Retry => {
+                // Another CPU briefly holds the address-space table.
+                // Returning re-executes the faulting instruction, which
+                // re-faults until the holder releases -- a spin at
+                // fault-granularity, bounded by the holder's own critical
+                // section.
+                return;
+            }
         }
     }
 
@@ -621,6 +629,10 @@ fn dump_frame_window(frame: &TrapFrame) {
 /// wrong, and it should not get thinner because the fault turned out to be
 /// survivable.
 fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
+    // From here on the machine is being reported dead, and every print
+    // must reach the wire even if another CPU wedged holding the console
+    // lock -- run-80's report stopped at its fifth line for exactly that.
+    crate::console::enter_fatal();
     println!();
     println!("==================================================================");
     match exception_name(frame.vector) {

@@ -152,6 +152,7 @@ LAYERS = {
     # above -- no device, no DMA window, no interrupt -- and it exists as its own
     # program rather than a shell command precisely so that stays true.
     "bhaskix-user-dhcp": -1,
+    "bhaskix-user-udp6": -1,
     # The TCP service, RFC 0020 step 4. It links `bhaskix-net` under the same
     # rule -- two rings, a report page, a configuration page, an endpoint and a
     # timer; no device, no DMA window, no interrupt -- and `bhaskix-rand`,

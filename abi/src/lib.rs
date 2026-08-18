@@ -607,6 +607,34 @@ pub mod socket {
     /// the old holder must not inherit the new socket.
     pub const CLOSE: u64 = 54;
 
+    /// Bind a UDP socket in the second family — RFC 0029 step 4.
+    ///
+    /// `arg0` is the port, as [`BIND_UDP`]. The family is the method, not a
+    /// flag: dispatch already switches on method numbers, and a flag would
+    /// spend a bit of every word distinguishing what the number already
+    /// says. The capability handed back is the same kind of socket; only
+    /// what it can carry differs.
+    pub const BIND_UDP6: u64 = 64;
+
+    /// Send a datagram from a v6 socket.
+    ///
+    /// A v6 endpoint is wider than a v4 one and the message still has four
+    /// words: `arg0`/`arg1` are the destination address's high and low
+    /// halves in wire order, `arg2` packs `(length << 16) | port`, and
+    /// `arg3` names the payload memory. The length cap this packing imposes
+    /// — 65535 — is the UDP length field's own, so nothing sendable is
+    /// lost to it.
+    pub const SEND_TO6: u64 = 65;
+
+    /// Take the next datagram from a v6 socket.
+    ///
+    /// The reply convention carries three service words, so the source
+    /// port rides above the outcome: `value = outcome | (port << 16)`,
+    /// `args[1]`/`args[2]` the source address's halves in wire order.
+    /// [`EMPTY`] when nothing has arrived, as ever an answer and not an
+    /// error.
+    pub const RECV_FROM6: u64 = 66;
+
     /// It worked.
     pub const OK: u64 = 0;
     /// That port is already bound, or none is free.
@@ -622,6 +650,10 @@ pub mod socket {
     /// through. Said rather than pretended, so a program can tell "nothing
     /// answered" from "there is nothing to answer".
     pub const NO_NETWORK: u64 = 5;
+    /// The socket exists but speaks the other family: a v4 call on a v6
+    /// socket or the reverse. Refused by name rather than mis-parsed,
+    /// because the two shapes read the same four words differently.
+    pub const WRONG_FAMILY: u64 = 6;
 
     /// Packs a socket's identity into the badge a capability carries.
     #[must_use]

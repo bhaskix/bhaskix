@@ -107,7 +107,47 @@ pub fn _print(args: fmt::Arguments<'_>) {
     // `write_fmt` on `Console` cannot fail, so discarding the result loses no
     // information. It is discarded explicitly rather than unwrapped because
     // `unwrap` is denied in kernel code (docs/coding-style.md §4).
+    if FATAL.load(core::sync::atomic::Ordering::Acquire) {
+        write_fatal(args);
+        return;
+    }
     let _ = CONSOLE.lock().write_fmt(args);
+}
+
+/// Set once a fatal report begins: every print after it goes through
+/// [`write_fatal`], which cannot block on the console lock.
+static FATAL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Routes every later print through the path that cannot block.
+///
+/// Called at the top of the exception report and the panic handler — the
+/// two places whose words must reach the wire on a machine whose locks may
+/// already be wedged. run-80's exception report stopped at its fifth line
+/// because the reporting CPU blocked on a console lock another, equally
+/// dead CPU held; this is the instrument that run named.
+pub fn enter_fatal() {
+    FATAL.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Prints without ever blocking: patience first, theft second.
+///
+/// A bounded wait keeps healthy output untorn — on a live machine the lock
+/// frees in microseconds. If it never frees, the console is written
+/// through anyway: a deliberate data race on a dying machine, because a
+/// torn line beats a silent wedge every time it matters.
+fn write_fatal(args: fmt::Arguments<'_>) {
+    for _ in 0..1_000_000 {
+        if let Some(mut console) = CONSOLE.try_lock() {
+            let _ = console.write_fmt(args);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    // SAFETY: aliasing the console deliberately, as `data_ptr`'s contract
+    // states: the machine is fatal, the holder may never release, and the
+    // report matters more than the formatting.
+    let console = unsafe { &mut *CONSOLE.data_ptr() };
+    let _ = console.write_fmt(args);
 }
 
 /// Prints to the kernel console.

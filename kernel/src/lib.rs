@@ -3765,6 +3765,19 @@ const DHCPD_PROGRAM: &[u8] = b"bin/dhcp";
 /// The marker `bin/dhcp` writes before its report.
 const DHCPD_MARKER: u64 = 0x3145_4e4f_5044_4844;
 
+/// Where `bin/udp6`'s stack lives in its own address space.
+const UDP6_STACK: u64 = 0x0000_0000_1900_0000;
+const UDP6_STACK_PAGES: u64 = 4;
+
+/// The v6 socket demonstration, from the filesystem.
+const UDP6_PROGRAM: &[u8] = b"bin/udp6";
+
+/// The marker `bin/udp6` writes before its report.
+const UDP6_MARKER: u64 = 0x3136_5044_5544_5844;
+
+/// The page `bin/udp6` leaves its findings in.
+static UDP6_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// The page `bin/dhcp` leaves its findings in.
 static DHCP_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -5048,6 +5061,91 @@ fn start_dhcp_client(
     .map_err(|_| "the dhcp client would not spawn")?;
 
     DHCP_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Starts `bin/udp6`, the v6 socket demonstration — RFC 0029 step 4.
+///
+/// `bin/dhcp`'s inventory exactly, granted the same way: the service
+/// endpoint at 0, an empty slot at 1 for the socket, a page at 2, a report
+/// page at 3, a timer at 4.
+///
+/// # Errors
+///
+/// Any capability that would not be created or installed. None is fatal: a
+/// machine that cannot ask a v6 question still boots.
+fn start_udp6_client(
+    cpu: u32,
+    hhdm_base: u64,
+    keeper: domain::DomainId,
+    endpoint: ipc::EndpointId,
+) -> Result<(), &'static str> {
+    let realm = domain::create("udp6", domain::ResourceEnvelope::new())
+        .map_err(|_| "the udp6 domain would not be created")?;
+
+    let network = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the udp6 client's network capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(0, network).is_ok()) != Some(true) {
+        return Err("the udp6 client's network capability would not install");
+    }
+
+    let memory = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the udp6 client's memory would not be created")?;
+    let named = shared::name(memory).map_err(|_| "the udp6 client's memory would not be named")?;
+    const UDP6_TIMER_BADGE: u64 = 1 << 0;
+    let timer = crate::notify::create()
+        .ok()
+        .and_then(|id| crate::notify::name(id).ok())
+        .and_then(|root| {
+            cap::with_arena(|arena| {
+                arena
+                    .derive(
+                        root,
+                        cap::Rights::READ.union(cap::Rights::WRITE),
+                        UDP6_TIMER_BADGE,
+                    )
+                    .ok()
+            })
+        });
+    if let Some(timer) = timer
+        && domain::with(realm, |owner| owner.cspace.install_at(4, timer).is_ok()) != Some(true)
+    {
+        return Err("the udp6 client's timer would not install");
+    }
+
+    if domain::with(realm, |owner| owner.cspace.install_at(2, named).is_ok()) != Some(true) {
+        return Err("the udp6 client's memory would not install");
+    }
+
+    let report = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the udp6 client's report page would not be created")?;
+    let named = shared::name(report).map_err(|_| "the udp6 client's report would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
+        return Err("the udp6 client's report would not install");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        cpu,
+        "udp6",
+        udp6_client_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the udp6 client would not spawn")?;
+
+    UDP6_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -7336,6 +7434,97 @@ fn report_net_ring(hhdm: u64) -> bool {
 /// Returns whether an address was offered. Not a failure when none was: a
 /// machine with no network still boots, and this program's whole point is that
 /// it needs nothing to try.
+/// Reads what `bin/udp6` found, and says so.
+///
+/// Returns whether the question was answered where a network existed. Not a
+/// failure when there is no network: the machine still boots.
+fn report_udp6_client(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = UDP6_REPORT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return true;
+    }
+    if !NET_CONTAINED.load(Ordering::Acquire) {
+        println!("    udp6 client    no unit contains the device, so there is no network to ask");
+        return true;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return true;
+    };
+    if count == 0 {
+        return true;
+    }
+
+    let mut words = [0u64; 4];
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // four little-endian words the client wrote there.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, 32) };
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    if words[0] != UDP6_MARKER {
+        println!("    udp6 client    left no report");
+        return false;
+    }
+
+    match words[3] {
+        0 => {
+            println!(
+                "    udp6 client    a v6 datagram crossed to the service and back: two sockets, \
+                 [::1]:{} to [::1]:{}, payload returned unchanged",
+                words[2], words[1]
+            );
+            true
+        }
+        1 => {
+            println!("    udp6 client    no network service to ask");
+            true
+        }
+        2 => {
+            println!(
+                "\x1b[91m    udp6 client    the datagram went out and nothing was delivered\x1b[0m"
+            );
+            false
+        }
+        3 => {
+            println!(
+                "\x1b[91m    udp6 client    something was delivered and it was not ours \
+                 (port {}, address tail {:#x})\x1b[0m",
+                words[1], words[2]
+            );
+            false
+        }
+        4 => {
+            println!(
+                "\x1b[91m    udp6 client    refused a slot to be answered in, status {}\x1b[0m",
+                words[1]
+            );
+            false
+        }
+        5 => {
+            println!(
+                "\x1b[91m    udp6 client    no socket: kernel {} service {}\x1b[0m",
+                words[1], words[2]
+            );
+            false
+        }
+        6 => {
+            println!(
+                "\x1b[91m    udp6 client    would not send: kernel {} service {}\x1b[0m",
+                words[1], words[2]
+            );
+            false
+        }
+        other => {
+            println!("\x1b[91m    udp6 client    unknown outcome {other}\x1b[0m");
+            false
+        }
+    }
+}
+
 fn report_dhcp_client(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
 
@@ -7768,6 +7957,50 @@ extern "C" fn dhcp_client_entry(hhdm_base: u64) -> ! {
     let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
     // SAFETY: as above.
     unsafe { enter_user("dhcp client", entry, rsp, [hertz, 0]) }
+}
+
+/// Loads and enters `bin/udp6`.
+extern "C" fn udp6_client_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    udp6 client    FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(UDP6_PROGRAM) else {
+        stop("bin/udp6 is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/udp6 is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(UDP6_STACK), UDP6_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/udp6 would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = UDP6_STACK + UDP6_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // The clock's rate, handed over at entry, for bin/dhcp's stated reason:
+    // reading time is ambient; knowing the units is not.
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space,
+    // and `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("udp6 client", entry, rsp, [hertz, 0]) }
 }
 
 /// Loads and enters `bin/fsd`.
@@ -8815,6 +9048,12 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         {
             println!("\x1b[91m    dhcp client    FAILED: {reason}\x1b[0m");
         }
+        // RFC 0029 step 4's live proof, beside the v4 client it mirrors.
+        if let Some(endpoint) = net_service_endpoint()
+            && let Err(reason) = start_udp6_client(cpu, hhdm, net_keeper(), endpoint)
+        {
+            println!("\x1b[91m    udp6 client    FAILED: {reason}\x1b[0m");
+        }
 
         if !report_net_ring(hhdm) {
             println!("\x1b[91m    net ring       FAILED\x1b[0m");
@@ -8845,6 +9084,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // own demonstration finishes, so this is read last of all.
         if !report_dhcp_client(hhdm) {
             println!("\x1b[91m    dhcp client    FAILED\x1b[0m");
+        }
+        if !report_udp6_client(hhdm) {
+            println!("\x1b[91m    udp6 client    FAILED\x1b[0m");
         }
         report_net_after_exchange(hhdm);
     }
@@ -11735,7 +11977,7 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             // designed, exactly as it caught `bin/tcpc` and `bin/tcpd`
             // before it.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 13,
+            entries >= 3 && bin == 14,
         ),
         (
             "the user program is an ELF the loader accepts",

@@ -763,6 +763,66 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (a lock-order specimen for the hunt: rank 9 while holding rank 9, at wait.rs:195)
+
+**The armed instrument fired once, on one uefi boot in five.** `LOCK ORDER — blocking on
+wait::WaitQueue (rank 9) while holding mask 0b1000000000, at kernel/src/wait.rs:195`: a
+thread entered `wait_until` with a WaitQueue rank already in its held mask — either a real
+nested wait (one queue's path blocking on another) or a mask bit leaked by a release that
+never happened, which is the counter disease's shape one ring out. The boot that caught it
+had RFC 0029 step 4's second dhcp-shaped client dozing concurrently with the first, which is
+new concurrency in exactly the notify/wait neighbourhood; four immediate re-runs stayed
+clean. Specimen preserved: `/root/bhaskix-soak-artifacts/2026-08-18-lockorder-wait195-specimen.log`.
+**The lead was run down the same day — the second specimen convicted the family's core.**
+The next suite produced its sibling: a bios boot wedged at `the fault was legal but could
+not be serviced: address space lock held` with the exception report never appearing. Reading
+`vm::handle_fault` closed it: the global `SPACES` table's `try_lock` failure was
+undiscriminated — a fault interrupting the holder on its own CPU (real self-deadlock) and a
+fault merely *coinciding* with another CPU's short hold (not a deadlock at all) both died,
+and the second kind kills innocents: any program touching a lazy page while any other CPU
+did a domain's bookkeeping lost its life to a lock it never contended — in kernel mode, the
+machine halted. RFC 0029 step 4's second client doubled exactly that concurrency, which is
+why a years-latent race started firing one boot in five. **Fixed by discrimination**: the
+lock's existing owner-CPU diagnostic decides — same CPU reports loudly, another CPU returns
+`FaultOutcome::Retry`, and the instruction re-faults until the holder releases, a spin at
+fault granularity bounded by the holder's own critical section. **And run-80's named
+instrument is finally built**: `console::enter_fatal()` at the top of the exception report
+and the panic handler routes every later print through patience-then-theft — a bounded
+try-lock, then a deliberate, eyes-open aliasing write — so a fatal report can no longer
+stop at its fifth line because another dead CPU holds the console. The wait.rs:195 rank-9
+print is this same family seen from the lock instrument's side; whether any of it recurs
+with both fixes in is what the next hundred boots are for.
+
+### 2026-08-18 (RFC 0029 step 4: the socket ABI grows its second family, and the peer turns out to be ::1)
+
+**A v6 datagram crosses the domain boundary both ways through capabilities.** The ABI grew
+`BIND_UDP6`, `SEND_TO6` and `RECV_FROM6` — with two corrections the implementation forced on
+the RFC's sketch: v4's `SEND_TO` already spends two words naming the payload, so the v6 port
+shares a word with the length (`(length << 16) | port`, capped by the UDP length field's own
+sixteen bits); and the reply convention surfaces three service words, not four, so
+`RECV_FROM6`'s source port rides above the outcome. `bin/ipd`'s socket table went
+dual-stack (family recorded at bind, delivery family-matched, cross-family calls refused by
+the new `WRONG_FAMILY` outcome, by name); `bhaskix-net` grew mandatory-checksum UDP over v6
+with the zero-transmits-as-ffff wrinkle honoured; `bhaskix-sock` grew `udp6` so no program
+hand-rolls the two-word split.
+
+**The live peer is `::1`, and that is a measurement, not a retreat.** The step went looking
+for a wire peer and pcap-proved there is none on this QEMU: the DNS question to `fec0::3`
+leaves so well-formed that `tcpdump` decodes it — `46614+ AAAA? bhaskix.` — and slirp never
+answers; a hairpinned datagram to the guest's own global address is dropped the same way.
+So `bin/ipd` implements loopback as what loopback is — self-addressed traffic delivered
+socket-to-socket, never touching a wire — and the new `bin/udp6` (bin/dhcp's inventory,
+second family, `unsafe_budget = 10`) binds two v6 sockets, sends seventeen bytes from one to
+`[::1]`, and receives them on the other, unchanged and correctly attributed. The off-box v6
+UDP reply joins inbound TCP on the written-trigger list. One more expiry lesson on the way:
+`serve`'s router-MAC snapshot came from a cache lookup whose entry had always expired by
+serve time — the link address is now held sticky from the advertisement itself, the third
+time the cache's lifetime answered a question nobody asked it.
+
+The gate line per networked placement: `udp6 client — a v6 datagram crossed to the service
+and back: two sockets, [::1]:p to [::1]:q, payload returned unchanged`. `/bin` holds
+fourteen programs and every exact-count gate moved with it.
+
 ### 2026-08-18 (RFC 0029 step 3: ipd speaks the second family, and three premises fall on one wire)
 
 **Every networked lane now boots dual-stack, and the gate line proves the family end to

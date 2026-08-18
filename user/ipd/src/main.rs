@@ -138,6 +138,10 @@ const HOST6: Ipv6Addr = Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 2]);
 /// from [`BURST_ID`], because the identifier is how replies are told apart.
 const PING6_ID: u16 = 0xbe59;
 
+/// `::1`. Self-addressed traffic never touches a wire on a correct stack;
+/// a datagram sent here is delivered to the matching socket directly.
+const LOOPBACK6: Ipv6Addr = Ipv6Addr([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
 /// RFC 0018 step 7: the burst that prices the two-domain split.
 ///
 /// Every packet in this burst crosses the boundary twice — once from `bin/netd`
@@ -490,6 +494,41 @@ unsafe fn read_runs(base: u64, into: *mut u8, runs: (ring::Run, ring::Run)) {
 /// Every layer of it comes from `bhaskix-net`: the same code the parser on the
 /// other side of the wire is tested against, and the reason this program can
 /// send a correct packet without knowing how to drive anything.
+/// Builds and sends one v6 datagram: UDP over IPv6 over Ethernet, every
+/// byte from `bhaskix-net`, everything routed via `via` — the router's
+/// link address, the same one-road discipline the v4 path has with its
+/// gateway.
+fn send_datagram6(
+    me_mac: MacAddr,
+    via: MacAddr,
+    from: Ipv6Addr,
+    to: Ipv6Addr,
+    from_port: u16,
+    to_port: u16,
+    payload: &[u8],
+) -> bool {
+    let mut out = [0u8; MAX_FRAME];
+    let at = eth::HEADER + ipv6::HEADER;
+    let body = match udp::write6(
+        &mut out[at..],
+        Port(from_port),
+        Port(to_port),
+        payload,
+        from,
+        to,
+    ) {
+        Ok(body) => body,
+        Err(_) => return false,
+    };
+    if ipv6::write_header(&mut out[eth::HEADER..], from, to, NextHeader::UDP, 64, body).is_err()
+        || eth::write_header(&mut out, via, me_mac, EtherType::IPV6).is_err()
+    {
+        return false;
+    }
+    // SAFETY: the return ring is mapped writable.
+    unsafe { send(&out[..at + body]) }
+}
+
 fn send_datagram(
     me: (MacAddr, Ipv4Addr),
     gateway: MacAddr,
@@ -680,10 +719,14 @@ struct Socket {
     /// Bumped every time the slot is reused, so a capability held across a
     /// close names a socket that no longer exists rather than the next one.
     generation: u32,
+    /// Which family this socket was bound in — the method that minted it
+    /// (`BIND_UDP` or `BIND_UDP6`), remembered so delivery and the two
+    /// receive shapes cannot cross families by accident.
+    v6: bool,
     /// **One** datagram, and the limit is stated rather than implied. A queue
     /// is a later question; what this step answers is whether a program holding
     /// a socket can be given what arrived for it.
-    from: Ipv4Addr,
+    from: Address,
     from_port: u16,
     length: u16,
     held: [u8; DATAGRAM],
@@ -919,6 +962,41 @@ fn drain_ring(
             refuse(why::NOT_A_FRAME, length, seen);
             continue;
         };
+        // RFC 0029 step 4: a v6 datagram, delivered by the same discipline
+        // as the v4 one below — family-matched to the socket, one held
+        // datagram, the newest wins.
+        if parsed.ethertype == EtherType::IPV6 {
+            let Ok((header6, payload6)) = Ipv6Header::parse(parsed.payload) else {
+                refuse(why::NOT_A_HEADER, length, seen);
+                continue;
+            };
+            if header6.next_header != NextHeader::UDP {
+                refuse(why::NOT_UDP, length, seen);
+                continue;
+            }
+            let Ok(datagram) = UdpDatagram::parse6(payload6, header6.source, header6.destination)
+            else {
+                refuse(why::NOT_A_DATAGRAM, length, seen);
+                continue;
+            };
+            let Some(socket) = sockets
+                .iter_mut()
+                .find(|held| held.v6 && held.port != 0 && held.port == datagram.destination.0)
+            else {
+                refuse(why::NO_SOCKET, length, seen);
+                continue;
+            };
+            let take = datagram.payload.len().min(DATAGRAM);
+            socket.held[..take].copy_from_slice(&datagram.payload[..take]);
+            socket.length = take as u16;
+            socket.from = Address::V6(header6.source);
+            socket.from_port = datagram.source.0;
+            DELIVERED.store(
+                DELIVERED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            continue;
+        }
         if parsed.ethertype != EtherType::IPV4 {
             refuse(why::NOT_IPV4, length, seen);
             continue;
@@ -954,7 +1032,7 @@ fn drain_ring(
         };
         let Some(socket) = sockets
             .iter_mut()
-            .find(|held| held.port != 0 && held.port == datagram.destination.0)
+            .find(|held| !held.v6 && held.port != 0 && held.port == datagram.destination.0)
         else {
             refuse(why::NO_SOCKET, length, seen);
             continue;
@@ -965,7 +1043,7 @@ fn drain_ring(
         let take = datagram.payload.len().min(DATAGRAM);
         socket.held[..take].copy_from_slice(&datagram.payload[..take]);
         socket.length = take as u16;
-        socket.from = header.source;
+        socket.from = Address::V4(header.source);
         socket.from_port = datagram.source.0;
         // **Counted, because nothing counted it.** Every number this program
         // reported described frames crossing the ring; not one said whether a
@@ -987,10 +1065,13 @@ fn drain_ring(
 /// what a receive queue is for.
 ///
 /// Returns never.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     sockets: &mut [Socket; SOCKETS],
     me: (MacAddr, Ipv4Addr),
     gateway: MacAddr,
+    v6_from: Option<Ipv6Addr>,
+    router6: Option<MacAddr>,
     can_send: bool,
     mut can_tcp: bool,
     mut tail: u64,
@@ -1039,7 +1120,7 @@ fn serve(
         // is the only capability that can mint a socket. A badge means the
         // caller holds a socket and is using it.
         if badge == 0 {
-            if method != socket::BIND_UDP {
+            if method != socket::BIND_UDP && method != socket::BIND_UDP6 {
                 reply(socket::GONE, 0, 0);
                 continue;
             }
@@ -1067,6 +1148,7 @@ fn serve(
                 wanted
             };
             sockets[index].port = port;
+            sockets[index].v6 = method == socket::BIND_UDP6;
             let generation = sockets[index].generation;
 
             // The capability, derived from this program's own endpoint and
@@ -1118,6 +1200,12 @@ fn serve(
                 sockets[index as usize].generation = generation.wrapping_add(1);
                 reply(socket::OK, 0, 0);
             }
+            socket::SEND_TO if held.v6 => {
+                // A v6 socket asked in the v4 shape. Refused by name rather
+                // than mis-sent: the caller's two words of address would
+                // have been read as one address and a port.
+                reply(socket::WRONG_FAMILY, 0, 0);
+            }
             socket::SEND_TO => {
                 // The payload comes out of memory the **caller** named, with
                 // `DRAIN` -- the mirror of `FILL`, built by RFC 0016 step 3 for
@@ -1149,6 +1237,69 @@ fn serve(
                 );
                 reply(if sent { socket::OK } else { socket::NO_NETWORK }, 0, 0);
             }
+            socket::SEND_TO6 if !held.v6 => {
+                reply(socket::WRONG_FAMILY, 0, 0);
+            }
+            socket::SEND_TO6 => {
+                // The wide endpoint in four words: the address's halves,
+                // then (length << 16) | port -- the packing the ABI states,
+                // with the UDP length field's own cap.
+                let mut to = [0u8; 16];
+                to[..8].copy_from_slice(&args[0].to_be_bytes());
+                to[8..].copy_from_slice(&args[1].to_be_bytes());
+                let to = Ipv6Addr(to);
+                let to_port = args[2] as u16;
+                let wanted = ((args[2] >> 16) as usize).min(DATAGRAM);
+                let mut payload = [0u8; DATAGRAM];
+                let (drained, took) = call(
+                    syscall::INVOKE,
+                    ENDPOINT,
+                    method::DRAIN,
+                    [args[3], payload.as_mut_ptr() as u64, wanted as u64, 0],
+                );
+                if drained != status::OK {
+                    reply(socket::GONE, 0, 0);
+                    continue;
+                }
+                let length = (took as usize).min(wanted);
+
+                // Loopback first: self-addressed traffic never touches a
+                // wire on a correct stack, so `[::1]` needs no address, no
+                // router and no frame -- delivered to the matching v6
+                // socket here, with the source the convention names. A
+                // port nobody holds swallows the datagram, exactly as the
+                // wire would.
+                if to == LOOPBACK6 {
+                    let from_port = held.port;
+                    if let Some(target) = sockets
+                        .iter_mut()
+                        .find(|other| other.v6 && other.port != 0 && other.port == to_port)
+                    {
+                        let take = length.min(DATAGRAM);
+                        target.held[..take].copy_from_slice(&payload[..take]);
+                        target.length = take as u16;
+                        target.from = Address::V6(LOOPBACK6);
+                        target.from_port = from_port;
+                        DELIVERED.store(
+                            DELIVERED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    reply(socket::OK, 0, 0);
+                    continue;
+                }
+
+                let (Some(from), Some(via)) = (v6_from, router6) else {
+                    reply(socket::NO_NETWORK, 0, 0);
+                    continue;
+                };
+                let sent =
+                    send_datagram6(me.0, via, from, to, held.port, to_port, &payload[..length]);
+                reply(if sent { socket::OK } else { socket::NO_NETWORK }, 0, 0);
+            }
+            socket::RECV_FROM if held.v6 => {
+                reply(socket::WRONG_FAMILY, 0, 0);
+            }
             socket::RECV_FROM => {
                 // **Asking is what makes this service look at the wire.** It is
                 // asleep in `receive` and has no other wakeup, so a client
@@ -1178,11 +1329,60 @@ fn serve(
                     continue;
                 }
                 sockets[index as usize].length = 0;
+                let Address::V4(from) = waiting.from else {
+                    // Cannot happen -- delivery is family-matched -- and
+                    // refused by name rather than unwrapped if it ever does.
+                    reply(socket::WRONG_FAMILY, 0, 0);
+                    continue;
+                };
                 let mut source = 0u64;
-                for octet in waiting.from.octets() {
+                for octet in from.octets() {
                     source = (source << 8) | u64::from(octet);
                 }
                 reply(socket::OK, source, u64::from(waiting.from_port));
+            }
+            socket::RECV_FROM6 if !held.v6 => {
+                reply(socket::WRONG_FAMILY, 0, 0);
+            }
+            socket::RECV_FROM6 => {
+                drain_ring(sockets, me, &mut tail, can_tcp);
+                let waiting = sockets[index as usize];
+                if waiting.length == 0 {
+                    reply(socket::EMPTY, 0, 0);
+                    continue;
+                }
+                let (filled, _) = call(
+                    syscall::INVOKE,
+                    ENDPOINT,
+                    method::FILL,
+                    [
+                        args[0],
+                        waiting.held.as_ptr() as u64,
+                        u64::from(waiting.length),
+                        0,
+                    ],
+                );
+                if filled != status::OK {
+                    reply(socket::GONE, 0, 0);
+                    continue;
+                }
+                sockets[index as usize].length = 0;
+                let Address::V6(from) = waiting.from else {
+                    reply(socket::WRONG_FAMILY, 0, 0);
+                    continue;
+                };
+                let octets = from.octets();
+                let mut high = [0u8; 8];
+                let mut low = [0u8; 8];
+                high.copy_from_slice(&octets[..8]);
+                low.copy_from_slice(&octets[8..]);
+                // The reply convention carries three service words; the
+                // source port rides above the outcome, as the ABI states.
+                reply(
+                    socket::OK | (u64::from(waiting.from_port) << 16),
+                    u64::from_be_bytes(high),
+                    u64::from_be_bytes(low),
+                );
             }
             _ => reply(socket::GONE, 0, 0),
         }
@@ -1260,7 +1460,8 @@ extern "C" fn ipd_main() -> ! {
     let mut sockets = [Socket {
         port: 0,
         generation: 1,
-        from: Ipv4Addr::UNSPECIFIED,
+        v6: false,
+        from: Address::V4(Ipv4Addr::UNSPECIFIED),
         from_port: 0,
         length: 0,
         held: [0u8; DATAGRAM],
@@ -1285,6 +1486,11 @@ extern "C" fn ipd_main() -> ! {
     // itself expires on a busy wire — ticks race past the lifetime — and
     // the report's question is "did NDP work", not "is the entry warm".
     let mut resolved6 = false;
+    // The router's link address, held from the advertisement itself and
+    // never expired: `serve` snapshots it once at its door, and on this
+    // network it cannot change. The cache's expiry answered the wrong
+    // question here twice — first for the resolved bit, then for this.
+    let mut router6_link: Option<MacAddr> = None;
     // The retry clock for the three sends above. Loop passes rather than
     // `ticks`: ticks advance one per *received* frame, and on the quiet
     // wire this family boots on, a lost reply would freeze exactly the
@@ -1760,7 +1966,25 @@ extern "C" fn ipd_main() -> ! {
                         prefix_word(prefix6),
                         v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
                     );
-                    serve(&mut sockets, me, gateway, can_send, can_tcp, tail, tcp_tail);
+                    // The v6 identity and road, snapshotted at the door:
+                    // `serve` has no cache to refresh a neighbour from, and
+                    // on this network the router's link address never
+                    // changes. Held from the advertisement itself rather
+                    // than looked up — the cache's expiry made this
+                    // snapshot None on any boot whose demonstration phase
+                    // outlived the entry's lifetime, which was all of them.
+                    let router6_mac = router6_link;
+                    serve(
+                        &mut sockets,
+                        me,
+                        gateway,
+                        global6,
+                        router6_mac,
+                        can_send,
+                        can_tcp,
+                        tail,
+                        tcp_tail,
+                    );
                 }
                 report(
                     frames,
@@ -1945,6 +2169,7 @@ extern "C" fn ipd_main() -> ! {
                     if let Ok(ra) = icmpv6::RouterAdvertisement::parse(body6, from6, to6) {
                         if let Some(link) = ra.source_link {
                             cache.learn(Address::V6(from6), link, ticks);
+                            router6_link = Some(link);
                         }
                         if ra.router_lifetime_seconds > 0 && router6.is_none() {
                             router6 = Some(from6);

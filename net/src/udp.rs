@@ -22,7 +22,13 @@
 //! and makes the coupling visible in the signature, which is where a reader
 //! will look for it.
 
-use crate::{NetError, addr::Ipv4Addr, addr::Port, be16, checksum, ipv4::Protocol};
+use crate::{
+    NetError,
+    addr::{Ipv4Addr, Ipv6Addr, Port},
+    be16, checksum,
+    ipv4::Protocol,
+    ipv6::{NextHeader, pseudo_header},
+};
 
 /// Bytes in a UDP header.
 pub const HEADER: usize = 8;
@@ -178,6 +184,127 @@ pub fn write(
     Ok(total)
 }
 
+impl<'a> UdpDatagram<'a> {
+    /// Parses a datagram carried over IPv6, verifying its checksum against
+    /// the addresses of the enclosing v6 header.
+    ///
+    /// Over v6 the checksum is **mandatory**: the IP header lost its own,
+    /// so the transport sum is the datagram's only integrity. A carried
+    /// zero — v4's "declined" — is refused here, not excused.
+    ///
+    /// # Errors
+    ///
+    /// As [`UdpDatagram::parse`], plus [`NetError::BadChecksum`] for the
+    /// zero checksum v4 would have accepted.
+    pub fn parse6(
+        bytes: &'a [u8],
+        source_address: Ipv6Addr,
+        destination_address: Ipv6Addr,
+    ) -> Result<Self, NetError> {
+        let header = bytes.get(..HEADER).ok_or(NetError::Truncated {
+            need: HEADER,
+            have: bytes.len(),
+        })?;
+
+        let stated = usize::from(be16(header, 4).unwrap_or(0));
+        if stated < HEADER {
+            return Err(NetError::Truncated {
+                need: HEADER,
+                have: stated,
+            });
+        }
+        if stated > bytes.len() {
+            return Err(NetError::LengthBeyondBuffer {
+                stated,
+                have: bytes.len(),
+            });
+        }
+        let datagram = bytes.get(..stated).ok_or(NetError::LengthBeyondBuffer {
+            stated,
+            have: bytes.len(),
+        })?;
+
+        let carried = be16(header, 6).unwrap_or(0);
+        if carried == 0 {
+            return Err(NetError::BadChecksum {
+                computed: 0,
+                carried: 0,
+            });
+        }
+        let pseudo = pseudo_header(
+            source_address,
+            destination_address,
+            NextHeader::UDP,
+            stated as u32,
+        );
+        let computed = checksum(&[&pseudo, &datagram[..6], &[0, 0], &datagram[8..]]);
+        if computed != carried {
+            return Err(NetError::BadChecksum { computed, carried });
+        }
+
+        Ok(Self {
+            source: Port(be16(header, 0).unwrap_or(0)),
+            destination: Port(be16(header, 2).unwrap_or(0)),
+            payload: datagram.get(HEADER..).unwrap_or(&[]),
+            checksummed: true,
+        })
+    }
+}
+
+/// Writes a datagram for carriage over IPv6, returning how many bytes.
+///
+/// The checksum is always computed — mandatory in v6 — and the
+/// specification's one wrinkle is honoured: a sum that computes to zero is
+/// transmitted as `0xffff`, because zero on the wire means "no checksum"
+/// and over v6 there is no such thing.
+///
+/// # Errors
+///
+/// As [`write`].
+pub fn write6(
+    out: &mut [u8],
+    source: Port,
+    destination: Port,
+    payload: &[u8],
+    source_address: Ipv6Addr,
+    destination_address: Ipv6Addr,
+) -> Result<usize, NetError> {
+    let total = HEADER
+        .checked_add(payload.len())
+        .ok_or(NetError::LengthBeyondBuffer {
+            stated: payload.len(),
+            have: usize::from(u16::MAX),
+        })?;
+    if total > usize::from(u16::MAX) {
+        return Err(NetError::LengthBeyondBuffer {
+            stated: total,
+            have: usize::from(u16::MAX),
+        });
+    }
+    let available = out.len();
+    let datagram = out.get_mut(..total).ok_or(NetError::Truncated {
+        need: total,
+        have: available,
+    })?;
+
+    datagram[0..2].copy_from_slice(&source.0.to_be_bytes());
+    datagram[2..4].copy_from_slice(&destination.0.to_be_bytes());
+    datagram[4..6].copy_from_slice(&(total as u16).to_be_bytes());
+    datagram[6..8].copy_from_slice(&[0, 0]);
+    datagram[HEADER..].copy_from_slice(payload);
+
+    let pseudo = pseudo_header(
+        source_address,
+        destination_address,
+        NextHeader::UDP,
+        total as u32,
+    );
+    let sum = checksum(&[&pseudo, &*datagram]);
+    let sum = if sum == 0 { 0xffff } else { sum };
+    datagram[6..8].copy_from_slice(&sum.to_be_bytes());
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +424,52 @@ mod tests {
         );
         let parsed = UdpDatagram::parse(&bytes[..HEADER], HERE, THERE).unwrap();
         assert!(parsed.payload.is_empty());
+    }
+
+    const SIX_HERE: Ipv6Addr = Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 0x0f]);
+    const SIX_THERE: Ipv6Addr = Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 3]);
+
+    #[test]
+    fn a_v6_datagram_round_trips_and_is_always_checksummed() {
+        let mut out = [0u8; 64];
+        let used = write6(
+            &mut out,
+            Port(49152),
+            Port(53),
+            b"query",
+            SIX_HERE,
+            SIX_THERE,
+        )
+        .expect("fits");
+        let parsed = UdpDatagram::parse6(&out[..used], SIX_HERE, SIX_THERE).expect("valid");
+        assert_eq!(parsed.source, Port(49152));
+        assert_eq!(parsed.destination, Port(53));
+        assert_eq!(parsed.payload, b"query");
+        assert!(parsed.checksummed);
+    }
+
+    #[test]
+    fn a_zero_checksum_is_refused_over_v6_not_excused() {
+        // Legal over v4, meaningless over v6: the IP header there has no
+        // checksum of its own, so "declined" is not a state the wire has.
+        let mut out = [0u8; 64];
+        let used = write6(&mut out, Port(1), Port(2), b"x", SIX_HERE, SIX_THERE).expect("fits");
+        out[6..8].copy_from_slice(&[0, 0]);
+        assert!(matches!(
+            UdpDatagram::parse6(&out[..used], SIX_HERE, SIX_THERE),
+            Err(NetError::BadChecksum { carried: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn the_v6_checksum_binds_the_addresses() {
+        let mut out = [0u8; 64];
+        let used = write6(&mut out, Port(1), Port(2), b"x", SIX_HERE, SIX_THERE).expect("fits");
+        let elsewhere = Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 9]);
+        assert!(UdpDatagram::parse6(&out[..used], SIX_HERE, SIX_THERE).is_ok());
+        assert!(matches!(
+            UdpDatagram::parse6(&out[..used], SIX_HERE, elsewhere),
+            Err(NetError::BadChecksum { .. })
+        ));
     }
 }

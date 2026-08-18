@@ -574,7 +574,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 13 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 14 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -1139,6 +1139,26 @@ elif grep -qE "net ring +nothing crossed; without a dma window" "$LOG"; then
 else
     fail "the ipv6 demonstration did not complete"
     grep -E "net ipv6" "$LOG" || true
+    status=1
+fi
+
+# RFC 0029 step 4: a datagram out and a datagram in, both through the v6
+# socket capabilities, across a real domain boundary twice -- bin/udp6
+# sends seventeen bytes from one v6 socket to [::1] and receives them,
+# unchanged and correctly attributed, on a second. Loopback rather than
+# the network because this QEMU's slirp has no v6 UDP peer at all: the
+# resolver has no v6 face and a hairpinned datagram is dropped, both
+# measured on the wire with a pcap; an off-box v6 UDP reply carries the
+# same written trigger as inbound TCP.
+if grep -qE "udp6 client +a v6 datagram crossed to the service and back: two sockets, \[::1\]:[0-9]+ to \[::1\]:[0-9]+, payload returned unchanged" "$LOG"; then
+    pass "a v6 datagram crossed both ways through the socket capabilities"
+elif grep -qE "net domain +no device on the bus" "$LOG"; then
+    pass "udp6 skipped: no network device on this machine"
+elif grep -qE "net ring +nothing crossed; without a dma window" "$LOG"; then
+    pass "udp6 skipped: no dma window"
+else
+    fail "the v6 socket demonstration did not complete"
+    grep -E "udp6 client" "$LOG" || true
     status=1
 fi
 

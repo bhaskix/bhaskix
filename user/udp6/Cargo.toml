@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The v6 socket demonstration: one datagram out and back through loopback.
+#
+# Not a member of the root workspace, for the reason user/ipd/Cargo.toml gives:
+# it needs its own code model and its own linker script.
+#
+# A separate program for bin/dhcp's stated reason: a client that needs a
+# socket, a page and nothing else should hold a socket, a page and nothing
+# else -- and this one exists to prove that the v6 face of the socket ABI
+# carries a datagram both ways across a domain boundary, which no service's
+# self-test can prove about itself. The peer is ::1, because this QEMU's
+# slirp has no v6 UDP peer at all -- see the program's own header.
+[workspace]
+
+[package]
+name = "bhaskix-user-udp6"
+description = "One v6 datagram to loopback and back, through sockets and nothing else."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "udp6"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-sock = { path = "../../sock" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 10, measured: the panic ud2, the page view (two sites -- the datagram is
+# built and read back through it), and the report writes -- the same
+# residues bin/dhcp keeps after RFC 0027 moved everything shared into
+# bhaskix-sock. No bhaskix-net at all: seventeen fixed bytes need no
+# protocol library.
+unsafe_budget = 10

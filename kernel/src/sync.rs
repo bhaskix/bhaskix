@@ -872,6 +872,14 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// The raw pointer to the protected value, for exactly one caller: the
+    /// console's fatal path, which steals a lock a wedged machine may never
+    /// release. Aliasing through this is a data race accepted with eyes
+    /// open, and nothing on a healthy path may touch it.
+    pub(crate) fn data_ptr(&self) -> *mut T {
+        self.value.get()
+    }
+
     /// Acquires the lock if it is free, without spinning.
     ///
     /// Exists for the page-fault path and for every other acquisition made

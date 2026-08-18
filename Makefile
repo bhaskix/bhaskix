@@ -49,6 +49,7 @@ BLKD_DIR     := user/blkd
 NETD_DIR     := user/netd
 IPD_DIR      := user/ipd
 DHCPD_DIR    := user/dhcp
+UDP6_DIR     := user/udp6
 TCPD_DIR     := user/tcpd
 TCPC_DIR     := user/tcpc
 TRACED_DIR   := user/traced
@@ -62,6 +63,7 @@ USER_BLKD    := $(BLKD_DIR)/target/$(TARGET)/release/blkd
 USER_NETD    := $(NETD_DIR)/target/$(TARGET)/release/netd
 USER_IPD     := $(IPD_DIR)/target/$(TARGET)/release/ipd
 USER_DHCPD   := $(DHCPD_DIR)/target/$(TARGET)/release/dhcp
+USER_UDP6    := $(UDP6_DIR)/target/$(TARGET)/release/udp6
 USER_TCPD    := $(TCPD_DIR)/target/$(TARGET)/release/tcpd
 USER_TCPC    := $(TCPC_DIR)/target/$(TARGET)/release/tcpc
 USER_TRACED  := $(TRACED_DIR)/target/$(TARGET)/release/traced
@@ -92,6 +94,8 @@ IPD_FLAGS    := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(IPD_DIR)/link.ld
 DHCPD_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(DHCPD_DIR)/link.ld
+UDP6_FLAGS   := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(UDP6_DIR)/link.ld
 TCPD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(TCPD_DIR)/link.ld
 TCPC_FLAGS   := -C relocation-model=static -C code-model=small \
@@ -211,7 +215,7 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
+$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
 	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
@@ -223,6 +227,7 @@ $(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USE
 	cp $(USER_NETD) $(INITRD_ROOT)/bin/netd
 	cp $(USER_IPD) $(INITRD_ROOT)/bin/ipd
 	cp $(USER_DHCPD) $(INITRD_ROOT)/bin/dhcp
+	cp $(USER_UDP6) $(INITRD_ROOT)/bin/udp6
 	cp $(USER_TCPD) $(INITRD_ROOT)/bin/tcpd
 	cp $(USER_TCPC) $(INITRD_ROOT)/bin/tcpc
 	cp $(USER_TRACED) $(INITRD_ROOT)/bin/traced
@@ -305,6 +310,14 @@ $(USER_IPD): $(IPD_DIR)/src/main.rs $(IPD_DIR)/link.ld $(IPD_DIR)/Cargo.toml \
 $(USER_DHCPD): $(DHCPD_DIR)/src/main.rs $(DHCPD_DIR)/link.ld $(DHCPD_DIR)/Cargo.toml \
                $(wildcard abi/src/*.rs) $(wildcard net/src/*.rs) $(wildcard sock/src/*.rs)
 	cd $(DHCPD_DIR) && RUSTFLAGS="$(DHCPD_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# RFC 0029 step 4's live proof: one v6 datagram to loopback and back,
+# through the socket capabilities and nothing else.
+$(USER_UDP6): $(UDP6_DIR)/src/main.rs $(UDP6_DIR)/link.ld $(UDP6_DIR)/Cargo.toml \
+               $(wildcard abi/src/*.rs) $(wildcard sock/src/*.rs)
+	cd $(UDP6_DIR) && RUSTFLAGS="$(UDP6_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 

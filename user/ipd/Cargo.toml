@@ -65,4 +65,6 @@ opt-level = "s"
 # 136 at RFC 0029 step 3: the second family's five sends and receives --
 # each the same shape as its v4 twin (the frame into the return ring, the
 # config and ring reads), no new kind of unsafe, five more lines of it.
-unsafe_budget = 136
+# 137 at step 4: the v6 datagram send from serve, the same DRAIN-and-ring
+# shape the v4 SEND_TO pays.
+unsafe_budget = 137
