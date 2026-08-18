@@ -6,8 +6,12 @@
 # This script's gate list IS the honest statement of how far sovereignty
 # has come: it grows a check per implemented step, and the roadmap's
 # bhaskixboot bullet closes only when this lane runs the same gates the
-# Limine lanes do. Today it proves step 1: the firmware starts our loader,
-# and the first words on the serial wire are ours.
+# Limine lanes do. Today it proves steps 1 through 7's parity work: the
+# payload byte-verified, the machine's shape taken, the kernel slid by a
+# drawn KASLR slide the kernel itself confirms, the jump through the
+# shim's second door, and four CPUs online -- found in the MADT and
+# started by the kernel's own INIT-SIPI, with no loader help. What
+# remains before the bullet closes is the full Limine-lane gate set.
 #
 # Usage:
 #   tests/qemu/native-boot-test.sh
@@ -19,7 +23,7 @@ LOADER="$REPO_ROOT/boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixbo
 KERNEL="$REPO_ROOT/target/x86_64-unknown-none/release/bhaskix"
 INITRD="$REPO_ROOT/build/initrd.tar"
 LOG="${BHASKIX_NATIVE_BOOT_LOG:-$(mktemp)}"
-TIMEOUT=30
+TIMEOUT=60
 
 RED=$'\033[1;31m'
 GREEN=$'\033[1;32m'
@@ -152,7 +156,7 @@ cp "$OVMF_VARS" "$WRITABLE_VARS"
 # legal (RFC 0021) but this lane's job is to prove the slid one.
 echo "booting the native loader under $(basename "$OVMF_CODE"), up to ${TIMEOUT}s..."
 timeout "$TIMEOUT" qemu-system-x86_64 \
-    -machine q35 -cpu max -m 256 -display none \
+    -machine q35 -cpu max -smp 4 -m 256 -display none \
     -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
     -drive "format=raw,file=fat:rw:$ESP" \
@@ -164,7 +168,7 @@ QEMU_PID=$!
 # the loader returns to the firmware after speaking, and the firmware then
 # wanders into its own shell -- the output is the event, not the exit.
 for _ in $(seq 1 "$TIMEOUT"); do
-    if grep -qE "handoff version 2|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
+    if grep -qE "tlb shootdown +[0-9]+ completed|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -314,10 +318,24 @@ else
     fail "the kernel did not report slide $KERNEL_SLIDE (unslid, or a different number)"
     status=1
 fi
-if grep -qF "loader reported no way to start secondaries" "$LOG" 2>/dev/null; then
-    pass "the single-CPU reduction is stated by the kernel, not hidden"
+# The secondaries: the loader still offers nothing, and the kernel now
+# does it alone -- discovery from the MADT, the trampoline, INIT-SIPI.
+if grep -qF "INIT-SIPI from the kernel: 4 processors in the madt" "$LOG" 2>/dev/null; then
+    pass "the kernel found four processors in the madt and started them itself"
 else
-    fail "the secondaries reduction was not stated"
+    fail "the kernel's INIT-SIPI line never appeared, or the count is not 4"
+    status=1
+fi
+if grep -qE "cpus +4 online of 4 reported" "$LOG" 2>/dev/null; then
+    pass "all four CPUs are online, none missing, none invented"
+else
+    fail "the cpus line is missing or short of 4 online of 4"
+    status=1
+fi
+if grep -qE "tlb shootdown +[1-9][0-9]* completed across 4 cpus, none timed out" "$LOG" 2>/dev/null; then
+    pass "shootdown IPIs cross all four natively-started CPUs"
+else
+    fail "the shootdown line is missing, timed out, or short of 4 cpus"
     status=1
 fi
 

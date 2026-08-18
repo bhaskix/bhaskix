@@ -64,6 +64,13 @@ const ICR_FIXED_ASSERT: u32 = 1 << 14;
 /// is serialising and the bit does not exist.
 const ICR_DELIVERY_PENDING: u32 = 1 << 12;
 
+/// INIT delivery mode, asserted: takes the target processor to its
+/// wait-for-SIPI state. The first half of bringing a CPU up by hand.
+const ICR_INIT_ASSERT: u32 = (0b101 << 8) | (1 << 14);
+/// STARTUP delivery mode, asserted: releases a waiting processor into real
+/// mode at `vector << 12`. The second half.
+const ICR_STARTUP: u32 = (0b110 << 8) | (1 << 14);
+
 /// `IA32_APIC_BASE` bit 11: global enable. Clearing it is irreversible until
 /// reset on most parts, which is why nothing here ever clears it.
 const APIC_BASE_ENABLE: u64 = 1 << 11;
@@ -539,8 +546,41 @@ unsafe fn write_icr64(value: u64) {
 /// As [`send_ipi_all_but_self`]: the APIC must be initialised and the target
 /// must have an IDT gate for `vector`.
 pub unsafe fn send_ipi(target: u32, vector: u8) -> bool {
-    let command = ICR_FIXED_ASSERT | u32::from(vector);
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { send_to(target, ICR_FIXED_ASSERT | u32::from(vector)) }
+}
 
+/// Sends INIT to `target`, taking it to its wait-for-SIPI state.
+///
+/// # Safety
+///
+/// As [`send_ipi`] — and `target` must not be the sender, because a CPU that
+/// INITs itself resets its own state out from under this very call.
+pub unsafe fn send_init(target: u32) -> bool {
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { send_to(target, ICR_INIT_ASSERT) }
+}
+
+/// Sends STARTUP to `target`, releasing it into real mode at `vector << 12`.
+///
+/// The vector is a page number below one megabyte, so a `u8` expresses every
+/// address the architecture can start a processor at.
+///
+/// # Safety
+///
+/// As [`send_init`], and the page at `vector << 12` must hold code a CPU in
+/// real mode can execute — this call is what makes it run.
+pub unsafe fn send_startup(target: u32, vector: u8) -> bool {
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { send_to(target, ICR_STARTUP | u32::from(vector)) }
+}
+
+/// Delivers `command` to `target`, in whichever mode the APIC is in.
+///
+/// # Safety
+///
+/// [`init`] must have run on this CPU.
+unsafe fn send_to(target: u32, command: u32) -> bool {
     // SAFETY: the APIC is initialised per the caller's obligation.
     unsafe {
         if in_x2apic_mode() {

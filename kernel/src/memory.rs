@@ -100,12 +100,22 @@ pub unsafe fn init(handoff: &Handoff, bump: &mut BumpAllocator) -> Result<Pmm, M
         if region.kind != MemoryKind::Usable {
             continue;
         }
-        add_region_excluding(
-            &mut pmm,
-            region.base.as_u64(),
-            region.end().as_u64(),
-            consumed,
-        );
+        let (base, end) = (region.base.as_u64(), region.end().as_u64());
+
+        // The SMP trampoline's page, carved out here before any frame can
+        // reach a free list: a processor released by STARTUP begins below
+        // one megabyte, and the only way to have a page there when it is
+        // needed is to never let the allocator hand it to anyone else.
+        // Recorded with `smp`, which refuses native bring-up honestly on a
+        // machine whose map had no usable page at this address.
+        const TRAMPOLINE_END: u64 = crate::smp::TRAMPOLINE_FRAME + FRAME_SIZE;
+        if base <= crate::smp::TRAMPOLINE_FRAME && TRAMPOLINE_END <= end {
+            crate::smp::note_trampoline_reserved();
+            add_region_excluding(&mut pmm, base, crate::smp::TRAMPOLINE_FRAME, consumed);
+            add_region_excluding(&mut pmm, TRAMPOLINE_END, end, consumed);
+        } else {
+            add_region_excluding(&mut pmm, base, end, consumed);
+        }
     }
 
     Ok(pmm)

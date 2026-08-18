@@ -72,17 +72,62 @@ pub fn hertz() -> Option<u64> {
 
 /// Converts a count of ticks to nanoseconds, or `None` without a rate.
 ///
-/// Multiplies before dividing, so a short interval does not truncate to zero,
-/// and saturates rather than wrapping on an implausible input.
+/// Multiplies before dividing, so a short interval does not truncate to
+/// zero — and the multiply is widened to 128 bits, because in 64 the
+/// product overflows at eighteen giga-ticks: **a few seconds of uptime**
+/// at any real rate. The saturating multiply this replaces froze the
+/// clock there — every value after the cliff collapsed to one constant,
+/// so every deadline computed from it was reachable never — and it was
+/// found by a bring-up wait that genuinely never ended, not by this
+/// comment's author reading carefully.
 #[must_use]
 pub fn to_nanos(ticks: u64) -> Option<u64> {
     let hertz = hertz()?;
-    Some(ticks.saturating_mul(1_000_000_000) / hertz)
+    let nanos = (u128::from(ticks) * 1_000_000_000) / u128::from(hertz);
+    // Beyond u64 nanoseconds is five centuries of uptime; saturation there
+    // is a statement, not a bug.
+    Some(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 /// Converts microseconds to ticks, or `None` without a rate.
+///
+/// Widened for the same reason as [`to_nanos`]: `micros × hertz` leaves
+/// 64 bits while both factors are still ordinary.
 #[must_use]
 pub fn from_micros(micros: u64) -> Option<u64> {
     let hertz = hertz()?;
-    Some(micros.saturating_mul(hertz) / 1_000_000)
+    let ticks = (u128::from(micros) * u128::from(hertz)) / 1_000_000;
+    Some(u64::try_from(ticks).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The clock must keep moving past eighteen giga-ticks — the exact
+    /// cliff where the pre-widening arithmetic saturated. Beyond it every
+    /// reading collapsed to one constant, so every deadline computed from
+    /// the clock became unreachable; found by a bring-up wait that
+    /// genuinely never ended, a few seconds into an emulated boot.
+    #[test]
+    fn the_clock_does_not_freeze_past_eighteen_giga_ticks() {
+        set_hertz(2_400_000_000);
+        let cliff = 19_030_889_816; // the reading the wedged boot printed
+        let before = to_nanos(cliff).expect("calibrated");
+        let after = to_nanos(cliff + 2_400_000_000).expect("calibrated");
+        assert_eq!(before, 7_929_537_423);
+        assert_eq!(
+            after - before,
+            1_000_000_000,
+            "one second of ticks must be one second of nanoseconds, at any uptime"
+        );
+    }
+
+    /// The other direction has the same cliff: microseconds times hertz
+    /// leaves 64 bits while both factors are still ordinary.
+    #[test]
+    fn micros_conversion_survives_large_durations() {
+        set_hertz(2_400_000_000);
+        assert_eq!(from_micros(8_000_000_000), Some(19_200_000_000_000));
+    }
 }

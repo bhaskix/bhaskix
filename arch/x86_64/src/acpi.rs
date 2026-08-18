@@ -39,6 +39,11 @@
 /// interrupt; a table declaring more is truncated, and says so.
 pub const MAX_OVERRIDES: usize = 16;
 
+/// Enabled processors a MADT may declare before this parser stops recording
+/// them. Matches the per-CPU table's own limit: a processor past it could not
+/// be brought online anyway, and the drop is reported as truncation.
+pub const MAX_LAPICS: usize = 64;
+
 /// Largest table this will read.
 ///
 /// A header claiming more is refused rather than believed. Real tables are a
@@ -92,6 +97,8 @@ pub struct Madt {
     io_apic: Option<IoApicEntry>,
     overrides: [Option<SourceOverride>; MAX_OVERRIDES],
     count: usize,
+    lapics: [u32; MAX_LAPICS],
+    lapic_count: usize,
     /// I/O APICs the table declared, including ones not used.
     pub io_apics_seen: usize,
     /// Whether entries were dropped for want of room.
@@ -103,6 +110,17 @@ impl Madt {
     #[must_use]
     pub const fn io_apic(&self) -> Option<IoApicEntry> {
         self.io_apic
+    }
+
+    /// Local APIC identifiers of every *enabled* processor the table
+    /// declared, the bootstrap CPU included, in table order.
+    ///
+    /// Entries whose enabled flag is clear are not listed: a disabled
+    /// processor is the firmware saying "do not start this one", and the
+    /// INIT-SIPI path takes it at its word.
+    #[must_use]
+    pub fn processors(&self) -> &[u32] {
+        &self.lapics[..self.lapic_count]
     }
 
     /// How many overrides were recorded.
@@ -513,6 +531,8 @@ pub fn parse_madt(bytes: &[u8]) -> Option<Madt> {
         io_apic: None,
         overrides: [None; MAX_OVERRIDES],
         count: 0,
+        lapics: [0; MAX_LAPICS],
+        lapic_count: 0,
         io_apics_seen: 0,
         truncated: false,
     };
@@ -558,10 +578,33 @@ pub fn parse_madt(bytes: &[u8]) -> Option<Madt> {
                     madt.truncated = true;
                 }
             }
-            // Everything else -- local APICs, NMI sources, x2APIC entries --
-            // is skipped by length. Skipping by length is safe here precisely
-            // because the length was checked above; skipping by a guessed size
-            // per type is how a walker desynchronises from the table.
+            // Processor local APIC. Only the enabled ones are recorded: a
+            // clear enabled flag is the firmware saying "do not start this
+            // one" -- an online-capable-but-disabled entry is a hot-plug
+            // socket, not a processor -- and the INIT-SIPI path takes the
+            // table at its word.
+            0 if entry_length >= 8 && u32_at(entry, 4)? & 1 != 0 => {
+                if madt.lapic_count < MAX_LAPICS {
+                    madt.lapics[madt.lapic_count] = u32::from(entry[3]);
+                    madt.lapic_count += 1;
+                } else {
+                    madt.truncated = true;
+                }
+            }
+            // Local x2APIC: the same processor statement with a 32-bit
+            // identifier, for machines with more than 254 of them.
+            9 if entry_length >= 16 && u32_at(entry, 8)? & 1 != 0 => {
+                if madt.lapic_count < MAX_LAPICS {
+                    madt.lapics[madt.lapic_count] = u32_at(entry, 4)?;
+                    madt.lapic_count += 1;
+                } else {
+                    madt.truncated = true;
+                }
+            }
+            // Everything else -- NMI sources, address overrides -- is skipped
+            // by length. Skipping by length is safe here precisely because
+            // the length was checked above; skipping by a guessed size per
+            // type is how a walker desynchronises from the table.
             _ => {}
         }
 
@@ -782,9 +825,50 @@ mod tests {
         entry
     }
 
-    /// A local APIC entry: skipped, and there to be skipped correctly.
+    /// A local APIC entry: one enabled processor.
     fn local_apic(id: u8) -> Vec<u8> {
         vec![0u8, 8, id, id, 1, 0, 0, 0]
+    }
+
+    /// A local APIC entry whose enabled flag is clear -- a socket, not a
+    /// processor, and the walk must not list it.
+    fn local_apic_disabled(id: u8) -> Vec<u8> {
+        vec![0u8, 8, id, id, 0, 0, 0, 0]
+    }
+
+    /// A local x2APIC entry: the 32-bit form of the same statement.
+    fn x2apic(id: u32, enabled: bool) -> Vec<u8> {
+        let mut entry = vec![9u8, 16, 0, 0];
+        entry.extend_from_slice(&id.to_le_bytes());
+        entry.extend_from_slice(&u32::from(enabled).to_le_bytes());
+        entry.extend_from_slice(&id.to_le_bytes()); // acpi uid
+        entry
+    }
+
+    #[test]
+    fn processors_lists_enabled_lapics_and_only_those() {
+        let bytes = madt_bytes(&[
+            local_apic(0),
+            local_apic_disabled(7),
+            io_apic(2, 0xfec0_0000, 0),
+            local_apic(1),
+            x2apic(300, true),
+            x2apic(301, false),
+        ]);
+        let madt = parse_madt(&bytes).expect("valid");
+        assert_eq!(madt.processors(), &[0, 1, 300]);
+        assert!(!madt.truncated);
+    }
+
+    #[test]
+    fn a_sixty_fifth_processor_is_truncation_not_silence() {
+        let mut entries: Vec<Vec<u8>> =
+            (0..=MAX_LAPICS).map(|id| x2apic(id as u32, true)).collect();
+        entries.push(io_apic(2, 0xfec0_0000, 0));
+        let bytes = madt_bytes(&entries);
+        let madt = parse_madt(&bytes).expect("valid");
+        assert_eq!(madt.processors().len(), MAX_LAPICS);
+        assert!(madt.truncated);
     }
 
     #[test]

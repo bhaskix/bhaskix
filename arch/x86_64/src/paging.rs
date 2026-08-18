@@ -290,6 +290,55 @@ pub unsafe fn map_device_page(
     }
 }
 
+/// Returns the physical address `virtual_address` maps to through a leaf of
+/// **any** size — 4 KiB, 2 MiB or 1 GiB.
+///
+/// [`translate`] deliberately answers `None` for large pages, because its
+/// callers go on to edit 4 KiB mappings. This one exists for presence
+/// probes: a bootloader's direct map is built from large pages, and asking
+/// "is this byte reachable" with a 4 KiB-only walk reports mapped memory as
+/// absent — which sent `mmio::map` into a doomed remap of a page that was
+/// there all along.
+///
+/// # Safety
+///
+/// As [`translate`].
+#[must_use]
+pub unsafe fn translate_any(root: u64, virtual_address: u64, hhdm_base: u64) -> Option<u64> {
+    let indices = indices_of(virtual_address);
+
+    // SAFETY: the caller guarantees `root` is a PML4 reachable through the
+    // direct map. Every read is of a table entry; nothing is written.
+    unsafe {
+        let mut table = (hhdm_base + root) as *mut u64;
+        for (level, &index) in indices[..3].iter().enumerate() {
+            let value = table.add(index).read_volatile();
+            if value & flags::PRESENT == 0 {
+                return None;
+            }
+            if value & flags::HUGE != 0 {
+                // A leaf at the PDPT is 1 GiB, at the PD 2 MiB. The PML4
+                // has no huge form; a set bit there is firmware garbage and
+                // is treated as absent rather than decoded.
+                let bits = match level {
+                    1 => 30,
+                    2 => 21,
+                    _ => return None,
+                };
+                let base = value & ADDRESS_MASK & !((1_u64 << bits) - 1);
+                return Some(base | (virtual_address & ((1_u64 << bits) - 1)));
+            }
+            table = (hhdm_base + (value & ADDRESS_MASK)) as *mut u64;
+        }
+        let leaf = table.add(indices[3]).read_volatile();
+        if leaf & flags::PRESENT == 0 {
+            None
+        } else {
+            Some((leaf & ADDRESS_MASK) | (virtual_address & 0xfff))
+        }
+    }
+}
+
 /// Returns the physical address `virtual_address` maps to, if any.
 ///
 /// # Safety

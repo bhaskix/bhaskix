@@ -130,7 +130,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **A5** | 5-level paging (LA57) | ✅ **Accepted** 2026-08-16 — answered by RFC 0025, implemented 2026-08-15 with the document; **the last open architecture question is closed** | **Four-level, on purpose, with the refusal shipped**: every walk and half-split in the tree is a bit-47 statement, so bring-up now reads `CR4.LA57` and halts with a sentence rather than corrupting addresses silently under a bootloader whose default changed. The boot report states capability beside choice. Five-level gets built against a written trigger — an address-space or physical-memory need no current machine has — not an open wait. | [RFC 0025](docs/rfc/0025-four-level-paging-on-purpose.md) |
 | **TE1** | Telemetry plane | ✅ **Accepted 2026-08-17** — drafted, implemented (all six steps) and accepted the same day, on the working demonstration: two boot gates per placement, one negative-armed, the emit priced from both sides | **A 64-byte typed event, one lock-free drop-newest ring per CPU, two capabilities to read them.** [ai-native.md](docs/ai-native.md) §2 built as specified, with three narrownesses stated in the draft rather than discovered later: per-domain enable bits deferred to their first consumer (per-class now), the `Audit` class reserved but refused (best-effort audit is false assurance — backpressure is its own RFC on this foundation), and the domain field carrying the id without the generation. Rejects the `TelemetryChannel`-per-domain sketch in `architecture.md` — the producer is a CPU, often in interrupt context, not a domain. Partially answers RFC 0008's Q4: a capability is named (domain, slot, kind) for tracing; audit-grade naming stays open | [RFC 0026](docs/rfc/0026-telemetry-plane.md) |
 | **SK1** | A sockets API worth the name | ✅ **Accepted 2026-08-17** — drafted, implemented (steps 1–4) and accepted the same day, on the ports: `bin/dhcp` 28 → 10 `unsafe` lines, `bin/tcpc` 45 → 12, the crate carries 20 once; every gate unchanged, the measure A/B'd neutral. Question 2 answered by the port (the leg order stays the caller's); questions 1 (the shell) and 3 (a user-rt crate) stay open with their triggers written | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
-| **BB1** | `bhaskixboot.efi` | ⬜ **Draft** 2026-08-17, steps 1–6 implemented — **the kernel boots on its own loader**: twenty lane gates plus a permanent negative arm, the kernel's own report naming `bhaskixboot 0.0.0`, validating the handoff, and stating both reductions (one CPU, unslid). Step 7 — parity — remains, and the roadmap bullet closes there | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
+| **BB1** | `bhaskixboot.efi` | ⬜ **Draft** 2026-08-17, step 7's parity work done — **the kernel boots on its own loader, slid by a drawn KASLR slide and running four CPUs the kernel started itself** (MADT discovery, kernel-side INIT-SIPI, claim-mailbox trampoline). Twenty-three lane gates plus a permanent negative arm, six consecutive green runs. What remains before the roadmap bullet closes: the lane adopts the full Limine-lane gate set | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -761,6 +761,45 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-18 (RFC 0028 step 7, second half: the kernel starts its own processors — and finds the clock cliff)
+
+**Four CPUs on the native lane, none of them started by anyone but the kernel.** The loader
+keeps offering `start_secondaries: None`, honestly, and `smp.rs` now answers `None` by owning
+the road its own header used to call "worth owning eventually": processors enumerated from the
+MADT (the ACPI walker grew `processors()`, host-tested, disabled entries refused), a real-mode
+trampoline (`bhaskix_arch::mp` — 16-bit entry to long mode in one page, position-independent,
+far-jump immediates as named symbols, encodings host-tested) copied to a page `memory::init`
+carves out below one megabyte before any frame reaches a free list, and INIT-SIPI-SIPI sent
+from the bootstrap CPU. RFC 0028's question 2 is answered **against its own sketch** — loader-
+side parking cannot satisfy the fn-pointer contract once the kernel leaves the boot tables —
+and the answer is stronger: this road serves *any* loader that cannot start secondaries.
+
+**Two real bugs surfaced, both convicted with instruments rather than theory.**
+First: `mmio::map`'s presence probe used the 4 KiB-only `translate`, which deliberately answers
+`None` for large pages — so on the loader's 2 MiB direct map the MADT looked unmapped and the
+remap failed against the huge entry. `translate_any` (leaf of any size) now serves the probe.
+Second, the one worth the changelog: **the kernel's clock froze at eighteen giga-ticks.**
+`tsc::to_nanos` multiplied ticks by 10⁹ in 64 bits with a *saturating* multiply — past
+`u64::MAX / 10⁹` ticks (seconds of emulated uptime; minutes of real) every reading collapsed to
+one constant, so every deadline computed from `now_nanos` became unreachable, forever. Found
+because bring-up waits "never ended" only on runs that booted slowly enough to cross the cliff
+first — a boot printed `tsc 19030889816 nanos Some(7669277472)` and the arithmetic confessed.
+(Two theories died honourably on the way: a phantom "second boot" — the loader's banner simply
+appears twice, serial and console-mirror, in every log including the first native boot — and a
+phantom low-memory zeroer.) Widened to 128 bits, both directions; the cliff is a host test
+watched red at the exact reading the wedged boot printed.
+
+**The trampoline hands over stacks through an atomic mailbox, because emulation taught it to.**
+A processor can arrive *seconds* late under TCG; a late processor reading slots repatched for
+its sibling was a shared stack and a stolen identity. Now the bootstrap CPU offers each stack
+with one atomic store, a released processor wins it with `lock cmpxchg` — emptying the mailbox
+in the same instruction — an unclaimed offer is retracted by the same CAS (and leaked, on
+purpose), and every processor derives its own identity from `CPUID`, which cannot be stale.
+The lane boots `-smp 4` and demands: the kernel's INIT-SIPI line naming four MADT processors,
+`cpus 4 online of 4`, and shootdown IPIs completing across all four. **Six consecutive lane
+runs green**; budgets 1110 → 1141 (arch) and 1248 → 1290 (kernel), measured, reasons in the
+manifests. Remaining before the roadmap bullet closes: the lane adopts the full gate set.
 
 ### 2026-08-18 (RFC 0028 step 7, first half: the slide stops being zero)
 

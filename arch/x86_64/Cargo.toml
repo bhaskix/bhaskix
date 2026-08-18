@@ -106,7 +106,13 @@ workspace = true
 # cannot be avoided, because a descriptor is memory the hardware reads and a
 # compiler that sank or reordered those writes past the tail register would
 # publish a queue entry the unit reads before it exists.
-unsafe_budget = 1110
+# 1141 at RFC 0028 step 7: the kernel takes ownership of secondary bring-up.
+# The trampoline's global_asm and the raw reads that measure it, the huge-page-
+# aware translate_any (a walker over live table frames, like translate beside
+# it), and the INIT and STARTUP sends -- one shared ICR path, the same shape as
+# send_ipi. None avoidable: a CPU is brought out of reset by exactly these
+# stores, and there is no safe wrapper for a processor that does not exist yet.
+unsafe_budget = 1141
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

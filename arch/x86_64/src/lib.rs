@@ -35,6 +35,7 @@ pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod ioapic;
+pub mod mp;
 pub mod msr;
 pub mod paging;
 pub mod pci;

@@ -252,7 +252,14 @@ workspace = true
 # 1248 at steps 3-4: the round trip's kernel half -- the probe burst's tail
 # write, and the traced report page read out through the direct map, the
 # same shape every report reader pays.
-unsafe_budget = 1248
+#
+# 1290 at RFC 0028 step 7: native secondary bring-up. The trampoline copy and
+# its patches through the direct map, the bring-up root's frame writes, the
+# stack mailbox viewed as the atomic it is, the MADT walk reusing irq's own
+# ensure-mapped closure shape, and the INIT-SIPI sends. All writes to memory
+# no Rust object owns -- a page reserved at boot for a processor that does
+# not exist yet.
+unsafe_budget = 1290
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

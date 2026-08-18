@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Draft — steps 1–6 implemented; step 7's parity work (KASLR, secondaries) landed 2026-08-18, with question 2 answered against its own sketch: bring-up lives in the kernel. What remains is the lane adopting the full gate set |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot |
 | **Milestone** | Phase 2 — the roadmap's `bhaskixboot.efi` bullet, and half of the phase's exit criterion ("boots on its own bootloader") |
@@ -91,9 +91,11 @@ small — sign of life, payload integrity — and grows with the steps below; th
 list at any moment *is* the honest statement of how far sovereignty has come. Two reductions
 are expected to persist past the first entry and are stated now rather than discovered:
 **secondary CPUs** (the kernel already answers a loader that cannot start them — "loader
-reported no way to start secondaries" — so the native lane boots one CPU until the loader
-grows INIT-SIPI parking, which is its own step) and **KASLR** (unslid until the draw step;
-the lane's gate accepts "unslid, and said so" only while that step is pending). Phase 2's
+reported no way to start secondaries" — so the native lane boots one CPU until the parking
+gap closes; *closed at step 7, and not as sketched here: the kernel grew its own INIT-SIPI,
+see unresolved question 2*) and **KASLR** (unslid until the draw step; the lane's gate
+accepts "unslid, and said so" only while that step is pending — *closed at step 7: the
+loader draws, and the lane demands the kernel confirm the slide*). Phase 2's
 exit criterion is met when the native lane runs the **same 48 gates as the Limine lanes**,
 and not before.
 
@@ -163,9 +165,21 @@ recorded beside the Limine lanes' as a curiosity, not a gate.
 1. **Where the native lane's ISO/ESP layout lives** — one hybrid image carrying both loaders,
    or a second image for the native lane. Decided in step 1 by whichever keeps
    `make test` one target.
-2. **Secondary-CPU parking** — the loader's INIT-SIPI step needs a real-mode trampoline; how
+2. **Secondary-CPU parking** — ~~the loader's INIT-SIPI step needs a real-mode trampoline; how
    much of `kernel/src/smp.rs`'s existing bring-up knowledge is shareable is decided when
-   that step is reached.
+   that step is reached.~~ **Answered at step 7, against the sketch**: the trampoline lives in
+   the *kernel*, not the loader. A loader-side implementation cannot satisfy the
+   `start_secondaries` contract — the function pointer would name loader code at identity
+   addresses that stop being mapped the moment the kernel leaves the boot tables — and
+   parking loader-started CPUs would put their whole world in reclaimable memory. So the
+   loader keeps offering `None`, honestly, and `smp.rs` answers `None` by doing the work
+   itself: processors enumerated from the MADT, a real-mode trampoline
+   (`bhaskix_arch::mp`) copied to a page reserved below one megabyte at boot, INIT-SIPI-SIPI
+   from the bootstrap CPU, and every stack handed over through an atomic mailbox a released
+   processor must *win* — because under emulation a processor can arrive seconds late, and a
+   late processor reading repatched slots was a shared stack and a stolen identity (each CPU
+   derives its own from `CPUID` instead). This road works for **any** loader that cannot
+   start secondaries, which is a stronger property than the sketch had.
 3. **Secure Boot signing** — deliberately out of scope; revisited when physical hardware
    (M1-17) makes it concrete.
 

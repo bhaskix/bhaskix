@@ -49,9 +49,13 @@ pub fn map(physical: u64, length: u64, hhdm: u64) -> Option<u64> {
     let mut page = first_page;
     loop {
         let target = hhdm.checked_add(page)?;
+        // Any leaf size counts as present: during early boot the active
+        // tables are the bootloader's, whose direct map is 2 MiB pages, and
+        // a 4 KiB-only probe would report those bytes absent and then fail
+        // remapping what was reachable all along.
         // SAFETY: reading the active page table's entries has no side effects.
         let present =
-            unsafe { paging::translate(paging::active_page_table(), target, hhdm).is_some() };
+            unsafe { paging::translate_any(paging::active_page_table(), target, hhdm).is_some() };
 
         if !present {
             let mapped = heap::with(|heap| {
