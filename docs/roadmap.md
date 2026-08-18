@@ -30,7 +30,7 @@ Every milestone has an exit criterion that a stranger can verify by running a co
 | [coding-style.md](coding-style.md) | ✅ adopted for Phase 1 |
 | A1 license | ✅ [RFC 0001](rfc/0001-license-apache-2.0.md) — Apache-2.0 |
 | A2 syscall ABI shape · A3 IPC style · A4 userspace ABI | ✅ [RFC 0008](rfc/0008-syscall-and-ipc-shape.md) |
-| A5 5-level paging (LA57) | ⬜ open |
+| A5 5-level paging (LA57) | ✅ [RFC 0025](rfc/0025-five-level-paging.md) — four-level on purpose, five behind written triggers |
 | Dev environment reproducible (`tools/setup-dev.sh`) | ✅ |
 | CI: build, fmt, clippy, host tests, QEMU boot | ✅ |
 | Design-document review by two people who did not write them | ⬜ **outstanding** |
@@ -46,7 +46,8 @@ marked complete. It does not block code, and it should be closed before the arch
 blocking *M1 exit*. They never blocked M1, which is boot and output and touches none of them; A1
 blocked *accepting external contributions*, and was settled before any arrived. A2, A3 and A4 were
 answered together by RFC 0008 — A4 by refusing its premise, since the native ABI *is* the syscall
-interface. A5 is the one still open.
+interface. A5 closed 2026-08-16 with RFC 0025 — this paragraph said "A5 is the one still open"
+until 2026-08-18, two days stale, found while closing RFC 0029. No architecture question is open.
 
 ---
 
@@ -208,7 +209,7 @@ held to the same gates as the incumbent. What remains is package management and 
   said "await acceptance review" until 2026-08-18). The sockets API above what the services themselves speak exists since
   [RFC 0027](rfc/0027-a-sockets-api-worth-the-name.md) (accepted 2026-08-17): `bhaskix-sock`,
   the client crate `bin/dhcp` and `bin/tcpc` now speak through. [RFC 0029](rfc/0029-ipv6.md)
-  (all six steps implemented 2026-08-18, acceptance pending) landed IPv6 as a second address
+  (accepted 2026-08-18, all six steps) landed IPv6 as a second address
   family rather than a second stack: zero-`unsafe` parsers and NDP, SLAAC, UDP and TCP over
   the same rings and handover with the state machine untouched, dual stack gated on every
   networked boot, and both families measured on the same run — the v6 numbers through the
