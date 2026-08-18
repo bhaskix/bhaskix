@@ -629,6 +629,44 @@ pub fn for_each_lock_event(
     }
 }
 
+/// Runs the acquire's claim — the count and rank going up — with interrupts
+/// off, as one step with respect to the tick.
+///
+/// **This closes the hole every 2026-08-18 specimen pointed at.** The veto
+/// in `preempt` protects a claimed holder; it cannot protect a claim in
+/// flight. Between reading which CPU this is and landing the increment —
+/// and again between the count's increment and the rank's — the count is
+/// still zero, so a tick there switches the thread out and steal may resume
+/// it on another CPU. The increment then lands on the *old* CPU's counter,
+/// poisoning whichever thread runs there next with a hold it never took
+/// (`BLOCK HOLDING` with no open guard, `SAVED COUNT`), while the claimant
+/// carries a rank with no count (`COUNT MISMATCH`) and its release
+/// underflows (`COUNT UNDERFLOW`) — the four markers of one tear, and
+/// run-161's mirror is the same race with the windows reversed. A few
+/// interrupt-free stores make the claim land whole, on one CPU, after which
+/// the veto's protection is continuous.
+fn claim_uninterrupted(claim: impl FnOnce()) {
+    // On the host there is no tick and no steal — the per-thread leases
+    // that stand in for CPUs never migrate — and a `cli` in ring 3 would
+    // end the test process, so the guard is the target's alone.
+    #[cfg(test)]
+    claim();
+    #[cfg(not(test))]
+    {
+        let were_enabled = bhaskix_arch::cpu::interrupts_enabled();
+        if were_enabled {
+            // SAFETY: re-enabled below on the same path; the window is a
+            // handful of stores.
+            unsafe { bhaskix_arch::cpu::disable_interrupts() };
+        }
+        claim();
+        if were_enabled {
+            // SAFETY: restoring exactly the state observed on entry.
+            unsafe { bhaskix_arch::cpu::enable_interrupts() };
+        }
+    }
+}
+
 fn holds_slot() -> &'static AtomicU32 {
     &HOLDS[effective_cpu()]
 }
@@ -857,7 +895,9 @@ impl<T> SpinLock<T> {
         // as a thread holding nothing. `lock` has always claimed its rank
         // before it starts spinning, for the same reason; this is that rule
         // applied to the count. Over-claiming costs a skipped preemption.
-        holds_slot().fetch_add(1, Ordering::Relaxed);
+        claim_uninterrupted(|| {
+            holds_slot().fetch_add(1, Ordering::Relaxed);
+        });
         let won = self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -942,8 +982,10 @@ impl<T> SpinLock<T> {
         // Both go up before the spin, so there is no instant in which the lock
         // is held and either says otherwise. Claiming while merely waiting
         // costs a skipped preemption.
-        holds_slot().fetch_add(1, Ordering::Relaxed);
-        slot().fetch_or(self.rank.bit(), Ordering::Relaxed);
+        claim_uninterrupted(|| {
+            holds_slot().fetch_add(1, Ordering::Relaxed);
+            slot().fetch_or(self.rank.bit(), Ordering::Relaxed);
+        });
 
         while self
             .locked

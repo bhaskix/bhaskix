@@ -762,6 +762,38 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (the disease convicted: the acquire's front edge was migratable, and four markers were one tear)
+
+**The upgraded instruments caught a complete specimen, and it convicts.** One suite boot
+wedged with the full sequence on cpu 1: `BLOCK HOLDING (mask 0, 1 held)` with **`open guard
+none — the counted hold has no open guard, which is itself the answer`**; `COUNT MISMATCH —
+rank mask 0b1000000000 with a hold count of zero: a counted increment has been lost, and the
+next release of this guard will underflow`; that exact underflow arriving at wait.rs:195's
+release; and `SAVED COUNT thread 12 (ring-0) switched out via block_self with 1 counted holds
+and an empty mask` — an *innocent* thread carrying a phantom hold with no guard behind it.
+
+**The mechanism, and it fits every specimen in the ledger**: `preempt`'s veto protects a
+*claimed* holder — it cannot protect a claim in flight. Between `percpu::cpu_id()` and the
+count's `fetch_add`, and again between the count's increment and the rank's, the count is
+still zero: a tick there switches the claimant out, steal resumes it on another CPU, and the
+accounting splits — the increment lands on the **old** CPU's counter, poisoning whichever
+thread runs there next (`BLOCK HOLDING` with no open guard, `SAVED COUNT`, and a permanent
+preemption veto on that CPU — the silent-hang family), while the claimant carries a rank with
+no count (`COUNT MISMATCH`) and its release underflows (`COUNT UNDERFLOW`). Run-161's phantom
+mask beside a healthy count is the same race with the windows reversed: **one bug, literally
+wearing two masks**, exactly as the specimen-soak entry guessed without being able to say
+where.
+
+**The fix is a few interrupt-free stores**: `claim_uninterrupted` runs the acquire's count and
+rank updates with interrupts off, as one step with respect to the tick, after which the veto's
+protection is continuous. Host tests keep their bare path — no tick, no steal, and a `cli` in
+ring 3 would end the process. The release needed nothing: its whole span is veto-protected,
+which the code's own comments already argued. **Claimed as the root cause of the counter
+family on the mechanism's fit to all seven specimens; the proof standard is the negative
+space** — the wedge rate of every suite and soak that follows, with all five markers still
+armed to convict a survivor. The crash/ghost-frame family may be downstream of a vetoed CPU or
+may be its own disease; it keeps its row and its frame-dump instrument either way.
+
 ### 2026-08-18 (RFC 0028 step 4: one ELF parser, and the kernel gives it up without changing)
 
 **`kernel/src/elf.rs` split along the line its own design drew.** The parser — every check,
