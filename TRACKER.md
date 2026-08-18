@@ -131,6 +131,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **TE1** | Telemetry plane | ✅ **Accepted 2026-08-17** — drafted, implemented (all six steps) and accepted the same day, on the working demonstration: two boot gates per placement, one negative-armed, the emit priced from both sides | **A 64-byte typed event, one lock-free drop-newest ring per CPU, two capabilities to read them.** [ai-native.md](docs/ai-native.md) §2 built as specified, with three narrownesses stated in the draft rather than discovered later: per-domain enable bits deferred to their first consumer (per-class now), the `Audit` class reserved but refused (best-effort audit is false assurance — backpressure is its own RFC on this foundation), and the domain field carrying the id without the generation. Rejects the `TelemetryChannel`-per-domain sketch in `architecture.md` — the producer is a CPU, often in interrupt context, not a domain. Partially answers RFC 0008's Q4: a capability is named (domain, slot, kind) for tracing; audit-grade naming stays open | [RFC 0026](docs/rfc/0026-telemetry-plane.md) |
 | **SK1** | A sockets API worth the name | ✅ **Accepted 2026-08-17** — drafted, implemented (steps 1–4) and accepted the same day, on the ports: `bin/dhcp` 28 → 10 `unsafe` lines, `bin/tcpc` 45 → 12, the crate carries 20 once; every gate unchanged, the measure A/B'd neutral. Question 2 answered by the port (the leg order stays the caller's); questions 1 (the shell) and 3 (a user-rt crate) stay open with their triggers written | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
 | **BB1** | `bhaskixboot.efi` | ✅ **Accepted 2026-08-18**, all seven steps implemented — **the machine boots on its own loader at full strength**: slid by a drawn KASLR slide, four CPUs the kernel started itself, and `boot-test.sh native` answering the **same 74 gates every Limine lane answers** (ring 3, services, shell path, network, filesystem — all of it), beside the loader-specific lane's 23 and its permanent negative arm. The roadmap bullet is closed | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
+| **IP6** | IPv6 | ⬜ **Draft** 2026-08-18 — RFC 0029, six steps; closes the networking bullet's last open line | **A second address family, not a second stack.** The collection on RFC 0018's pre-paid abstraction: a `V6` variant on the one-variant `Address` enum (the compiler produces the work list), parsers and NDP as zero-`unsafe` arithmetic in `bhaskix-net`, SLAAC in `bin/ipd`, UDP/TCP over the same rings and capability handover — a v6 endpoint fits an IPC message's four words exactly. Refused with written triggers: extension headers, fragmentation, DHCPv6, privacy addresses, a resolver. One stated harness reduction: this QEMU's slirp cannot deliver inbound v6, so the LISTEN path's v6 wire proof waits on a newer QEMU or hardware | [RFC 0029](docs/rfc/0029-ipv6.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -761,6 +762,20 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-18 (RFC 0029 drafted: IPv6, the second family the first one was shaped for)
+
+**The last open line of the last open Phase 2 bullet gets its RFC.** Six steps: the family
+as zero-`unsafe` arithmetic in `bhaskix-net` (fixed header, mandatory-checksum discipline,
+ICMPv6 with the pseudo-header), NDP with the ARP cache generalised to one neighbour table
+keyed on `Address`, link-local + SLAAC in `bin/ipd` with the boot report saying what was
+obtained, then UDP and TCP over the **same rings and the same three-leg handover** — the RFC
+fails its own premise if `tcpd` needs more than a checksum and a key type. The ABI carries a
+v6 endpoint in registers: two words of address, a port, a leg — `CONNECT6` uses all four
+words exactly. Five refusals with written triggers (extension headers, fragmentation, DHCPv6,
+privacy addresses, a resolver) and one harness reduction stated up front: slirp on this QEMU
+speaks v6 outbound (`ipv6=on` verified accepted) but has no inbound v6 `hostfwd`, so the
+LISTEN path's v6 wire proof carries a trigger instead of a silence.
 
 ### 2026-08-18 (RFC 0028 accepted: the first instruction on every UEFI boot is ours)
 
