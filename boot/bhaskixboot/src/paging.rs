@@ -6,8 +6,8 @@
 //! until the jump), the **higher-half direct map** at the base the kernel
 //! expects — both of physical memory and the framebuffer, and both through
 //! the *same* page-directory pages, because they map the same bytes — and
-//! the **kernel image**, its segments at their linked high-half addresses,
-//! W^X held per segment with 4 KiB precision.
+//! the **kernel image**, its segments at their linked high-half addresses
+//! plus the KASLR slide, W^X held per segment with 4 KiB precision.
 //!
 //! Four-level on purpose, exactly as RFC 0025 settled for the kernel: the
 //! loader hands over the world the kernel was built for.
@@ -117,7 +117,9 @@ pub struct World {
 /// Builds the world: identity and HHDM over `[0, physical_top)` plus the
 /// framebuffer span, 2 MiB pages, sharing directories; then the kernel's
 /// segments, 4 KiB pages, W^X from the image's own protections, backed by
-/// `kernel_phys` where the loader placed them.
+/// `kernel_phys` where the loader placed them and mapped at their linked
+/// addresses **plus `slide`** — the KASLR term, zero only when the machine
+/// had no entropy to draw from.
 ///
 /// Returns `None` — a printed refusal at the caller — if the pool runs dry.
 #[must_use]
@@ -128,6 +130,7 @@ pub fn build(
     image: &Image,
     kernel_phys: u64,
     kernel_virt_base: u64,
+    slide: u64,
 ) -> Option<World> {
     let root = pool.take()?;
 
@@ -146,12 +149,14 @@ pub fn build(
     // The kernel's segments, 4 KiB precision, protections from the image —
     // the same `Protection` the parser refused W+X in, translated here into
     // the architecture's bits: writable adds W, non-executable adds NX.
+    // `virt` walks link addresses — the physical placement is keyed to them
+    // — and the slide is added only where the page is named in the tables.
     for segment in image.segments() {
         let (span_start, span_end) = page_span(segment)?;
         let mut virt = span_start;
         while virt < span_end {
             let phys = kernel_phys + (virt - kernel_virt_base);
-            let (l4, l3, l2, l1) = indices(virt);
+            let (l4, l3, l2, l1) = indices(virt.wrapping_add(slide));
             let pdpt = child(pool, root, l4)?;
             let pd = child(pool, pdpt, l3)?;
             let pt = child(pool, pd, l2)?;

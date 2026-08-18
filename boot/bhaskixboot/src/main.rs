@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `bhaskixboot.efi` — the native UEFI loader, RFC 0028.
 //!
-//! Steps 1 through 5: enter from the firmware and say so; read the kernel,
+//! The whole flight: enter from the firmware and say so; read the kernel,
 //! the initrd and the configuration into memory the loader owns, proving
-//! every byte; take the machine's shape; exit boot services; then build
-//! the world the kernel will be entered under — the identity and
-//! higher-half maps, the kernel's segments placed W^X at their linked
-//! addresses, and the `Handoff` assembled in reclaimable memory. The one
-//! thing this step does not do is jump: step 6 opens the shim's second
-//! door, and until then the loader parks on a machine it fully owns, with
-//! everything the jump needs already standing.
+//! every byte; take the machine's shape; exit boot services; draw the
+//! KASLR slide (RFC 0021's draw — a machine without entropy boots unslid
+//! and says so); build the world the kernel will be entered under — the
+//! identity and higher-half maps, the kernel's segments placed W^X at
+//! their linked addresses plus the slide, and the `Handoff` assembled in
+//! reclaimable memory; then jump through the shim's second door and never
+//! return.
 //!
 //! # The bindings are hand-rolled, and hostile
 //!
@@ -255,17 +255,30 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
             &kernel_buffer[segment.file_offset..segment.file_offset + segment.file_size],
         );
     }
-    // A relocatable kernel's fixups, applied at slide zero — the value
-    // written is exactly the addend, and the day KASLR arrives the slide
-    // joins the sum and nothing else changes. Any relocation kind the
-    // loader cannot express refuses the whole image, in the crate, before
-    // a single byte is patched.
+    // The slide — RFC 0021's draw, joining the sum exactly as the step-5
+    // comment promised it would. Policy: a machine with entropy draws a
+    // 2 MiB-aligned slide from (0, 1 GiB) — the range excludes zero on
+    // purpose, so the kernel's "slide of zero means KASLR did not happen"
+    // stays a true sentence — and a machine that cannot answer boots
+    // unslid and says so, RFC 0021's rule for every consumer, held here
+    // for the first consumer that runs before the kernel exists.
+    let slide = match bhaskix_rand::u64() {
+        Some(draw) => (1 + draw % 511) << 21,
+        None => {
+            serial::write("bhaskixboot: kaslr no entropy; entering unslid, and saying so\r\n");
+            0
+        }
+    };
+
+    // A relocatable kernel's fixups: the value written is the slide plus
+    // the addend. Any relocation kind the loader cannot express refuses
+    // the whole image, in the crate, before a single byte is patched.
     let applied = match bhaskix_elf::for_each_relative_relocation(
         &kernel_buffer[..kernel_len],
         &image,
         |address, addend| {
             let at = (address - virt_base) as usize;
-            span[at..at + 8].copy_from_slice(&(addend as u64).to_le_bytes());
+            span[at..at + 8].copy_from_slice(&slide.wrapping_add(addend as u64).to_le_bytes());
         },
     ) {
         Ok(applied) => applied,
@@ -274,7 +287,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write("bhaskixboot: relative relocations applied: ");
     serial::write_dec(applied as u64);
     serial::write(", slide ");
-    serial::write_hex(0);
+    serial::write_hex(slide);
     serial::write("\r\n");
     serial::write("bhaskixboot: kernel placed at ");
     serial::write_hex(kernel_phys);
@@ -382,6 +395,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         &image,
         kernel_phys,
         virt_base,
+        slide,
     ) else {
         serial::write("bhaskixboot: the table pool ran dry; the guess is now a measurement\r\n");
         park()
@@ -397,7 +411,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     let findings = handoff::Findings {
         map: &map,
         kernel_phys,
-        kernel_virt: virt_base,
+        kernel_virt: virt_base + slide,
         framebuffer,
         rsdp,
         smbios,
@@ -427,8 +441,9 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     // first argument register, the magic in the second, and the entry the
     // image named. Nothing returns from here; the next words on the wire
     // are the kernel's.
+    let entry = image.entry.wrapping_add(slide);
     serial::write("bhaskixboot: the world is built; jumping: entry ");
-    serial::write_hex(image.entry);
+    serial::write_hex(entry);
     serial::write(", cr3 ");
     serial::write_hex(world.root);
     serial::write(", handoff ");
@@ -452,7 +467,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
             "jmp r10",
             in("r8") world.root,
             in("r9") stack_top,
-            in("r10") image.entry,
+            in("r10") entry,
             in("rdi") block,
             in("rsi") bhaskix_boot::NATIVE_ENTRY_MAGIC,
             options(noreturn),

@@ -762,6 +762,25 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (RFC 0028 step 7, first half: the slide stops being zero)
+
+**KASLR on the native lane.** The step-5 comment promised that "the day KASLR arrives the slide
+joins the sum and nothing else changes" — that day was today, and the promise held to the letter:
+the loader draws through `bhaskix-rand` (RFC 0021's primitive, its first consumer that runs
+before the kernel exists), and one drawn number joins four existing sums — the relocation values,
+the page-table indices, the handoff's `kernel_virt_base`, and the entry. Policy: a 2 MiB-aligned
+slide from **(0, 1 GiB), zero excluded on purpose** so the kernel's "slide of zero means KASLR
+did not happen" honesty line stays a true sentence; a machine without entropy boots unslid *and
+says so*, RFC 0021's rule held where it was written for. The lane grew to **22 gates**: it boots
+`-cpu max` (the default model has no `RDRAND`), extracts the slide from the loader's own line,
+checks the policy (nonzero, aligned, in range — all three predicates watched red), demands the
+jump land at the ELF's entry *plus* the slide, and then the cross-check that makes it real: **the
+kernel measures the slide itself** — handoff base against its own link base — **and must name
+the loader's number**. Three consecutive boots drew `0x3b400000`, `0x2d600000`, `0x24e00000`;
+the kernel confirmed each. Budget unchanged at 97 — the draw's `unsafe` lives in `bhaskix-rand`,
+inside its own budget of 21. **Step 7's second half — secondaries — remains, then the full gate
+set.**
+
 ### 2026-08-18 (RFC 0028 step 6: the machine enters through our own door, and the kernel answers)
 
 **Bhaskix boots on its own bootloader.** The shim's entry became one address with two doors:

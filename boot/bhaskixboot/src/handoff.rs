@@ -58,7 +58,8 @@ pub struct Findings<'boot> {
     pub map: &'boot MemoryMap,
     /// Where the kernel's segments were placed.
     pub kernel_phys: u64,
-    /// The image's linked base.
+    /// Where the image lives in the world's tables: the linked base plus
+    /// the KASLR slide.
     pub kernel_virt: u64,
     /// The framebuffer, as `(width, height, stride pixels, base, bgr)`.
     pub framebuffer: Option<(u32, u32, u32, u64, bool)>,

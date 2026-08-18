@@ -29,6 +29,9 @@ path = "src/main.rs"
 bhaskix-boot = { path = "../handoff" }
 # The same fuzz-hardened parser the kernel loads programs with.
 bhaskix-elf = { path = "../../elf" }
+# RFC 0021's draw, for the KASLR slide. A machine that cannot answer
+# boots unslid and says so -- the same policy every consumer holds.
+bhaskix-rand = { path = "../../rand" }
 
 [profile.release]
 panic = "abort"

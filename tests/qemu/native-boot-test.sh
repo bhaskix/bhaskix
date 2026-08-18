@@ -147,9 +147,12 @@ PY
 WRITABLE_VARS="$REPO_ROOT/build/OVMF_VARS_native.fd"
 cp "$OVMF_VARS" "$WRITABLE_VARS"
 
+# -cpu max for RDRAND: the slide gates below demand a drawn slide, and the
+# default model has no entropy to draw from. The entropy-less path stays
+# legal (RFC 0021) but this lane's job is to prove the slid one.
 echo "booting the native loader under $(basename "$OVMF_CODE"), up to ${TIMEOUT}s..."
 timeout "$TIMEOUT" qemu-system-x86_64 \
-    -machine q35 -m 256 -display none \
+    -machine q35 -cpu max -m 256 -display none \
     -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
     -drive "format=raw,file=fat:rw:$ESP" \
@@ -233,12 +236,27 @@ else
     fail "kernel parse line missing or wrong: wanted $KSEGS segments, entry $KENTRY"
     status=1
 fi
-if grep -qF "bhaskixboot: relative relocations applied: $KRELOCS, slide 0x0000000000000000" "$LOG" 2>/dev/null; then
-    pass "all $KRELOCS relative relocations applied at slide zero"
+# The slide, drawn fresh every boot: extracted from the loader's own line,
+# then checked against the policy (2 MiB aligned, inside (0, 1 GiB)) and,
+# below, against the kernel's independent measurement of it.
+SLIDE=$(grep -oE "bhaskixboot: relative relocations applied: $KRELOCS, slide 0x[0-9a-f]{16}" "$LOG" 2>/dev/null | grep -oE '0x[0-9a-f]{16}$' || true)
+if [ -n "$SLIDE" ]; then
+    pass "all $KRELOCS relative relocations applied at slide $SLIDE"
 else
-    fail "relocation line missing or wrong: wanted $KRELOCS at slide zero"
+    fail "relocation line missing or wrong: wanted $KRELOCS relocations"
+    status=1
+    SLIDE=0x0
+fi
+if python3 -c "
+s = int('$SLIDE', 16)
+raise SystemExit(0 if (s != 0 and s % (2 << 20) == 0 and s < (1 << 30)) else 1)
+"; then
+    pass "the slide obeys the policy: nonzero, 2 MiB aligned, under 1 GiB"
+else
+    fail "the slide $SLIDE breaks the policy (nonzero, 2 MiB aligned, under 1 GiB)"
     status=1
 fi
+SLID_ENTRY=$(python3 -c "import sys; print('0x%016x' % ((int(sys.argv[1], 16) + int(sys.argv[2], 16)) & ((1 << 64) - 1)))" "$KENTRY" "$SLIDE")
 if grep -qE "bhaskixboot: kernel placed at 0x[0-9a-f]{16}, virt base $KBASE, span [1-9][0-9]* KiB, W\^X per segment" "$LOG" 2>/dev/null; then
     pass "the kernel is placed at its link base, W^X per segment"
 else
@@ -258,10 +276,10 @@ else
     fail "handoff line missing or wrong"
     status=1
 fi
-if grep -qE "bhaskixboot: the world is built; jumping: entry $KENTRY, cr3 0x[0-9a-f]{16}, handoff 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
-    pass "the world is built, and the loader jumped to the entry both readers named"
+if grep -qE "bhaskixboot: the world is built; jumping: entry $SLID_ENTRY, cr3 0x[0-9a-f]{16}, handoff 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
+    pass "the world is built, and the loader jumped to the ELF's entry plus the slide"
 else
-    fail "the jump line never appeared"
+    fail "the jump line never appeared, or its entry is not $KENTRY + $SLIDE"
     status=1
 fi
 
@@ -284,6 +302,16 @@ if grep -qF "handoff version 2" "$LOG" 2>/dev/null; then
     pass "the kernel validated and accepted the handoff the loader built"
 else
     fail "the kernel never reported the handoff"
+    status=1
+fi
+# The cross-check that makes the slide real: the kernel computes it
+# independently, from the handoff's virt base against its own link base,
+# and must name the same number the loader drew.
+KERNEL_SLIDE=$(python3 -c "print(hex(int('$SLIDE', 16)))")
+if grep -qE "kaslr +slid $KERNEL_SLIDE bytes from 0xffffffff80000000" "$LOG" 2>/dev/null; then
+    pass "the kernel measured the slide itself and named the loader's number"
+else
+    fail "the kernel did not report slide $KERNEL_SLIDE (unslid, or a different number)"
     status=1
 fi
 if grep -qF "loader reported no way to start secondaries" "$LOG" 2>/dev/null; then
