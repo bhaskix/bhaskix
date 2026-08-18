@@ -419,11 +419,45 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write_hex(stack_top);
     serial::write("\r\n");
 
-    // Step 5 ends parked: everything the jump needs is standing, and the
-    // jump itself is step 6 — the shim's second door, entered with EFER.NXE
-    // set and this world's root in CR3.
-    serial::write("bhaskixboot: the world is built; the jump is step 6\r\n");
-    park()
+    // Step 6: the jump. Interrupts off for the entry contract; `EFER.NXE`
+    // set so the NX bits in the world's tables are architecture rather than
+    // reserved-bit faults; the world's root into CR3 — the loader keeps
+    // executing through the identity view it built for exactly this moment
+    // — then the kernel's own stack, and the door: the `Handoff` in the
+    // first argument register, the magic in the second, and the entry the
+    // image named. Nothing returns from here; the next words on the wire
+    // are the kernel's.
+    serial::write("bhaskixboot: the world is built; jumping: entry ");
+    serial::write_hex(image.entry);
+    serial::write(", cr3 ");
+    serial::write_hex(world.root);
+    serial::write(", handoff ");
+    serial::write_hex(block);
+    serial::write("\r\n");
+    // SAFETY: RFC 0028's entry contract, held by construction above: the
+    // root maps the identity view (this code keeps running), the kernel's
+    // segments at the entry's addresses W^X, and the handoff block; the
+    // stack top is inside that block; the registers are pinned so the
+    // MSR sequence's eax/ecx/edx cannot collide with them.
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            "mov ecx, 0xC0000080",
+            "rdmsr",
+            "or eax, 1 << 11",
+            "wrmsr",
+            "mov cr3, r8",
+            "mov rsp, r9",
+            "xor ebp, ebp",
+            "jmp r10",
+            in("r8") world.root,
+            in("r9") stack_top,
+            in("r10") image.entry,
+            in("rdi") block,
+            in("rsi") bhaskix_boot::NATIVE_ENTRY_MAGIC,
+            options(noreturn),
+        )
+    }
 }
 
 /// Prints `text` on the firmware console, UCS-2 encoded in bounded chunks.

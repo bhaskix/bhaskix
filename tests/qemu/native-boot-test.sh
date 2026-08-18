@@ -161,7 +161,7 @@ QEMU_PID=$!
 # the loader returns to the firmware after speaking, and the firmware then
 # wanders into its own shell -- the output is the event, not the exit.
 for _ in $(seq 1 "$TIMEOUT"); do
-    if grep -qE "bhaskixboot: (the world is built|the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
+    if grep -qE "handoff version 2|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -258,15 +258,77 @@ else
     fail "handoff line missing or wrong"
     status=1
 fi
-if grep -qF "bhaskixboot: the world is built; the jump is step 6" "$LOG" 2>/dev/null; then
-    pass "the world is built; the jump is step 6"
+if grep -qE "bhaskixboot: the world is built; jumping: entry $KENTRY, cr3 0x[0-9a-f]{16}, handoff 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
+    pass "the world is built, and the loader jumped to the entry both readers named"
 else
-    fail "the step-5 closing line never appeared"
+    fail "the jump line never appeared"
     status=1
+fi
+
+# Step 6: the kernel is running, entered through our own door. The words
+# after the jump are the kernel's -- its banner, the loader named as ours
+# in its own boot report, and its own validation of the handoff we built.
+if grep -qF "An open-source, AI-native, enterprise operating system" "$LOG" 2>/dev/null; then
+    pass "the kernel's banner followed the jump"
+else
+    fail "the kernel's banner never appeared after the jump"
+    status=1
+fi
+if grep -qE "loader +bhaskixboot 0.0.0" "$LOG" 2>/dev/null; then
+    pass "the kernel names bhaskixboot as its loader"
+else
+    fail "the kernel's loader line does not name bhaskixboot"
+    status=1
+fi
+if grep -qF "handoff version 2" "$LOG" 2>/dev/null; then
+    pass "the kernel validated and accepted the handoff the loader built"
+else
+    fail "the kernel never reported the handoff"
+    status=1
+fi
+if grep -qF "loader reported no way to start secondaries" "$LOG" 2>/dev/null; then
+    pass "the single-CPU reduction is stated by the kernel, not hidden"
+else
+    fail "the secondaries reduction was not stated"
+    status=1
+fi
+
+# The negative arm, permanent: a corrupted kernel image must be refused
+# with its reason printed, never jumped into. The corruption is the ELF
+# magic -- the parser's first check -- and the arm demands both the refusal
+# and the absence of any jump.
+echo "the negative arm: a corrupted kernel must be refused, up to ${TIMEOUT}s..."
+printf 'XXXX' | dd of="$ESP/bhaskix/kernel" bs=1 count=4 conv=notrunc 2>/dev/null
+cp "$OVMF_VARS" "$WRITABLE_VARS"
+NEGATIVE_LOG=$(mktemp)
+timeout "$TIMEOUT" qemu-system-x86_64 \
+    -machine q35 -m 256 -display none \
+    -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
+    -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
+    -drive "format=raw,file=fat:rw:$ESP" \
+    -serial "file:$NEGATIVE_LOG" \
+    >/dev/null 2>&1 &
+NEG_PID=$!
+for _ in $(seq 1 "$TIMEOUT"); do
+    if grep -q "bhaskixboot: the kernel image failed the parser" "$NEGATIVE_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+kill "$NEG_PID" >/dev/null 2>&1
+wait "$NEG_PID" 2>/dev/null
+if grep -q "bhaskixboot: the kernel image failed the parser" "$NEGATIVE_LOG" 2>/dev/null \
+   && ! grep -q "jumping: entry" "$NEGATIVE_LOG" 2>/dev/null; then
+    pass "a corrupted kernel was refused with its reason, and nothing jumped"
+else
+    fail "the corrupted kernel was not refused cleanly"
+    status=1
+    echo "--- negative-arm serial log ---"
+    cat "$NEGATIVE_LOG" 2>/dev/null | head -20
 fi
 
 if [[ "$status" -ne 0 ]]; then
     echo "--- serial log ---"
-    cat "$LOG" 2>/dev/null | head -40
+    cat "$LOG" 2>/dev/null | head -60
 fi
 exit "$status"

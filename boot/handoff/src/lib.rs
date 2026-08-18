@@ -42,6 +42,17 @@ use core::fmt;
 /// this on any change to the layout or meaning of the structures below.
 pub const HANDOFF_VERSION: u32 = 2;
 
+/// What the native loader leaves in the second argument register at entry
+/// — `b"BHXBOOT1"`, little-endian.
+///
+/// The kernel's entry point serves two callers: Limine, which enters with
+/// undefined registers and its answers in static request structures, and
+/// `bhaskixboot`, which enters with a [`Handoff`] pointer in the first
+/// argument and this word in the second. Sixty-four bits of magic decide
+/// which world the shim is standing in, and the handoff's own version
+/// check stands behind it — a collision would have to forge both.
+pub const NATIVE_ENTRY_MAGIC: u64 = u64::from_le_bytes(*b"BHXBOOT1");
+
 /// A physical address.
 ///
 /// Distinct from [`VirtAddr`] on purpose. Both are 64-bit integers, and

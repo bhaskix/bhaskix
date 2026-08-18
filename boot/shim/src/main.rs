@@ -20,12 +20,27 @@ use bhaskix_arch::cpu;
 use bhaskix_arch::serial::COM1;
 use bhaskix_kernel::{console, kernel_main, println};
 
-/// ELF entry point.
+/// ELF entry point — one address, two doors.
 ///
-/// Called by the bootloader in 64-bit long mode with interrupts disabled, a
-/// valid stack, and the kernel mapped in the higher half.
+/// Called in 64-bit long mode with interrupts disabled, a valid stack, and
+/// the kernel mapped in the higher half, by either of two loaders. Limine
+/// enters with undefined argument registers and its answers in the static
+/// request structures `limine.rs` owns. `bhaskixboot` (RFC 0028 step 6)
+/// enters with a `Handoff` pointer in the first argument register and
+/// [`bhaskix_boot::NATIVE_ENTRY_MAGIC`] in the second — the native boot
+/// protocol *is* the `Handoff`, so its door is a pointer check, a magic
+/// check, and the same `kernel_main` three lines later. `kernel_main`
+/// validates the handoff itself, whichever door it came through.
 #[unsafe(no_mangle)]
-pub extern "C" fn bhaskix_start() -> ! {
+pub extern "C" fn bhaskix_start(first: u64, second: u64) -> ! {
+    if second == bhaskix_boot::NATIVE_ENTRY_MAGIC && first != 0 {
+        // SAFETY: the native loader's contract (RFC 0028): `first` is a
+        // `Handoff` the loader assembled in bootloader-reclaimable memory,
+        // alive for the kernel's whole run; the magic says this is that
+        // caller, and `kernel_main`'s own validation stands behind it.
+        let handoff = unsafe { &*(first as *const bhaskix_boot::Handoff) };
+        kernel_main(handoff)
+    }
     if !limine::base_revision_supported() {
         // Bring up serial by hand so this is diagnosable. Nothing else is
         // trustworthy at this point — if the base revision is wrong, the

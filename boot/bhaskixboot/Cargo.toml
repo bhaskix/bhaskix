@@ -54,4 +54,8 @@ opt-level = "s"
 # handoff block's writes with the fabricated references whose lifetimes
 # the reclamation contract states. The decisions -- the parse, the
 # relocation walk, the refusals -- stay in bhaskix-elf at budget zero.
-unsafe_budget = 78
+#
+# 97 at step 6: the jump -- one asm block that never returns: interrupts
+# off, EFER.NXE, the world's root into CR3, the kernel's stack, and the
+# door with the handoff and the magic in the argument registers.
+unsafe_budget = 97
