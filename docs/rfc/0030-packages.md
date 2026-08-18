@@ -160,6 +160,14 @@ spawner; the child inherits the badge the shell's own capability carries. One st
 the manifest declares `entry hertz` and the spawner passes zero — it cannot know the rate
 — so the first installed program that keeps time is the trigger for threading it through.
 
+**Step 5's verdict**: removal was implemented beside install at step 3 (the record
+deleted first, the payload after) and is now gated with the strongest ordering proof
+visible from outside — after `pkg remove hello`, running refuses off the gone record,
+and a **reinstall succeeds**, which no surviving dropping would allow: a leftover file
+or directory would trip the same `EXISTS` refusal the second-install gate proves works.
+The full cycle — install, list, refuse-duplicate, run, refuse-over-ask, remove,
+refuse-run, reinstall — is one typed conversation in the shell test.
+
 Running an installed program is RFC 0017's machinery with the manifest as the grant list:
 the starter grants **the intersection of what the manifest requests and what the starter
 holds**, and a manifest asking beyond the starter's own authority is refused whole — no

@@ -115,6 +115,12 @@ else
         # any domain exists. `run` comes after `spawn`'s own arc so the one
         # child the envelope allows is free again.
         commands+=$'pkg install greedy.bpk\r'$'pkg run greedy\r'$'pkg run hello\r'
+        # RFC 0030 step 5: removal, and the ordering proof that can be seen
+        # from outside -- after `pkg remove`, running refuses off the gone
+        # record, and a REINSTALL succeeds, which no surviving dropping
+        # would allow: a leftover directory or file would trip the EXISTS
+        # refusal the second-install check above just proved works.
+        commands+=$'pkg remove hello\r'$'pkg run hello\r'$'pkg install hello.bpk\r'$'pkg list\r'
         # RFC 0018 step 5, and only under `iommu` because that is the only mode
         # where there is a device behind the service. Without one the command
         # still answers -- "there is a service but no device behind it" -- which
@@ -370,6 +376,9 @@ else
             "the installed program ran with its manifest's grants:running.*hello"
             "the installed program spoke through the granted console:namaste from an installed package"
             "the run was watched to its end:it ended cleanly"
+            "the package was removed:removed.*hello"
+            "a removed program will not run:pkg: not installed"
+            "reinstall after remove succeeded, so nothing survived:2 installed"
         )
         for check in "${pkg_checks[@]}"; do
             checks+=("$check")

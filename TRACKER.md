@@ -764,6 +764,18 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-19 (RFC 0030 step 5: remove proves itself by what a reinstall does not hit)
+
+**The cycle closed at a live prompt, green on the first run.** `pkg remove hello` deletes
+the record first and the payload after; `pkg run hello` then refuses off the gone record;
+and `pkg install hello.bpk` **succeeds again** — the ordering proof visible from outside,
+because any surviving dropping (a file, a directory, a stale record) would trip exactly
+the `EXISTS` refusal the second-install gate proves is real. The removal code itself
+shipped with step 3; this step is the gates: removed, refused, reinstalled, and the
+installed set counting two with `greedy` untouched beside it. The whole
+install/list/duplicate-refused/run/over-ask-refused/remove/run-refused/reinstall arc is
+now one typed conversation in `shell-test.sh`, every reply asserted.
+
 ### 2026-08-19 (RFC 0030 step 4: an installed program runs on its manifest's word, and the over-asker is refused whole)
 
 **`pkg run hello` at a live prompt, gated**: the record read back off the disk and parsed
