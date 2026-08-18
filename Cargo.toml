@@ -61,6 +61,11 @@ members = [
     # three programs used to hand-roll. Depends on the ABI and nothing
     # else; programs depend on it.
     "sock",
+
+    # Phase 2 — RFC 0028 step 4. The ELF64 parser, out of the kernel and
+    # into the leaf layer: one fuzz-hardened copy, reachable from the
+    # kernel, the boot loader and the fuzz target alike.
+    "elf",
 ]
 
 # The negative fixture for `tools/check-placements.sh`: a service that reaches

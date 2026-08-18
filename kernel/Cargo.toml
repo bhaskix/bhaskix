@@ -19,6 +19,10 @@ bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-mm = { path = "../mm" }
 bhaskix-device = { path = "../device" }
 bhaskix-fs = { path = "../fs" }
+# RFC 0028 step 4: the ELF parser, extracted so the boot loader can run
+# the same fuzz-hardened checks. The loader half stays here, with the
+# address spaces it needs.
+bhaskix-elf = { path = "../elf" }
 # RFC 0021. The kernel does not need unpredictability itself yet -- randomising
 # the heap base is that RFC's open question 2 -- but it is the thing that boots,
 # so it is where "the instruction actually works on this machine" is checked.

@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0028 step 4: the ELF64 parser as a leaf crate. It is the whole attack
+# surface reachable from a file on disk, it carries 10.97 billion fuzz
+# executions of assurance, and the kernel, the boot loader and the fuzz
+# target all need exactly the same checks -- so there is one copy, at the
+# layer all three can reach, depending on nothing.
+[package]
+name = "bhaskix-elf"
+description = "ELF64 parsing: the checks, the refusals, and nothing that maps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_elf"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, enforced twice: this number, and forbid(unsafe_code) in the crate
+# root. Everything here is arithmetic over a byte slice, which is the whole
+# reason it could leave the kernel.
+unsafe_budget = 0

@@ -28,6 +28,10 @@ name = "bhaskix-device"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-elf"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-fs"
 version = "0.0.0"
 
@@ -36,6 +40,7 @@ name = "bhaskix-fuzz"
 version = "0.0.0"
 dependencies = [
  "bhaskix-arch-x86-64",
+ "bhaskix-elf",
  "bhaskix-kernel",
  "bhaskix-net",
  "bhaskix-service-vfs",
@@ -50,12 +55,14 @@ dependencies = [
  "bhaskix-arch-x86-64",
  "bhaskix-boot",
  "bhaskix-device",
+ "bhaskix-elf",
  "bhaskix-fs",
  "bhaskix-mm",
  "bhaskix-rand",
  "bhaskix-service",
  "bhaskix-service-console",
  "bhaskix-service-vfs",
+ "bhaskix-telemetry",
 ]
 
 [[package]]
@@ -95,6 +102,10 @@ dependencies = [
  "bhaskix-abi",
  "bhaskix-service",
 ]
+
+[[package]]
+name = "bhaskix-telemetry"
+version = "0.0.0"
 
 [[package]]
 name = "cc"

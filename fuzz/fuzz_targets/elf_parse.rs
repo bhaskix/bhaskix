@@ -9,7 +9,7 @@
 //! same assurance. This closes that gap; the seeded harness stays, because it
 //! runs in CI in twenty milliseconds and this does not.
 //!
-//! [`bhaskix_kernel::elf::parse`] is the whole attack surface reachable from a
+//! [`bhaskix_elf::parse`] is the whole attack surface reachable from a
 //! byte buffer: it validates an image without mapping anything, which is why it
 //! was split out from `load_into` in the first place.
 //!
@@ -33,5 +33,5 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     // The result is deliberately ignored. Every `Err` is a success: the
     // interesting outcomes are the ones that never return at all.
-    let _ = bhaskix_kernel::elf::parse(data);
+    let _ = bhaskix_elf::parse(data);
 });

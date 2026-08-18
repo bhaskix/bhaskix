@@ -75,6 +75,11 @@ LAYERS = {
     # process -- so it depends on nothing, and nothing it observes may ever
     # become something it links.
     "bhaskix-telemetry": -3,
+    # The ELF64 parser, RFC 0028 step 4, and the same argument a fifth
+    # time: the kernel loads with it, the boot loader will load with it,
+    # and the fuzz target drives it -- one copy, reachable by all three,
+    # depending on nothing.
+    "bhaskix-elf": -3,
     # RFC 0027: the client side of the network, the rung *between* the leaf
     # crates and the programs -- it depends on the ABI, and programs depend
     # on it. The leaf layer renumbered from -2 to -3 to make this rung
