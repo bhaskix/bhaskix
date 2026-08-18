@@ -763,6 +763,31 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (RFC 0029 step 1: the family exists, and the enum's promise is collected)
+
+**`bhaskix-net` speaks the second family** — as arithmetic, zero `unsafe`, like everything
+beside it. `Ipv6Addr` (sixteen bytes, wire order — unlike `Ipv4Addr`'s host-order `u32`,
+because v6 has no prefix arithmetic here and a `u128` would put a byte-swap trap at every
+comparison), with the RFC 5952 compressed rendering host-tested so addresses grep like every
+other tool prints them. `ipv6::Ipv6Header` — forty fixed bytes, frame padding cut, **every
+extension type refused where the chain would start** (the refusal enumerated and watched red);
+`ipv6::pseudo_header` — the forty-byte block v6 transport checksums are computed over; and
+`icmpv6::Echo` — the v6 echo, whose checksum takes addresses because in v6 the sum reaches
+outside the message.
+
+**The one-variant enum's promise held.** Adding `Address::V6` broke exactly one place: the
+irrefutable `let Address::V4(..)` in `tcp::isn::encode`, which its own comment planted as a
+tripwire ("stops compiling the day a second is added — which is the point"). The encoding is
+now fixed-width per end — family byte, padded sixteen-byte slot, port — so no two distinct
+tuples, same-family or cross, hash alike. Everything else in the tree compiled untouched.
+
+**And one lesson the tests taught**: the first checksum-binding test swapped source and
+destination and asserted a failure the arithmetic cannot produce — one's-complement addition
+is commutative, so a pseudo-header with its addresses exchanged sums identically. The test
+now binds against a genuinely different address and records why: the checksum binds the *set*
+of address words, not their order; anything stronger is authentication's job. 170 host tests;
+ten fuzz targets (two new) at 300k seeds each, clean.
+
 ### 2026-08-18 (RFC 0029 drafted: IPv6, the second family the first one was shaped for)
 
 **The last open line of the last open Phase 2 bullet gets its RFC.** Six steps: the family

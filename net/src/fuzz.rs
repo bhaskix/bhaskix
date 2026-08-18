@@ -43,12 +43,13 @@
 //! inherit this paragraph's conclusion.
 
 use crate::{
-    addr::{Address, Ipv4Addr, MacAddr, Port},
+    addr::{Address, Ipv4Addr, Ipv6Addr, MacAddr, Port},
     arp::ArpPacket,
     checksum,
     eth::{self, EthFrame, EtherType},
-    icmp,
+    icmp, icmpv6,
     ipv4::{self, Ipv4Header, Protocol, Reassembly},
+    ipv6::{self, Ipv6Header},
     tcp::{
         FourTuple, Sequence,
         segment::{self, Flags, Options, Segment},
@@ -555,6 +556,73 @@ fn the_tcp_state_machine_never_panics_and_holds_its_invariants() {
             let (next, actions) = state::step(tcb, event, now);
             tcb = next;
             invariants(&tcb, &actions);
+        }
+    }
+}
+
+#[test]
+fn ipv6_never_panics() {
+    let (first, iterations) = campaign();
+    for seed in first..first.saturating_add(iterations) {
+        let mut rng = rng_for(seed);
+        let mut bytes = vec![0u8; ipv6::HEADER + 32];
+        let source = Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 1]);
+        let destination = Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 2]);
+        ipv6::write_header(
+            &mut bytes,
+            source,
+            destination,
+            ipv6::NextHeader::UDP,
+            64,
+            32,
+        )
+        .unwrap();
+        let count = 1 + rng.below(6);
+        mutate(&mut rng, &mut bytes, count);
+        maybe_truncate(&mut rng, &mut bytes);
+        if let Ok((header, payload)) = Ipv6Header::parse(&bytes) {
+            // A payload the parser hands back must be inside what was
+            // supplied, and a next header it accepted must not be one it
+            // promised to refuse.
+            assert!(ipv6::HEADER + payload.len() <= bytes.len());
+            assert!(!header.next_header.is_extension());
+        }
+    }
+}
+
+#[test]
+fn icmpv6_never_panics() {
+    let (first, iterations) = campaign();
+    let source = Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 1]);
+    let destination = Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 2]);
+    for seed in first..first.saturating_add(iterations) {
+        let mut rng = rng_for(seed);
+        let mut bytes = vec![0u8; icmpv6::HEADER + 24];
+        icmpv6::write_echo(
+            &mut bytes,
+            source,
+            destination,
+            false,
+            0x1234,
+            1,
+            &[0xee; 24],
+        )
+        .unwrap();
+        let count = 1 + rng.below(6);
+        mutate(&mut rng, &mut bytes, count);
+        // Half the seeds repair the checksum -- over the pseudo-header,
+        // because in v6 the sum reaches outside the message -- so the type
+        // and code checks behind it stay reachable.
+        if seed & 1 == 0 && bytes.len() >= icmpv6::HEADER {
+            bytes[2..4].copy_from_slice(&[0, 0]);
+            let length = u32::try_from(bytes.len()).unwrap();
+            let pseudo = ipv6::pseudo_header(source, destination, ipv6::NextHeader::ICMPV6, length);
+            let sum = checksum(&[&pseudo, &bytes]);
+            bytes[2..4].copy_from_slice(&sum.to_be_bytes());
+        }
+        maybe_truncate(&mut rng, &mut bytes);
+        if let Ok(parsed) = icmpv6::Echo::parse(&bytes, source, destination) {
+            assert!(parsed.payload.len() + icmpv6::HEADER <= bytes.len());
         }
     }
 }

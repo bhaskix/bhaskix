@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Ethernet, ARP, IPv4, UDP and the beginnings of TCP, as arithmetic over a
-//! byte slice.
+//! Ethernet, ARP, IPv4, IPv6, UDP and TCP, as arithmetic over a byte
+//! slice.
 //!
 //! [RFC 0018](../../docs/rfc/0018-networking.md) step 1, and
 //! [RFC 0020](../../docs/rfc/0020-tcp.md) step 1. This is the whole of the
@@ -8,10 +8,9 @@
 //! no domain, no IPC, no clock. A caller supplies bytes and, where something
 //! ages, the current time; everything here is a pure function or a fixed table.
 //!
-//! TCP is one module deep so far — [`tcp::isn`], the initial sequence number,
-//! which came first because it was the piece that turned out to have a
-//! prerequisite the system did not have. The segment parser and the state
-//! machine are RFC 0020's steps 2 and 3 and are not here yet.
+//! TCP is [`tcp::isn`], [`tcp::segment`] and [`tcp::state`] — RFC 0020,
+//! complete. IPv6 is [`ipv6`] and [`icmpv6`] — RFC 0029, arriving step by
+//! step, with the neighbour-discovery messages joining `icmpv6` at step 2.
 //!
 //! # This is the most exposed code in the system
 //!
@@ -58,7 +57,9 @@ pub mod arp;
 pub mod dhcp;
 pub mod eth;
 pub mod icmp;
+pub mod icmpv6;
 pub mod ipv4;
+pub mod ipv6;
 pub mod siphash;
 pub mod tcp;
 pub mod udp;
@@ -66,12 +67,13 @@ pub mod udp;
 #[cfg(test)]
 mod fuzz;
 
-pub use addr::{Address, Ipv4Addr, MacAddr, Port};
+pub use addr::{Address, Ipv4Addr, Ipv6Addr, MacAddr, Port};
 pub use arp::{ArpCache, ArpOp, ArpPacket};
 pub use dhcp::Offer;
 pub use eth::{EthFrame, EtherType};
 pub use icmp::Echo;
 pub use ipv4::{Ipv4Header, Protocol, Reassembly};
+pub use ipv6::{Ipv6Header, NextHeader};
 pub use tcp::{FourTuple, Sequence};
 pub use udp::UdpDatagram;
 
@@ -111,7 +113,7 @@ pub enum NetError {
         /// The total length the same header stated, in bytes.
         total: usize,
     },
-    /// The IP version field was not 4.
+    /// The IP version field did not match the family being parsed.
     BadVersion(u8),
     /// A header checksum did not verify.
     BadChecksum {

@@ -6,15 +6,14 @@
 //! are all just numbers, they are all read out of the same packet, and swapping
 //! two of them produces code that compiles and is wrong.
 //!
-//! # One family, and an enum anyway
+//! # Two families, one enum — as designed
 //!
-//! [`Address`] has a single variant today. RFC 0018 chose IPv4 first and
-//! deferred IPv6, and this is the whole of what that decision costs now:
-//! signatures take `Address`, the routing key is `Address`, and adding IPv6 is a
-//! variant, a parser and a neighbour-discovery mechanism rather than a second
-//! copy of everything above it. Retrofitting an address abstraction through a
-//! socket API afterwards is the expensive version of the same decision, and it
-//! is the version most stacks have had to do.
+//! [`Address`] was built with a single variant by RFC 0018, which chose IPv4
+//! first and promised that IPv6 would be "a variant, a parser and a
+//! neighbour-discovery mechanism rather than a second copy of everything
+//! above it". RFC 0029 collected: signatures take `Address`, the routing key
+//! is `Address`, and the `V6` variant arrived with the compiler producing
+//! the list of every place that had quietly assumed one family.
 
 use core::fmt;
 
@@ -140,25 +139,155 @@ impl Port {
     }
 }
 
+/// A 128-bit IPv6 address, held in wire order.
+///
+/// Wire order rather than a host-order integer, deliberately — and
+/// differently from [`Ipv4Addr`], whose host-order `u32` exists for prefix
+/// arithmetic. Sixteen bytes have no natural host-integer form, every use
+/// in this stack is a byte-for-byte comparison or a copy into a packet, and
+/// a `u128` would put a byte-swap trap at every one of those sites.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ipv6Addr(pub [u8; 16]);
+
+impl Ipv6Addr {
+    /// `::` — no address, or "not yet".
+    pub const UNSPECIFIED: Self = Self([0; 16]);
+
+    /// `ff02::1` — every node on the link.
+    pub const ALL_NODES: Self = Self([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+    /// `ff02::2` — every router on the link.
+    pub const ALL_ROUTERS: Self = Self([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+
+    /// An address from eight 16-bit segments, written the way the literature
+    /// writes them.
+    #[must_use]
+    pub const fn new(segments: [u16; 8]) -> Self {
+        let mut bytes = [0u8; 16];
+        let mut index = 0;
+        while index < 8 {
+            let [high, low] = segments[index].to_be_bytes();
+            bytes[index * 2] = high;
+            bytes[index * 2 + 1] = low;
+            index += 1;
+        }
+        Self(bytes)
+    }
+
+    /// The sixteen bytes, in wire order.
+    #[must_use]
+    pub const fn octets(self) -> [u8; 16] {
+        self.0
+    }
+
+    /// The eight segments, in the order they are written.
+    #[must_use]
+    pub fn segments(self) -> [u16; 8] {
+        let mut segments = [0u16; 8];
+        for (index, segment) in segments.iter_mut().enumerate() {
+            *segment = u16::from_be_bytes([self.0[index * 2], self.0[index * 2 + 1]]);
+        }
+        segments
+    }
+
+    /// Whether this is a multicast address — the `ff00::/8` block.
+    #[must_use]
+    pub const fn is_multicast(self) -> bool {
+        self.0[0] == 0xff
+    }
+
+    /// Whether this is `::`.
+    #[must_use]
+    pub const fn is_unspecified(self) -> bool {
+        matches!(self.0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    }
+}
+
+impl fmt::Debug for Ipv6Addr {
+    /// The compressed textual form: lowercase hex segments, leading zeros
+    /// dropped, and the longest run of zero segments (of length at least
+    /// two, leftmost on a tie) written `::` — RFC 5952's rules, because an
+    /// address that prints differently from every other tool's rendering of
+    /// it is an address nobody can grep for.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let segments = self.segments();
+
+        // The longest zero run, leftmost on ties, only if two or more long.
+        let mut best: Option<(usize, usize)> = None;
+        let mut index = 0;
+        while index < 8 {
+            if segments[index] == 0 {
+                let start = index;
+                while index < 8 && segments[index] == 0 {
+                    index += 1;
+                }
+                let length = index - start;
+                if length >= 2 && best.is_none_or(|(_, held)| length > held) {
+                    best = Some((start, length));
+                }
+            } else {
+                index += 1;
+            }
+        }
+
+        match best {
+            Some((start, length)) => {
+                for (index, segment) in segments.iter().enumerate().take(start) {
+                    if index > 0 {
+                        write!(f, ":")?;
+                    }
+                    write!(f, "{segment:x}")?;
+                }
+                write!(f, "::")?;
+                for (index, segment) in segments.iter().enumerate().skip(start + length) {
+                    if index > start + length {
+                        write!(f, ":")?;
+                    }
+                    write!(f, "{segment:x}")?;
+                }
+                Ok(())
+            }
+            None => {
+                for (index, segment) in segments.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ":")?;
+                    }
+                    write!(f, "{segment:x}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// A network-layer address, of whichever family.
 ///
-/// One variant today. See the module header for why it is an enum anyway.
+/// Built with one variant by RFC 0018, on the promise that the second would
+/// be a variant and not a rewrite; RFC 0029 is the promise collected.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Address {
     /// An IPv4 address.
     V4(Ipv4Addr),
+    /// An IPv6 address.
+    V6(Ipv6Addr),
 }
 
 impl Address {
     /// The IPv4 address, if this is one.
-    ///
-    /// Returns an `Option` rather than being infallible, so that the call sites
-    /// that will have to handle a second family are already written as though
-    /// there is one.
     #[must_use]
     pub const fn v4(self) -> Option<Ipv4Addr> {
         match self {
             Self::V4(address) => Some(address),
+            Self::V6(_) => None,
+        }
+    }
+
+    /// The IPv6 address, if this is one.
+    #[must_use]
+    pub const fn v6(self) -> Option<Ipv6Addr> {
+        match self {
+            Self::V4(_) => None,
+            Self::V6(address) => Some(address),
         }
     }
 }
@@ -166,6 +295,12 @@ impl Address {
 impl From<Ipv4Addr> for Address {
     fn from(address: Ipv4Addr) -> Self {
         Self::V4(address)
+    }
+}
+
+impl From<Ipv6Addr> for Address {
+    fn from(address: Ipv6Addr) -> Self {
+        Self::V6(address)
     }
 }
 

@@ -43,7 +43,7 @@
 //! processor involved. The one caller with hardware, `bin/tcpd`, draws the key
 //! at start-up and **does not start if it cannot**.
 
-use crate::addr::Address;
+use crate::addr::{Address, Port};
 use crate::siphash::{self, Key};
 use crate::tcp::{FourTuple, Sequence};
 
@@ -54,16 +54,21 @@ use crate::tcp::{FourTuple, Sequence};
 /// every `now` in this crate carries.
 pub const TICK_NANOS: u64 = 4_000;
 
-/// Bytes in the encoded four-tuple, for the one address family that exists.
+/// Bytes in the encoded four-tuple, now that both families exist.
 ///
-/// A family byte, then address and port for each end. The family byte is not
-/// load-bearing today — one family, one length — and is written anyway so that
-/// the encoding of an IPv6 tuple cannot collide with an IPv4 one by having the
-/// same bytes in a different arrangement.
-const ENCODED: usize = 13;
+/// A family byte and a sixteen-byte address slot per end, ports after each:
+/// fixed-size again, because a v4 address in a padded slot with its family
+/// byte in front cannot collide with any v6 arrangement, and a fixed size
+/// keeps the hash input's length out of the attacker's hands. The second
+/// family arrived exactly where the old comment promised it would — this
+/// constant, this function — and nowhere else in the file.
+const ENCODED: usize = 38;
 
-/// The tag for an IPv4 tuple in the encoding.
+/// The tag for an IPv4 address slot in the encoding.
 const FAMILY_V4: u8 = 4;
+
+/// The tag for an IPv6 address slot in the encoding.
+const FAMILY_V6: u8 = 6;
 
 /// The initial sequence number for `connection` at `now`.
 ///
@@ -93,31 +98,33 @@ pub fn initial_sequence(key: &Key, connection: FourTuple, now: u64) -> Sequence 
 
 /// The four-tuple as bytes, in a fixed order and with fixed widths.
 ///
-/// # The destructuring is deliberate
-///
-/// `let Address::V4(..) = ..` compiles today because there is one family, and
-/// **stops compiling the day a second is added** — which is the point. A `match`
-/// with a catch-all, or an encoder that quietly wrote four zero bytes for an
-/// address it did not understand, would make two different connections hash the
-/// same and would do it silently. The compiler is a better reviewer of that than
-/// a test can be, because there is no IPv6 address to write a test with yet.
-///
-/// The return type is a fixed array rather than a buffer and a length, because
-/// today every tuple encodes to the same size. A second family makes that false
-/// and will change this signature — which is the same rewrite the destructuring
-/// above already forces, in the same function, and not a second one.
+/// The irrefutable `let Address::V4(..)` that used to live here did its job:
+/// it stopped compiling the day the second family was added, and this
+/// per-address encoding is what it forced. Each end is a family byte, a
+/// sixteen-byte address slot (v4 in the first four bytes, the rest zero, the
+/// family byte making the padding unambiguous), and the port — so no two
+/// distinct tuples, same-family or cross-family, encode to the same bytes.
 fn encode(connection: FourTuple) -> [u8; ENCODED] {
-    let Address::V4(local) = connection.local;
-    let Address::V4(remote) = connection.remote;
-
     // Ports in network order, which is the order they are seen in on the wire.
     let mut out = [0u8; ENCODED];
-    out[0] = FAMILY_V4;
-    out[1..5].copy_from_slice(&local.octets());
-    out[5..7].copy_from_slice(&connection.local_port.0.to_be_bytes());
-    out[7..11].copy_from_slice(&remote.octets());
-    out[11..13].copy_from_slice(&connection.remote_port.0.to_be_bytes());
+    encode_end(&mut out[0..19], connection.local, connection.local_port);
+    encode_end(&mut out[19..38], connection.remote, connection.remote_port);
     out
+}
+
+/// One end of the tuple: family byte, padded address slot, port.
+fn encode_end(out: &mut [u8], address: Address, port: Port) {
+    match address {
+        Address::V4(address) => {
+            out[0] = FAMILY_V4;
+            out[1..5].copy_from_slice(&address.octets());
+        }
+        Address::V6(address) => {
+            out[0] = FAMILY_V6;
+            out[1..17].copy_from_slice(&address.octets());
+        }
+    }
+    out[17..19].copy_from_slice(&port.0.to_be_bytes());
 }
 
 #[cfg(test)]
