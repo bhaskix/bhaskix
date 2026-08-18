@@ -267,7 +267,12 @@ workspace = true
 # ensure-mapped closure shape, and the INIT-SIPI sends. All writes to memory
 # no Rust object owns -- a page reserved at boot for a processor that does
 # not exist yet.
-unsafe_budget = 1294
+#
+# 1302 at RFC 0029 step 6 (2026-08-18): the tcpc report page's four v6
+# measurement words read out through the direct map -- the same
+# report-reader shape the v4 measures pay at words four to nine, eight
+# lines for one more volatile block over the frame the client owns.
+unsafe_budget = 1302
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

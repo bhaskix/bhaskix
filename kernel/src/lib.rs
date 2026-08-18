@@ -6738,8 +6738,9 @@ fn report_tcp_client(hhdm: u64) {
         }
         12 => {
             "did everything outcome 9 says, then opened a v6 connection to [::1], accepted it \
-             with its own listener, and echoed itself sixteen bytes through the loopback -- \
-             the whole TCP machine, both roles, second family, one program (RFC 0029 step 5)"
+             with its own listener, and echoed itself eight samples and 32 KiB through the \
+             loopback -- the whole TCP machine, both roles, second family, one program \
+             (RFC 0029 steps 5 and 6)"
         }
         _ => "an outcome this kernel does not know",
     };
@@ -6778,6 +6779,34 @@ fn report_tcp_client(hhdm: u64) {
             bulk_bytes / 1024,
             bulk_micros / 1000,
             through,
+        );
+    }
+    // RFC 0029 step 6: the second family's numbers, from words ten to
+    // thirteen. Both ends live in one program here, so the bulk figure is
+    // per-crossing cost driven turn by turn, not a pipeline rate -- and
+    // with the peer at [::1] there is no emulator in any of these numbers:
+    // they are the stack's own price, paid twice per round trip.
+    // SAFETY: the same frame as above, words ten to thirteen.
+    let (handshake6, rtt6_median, bulk6_ticks, bulk6_bytes) = unsafe {
+        (
+            core::ptr::read_volatile((hhdm + pages[0] + 80) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 88) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 96) as *const u64),
+            core::ptr::read_volatile((hhdm + pages[0] + 104) as *const u64),
+        )
+    };
+    if handshake6 != 0 && hertz != 0 {
+        let bulk6_micros = micros(bulk6_ticks).max(1);
+        let through6 = bulk6_bytes.saturating_mul(1_000_000) / bulk6_micros / 1024;
+        println!(
+            "    tcp measure6   loopback handshake {} us; 16-byte echo round trip median \
+             {} us over 8; {} KiB echoed in {} ms, {} KiB/s each way -- no emulator in the \
+             loop, the stack's own cost both directions",
+            micros(handshake6),
+            micros(rtt6_median),
+            bulk6_bytes / 1024,
+            bulk6_micros / 1000,
+            through6,
         );
     }
     if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 || outcome == 12 {

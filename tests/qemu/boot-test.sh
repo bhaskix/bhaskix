@@ -1240,6 +1240,16 @@ if grep -qE "tcp client +echoed outbound" "$LOG" && ! grep -qE "tcp measure +han
     status=1
 fi
 
+# RFC 0029 step 6: the second family measures itself the same way -- and
+# because the loopback peer is the program's other half, these numbers carry
+# no emulator at all. Same discipline: recorded, not gated on magnitude, but
+# a boot whose v6 act completed without producing them measured nothing.
+if grep -qE "tcp client +did everything outcome 9 says" "$LOG" \
+    && ! grep -qE "tcp measure6 +loopback handshake [0-9]+ us" "$LOG"; then
+    fail "the v6 loopback act completed but produced no measurement"
+    status=1
+fi
+
 # RFC 0029 step 5 raised the terminal: after both v4 directions, the same
 # program opens a v6 connection to [::1], accepts it with its own listener,
 # and echoes itself through the loopback -- the whole machine, both roles,

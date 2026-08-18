@@ -96,6 +96,10 @@ const PAYLOAD6: &[u8] = b"bhaskix-tcp6-lp@";
 
 /// The machine-state numbers the service packs into `RECV` replies.
 const STATE_ESTABLISHED: u64 = 4;
+/// The two states RFC 0020's slots treat as evictable: the machine is dead
+/// (`Closed`) or merely serving out its tuple's quarantine (`TimeWait`).
+const STATE_CLOSED: u64 = 0;
+const STATE_TIME_WAIT: u64 = 10;
 
 /// First eight bytes of the report: "TCPC_RPT" says the mapping worked.
 const MARKER: u64 = 0x5450_525f_4350_4354;
@@ -258,10 +262,12 @@ fn stream_state(step: u64) -> (u64, u64) {
     stream_state_consuming(step, 0)
 }
 
-/// [`stream_state`] against a named connection slot — the v6 act's client
-/// side lands in its own slot, and the shared refusal decoding applies.
-fn stream_state_on(slot: u64, step: u64) -> (u64, u64) {
-    match tcp::recv(slot, 0) {
+/// [`stream_state_consuming`] against a named connection slot — the v6
+/// act's two sides land in their own slots, and the shared refusal
+/// decoding applies. `consumed` reopens the receive window, exactly as on
+/// the v4 connection.
+fn stream_state_on(slot: u64, step: u64, consumed: u64) -> (u64, u64) {
+    match tcp::recv(slot, consumed) {
         StreamPoll::Ready { state, delivered } => (state, delivered),
         StreamPoll::Unreachable => {
             report(step, outcome::DARK, 0);
@@ -701,6 +707,31 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // ------------------------------------------------------------------
     const LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     report(14, outcome::STARTING, 0);
+    // Both v4 tenants must finish dying before the second family knocks.
+    // A SYN arriving while the accepted slot's machine is still mid-close
+    // is refused -- correctly, the slot is genuinely occupied -- and only
+    // the one-second retransmit would carry the handshake home, which is
+    // what the first measured run showed: 1 005 691 us, the initial RTO
+    // plus six milliseconds of actual path. Waiting for the funerals keeps
+    // the clock honest: what is measured below is the handshake, not the
+    // previous connections' closing arithmetic. A refusal here means the
+    // machine is already gone, which is dead enough.
+    let resting = |slot: u64| -> bool {
+        match tcp::recv(slot, 0) {
+            StreamPoll::Ready { state, .. } => state == STATE_CLOSED || state == STATE_TIME_WAIT,
+            _ => true,
+        }
+    };
+    let mut lingered = 0u32;
+    while !(resting(CONNECTION) && resting(INBOUND)) {
+        lingered += 1;
+        if lingered > 300 {
+            report(14, outcome::STUCK, 1);
+            exit();
+        }
+        news(WAKE, &pace);
+    }
+    let handshake6_started = now();
     if let Err(status) = tcp::expect(SERVICE, CONNECTION6) {
         report(14, outcome::REFUSED, status << 8);
         exit();
@@ -728,7 +759,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // program only has to watch its client side arrive at ESTABLISHED.
     let mut bounded6 = 0u32;
     loop {
-        let (state6, _) = stream_state_on(CONNECTION6, 15);
+        let (state6, _) = stream_state_on(CONNECTION6, 15, 0);
         if state6 == STATE_ESTABLISHED {
             break;
         }
@@ -739,6 +770,9 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         }
         news(WAKE, &pace);
     }
+    // RFC 0029 step 6: the loopback handshake, on the clock. No emulator
+    // in this number -- it is the stack's own cost, twice over.
+    report_word(10, now().wrapping_sub(handshake6_started));
 
     // The accepted twin, from this program's own listener.
     if let Err(status) = tcp::expect(SERVICE, INBOUND6) {
@@ -765,61 +799,143 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         exit();
     }
 
-    // Client sends; server (this same program) sees it arrive on the
-    // listener rings, echoes it, and the client reads it back. The
-    // stream offsets are the new connection's own and start at zero —
+    // RFC 0029 steps 5 and 6 together: the echo, measured. Eight sixteen-
+    // byte round trips, each driven end to end by this one program --
+    // client send, server echo, client read -- so every sample is the
+    // stack's own cost through the loopback, both crossings, no emulator.
+    // The stream offsets are the new connection's own and start at zero;
     // the ring bytes are the old story's leavings, overwritten, and the
     // payload's final byte was chosen to differ from every one of them.
-    for (index, byte) in PAYLOAD6.iter().enumerate() {
-        send_view.write(index as u64, *byte);
-    }
-    if let Err(status) = tcp::send(CONNECTION6, PAYLOAD6.len() as u64) {
-        report(17, outcome::REFUSED, status << 8);
-        exit();
-    }
     report(17, outcome::STARTING, 3);
-    let mut served6 = false;
-    for _ in 0..300u32 {
-        match tcp::recv(INBOUND6, 0) {
-            StreamPoll::Ready { delivered, .. } => {
-                if delivered >= PAYLOAD6.len() as u64 {
-                    served6 = true;
-                    break;
+    let mut samples6 = [0u64; 8];
+    let mut client_sent6 = 0u64;
+    let mut served_told6 = 0u64;
+    for (index, sample) in samples6.iter_mut().enumerate() {
+        for (offset, byte) in PAYLOAD6.iter().enumerate() {
+            send_view.write(client_sent6 + offset as u64, *byte);
+        }
+        let begun6 = now();
+        if let Err(status) = tcp::send(CONNECTION6, PAYLOAD6.len() as u64) {
+            report(17, outcome::REFUSED, status << 8);
+            exit();
+        }
+        client_sent6 += PAYLOAD6.len() as u64;
+        // The server half of the same program: wait for the bytes to land
+        // in the listener rings, echo them back, tell the service.
+        let mut served6 = false;
+        for _ in 0..300u32 {
+            match tcp::recv(INBOUND6, 0) {
+                StreamPoll::Ready { delivered, .. } => {
+                    if delivered >= client_sent6 {
+                        served6 = true;
+                        break;
+                    }
+                    news(L_WAKE, &pace);
                 }
-                news(L_WAKE, &pace);
-            }
-            _ => {
-                report(17, outcome::REFUSED, 1);
-                exit();
+                _ => {
+                    report(17, outcome::REFUSED, 1);
+                    exit();
+                }
             }
         }
+        if !served6 {
+            report(17, outcome::STUCK, index as u64);
+            exit();
+        }
+        for offset in served_told6..client_sent6 {
+            l_send_view.write(offset, l_recv_view.read(offset));
+        }
+        if let Err(status) = tcp::send(INBOUND6, client_sent6 - served_told6) {
+            report(18, outcome::REFUSED, status << 8);
+            exit();
+        }
+        // The window reopens on both connections as the bytes are finished
+        // with -- the same discipline the v4 bulk learned, paid here per
+        // sample so the bulk that follows starts with both windows whole.
+        let _ = stream_state_on(INBOUND6, 17, client_sent6 - served_told6);
+        served_told6 = client_sent6;
+        if !recv_view.wait_for(
+            client_sent6 - 1,
+            PAYLOAD6[PAYLOAD6.len() - 1],
+            WAKE,
+            &pace,
+            600,
+        ) {
+            report(18, outcome::STUCK, index as u64);
+            exit();
+        }
+        let _ = stream_state_on(CONNECTION6, 18, PAYLOAD6.len() as u64);
+        *sample = now().wrapping_sub(begun6);
     }
-    if !served6 {
-        report(17, outcome::STUCK, 0);
-        exit();
-    }
-    for index in 0..PAYLOAD6.len() as u64 {
-        l_send_view.write(index, l_recv_view.read(index));
-    }
-    if let Err(status) = tcp::send(INBOUND6, PAYLOAD6.len() as u64) {
-        report(18, outcome::REFUSED, status << 8);
-        exit();
-    }
-    if !recv_view.wait_for(
-        PAYLOAD6.len() as u64 - 1,
-        PAYLOAD6[PAYLOAD6.len() - 1],
-        WAKE,
-        &pace,
-        600,
-    ) {
-        report(18, outcome::STUCK, 0);
-        exit();
-    }
+    samples6.sort_unstable();
+    report_word(11, samples6[samples6.len() / 2]);
+    // The first sample's bytes, verified in full -- the correctness check
+    // the measurement rides on.
     let echoed6 = (0..PAYLOAD6.len()).all(|index| recv_view.read(index as u64) == PAYLOAD6[index]);
     if !echoed6 {
         report(18, outcome::MANGLED, 0);
         exit();
     }
+
+    // Bulk through the loopback: thirty-two KiB, serialized chunk by chunk
+    // because one program is both ends -- so the number is per-crossing
+    // cost, not a pipeline rate, and the report says which. Stamps sit
+    // above the v4 story's leavings ('A' onward; the old stamps stopped at
+    // thirty-two).
+    const CHUNK6: u64 = 1024;
+    const CHUNKS6: u64 = 32;
+    let bulk6_started = now();
+    for chunk in 0..CHUNKS6 {
+        let stamp = b'A' + chunk as u8;
+        for offset in 0..CHUNK6 {
+            send_view.write(client_sent6 + offset, stamp);
+        }
+        if let Err(status) = tcp::send(CONNECTION6, CHUNK6) {
+            report(19, outcome::REFUSED, status << 8);
+            exit();
+        }
+        client_sent6 += CHUNK6;
+        let mut served6 = false;
+        for _ in 0..600u32 {
+            match tcp::recv(INBOUND6, 0) {
+                StreamPoll::Ready { delivered, .. } => {
+                    if delivered >= client_sent6 {
+                        served6 = true;
+                        break;
+                    }
+                    news(L_WAKE, &pace);
+                }
+                _ => {
+                    report(19, outcome::REFUSED, 1);
+                    exit();
+                }
+            }
+        }
+        if !served6 {
+            report(19, outcome::STUCK, chunk);
+            exit();
+        }
+        for offset in served_told6..client_sent6 {
+            l_send_view.write(offset, l_recv_view.read(offset));
+        }
+        if let Err(status) = tcp::send(INBOUND6, CHUNK6) {
+            report(19, outcome::REFUSED, status << 8);
+            exit();
+        }
+        // The window reopens as each chunk is finished with, on both
+        // connections -- without this the ring fills at sixteen KiB and
+        // the thirty-second kilobyte never ships, which the first run of
+        // this act demonstrated by wedging exactly there.
+        let _ = stream_state_on(INBOUND6, 19, client_sent6 - served_told6);
+        served_told6 = client_sent6;
+        if !recv_view.wait_for(client_sent6 - 1, stamp, WAKE, &pace, 600) {
+            report(19, outcome::STUCK, chunk | 0x100);
+            exit();
+        }
+        let _ = stream_state_on(CONNECTION6, 19, CHUNK6);
+    }
+    report_word(12, now().wrapping_sub(bulk6_started));
+    report_word(13, CHUNKS6 * CHUNK6);
     let _ = tcp::shutdown(CONNECTION6);
     let _ = tcp::shutdown(INBOUND6);
     report(19, outcome::LOOPED6, 0);

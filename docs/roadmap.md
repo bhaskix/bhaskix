@@ -193,7 +193,7 @@ held to the same gates as the incumbent. What remains is package management and 
   plan: the second driver — `bin/blkd`, in a domain — cost three bugs the first one had already
   learned and written down in comments, and a framework is the difference between a lesson recorded
   and a lesson enforced
-- 🟢 **Networking** — `DONE within its RFCs`, 2026-08-15. [RFC 0018](rfc/0018-networking.md)
+- ✅ **Networking** — every word of the bullet's name real as of 2026-08-18, IPv6 last. [RFC 0018](rfc/0018-networking.md)
   (accepted, all seven steps): virtio-net in a domain, Ethernet, ARP, IPv4, ICMP and UDP in a
   `no_std` crate with six fuzz targets, a socket that is a badged capability rather than a
   descriptor, DHCP by demonstration. [RFC 0020](rfc/0020-tcp.md) (implemented, all six steps): a
@@ -203,11 +203,19 @@ held to the same gates as the incumbent. What remains is package management and 
   owns and hands over as capabilities** ([RFC 0022](rfc/0022-capability-in-a-call.md),
   implemented), outbound against a deterministic peer and inbound from a host-initiated
   connection, with handshake, round trip and throughput measured as distributions and every wait
-  wake-driven ([RFC 0023](rfc/0023-a-wake-for-a-connection.md), implemented). The four TCP-era
-  RFCs await acceptance review. **Not done:** IPv6, reassembly, and congestion control. The sockets API above what the
-  services themselves speak exists since [RFC 0027](rfc/0027-a-sockets-api-worth-the-name.md)
-  (accepted 2026-08-17): `bhaskix-sock`, the client crate `bin/dhcp` and `bin/tcpc` now speak
-  through
+  wake-driven ([RFC 0023](rfc/0023-a-wake-for-a-connection.md), accepted — the four TCP-era
+  RFCs are all accepted, 0021 on 2026-08-14 and 0020/0022/0023 on 2026-08-16; this bullet
+  said "await acceptance review" until 2026-08-18). The sockets API above what the services themselves speak exists since
+  [RFC 0027](rfc/0027-a-sockets-api-worth-the-name.md) (accepted 2026-08-17): `bhaskix-sock`,
+  the client crate `bin/dhcp` and `bin/tcpc` now speak through. [RFC 0029](rfc/0029-ipv6.md)
+  (all six steps implemented 2026-08-18, acceptance pending) landed IPv6 as a second address
+  family rather than a second stack: zero-`unsafe` parsers and NDP, SLAAC, UDP and TCP over
+  the same rings and handover with the state machine untouched, dual stack gated on every
+  networked boot, and both families measured on the same run — the v6 numbers through the
+  loopback carry no emulator at all. **Not done, each with a written trigger:** off-box v6
+  UDP/TCP peers and inbound v6 (this emulator has no v6 peer — pcap-proven), extension
+  headers, fragmentation, DHCPv6, a resolver; and beyond any RFC's scope yet: reassembly and
+  congestion control
 - ✅ **Telemetry plane** — [RFC 0026](rfc/0026-telemetry-plane.md), accepted 2026-08-17,
   drafted and implemented the same day. [ai-native.md](ai-native.md) §2 as written: a 64-byte
   typed event, schema-versioned and never text; one lock-free drop-newest ring per CPU; a
