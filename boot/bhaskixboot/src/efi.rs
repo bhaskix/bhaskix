@@ -110,7 +110,12 @@ struct BootServices {
     hdr: TableHeader,
     raise_tpl: usize,
     restore_tpl: usize,
-    allocate_pages: usize,
+    allocate_pages: unsafe extern "efiapi" fn(
+        allocate_type: u32,
+        memory_type: u32,
+        pages: usize,
+        memory: *mut u64,
+    ) -> usize,
     free_pages: usize,
     get_memory_map: unsafe extern "efiapi" fn(
         size: *mut usize,
@@ -431,11 +436,13 @@ struct GraphicsInfo {
 }
 
 /// The framebuffer the firmware drives, if it drives one: width, height,
-/// stride in pixels, and the physical base. `None` is a machine with no
-/// graphics protocol or one whose answers fail their null checks —
-/// serial-only machines are real, and this loader treats them as a state.
+/// stride in pixels, the physical base, and whether the byte order is BGR.
+/// `None` is a machine with no graphics protocol, one whose answers fail
+/// their null checks, or one whose pixel format is neither of the two
+/// linear layouts — serial-only machines are real, and this loader treats
+/// all three as a state.
 #[must_use]
-pub fn framebuffer(table: *mut SystemTable) -> Option<(u32, u32, u32, u64)> {
+pub fn framebuffer(table: *mut SystemTable) -> Option<(u32, u32, u32, u64, bool)> {
     // SAFETY: `table` passed `validate`.
     let services = unsafe { (*table).boot_services };
     if services.is_null() {
@@ -463,11 +470,19 @@ pub fn framebuffer(table: *mut SystemTable) -> Option<(u32, u32, u32, u64)> {
     }
     // SAFETY: null-checked just above.
     let info = unsafe { &*info };
+    // 0 is RGBX, 1 is BGRX; the bitmask and blt-only formats are refused —
+    // a framebuffer whose layout the console cannot describe is not one.
+    let bgr = match info.pixel_format {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     Some((
         info.horizontal_resolution,
         info.vertical_resolution,
         info.pixels_per_scan_line,
         base,
+        bgr,
     ))
 }
 
@@ -495,11 +510,6 @@ pub struct MemoryMap {
     buffer: [u8; Self::BYTES],
     bytes_used: usize,
     stride: usize,
-    /// Descriptors the buffer could not hold — always zero on a map this
-    /// function returned, because a truncated take is refused with its
-    /// count instead of returned; the field keeps the summary line honest
-    /// by construction.
-    pub truncated: usize,
 }
 
 impl MemoryMap {
@@ -595,7 +605,6 @@ pub fn take_map_and_exit(
         buffer: [0u8; MemoryMap::BYTES],
         bytes_used: 0,
         stride: 0,
-        truncated: 0,
     };
     for _ in 0..8 {
         let mut size = MemoryMap::BYTES;
@@ -645,4 +654,47 @@ pub fn take_map_and_exit(
         // The key went stale between the two calls; take the map again.
     }
     Err((INVALID_PARAMETER, 0))
+}
+
+/// `AllocateAnyPages`.
+const ALLOCATE_ANY_PAGES: u32 = 0;
+/// `EfiLoaderCode` — the type this loader gives the kernel image and the
+/// initrd, so the region translation can tell "the payload" apart from
+/// "the loader's scaffolding" by the firmware's own labels.
+pub const LOADER_CODE: u32 = 1;
+/// `EfiLoaderData` — the scaffolding: table pool, handoff block, stack.
+pub const LOADER_DATA: u32 = 2;
+
+/// Allocates `pages` pages of the given memory type, physically contiguous,
+/// anywhere the firmware likes. The pages are the loader's until the
+/// machine is handed over, and their type is what the memory map will say
+/// about them after the exit.
+///
+/// # Errors
+///
+/// The firmware's status, or `usize::MAX` for a zero answer that claimed
+/// success.
+pub fn allocate_pages(
+    table: *mut SystemTable,
+    memory_type: u32,
+    pages: usize,
+) -> Result<u64, usize> {
+    // SAFETY: `table` passed `validate`.
+    let services = unsafe { (*table).boot_services };
+    if services.is_null() {
+        return Err(usize::MAX);
+    }
+    let mut memory: u64 = 0;
+    // SAFETY: the specification's signature; the firmware writes only
+    // `memory`.
+    let status = unsafe {
+        ((*services).allocate_pages)(ALLOCATE_ANY_PAGES, memory_type, pages, &raw mut memory)
+    };
+    if status != SUCCESS {
+        return Err(status);
+    }
+    if memory == 0 {
+        return Err(usize::MAX);
+    }
+    Ok(memory)
 }

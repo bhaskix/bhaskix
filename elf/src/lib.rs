@@ -69,6 +69,16 @@ const CLASS_64: u8 = 2;
 const DATA_LSB: u8 = 1;
 /// `e_type` value for an executable.
 const TYPE_EXEC: u16 = 2;
+/// `e_type` value for a position-independent executable.
+const TYPE_DYN: u16 = 3;
+/// `p_type` value for the dynamic segment.
+const PT_DYNAMIC: u32 = 2;
+/// `DT_RELA`, `DT_RELASZ`, `DT_RELAENT` — where the relocations live.
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+/// `R_X86_64_RELATIVE` — the one relocation kind a slid kernel needs.
+const R_RELATIVE: u32 = 8;
 /// `e_machine` value for x86-64.
 const MACHINE_X86_64: u16 = 0x3e;
 /// `p_type` value for a loadable segment.
@@ -88,6 +98,21 @@ mod flags {
 
 /// Where the kernel half begins. Nothing user-mode may be mapped at or above.
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
+
+/// Which half of the address space an image is allowed to ask for.
+///
+/// The check is the same shape either way — every segment entirely inside
+/// its half, refused otherwise — but the halves are opposite worlds: a ring
+/// 3 program in the kernel half is an escalation, and a kernel image in the
+/// user half is a loader about to jump into unmapped space. One parser,
+/// told which world it is validating for, refuses both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressHalf {
+    /// Ring 3 programs: every segment below [`KERNEL_HALF`].
+    User,
+    /// The kernel image itself: every segment at or above it.
+    Kernel,
+}
 
 /// Segments one program may have.
 ///
@@ -125,6 +150,14 @@ pub enum ElfError {
     SegmentsOverlap,
     /// An entry point that is not inside any loadable segment.
     EntryOutsideImage,
+    /// A dynamic image whose relocations are not all `R_X86_64_RELATIVE`,
+    /// or whose relocation table lies outside the file or its segments.
+    ///
+    /// Refused rather than partially applied: a kernel with one relocation
+    /// this loader cannot express would run with one wrong pointer, and a
+    /// wrong pointer at a random call site is the least diagnosable failure
+    /// a boot can have.
+    UnsupportedRelocation,
     /// The address space rejected a mapping.
     ///
     /// The one variant the parser never produces: it belongs to the loader
@@ -164,6 +197,10 @@ pub struct Image {
     pub entry: u64,
     segments: [Option<Segment>; MAX_SEGMENTS],
     count: usize,
+    /// The dynamic segment's place in the file, when the image is a
+    /// position-independent executable: `(file offset, bytes)`, bounds
+    /// already checked against the file.
+    dynamic: Option<(usize, usize)>,
 }
 
 impl Image {
@@ -220,6 +257,19 @@ pub fn page_span(segment: &Segment) -> Option<(u64, u64)> {
 /// [`ElfError`] naming what was wrong. The variants are specific because a
 /// single "invalid" tells whoever built the file nothing.
 pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
+    parse_in(bytes, AddressHalf::User)
+}
+
+/// [`parse`], for a caller that says which half the image belongs to.
+///
+/// The boot loader's entry point (RFC 0028 step 5): the kernel image lives
+/// in the high half, and every other check — the magic, the machine, the
+/// arithmetic, W^X, the overlap rule, the entry bound — is identical.
+///
+/// # Errors
+///
+/// [`ElfError`], exactly as [`parse`].
+pub fn parse_in(bytes: &[u8], half: AddressHalf) -> Result<Image, ElfError> {
     if bytes.len() < 64 {
         return Err(ElfError::Truncated);
     }
@@ -229,10 +279,18 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
     if bytes.get(4) != Some(&CLASS_64) || bytes.get(5) != Some(&DATA_LSB) {
         return Err(ElfError::WrongMachine);
     }
-    if u16_at(bytes, 16) != Some(TYPE_EXEC) {
-        // Includes `ET_DYN`, which is what a PIE is. Refusing it is what keeps
-        // relocation processing out of this loader entirely.
-        return Err(ElfError::NotExecutable);
+    let e_type = u16_at(bytes, 16).ok_or(ElfError::Truncated)?;
+    match (half, e_type) {
+        // Ring 3 programs: static executables only. Refusing `ET_DYN` is
+        // what keeps relocation processing out of the *program* loader
+        // entirely.
+        (AddressHalf::User, TYPE_EXEC) => {}
+        // The kernel image: `ET_DYN` as well, because a KASLR-able kernel
+        // is relocatable by construction — this tree's own kernel is one —
+        // and its relocations are walked by [`for_each_relative_relocation`],
+        // every one of them `R_X86_64_RELATIVE` or the whole image refused.
+        (AddressHalf::Kernel, TYPE_EXEC | TYPE_DYN) => {}
+        _ => return Err(ElfError::NotExecutable),
     }
     if u16_at(bytes, 18) != Some(MACHINE_X86_64) {
         return Err(ElfError::WrongMachine);
@@ -263,11 +321,29 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
 
     let mut segments = [None; MAX_SEGMENTS];
     let mut count = 0;
+    let mut dynamic = None;
 
     for index in 0..phnum {
         let header = phoff + index * phentsize;
 
-        if u32_at(bytes, header).ok_or(ElfError::BadProgramHeaders)? != PT_LOAD {
+        let p_type = u32_at(bytes, header).ok_or(ElfError::BadProgramHeaders)?;
+        if p_type == PT_DYNAMIC {
+            // Captured for the relocation walk, bounds-checked like any
+            // segment: a dynamic table outside the file is a header lying.
+            let offset = u64_at(bytes, header + 8).ok_or(ElfError::BadProgramHeaders)?;
+            let filesz = u64_at(bytes, header + 32).ok_or(ElfError::BadProgramHeaders)?;
+            let offset = usize::try_from(offset).map_err(|_| ElfError::BadProgramHeaders)?;
+            let filesz = usize::try_from(filesz).map_err(|_| ElfError::BadProgramHeaders)?;
+            let end = offset
+                .checked_add(filesz)
+                .ok_or(ElfError::BadProgramHeaders)?;
+            if end > bytes.len() {
+                return Err(ElfError::BadProgramHeaders);
+            }
+            dynamic = Some((offset, filesz));
+            continue;
+        }
+        if p_type != PT_LOAD {
             continue;
         }
 
@@ -295,11 +371,15 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
             return Err(ElfError::SegmentOutsideFile);
         }
 
-        // The mapping must be in the user half, and must not wrap into it.
+        // The mapping must sit entirely inside its half, and must not wrap.
         let last = vaddr
             .checked_add(memsz.max(1) - 1)
             .ok_or(ElfError::SegmentOutsideUserSpace)?;
-        if vaddr >= KERNEL_HALF || last >= KERNEL_HALF {
+        let outside = match half {
+            AddressHalf::User => vaddr >= KERNEL_HALF || last >= KERNEL_HALF,
+            AddressHalf::Kernel => vaddr < KERNEL_HALF,
+        };
+        if outside {
             return Err(ElfError::SegmentOutsideUserSpace);
         }
 
@@ -369,12 +449,236 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
         entry,
         segments,
         count,
+        dynamic,
     })
+}
+
+/// The file offset a virtual address lives at, through the image's own
+/// segments — how the relocation table, named by address, is found in the
+/// file's bytes.
+fn file_offset_of(image: &Image, address: u64, length: usize) -> Option<usize> {
+    for segment in image.segments() {
+        let end = segment.address.checked_add(segment.file_size as u64)?;
+        if address >= segment.address && address.checked_add(length as u64)? <= end {
+            return Some(segment.file_offset + (address - segment.address) as usize);
+        }
+    }
+    None
+}
+
+/// Walks a position-independent image's relocations, calling `apply` with
+/// each one's `(virtual address, addend)` — the loader writes
+/// `slide + addend` at the address, whatever its slide is, zero included.
+/// Returns how many there were. An image with no dynamic segment has none,
+/// which is an answer, not an error.
+///
+/// # Errors
+///
+/// [`ElfError::UnsupportedRelocation`] for any relocation that is not
+/// `R_X86_64_RELATIVE`, a table that lies outside the file or the
+/// segments, or a malformed entry size — refused whole, because a
+/// partially relocated kernel fails at a random call site instead of
+/// here, with a sentence.
+pub fn for_each_relative_relocation(
+    bytes: &[u8],
+    image: &Image,
+    mut apply: impl FnMut(u64, i64),
+) -> Result<usize, ElfError> {
+    let Some((dyn_offset, dyn_size)) = image.dynamic else {
+        return Ok(0);
+    };
+    // The dynamic table: (tag, value) pairs, sixteen bytes each, ended by
+    // DT_NULL or the segment's own size.
+    let mut rela_address = None;
+    let mut rela_size = None;
+    let mut rela_entry = None;
+    let mut at = 0;
+    while at + 16 <= dyn_size {
+        let tag = u64_at(bytes, dyn_offset + at).ok_or(ElfError::UnsupportedRelocation)?;
+        let value = u64_at(bytes, dyn_offset + at + 8).ok_or(ElfError::UnsupportedRelocation)?;
+        match tag {
+            0 => break,
+            DT_RELA => rela_address = Some(value),
+            DT_RELASZ => rela_size = Some(value),
+            DT_RELAENT => rela_entry = Some(value),
+            _ => {}
+        }
+        at += 16;
+    }
+    let (Some(address), Some(size)) = (rela_address, rela_size) else {
+        // A dynamic segment with no relocation table: nothing to apply.
+        return Ok(0);
+    };
+    if rela_entry.unwrap_or(24) != 24 {
+        return Err(ElfError::UnsupportedRelocation);
+    }
+    let size = usize::try_from(size).map_err(|_| ElfError::UnsupportedRelocation)?;
+    if size % 24 != 0 {
+        return Err(ElfError::UnsupportedRelocation);
+    }
+    let table = file_offset_of(image, address, size).ok_or(ElfError::UnsupportedRelocation)?;
+
+    let count = size / 24;
+    for index in 0..count {
+        let entry = table + index * 24;
+        let r_offset = u64_at(bytes, entry).ok_or(ElfError::UnsupportedRelocation)?;
+        let r_info = u64_at(bytes, entry + 8).ok_or(ElfError::UnsupportedRelocation)?;
+        let r_addend = u64_at(bytes, entry + 16).ok_or(ElfError::UnsupportedRelocation)? as i64;
+        if (r_info & 0xffff_ffff) as u32 != R_RELATIVE {
+            return Err(ElfError::UnsupportedRelocation);
+        }
+        // The target must be inside a loaded segment's memory span, or the
+        // loader would write outside the image it placed.
+        let inside = image.segments().any(|segment| {
+            r_offset >= segment.address
+                && r_offset
+                    .checked_add(8)
+                    .is_some_and(|end| end <= segment.address.saturating_add(segment.memory_size))
+        });
+        if !inside {
+            return Err(ElfError::UnsupportedRelocation);
+        }
+        apply(r_offset, r_addend);
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a high-half `ET_DYN` image: one loadable RX segment whose
+    /// contents hold a relocation table, and a `DYNAMIC` segment naming it.
+    /// `reloc_type` lets a test hand in a kind the walker must refuse.
+    fn dynamic_elf(reloc_count: usize, reloc_type: u32, target: u64) -> Vec<u8> {
+        const BASE: u64 = 0xffff_ffff_8000_0000;
+        const PHOFF: usize = 64;
+        const PHENTSIZE: usize = 56;
+        let contents_at = PHOFF + 2 * PHENTSIZE;
+        let dyn_at = contents_at; // dynamic table first
+        let dyn_bytes = 4 * 16;
+        let rela_at = dyn_at + dyn_bytes;
+        let rela_bytes = reloc_count * 24;
+        let total = rela_at + rela_bytes;
+
+        let mut bytes = vec![0u8; total];
+        bytes[0..4].copy_from_slice(&MAGIC);
+        bytes[4] = CLASS_64;
+        bytes[5] = DATA_LSB;
+        bytes[16..18].copy_from_slice(&TYPE_DYN.to_le_bytes());
+        bytes[18..20].copy_from_slice(&MACHINE_X86_64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&BASE.to_le_bytes());
+        bytes[32..40].copy_from_slice(&(PHOFF as u64).to_le_bytes());
+        bytes[54..56].copy_from_slice(&(PHENTSIZE as u16).to_le_bytes());
+        bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+
+        // The loadable segment: the whole file, RX, at the base.
+        let ph = PHOFF;
+        bytes[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        bytes[ph + 4..ph + 8].copy_from_slice(&(flags::READ | flags::EXEC).to_le_bytes());
+        bytes[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes());
+        bytes[ph + 16..ph + 24].copy_from_slice(&BASE.to_le_bytes());
+        bytes[ph + 32..ph + 40].copy_from_slice(&(total as u64).to_le_bytes());
+        bytes[ph + 40..ph + 48].copy_from_slice(&(total as u64).to_le_bytes());
+
+        // The dynamic segment, inside the loadable one.
+        let ph = PHOFF + PHENTSIZE;
+        bytes[ph..ph + 4].copy_from_slice(&PT_DYNAMIC.to_le_bytes());
+        bytes[ph + 8..ph + 16].copy_from_slice(&(dyn_at as u64).to_le_bytes());
+        bytes[ph + 16..ph + 24].copy_from_slice(&(BASE + dyn_at as u64).to_le_bytes());
+        bytes[ph + 32..ph + 40].copy_from_slice(&(dyn_bytes as u64).to_le_bytes());
+        bytes[ph + 40..ph + 48].copy_from_slice(&(dyn_bytes as u64).to_le_bytes());
+
+        // DT_RELA, DT_RELASZ, DT_RELAENT, DT_NULL.
+        let entries = [
+            (DT_RELA, BASE + rela_at as u64),
+            (DT_RELASZ, rela_bytes as u64),
+            (DT_RELAENT, 24u64),
+            (0u64, 0u64),
+        ];
+        for (slot, (tag, value)) in entries.iter().enumerate() {
+            let at = dyn_at + slot * 16;
+            bytes[at..at + 8].copy_from_slice(&tag.to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&value.to_le_bytes());
+        }
+
+        // The relocations: each targets `target`, addend = its index.
+        for index in 0..reloc_count {
+            let at = rela_at + index * 24;
+            bytes[at..at + 8].copy_from_slice(&target.to_le_bytes());
+            let info = u64::from(reloc_type);
+            bytes[at + 8..at + 16].copy_from_slice(&info.to_le_bytes());
+            bytes[at + 16..at + 24].copy_from_slice(&(index as u64).to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_dynamic_kernel_image_parses_and_its_relocations_are_walked() {
+        let file = dynamic_elf(3, R_RELATIVE, 0xffff_ffff_8000_0010);
+        // Still refused for ring 3: a PIE is not a static executable.
+        assert_eq!(parse(&file), Err(ElfError::NotExecutable));
+        let image = parse_in(&file, AddressHalf::Kernel).expect("a relocatable kernel");
+        let mut seen = Vec::new();
+        let walked = for_each_relative_relocation(&file, &image, |address, addend| {
+            seen.push((address, addend));
+        })
+        .expect("all relative");
+        assert_eq!(walked, 3);
+        assert_eq!(
+            seen,
+            [
+                (0xffff_ffff_8000_0010, 0),
+                (0xffff_ffff_8000_0010, 1),
+                (0xffff_ffff_8000_0010, 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relocation_kind_the_loader_cannot_express_refuses_the_whole_image() {
+        // R_X86_64_64 is 1: a symbolic relocation, which a loader with no
+        // symbol table must refuse rather than write garbage for.
+        let file = dynamic_elf(2, 1, 0xffff_ffff_8000_0010);
+        let image = parse_in(&file, AddressHalf::Kernel).expect("parses");
+        assert_eq!(
+            for_each_relative_relocation(&file, &image, |_, _| {}),
+            Err(ElfError::UnsupportedRelocation)
+        );
+    }
+
+    #[test]
+    fn a_relocation_outside_the_image_is_refused() {
+        let file = dynamic_elf(1, R_RELATIVE, 0xffff_ffff_9000_0000);
+        let image = parse_in(&file, AddressHalf::Kernel).expect("parses");
+        assert_eq!(
+            for_each_relative_relocation(&file, &image, |_, _| {}),
+            Err(ElfError::UnsupportedRelocation)
+        );
+    }
+
+    #[test]
+    fn each_half_refuses_the_other_and_accepts_its_own() {
+        // A high-half image: refused by the user parse, accepted by the
+        // kernel parse — and the mirror, so neither check is vacuous.
+        let high = elf(
+            0xffff_ffff_8000_0000,
+            0xffff_ffff_8000_0000,
+            flags::READ | flags::EXEC,
+            16,
+            16,
+        );
+        assert_eq!(parse(&high), Err(ElfError::SegmentOutsideUserSpace));
+        let image = parse_in(&high, AddressHalf::Kernel).expect("a kernel image in its half");
+        assert_eq!(image.entry, 0xffff_ffff_8000_0000);
+
+        let low = good();
+        assert!(parse(&low).is_ok());
+        assert_eq!(
+            parse_in(&low, AddressHalf::Kernel),
+            Err(ElfError::SegmentOutsideUserSpace)
+        );
+    }
 
     /// Builds a minimal valid ELF64 executable with one loadable segment.
     fn elf(vaddr: u64, entry: u64, permissions: u32, filesz: u64, memsz: u64) -> Vec<u8> {

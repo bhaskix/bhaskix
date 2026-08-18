@@ -24,6 +24,12 @@ license = "Apache-2.0"
 name = "bhaskixboot"
 path = "src/main.rs"
 
+[dependencies]
+# The contract the native protocol IS -- the kernel's own Handoff types.
+bhaskix-boot = { path = "../handoff" }
+# The same fuzz-hardened parser the kernel loads programs with.
+bhaskix-elf = { path = "../../elf" }
+
 [profile.release]
 panic = "abort"
 opt-level = "s"
@@ -42,4 +48,10 @@ opt-level = "s"
 # graphics chain's null-checked hops, the memory-map take welded to the
 # exit, and the park. Every new line is a firmware answer read behind a
 # check, or the hlt that ends a machine the loader now owns.
-unsafe_budget = 50
+#
+# 78 at step 5: the world -- page allocation, the buffer views over pages
+# the firmware granted, the table pool's zeroing and entries, and the
+# handoff block's writes with the fabricated references whose lifetimes
+# the reclamation contract states. The decisions -- the parse, the
+# relocation walk, the refusals -- stay in bhaskix-elf at budget zero.
+unsafe_budget = 78

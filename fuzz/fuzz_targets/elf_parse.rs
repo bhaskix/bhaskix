@@ -34,4 +34,10 @@ fuzz_target!(|data: &[u8]| {
     // The result is deliberately ignored. Every `Err` is a success: the
     // interesting outcomes are the ones that never return at all.
     let _ = bhaskix_elf::parse(data);
+    // The kernel-half parse and the relocation walk are the boot loader's
+    // path through the same crate; fuzzing them here is what step 4's
+    // extraction bought.
+    if let Ok(image) = bhaskix_elf::parse_in(data, bhaskix_elf::AddressHalf::Kernel) {
+        let _ = bhaskix_elf::for_each_relative_relocation(data, &image, |_, _| {});
+    }
 });

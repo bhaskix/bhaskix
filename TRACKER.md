@@ -130,7 +130,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **A5** | 5-level paging (LA57) | ✅ **Accepted** 2026-08-16 — answered by RFC 0025, implemented 2026-08-15 with the document; **the last open architecture question is closed** | **Four-level, on purpose, with the refusal shipped**: every walk and half-split in the tree is a bit-47 statement, so bring-up now reads `CR4.LA57` and halts with a sentence rather than corrupting addresses silently under a bootloader whose default changed. The boot report states capability beside choice. Five-level gets built against a written trigger — an address-space or physical-memory need no current machine has — not an open wait. | [RFC 0025](docs/rfc/0025-four-level-paging-on-purpose.md) |
 | **TE1** | Telemetry plane | ✅ **Accepted 2026-08-17** — drafted, implemented (all six steps) and accepted the same day, on the working demonstration: two boot gates per placement, one negative-armed, the emit priced from both sides | **A 64-byte typed event, one lock-free drop-newest ring per CPU, two capabilities to read them.** [ai-native.md](docs/ai-native.md) §2 built as specified, with three narrownesses stated in the draft rather than discovered later: per-domain enable bits deferred to their first consumer (per-class now), the `Audit` class reserved but refused (best-effort audit is false assurance — backpressure is its own RFC on this foundation), and the domain field carrying the id without the generation. Rejects the `TelemetryChannel`-per-domain sketch in `architecture.md` — the producer is a CPU, often in interrupt context, not a domain. Partially answers RFC 0008's Q4: a capability is named (domain, slot, kind) for tracing; audit-grade naming stays open | [RFC 0026](docs/rfc/0026-telemetry-plane.md) |
 | **SK1** | A sockets API worth the name | ✅ **Accepted 2026-08-17** — drafted, implemented (steps 1–4) and accepted the same day, on the ports: `bin/dhcp` 28 → 10 `unsafe` lines, `bin/tcpc` 45 → 12, the crate carries 20 once; every gate unchanged, the measure A/B'd neutral. Question 2 answered by the port (the leg order stays the caller's); questions 1 (the shell) and 3 (a user-rt crate) stay open with their triggers written | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
-| **BB1** | `bhaskixboot.efi` | ⬜ **Draft** 2026-08-17, steps 1–4 implemented — the lane is alive, the payload byte-proven, boot services exited, and the fuzz-hardened ELF parser extracted to `bhaskix-elf` for the loader to share | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
+| **BB1** | `bhaskixboot.efi` | ⬜ **Draft** 2026-08-17, steps 1–5 implemented — the lane runs fifteen gates: payload byte-proven, the machine's shape taken, boot services exited, the kernel parsed and relocated (715 fixups, both readers agreeing), placed W^X, the world's tables standing, the handoff assembled. Step 6 is the jump | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -761,6 +761,44 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-18 (RFC 0028 step 5: the world is built — and the kernel turned out to be a PIE)
+
+**The loader builds everything the jump needs, and the step's first finding was the parser
+doing its job**: the kernel image failed `parse_in(Kernel)` because it is **`ET_DYN`** — a
+position-independent executable, which is *how* Limine slides it for KASLR, and which the
+parser refuses for ring 3 by design. The honest extension, all of it in the fuzz-hardened
+crate: kernel-half images may be `ET_DYN`; the `DYNAMIC` segment is captured bounds-checked;
+and `for_each_relative_relocation` walks the table refusing anything that is not
+`R_X86_64_RELATIVE` — whole-image refusal, because a partially relocated kernel fails at a
+random call site instead of here with a sentence. Three new tests (the walk, the
+unsupported-kind refusal, the out-of-image refusal) and the fuzz target now drives the
+kernel-half parse and the walk too. **The slide term is already in the sum**: the loader
+writes `slide + addend` with slide zero today, and step 7's KASLR changes one number.
+
+**The lane runs fifteen gates, every computable fact cross-checked by a second implementation**:
+a python ELF reader in the harness independently derives the segment count, the entry, the
+link base and the relocation count from the staged kernel — and the loader agreed on all four,
+**715 relocations** included. The rest of the step: the payload read whole into `LoaderCode`
+pages (the label the region translation turns into `KernelAndModules`, with `LoaderData`
+becoming `BootloaderReclaimable` — the firmware's own vocabulary made to carry the
+discrimination); the segments placed in one zeroed span, W^X per segment with 4 KiB precision;
+identity and HHDM built as **two PML4 slots over one set of directories** — the sharing is the
+statement that they agree — with the framebuffer span mapped and `EFER.NXE` noted as step 6's
+precondition; and the `Handoff` assembled in the reclaimable block with the memory map
+translated, sorted, and refused-not-truncated past 128 regions. Budget 50 → 78; the decisions
+stay in `bhaskix-elf` at budget zero. Full suite green.
+
+**The post-fix soak, recorded beside it**: 118 of 120. Zero counter markers anywhere — the
+convicted family produced not one `COUNT MISMATCH`, `UNDERFLOW`, guard-less `BLOCK HOLDING`
+or `SAVED COUNT` in 120 boots, where the pre-fix suite produced the full quartet in one
+afternoon. The two failures are the *other* family at its usual phase: run-111 stops silently
+after the migration line, and run-80 faults and then **the report itself wedges mid-println**
+— "the fault was legal but could not be serviced: " with the reason never printed, which
+reads as the exception path blocking on a console lock another CPU holds, and which means the
+frame-dump instrument never got its chance. Both preserved. The next instrument is named
+before it is built: the fatal report must not block on a lock a wedged machine may hold — the
+panic path's console-stealing discipline, applied to the exception report.
 
 ### 2026-08-18 (the disease convicted: the acquire's front edge was migratable, and four markers were one tear)
 

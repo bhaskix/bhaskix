@@ -102,6 +102,48 @@ INITRD_FNV=$(fnv "$ESP/bhaskix/initrd.tar")
 CONF_BYTES=$(stat -c %s "$ESP/bhaskix/boot.conf")
 CONF_FNV=$(fnv "$ESP/bhaskix/boot.conf")
 
+# The kernel image's own facts, from a second ELF reader: loadable segment
+# count, entry point, link base, and how many relative relocations the
+# dynamic table names. The loader must agree exactly with all four.
+read -r KSEGS KENTRY KBASE KRELOCS <<< "$(python3 - "$ESP/bhaskix/kernel" <<'PY'
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+entry = struct.unpack_from("<Q", data, 24)[0]
+phoff = struct.unpack_from("<Q", data, 32)[0]
+phentsize = struct.unpack_from("<H", data, 54)[0]
+phnum = struct.unpack_from("<H", data, 56)[0]
+segs, base, dyn = 0, None, None
+loads = []
+for i in range(phnum):
+    o = phoff + i * phentsize
+    p_type = struct.unpack_from("<I", data, o)[0]
+    p_offset, p_vaddr = struct.unpack_from("<QQ", data, o + 8)
+    p_filesz = struct.unpack_from("<Q", data, o + 32)[0]
+    if p_type == 1:
+        segs += 1
+        loads.append((p_vaddr, p_offset, p_filesz))
+        base = p_vaddr & ~0xFFF if base is None else min(base, p_vaddr & ~0xFFF)
+    if p_type == 2:
+        dyn = (p_offset, p_filesz)
+relocs = 0
+if dyn:
+    rela = relasz = None
+    at = dyn[0]
+    while at + 16 <= dyn[0] + dyn[1]:
+        tag, val = struct.unpack_from("<QQ", data, at)
+        if tag == 0:
+            break
+        if tag == 7:
+            rela = val
+        if tag == 8:
+            relasz = val
+        at += 16
+    if rela is not None and relasz:
+        relocs = relasz // 24
+print(f"{segs} 0x{entry:016x} 0x{base:016x} {relocs}")
+PY
+)"
+
 WRITABLE_VARS="$REPO_ROOT/build/OVMF_VARS_native.fd"
 cp "$OVMF_VARS" "$WRITABLE_VARS"
 
@@ -119,7 +161,7 @@ QEMU_PID=$!
 # the loader returns to the firmware after speaking, and the firmware then
 # wanders into its own shell -- the output is the event, not the exit.
 for _ in $(seq 1 "$TIMEOUT"); do
-    if grep -qE "bhaskixboot: (boot services exited|the exit was refused|the exit succeeded with an empty)" "$LOG" 2>/dev/null; then
+    if grep -qE "bhaskixboot: (the world is built|the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -180,6 +222,46 @@ if grep -qF "bhaskixboot: boot services exited; the machine is ours" "$LOG" 2>/d
     pass "boot services exited: the machine is ours"
 else
     fail "the exit line never appeared"
+    status=1
+fi
+
+# Step 5: the load and the tables, every computable fact cross-checked
+# against the second ELF reader above.
+if grep -qF "bhaskixboot: kernel parsed: $KSEGS loadable segments, entry $KENTRY" "$LOG" 2>/dev/null; then
+    pass "the kernel parsed: $KSEGS segments, entry $KENTRY, both agreed"
+else
+    fail "kernel parse line missing or wrong: wanted $KSEGS segments, entry $KENTRY"
+    status=1
+fi
+if grep -qF "bhaskixboot: relative relocations applied: $KRELOCS, slide 0x0000000000000000" "$LOG" 2>/dev/null; then
+    pass "all $KRELOCS relative relocations applied at slide zero"
+else
+    fail "relocation line missing or wrong: wanted $KRELOCS at slide zero"
+    status=1
+fi
+if grep -qE "bhaskixboot: kernel placed at 0x[0-9a-f]{16}, virt base $KBASE, span [1-9][0-9]* KiB, W\^X per segment" "$LOG" 2>/dev/null; then
+    pass "the kernel is placed at its link base, W^X per segment"
+else
+    fail "kernel placement line missing or wrong: wanted virt base $KBASE"
+    status=1
+fi
+if grep -qE "bhaskixboot: tables built: [1-9][0-9]* frames; identity and hhdm to 0x[0-9a-f]{16}, kernel in the high half, cr3 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
+    pass "the world's tables stand: identity, hhdm, kernel high half"
+else
+    fail "table line missing or malformed"
+    status=1
+fi
+INITRD_BYTES2=$(stat -c %s "$ESP/bhaskix/initrd.tar")
+if grep -qE "bhaskixboot: handoff assembled: version 2, [1-9][0-9]* regions, initrd $INITRD_BYTES2 bytes, stack top 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
+    pass "the handoff is assembled: version 2, the initrd whole"
+else
+    fail "handoff line missing or wrong"
+    status=1
+fi
+if grep -qF "bhaskixboot: the world is built; the jump is step 6" "$LOG" 2>/dev/null; then
+    pass "the world is built; the jump is step 6"
+else
+    fail "the step-5 closing line never appeared"
     status=1
 fi
 
