@@ -451,6 +451,167 @@ fn handle_interrupt(frame: &mut TrapFrame) {
     }
 }
 
+/// The name of the frame field at `offset` bytes from the frame's base, or
+/// where the qword sits relative to it. The layout is `TrapFrame`'s, stated
+/// here as a match so the dump can never drift from the struct silently —
+/// a mismatch prints a wrong *label* beside a right *address*, which the
+/// next reader catches against the struct in one glance.
+const fn frame_field(offset: i64) -> &'static str {
+    match offset {
+        i64::MIN..=-1 => "below the frame",
+        0 => "r15",
+        8 => "r14",
+        16 => "r13",
+        24 => "r12",
+        32 => "r11",
+        40 => "r10",
+        48 => "r9",
+        56 => "r8",
+        64 => "rbp",
+        72 => "rdi",
+        80 => "rsi",
+        88 => "rdx",
+        96 => "rcx",
+        104 => "rbx",
+        112 => "rax",
+        120 => "vector",
+        128 => "error code",
+        136 => "rip  (iret)",
+        144 => "cs   (iret)",
+        152 => "rflags (iret)",
+        160 => "rsp  (iret)",
+        168 => "ss   (iret)",
+        _ => "above the frame",
+    }
+}
+
+/// What address family a qword belongs to — the classification the run-312
+/// and run-85 analyses did by hand, printed so the next specimen arrives
+/// pre-sorted.
+const fn shape_of(value: u64) -> &'static str {
+    if value == 0 {
+        return "";
+    }
+    if value >= 0xffff_ffff_8000_0000 {
+        return "  [kernel image half]";
+    }
+    if value >= 0xffff_a000_0000_0000 && value < 0xffff_c000_0000_0000 {
+        return "  [kernel stacks]";
+    }
+    if value >= 0xffff_8000_0000_0000 {
+        return "  [direct map]";
+    }
+    if value < 0x0000_8000_0000_0000 {
+        return "";
+    }
+    "  [NON-CANONICAL]"
+}
+
+/// The raw qwords around the frame, one line each, annotated — the
+/// instrument run-85 asked for. Its finding was made by hand: the error
+/// code equalled the low sixteen bits of the live `rbx`, and the `ss` slot
+/// held a kernel pointer, which reads as register-shaped data written over
+/// an in-flight frame. This prints the clobber's *pattern*: every qword in
+/// the window, its expected role, its address family, and — the
+/// fingerprint — whether it echoes one of the frame's own registers.
+fn dump_frame_window(frame: &TrapFrame) {
+    let base = core::ptr::from_ref(frame) as u64;
+    let size = core::mem::size_of::<TrapFrame>() as u64;
+    // Only the pages the frame itself occupies are known-mapped — the CPU
+    // and the stub wrote the frame there. One qword beyond them is a gamble
+    // on a guard page, and a nested fault inside the fatal report loses the
+    // report, so the window clamps to those pages rather than discovering
+    // the edge the hard way.
+    let lo_mapped = base & !0xFFF;
+    let hi_mapped = ((base + size - 1) & !0xFFF) + 0x1000;
+    let lo = core::cmp::max(lo_mapped, base.saturating_sub(4 * 8));
+    let hi = core::cmp::min(hi_mapped, base + size + 16 * 8);
+
+    println!();
+    println!("  raw stack window around the frame, low to high:");
+    let named = [
+        (frame.rax, "rax"),
+        (frame.rbx, "rbx"),
+        (frame.rcx, "rcx"),
+        (frame.rdx, "rdx"),
+        (frame.rsi, "rsi"),
+        (frame.rdi, "rdi"),
+        (frame.rbp, "rbp"),
+        (frame.r8, "r8"),
+        (frame.r9, "r9"),
+        (frame.r10, "r10"),
+        (frame.r11, "r11"),
+        (frame.r12, "r12"),
+        (frame.r13, "r13"),
+        (frame.r14, "r14"),
+        (frame.r15, "r15"),
+    ];
+    let mut at = lo;
+    while at < hi {
+        // SAFETY: `at` stays within pages the frame occupies, which are
+        // mapped -- the frame was written there by the CPU and the stub --
+        // and the read is an aligned qword with no side effects.
+        let value = unsafe { core::ptr::read_volatile(at as *const u64) };
+        let offset = at as i64 - base as i64;
+        let mut echo = "";
+        let mut partial = "";
+        if offset >= 120 {
+            // Only the slots past the pushed registers are interesting to
+            // fingerprint: a register slot equalling its register is the
+            // frame working. Small values are excluded from the full-match
+            // — a selector equalling a register that happens to hold 0x10
+            // is coincidence, not contamination.
+            for (register, name) in named {
+                if value == register && value > 0xFFFF {
+                    echo = name;
+                    break;
+                }
+            }
+            // The vector and error slots expect small values, and run-85's
+            // decisive clue was a *fragment*: an error code equalling the
+            // low sixteen bits of a live pointer register. Flagged only for
+            // pointer-shaped registers, so a genuinely small error code
+            // cannot echo a genuinely small register by accident.
+            if echo.is_empty() && (offset == 120 || offset == 128) && value != 0 {
+                for (register, name) in named {
+                    if register > u64::from(u32::MAX) && register & 0xFFFF == value & 0xFFFF {
+                        partial = name;
+                        break;
+                    }
+                }
+            }
+        }
+        if !echo.is_empty() {
+            println!(
+                "    {:#018x}  {:#018x}  {}{}  = live {}",
+                at,
+                value,
+                frame_field(offset),
+                shape_of(value),
+                echo
+            );
+        } else if !partial.is_empty() {
+            println!(
+                "    {:#018x}  {:#018x}  {}{}  low bits echo live {}",
+                at,
+                value,
+                frame_field(offset),
+                shape_of(value),
+                partial
+            );
+        } else {
+            println!(
+                "    {:#018x}  {:#018x}  {}{}",
+                at,
+                value,
+                frame_field(offset),
+                shape_of(value)
+            );
+        }
+        at += 8;
+    }
+}
+
 /// Reports an exception in full, and returns.
 ///
 /// Returns rather than halting because the verdict is no longer the same for
@@ -583,6 +744,8 @@ fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
     println!();
     println!("  cr0 {:#018x}  cr2 {:#018x}", read_cr0(), read_cr2());
     println!("  cr3 {:#018x}  cr4 {:#018x}", read_cr3(), read_cr4());
+
+    dump_frame_window(frame);
 
     if frame.vector == 8 {
         println!();

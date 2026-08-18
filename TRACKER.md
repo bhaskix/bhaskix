@@ -762,6 +762,30 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (the frame-dump instrument: the next specimen arrives pre-sorted, fingerprints attached)
+
+**The instrument run-85 asked for exists.** Every fatal exception report now ends with a raw
+stack window around the frame — every qword from four below the frame's base to sixteen past
+its end, clamped to the pages the frame itself occupies (the CPU and the stub wrote it there,
+so those pages are mapped; one qword further is a gamble on a guard page, and a nested fault
+inside the fatal report loses the report). Each line carries the qword's expected role — the
+`TrapFrame` layout restated as a match, so a drift prints a wrong label beside a right address
+and is caught in one glance — its address family (kernel image half, kernel stacks, direct
+map, low half, `NON-CANONICAL`), and **the fingerprint**: iret-frame slots that equal a live
+register are flagged `= live rbx`, and the vector and error slots — where small values are
+expected — are checked for the *fragment* echo that cracked run-85 by hand, the low sixteen
+bits of a pointer-shaped register, flagged only for registers above 32 bits so a genuinely
+small error cannot echo a genuinely small register by accident.
+
+**Verified against a real fault, twice**: an injected `#GP`'s window read correct in every
+slot — vector 0x0d, the deliberate `0xdeac` selector in the error slot, `cs 0x0008`, `rip` in
+kernel text, `rsp` pointing one qword past the frame — and the first version's noise (an
+`ss` of `0x10` "echoing" an `r8` of `0x10`) was seen in that output and filtered before it
+could cry wolf: full-qword echoes now require pointer-sized values. The fault-injection lane
+passes unchanged; the full suite is green. When the frame-clobber specimen next appears, its
+window will say which registers were written over it and in what order — the writer's
+fingerprint, printed at the scene.
+
 ### 2026-08-18 (the courtship soak: 1 in 120, and the crash arm yields its first full-register specimen)
 
 **119 of 120 instrument-armed boots passed; the one that did not is the richest specimen the
