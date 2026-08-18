@@ -763,6 +763,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (RFC 0029 step 3: ipd speaks the second family, and three premises fall on one wire)
+
+**Every networked lane now boots dual-stack, and the gate line proves the family end to
+end**: `net ipv6 slaac fec0:0:0:0::/64, router advertised, host resolved by ndp; 1 v6 echo
+replies`. `bin/ipd` derives its link-local identity from the MAC the moment it knows one,
+sends a router solicitation, walks SLAAC's one arithmetic step from the advertisement,
+resolves `fec0::2` by neighbour solicitation, answers solicitations and echoes for its own
+addresses (NDP accepted only at hop limit 255 — the check the parser assigned to its
+caller, honoured), and pings the v6 host with the same payload discipline as the v4 ping.
+The report page carries the prefix and a packed v6 word at indexes 21 and 22.
+
+**Three wrong premises fell, each convicted by an instrument:**
+1. *"The report's words 11 and 12 are spare."* They are the ring's own head and tail,
+   written by `refresh()` once serving starts — the first v6 draft put its words there and
+   read back `126, 126`, which turned out to be byte offsets into the netd ring. The page
+   now carries a map comment where the trap was.
+2. *"netd's virtio-header measurement is sound."* Its premise — the first received frame
+   answers this station's own broadcast — dies on any wire with unsolicited multicast, and
+   dies harder when v4 never answers at all: the probe matched nothing, `header` stayed 0,
+   and every frame crossed to ipd with twelve bytes of virtio header in front, parsing as
+   an all-zero Ethernet header. Zero was never an answer; the documented modern layout is
+   now the fallback and the probe keeps its one real job (the ten-byte legacy device).
+3. *"`ipv6=on` just enables IPv6."* On this QEMU, slirp's v6 is on **by default** and
+   dual-stack works — but the *explicit* flag makes slirp stop answering v4 ARP entirely,
+   bisected with a pcap in both directions. The flag stays implicit, `devices.sh` carries
+   the do-not-tidy warning, and the dedicated v6-only lane this bug briefly justified was
+   deleted the moment the default was found to work.
+
+Also hardened on the way: the three v6 sends retry on a *loop-pass* clock, because `ticks`
+advance one per received frame and a lost reply on a quiet wire would freeze exactly the
+clock that should retry it; and the resolved bit is sticky, because the question is "did
+NDP work", not "is the cache entry still warm". Five consecutive green runs of the busiest
+lane; the resolved-by-ndp gate joined every networked placement.
+
 ### 2026-08-18 (RFC 0029 step 2: the four messages that replaced ARP, and one table for both families)
 
 **NDP lands in `bhaskix-net`** — router solicitation and advertisement, neighbour solicitation

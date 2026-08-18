@@ -74,6 +74,13 @@ qemu_device_list() {
                 # but these answer the same way every boot, inside
                 # `restrict=on`, needing no host configuration and reaching
                 # nothing outside the emulator.
+                # No explicit ipv6 flag, deliberately: this QEMU's slirp
+                # defaults IPv6 ON and dual-stack works -- but passing
+                # `ipv6=on` EXPLICITLY makes slirp stop answering v4 ARP
+                # entirely (bisected with a pcap, 2026-08-18: same guest,
+                # same request, answered without the flag and silent with
+                # it). Do not "tidy" this line by making the default
+                # explicit; the default and the flag are different worlds.
                 -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:45557-:7"
                 -device "virtio-net-pci,netdev=net0$suffix"
             )

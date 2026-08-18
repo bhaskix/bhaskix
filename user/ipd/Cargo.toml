@@ -62,4 +62,7 @@ opt-level = "s"
 # report words for the first data segment out and in.
 # 131 after RFC 0026 step 5 retired the pipeline stamps: stamp_once and
 # its rdtsc were nine lines of unsafe this program no longer contains.
-unsafe_budget = 131
+# 136 at RFC 0029 step 3: the second family's five sends and receives --
+# each the same shape as its v4 twin (the frame into the return ring, the
+# config and ring reads), no new kind of unsafe, five more lines of it.
+unsafe_budget = 136

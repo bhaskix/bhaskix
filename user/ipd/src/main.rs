@@ -29,8 +29,9 @@
 
 use bhaskix_abi::{method, rights, ring, socket, status, syscall};
 use bhaskix_net::{
-    Address, ArpOp, ArpPacket, EthFrame, EtherType, Ipv4Addr, Ipv4Header, MacAddr, NeighbourCache,
-    Port, Protocol, UdpDatagram, arp, eth, icmp, ipv4, udp,
+    Address, ArpOp, ArpPacket, EthFrame, EtherType, Ipv4Addr, Ipv4Header, Ipv6Addr, Ipv6Header,
+    MacAddr, NeighbourCache, NextHeader, Port, Protocol, UdpDatagram, arp, eth, icmp, icmpv6, ipv4,
+    ipv6, udp,
 };
 
 /// Slot: the ring `bin/netd` writes frames into.
@@ -128,6 +129,14 @@ const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 
 /// What this program puts in an echo request, and expects back unchanged.
 const PING_PAYLOAD: [u8; 17] = *b"bhaskix-icmp-0001";
+
+/// The v6 face of the same host: slirp answers at `fec0::2` on its default
+/// prefix, the way `10.0.2.2` answers on the v4 side.
+const HOST6: Ipv6Addr = Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 2]);
+
+/// The v6 demonstration ping's identifier. Distinct from the v4 ping's and
+/// from [`BURST_ID`], because the identifier is how replies are told apart.
+const PING6_ID: u16 = 0xbe59;
 
 /// RFC 0018 step 7: the burst that prices the two-domain split.
 ///
@@ -378,6 +387,37 @@ fn frame(
     Some(end)
 }
 
+/// Builds an Ethernet + IPv6 frame around an ICMPv6 message.
+///
+/// Returns how many bytes of `into` were used. `hop` is 255 for neighbour
+/// discovery — the specification's proof-of-no-router — and an ordinary 64
+/// for echo.
+#[allow(clippy::too_many_arguments)]
+fn frame6(
+    into: &mut [u8],
+    destination_mac: MacAddr,
+    source_mac: MacAddr,
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    hop: u8,
+    message: &[u8],
+) -> Option<usize> {
+    eth::write_header(into, destination_mac, source_mac, EtherType::IPV6).ok()?;
+    ipv6::write_header(
+        &mut into[eth::HEADER..],
+        source,
+        destination,
+        NextHeader::ICMPV6,
+        hop,
+        message.len(),
+    )
+    .ok()?;
+    let at = eth::HEADER + ipv6::HEADER;
+    let end = at + message.len();
+    into.get_mut(at..end)?.copy_from_slice(message);
+    Some(end)
+}
+
 /// What this program was able to do, as bits.
 ///
 /// Bit 2 is whether the TCP rings attached, which cannot be a one-shot answer:
@@ -566,6 +606,11 @@ fn refuse(code: u64, length: usize, ethertype: u16) {
 /// and delivered a datagram. **A counter that has stopped moving reads exactly
 /// like a subsystem that has stopped working**, which cost three separate
 /// wrong diagnoses in one day, twice on this very page.
+/// RFC 0029 step 3's two report words, held here so `refresh` can keep
+/// writing them after `serve` takes over the page.
+static V6_PREFIX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static V6_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static CACHE: [core::sync::atomic::AtomicU64; 8] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -609,6 +654,8 @@ fn refresh() {
         EMPTY_POLLS.load(Relaxed),
         LONGEST_WAIT.load(Relaxed),
         NOTIFIED_WAKES.load(Relaxed),
+        V6_PREFIX.load(Relaxed),
+        V6_STATE.load(Relaxed),
     ]);
 }
 
@@ -1219,6 +1266,30 @@ extern "C" fn ipd_main() -> ! {
         held: [0u8; DATAGRAM],
     }; SOCKETS];
     let mut pongs = 0u64;
+    // RFC 0029 step 3: the v6 identity and its demonstrations. The
+    // link-local address is derived the moment the MAC is known; the global
+    // address and the default router arrive by SLAAC; the neighbour
+    // solicitation and the ping mirror the ARP request and the v4 ping.
+    let mut link_local = Ipv6Addr::UNSPECIFIED;
+    let mut prefix6 = Ipv6Addr::UNSPECIFIED;
+    let mut global6: Option<Ipv6Addr> = None;
+    let mut router6: Option<Ipv6Addr> = None;
+    let mut rs_sent = false;
+    let mut rs_pass = 0u64;
+    let mut ns6_sent = false;
+    let mut ns6_pass = 0u64;
+    let mut pinged6 = false;
+    let mut ping6_pass = 0u64;
+    let mut pongs6 = 0u64;
+    // Sticky: the v6 host was resolved at least once. The cache entry
+    // itself expires on a busy wire — ticks race past the lifetime — and
+    // the report's question is "did NDP work", not "is the entry warm".
+    let mut resolved6 = false;
+    // The retry clock for the three sends above. Loop passes rather than
+    // `ticks`: ticks advance one per *received* frame, and on the quiet
+    // wire this family boots on, a lost reply would freeze exactly the
+    // clock that should be retrying it.
+    let mut passes = 0u64;
     // RFC 0018 step 7's burst state. See `BURST`.
     let mut phase = 0u32;
     let mut burst_sent = 0u32;
@@ -1245,6 +1316,8 @@ extern "C" fn ipd_main() -> ! {
         0,
         state(can_send, MacAddr::UNSPECIFIED, can_tcp),
         0,
+        0,
+        0,
     );
 
     // No wakeup, and this is a gap rather than a choice. RFC 0018 step 3 asked
@@ -1269,7 +1342,11 @@ extern "C" fn ipd_main() -> ! {
             cache.live(ticks) as u64,
             state(can_send, me.0, can_tcp),
             pongs,
+            prefix_word(prefix6),
+            v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
         );
+
+        passes += 1;
 
         // The TCP rings, once the kernel has installed them. See the note at
         // `can_tcp`'s declaration: they land after this program starts.
@@ -1366,6 +1443,96 @@ extern "C" fn ipd_main() -> ! {
                     built += 1;
                     pinged = true;
                 }
+            }
+        }
+
+        // RFC 0029 step 3: the same demonstrations, second family. A router
+        // solicitation instead of a DHCP exchange, a neighbour solicitation
+        // instead of an ARP request, and the same ping — each built entirely
+        // by `bhaskix-net` and each sent once.
+        if me.0 != MacAddr::UNSPECIFIED && link_local.is_unspecified() {
+            link_local = Ipv6Addr::link_local_from(me.0);
+        }
+        if router6.is_none() && rs_sent && passes >= rs_pass + 200_000 {
+            rs_sent = false;
+        }
+        if can_send && !rs_sent && !link_local.is_unspecified() {
+            let mut message = [0u8; 16];
+            if let Ok(body) = icmpv6::write_router_solicitation(
+                &mut message,
+                link_local,
+                Ipv6Addr::ALL_ROUTERS,
+                Some(me.0),
+            ) && let Some(total) = frame6(
+                &mut outgoing,
+                Ipv6Addr::ALL_ROUTERS.multicast_mac(),
+                me.0,
+                link_local,
+                Ipv6Addr::ALL_ROUTERS,
+                255,
+                &message[..body],
+            )
+                // SAFETY: the return ring is mapped writable.
+                && unsafe { send(&outgoing[..total]) }
+            {
+                built += 1;
+                rs_sent = true;
+                rs_pass = passes;
+            }
+        }
+        if ns6_sent
+            && passes >= ns6_pass + 200_000
+            && cache.lookup(Address::V6(HOST6), ticks).is_none()
+        {
+            ns6_sent = false;
+        }
+        if can_send
+            && !ns6_sent
+            && let Some(from) = global6
+        {
+            let mut message = [0u8; 32];
+            if let Ok(body) = icmpv6::write_neighbour_solicitation(
+                &mut message,
+                from,
+                HOST6.solicited_node(),
+                HOST6,
+                Some(me.0),
+            ) && let Some(total) = frame6(
+                &mut outgoing,
+                HOST6.solicited_node().multicast_mac(),
+                me.0,
+                from,
+                HOST6.solicited_node(),
+                255,
+                &message[..body],
+            )
+                // SAFETY: the return ring is mapped writable.
+                && unsafe { send(&outgoing[..total]) }
+            {
+                built += 1;
+                ns6_sent = true;
+                ns6_pass = passes;
+            }
+        }
+        if pinged6 && pongs6 == 0 && passes >= ping6_pass + 200_000 {
+            pinged6 = false;
+        }
+        if can_send
+            && !pinged6
+            && let Some(from) = global6
+            && let Some(host) = cache.lookup(Address::V6(HOST6), ticks)
+        {
+            let mut message = [0u8; icmpv6::HEADER + PING_PAYLOAD.len()];
+            if let Ok(body) =
+                icmpv6::write_echo(&mut message, from, HOST6, false, PING6_ID, 1, &PING_PAYLOAD)
+                && let Some(total) =
+                    frame6(&mut outgoing, host, me.0, from, HOST6, 64, &message[..body])
+                // SAFETY: the return ring is mapped writable.
+                && unsafe { send(&outgoing[..total]) }
+            {
+                built += 1;
+                pinged6 = true;
+                ping6_pass = passes;
             }
         }
 
@@ -1567,6 +1734,8 @@ extern "C" fn ipd_main() -> ! {
                         cache.live(ticks) as u64,
                         state(can_send, me.0, can_tcp),
                         pongs,
+                        prefix_word(prefix6),
+                        v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
                     );
                     let gateway = cache
                         .lookup(Address::V4(GATEWAY), ticks)
@@ -1588,6 +1757,8 @@ extern "C" fn ipd_main() -> ! {
                         cache.live(ticks) as u64,
                         state(can_send, me.0, can_tcp),
                         pongs,
+                        prefix_word(prefix6),
+                        v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
                     );
                     serve(&mut sockets, me, gateway, can_send, can_tcp, tail, tcp_tail);
                 }
@@ -1600,6 +1771,8 @@ extern "C" fn ipd_main() -> ! {
                     cache.live(ticks) as u64,
                     state(can_send, me.0, can_tcp),
                     pongs,
+                    prefix_word(prefix6),
+                    v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
                 );
                 exit()
             }
@@ -1755,6 +1928,133 @@ extern "C" fn ipd_main() -> ! {
             }
         }
 
+        // RFC 0029 step 3: the second family's arrivals. Neighbour discovery
+        // is accepted only at hop limit 255 — the check `icmpv6`'s header
+        // assigned to the caller, because a discovery message that crossed a
+        // router is a forgery by construction, and the hop limit lives in
+        // the IP header only this program sees.
+        if let Ok(parsed) = EthFrame::parse(&buffer[..length])
+            && parsed.ethertype == EtherType::IPV6
+            && let Ok((header6, body6)) = Ipv6Header::parse(parsed.payload)
+            && header6.next_header == NextHeader::ICMPV6
+            && !body6.is_empty()
+        {
+            let (from6, to6) = (header6.source, header6.destination);
+            match body6[0] {
+                icmpv6::ROUTER_ADVERTISEMENT if header6.hop_limit == 255 => {
+                    if let Ok(ra) = icmpv6::RouterAdvertisement::parse(body6, from6, to6) {
+                        if let Some(link) = ra.source_link {
+                            cache.learn(Address::V6(from6), link, ticks);
+                        }
+                        if ra.router_lifetime_seconds > 0 && router6.is_none() {
+                            router6 = Some(from6);
+                        }
+                        // SLAAC's one step: the advertised /64 plus this
+                        // interface's identifier. Held once obtained — a
+                        // later advertisement does not move an address
+                        // sockets may already be bound to.
+                        if global6.is_none()
+                            && let Some(info) = ra.prefix
+                            && info.autonomous
+                            && info.prefix_length == 64
+                            && me.0 != MacAddr::UNSPECIFIED
+                        {
+                            prefix6 = info.prefix;
+                            global6 = Some(Ipv6Addr::from_prefix(
+                                info.prefix,
+                                Ipv6Addr::interface_id(me.0),
+                            ));
+                        }
+                    }
+                }
+                icmpv6::NEIGHBOUR_ADVERTISEMENT if header6.hop_limit == 255 => {
+                    if let Ok(na) = icmpv6::NeighbourAdvertisement::parse(body6, from6, to6)
+                        && let Some(link) = na.target_link
+                        && cache.learn(Address::V6(na.target), link, ticks)
+                        && na.target == HOST6
+                    {
+                        resolved6 = true;
+                    }
+                }
+                icmpv6::NEIGHBOUR_SOLICITATION if header6.hop_limit == 255 && can_send => {
+                    if let Ok(ns) = icmpv6::NeighbourSolicitation::parse(body6, from6, to6)
+                        && (ns.target == link_local || Some(ns.target) == global6)
+                        && !from6.is_unspecified()
+                    {
+                        // Answered from the address that was asked about, to
+                        // the asker, at their link address — the option if
+                        // they carried one, the frame's source if not.
+                        let to_mac = ns.source_link.unwrap_or(parsed.source);
+                        let mut message = [0u8; 40];
+                        if let Ok(body) = icmpv6::write_neighbour_advertisement(
+                            &mut message,
+                            ns.target,
+                            from6,
+                            ns.target,
+                            true,
+                            Some(me.0),
+                        ) && let Some(total) = frame6(
+                            &mut outgoing,
+                            to_mac,
+                            me.0,
+                            ns.target,
+                            from6,
+                            255,
+                            &message[..body],
+                        )
+                            // SAFETY: the return ring is mapped writable.
+                            && unsafe { send(&outgoing[..total]) }
+                        {
+                            built += 1;
+                        }
+                    }
+                }
+                icmpv6::ECHO_REQUEST if can_send => {
+                    if let Ok(echo) = icmpv6::Echo::parse(body6, from6, to6)
+                        && !echo.is_reply
+                        && (to6 == link_local || Some(to6) == global6)
+                    {
+                        let mut message = [0u8; MAX_FRAME];
+                        if let Ok(body) = icmpv6::write_echo(
+                            &mut message,
+                            to6,
+                            from6,
+                            true,
+                            echo.identifier,
+                            echo.sequence,
+                            echo.payload,
+                        ) && let Some(total) = frame6(
+                            &mut outgoing,
+                            parsed.source,
+                            me.0,
+                            to6,
+                            from6,
+                            64,
+                            &message[..body],
+                        )
+                            // SAFETY: the return ring is mapped writable.
+                            && unsafe { send(&outgoing[..total]) }
+                        {
+                            built += 1;
+                        }
+                    }
+                }
+                icmpv6::ECHO_REPLY => {
+                    // The v6 pong. Matched by identifier and payload, the
+                    // same discipline as the v4 one: only an exact return
+                    // proves the whole path.
+                    if let Ok(echo) = icmpv6::Echo::parse(body6, from6, to6)
+                        && echo.is_reply
+                        && echo.identifier == PING6_ID
+                        && echo.payload == PING_PAYLOAD
+                    {
+                        pongs6 += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // **This is the first parsing this system does of bytes from a wire.**
         // Every one of them was chosen by whoever can reach the segment, and
         // every refusal below is `bhaskix-net`'s rather than this program's.
@@ -1814,6 +2114,8 @@ extern "C" fn ipd_main() -> ! {
             cache.live(ticks) as u64,
             state(can_send, me.0, can_tcp),
             pongs,
+            prefix_word(prefix6),
+            v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
         );
     }
 }
@@ -1831,6 +2133,18 @@ fn publish(tail: u64) {
 }
 
 /// Leaves the findings where the kernel granted memory for them.
+/// The high half of the SLAAC prefix, as one report word. Zero until a
+/// router advertisement carried one, which is what makes zero mean "none".
+fn prefix_word(prefix: Ipv6Addr) -> u64 {
+    let o = prefix.octets();
+    u64::from_be_bytes([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]])
+}
+
+/// What v6 obtained, as bits, with the echo count above them.
+fn v6_word(global: bool, router: bool, resolved: bool, pongs6: u64) -> u64 {
+    u64::from(global) | (u64::from(router) << 1) | (u64::from(resolved) << 2) | (pongs6 << 8)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn report(
     frames: u64,
@@ -1841,6 +2155,8 @@ fn report(
     learned: u64,
     state: u64,
     pongs: u64,
+    v6_prefix: u64,
+    v6_state: u64,
 ) {
     let words = [
         MARKER,
@@ -1865,6 +2181,12 @@ fn report(
         pongs,
         DELIVERED.load(core::sync::atomic::Ordering::Relaxed),
         WHY.load(core::sync::atomic::Ordering::Relaxed),
+        // Words 11 and 12 belong to the ring's own head and tail -- zero
+        // here, filled by `refresh` once serving starts, printed by the
+        // kernel's "ipd after" line. RFC 0029's first draft took the zeros
+        // for spares and its v6 words were silently overwritten on the
+        // first refresh; the v6 words live at 21 and 22 instead, and this
+        // comment is the map that was missing.
         0,
         0,
         COPIES.load(core::sync::atomic::Ordering::Relaxed),
@@ -1875,7 +2197,15 @@ fn report(
         EMPTY_POLLS.load(core::sync::atomic::Ordering::Relaxed),
         LONGEST_WAIT.load(core::sync::atomic::Ordering::Relaxed),
         NOTIFIED_WAKES.load(core::sync::atomic::Ordering::Relaxed),
+        // RFC 0029 step 3: the high half of the SLAAC prefix, and a word
+        // packing what v6 obtained with the v6 echo count above it. Stored
+        // into statics as well, so `refresh` keeps reporting them after
+        // serving starts.
+        v6_prefix,
+        v6_state,
     ];
+    V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
+    V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);
     for (slot, value) in CACHE.iter().zip([
         frames,
         bytes,
@@ -1892,7 +2222,7 @@ fn report(
 }
 
 /// Puts ten words on the report page.
-fn write_report(words: [u64; 21]) {
+fn write_report(words: [u64; 23]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.

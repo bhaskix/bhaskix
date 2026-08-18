@@ -958,7 +958,7 @@ extern "C" fn netd_main() -> ! {
             // this device's MAC -- and the offset those six bytes appear at is
             // the size of whatever the device put in front of them.
             let mut header = 0u64;
-            for candidate in [VIRTIO_NET_HEADER, 12] {
+            for candidate in [VIRTIO_NET_HEADER, 10] {
                 // SAFETY: inside a receive buffer this program mapped writable
                 // and the device has finished with.
                 let matches = unsafe {
@@ -969,6 +969,7 @@ extern "C" fn netd_main() -> ! {
                     break;
                 }
             }
+
             // SAFETY: as above -- the source address follows the destination.
             let source = unsafe {
                 let mut value = 0u64;
@@ -987,6 +988,22 @@ extern "C" fn netd_main() -> ! {
             )
         }
         None => (0, 0, 0, 0),
+    };
+    // The measurement's premise is that the first received frame answers
+    // this station's own broadcast, so its destination is this MAC. A
+    // segment speaking IPv6 breaks that premise twice over: a router
+    // advertisement is multicast and can arrive first (the probe matches
+    // nothing), and on a wire where v4 is dead the answer never comes at
+    // all (the await times out and the match never runs). Either way zero
+    // was never an answer — it was the premise failing silently, and every
+    // frame crossed to ipd with twelve bytes of virtio header still in
+    // front, parsing as an all-zero Ethernet header. The documented modern
+    // layout is the fallback; the probe stays for the ten-byte legacy
+    // device it was written to catch.
+    let header = if header == 0 {
+        VIRTIO_NET_HEADER
+    } else {
+        header
     };
 
     let mut own = 0u64;

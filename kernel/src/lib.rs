@@ -7198,10 +7198,13 @@ fn report_net_ring(hhdm: u64) -> bool {
         return false;
     }
 
-    let mut words = [0u64; 9];
+    let mut words = [0u64; 23];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // nine little-endian words the service wrote there.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames_of[0]) as *const u8, 72) };
+    // twenty-three little-endian words the service writes — nine consumed
+    // here since RFC 0018, plus RFC 0029's two v6 words at 21 and 22. Not
+    // 11 and 12: those carry the ring's own head and tail for the "ipd
+    // after" line, which the first v6 draft discovered by overwriting them.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames_of[0]) as *const u8, 184) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -7284,6 +7287,35 @@ fn report_net_ring(hhdm: u64) -> bool {
              blamed on the host and never was the host"
         );
     }
+    // RFC 0029 step 3: the second family, reported the same way. The
+    // prefix word is the high half of what SLAAC obtained; zero means no
+    // router advertisement ever arrived, which on a network without v6 is
+    // a state and not a fault.
+    let (v6_prefix, v6_state) = (words[21], words[22]);
+    if v6_prefix != 0 {
+        let seg = |shift: u32| (v6_prefix >> shift) & 0xffff;
+        println!(
+            "    net ipv6       slaac {:x}:{:x}:{:x}:{:x}::/64{}{}; {} v6 echo replies",
+            seg(48),
+            seg(32),
+            seg(16),
+            seg(0),
+            if v6_state & 0b10 != 0 {
+                ", router advertised"
+            } else {
+                ""
+            },
+            if v6_state & 0b100 != 0 {
+                ", host resolved by ndp"
+            } else {
+                ""
+            },
+            v6_state >> 8
+        );
+    } else {
+        println!("    net ipv6       no router advertisement; link-local only");
+    }
+
     if words[5] == 0 {
         println!("\x1b[91m    net reply      FAILED: the service built nothing to send\x1b[0m");
         return false;

@@ -1122,6 +1122,26 @@ else
     status=1
 fi
 
+# RFC 0029 step 3: the second family, end to end on the same wire as the
+# first. SLAAC obtained the prefix slirp advertises, a neighbour
+# solicitation resolved the v6 host (sticky -- the cache entry itself may
+# expire on a busy wire), and an ICMPv6 echo returned byte-for-byte: the
+# v4 pongs gate's mirror, one family over, dual stack on one netdev.
+# Slirp's IPv6 is on BY DEFAULT here and must stay implicit -- passing
+# `ipv6=on` explicitly makes this QEMU's slirp stop answering v4 ARP
+# (bisected with a pcap, 2026-08-18); see devices.sh.
+if grep -qE "net ipv6 +slaac fec0:0:0:0::/64, router advertised, host resolved by ndp; [1-9][0-9]* v6 echo replies" "$LOG"; then
+    pass "ipv6: slaac obtained the prefix, ndp resolved the host, the v6 echo returned"
+elif grep -qE "net domain +no device on the bus" "$LOG"; then
+    pass "ipv6 skipped: no network device on this machine"
+elif grep -qE "net ring +nothing crossed; without a dma window" "$LOG"; then
+    pass "ipv6 skipped: no dma window"
+else
+    fail "the ipv6 demonstration did not complete"
+    grep -E "net ipv6" "$LOG" || true
+    status=1
+fi
+
 # RFC 0020 steps 4 and 5: the TCP domain, against the deterministic peer
 # devices.sh provides. The state word is bits -- attached, keyed, configured,
 # serving -- and "keyed" means bin/tcpd drew a 128-bit secret from the
