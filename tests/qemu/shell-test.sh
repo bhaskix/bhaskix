@@ -379,6 +379,8 @@ else
             "the package was removed:removed.*hello"
             "a removed program will not run:pkg: not installed"
             "reinstall after remove succeeded, so nothing survived:2 installed"
+            "the install said its price:payload bytes through the journal in [1-9][0-9]* writes, [1-9][0-9]* cycles"
+            "the removal said its price:cycles through the journal"
         )
         for check in "${pkg_checks[@]}"; do
             checks+=("$check")

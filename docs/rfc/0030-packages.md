@@ -229,6 +229,13 @@ host-side, where the journal's promises are already proven.
    criterion needs a definition — probably "a utility can be built, packaged, installed
    and run without editing the Makefile or the kernel" — and this RFC's steps are the
    instrument that will show whether that definition is met or merely approached.
+   **Measured at step 6 against what `bin/hello` actually required**: its own crate, its
+   `manifest.in`, and three Makefile stanzas (build, `.bpk` emission, one `--file` line)
+   — and **zero per-utility kernel edits**, which is the half that matters. The kernel
+   half of the definition is met; the Makefile half is approached, not met: the stanzas
+   are boilerplate a pattern rule could fold away, and naming what ships in the image
+   should arguably stay an explicit decision. The remaining distance is one build-system
+   refactor, not a design question — recorded here, not resolved here.
 3. **Does `fs.img` assembly also migrate to `mkimage`?** ~~Decided when step 2 touches
    it.~~ **Answered at step 2: no.** `mkfs` owns the on-disk format and keeps building
    `fs.img`; `mkimage` carries it into the image as a declared build artifact
@@ -254,7 +261,17 @@ host-side, where the journal's promises are already proven.
    the refusal.
 6. **Measurement and the ledger**: install and remove priced through the journal
    (bytes, calls, wall clock), the gate count moves with its composition stated, and the
-   bullet closes with question 2's definition tested against what exists.
+   bullet closes with question 2's definition tested against what exists. **Done, with
+   the numbers in the report itself**: every `pkg install` says its price — for `hello`,
+   15,408 payload bytes through the journal in 5 writes, 320–382 million cycles across
+   three installs of one boot; a removal, 221 million — raw cycles on purpose, because
+   the shell was not told the rate and the boot log carries it for whoever converts.
+   The prices are gated as present, not as magnitudes: a slow disk is not a broken
+   package manager, but an install that will not say what it cost is a broken
+   instrument. The boot-gate ledger is unchanged at 51 per placement — steps 3 to 5
+   live in the shell test's typed conversation, which grew by thirteen asserted
+   replies (install, list, duplicate refused, over-ask refused, run, spoken greeting,
+   reaped ending, removal, refused rerun, clean reinstall, both prices).
 
 Steps 1–2 touch no guest code; step 3 is the first boot-visible change; steps 4–5 ride
 RFC 0017's machinery unchanged or the design claim fails; step 6 is the same discipline

@@ -1476,7 +1476,7 @@ fn pkg_ensure_directory(parent: u64, into: u64, name: &[u8]) -> bool {
 
 /// Writes `bytes` into the file whose writable handle sits at `handle`,
 /// one transfer page at a time, and says how many crossed.
-fn pkg_write_file(handle: u64, bytes: &[u8]) -> bool {
+fn pkg_write_file(handle: u64, bytes: &[u8], writes: &mut u64) -> bool {
     let mut offset = 0usize;
     while offset < bytes.len() {
         let take = (bytes.len() - offset).min(4096);
@@ -1498,6 +1498,7 @@ fn pkg_write_file(handle: u64, bytes: &[u8]) -> bool {
             pkg_refused(b"writing", wrote.raw());
             return false;
         }
+        *writes += 1;
         offset += take;
     }
     true
@@ -1505,7 +1506,7 @@ fn pkg_write_file(handle: u64, bytes: &[u8]) -> bool {
 
 /// Creates and fills one file at `path` (at most two components) under the
 /// package directory at `PKG_WORK`.
-fn pkg_place_file(path: &[u8], bytes: &[u8]) -> bool {
+fn pkg_place_file(path: &[u8], bytes: &[u8], writes: &mut u64) -> bool {
     let mut parent = PKG_WORK;
     let mut name = path;
     if let Some(slash) = path.iter().position(|b| *b == b'/') {
@@ -1530,7 +1531,7 @@ fn pkg_place_file(path: &[u8], bytes: &[u8]) -> bool {
         pkg_refused(b"creating a file", made.raw());
         return false;
     }
-    let placed = pkg_write_file(PKG_FILE, bytes);
+    let placed = pkg_write_file(PKG_FILE, bytes, writes);
     syscall(syscall::INVOKE, PKG_FILE, method::DELETE, [0; 4]);
     placed
 }
@@ -1618,14 +1619,19 @@ fn pkg_install(file: &[u8]) {
         return;
     }
 
-    // Payloads first...
+    // Payloads first... priced from here: the verify above is arithmetic,
+    // and what the journal charges for is what follows.
+    let begun = cycles();
+    let mut writes = 0u64;
+    let mut payload_bytes = 0u64;
     let mut placed = true;
     for file_entry in manifest.files() {
         let Some(data) = verified.data(file_entry.path) else {
             placed = false;
             break;
         };
-        if !pkg_place_file(file_entry.path, data) {
+        payload_bytes += data.len() as u64;
+        if !pkg_place_file(file_entry.path, data, &mut writes) {
             placed = false;
             break;
         }
@@ -1637,7 +1643,7 @@ fn pkg_install(file: &[u8]) {
         let made = dir_call(PKG_WORK, PKG_FILE, dir::CREATE_AT, chunk.pack(0));
         placed = made.delivered()
             && made.raw() == dir::OK
-            && pkg_write_file(PKG_FILE, verified.manifest_bytes());
+            && pkg_write_file(PKG_FILE, verified.manifest_bytes(), &mut writes);
         syscall(syscall::INVOKE, PKG_FILE, method::DELETE, [0; 4]);
     }
     syscall(syscall::INVOKE, PKG_WORK2, method::DELETE, [0; 4]);
@@ -1645,10 +1651,13 @@ fn pkg_install(file: &[u8]) {
     if placed {
         write(b"  [1;32minstalled[0m  /pkg/");
         write(manifest.name);
-        write(
-            b"
-",
-        );
+        write(b" -- ");
+        write_number(payload_bytes);
+        write(b" payload bytes through the journal in ");
+        write_number(writes);
+        write(b" writes, ");
+        write_number(cycles().wrapping_sub(begun));
+        write(b" cycles\n");
     } else {
         write(
             b"  [91mpkg: the install did not finish -- no record was written[0m
@@ -1761,6 +1770,7 @@ fn pkg_remove(name: &[u8]) {
     }
     // The record goes first: from here on the package does not claim to be
     // installed, whatever else survives a crash.
+    let begun = cycles();
     let (record, _) = Chunk::take(b"manifest");
     let _ = call(PKG_WORK, dir::REMOVE_AT, record.pack(0));
     let cleared = pkg_clear_directory(PKG_WORK, PKG_WORK2);
@@ -1780,10 +1790,25 @@ fn pkg_remove(name: &[u8]) {
     }
     write(b"  [1;32mremoved[0m    ");
     write(name);
-    write(
-        b"
-",
-    );
+    write(b" -- ");
+    write_number(cycles().wrapping_sub(begun));
+    write(b" cycles through the journal\n");
+}
+
+/// The cycle counter, for pricing `pkg` operations. Raw cycles on
+/// purpose: this program was not told the rate (the boot log's feature
+/// lines carry it for whoever converts), and a number with honest units
+/// beats a guessed millisecond.
+fn cycles() -> u64 {
+    let low: u64;
+    let high: u64;
+    // SAFETY: `rdtsc` reads a counter and writes two registers, both
+    // listed; it is unprivileged on this machine by design (RFC 0019:
+    // reading time is ambient, being woken is the scarce thing).
+    unsafe {
+        core::arch::asm!("rdtsc", out("rax") low, out("rdx") high, options(nomem, nostack));
+    }
+    (high << 32) | low
 }
 
 // A package-run child's console carries `BADGE_CONSOLE`, the same badge

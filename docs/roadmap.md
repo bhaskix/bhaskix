@@ -153,7 +153,9 @@ framework, IOMMU discovery and per-device domains, the driver framework, the ful
 management. Networking runs through TCP, both directions, measured, and programs speak it
 through `bhaskix-sock` rather than hand-rolled exchanges. The telemetry plane runs — typed
 events, per-CPU rings, a live reader. The machine boots on its own loader — `bhaskixboot.efi`,
-held to the same gates as the incumbent. What remains is package management and libc.
+held to the same gates as the incumbent. Packages exist — the image is a function of
+reviewable manifests, and programs install, run and remove at the shell with grants
+derived from what their manifests ask. What remains is libc.
 
 - ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
   M9-18 … M9-23. Capability-shaped rather than POSIX-shaped: no `fork` (it duplicates a capability
@@ -235,7 +237,17 @@ held to the same gates as the incumbent. What remains is package management and 
   kernel-side INIT-SIPI), and **the full Limine-lane gate set answered natively** — 74 gates
   green on both loaders, plus the loader-specific lane's 23 and its permanent negative arm.
   Limine remains as the second lane, exactly as the RFC keeps it
-- ⬜ **Package management** and image building
+- ✅ **Package management and image building** — [RFC 0030](rfc/0030-packages.md), all six
+  steps implemented 2026-08-19 (acceptance pending). A package is a program plus the
+  authority it asks for, in one reviewable file: the boot image is a deterministic
+  function of `packages/*.manifest.in` (assembled twice and byte-compared every build,
+  the fourteen boot programs' authority written down and shipped), and `pkg
+  install/list/run/remove` work at the shell — verified in ring 3 by the same
+  zero-`unsafe` parser the host tools use, crash-safe ordering proven by what a
+  reinstall does not hit, over-asking manifests refused whole before a domain exists,
+  every operation priced through the journal. The kernel gained no method and no object.
+  Refused with written triggers: network fetch, signatures, dependency resolution,
+  upgrades; install-time scripts refused flat — a postinst is ambient authority
 - ⬜ **libc** — enough for real userspace software. Belongs to the **Linux personality**
   ([RFC 0005](rfc/0005-linux-abi-compatibility.md)), not to native userspace: RFC 0008
   is accepted, and the native ABI *is* the capability interface, so a native program
