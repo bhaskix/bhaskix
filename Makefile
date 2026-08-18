@@ -32,6 +32,10 @@ DOMAIN_DISK  := build/domain-disk.img
 # both and reads a file from each.
 FS_IMAGE     := build/fs.img
 MKFS         := target/$(HOST_TARGET)/release/mkfs
+# The image assembler (RFC 0030 step 2): the initrd as a function of the
+# package set. Built like mkfs -- a host binary behind a feature.
+MKIMAGE      := target/$(HOST_TARGET)/release/mkimage
+PACKAGES     := $(wildcard packages/*.manifest.in)
 INITRD_DIR   := initrd
 INITRD_ROOT  := build/initrd_root
 LIMINE_DIR   := boot/limine/limine
@@ -177,6 +181,10 @@ $(MKFS): $(wildcard fs/src/*.rs) $(wildcard fs/src/bin/*.rs) fs/Cargo.toml
 	$(CARGO) build --release --target $(HOST_TARGET) -p bhaskix-fs --features tool
 	@echo "built $@"
 
+$(MKIMAGE): $(wildcard pkg/src/*.rs) $(wildcard pkg/src/bin/*.rs) pkg/Cargo.toml
+	$(CARGO) build --release --target $(HOST_TARGET) -p bhaskix-pkg --features tool
+	@echo "built $@"
+
 # The image, with one file whose contents nothing else on the machine has. A
 # format that reads back its own zeroes would look identical to one that works.
 $(FS_IMAGE): $(MKFS) $(INITRD_DIR)/etc/hostname
@@ -215,28 +223,23 @@ FORCE:
 # files, and the kernel's parser implements the documented format rather than
 # one vendor's superset. Sorted, so the archive is byte-identical for the same
 # inputs and a rebuild does not change the image for no reason.
-$(INITRD): $(shell find $(INITRD_DIR) -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
-	@rm -rf $(INITRD_ROOT)
-	@mkdir -p $(dir $@) $(INITRD_ROOT)/bin
-	cp -r $(INITRD_DIR)/. $(INITRD_ROOT)/
-	cp $(PROBE) $(INITRD_ROOT)/bin/probe
-	cp $(USER_SHELL) $(INITRD_ROOT)/bin/shell
-	cp $(USER_VFSD) $(INITRD_ROOT)/bin/vfsd
-	cp $(USER_CONSOLED) $(INITRD_ROOT)/bin/consoled
-	cp $(USER_BLKD) $(INITRD_ROOT)/bin/blkd
-	cp $(USER_NETD) $(INITRD_ROOT)/bin/netd
-	cp $(USER_IPD) $(INITRD_ROOT)/bin/ipd
-	cp $(USER_DHCPD) $(INITRD_ROOT)/bin/dhcp
-	cp $(USER_UDP6) $(INITRD_ROOT)/bin/udp6
-	cp $(USER_TCPD) $(INITRD_ROOT)/bin/tcpd
-	cp $(USER_TCPC) $(INITRD_ROOT)/bin/tcpc
-	cp $(USER_TRACED) $(INITRD_ROOT)/bin/traced
-	cp $(USER_FSD) $(INITRD_ROOT)/bin/fsd
-	cp $(USER_SUP) $(INITRD_ROOT)/bin/sup
-	cp $(FS_IMAGE) $(INITRD_ROOT)/fs.img
-	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
-	    --mtime='@0' -cf $@ -C $(INITRD_ROOT) .
-	@echo "built $@ ($$(stat -c%s $@) bytes)"
+# RFC 0030 step 2: the image is a function of the package set. The cp list
+# that lived here through fourteen programs retired on 2026-08-18; each
+# program's payload path and its authority now live in packages/*.manifest.in,
+# and mkimage stages, hashes, verifies with the machine's own parsers, and
+# drives the same tar flags this rule always trusted. Assembled twice and
+# byte-compared every build: determinism is a gate, not a hope.
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
+	@mkdir -p $(dir $@)
+	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
+	    --file fs.img=$(FS_IMAGE) \
+	    $(foreach manifest,$(PACKAGES),--package $(manifest))
+	./$(MKIMAGE) $@.again $(INITRD_ROOT).again --root . --static $(INITRD_DIR) \
+	    --file fs.img=$(FS_IMAGE) \
+	    $(foreach manifest,$(PACKAGES),--package $(manifest))
+	cmp $@ $@.again
+	@rm -rf $@.again $(INITRD_ROOT).again
+	@echo "built $@ ($$(stat -c%s $@) bytes, byte-identical twice)"
 
 # Built through a staging directory rather than into `initrd/`, so that a
 # compiled artefact never lands in a source tree that is under version control.
@@ -611,6 +614,9 @@ gates:
 	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-fs --features tool \
 	    && printf '  \033[1;32mok\033[0m    the filesystem image builder still builds\n' \
 	    || { echo "  FAIL  the filesystem image builder does not build"; exit 1; }
+	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-pkg --features tool \
+	    && printf '  \033[1;32mok\033[0m    the package image assembler still builds\n' \
+	    || { echo "  FAIL  the package image assembler does not build"; exit 1; }
 	tools/check-unsafe-budget.py
 	tools/check-deps.py
 	tools/check-one-machine.sh

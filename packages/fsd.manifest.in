@@ -1,0 +1,22 @@
+# The journalled writable filesystem, outside the nucleus: the block
+# service's endpoint, two pages for bulk and report, the endpoint it
+# serves files on, and eight single-page cache frames it may hand
+# weaker copies of away.
+package fsd
+version 0.1.0
+
+program bin/fsd
+entry hertz
+cap endpoint block
+cap memory pages=2
+cap serve fs
+cap memory pages=1
+cap memory pages=1
+cap memory pages=1
+cap memory pages=1
+cap memory pages=1
+cap memory pages=1
+cap memory pages=1
+cap memory pages=1
+
+payload bin/fsd from user/fsd/target/x86_64-unknown-none/release/fsd

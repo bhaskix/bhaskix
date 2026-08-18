@@ -1,0 +1,10 @@
+# The filesystem service. One capability: the endpoint it answers on.
+# A domain that could find its own storage would not be a domain.
+package vfsd
+version 0.1.0
+
+program bin/vfsd
+entry hertz
+cap serve vfs
+
+payload bin/vfsd from user/vfsd/target/x86_64-unknown-none/release/vfsd

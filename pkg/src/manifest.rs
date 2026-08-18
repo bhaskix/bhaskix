@@ -27,8 +27,14 @@
 //! cap console                 #   a capability request, one per line
 //! cap notification
 //! cap timer
-//! cap memory pages=<n>
-//! cap endpoint <service>
+//! cap memory pages=<n>        #   pages= omitted: the granter sizes it
+//! cap endpoint <service>      #   the calling side of an endpoint
+//! cap serve <service>         #   the answering side, a different power
+//! cap device-registers
+//! cap dma-window
+//! cap interrupt
+//! cap domain-control
+//! cap directory
 //! file <path> sha256=<64 hex> length=<n>
 //! ```
 //!
@@ -61,17 +67,37 @@ pub const MAX_PATH: usize = 100;
 pub enum Cap<'a> {
     /// Put a character, take a byte.
     Console,
-    /// A badged endpoint to the named service.
+    /// A badged endpoint to the named service — the *calling* side.
     Endpoint(&'a [u8]),
-    /// `pages` pages of memory, mappable.
+    /// The endpoint a service answers on — the *serving* side. Stated
+    /// separately from [`Cap::Endpoint`] because answering and asking are
+    /// different powers, and a manifest that conflated them would review
+    /// as less than it grants.
+    Serve(&'a [u8]),
+    /// Memory, mappable. `pages` absent means the granter sizes the object
+    /// — the supervisor's child-image is the case that forced the option:
+    /// its memory is sized to the program it stages, and a fixed number
+    /// here would be a lie every time the program changed.
     Memory {
-        /// How many pages.
-        pages: u64,
+        /// How many pages, if the manifest fixes it.
+        pages: Option<u64>,
     },
     /// A notification to wait on and be signalled through.
     Notification,
     /// A notification with the deadline methods — RFC 0019's shape.
     Timer,
+    /// A device's register windows — the driver authority.
+    DeviceRegisters,
+    /// The authority to bound what a device may reach (RFC 0012).
+    DmaWindow,
+    /// A device interrupt: wait for it, acknowledge it, nothing about
+    /// programming it.
+    Interrupt,
+    /// The authority to create and start a child domain (RFC 0017).
+    DomainControl,
+    /// One directory of the filesystem, and what is inside it — no path
+    /// upward.
+    Directory,
 }
 
 /// One program section: the binary, its entry convention, its requests.
@@ -379,14 +405,21 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest<'_>, ManifestError> {
                     (b"console", b"") => Cap::Console,
                     (b"notification", b"") => Cap::Notification,
                     (b"timer", b"") => Cap::Timer,
+                    (b"device-registers", b"") => Cap::DeviceRegisters,
+                    (b"dma-window", b"") => Cap::DmaWindow,
+                    (b"interrupt", b"") => Cap::Interrupt,
+                    (b"domain-control", b"") => Cap::DomainControl,
+                    (b"directory", b"") => Cap::Directory,
+                    (b"memory", b"") => Cap::Memory { pages: None },
                     (b"memory", argument) => {
                         let pages = keyed(argument, b"pages")
                             .and_then(decimal)
                             .filter(|pages| *pages > 0)
                             .ok_or(ManifestError::BadCap(number))?;
-                        Cap::Memory { pages }
+                        Cap::Memory { pages: Some(pages) }
                     }
                     (b"endpoint", service) if valid_name(service) => Cap::Endpoint(service),
+                    (b"serve", service) if valid_name(service) => Cap::Serve(service),
                     _ => return Err(ManifestError::BadCap(number)),
                 };
                 program.caps[program.cap_count] = Some(cap);
@@ -466,7 +499,7 @@ mod tests {
             caps,
             std::vec![
                 Cap::Console,
-                Cap::Memory { pages: 2 },
+                Cap::Memory { pages: Some(2) },
                 Cap::Endpoint(b"net")
             ]
         );
@@ -539,15 +572,62 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_vocabulary_parses_and_each_word_is_itself() {
+        let manifest = parse(
+            b"package all
+version 0.1.0
+
+program bin/all
+entry hertz
+              cap console
+cap notification
+cap timer
+cap memory
+              cap memory pages=16
+cap endpoint net
+cap serve fs
+              cap device-registers
+cap dma-window
+cap interrupt
+              cap domain-control
+cap directory
+
+              file bin/all sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 length=0
+",
+        )
+        .unwrap();
+        let caps: std::vec::Vec<_> = manifest.programs().next().unwrap().caps().collect();
+        assert_eq!(
+            caps,
+            std::vec![
+                Cap::Console,
+                Cap::Notification,
+                Cap::Timer,
+                Cap::Memory { pages: None },
+                Cap::Memory { pages: Some(16) },
+                Cap::Endpoint(b"net"),
+                Cap::Serve(b"fs"),
+                Cap::DeviceRegisters,
+                Cap::DmaWindow,
+                Cap::Interrupt,
+                Cap::DomainControl,
+                Cap::Directory,
+            ]
+        );
+    }
+
+    #[test]
     fn the_cap_vocabulary_is_closed() {
         for bad in [
             "cap root",
-            "cap memory",
             "cap memory pages=0",
             "cap memory pages=x",
             "cap endpoint",
             "cap endpoint Net",
+            "cap serve",
             "cap console extra",
+            "cap device-registers extra",
+            "cap domain-control now",
         ] {
             assert!(
                 matches!(

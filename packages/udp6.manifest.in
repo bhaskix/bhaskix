@@ -1,0 +1,13 @@
+# RFC 0029's v6 socket proof: two sockets to loopback and back, the
+# same inventory as the DHCP client plus one empty slot of its own.
+package udp6
+version 0.1.0
+
+program bin/udp6
+entry hertz
+cap endpoint net
+cap memory pages=1
+cap memory pages=1
+cap timer
+
+payload bin/udp6 from user/udp6/target/x86_64-unknown-none/release/udp6

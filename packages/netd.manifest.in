@@ -1,0 +1,19 @@
+# The network driver: the virtio shape the block driver has -- register
+# windows, eight ring pages, the DMA window, the interrupt and its
+# notification -- plus the two 16-page rings frames cross to bin/ipd
+# through, and the inbox that wakes it when frames come back.
+package netd
+version 0.1.0
+
+program bin/netd
+entry hertz
+cap device-registers
+cap memory pages=8
+cap dma-window
+cap interrupt
+cap notification
+cap memory pages=16
+cap memory pages=16
+cap notification
+
+payload bin/netd from user/netd/target/x86_64-unknown-none/release/netd

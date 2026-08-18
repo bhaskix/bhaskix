@@ -1,0 +1,18 @@
+# The ring 3 probe: the kernel self-tests' demonstration program. Its
+# CSpace is bespoke -- built by the tests to show grants, refusals and
+# revocation working -- and this manifest states that shape truthfully:
+# a badged console, one page held strong and weak, a read-only window
+# on device registers, a notification held with read and with write,
+# and one directory of the filesystem, nothing above it.
+package probe
+version 0.1.0
+
+program bin/probe
+entry hertz
+cap endpoint console
+cap memory pages=1
+cap device-registers
+cap notification
+cap directory
+
+payload bin/probe from user/probe/target/x86_64-unknown-none/release/probe

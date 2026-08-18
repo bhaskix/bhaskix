@@ -1,0 +1,13 @@
+# The DHCP client: a socket on the network service, one page the
+# datagram is built in, a report page, and a timer to wait with.
+package dhcp
+version 0.1.0
+
+program bin/dhcp
+entry hertz
+cap endpoint net
+cap memory pages=1
+cap memory pages=1
+cap timer
+
+payload bin/dhcp from user/dhcp/target/x86_64-unknown-none/release/dhcp

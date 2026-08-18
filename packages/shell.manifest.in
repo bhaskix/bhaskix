@@ -1,0 +1,18 @@
+# The user-mode shell: the one program a human drives. A console, the
+# filesystem, one page (held read-write and again read-only, to show
+# the difference), a read-only device window, a notification held two
+# ways, one directory, and the authority to spawn one child domain.
+package shell
+version 0.1.0
+
+program bin/shell
+entry hertz
+cap endpoint console
+cap endpoint vfs
+cap memory pages=1
+cap device-registers
+cap notification
+cap directory
+cap domain-control
+
+payload bin/shell from user/shell/target/x86_64-unknown-none/release/shell

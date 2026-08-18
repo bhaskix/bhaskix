@@ -77,7 +77,17 @@ file bin/hello sha256=af13...9e length=18432
 `package`/`version` name the unit. Each `program` section names a payload binary, its
 entry convention, and its **capability requests** — by kind, from the vocabulary the ABI
 actually has (`console`, `endpoint <service>`, `memory pages=N`, `notification`,
-`timer`), each one line, so a diff of authority is a diff of lines. Each `file` line
+`timer`), each one line, so a diff of authority is a diff of lines. **Step 2's
+correction, recorded where the claim stood: the fourteen real programs taught the
+vocabulary seven more things.** `serve <name>` joined beside `endpoint <name>` because
+answering and asking are different powers and a manifest that conflated them would review
+as less than it grants; `device-registers`, `dma-window`, `interrupt`, `domain-control`
+and `directory` joined because the drivers, the supervisor and the shell genuinely hold
+those authorities and a vocabulary that could not spell them would have forced either a
+lie or a blank; and `pages=` became optional on `memory` because the supervisor's
+child-image object is sized by the granter to the program it stages — a fixed number
+there would be stale on every program change. The vocabulary remains closed; it is
+simply no longer smaller than the truth. Each `file` line
 carries the payload's SHA-256 and length. **The hash is honest about what it is**: inside
 an unsigned archive it detects corruption, not tampering — an adversary who rewrites the
 payload rewrites the hash beside it. It is content identity, and it becomes load-bearing
@@ -173,9 +183,12 @@ host-side, where the journal's promises are already proven.
    criterion needs a definition — probably "a utility can be built, packaged, installed
    and run without editing the Makefile or the kernel" — and this RFC's steps are the
    instrument that will show whether that definition is met or merely approached.
-3. **Does `fs.img` assembly also migrate to `mkimage`?** The writable filesystem image is
-   currently `mkfs`'s job with its own file list. One tool owning both is tidier; two
-   tools with one shared package set may be honester. Decided when step 2 touches it.
+3. **Does `fs.img` assembly also migrate to `mkimage`?** ~~Decided when step 2 touches
+   it.~~ **Answered at step 2: no.** `mkfs` owns the on-disk format and keeps building
+   `fs.img`; `mkimage` carries it into the image as a declared build artifact
+   (`--file fs.img=…`), exactly like a static file except that it is built. Two tools,
+   one image, each owning its own format — folding the filesystem writer into the
+   package assembler would have made one tool own two formats to save one Makefile line.
 
 ## Implementation plan
 

@@ -1,0 +1,22 @@
+# The protocol service, the system's only IP parser: both frame rings
+# to the driver and both segment rings to bin/tcpd (16 pages each), its
+# report and read-only configuration pages, the endpoint sockets are
+# served on, and three notifications -- the driver's doorbell, its own
+# inbox, and the bell that wakes bin/tcpd.
+package ipd
+version 0.1.0
+
+program bin/ipd
+entry hertz
+cap memory pages=16
+cap memory pages=16
+cap memory pages=16
+cap memory pages=16
+cap memory pages=1
+cap memory pages=1
+cap serve net
+cap notification
+cap notification
+cap notification
+
+payload bin/ipd from user/ipd/target/x86_64-unknown-none/release/ipd

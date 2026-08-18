@@ -764,6 +764,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (RFC 0030 step 2: the cp list retires, and fourteen programs' authority is finally written down)
+
+**The image is a function now.** `mkimage` — a host binary in `pkg/` behind the `tool`
+feature, the `mkfs` pattern — assembles `build/initrd.tar` from `packages/*.manifest.in`
+plus the static tree and the filesystem image, and the Makefile's fourteen-line `cp` list
+is gone. Source manifests carry `payload <path> from <artifact>` lines because a checked-in
+digest of a binary that changes every rebuild would be stale by construction; the tool
+computes the digests, emits finished manifests, and **distrusts itself twice** — every
+finished manifest is round-tripped through `bhaskix_pkg::manifest` (the real parser, not
+the tool's opinion) before staging, and the assembled archive is read back through
+`bhaskix_ustar` to prove every expected member present exactly once and nothing present
+unclaimed. The write side stays with the exact `tar` flags this repository has always
+trusted. **Determinism is a gate, not a hope**: every build assembles the image twice and
+byte-compares — 501,760 bytes, identical, on the first real run. The migration's one-time
+member-list comparison: the new image carries every member the old rule produced, plus
+exactly the fourteen shipped manifests at `packages/<name>.manifest` — the authority that
+was reviewed is now readable on the machine that runs it.
+
+**The fourteen real programs taught the vocabulary seven more things**, recorded in the
+RFC where the original claim stood. `serve <name>` beside `endpoint <name>`, because
+answering and asking are different powers; `device-registers`, `dma-window`, `interrupt`,
+`domain-control` and `directory`, because the drivers, the supervisor and the shell
+genuinely hold those authorities and a vocabulary that could not spell them would have
+forced a lie or a blank; and `pages=` optional on `memory`, because the supervisor's
+child-image object is sized by the granter to the program it stages. Every manifest's
+capability list was derived from the programs' own documented slot layouts and verified
+against the kernel's grant sites — ring sizes (16 pages per net ring, 4 per tcpc stream
+ring, 64 KiB per telemetry ring), report pages, the fs domain's eight cache frames — not
+guessed; the first draft *did* guess three page counts and was rewritten before it ever
+built. Open question 3 answered: `fs.img` stays `mkfs`'s — two tools, one image, each
+owning its own format. `make gates` holds the assembler to the same still-builds check
+as the filesystem builder. Grammar tests grew to cover every word; 30 host tests green;
+the packaged image smoke-booted the full IOMMU lane before the suite.
+
 ### 2026-08-18 (RFC 0030 step 1: the format exists, and its hash hung before it hashed)
 
 **The `pkg` crate: three refusals-first parsers, zero `unsafe`, forty host tests.** The

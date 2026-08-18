@@ -1,0 +1,18 @@
+# The TCP service: a pure state machine behind an endpoint. Both
+# segment rings to bin/ipd, report and configuration pages, the
+# doorbell that wakes the forwarder and the inbox that wakes it.
+# It deliberately parses no IP.
+package tcpd
+version 0.1.0
+
+program bin/tcpd
+entry hertz
+cap memory pages=16
+cap memory pages=16
+cap memory pages=1
+cap memory pages=1
+cap serve tcp
+cap notification
+cap notification
+
+payload bin/tcpd from user/tcpd/target/x86_64-unknown-none/release/tcpd

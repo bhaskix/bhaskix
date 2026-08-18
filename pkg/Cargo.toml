@@ -20,6 +20,19 @@ license.workspace = true
 name = "bhaskix_pkg"
 path = "src/lib.rs"
 
+# The image builder, RFC 0030 step 2. A host program behind a feature, for
+# `mkfs`'s stated reason: the workspace builds freestanding and this tool
+# needs `std`. `make mkimage` builds it, and the image rule keeps it honest.
+[[bin]]
+name = "mkimage"
+path = "src/bin/mkimage.rs"
+required-features = ["tool"]
+
+[features]
+# Enables the host-side image builder. Off by default so the freestanding
+# build never sees it.
+tool = []
+
 [dependencies]
 bhaskix-ustar = { path = "../ustar" }
 

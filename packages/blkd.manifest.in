@@ -1,0 +1,17 @@
+# The block driver, in a domain: the virtio device's register windows,
+# four pages for its rings, the window that bounds what the device may
+# reach, its interrupt and the notification it signals, and the
+# endpoint blocks are served on.
+package blkd
+version 0.1.0
+
+program bin/blkd
+entry hertz
+cap device-registers
+cap memory pages=4
+cap dma-window
+cap interrupt
+cap notification
+cap serve block
+
+payload bin/blkd from user/blkd/target/x86_64-unknown-none/release/blkd

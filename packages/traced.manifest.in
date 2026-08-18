@@ -1,0 +1,17 @@
+# The telemetry reader: its report page, a wake for its deadline, the
+# tails page it may write one word per CPU into, and every CPU's
+# 64-KiB event ring, read-only.
+package traced
+version 0.1.0
+
+program bin/traced
+entry hertz
+cap memory pages=1
+cap notification
+cap memory pages=1
+cap memory pages=16
+cap memory pages=16
+cap memory pages=16
+cap memory pages=16
+
+payload bin/traced from user/traced/target/x86_64-unknown-none/release/traced

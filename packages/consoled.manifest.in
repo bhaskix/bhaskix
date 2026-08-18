@@ -1,0 +1,11 @@
+# The console service: the endpoint it answers on, and the console
+# itself -- put a character, take a byte, nothing else.
+package consoled
+version 0.1.0
+
+program bin/consoled
+entry hertz
+cap serve console
+cap console
+
+payload bin/consoled from user/consoled/target/x86_64-unknown-none/release/consoled

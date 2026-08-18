@@ -1,0 +1,15 @@
+# The supervisor, RFC 0017's restart policy in ring 3: a console to
+# report through, the authority to make one domain at a time, memory
+# holding the child's image (sized by the granter to the program it
+# stages), and the signal endings arrive on.
+package sup
+version 0.1.0
+
+program bin/sup
+entry hertz
+cap endpoint console
+cap domain-control
+cap memory
+cap notification
+
+payload bin/sup from user/sup/target/x86_64-unknown-none/release/sup

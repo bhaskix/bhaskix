@@ -1,0 +1,18 @@
+# The TCP demonstration client and instrument: a badged endpoint to
+# the service, its report page, four 4-page stream rings it owns and
+# gifts across the handover, and the two wakes it stops spinning on.
+package tcpc
+version 0.1.0
+
+program bin/tcpc
+entry hertz
+cap endpoint tcp
+cap memory pages=1
+cap memory pages=4
+cap memory pages=4
+cap memory pages=4
+cap memory pages=4
+cap notification
+cap notification
+
+payload bin/tcpc from user/tcpc/target/x86_64-unknown-none/release/tcpc
