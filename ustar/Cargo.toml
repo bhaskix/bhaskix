@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0030 step 1: the `ustar` reader as a leaf crate, out of the filesystem
+# service with its code unchanged -- the RFC 0028 pattern, applied to the
+# other boot-medium parser. The initrd, the VFS's archive, and now the
+# package format all read the same documented subset, so there is one copy,
+# at the layer the kernel, the services, the `pkg` crate and the fuzz target
+# can all reach, depending on nothing.
+[package]
+name = "bhaskix-ustar"
+description = "The ustar subset this system reads: one parser, every consumer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_ustar"
+path = "src/lib.rs"
+
+[dependencies]
+
+[features]
+# The archive builders, for tests in crates that consume this one. Gated so
+# that nothing shipping can link a header *writer*: this crate reads archives,
+# and the one well-formed-header definition it carries exists to feed its own
+# parser in tests, not to produce archives in production.
+test-support = []
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# A parser of hostile bytes with no business holding a raw pointer, exactly
+# as it was inside the filesystem service.
+unsafe_budget = 0

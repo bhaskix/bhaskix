@@ -35,7 +35,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-pub mod ustar;
+// RFC 0030 step 1: the parser moved to the `bhaskix-ustar` leaf crate, code
+// unchanged, so the package format and this service read one definition of
+// the subset. Re-exported so every existing path still names it.
+pub use bhaskix_ustar as ustar;
 pub mod vfs;
 
 mod service;

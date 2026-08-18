@@ -88,8 +88,13 @@ version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
  "bhaskix-service",
+ "bhaskix-ustar",
 ]
 
 [[package]]
 name = "bhaskix-telemetry"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-ustar"
 version = "0.0.0"

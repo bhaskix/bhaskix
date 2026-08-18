@@ -327,7 +327,7 @@ mod tests {
 
     /// The archive `tar -C initrd .` produces, in miniature.
     fn sample() -> alloc::vec::Vec<u8> {
-        crate::ustar::tests::archive_of(&[
+        crate::ustar::test_support::archive_of(&[
             (b"./", b"", b'5'),
             (b"./hello.txt", b"hello\n", b'0'),
             (b"./etc/", b"", b'5'),

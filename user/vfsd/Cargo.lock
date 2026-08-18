@@ -27,6 +27,7 @@ version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
  "bhaskix-service",
+ "bhaskix-ustar",
 ]
 
 [[package]]
@@ -38,3 +39,7 @@ dependencies = [
  "bhaskix-service-domain",
  "bhaskix-service-vfs",
 ]
+
+[[package]]
+name = "bhaskix-ustar"
+version = "0.0.0"

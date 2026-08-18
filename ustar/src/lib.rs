@@ -18,19 +18,14 @@
 //! # The fuzz requirement, and how it is met
 //!
 //! `docs/coding-style.md` §8 requires a fuzz target for anything parsing
-//! untrusted input, before it merges. Coverage-guided fuzzing — `cargo-fuzz`,
-//! libFuzzer — needs a nightly toolchain for its sanitizer support, and
-//! `docs/nightly-features.md` is empty and worth keeping that way.
-//!
-//! What runs instead is a **seeded mutation harness**: a deterministic
-//! generator produces malformed archives from a valid one and requires the
-//! parser to terminate without panicking. It runs on stable, in CI, on every
-//! build, and it is *weaker* than a coverage-guided fuzzer — it explores
-//! blindly and will not find a path that needs several specific bytes to line
-//! up. Saying so is the point; calling it fuzzing without the qualifier would
-//! misrepresent how much assurance it gives.
-//!
-//! `BHASKIX_FUZZ_ITERATIONS` raises the count for a soak run.
+//! untrusted input. Two things meet it. A **seeded mutation harness** runs
+//! in this crate's tests on stable, in CI, on every build — deterministic
+//! seeds, so a failure names its input exactly; `BHASKIX_FUZZ_ITERATIONS`
+//! raises the count for a soak. And the **coverage-guided target**
+//! `fuzz/fuzz_targets/ustar_parse.rs` runs in campaigns — this paragraph
+//! said the harness ran "instead" of a fuzzer until 2026-08-18, stale from
+//! the day the target closed that deviation; the harness is the weaker,
+//! always-on half and the target is the guided one, and both are true now.
 //!
 //! # Why `ustar` and not something better
 //!
@@ -50,6 +45,21 @@
 //! - **Not a filesystem.** There are no directories to open, no cursor, no
 //!   permissions. `docs/roadmap.md` M6 puts a VFS above this; this is the
 //!   layer that hands it bytes.
+//!
+//! # Why this is a crate and not a module
+//!
+//! RFC 0030 step 1 moved it out of the filesystem service, parser unchanged,
+//! for RFC 0028's reason: the package format is this same subset, and a
+//! second copy of "what is a well-formed header" in the `pkg` crate would be
+//! a second opinion. The service re-exports it, so every existing path
+//! still names it.
+
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![forbid(unsafe_code)]
+
+#[cfg(any(test, feature = "test-support"))]
+extern crate alloc;
 
 /// Every record is a multiple of this, header and payload alike.
 pub const BLOCK: usize = 512;
@@ -288,18 +298,22 @@ impl<'a> Iterator for Archive<'a> {
     }
 }
 
-/// Archive builders, shared with the tests in `vfs`.
+/// Archive builders, shared with the tests of every consuming crate.
 ///
-/// `pub(crate)` rather than private because the VFS's own tests need archives
-/// to resolve paths against, and a second builder there would be a second
-/// opinion about what a well-formed `ustar` header looks like. There is one
-/// definition of that, and it belongs next to the parser it feeds.
-#[cfg(test)]
-pub(crate) mod tests {
+/// Public behind the `test-support` feature (and in this crate's own tests)
+/// rather than private, because the VFS's tests need archives to resolve
+/// paths against and the `pkg` crate's need packages to verify — and a
+/// second builder in either would be a second opinion about what a
+/// well-formed `ustar` header looks like. There is one definition of that,
+/// and it belongs next to the parser it feeds. Hidden from documentation:
+/// it is a test fixture, not an archive writer.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
     use super::*;
 
     /// Builds a well-formed header for `name` with `size` bytes of payload.
-    pub(crate) fn header(name: &[u8], size: usize, kind: u8) -> [u8; BLOCK] {
+    pub fn header(name: &[u8], size: usize, kind: u8) -> [u8; BLOCK] {
         let mut block = [0u8; BLOCK];
         block[..name.len()].copy_from_slice(name);
         // Mode, uid, gid: plausible octal so the checksum is realistic.
@@ -345,7 +359,7 @@ pub(crate) mod tests {
         block
     }
 
-    pub(crate) fn archive(members: &[(&[u8], &[u8])]) -> alloc::vec::Vec<u8> {
+    pub fn archive(members: &[(&[u8], &[u8])]) -> alloc::vec::Vec<u8> {
         let typed: alloc::vec::Vec<_> = members
             .iter()
             .map(|(name, data)| (*name, *data, b'0'))
@@ -354,7 +368,7 @@ pub(crate) mod tests {
     }
 
     /// The same, with an explicit type flag per member — directories included.
-    pub(crate) fn archive_of(members: &[(&[u8], &[u8], u8)]) -> alloc::vec::Vec<u8> {
+    pub fn archive_of(members: &[(&[u8], &[u8], u8)]) -> alloc::vec::Vec<u8> {
         let mut bytes = alloc::vec::Vec::new();
         for (name, data, kind) in members {
             bytes.extend_from_slice(&header(name, data.len(), *kind));
@@ -365,6 +379,12 @@ pub(crate) mod tests {
         bytes.extend(core::iter::repeat_n(0u8, BLOCK * 2));
         bytes
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{archive, header};
+    use super::*;
 
     #[test]
     fn a_well_formed_archive_lists_its_members() {

@@ -31,7 +31,10 @@ TARGET="x86_64-unknown-none"
 # What a service crate is allowed to reach. Adding to this list is a design
 # decision about every service at once, which is why it is three lines long
 # and in a file people read.
-ALLOWED="bhaskix-abi bhaskix-service"
+# `bhaskix-ustar` joined the list at RFC 0030 step 1: it is the parser the
+# VFS always contained, extracted to the leaf layer, and it depends on
+# nothing -- a service reaching it holds no more authority than before.
+ALLOWED="bhaskix-abi bhaskix-service bhaskix-ustar"
 
 RED=$'\033[1;31m'
 GREEN=$'\033[1;32m'

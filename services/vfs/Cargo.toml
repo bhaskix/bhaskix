@@ -13,13 +13,23 @@ license.workspace = true
 name = "bhaskix_service_vfs"
 path = "src/lib.rs"
 
-# Two, as for every service crate. The filesystem is the one that had to be
-# argued down to this: its bulk path used to read a caller's pages through the
-# kernel's direct map, and the whole of RFC 0013 step 3 was turning that into
-# something a context can hand over.
+# Two, as for every service crate, plus one leaf. The filesystem is the one
+# that had to be argued down to two: its bulk path used to read a caller's
+# pages through the kernel's direct map, and the whole of RFC 0013 step 3 was
+# turning that into something a context can hand over. The third arrived with
+# RFC 0030 step 1 and is a *narrowing*, not a widening: the `ustar` parser
+# this crate used to contain, moved to the leaf layer so the package format
+# reads the same one -- a leaf that depends on nothing, allowed by name in
+# `tools/check-placements.sh` for that reason.
 [dependencies]
 bhaskix-abi = { path = "../../abi" }
 bhaskix-service = { path = "../../service" }
+bhaskix-ustar = { path = "../../ustar" }
+
+[dev-dependencies]
+# The archive builders this crate's tests always used; they lived beside the
+# parser and moved with it.
+bhaskix-ustar = { path = "../../ustar", features = ["test-support"] }
 
 [lints]
 workspace = true

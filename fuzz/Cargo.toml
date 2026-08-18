@@ -28,6 +28,7 @@ bhaskix-elf = { path = "../elf" }
 bhaskix-service-vfs = { path = "../services/vfs" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-net = { path = "../net" }
+bhaskix-pkg = { path = "../pkg" }
 
 [[bin]]
 name = "elf_parse"
@@ -44,6 +45,24 @@ debug = true
 [[bin]]
 name = "ustar_parse"
 path = "fuzz_targets/ustar_parse.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 0030 step 1. Two targets for one format, because the manifest grammar
+# and the composed archive walk fail differently: one is a line parser with
+# fixed capacities, the other is the seam where a member's name meets a
+# manifest's path, over digests that must be checked and not assumed.
+[[bin]]
+name = "pkg_manifest"
+path = "fuzz_targets/pkg_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkg_package"
+path = "fuzz_targets/pkg_package.rs"
 test = false
 doc = false
 bench = false

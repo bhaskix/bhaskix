@@ -80,6 +80,14 @@ LAYERS = {
     # and the fuzz target drives it -- one copy, reachable by all three,
     # depending on nothing.
     "bhaskix-elf": -3,
+    # The ustar reader, RFC 0030 step 1, the same argument a sixth time:
+    # the VFS reads the initrd with it, the pkg crate reads packages with
+    # it, and the fuzz target drives it -- one copy, depending on nothing.
+    "bhaskix-ustar": -3,
+    # The package format, RFC 0030: manifest, archive walk, SHA-256. A rung
+    # above the leaves because it reads archives through `bhaskix-ustar`;
+    # nothing below the programs and the host tools depends on it.
+    "bhaskix-pkg": -2,
     # RFC 0027: the client side of the network, the rung *between* the leaf
     # crates and the programs -- it depends on the ABI, and programs depend
     # on it. The leaf layer renumbered from -2 to -3 to make this rung

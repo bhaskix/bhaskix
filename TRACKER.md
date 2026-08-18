@@ -764,6 +764,44 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (RFC 0030 step 1: the format exists, and its hash hung before it hashed)
+
+**The `pkg` crate: three refusals-first parsers, zero `unsafe`, forty host tests.** The
+manifest grammar as specified — fixed capacities refused with numbers, zero-copy slices,
+every malformed line named by its 1-based number, the capability vocabulary closed (an
+unknown authority is a parse error, not a warning). The `.bpk` walk composed over it:
+manifest first, every `file` line proven against the archive by length then digest with
+indexed refusals, every remaining member claimed or a directory or the package refused
+whole — and an escaping member name (`..`, absolute) refused *as a name*, pointing at the
+attempt rather than at a missing file line. SHA-256 as arithmetic against the FIPS
+vectors, streaming and one-shot held equal across every split point of a multi-block
+message. Each parser carries the seeded mutation harness the others do, and two
+coverage-guided targets joined `fuzz/` (`pkg_manifest`, `pkg_package` — the second exists
+for the seam where a member's name meets a manifest's path). All three parsers watched
+red by deliberate breakage: a flipped `K[0]` failed exactly the four vector tests, a
+dropped `..` rule failed exactly the escape tests, a skipped digest check failed exactly
+the flipped-byte test.
+
+**The `ustar` reader became a leaf crate on the way** — `bhaskix-ustar`, the RFC 0028
+extraction pattern a second time, parser unchanged: the package format is the initrd's
+own subset, and a second copy of "what is a well-formed header" in `pkg` would have been
+a second opinion. `services/vfs` re-exports it so every existing path still names it; the
+archive builders its tests always used moved with the parser behind a `test-support`
+feature; `tools/check-placements.sh` allows the leaf by name (a service reaching a crate
+that depends on nothing holds no more authority than before). One stale claim corrected
+in the moved file's own header: it still said the seeded harness ran *instead of* a
+coverage-guided fuzzer, which stopped being true the day `ustar_parse` joined `fuzz/`.
+
+**The bug worth the record: every digest hung, and the vectors never got to vote.** The
+first `Sha256::update` fell through its buffer top-up and overwrote `buffered` with the
+consumed remainder's length — zero — so `finish`'s pad loop could never reach the
+fifty-six-byte mark and *every* call spun for ever: three sha256 tests and five package
+tests at four hundred percent CPU, killed after two and a quarter burned hours. An early
+return when the input is consumed into the buffer ends it, and the comment above that
+return names the failure. The FIPS vectors then passed unmodified — the constants were
+right all along; the plumbing between them was the bug, which is exactly why the
+streaming-versus-one-shot split-point test exists beside the vectors.
+
 ### 2026-08-18 (RFC 0030 drafted: a package is authority made reviewable)
 
 **The next bullet opens: package management and image building, as one RFC.** The premise is

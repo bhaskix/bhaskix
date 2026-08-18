@@ -68,6 +68,13 @@ name = "bhaskix-net"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-pkg"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-ustar",
+]
+
+[[package]]
 name = "bhaskix-rand"
 version = "0.0.0"
 
@@ -100,6 +107,7 @@ version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
  "bhaskix-service",
+ "bhaskix-ustar",
 ]
 
 [[package]]
@@ -111,4 +119,8 @@ dependencies = [
 
 [[package]]
 name = "bhaskix-telemetry"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-ustar"
 version = "0.0.0"

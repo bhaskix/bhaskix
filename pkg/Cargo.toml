@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0030 step 1: the package format. A package is a program plus the
+# authority it asks for, in one reviewable file -- this crate is the part
+# that reads one and refuses the rest: the manifest grammar, the archive
+# walk over `bhaskix-ustar`, and SHA-256 as pure arithmetic. Host-testable
+# and fuzzed like every parser of hostile bytes beside it; `mkimage` grows
+# here at step 2, the `mkfs` pattern.
+[package]
+name = "bhaskix-pkg"
+description = "The package format: manifest, archive walk, and content identity."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_pkg"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-ustar = { path = "../ustar" }
+
+[dev-dependencies]
+bhaskix-ustar = { path = "../ustar", features = ["test-support"] }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Parsers of hostile bytes and a hash function: arithmetic all the way down,
+# and the RFC writes this zero into its design as a claim, not a hope.
+unsafe_budget = 0
