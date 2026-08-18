@@ -54,11 +54,11 @@ bhaskix-abi = { path = "../../abi" }
 # A seventh block would need a reason these six have.
 # 32 at step 5: the socket demonstration, which maps a page and reads what a
 # service filled into it.
-# 40 at RFC 0030 step 3 (2026-08-18): the staging window read as a slice
-# and the transfer window written a chunk at a time -- both memory this
-# program holds and mapped at addresses of its own choosing, eight lines
-# across the two `pkg` views.
-unsafe_budget = 40
+# 41 at RFC 0030 steps 3-4 (2026-08-18): the staging window read as a
+# slice (twice -- the archive at install, the record at run), and the
+# transfer window written a chunk at a time. All memory this program
+# holds and mapped at addresses of its own choosing.
+unsafe_budget = 41
 
 [profile.release]
 panic = "abort"

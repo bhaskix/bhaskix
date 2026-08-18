@@ -110,6 +110,11 @@ else
         # same install twice, because the second answer -- already installed
         # -- proves the record was written and read back, not just printed.
         commands+=$'pkg install hello.bpk\r'$'pkg list\r'$'pkg install hello.bpk\r'
+        # RFC 0030 step 4: the installed program runs with grants derived
+        # from its manifest -- and the over-asker is refused whole before
+        # any domain exists. `run` comes after `spawn`'s own arc so the one
+        # child the envelope allows is free again.
+        commands+=$'pkg install greedy.bpk\r'$'pkg run greedy\r'$'pkg run hello\r'
         # RFC 0018 step 5, and only under `iommu` because that is the only mode
         # where there is a device behind the service. Without one the command
         # still answers -- "there is a service but no device behind it" -- which
@@ -361,6 +366,10 @@ else
             "the install completed and said where:installed.*\\/pkg\\/hello"
             "the installed set lists it:pkg list"
             "a second install was refused by the record:already installed"
+            "the over-asking manifest was refused whole:asks for authority this shell does not hold"
+            "the installed program ran with its manifest's grants:running.*hello"
+            "the installed program spoke through the granted console:namaste from an installed package"
+            "the run was watched to its end:it ended cleanly"
         )
         for check in "${pkg_checks[@]}"; do
             checks+=("$check")

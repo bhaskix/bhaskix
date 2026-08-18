@@ -3352,7 +3352,11 @@ fn filesystem_self_test() -> bool {
 /// sixty-four kilobytes of stack is not a thing this kernel has, and rather
 /// than on the heap because a self-test that can fail for want of memory is a
 /// self-test that reports the wrong thing when it does.
-static mut JOURNAL_IMAGE: [u8; 32 * bhaskix_fs::BLOCK] = [0; 32 * bhaskix_fs::BLOCK];
+// 48 blocks since RFC 0030 step 4: the disk filesystem now holds installed
+// packages, and two fifteen-kilobyte payloads plus their records did not
+// fit in 32 -- the second install failed as `Full`, the allocator working,
+// the number simply outgrown. The 512-sector disk holds 64.
+static mut JOURNAL_IMAGE: [u8; 48 * bhaskix_fs::BLOCK] = [0; 48 * bhaskix_fs::BLOCK];
 
 /// The pages that filesystem is cached in.
 ///
@@ -5712,11 +5716,11 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
     // what `mkfs` does from a developer's machine. Formatting through the
     // store would work equally well and would prove less: what is wanted here
     // is a device holding an image this kernel did not make up as it read it.
-    // Thirty-two, not sixteen. Sixteen left three data blocks after the
-    // superblock, the bitmap, the inode table and the journal's nine, and the
-    // tree below needs five. It failed as `Full`, which is the allocator
-    // working; the number was simply wrong.
-    let blocks = 32u32;
+    // Thirty-two, not sixteen, and forty-eight since RFC 0030 step 4 --
+    // each time it failed as `Full`, which is the allocator working; the
+    // number was simply outgrown, first by the journal tree, then by two
+    // installed packages.
+    let blocks = 48u32;
     if bhaskix_fs::format(image, 128).is_err() || u64::from(blocks) > sectors / 8 {
         DISK_JOURNAL.store(0, Ordering::Release);
         sched::exit()

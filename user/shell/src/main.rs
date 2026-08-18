@@ -441,6 +441,7 @@ fn help() {
     write(b"    spawn <path>      start a program in a domain of its own\n");
     write(b"    pkg install <f>   install a package onto the writable filesystem\n");
     write(b"    pkg list          what is installed\n");
+    write(b"    pkg run <n>       start an installed program, grants from its manifest\n");
     write(b"    pkg remove <n>    remove an installed package\n");
     write(b"    exit              end this shell\n");
     write(b"\n");
@@ -1785,6 +1786,197 @@ fn pkg_remove(name: &[u8]) {
     );
 }
 
+// A package-run child's console carries `BADGE_CONSOLE`, the same badge
+// `spawn` grants: the shell's console capability is itself badged, and a
+// grant may narrow rights but never swap identities — a fresh badge here
+// was refused with INSUFFICIENT_RIGHTS, which is the monotonicity rule
+// doing its job against this very program.
+
+/// Reads the whole file whose handle sits at `handle` into the memory
+/// object at `slot`, one transfer page per call, reassembled in place.
+/// Returns the byte count, or `None` with the refusal reported.
+fn pkg_read_file(handle: u64, slot: u64, limit: u64) -> Option<u64> {
+    let mut offset = 0u64;
+    loop {
+        let reply = call(handle, dir::READ_INTO, [slot, 4096, offset, 0]);
+        if !reply.delivered() || reply.raw() != dir::OK {
+            pkg_refused(b"reading an installed file", reply.raw());
+            return None;
+        }
+        let read = reply.args[1];
+        if read == 0 {
+            return Some(offset);
+        }
+        offset += read;
+        if offset > limit {
+            pkg_refused(b"a file bigger than the staging memory", 0);
+            return None;
+        }
+    }
+}
+
+/// `pkg run <name>`: starts an installed program with **exactly the grants
+/// its manifest requested and this shell holds** — RFC 0030 step 4. An
+/// over-ask is refused whole, before any domain exists: no partial grants,
+/// no silently narrowed authority, the same rule the driver enumerator and
+/// RFC 0022 enforce.
+fn pkg_run(name: &[u8]) {
+    if !pkg_attach() {
+        pkg_refused(b"mapping the staging memory", 0);
+        return;
+    }
+    let (chunk, more) = Chunk::take(name);
+    if !more.is_empty() {
+        pkg_refused(b"a package name over sixteen bytes", 0);
+        return;
+    }
+    let opened = dir_call(PKG_DIR, PKG_WORK, dir::OPEN_AT, chunk.pack(0));
+    if opened.delivered() && opened.raw() == dir::NO_SUCH_NAME {
+        write(b"  \x1b[93mpkg: not installed\x1b[0m\n");
+        return;
+    }
+    if !opened.delivered() || opened.raw() != dir::OK {
+        pkg_refused(b"opening the package", opened.raw());
+        return;
+    }
+
+    // The record, read back and parsed with the same grammar that admitted
+    // it at install. The authority about to be granted is the authority
+    // that was reviewed -- this file, not a memory of it.
+    let (record, _) = Chunk::take(b"manifest");
+    let record_handle = dir_call(PKG_WORK, PKG_FILE, dir::OPEN_AT, record.pack(0));
+    if !record_handle.delivered() || record_handle.raw() != dir::OK {
+        pkg_refused(b"opening the record", record_handle.raw());
+        return;
+    }
+    let Some(record_bytes) = pkg_read_file(PKG_FILE, STAGING, 4096) else {
+        return;
+    };
+    // SAFETY: the staging window this program attached at `STAGING_AT`;
+    // the record was just read into its first `record_bytes` bytes.
+    let record_slice =
+        unsafe { core::slice::from_raw_parts(STAGING_AT as *const u8, record_bytes as usize) };
+    let Ok(manifest) = bhaskix_pkg::manifest::parse(record_slice) else {
+        write(b"  \x1b[91mpkg: the installed record does not parse (");
+        write_number(record_bytes);
+        write(b" bytes) -- refusing to run\x1b[0m\n");
+        return;
+    };
+    let Some(program) = manifest.programs().next() else {
+        write(b"  \x1b[93mpkg: this package carries no program\x1b[0m\n");
+        return;
+    };
+
+    // Every request checked against what this shell can grant, before any
+    // domain exists. The vocabulary this spawner can honour is exactly one
+    // word today -- console -- and anything else is refused whole, by name.
+    let mut grantable = true;
+    for cap in program.caps() {
+        if !matches!(cap, bhaskix_pkg::manifest::Cap::Console) {
+            grantable = false;
+        }
+    }
+    if !grantable {
+        write(
+            b"  \x1b[91mpkg: the manifest asks for authority this shell does not hold -- \
+refused whole, nothing granted\x1b[0m\n",
+        );
+        return;
+    }
+
+    // The program's bytes, out of the installed tree into the staging
+    // object -- overwriting the record copy, which has served its purpose.
+    let mut parent = PKG_WORK;
+    let mut file_name = program.path;
+    if let Some(slash) = program.path.iter().position(|b| *b == b'/') {
+        let (first, rest) = (&program.path[..slash], &program.path[slash + 1..]);
+        let (dir_chunk, _) = Chunk::take(first);
+        let inner = dir_call(PKG_WORK, PKG_WORK2, dir::OPEN_AT, dir_chunk.pack(0));
+        if !inner.delivered() || inner.raw() != dir::OK {
+            pkg_refused(b"opening the program's directory", inner.raw());
+            return;
+        }
+        parent = PKG_WORK2;
+        file_name = rest;
+    }
+    let (file_chunk, _) = Chunk::take(file_name);
+    let binary = dir_call(parent, PKG_FILE, dir::OPEN_AT, file_chunk.pack(0));
+    if !binary.delivered() || binary.raw() != dir::OK {
+        pkg_refused(b"opening the program", binary.raw());
+        return;
+    }
+    let Some(bytes) = pkg_read_file(PKG_FILE, STAGING, 16 * 4096) else {
+        return;
+    };
+    syscall(syscall::INVOKE, PKG_FILE, method::DELETE, [0; 4]);
+    syscall(syscall::INVOKE, PKG_WORK2, method::DELETE, [0; 4]);
+    syscall(syscall::INVOKE, PKG_WORK, method::DELETE, [0; 4]);
+
+    // From here it is `spawn`'s own arc: an empty domain, the reviewed
+    // grants, the ending bound before the start. The entry argument is
+    // zero -- the manifest declares `entry hertz` and this spawner cannot
+    // know the rate; the first installed program that keeps time is the
+    // trigger for threading it through, and `bin/hello` ignores it.
+    let made = syscall(
+        syscall::INVOKE,
+        DOMAIN_CONTROL,
+        method::SPAWN,
+        [CHILD, NAME_LOW, NAME_HIGH, 0],
+    );
+    if !made.delivered() {
+        report_refusal(b"pkg run: creating the domain", &made);
+        return;
+    }
+    for cap in program.caps() {
+        let bhaskix_pkg::manifest::Cap::Console = cap else {
+            continue;
+        };
+        let granted = syscall(
+            syscall::INVOKE,
+            CHILD,
+            method::GRANT,
+            [CONSOLE, 0, EVERYTHING_HELD, BADGE_CONSOLE],
+        );
+        if !granted.delivered() {
+            report_refusal(b"pkg run: granting the console", &granted);
+            let _ = syscall(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
+            return;
+        }
+    }
+    let bound = syscall(
+        syscall::INVOKE,
+        CHILD,
+        method::BIND,
+        [SIGNAL, CHILD_BADGE, 0, 0],
+    );
+    if !bound.delivered() {
+        report_refusal(b"pkg run: asking to be told it ended", &bound);
+        let _ = syscall(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
+        return;
+    }
+    write(b"  \x1b[1;32mrunning\x1b[0m    ");
+    write(name);
+    write(b" (");
+    write_number(bytes);
+    write(b" bytes, grants from its manifest)\n");
+    let started = syscall(
+        syscall::INVOKE,
+        CHILD,
+        method::START,
+        [STAGING, bytes, 0, 0],
+    );
+    if !started.delivered() {
+        report_refusal(b"pkg run: starting it", &started);
+        let _ = syscall(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
+        return;
+    }
+    let ended = syscall(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+    if ended.delivered() {
+        write(b"  it ended cleanly\n");
+    }
+    let _ = syscall(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
+}
+
 /// The `pkg` family -- install, list, remove. RFC 0030 steps 3 and 5,
 /// and the shell is the actor because it already holds exactly the
 /// authority installing needs: the boot image read-only, `/pkg` writable,
@@ -1794,10 +1986,11 @@ fn pkg(rest: &[u8]) {
     match word {
         b"install" if !name.is_empty() => pkg_install(name),
         b"list" => pkg_list(),
+        b"run" if !name.is_empty() => pkg_run(name),
         b"remove" if !name.is_empty() => pkg_remove(name),
         _ => {
             write(
-                b"  pkg install <file> | pkg list | pkg remove <name>
+                b"  pkg install <file> | pkg list | pkg run <name> | pkg remove <name>
 ",
             );
         }

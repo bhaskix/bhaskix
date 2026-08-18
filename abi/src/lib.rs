@@ -585,6 +585,18 @@ pub mod dir {
     /// Replies with the entry's name as a chunk in `args[1..3]`, its kind
     /// in the reply's fourth word, [`END`] past the last entry.
     pub const LIST_AT: u64 = 8;
+    /// Read bytes of the file this handle names into memory the caller
+    /// named — [`WRITE_FROM`]'s mirror, and what running an installed
+    /// program needs (RFC 0030 step 4): [`MAP`] lends only the first page,
+    /// and a binary is bigger than a page.
+    ///
+    /// `arg0` = the caller's own slot holding a `Memory` object, `arg1` =
+    /// how many bytes at most (one transfer page per call, the caller
+    /// loops), `arg2` = the file offset — which is also the offset the
+    /// bytes land at in the caller's object, so a linear read reassembles
+    /// the file in place. Replies with the count in `args[1]`; zero is end
+    /// of file. Any handle may read: reading is what every handle has.
+    pub const READ_INTO: u64 = 9;
 
     /// Packs an inode and a generation into the badge that names them.
     #[must_use]

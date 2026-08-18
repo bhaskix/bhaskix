@@ -143,6 +143,23 @@ sweepable droppings and no claim of success; **remove deletes the record first, 
 after** — a torn remove leaves droppings and no claim of presence. Hashes are verified on
 install, before the record exists.
 
+**Step 4's verdict, over the paragraph below that specified it.** `pkg run hello` at a
+live prompt: the record read back off the disk and parsed with the grammar that admitted
+it, the binary read out of the installed tree through `READ_INTO` (`WRITE_FROM`'s mirror,
+added for exactly this — `MAP` lends one page and a binary is bigger), the intersection
+rule enforced *before any domain exists*, and the program spoke through the console its
+manifest asked for. The over-ask is gated live: `greedy`, the same binary under a manifest
+asking for a DMA window, is refused whole with nothing granted. Two findings worth their
+ink: the first `WRITE_FROM`/`READ_INTO` used the block store's own transfer page as a data
+buffer, and every cache miss during the very operation being served ran device traffic
+through it — installed records came back the right length and the wrong bytes; both arms
+now use stack buffers and the changelog names the disease. And granting the child's
+console under a fresh badge was refused with `INSUFFICIENT_RIGHTS` — the shell's console
+is itself badged, and rights monotonicity does not allow identity swaps even for the
+spawner; the child inherits the badge the shell's own capability carries. One stated gap:
+the manifest declares `entry hertz` and the spawner passes zero — it cannot know the rate
+— so the first installed program that keeps time is the trigger for threading it through.
+
 Running an installed program is RFC 0017's machinery with the manifest as the grant list:
 the starter grants **the intersection of what the manifest requests and what the starter
 holds**, and a manifest asking beyond the starter's own authority is refused whole — no

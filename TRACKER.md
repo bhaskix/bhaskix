@@ -764,6 +764,36 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-19 (RFC 0030 step 4: an installed program runs on its manifest's word, and the over-asker is refused whole)
+
+**`pkg run hello` at a live prompt, gated**: the record read back off the disk and parsed
+with the grammar that admitted it at install, the binary read out of the installed tree
+through the new `dir::READ_INTO` (`WRITE_FROM`'s mirror — `MAP` lends one page and a
+binary is bigger), the grant check run **before any domain exists**, the console granted
+per the manifest, the program started through RFC 0017's own arc, and `namaste from an
+installed package` on the console with the ending reaped. The refusal is gated beside it:
+`bin/greedy` — the same binary under a manifest asking for a DMA window — is **refused
+whole with nothing granted**, by name, before a domain exists. The intersection rule is
+now a fact a boot test watches, not a sentence in an RFC.
+
+**The finding worth the step: the bulk-page aliasing disease.** The first `WRITE_FROM` and
+`READ_INTO` used `bin/fsd`'s bulk page as their data buffer — but that page is the block
+store's own transfer window, and every cache miss during the very operation being served
+runs a device read through it. A journalled write's own misses overwrote the data being
+written; installed records came back the right length and the wrong bytes. Both arms now
+use stack buffers (the sixteen-page stack bought one step earlier paying out), and the
+comment in `write_from` names the disease in capitals. Second finding, and the system
+defending itself against its own spawner: granting the child's console under a fresh badge
+was refused with `INSUFFICIENT_RIGHTS` — the shell's console capability is itself badged,
+and rights monotonicity does not permit identity swaps; the child inherits the shell's
+badge. Third: the disk filesystem outgrew 32 blocks the moment it held two installed
+packages — the second install failed as `Full`, the allocator working, and 48 blocks is
+the new number with the old ones' history kept in the comment. One stated gap: `entry
+hertz` is declared and the spawner passes zero; the first installed program that keeps
+time is the trigger. The torn-install discipline was also observed live before the disk
+grew: greedy's failed install left droppings and no record, and `pkg run greedy` refused
+off the missing record — exactly the crash story, exercised by accident.
+
 ### 2026-08-18 (RFC 0030 step 3: pkg install works at a live prompt, and the kernel gained no method for it)
 
 **A package installed itself onto the writable filesystem, typed at the shell.** The full

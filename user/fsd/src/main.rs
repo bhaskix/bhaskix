@@ -379,21 +379,25 @@ fn write_from(
         answer(dir::BAD_NAME, 0, 0);
         return cache;
     }
-    // The caller's bytes land in this program's bulk page -- DRAIN, the
-    // mirror of the FILL the read path has always used.
+    // The caller's bytes land in a buffer on this program's own stack --
+    // NOT the bulk page, and the first version of this arm is why that is
+    // written in capitals: the bulk page is the block store's transfer
+    // window, and every cache miss during the journalled write below runs
+    // a device read through it. Draining into it handed `volume.write`
+    // a buffer the write's own misses were overwriting -- installed
+    // records came back the right length and the wrong bytes.
+    let mut buffer = [0u8; 4096];
     let (drained, _) = call(
         syscall::INVOKE,
         ENDPOINT,
         method::DRAIN,
-        [caller_slot, BULK_AT, length as u64, 0],
+        [caller_slot, buffer.as_mut_ptr() as u64, length as u64, 0],
     );
     if drained != status::OK {
         answer(dir::NOWHERE, drained, 0);
         return cache;
     }
-    // SAFETY: the bulk page this program holds and mapped, `length` bounded
-    // to one page above.
-    let bytes = unsafe { core::slice::from_raw_parts(BULK_AT as *const u8, length) };
+    let bytes = &buffer[..length];
     let (cache, wrote) = writing(cache, |volume| {
         let file = volume.inode(index).map_err(|_| dir::GONE)?;
         if file.generation != generation || file.kind != Kind::File {
@@ -438,6 +442,44 @@ fn remove_at(
         Err(outcome) => answer(outcome, 0, 0),
     }
     cache
+}
+
+/// Answers `READ_INTO`: bytes of this file into the caller's own memory,
+/// through the bulk page and `FILL` — the read mirror of [`write_from`],
+/// and the path an installed program's bytes travel to reach `START`.
+fn read_into(cache: &mut Cache<'static, BlockService>, badge: u64, args: &[u64; 4]) {
+    let (index, generation) = dir::parts(badge);
+    let (caller_slot, limit, offset) = (args[0], (args[1] as usize).min(4096), args[2]);
+    let Ok(mut mounted) = Filesystem::mount(cache) else {
+        answer(dir::GONE, 0, 0);
+        return;
+    };
+    let Ok(file) = mounted.inode(index) else {
+        answer(dir::GONE, 0, 0);
+        return;
+    };
+    if file.generation != generation || file.kind != Kind::File {
+        answer(dir::GONE, 0, 0);
+        return;
+    }
+    // A stack buffer, for the write arm's stated reason: the bulk page is
+    // the store's transfer window, and this read's own cache misses run
+    // device traffic through it while the copy is being assembled.
+    let mut buffer = [0u8; 4096];
+    let read = mounted.read(&file, offset, &mut buffer[..limit]);
+    if read > 0 {
+        let (filled, _) = call(
+            syscall::INVOKE,
+            ENDPOINT,
+            method::FILL,
+            [caller_slot, buffer.as_ptr() as u64, read as u64, offset],
+        );
+        if filled != status::OK {
+            answer(dir::NOWHERE, filled, 0);
+            return;
+        }
+    }
+    answer(dir::OK, read as u64, 0);
 }
 
 /// Answers `LIST_AT`: entry `args[0]` of this directory, one per call, no
@@ -899,6 +941,10 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
         }
         if method == dir::LIST_AT {
             list_at(&mut cache, badge, &args);
+            continue;
+        }
+        if method == dir::READ_INTO {
+            read_into(&mut cache, badge, &args);
             continue;
         }
         // The write family, RFC 0030 step 3. Every arm checks the badge's

@@ -1,0 +1,13 @@
+# The over-asker: the same greeting binary as `hello`, and a manifest that
+# asks for a DMA window the shell has no business granting. It exists so
+# the refusal is a gate rather than a promise -- `pkg run greedy` must
+# refuse whole, before any domain exists, with nothing granted.
+package greedy
+version 0.1.0
+
+program bin/greedy
+entry hertz
+cap console
+cap dma-window
+
+payload bin/greedy from user/hello/target/x86_64-unknown-none/release/hello
