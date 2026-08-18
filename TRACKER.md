@@ -132,6 +132,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **SK1** | A sockets API worth the name | ✅ **Accepted 2026-08-17** — drafted, implemented (steps 1–4) and accepted the same day, on the ports: `bin/dhcp` 28 → 10 `unsafe` lines, `bin/tcpc` 45 → 12, the crate carries 20 once; every gate unchanged, the measure A/B'd neutral. Question 2 answered by the port (the leg order stays the caller's); questions 1 (the shell) and 3 (a user-rt crate) stay open with their triggers written | **A client crate, not a new interface.** `bhaskix-sock`: the UDP calls, the TCP three-leg handover, the stream arithmetic, the window discipline and the memory-wait as one audited `no_std` library — no new syscall, no new object, no new service, no new authority. The motivation is RFC 0014's invoice arriving a layer up: three programs hand-roll the exchange today (797 + 332 lines, 31 `unsafe` blocks between them), and a comment is a lesson recorded, not enforced. POSIX explicitly refused natively — that is RFC 0005's Linux personality. Proven or not on the ports: `bin/dhcp` (step 1) and `bin/tcpc` (step 4), gates unchanged | [RFC 0027](docs/rfc/0027-a-sockets-api-worth-the-name.md) |
 | **BB1** | `bhaskixboot.efi` | ✅ **Accepted 2026-08-18**, all seven steps implemented — **the machine boots on its own loader at full strength**: slid by a drawn KASLR slide, four CPUs the kernel started itself, and `boot-test.sh native` answering the **same 74 gates every Limine lane answers** (ring 3, services, shell path, network, filesystem — all of it), beside the loader-specific lane's 23 and its permanent negative arm. The roadmap bullet is closed | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
 | **IP6** | IPv6 | ✅ **Accepted 2026-08-18** — drafted, implemented (all six steps) and accepted in one day, on the working demonstration: dual stack gated on every networked lane, both families measured on one boot, the networking bullet closed | **A second address family, not a second stack.** The collection on RFC 0018's pre-paid abstraction: a `V6` variant on the one-variant `Address` enum (the compiler produces the work list), parsers and NDP as zero-`unsafe` arithmetic in `bhaskix-net`, SLAAC in `bin/ipd`, UDP/TCP over the same rings and capability handover — a v6 endpoint fits an IPC message's four words exactly. Refused with written triggers: extension headers, fragmentation, DHCPv6, privacy addresses, a resolver. One stated harness reduction: this QEMU's slirp cannot deliver inbound v6, so the LISTEN path's v6 wire proof waits on a newer QEMU or hardware | [RFC 0029](docs/rfc/0029-ipv6.md) |
+| **PKG** | Packages | ⬜ **Draft** 2026-08-18 — RFC 0030, six steps; one of Phase 2's last two bullets | **A package is a program plus the authority it asks for, in one reviewable file.** `driver-model.md` §5's manifest principle generalised to every installable thing: a ustar `.bpk` with a line-grammar manifest naming binaries, capability requests and SHA-256 content identity (honest about being corruption-detection until Phase 3 signs it). Build time: the image becomes a deterministic function of `packages/` — byte-identical gated, the Makefile cp-list retires. Run time: install/run/remove on RFC 0016's filesystem, grants = intersection of manifest and granter, over-ask refused whole, crash-safe ordering. Design claim: zero new kernel code. Refused with triggers: fetch, signatures, dependency solving, upgrades; install-time scripts refused *flat* — ambient authority by definition | [RFC 0030](docs/rfc/0030-packages.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -762,6 +763,28 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-18 (RFC 0030 drafted: a package is authority made reviewable)
+
+**The next bullet opens: package management and image building, as one RFC.** The premise is
+the one `driver-model.md` §5 wrote down for drivers — the manifest is the reviewable summary
+of authority — promoted to the shape of every installable thing, because on this system a
+binary without grants does nothing and a package format that lists files but not authority
+documents the half that matters less. One format, two halves. Build time: the boot image
+stops being a fourteen-line `cp` list and becomes a deterministic function of `packages/`,
+byte-identical across runs and gated on it — which is also the moment the fourteen current
+programs' authority gets *written down* instead of living implicitly in kernel bring-up
+code. Run time: `.bpk` archives (the initrd's own ustar subset, manifest first) installed
+onto RFC 0016's writable filesystem with hash verification before the record, run through
+RFC 0017's machinery with grants = the intersection of what the manifest requests and the
+granter holds (over-ask refused whole), removed with the record deleted first so a crash
+can leave droppings but never a lie. The design claim, to be tested by building: packaging
+adds nothing to the kernel. SHA-256 arrives as pure arithmetic against the FIPS vectors,
+stated as corruption-detection, not tampering-proof, until Phase 3's signature makes the
+manifest's hash lines its payload. Refused with written triggers: network fetch,
+signatures, dependency resolution, upgrades, side-by-side versions — and install-time
+scripts refused flat, no trigger, because a postinst is ambient authority by definition.
+Six steps; 1–2 touch no guest code. Decision-log row **PKG**.
 
 ### 2026-08-18 (RFC 0029 accepted: the second family, collected on the promise the one-variant enum was built to keep)
 
