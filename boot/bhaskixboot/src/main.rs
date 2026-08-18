@@ -156,10 +156,115 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     }
     efi::close(root);
 
-    // Step 2 ends here: control goes back to the firmware, cleanly. The
-    // machine's shape, the tables and the jump are the steps that grow
-    // from this line.
-    efi::SUCCESS
+    // Step 3: the machine's shape, from the firmware that knows it. The
+    // configuration tables and the framebuffer come first, while boot
+    // services still answer; the memory map comes last, welded to the exit
+    // in one held breath, because the map's key names a moment and a
+    // single console print stales it.
+    let (rsdp, smbios) = efi::find_tables(table);
+    match rsdp {
+        Some(address) => {
+            serial::write("bhaskixboot: acpi rsdp ");
+            serial::write_hex(address);
+            serial::write(
+                "
+",
+            );
+        }
+        None => serial::write(
+            "bhaskixboot: acpi rsdp absent
+",
+        ),
+    }
+    match smbios {
+        Some(address) => {
+            serial::write("bhaskixboot: smbios ");
+            serial::write_hex(address);
+            serial::write(
+                "
+",
+            );
+        }
+        None => serial::write(
+            "bhaskixboot: smbios absent
+",
+        ),
+    }
+    match efi::framebuffer(table) {
+        Some((width, height, stride, base)) => {
+            serial::write("bhaskixboot: framebuffer ");
+            serial::write_dec(u64::from(width));
+            serial::write("x");
+            serial::write_dec(u64::from(height));
+            serial::write(" stride ");
+            serial::write_dec(u64::from(stride));
+            serial::write(" at ");
+            serial::write_hex(base);
+            serial::write(
+                "
+",
+            );
+        }
+        None => serial::write(
+            "bhaskixboot: framebuffer absent; serial-only is a state
+",
+        ),
+    }
+
+    // The exit. After this line succeeds there is no firmware to return
+    // to: no files, no console protocol, no `SUCCESS` to hand back. The
+    // loader owns the machine, says so on the one wire it still has, and
+    // parks — the tables and the jump are the steps that grow from here.
+    match efi::take_map_and_exit(table, image_handle) {
+        Ok(map) if map.is_empty() => {
+            // A firmware that exits successfully while handing over an
+            // empty map is lying about something; park loudly.
+            serial::write(
+                "bhaskixboot: the exit succeeded with an empty memory map
+",
+            );
+        }
+        Ok(map) => {
+            serial::write("bhaskixboot: memory map ");
+            serial::write_dec(map.len() as u64);
+            serial::write(" descriptors, ");
+            serial::write_dec(map.usable_bytes() / 1024);
+            serial::write(" KiB usable, ");
+            serial::write_dec(map.reclaimable_bytes() / 1024);
+            serial::write(" KiB reclaimable; truncated: ");
+            if map.truncated == 0 {
+                serial::write("no");
+            } else {
+                serial::write_dec(map.truncated as u64);
+            }
+            serial::write(
+                "
+",
+            );
+            serial::write(
+                "bhaskixboot: boot services exited; the machine is ours
+",
+            );
+        }
+        Err((status, dropped)) => {
+            serial::write("bhaskixboot: the exit was refused, status ");
+            serial::write_hex(status as u64);
+            if dropped != 0 {
+                serial::write(", ");
+                serial::write_dec(dropped as u64);
+                serial::write(" descriptors past the buffer");
+            }
+            serial::write(
+                "
+",
+            );
+        }
+    }
+    loop {
+        // SAFETY: `hlt` parks the machine the loader now owns; the harness
+        // reads the wire and ends the run.
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Prints `text` on the firmware console, UCS-2 encoded in bounded chunks.

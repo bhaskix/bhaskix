@@ -119,7 +119,7 @@ QEMU_PID=$!
 # the loader returns to the firmware after speaking, and the firmware then
 # wanders into its own shell -- the output is the event, not the exit.
 for _ in $(seq 1 "$TIMEOUT"); do
-    if grep -q "bhaskixboot: payload conf " "$LOG" 2>/dev/null; then
+    if grep -qE "bhaskixboot: (boot services exited|the exit was refused|the exit succeeded with an empty)" "$LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -149,8 +149,42 @@ do
     fi
 done
 
+# Step 3: the machine's shape, and the exit. The values are the firmware's
+# to choose -- the gates demand the *lines*, well-formed, plus the two facts
+# that must be true on OVMF: an RSDP exists, and the map was not truncated.
+if grep -qE "bhaskixboot: acpi rsdp 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
+    pass "the firmware's ACPI root was found and named"
+else
+    fail "no ACPI RSDP line"
+    status=1
+fi
+if grep -qE "bhaskixboot: smbios (0x[0-9a-f]{16}|absent)" "$LOG" 2>/dev/null; then
+    pass "SMBIOS found or its absence said"
+else
+    fail "no SMBIOS line"
+    status=1
+fi
+if grep -qE "bhaskixboot: framebuffer [0-9]+x[0-9]+ stride [0-9]+ at 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
+    pass "the framebuffer was found and measured"
+else
+    fail "no framebuffer line"
+    status=1
+fi
+if grep -qE "bhaskixboot: memory map [1-9][0-9]* descriptors, [1-9][0-9]* KiB usable, [0-9]+ KiB reclaimable; truncated: no" "$LOG" 2>/dev/null; then
+    pass "the memory map was taken whole, nothing dropped"
+else
+    fail "no untruncated memory-map line"
+    status=1
+fi
+if grep -qF "bhaskixboot: boot services exited; the machine is ours" "$LOG" 2>/dev/null; then
+    pass "boot services exited: the machine is ours"
+else
+    fail "the exit line never appeared"
+    status=1
+fi
+
 if [[ "$status" -ne 0 ]]; then
     echo "--- serial log ---"
-    cat "$LOG" 2>/dev/null | head -30
+    cat "$LOG" 2>/dev/null | head -40
 fi
 exit "$status"

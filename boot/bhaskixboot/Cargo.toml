@@ -37,4 +37,9 @@ opt-level = "s"
 # 23 at step 2: the payload path -- HandleProtocol twice, OpenVolume, Open,
 # Read and Close through the transcribed tables, each behind a null check
 # and each able to refuse with a printed status.
-unsafe_budget = 23
+#
+# 50 at step 3: the machine's shape -- the configuration-table walk, the
+# graphics chain's null-checked hops, the memory-map take welded to the
+# exit, and the park. Every new line is a firmware answer read behind a
+# check, or the hlt that ends a machine the loader now owns.
+unsafe_budget = 50
