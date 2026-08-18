@@ -50,7 +50,14 @@ use bhaskix_net::tcp::{
     segment::{self, Segment},
     state::{self, Action, Event, Tcb, Timer},
 };
-use bhaskix_net::{Address, Ipv4Addr, Port};
+use bhaskix_net::{Address, Ipv4Addr, Ipv6Addr, Port};
+
+/// `::1`, the one v6 address this service can call its own today. A
+/// `CONNECT6` anywhere else is refused: this program has no global v6
+/// identity until the configuration page carries one, and the network
+/// this system boots on has no v6 TCP peer anyway — both recorded in RFC
+/// 0029 with their triggers.
+const LOOPBACK6: Address = Address::V6(Ipv6Addr([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]));
 
 /// Slot: the ring `bin/ipd` forwards TCP segments into.
 const FWD: u64 = 0;
@@ -311,7 +318,7 @@ unsafe fn read_runs(base: u64, into: *mut u8, runs: (ring::Run, ring::Run)) {
 /// # Safety
 ///
 /// The back ring must be mapped writable at [`BACK_AT`].
-unsafe fn send_entry(source: Ipv4Addr, destination: Ipv4Addr, segment: &[u8]) -> bool {
+unsafe fn send_entry(source: Address, destination: Address, segment: &[u8]) -> bool {
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
         return false;
     };
@@ -326,7 +333,16 @@ unsafe fn send_entry(source: Ipv4Addr, destination: Ipv4Addr, segment: &[u8]) ->
     let Some(cursor) = ring::Cursor::new(layout, head, tail) else {
         return false;
     };
-    let total = 8 + segment.len();
+    // The record shape follows the family: eight bytes of v4 addresses,
+    // or the impossible-source marker and two sixteen-byte addresses. A
+    // mixed pair names a segment no wire can carry and is refused here,
+    // the same answer the checksum's seam gives.
+    let header = match (source, destination) {
+        (Address::V4(_), Address::V4(_)) => 8,
+        (Address::V6(_), Address::V6(_)) => 36,
+        _ => return false,
+    };
+    let total = header + segment.len();
     let Some(framed) = ring::frame_to_write(layout, cursor, total) else {
         return false;
     };
@@ -334,9 +350,19 @@ unsafe fn send_entry(source: Ipv4Addr, destination: Ipv4Addr, segment: &[u8]) ->
     let Some(slot) = entry.get_mut(..total) else {
         return false;
     };
-    slot[0..4].copy_from_slice(&source.octets());
-    slot[4..8].copy_from_slice(&destination.octets());
-    slot[8..].copy_from_slice(segment);
+    match (source, destination) {
+        (Address::V4(source), Address::V4(destination)) => {
+            slot[0..4].copy_from_slice(&source.octets());
+            slot[4..8].copy_from_slice(&destination.octets());
+        }
+        (Address::V6(source), Address::V6(destination)) => {
+            slot[0..4].copy_from_slice(&bhaskix_abi::tcp::V6_RECORD);
+            slot[4..20].copy_from_slice(&source.octets());
+            slot[20..36].copy_from_slice(&destination.octets());
+        }
+        _ => return false,
+    }
+    slot[header..].copy_from_slice(segment);
     let prefix = (total as u32).to_le_bytes();
     // SAFETY: every offset is `abi::ring`'s, inside the region this program
     // mapped writable, and `entry` is a buffer it owns.
@@ -553,12 +579,14 @@ fn perform(
                 }
                 let built = emit.segment(connection.tcb.connection, &payload[..length]);
                 let mut bytes = [0u8; segment::MAX_HEADER + MAX_EMIT];
-                let Some(destination) = connection.tcb.connection.remote.v4() else {
-                    continue;
-                };
-                if let Ok(written) = segment::write(&mut bytes, &built, service.me, destination) {
+                // The connection's own pair, whichever family it is in —
+                // `service.me` stopped being the only local address the
+                // day the tuple learned to carry `::1`.
+                let local = connection.tcb.connection.local;
+                let remote = connection.tcb.connection.remote;
+                if let Ok(written) = segment::write(&mut bytes, &built, local, remote) {
                     // SAFETY: the back ring is mapped writable at BACK_AT.
-                    if unsafe { send_entry(service.me, destination, &bytes[..written]) } {
+                    if unsafe { send_entry(local, remote, &bytes[..written]) } {
                         service.sent += 1;
                     }
                 }
@@ -705,11 +733,34 @@ fn drain_forward(service: &mut Service) {
         publish_tail(service.tail);
         service.taken += 1;
 
-        let source = Ipv4Addr(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]));
-        let destination = Ipv4Addr(u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]));
+        // Two record shapes, told apart by the marker no v4 segment can
+        // carry as its source. Either way the pair comes out as `Address`
+        // and everything below is family-blind — RFC 0029's premise.
+        let (source, destination, body) =
+            if length >= 36 && entry[0..4] == bhaskix_abi::tcp::V6_RECORD {
+                let mut from = [0u8; 16];
+                from.copy_from_slice(&entry[4..20]);
+                let mut to = [0u8; 16];
+                to.copy_from_slice(&entry[20..36]);
+                (
+                    Address::V6(Ipv6Addr(from)),
+                    Address::V6(Ipv6Addr(to)),
+                    &entry[36..length],
+                )
+            } else {
+                (
+                    Address::V4(Ipv4Addr(u32::from_be_bytes([
+                        entry[0], entry[1], entry[2], entry[3],
+                    ]))),
+                    Address::V4(Ipv4Addr(u32::from_be_bytes([
+                        entry[4], entry[5], entry[6], entry[7],
+                    ]))),
+                    &entry[8..length],
+                )
+            };
         // Every refusal in `parse` is `bhaskix-net`'s, fuzzed as ordinary code,
         // which is the whole reason the segment parser lives there.
-        let Ok(parsed) = Segment::parse(&entry[8..length], source, destination) else {
+        let Ok(parsed) = Segment::parse(body, source, destination) else {
             service.refused += 1;
             continue;
         };
@@ -721,8 +772,8 @@ fn drain_forward(service: &mut Service) {
         for (candidate, connection) in service.connections.iter().enumerate() {
             if let Some(connection) = connection {
                 let expected = connection.tcb.connection;
-                if Address::V4(source) == expected.remote
-                    && Address::V4(destination) == expected.local
+                if source == expected.remote
+                    && destination == expected.local
                     && parsed.source == expected.remote_port
                     && parsed.destination == expected.local_port
                 {
@@ -804,18 +855,33 @@ fn drain_forward(service: &mut Service) {
 fn accept_syn(
     service: &mut Service,
     parsed: &Segment<'_>,
-    source: Ipv4Addr,
-    destination: Ipv4Addr,
+    source: Address,
+    destination: Address,
 ) -> Option<usize> {
     use bhaskix_net::tcp::segment::Flags;
 
     let listener = service.listener.as_ref()?;
+    // The listener is family-blind on purpose: the tuple carries the
+    // family, so one port serves both — a v6 SYN to `::1` births a v6
+    // connection on the same rings a v4 one would use.
+    let ours = destination == Address::V4(service.me) || destination == LOOPBACK6;
     if !parsed.flags.contains(Flags::SYN)
         || parsed.acknowledgement.is_some()
         || parsed.destination != Port(listener.port)
-        || Address::V4(destination) != Address::V4(service.me)
+        || !ours
     {
         return None;
+    }
+    // TIME_WAIT holds the tuple, not the slot — the same reclamation the
+    // outbound slot got, for the same reason: the machine there absorbs
+    // stragglers for its own four-tuple, and this SYN names a new one.
+    if let Some(held) = service.connections[ACCEPTED].as_ref()
+        && matches!(
+            held.tcb.state,
+            state::State::Closed | state::State::TimeWait
+        )
+    {
+        service.connections[ACCEPTED] = None;
     }
     if service.connections[ACCEPTED].is_some() {
         // The one accepted slot is taken. `CONGESTED` is the table's word
@@ -824,9 +890,12 @@ fn accept_syn(
         return None;
     }
     let connection = FourTuple {
-        local: Address::V4(service.me),
+        // The address the SYN was sent to, not an assumption about which
+        // of ours that was — what makes the same listener serve both
+        // families.
+        local: destination,
         local_port: Port(listener.port),
-        remote: Address::V4(source),
+        remote: source,
         remote_port: parsed.source,
     };
     let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
@@ -1021,11 +1090,55 @@ fn connect_leg_serving(
     service: &mut Service,
     args: [u64; 4],
 ) -> (u64, u64) {
-    if args[2] != 2 {
-        let answer = connect_leg(handover, args[2]);
+    let local = Address::V4(service.me);
+    let remote = Address::V4(Ipv4Addr(args[0] as u32));
+    connect_serving(handover, service, args[2], local, remote, args[1] as u16)
+}
+
+/// [`connect_leg_serving`]'s second-family face — RFC 0029 step 5.
+///
+/// The four words are all spent: the destination's halves, the port, the
+/// leg. The legs themselves are the shared machinery below, untouched;
+/// what this function decides is the *local* address, and today the only
+/// v6 address this service owns is `::1` — a destination anywhere else is
+/// refused with the reason in [`LOOPBACK6`]'s comment.
+fn connect6_leg_serving(
+    handover: &mut Handover,
+    service: &mut Service,
+    args: [u64; 4],
+) -> (u64, u64) {
+    let mut to = [0u8; 16];
+    to[..8].copy_from_slice(&args[0].to_be_bytes());
+    to[8..].copy_from_slice(&args[1].to_be_bytes());
+    let remote = Address::V6(Ipv6Addr(to));
+    if remote != LOOPBACK6 {
+        return (tcp::BARE, 6);
+    }
+    connect_serving(
+        handover,
+        service,
+        args[3],
+        LOOPBACK6,
+        remote,
+        args[2] as u16,
+    )
+}
+
+/// The shared body behind both connect faces: the legs, and — on leg 2 —
+/// the open itself, with the tuple the caller's face built.
+fn connect_serving(
+    handover: &mut Handover,
+    service: &mut Service,
+    leg: u64,
+    local: Address,
+    remote: Address,
+    remote_port: u16,
+) -> (u64, u64) {
+    if leg != 2 {
+        let answer = connect_leg(handover, leg);
         // A wake that lands after leg 2 still reaches the live connection:
         // the handover is where gifts arrive, the table is where they act.
-        if args[2] == 3
+        if leg == 3
             && handover.notified
             && let Some(connection) = service.connections[OUTBOUND].as_mut()
         {
@@ -1036,12 +1149,27 @@ fn connect_leg_serving(
     if !(handover.send_mapped && handover.recv_mapped) {
         return (tcp::BARE, 2);
     }
+    // TIME_WAIT holds the tuple, not the slot: a closed or time-waiting
+    // machine exists to absorb stragglers for *its* four-tuple, and a new
+    // connect names a different one. Found when RFC 0029 step 5's v6
+    // connect arrived while the v4 story's machine sat out its 2MSL — the
+    // slot check below skipped creation and handed the caller a dying
+    // connection whose news had already happened, which is a caller frozen
+    // in a wait no wake ends.
+    if let Some(held) = service.connections[OUTBOUND].as_ref()
+        && matches!(
+            held.tcb.state,
+            state::State::Closed | state::State::TimeWait
+        )
+    {
+        service.connections[OUTBOUND] = None;
+    }
     if service.connections[OUTBOUND].is_none() {
         let connection = FourTuple {
-            local: Address::V4(service.me),
+            local,
             local_port: Port(LOCAL_PORT),
-            remote: Address::V4(Ipv4Addr(args[0] as u32)),
-            remote_port: Port(args[1] as u16),
+            remote,
+            remote_port: Port(remote_port),
         };
         let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
         service.connections[OUTBOUND] = Some(Connection {
@@ -1448,6 +1576,10 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         } else if method_in == tcp::CONNECT {
             let (outcome_word, detail) =
                 connect_leg_serving(&mut connect_handover, &mut service, args);
+            reply(outcome_word, detail, 0);
+        } else if method_in == tcp::CONNECT6 {
+            let (outcome_word, detail) =
+                connect6_leg_serving(&mut connect_handover, &mut service, args);
             reply(outcome_word, detail, 0);
         } else if method_in == tcp::LISTEN {
             let (outcome_word, detail) =

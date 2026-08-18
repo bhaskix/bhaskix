@@ -91,6 +91,66 @@ pub fn leg(
     Err(LegError::Stuck)
 }
 
+/// One `CONNECT6` leg — RFC 0029 step 5.
+///
+/// [`leg`]'s discipline exactly (the stage-then-call retry, the same
+/// refusal decoding), with the second family's packing: the destination's
+/// halves in the first two words, the port in the third, the leg in the
+/// fourth — the one call in the family that spends all four words.
+///
+/// # Errors
+///
+/// As [`leg`].
+pub fn leg6(
+    service_slot: u64,
+    address: [u8; 16],
+    port: u16,
+    gift: Option<(u64, u64)>,
+    leg_number: u64,
+) -> Result<u64, LegError> {
+    let mut high = [0u8; 8];
+    let mut low = [0u8; 8];
+    high.copy_from_slice(&address[..8]);
+    low.copy_from_slice(&address[8..]);
+    for _ in 0..50_000u32 {
+        if let Some((slot, badge)) = gift {
+            let staged = call(
+                syscall::INVOKE,
+                service_slot,
+                method::HAND,
+                [slot, rights::READ | rights::WRITE, badge, 0],
+            );
+            if !staged.kernel_ok() {
+                return Err(LegError::HandRefused(staged.status));
+            }
+        }
+        let reply = call(
+            syscall::CALL,
+            service_slot,
+            tcp::CONNECT6,
+            [
+                u64::from_be_bytes(high),
+                u64::from_be_bytes(low),
+                u64::from(port),
+                leg_number,
+            ],
+        );
+        if reply.status == status::SLOT_UNAVAILABLE || reply.value == tcp::LATER {
+            crate::call::yield_now();
+            continue;
+        }
+        if reply.kernel_ok() && reply.value == tcp::OK {
+            return Ok(reply.second);
+        }
+        return Err(LegError::Refused {
+            status: reply.status,
+            value: reply.value,
+            detail: reply.second,
+        });
+    }
+    Err(LegError::Stuck)
+}
+
 /// Declares where a reply-carried capability may land: `EXPECT` on the
 /// endpoint, one-shot, the slot chosen by the program and never by the
 /// service.

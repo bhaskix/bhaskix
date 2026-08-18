@@ -736,6 +736,22 @@ pub mod tcp {
     /// which is what makes a request/response protocol expressible.
     pub const SHUTDOWN: u64 = 63;
 
+    /// Open a connection in the second family — RFC 0029 step 5.
+    ///
+    /// The one call in the family that uses all four words exactly:
+    /// `arg0`/`arg1` the destination address's halves in wire order,
+    /// `arg2` the port, `arg3` the leg. The legs are [`CONNECT`]'s,
+    /// unchanged — the handover never looked inside an address.
+    pub const CONNECT6: u64 = 67;
+
+    /// The first four bytes of a v6 record in the rings between the
+    /// protocol service and the TCP service, where a v4 record carries the
+    /// source address instead: `255.255.255.255` can never originate a
+    /// TCP segment, which is what makes the marker unambiguous. A v6
+    /// record follows it with the two sixteen-byte addresses, then the
+    /// segment.
+    pub const V6_RECORD: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
     /// It worked.
     pub const OK: u64 = 0;
     /// The peer answered the connection request with a reset.

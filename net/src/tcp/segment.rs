@@ -34,7 +34,8 @@
 //! silently ignore an MSS sitting behind a timestamp, which is a real
 //! arrangement on a real network.
 
-use crate::addr::{Ipv4Addr, Port};
+use crate::addr::{Address, Port};
+use crate::ipv6::{self, NextHeader};
 use crate::tcp::Sequence;
 use crate::{NetError, be16, be32, checksum, ipv4::Protocol};
 
@@ -217,8 +218,8 @@ impl<'a> Segment<'a> {
     ///   three.
     pub fn parse(
         bytes: &'a [u8],
-        source_address: Ipv4Addr,
-        destination_address: Ipv4Addr,
+        source_address: Address,
+        destination_address: Address,
     ) -> Result<Self, NetError> {
         let fixed = bytes.get(..HEADER).ok_or(NetError::Truncated {
             need: HEADER,
@@ -252,22 +253,17 @@ impl<'a> Segment<'a> {
             })?;
 
         let carried = be16(fixed, 16).unwrap_or(0);
-        // The pseudo-header: the two addresses, a zero, the protocol, and the
-        // length of the whole segment, which TCP computes rather than carries.
-        let mut pseudo = [0u8; 12];
-        pseudo[0..4].copy_from_slice(&source_address.octets());
-        pseudo[4..8].copy_from_slice(&destination_address.octets());
-        pseudo[9] = Protocol::TCP.0;
         let length = u16::try_from(bytes.len()).map_err(|_| NetError::LengthBeyondBuffer {
             stated: bytes.len(),
             have: usize::from(u16::MAX),
         })?;
-        pseudo[10..12].copy_from_slice(&length.to_be_bytes());
+        let (pseudo, pseudo_len) =
+            pseudo_of(source_address, destination_address, u32::from(length))?;
 
         // Summed with the checksum field taken as zero, in spans, so no copy of
         // a payload whose length a remote party chose is ever made.
         let computed = checksum(&[
-            &pseudo,
+            &pseudo[..pseudo_len],
             bytes.get(..16).unwrap_or(&[]),
             &[0, 0],
             bytes.get(18..).unwrap_or(&[]),
@@ -394,8 +390,8 @@ fn parse_options(header: &[u8]) -> Result<Options, NetError> {
 pub fn write(
     out: &mut [u8],
     segment: &Segment<'_>,
-    source_address: Ipv4Addr,
-    destination_address: Ipv4Addr,
+    source_address: Address,
+    destination_address: Address,
 ) -> Result<usize, NetError> {
     // Only one option is ever written, and it is four bytes, so the header is
     // always a multiple of four without padding. A second option changes that
@@ -454,25 +450,58 @@ pub fn write(
     }
     bytes[header_length..].copy_from_slice(segment.payload);
 
-    let mut pseudo = [0u8; 12];
-    pseudo[0..4].copy_from_slice(&source_address.octets());
-    pseudo[4..8].copy_from_slice(&destination_address.octets());
-    pseudo[9] = Protocol::TCP.0;
     // Proved to fit by the bound above.
     let length = u16::try_from(total).unwrap_or(u16::MAX);
-    pseudo[10..12].copy_from_slice(&length.to_be_bytes());
+    let (pseudo, pseudo_len) = pseudo_of(source_address, destination_address, u32::from(length))?;
 
-    let sum = checksum(&[&pseudo, bytes]);
+    let sum = checksum(&[&pseudo[..pseudo_len], bytes]);
     bytes[16..18].copy_from_slice(&sum.to_be_bytes());
     Ok(total)
+}
+
+/// The pseudo-header for whichever family both addresses are in — twelve
+/// bytes over v4, forty over v6, returned in a buffer sized for the wider
+/// with the used length beside it.
+///
+/// RFC 0029's premise, cashed at this exact seam: the segment parser and
+/// writer touch addresses **only** here, so the second family is a second
+/// arm of this one function and nothing else in the module moved. A mixed
+/// pair is refused — it names a datagram no wire can carry.
+fn pseudo_of(
+    source: Address,
+    destination: Address,
+    length: u32,
+) -> Result<([u8; 40], usize), NetError> {
+    match (source, destination) {
+        (Address::V4(source), Address::V4(destination)) => {
+            let mut pseudo = [0u8; 40];
+            pseudo[0..4].copy_from_slice(&source.octets());
+            pseudo[4..8].copy_from_slice(&destination.octets());
+            pseudo[9] = Protocol::TCP.0;
+            pseudo[10..12].copy_from_slice(&(length as u16).to_be_bytes());
+            Ok((pseudo, 12))
+        }
+        (Address::V6(source), Address::V6(destination)) => Ok((
+            ipv6::pseudo_header(source, destination, NextHeader::TCP, length),
+            40,
+        )),
+        _ => Err(NetError::Unsupported {
+            field: "pseudo-header family (mixed)",
+            value: 0,
+        }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const HERE: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
-    const THERE: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+    use crate::addr::{Ipv4Addr, Ipv6Addr};
+
+    const HERE: Address = Address::V4(Ipv4Addr::new(10, 0, 2, 15));
+    const THERE: Address = Address::V4(Ipv4Addr::new(10, 0, 2, 2));
+    const SIX_HERE: Address = Address::V6(Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 0x0f]));
+    const SIX_THERE: Address = Address::V6(Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 2]));
 
     fn segment<'a>(flags: Flags, payload: &'a [u8]) -> Segment<'a> {
         Segment {
@@ -543,7 +572,11 @@ mod tests {
         let (bytes, length) = built(&segment(Flags::ACK, &[1, 2, 3]));
         assert!(Segment::parse(&bytes[..length], HERE, THERE).is_ok());
         assert!(matches!(
-            Segment::parse(&bytes[..length], HERE, Ipv4Addr::new(10, 0, 2, 3)),
+            Segment::parse(
+                &bytes[..length],
+                HERE,
+                Address::V4(Ipv4Addr::new(10, 0, 2, 3))
+            ),
             Err(NetError::BadChecksum { .. })
         ));
     }
@@ -589,12 +622,8 @@ mod tests {
     fn with_data_offset(bytes: &mut [u8], words: u8) {
         bytes[12] = (bytes[12] & 0x0f) | (words << 4);
         bytes[16..18].copy_from_slice(&[0, 0]);
-        let mut pseudo = [0u8; 12];
-        pseudo[0..4].copy_from_slice(&HERE.octets());
-        pseudo[4..8].copy_from_slice(&THERE.octets());
-        pseudo[9] = Protocol::TCP.0;
-        pseudo[10..12].copy_from_slice(&(bytes.len() as u16).to_be_bytes());
-        let sum = checksum(&[&pseudo, bytes]);
+        let (pseudo, used) = pseudo_of(HERE, THERE, bytes.len() as u32).expect("one family");
+        let sum = checksum(&[&pseudo[..used], bytes]);
         bytes[16..18].copy_from_slice(&sum.to_be_bytes());
     }
 
@@ -862,5 +891,41 @@ mod tests {
                 have: 24
             })
         );
+    }
+
+    #[test]
+    fn a_segment_rides_the_second_family_with_only_the_checksum_knowing() {
+        // RFC 0029's premise as a test: the same Segment, written and
+        // parsed over v6 addresses, differs from its v4 twin only in the
+        // pseudo-header the checksum consumed.
+        let template = segment(Flags::SYN, b"hello");
+        let mut four = [0u8; 128];
+        let mut six = [0u8; 128];
+        let wrote4 = write(&mut four, &template, HERE, THERE).expect("fits");
+        let wrote6 = write(&mut six, &template, SIX_HERE, SIX_THERE).expect("fits");
+        assert_eq!(wrote4, wrote6);
+        // Everything but the checksum bytes is identical.
+        assert_eq!(four[..16], six[..16]);
+        assert_eq!(four[18..wrote4], six[18..wrote6]);
+        assert_ne!(four[16..18], six[16..18]);
+
+        let parsed = Segment::parse(&six[..wrote6], SIX_HERE, SIX_THERE).expect("valid");
+        assert_eq!(parsed.payload, b"hello");
+        // And the v6 bytes verified against v4 addresses fail, which is the
+        // pseudo-header doing its one job.
+        assert!(matches!(
+            Segment::parse(&six[..wrote6], HERE, THERE),
+            Err(NetError::BadChecksum { .. })
+        ));
+    }
+
+    #[test]
+    fn a_mixed_family_pair_is_refused_not_summed() {
+        let template = segment(Flags::SYN, b"");
+        let mut out = [0u8; 128];
+        assert!(matches!(
+            write(&mut out, &template, HERE, SIX_THERE),
+            Err(NetError::Unsupported { .. })
+        ));
     }
 }

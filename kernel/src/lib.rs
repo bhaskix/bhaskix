@@ -6252,9 +6252,11 @@ fn report_net_after_exchange(hhdm: u64) {
                 core::ptr::read_volatile((hhdm + pages[0] + 16) as *const u64),
             )
         };
-        // Six — outbound echoed — is on the way to nine on a networked
-        // machine, not an end.
-        if marker == TCPC_MARKER && outcome >= 3 && outcome != 6 {
+        // Six — outbound echoed — is on the way to nine, and nine is on
+        // the way to twelve since RFC 0029 step 5 taught the same program
+        // to echo itself through the v6 loopback. Neither is an end on a
+        // networked machine.
+        if marker == TCPC_MARKER && outcome >= 3 && outcome != 6 && outcome != 9 {
             break;
         }
         wait_millis(100);
@@ -6734,6 +6736,11 @@ fn report_tcp_client(hhdm: u64) {
             "holds a working connection capability on a machine that cannot be unpredictable; \
              the service said so when asked to stream, which is this machine's truthful ending"
         }
+        12 => {
+            "did everything outcome 9 says, then opened a v6 connection to [::1], accepted it \
+             with its own listener, and echoed itself sixteen bytes through the loopback -- \
+             the whole TCP machine, both roles, second family, one program (RFC 0029 step 5)"
+        }
         _ => "an outcome this kernel does not know",
     };
     // RFC 0020 step 6: the numbers, converted here because the client only
@@ -6773,7 +6780,7 @@ fn report_tcp_client(hhdm: u64) {
             through,
         );
     }
-    if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 {
+    if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 || outcome == 12 {
         println!("    tcp client     {said}");
     } else {
         println!(

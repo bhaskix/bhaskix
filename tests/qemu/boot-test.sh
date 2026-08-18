@@ -1240,7 +1240,11 @@ if grep -qE "tcp client +echoed outbound" "$LOG" && ! grep -qE "tcp measure +han
     status=1
 fi
 
-if grep -qE "tcp client +echoed outbound through rings it owns, then listened, accepted" "$LOG"; then
+# RFC 0029 step 5 raised the terminal: after both v4 directions, the same
+# program opens a v6 connection to [::1], accepts it with its own listener,
+# and echoes itself through the loopback -- the whole machine, both roles,
+# second family. On networked lanes that ending is now the demanded one.
+if grep -qE "tcp client +did everything outcome 9 says, then opened a v6 connection" "$LOG"; then
     if [[ -f "$INBOUND_VERDICT" ]]; then
         pass "both directions: outbound echoed, and a host-initiated connection was accepted and served"
         rm -f "$INBOUND_VERDICT"

@@ -57,6 +57,11 @@ const INBOUND: u64 = 8;
 /// gifted so the service can ring them and waited on so this program stops
 /// spinning.
 const WAKE: u64 = 9;
+/// Where the second family's connection capability lands (RFC 0029 step
+/// 5), and where its accepted twin does. New slots; the rings and wakes
+/// are the v4 story's, reused — the handover survives its connection.
+const CONNECTION6: u64 = 11;
+const INBOUND6: u64 = 12;
 const L_WAKE: u64 = 10;
 
 /// Where the report page maps in this program's space.
@@ -83,6 +88,11 @@ const INBOUND_LEN: usize = 16;
 /// of the diagram every TCP text draws, and now the data rides rings this
 /// program owns.
 const PAYLOAD: &[u8] = b"bhaskix-tcp-0001";
+
+/// The second family's payload. Its final byte differs from everything the
+/// v4 acts left in these rings at the same offsets — the stale-byte check
+/// the loopback wait depends on, chosen rather than hoped.
+const PAYLOAD6: &[u8] = b"bhaskix-tcp6-lp@";
 
 /// The machine-state numbers the service packs into `RECV` replies.
 const STATE_ESTABLISHED: u64 = 4;
@@ -128,6 +138,11 @@ mod outcome {
     /// bytes read out of this program's ring and sent back — and the peer's
     /// close arrived, which only happens after the reply reached it.
     pub const SERVED: u64 = 9;
+    /// RFC 0029 step 5: a v6 connection opened to `[::1]`, accepted by
+    /// this program's own listener, sixteen bytes echoed by its own serve
+    /// path and read back byte-for-byte on the client side — the whole TCP
+    /// machine, both roles, second family, one program.
+    pub const LOOPED6: u64 = 12;
     /// Listened, and nobody called. A state rather than a failure: only the
     /// boot test's harness runs a host-side driver, and every other boot of
     /// this machine — the shell test's, a hand-started one — has a listener
@@ -241,6 +256,30 @@ fn stream_state_consuming(step: u64, consumed: u64) -> (u64, u64) {
 /// A poll that consumes nothing.
 fn stream_state(step: u64) -> (u64, u64) {
     stream_state_consuming(step, 0)
+}
+
+/// [`stream_state`] against a named connection slot — the v6 act's client
+/// side lands in its own slot, and the shared refusal decoding applies.
+fn stream_state_on(slot: u64, step: u64) -> (u64, u64) {
+    match tcp::recv(slot, 0) {
+        StreamPoll::Ready { state, delivered } => (state, delivered),
+        StreamPoll::Unreachable => {
+            report(step, outcome::DARK, 0);
+            exit()
+        }
+        StreamPoll::NoEntropy => {
+            report(step, outcome::NO_ENTROPY, 0);
+            exit()
+        }
+        StreamPoll::ServiceSaid(word) => {
+            report(step, outcome::REFUSED, word << 16);
+            exit()
+        }
+        StreamPoll::KernelSaid(status) => {
+            report(step, outcome::REFUSED, status << 16);
+            exit()
+        }
+    }
 }
 
 /// Tells the service `count` more bytes are in the send ring, or ends the
@@ -648,6 +687,142 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     }
     let _ = tcp::shutdown(INBOUND);
     report(13, outcome::SERVED, 0);
+
+    // ------------------------------------------------------------------
+    // RFC 0029 step 5: the same machine, second family, both roles. The
+    // v4 story is over: the outbound connection closed, the accepted one
+    // closed, and both table slots are free — but the handover's rings
+    // are still mapped in the service, and the listener is still armed.
+    // One CONNECT6 leg re-opens the outbound slot with a v6 tuple over
+    // those same rings; the SYN to [::1] loops back through the protocol
+    // service without touching a wire, this program's own listener
+    // accepts it, and this program serves itself an echo — client and
+    // server, sixteen bytes, every state both machines walk.
+    // ------------------------------------------------------------------
+    const LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    report(14, outcome::STARTING, 0);
+    if let Err(status) = tcp::expect(SERVICE, CONNECTION6) {
+        report(14, outcome::REFUSED, status << 8);
+        exit();
+    }
+    if let Err(error) = tcp::leg6(SERVICE, LOOPBACK, LISTEN_PORT as u16, None, 2) {
+        let detail = match error {
+            LegError::Stuck => {
+                report(14, outcome::STUCK, 0);
+                exit();
+            }
+            LegError::HandRefused(status) => status,
+            LegError::Refused { detail, .. } => detail,
+        };
+        report(14, outcome::REFUSED, detail << 16);
+        exit();
+    }
+    report(15, outcome::STARTING, 1);
+    let (landed6, _) = tcp::occupied(CONNECTION6);
+    if !landed6 {
+        report(14, outcome::UNLANDED, 0);
+        exit();
+    }
+
+    // The handshake runs machine-to-machine through the loopback: this
+    // program only has to watch its client side arrive at ESTABLISHED.
+    let mut bounded6 = 0u32;
+    loop {
+        let (state6, _) = stream_state_on(CONNECTION6, 15);
+        if state6 == STATE_ESTABLISHED {
+            break;
+        }
+        bounded6 += 1;
+        if bounded6 > 300 {
+            report(15, outcome::STUCK, state6);
+            exit();
+        }
+        news(WAKE, &pace);
+    }
+
+    // The accepted twin, from this program's own listener.
+    if let Err(status) = tcp::expect(SERVICE, INBOUND6) {
+        report(16, outcome::REFUSED, status << 8);
+        exit();
+    }
+    report(16, outcome::STARTING, 2);
+    let mut accepted6 = false;
+    for _ in 0..300u32 {
+        match tcp::accept(LISTENER) {
+            AcceptPoll::Accepted => {
+                accepted6 = true;
+                break;
+            }
+            AcceptPoll::Later => news(L_WAKE, &pace),
+            _ => {
+                report(16, outcome::REFUSED, 0);
+                exit();
+            }
+        }
+    }
+    if !accepted6 {
+        report(16, outcome::NOBODY, 0);
+        exit();
+    }
+
+    // Client sends; server (this same program) sees it arrive on the
+    // listener rings, echoes it, and the client reads it back. The
+    // stream offsets are the new connection's own and start at zero —
+    // the ring bytes are the old story's leavings, overwritten, and the
+    // payload's final byte was chosen to differ from every one of them.
+    for (index, byte) in PAYLOAD6.iter().enumerate() {
+        send_view.write(index as u64, *byte);
+    }
+    if let Err(status) = tcp::send(CONNECTION6, PAYLOAD6.len() as u64) {
+        report(17, outcome::REFUSED, status << 8);
+        exit();
+    }
+    report(17, outcome::STARTING, 3);
+    let mut served6 = false;
+    for _ in 0..300u32 {
+        match tcp::recv(INBOUND6, 0) {
+            StreamPoll::Ready { delivered, .. } => {
+                if delivered >= PAYLOAD6.len() as u64 {
+                    served6 = true;
+                    break;
+                }
+                news(L_WAKE, &pace);
+            }
+            _ => {
+                report(17, outcome::REFUSED, 1);
+                exit();
+            }
+        }
+    }
+    if !served6 {
+        report(17, outcome::STUCK, 0);
+        exit();
+    }
+    for index in 0..PAYLOAD6.len() as u64 {
+        l_send_view.write(index, l_recv_view.read(index));
+    }
+    if let Err(status) = tcp::send(INBOUND6, PAYLOAD6.len() as u64) {
+        report(18, outcome::REFUSED, status << 8);
+        exit();
+    }
+    if !recv_view.wait_for(
+        PAYLOAD6.len() as u64 - 1,
+        PAYLOAD6[PAYLOAD6.len() - 1],
+        WAKE,
+        &pace,
+        600,
+    ) {
+        report(18, outcome::STUCK, 0);
+        exit();
+    }
+    let echoed6 = (0..PAYLOAD6.len()).all(|index| recv_view.read(index as u64) == PAYLOAD6[index]);
+    if !echoed6 {
+        report(18, outcome::MANGLED, 0);
+        exit();
+    }
+    let _ = tcp::shutdown(CONNECTION6);
+    let _ = tcp::shutdown(INBOUND6);
+    report(19, outcome::LOOPED6, 0);
     exit()
 }
 

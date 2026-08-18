@@ -67,4 +67,7 @@ opt-level = "s"
 # config and ring reads), no new kind of unsafe, five more lines of it.
 # 137 at step 4: the v6 datagram send from serve, the same DRAIN-and-ring
 # shape the v4 SEND_TO pays.
-unsafe_budget = 137
+# 161 at step 5: forward_tcp6's ring writes and doorbell (the v4 forward's
+# shape, second record format), and the back ring's v6 arm -- the loopback
+# reinjection and the routed send. Every line a twin of an existing one.
+unsafe_budget = 161

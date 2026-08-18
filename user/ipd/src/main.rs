@@ -803,13 +803,80 @@ unsafe fn forward_tcp(source: Ipv4Addr, destination: Ipv4Addr, segment: &[u8]) -
     true
 }
 
+/// Hands one v6 segment across to `bin/tcpd`, marker-prefixed.
+///
+/// The record's first four bytes are [`bhaskix_abi::tcp::V6_RECORD`] — an
+/// impossible v4 source — then the two sixteen-byte addresses, then the
+/// segment. Same ring, same doorbell, one more record shape.
+///
+/// # Safety
+///
+/// As `forward_tcp`.
+unsafe fn forward_tcp6(source: Ipv6Addr, destination: Ipv6Addr, segment: &[u8]) -> bool {
+    let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
+        return false;
+    };
+    // SAFETY: the ring's header, in the region this program mapped. Volatile
+    // because the consumer is another domain and takes no lock.
+    let (head, tail) = unsafe {
+        (
+            core::ptr::read_volatile((TCP_FWD_AT + ring::HEAD_OFFSET as u64) as *const u64),
+            core::ptr::read_volatile((TCP_FWD_AT + ring::TAIL_OFFSET as u64) as *const u64),
+        )
+    };
+    let Some(cursor) = ring::Cursor::new(layout, head, tail) else {
+        return false;
+    };
+    let total = 36 + segment.len();
+    let Some(framed) = ring::frame_to_write(layout, cursor, total) else {
+        return false;
+    };
+    let mut entry = [0u8; 36 + MAX_FRAME];
+    entry[0..4].copy_from_slice(&bhaskix_abi::tcp::V6_RECORD);
+    entry[4..20].copy_from_slice(&source.octets());
+    entry[20..36].copy_from_slice(&destination.octets());
+    let Some(slot) = entry.get_mut(36..total) else {
+        return false;
+    };
+    slot.copy_from_slice(segment);
+    let prefix = (total as u32).to_le_bytes();
+    // SAFETY: offsets are `abi::ring`'s, inside the region mapped writable,
+    // and `entry` is a buffer this program owns, `total` bounded by its size.
+    unsafe {
+        write_runs(TCP_FWD_AT, prefix.as_ptr(), framed.prefix);
+        write_runs(TCP_FWD_AT, entry.as_ptr(), framed.payload);
+    }
+    copied();
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: the ring's header, which only this program writes.
+    unsafe {
+        core::ptr::write_volatile(
+            (TCP_FWD_AT + ring::HEAD_OFFSET as u64) as *mut u64,
+            framed.next,
+        );
+    }
+    // Index first, wake second, as every doorbell in this system orders it.
+    call(syscall::INVOKE, TCP_BELL, method::SIGNAL, [0; 4]);
+    TCP_FORWARDED.store(
+        TCP_FORWARDED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    true
+}
+
 /// Takes segments `bin/tcpd` has handed back and puts them on the wire.
 ///
 /// Each entry is eight bytes of addresses and a segment; this program wraps it
 /// in the IPv4 and Ethernet headers `tcpd` deliberately cannot build, using
 /// the gateway's hardware address for every destination — one interface, one
 /// route, which is all this network has.
-fn drain_tcp_back(me: (MacAddr, Ipv4Addr), gateway: MacAddr, tail: &mut u64) {
+fn drain_tcp_back(
+    me: (MacAddr, Ipv4Addr),
+    gateway: MacAddr,
+    v6_from: Option<Ipv6Addr>,
+    router6: Option<MacAddr>,
+    tail: &mut u64,
+) {
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
         return;
     };
@@ -843,6 +910,60 @@ fn drain_tcp_back(me: (MacAddr, Ipv4Addr), gateway: MacAddr, tail: &mut u64) {
         copied();
         *tail = framed.next;
         publish_tcp_tail(*tail);
+
+        // A v6 record, by its marker. Loopback destinations reinject
+        // straight into the forward ring -- self-addressed traffic never
+        // touches a wire -- and everything else rides the router, the same
+        // one-road discipline the v4 arm has with its gateway.
+        if length >= 36 && entry[0..4] == bhaskix_abi::tcp::V6_RECORD {
+            let mut source6 = [0u8; 16];
+            source6.copy_from_slice(&entry[4..20]);
+            let mut destination6 = [0u8; 16];
+            destination6.copy_from_slice(&entry[20..36]);
+            let (source6, destination6) = (Ipv6Addr(source6), Ipv6Addr(destination6));
+            let segment = &entry[36..length];
+            if destination6 == LOOPBACK6 {
+                // SAFETY: the forward ring is mapped writable.
+                if unsafe { forward_tcp6(source6, destination6, segment) } {
+                    TCP_RETURNED.store(
+                        TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                continue;
+            }
+            let (Some(_from), Some(via)) = (v6_from, router6) else {
+                continue;
+            };
+            let body_length = segment.len();
+            if ipv6::write_header(
+                &mut outgoing[eth::HEADER..],
+                source6,
+                destination6,
+                NextHeader::TCP,
+                64,
+                body_length,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let at = eth::HEADER + ipv6::HEADER;
+            let Some(slot) = outgoing.get_mut(at..at + body_length) else {
+                continue;
+            };
+            slot.copy_from_slice(segment);
+            if eth::write_header(&mut outgoing, via, me.0, EtherType::IPV6).is_ok()
+                // SAFETY: the return ring is mapped writable.
+                && unsafe { send(&outgoing[..at + body_length]) }
+            {
+                TCP_RETURNED.store(
+                    TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            continue;
+        }
 
         let destination = Ipv4Addr(u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]));
         let segment = &entry[8..length];
@@ -1105,7 +1226,7 @@ fn serve(
             );
             drain_ring(sockets, me, &mut tail, can_tcp);
             if can_tcp {
-                drain_tcp_back(me, gateway, &mut tcp_tail);
+                drain_tcp_back(me, gateway, v6_from, router6, &mut tcp_tail);
             }
             continue;
         }
@@ -1113,7 +1234,7 @@ fn serve(
             continue;
         }
         if can_tcp {
-            drain_tcp_back(me, gateway, &mut tcp_tail);
+            drain_tcp_back(me, gateway, v6_from, router6, &mut tcp_tail);
         }
 
         // Unbadged means the caller invoked the service's own endpoint, which
@@ -1862,7 +1983,7 @@ extern "C" fn ipd_main() -> ! {
             let mac = cache
                 .lookup(Address::V4(GATEWAY), ticks)
                 .unwrap_or(MacAddr::BROADCAST);
-            drain_tcp_back(me, mac, &mut tcp_tail);
+            drain_tcp_back(me, mac, global6, router6_link, &mut tcp_tail);
         }
 
         // SAFETY: the ring's header, in the region this program mapped. Read
@@ -2086,6 +2207,17 @@ extern "C" fn ipd_main() -> ! {
         {
             // SAFETY: the forward ring is mapped writable when `can_tcp`.
             unsafe { forward_tcp(header.source, header.destination, payload) };
+        }
+        // The second family's segments, forwarded here for the same
+        // retransmission-sparing reason as the v4 arm above.
+        if can_tcp
+            && let Ok(parsed) = EthFrame::parse(&buffer[..length])
+            && parsed.ethertype == EtherType::IPV6
+            && let Ok((header6, payload6)) = Ipv6Header::parse(parsed.payload)
+            && header6.next_header == NextHeader::TCP
+        {
+            // SAFETY: the forward ring is mapped writable when `can_tcp`.
+            unsafe { forward_tcp6(header6.source, header6.destination, payload6) };
         }
 
         // An IPv4 datagram addressed to us. The echo reply this program asked

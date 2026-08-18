@@ -2251,7 +2251,10 @@ mod tests {
         let payload = [7u8, 8, 9, 10];
         let segment = sent[0].segment(connection(), &payload);
 
-        let (here, there) = (Ipv4Addr::new(10, 0, 2, 15), Ipv4Addr::new(10, 0, 2, 2));
+        let (here, there) = (
+            Address::V4(Ipv4Addr::new(10, 0, 2, 15)),
+            Address::V4(Ipv4Addr::new(10, 0, 2, 2)),
+        );
         let mut bytes = [0u8; 128];
         let written = crate::tcp::segment::write(&mut bytes, &segment, here, there).unwrap();
         let parsed = Segment::parse(&bytes[..written], here, there).unwrap();

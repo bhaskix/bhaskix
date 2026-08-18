@@ -398,7 +398,8 @@ fn tcp_never_panics() {
             template.options.mss = Some(1460);
         }
         let mut bytes = vec![0u8; segment::HEADER + 8 + payload.len()];
-        let written = segment::write(&mut bytes, &template, HERE, THERE).unwrap();
+        let written =
+            segment::write(&mut bytes, &template, Address::V4(HERE), Address::V4(THERE)).unwrap();
         bytes.truncate(written);
 
         let count = 1 + rng.below(6);
@@ -418,7 +419,7 @@ fn tcp_never_panics() {
         }
         maybe_truncate(&mut rng, &mut bytes);
 
-        if let Ok(parsed) = Segment::parse(&bytes, HERE, THERE) {
+        if let Ok(parsed) = Segment::parse(&bytes, Address::V4(HERE), Address::V4(THERE)) {
             // A payload cannot exceed the segment it was cut from, and the data
             // offset is the only thing that decides where it starts -- so this
             // is what a mis-checked offset would break while still returning

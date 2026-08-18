@@ -793,6 +793,32 @@ stop at its fifth line because another dead CPU holds the console. The wait.rs:1
 print is this same family seen from the lock instrument's side; whether any of it recurs
 with both fixes in is what the next hundred boots are for.
 
+### 2026-08-18 (RFC 0029 step 5: TCP crosses families, and the premise pays out with an itemised bill)
+
+**The whole TCP machine runs both roles over v6, and the state machine did not change by a
+line.** The RFC bet that `tcpd` would need only the pseudo-header and the key's type; the
+audited bill says: the checksum seam (`pseudo_of`, now the one address-touching function in
+the segment module — v4 twelve bytes, v6 forty, mixed refused), the tuple's types (already
+`Address` since step 1's ISN tripwire), and a second record shape on the service rings (an
+impossible-v4-source marker, then two sixteen-byte addresses). `CONNECT6` spends all four
+words; `bin/tcpc`, after finishing both v4 directions, reopens its outbound slot with a v6
+tuple **over the same still-mapped handover rings**, connects to `[::1]:7`, is accepted by
+its own listener, and echoes itself sixteen bytes — client and server, every state both
+machines walk, terminal outcome 12 demanded by the gate on every networked lane.
+
+**Two latent lifecycle bugs fell out, and they are deliberately not on the family's bill**:
+both connection slots refused reuse while a finished machine sat out TIME_WAIT, so the second
+connect of *any* family handed its caller a dying connection whose news had already rung —
+a caller frozen in a wait no wake ends. TIME_WAIT holds the tuple, not the slot; both slots
+now evict a Closed or TimeWait machine when a new tuple asks. Found by the stage-marker
+breadcrumbs the act reports as it goes — the freeze pointed at its own line twice.
+
+The dual-stack listener needed no `LISTEN6`: the tuple carries the family, so one listener
+serves both, and the accepted side's local address is the address the SYN was sent to rather
+than an assumption. `bhaskix-sock` grew `tcp::leg6`; segments over v6 are host-tested to be
+byte-identical to their v4 twins except the two checksum bytes, which is the premise as a
+test.
+
 ### 2026-08-18 (RFC 0029 step 4: the socket ABI grows its second family, and the peer turns out to be ::1)
 
 **A v6 datagram crosses the domain boundary both ways through capabilities.** The ABI grew
