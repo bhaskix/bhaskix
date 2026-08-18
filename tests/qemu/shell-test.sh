@@ -105,6 +105,11 @@ else
         # RFC 0017 step 1 a fault ends the domain, which would end the shell in
         # the middle of its own test.
         commands+=$'lend\r'$'held\r'$'release\r'
+        # RFC 0030 step 3: a package installed at the prompt, onto the
+        # writable filesystem, out of an archive the boot image carries. The
+        # same install twice, because the second answer -- already installed
+        # -- proves the record was written and read back, not just printed.
+        commands+=$'pkg install hello.bpk\r'$'pkg list\r'$'pkg install hello.bpk\r'
         # RFC 0018 step 5, and only under `iommu` because that is the only mode
         # where there is a device behind the service. Without one the command
         # still answers -- "there is a service but no device behind it" -- which
@@ -351,6 +356,16 @@ else
     # because each is a different rule and the mechanism is only worth having
     # if all four hold.
     if [[ "$MODE" == "iommu" ]]; then
+        pkg_checks=(
+            "the package verified before anything was written:verified   hello 0.1.0"
+            "the install completed and said where:installed.*\\/pkg\\/hello"
+            "the installed set lists it:pkg list"
+            "a second install was refused by the record:already installed"
+        )
+        for check in "${pkg_checks[@]}"; do
+            checks+=("$check")
+        done
+
         lend_checks=(
                 # RFC 0015 step 4. The shell holds a capability to one directory --
                 # `sub` -- and nothing naming the directory above it.

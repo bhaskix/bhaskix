@@ -36,7 +36,10 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-unsafe_budget = 53
+# 55 at RFC 0030 step 3 (2026-08-18): two more lines for the bulk page
+# viewed read-only in WRITE_FROM -- the same page, the same promise, the
+# read direction.
+unsafe_budget = 55
 #
 # Up three for the comment on `rsi`: the `unsafe` counter counts lines
 # inside an `unsafe` block, and an explanation of why a register is declared

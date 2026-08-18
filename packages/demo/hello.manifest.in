@@ -1,0 +1,11 @@
+# The demonstration package: not part of the boot set. Built into a `.bpk`
+# by `mkimage --bpk`, staged in the image as a file, and installed at a
+# shell prompt -- the first program to arrive on this machine as a package.
+package hello
+version 0.1.0
+
+program bin/hello
+entry hertz
+cap console
+
+payload bin/hello from user/hello/target/x86_64-unknown-none/release/hello

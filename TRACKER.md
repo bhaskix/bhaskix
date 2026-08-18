@@ -764,6 +764,48 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-18 (RFC 0030 step 3: pkg install works at a live prompt, and the kernel gained no method for it)
+
+**A package installed itself onto the writable filesystem, typed at the shell.** The full
+arc, gated in `shell-test.sh`: `pkg install hello.bpk` reads the archive out of the boot
+image through the vfs, verifies it in ring 3 **with the same `bhaskix-pkg` parser the host
+tools use** (the `no_std` zero-`unsafe` design collecting its dividend), makes
+`/pkg/hello`, writes the payload one transfer page at a time, and writes the manifest
+record *last* — then `pkg list` shows it and a second install is refused off the record,
+which proves the record was read back and not merely printed. The `dir` protocol grew its
+write family — `CREATE_AT`, `MAKE_DIRECTORY_AT`, `WRITE_FROM`, `REMOVE_AT`, `LIST_AT` —
+all service-defined in `bin/fsd` over `Volume`'s journalled create/write/remove (offered
+to a caller for the first time; until now only demonstrations wrote). The kernel gained
+**no method and no object**: `DRAIN` already existed as `FILL`'s mirror. Kernel changes,
+stated exactly: two grant lines (the shell's writable `/pkg` handle — minted from the
+handle `bin/fsd` reports after *ensuring `/pkg` exists at boot*, a journalled create now
+exercised on every boot — and a sixteen-page staging object) and two stack sizes.
+Writability rides the badge's top bit, `tcp::handle`'s listener-bit precedent, and
+inherits downward through `OPEN_AT` only; the shell holds `/pkg` and nothing above it.
+The grammar gained `directory writable`; the shell's manifest now states all of it.
+
+**Three defects, all this step's own, all found by the first live runs.** (1) `dir_call`'s
+first line deleted the *held* capability instead of clearing the destination slot — the
+first `pkg install` of a boot destroyed the shell's own `/pkg` handle and every later
+`pkg` command found the slot empty; one character of difference. (2) The shell's four-page
+stack blew at `verify` — a parsed manifest is a fixed-capacity value of about eight
+kilobytes — faulting at 0x10fff668, rsp eighteen kilobytes under the floor; sixteen pages
+now. (3) `bin/fsd`'s four-page stack blew the same way one domain over, at 0x12fffd58:
+`Volume::mount` carries the whole cache by value; sixteen pages now. A fourth finding was
+a collision, not a defect: the first slot numbers chosen for the `pkg` family landed on
+the shell's `SOCKET` slot and broke `net` — renumbered to 20–24 after actually reading
+the whole slot table. The four new gates were **watched red the honest way — by being
+red**: the `dir_call` run failed exactly the install, record and second-install checks
+(log preserved at `/root/bhaskix-soak-artifacts/rfc30-step3-gates-red-dircall-bug.log`).
+
+**One latent kernel seam flagged rather than fixed**: `DRAIN`'s copy loop passes each
+frame of the caller's object to a sink that writes a *fixed* destination — for a
+multi-frame object, later frames would overwrite the first page. Every current caller
+drains at most one page, so it is harmless today; written here so the first multi-frame
+caller reads this instead of debugging it. `Volume` gained `into_cache` so `bin/fsd`
+alternates read mounts and write mounts over one cache; every public mutation commits
+before returning, which is what makes the alternation sound.
+
 ### 2026-08-18 (RFC 0030 step 2: the cp list retires, and fourteen programs' authority is finally written down)
 
 **The image is a function now.** `mkimage` — a host binary in `pkg/` behind the `tool`

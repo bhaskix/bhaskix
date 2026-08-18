@@ -249,6 +249,19 @@ impl<'f, S: Store> Volume<'f, S> {
         Ok(())
     }
 
+    /// Gives the cache back, ending the mount.
+    ///
+    /// Safe at any point between public calls: every mutation on this type
+    /// runs as one journal transaction and commits before returning, so
+    /// there is never an open transaction to abandon here. What the cache
+    /// then holds is a committed filesystem another mount can read —
+    /// which is exactly how `bin/fsd` alternates between serving reads
+    /// through [`crate::Filesystem`] and writing through this type
+    /// (RFC 0030 step 3).
+    pub fn into_cache(self) -> Cache<'f, S> {
+        self.cache
+    }
+
     /// Reads one inode.
     ///
     /// # Errors

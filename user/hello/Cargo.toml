@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0030 step 3's demonstration payload: the first program that arrives on
+# this machine as a *package* rather than as a line in the image build. It
+# holds a console and nothing else, which is exactly what its manifest asks.
+[package]
+name = "bhaskix-user-hello"
+description = "The installable greeting: one console capability, one sentence."
+version = "0.1.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+license = "Apache-2.0"
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+# Its own workspace, as every user program is: these crates need their own
+# code-generation settings, which a workspace member cannot have.
+[workspace]
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 16, measured: the syscall stub's one block is most of it -- every
+# register named -- plus the panic ud2 and the entry asm. All promises
+# about the machine, none avoidable from ring 3.
+unsafe_budget = 16

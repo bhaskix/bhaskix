@@ -46,6 +46,23 @@ const FILESYSTEM: u64 = 1;
 const DOMAIN_CONTROL: u64 = 14;
 /// Where [`spawn`] puts the domain it makes. Given back with `RELEASE`.
 const CHILD: u64 = 15;
+/// The one *writable* directory this program holds: `/pkg`, and nothing
+/// above it (RFC 0030 step 3). Absent on a machine whose filesystem could
+/// not make it, and `pkg` commands then refuse with the slot empty.
+const PKG_DIR: u64 = 20;
+/// Sixteen pages a package archive is staged in: read out of the initrd,
+/// verified in place, drained from one page at a time.
+const STAGING: u64 = 21;
+/// Working slots the `pkg` commands resolve handles into. Emptied after use.
+const PKG_WORK: u64 = 22;
+const PKG_WORK2: u64 = 23;
+const PKG_FILE: u64 = 24;
+/// Where the staging memory maps.
+const STAGING_AT: u64 = 0x3700_0000;
+/// Where the one-page transfer window maps for `pkg` writes — the same
+/// object `map` demonstrates with, at an address of its own so the two
+/// commands cannot trip each other.
+const TRANSFER_AT: u64 = 0x3800_0000;
 /// The badge the child's ending carries, so a wake can be told from any other.
 const CHILD_BADGE: u64 = 0xc1d;
 /// At most this much of a file is read in as an image.
@@ -422,6 +439,9 @@ fn help() {
         b"    map               map memory this program holds, and be refused what it does not\n",
     );
     write(b"    spawn <path>      start a program in a domain of its own\n");
+    write(b"    pkg install <f>   install a package onto the writable filesystem\n");
+    write(b"    pkg list          what is installed\n");
+    write(b"    pkg remove <n>    remove an installed package\n");
     write(b"    exit              end this shell\n");
     write(b"\n");
     write(b"  this shell runs in ring 3 and can do nothing it does not hold a\n");
@@ -1375,6 +1395,415 @@ fn release() {
     }
 }
 
+/// One `dir` call against a held handle: declare where the answer's
+/// capability may land, ask, and hand back the raw reply.
+fn dir_call(held: u64, into: u64, method_number: u64, args: [u64; 4]) -> Reply {
+    // Only the *destination* is cleared. The first version of this line
+    // also deleted `held` -- the capability being invoked -- so the first
+    // `pkg install` of a boot destroyed the shell's own /pkg handle and
+    // every later `pkg` command found the slot empty. One character of
+    // difference, and the whole command family died of it.
+    let _ = syscall(syscall::INVOKE, into, method::DELETE, [0; 4]);
+    let declared = syscall(syscall::INVOKE, held, method::EXPECT, [into, 0, 0, 0]);
+    if declared.status != status::OK {
+        return declared;
+    }
+    call(held, method_number, args)
+}
+
+/// The failure report every `pkg` refusal goes through: red, and saying
+/// which step said no.
+fn pkg_refused(step: &[u8], code: u64) {
+    write(b"  [91mpkg: ");
+    write(step);
+    write(b" refused (");
+    write_number(code);
+    write(
+        b")[0m
+",
+    );
+}
+
+/// Ensures the staging and transfer windows are mapped. Repeat attaches are
+/// tolerated: the second `pkg` command of a session finds them where the
+/// first put them.
+fn pkg_attach() -> bool {
+    let staged = syscall(
+        syscall::INVOKE,
+        STAGING,
+        method::ATTACH,
+        [STAGING_AT, 1, 0, 0],
+    );
+    let transfer = syscall(
+        syscall::INVOKE,
+        MEMORY_RW,
+        method::ATTACH,
+        [TRANSFER_AT, 1, 0, 0],
+    );
+    // `OK` the first time, and `SLOT_UNAVAILABLE` every time after -- the
+    // range is already mapped, which is the kernel refusing to double-map,
+    // not the window being absent. Both mean the window is there.
+    let usable =
+        |reply: &Reply| reply.status == status::OK || reply.status == status::SLOT_UNAVAILABLE;
+    usable(&staged) && usable(&transfer)
+}
+
+/// Opens (or makes) the directory for one path component under `parent`,
+/// leaving a writable handle at `into`. `EXISTS` falls back to opening,
+/// which inherits writability from the parent.
+fn pkg_ensure_directory(parent: u64, into: u64, name: &[u8]) -> bool {
+    let (chunk, rest) = Chunk::take(name);
+    if !rest.is_empty() {
+        pkg_refused(b"a component name over sixteen bytes", 0);
+        return false;
+    }
+    let made = dir_call(parent, into, dir::MAKE_DIRECTORY_AT, chunk.pack(0));
+    if made.delivered() && made.raw() == dir::OK {
+        return true;
+    }
+    if made.delivered() && made.raw() == dir::EXISTS {
+        let opened = dir_call(parent, into, dir::OPEN_AT, chunk.pack(0));
+        if opened.delivered() && opened.raw() == dir::OK {
+            return true;
+        }
+        pkg_refused(b"opening an existing directory", opened.raw());
+        return false;
+    }
+    pkg_refused(b"making a directory", made.raw());
+    false
+}
+
+/// Writes `bytes` into the file whose writable handle sits at `handle`,
+/// one transfer page at a time, and says how many crossed.
+fn pkg_write_file(handle: u64, bytes: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let take = (bytes.len() - offset).min(4096);
+        // SAFETY: the transfer window this program attached writable at
+        // `TRANSFER_AT`, one page, and `take` is bounded to it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(offset),
+                TRANSFER_AT as *mut u8,
+                take,
+            );
+        }
+        let wrote = call(
+            handle,
+            dir::WRITE_FROM,
+            [MEMORY_RW, take as u64, offset as u64, 0],
+        );
+        if !wrote.delivered() || wrote.raw() != dir::OK {
+            pkg_refused(b"writing", wrote.raw());
+            return false;
+        }
+        offset += take;
+    }
+    true
+}
+
+/// Creates and fills one file at `path` (at most two components) under the
+/// package directory at `PKG_WORK`.
+fn pkg_place_file(path: &[u8], bytes: &[u8]) -> bool {
+    let mut parent = PKG_WORK;
+    let mut name = path;
+    if let Some(slash) = path.iter().position(|b| *b == b'/') {
+        let (first, rest) = (&path[..slash], &path[slash + 1..]);
+        if rest.contains(&b'/') {
+            pkg_refused(b"a path deeper than two components", 0);
+            return false;
+        }
+        if !pkg_ensure_directory(PKG_WORK, PKG_WORK2, first) {
+            return false;
+        }
+        parent = PKG_WORK2;
+        name = rest;
+    }
+    let (chunk, more) = Chunk::take(name);
+    if !more.is_empty() {
+        pkg_refused(b"a file name over sixteen bytes", 0);
+        return false;
+    }
+    let made = dir_call(parent, PKG_FILE, dir::CREATE_AT, chunk.pack(0));
+    if !made.delivered() || made.raw() != dir::OK {
+        pkg_refused(b"creating a file", made.raw());
+        return false;
+    }
+    let placed = pkg_write_file(PKG_FILE, bytes);
+    syscall(syscall::INVOKE, PKG_FILE, method::DELETE, [0; 4]);
+    placed
+}
+
+/// `pkg install <file>`: reads a `.bpk` out of the boot image, verifies it
+/// whole -- the same parser the build tools use, in ring 3 -- and installs
+/// it under `/pkg`, payloads first and the manifest record last, so a crash
+/// leaves droppings and never a lie.
+fn pkg_install(file: &[u8]) {
+    if !pkg_attach() {
+        pkg_refused(b"mapping the staging memory", 0);
+        return;
+    }
+    // The archive, out of the initrd through the filesystem service.
+    let reset = call(FILESYSTEM, fs::RESET, [0; 4]);
+    if !reset.delivered() {
+        report_refusal(b"pkg", &reset);
+        return;
+    }
+    if let Err(reply) = send_path(file) {
+        report_refusal(b"pkg", &reply);
+        return;
+    }
+    let opened = call(FILESYSTEM, fs::OPEN, [0; 4]);
+    if !opened.delivered() || opened.outcome() != outcome::OK {
+        write(
+            b"  [91mpkg: no such package file[0m
+",
+        );
+        return;
+    }
+    let loaded = call(FILESYSTEM, fs::READ_INTO, [STAGING, 16 * 4096, 0, 0]);
+    if !loaded.delivered() || loaded.outcome() != outcome::OK {
+        report_refusal(b"pkg: reading the archive", &loaded);
+        return;
+    }
+    let size = loaded.value() as usize;
+    // SAFETY: the staging window this program attached at `STAGING_AT`,
+    // sixteen pages, and `size` is what the service wrote, bounded by the
+    // limit it was given.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(STAGING_AT as *const u8, size.min(16 * 4096)) };
+
+    let verified = match bhaskix_pkg::package::verify(bytes) {
+        Ok(verified) => verified,
+        Err(_) => {
+            write(
+                b"  [91mpkg: not a package -- refused whole[0m
+",
+            );
+            return;
+        }
+    };
+    let manifest = verified.manifest();
+    write(b"  verified   ");
+    write(manifest.name);
+    write(b" ");
+    write(manifest.version);
+    write(b" -- ");
+    write_number(manifest.files().count() as u64);
+    write(b" files, ");
+    write_number(size as u64);
+    write(
+        b" bytes, digests good
+",
+    );
+
+    // The package's own directory. EXISTS is "already installed", which is
+    // an answer and not an error to bury.
+    let (chunk, more) = Chunk::take(manifest.name);
+    if !more.is_empty() {
+        pkg_refused(b"a package name over sixteen bytes", 0);
+        return;
+    }
+    let made = dir_call(PKG_DIR, PKG_WORK, dir::MAKE_DIRECTORY_AT, chunk.pack(0));
+    if made.delivered() && made.raw() == dir::EXISTS {
+        write(
+            b"  [93mpkg: already installed -- 'pkg remove' it first[0m
+",
+        );
+        return;
+    }
+    if !made.delivered() || made.raw() != dir::OK {
+        pkg_refused(b"making the package directory", made.raw());
+        return;
+    }
+
+    // Payloads first...
+    let mut placed = true;
+    for file_entry in manifest.files() {
+        let Some(data) = verified.data(file_entry.path) else {
+            placed = false;
+            break;
+        };
+        if !pkg_place_file(file_entry.path, data) {
+            placed = false;
+            break;
+        }
+    }
+    // ...the record last. Only after every payload landed does anything
+    // claim the install happened.
+    if placed {
+        let (chunk, _) = Chunk::take(b"manifest");
+        let made = dir_call(PKG_WORK, PKG_FILE, dir::CREATE_AT, chunk.pack(0));
+        placed = made.delivered()
+            && made.raw() == dir::OK
+            && pkg_write_file(PKG_FILE, verified.manifest_bytes());
+        syscall(syscall::INVOKE, PKG_FILE, method::DELETE, [0; 4]);
+    }
+    syscall(syscall::INVOKE, PKG_WORK2, method::DELETE, [0; 4]);
+    syscall(syscall::INVOKE, PKG_WORK, method::DELETE, [0; 4]);
+    if placed {
+        write(b"  [1;32minstalled[0m  /pkg/");
+        write(manifest.name);
+        write(
+            b"
+",
+        );
+    } else {
+        write(
+            b"  [91mpkg: the install did not finish -- no record was written[0m
+",
+        );
+    }
+}
+
+/// `pkg list`: what is installed, one line each.
+fn pkg_list() {
+    let mut index = 0u64;
+    let mut count = 0u64;
+    loop {
+        let reply = call(PKG_DIR, dir::LIST_AT, [index, 0, 0, 0]);
+        if !reply.delivered() {
+            report_refusal(b"pkg list", &reply);
+            return;
+        }
+        match reply.args[0] {
+            dir::OK => {
+                let length = (reply.args[3] & 0xff) as usize;
+                let mut name = [0u8; 16];
+                name[..8].copy_from_slice(&reply.args[1].to_le_bytes());
+                name[8..].copy_from_slice(&reply.args[2].to_le_bytes());
+                write(b"  [1;32m");
+                write(&name[..length.min(16)]);
+                write(
+                    b"[0m
+",
+                );
+                count += 1;
+            }
+            dir::END => break,
+            other => {
+                pkg_refused(b"listing", other);
+                return;
+            }
+        }
+        index += 1;
+    }
+    write(b"  ");
+    write_number(count);
+    write(
+        b" installed
+",
+    );
+}
+
+/// Removes every file entry of the directory held at `held`, restarting at
+/// index zero after each removal. Directories under it are cleared one
+/// level down -- the install refused anything deeper.
+fn pkg_clear_directory(held: u64, spare: u64) -> bool {
+    loop {
+        let reply = call(held, dir::LIST_AT, [0, 0, 0, 0]);
+        if !reply.delivered() {
+            return false;
+        }
+        match reply.args[0] {
+            dir::END => return true,
+            dir::OK => {}
+            _ => return false,
+        }
+        let length = (reply.args[3] & 0xff) as usize;
+        let is_directory = reply.args[3] >> 8 != 0;
+        let mut name = [0u8; 16];
+        name[..8].copy_from_slice(&reply.args[1].to_le_bytes());
+        name[8..].copy_from_slice(&reply.args[2].to_le_bytes());
+        let (chunk, _) = Chunk::take(&name[..length.min(16)]);
+        if is_directory {
+            if spare == 0 {
+                // Two levels was the install's stated ceiling; finding a
+                // third here means the tree was not this program's work.
+                return false;
+            }
+            let opened = dir_call(held, spare, dir::OPEN_AT, chunk.pack(0));
+            if !opened.delivered() || opened.raw() != dir::OK {
+                return false;
+            }
+            if !pkg_clear_directory(spare, 0) {
+                return false;
+            }
+            syscall(syscall::INVOKE, spare, method::DELETE, [0; 4]);
+        }
+        let removed = call(held, dir::REMOVE_AT, chunk.pack(0));
+        if !removed.delivered() || removed.raw() != dir::OK {
+            return false;
+        }
+    }
+}
+
+/// `pkg remove <name>`: the record first, the payload after -- a torn
+/// remove leaves droppings and no claim of presence.
+fn pkg_remove(name: &[u8]) {
+    let (chunk, more) = Chunk::take(name);
+    if !more.is_empty() {
+        pkg_refused(b"a package name over sixteen bytes", 0);
+        return;
+    }
+    let opened = dir_call(PKG_DIR, PKG_WORK, dir::OPEN_AT, chunk.pack(0));
+    if opened.delivered() && opened.raw() == dir::NO_SUCH_NAME {
+        write(
+            b"  [93mpkg: not installed[0m
+",
+        );
+        return;
+    }
+    if !opened.delivered() || opened.raw() != dir::OK {
+        pkg_refused(b"opening the package", opened.raw());
+        return;
+    }
+    // The record goes first: from here on the package does not claim to be
+    // installed, whatever else survives a crash.
+    let (record, _) = Chunk::take(b"manifest");
+    let _ = call(PKG_WORK, dir::REMOVE_AT, record.pack(0));
+    let cleared = pkg_clear_directory(PKG_WORK, PKG_WORK2);
+    syscall(syscall::INVOKE, PKG_WORK2, method::DELETE, [0; 4]);
+    syscall(syscall::INVOKE, PKG_WORK, method::DELETE, [0; 4]);
+    if !cleared {
+        write(
+            b"  [91mpkg: droppings remain -- the record is gone, run remove again[0m
+",
+        );
+        return;
+    }
+    let removed = call(PKG_DIR, dir::REMOVE_AT, chunk.pack(0));
+    if !removed.delivered() || removed.raw() != dir::OK {
+        pkg_refused(b"removing the package directory", removed.raw());
+        return;
+    }
+    write(b"  [1;32mremoved[0m    ");
+    write(name);
+    write(
+        b"
+",
+    );
+}
+
+/// The `pkg` family -- install, list, remove. RFC 0030 steps 3 and 5,
+/// and the shell is the actor because it already holds exactly the
+/// authority installing needs: the boot image read-only, `/pkg` writable,
+/// and nothing else.
+fn pkg(rest: &[u8]) {
+    let (word, name) = split(rest);
+    match word {
+        b"install" if !name.is_empty() => pkg_install(name),
+        b"list" => pkg_list(),
+        b"remove" if !name.is_empty() => pkg_remove(name),
+        _ => {
+            write(
+                b"  pkg install <file> | pkg list | pkg remove <name>
+",
+            );
+        }
+    }
+}
+
 fn run(line: &[u8]) {
     let (command, rest) = split(line);
     match command {
@@ -1399,6 +1828,7 @@ fn run(line: &[u8]) {
         b"map" => map(),
         b"irq" => signals(),
         b"net" => network(rest),
+        b"pkg" => pkg(rest),
         b"cat" => {
             if rest.is_empty() {
                 write(b"  cat: which file?\n");

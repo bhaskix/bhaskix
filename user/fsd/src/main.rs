@@ -46,7 +46,7 @@
 #![no_main]
 
 use bhaskix_abi::{Chunk, block, dir, method, rights, status, syscall};
-use bhaskix_fs::{Cache, Filesystem, FsError, Kind, Store};
+use bhaskix_fs::{Cache, Filesystem, FsError, Kind, Store, Volume};
 
 /// The slot the block service's endpoint capability is in.
 const BLOCK: u64 = 0;
@@ -275,6 +275,228 @@ fn answer(outcome: u64, size: u64, is_directory: u64) {
     let _ = status;
 }
 
+/// [`answer`], with all four words — the listing's reply carries a name.
+fn answer_words(words: [u64; 4]) {
+    let (status, _) = call(syscall::REPLY, 0, 0, words);
+    let _ = status;
+}
+
+/// Mounts the volume for one write, runs `operation`, and gives the cache
+/// back. A mount failure here is fatal on purpose: the same cache mounted at
+/// boot, so a filesystem that stopped mounting mid-serve is not a state to
+/// keep answering questions from.
+fn writing<R>(
+    cache: Cache<'static, BlockService>,
+    operation: impl FnOnce(&mut Volume<'static, BlockService>) -> R,
+) -> (Cache<'static, BlockService>, R) {
+    let Ok((mut volume, _)) = Volume::mount(cache) else {
+        exit()
+    };
+    let result = operation(&mut volume);
+    (volume.into_cache(), result)
+}
+
+/// The refusal for a write method asked of a read-only handle.
+///
+/// One place, because the check is the whole security story of RFC 0030
+/// step 3: writability rides the badge, the kernel stamped the badge, and a
+/// caller holding only read handles cannot manufacture this bit.
+fn refused_read_only(badge: u64) -> bool {
+    if bhaskix_abi::dir::writable(badge) {
+        return false;
+    }
+    answer(dir::READ_ONLY, 0, 0);
+    true
+}
+
+/// Answers `CREATE_AT` or `MAKE_DIRECTORY_AT`: a new name in a writable
+/// directory, and a writable handle to it handed back.
+fn create_at(
+    cache: Cache<'static, BlockService>,
+    badge: u64,
+    args: &[u64; 4],
+    kind: Kind,
+) -> Cache<'static, BlockService> {
+    let chunk = Chunk::unpack(args);
+    let name = chunk.bytes();
+    if !is_one_component(name) || chunk.more() {
+        answer(dir::BAD_NAME, 0, 0);
+        return cache;
+    }
+    let (directory_index, generation) = dir::parts(badge);
+    let (cache, made) = writing(cache, |volume| {
+        let directory = volume.inode(directory_index).map_err(|_| dir::GONE)?;
+        if directory.generation != generation || directory.kind != Kind::Directory {
+            return Err(dir::GONE);
+        }
+        if volume.lookup(directory_index, name).is_ok() {
+            return Err(dir::EXISTS);
+        }
+        let index = volume
+            .create(directory_index, name, kind)
+            .map_err(|_| dir::REFUSED)?;
+        let created = volume.inode(index).map_err(|_| dir::REFUSED)?;
+        Ok((index, created.generation))
+    });
+    match made {
+        Ok((index, generation)) => {
+            // A writable handle to the new thing, exactly as OPEN_AT hands
+            // read handles: where it lands is the caller's EXPECT slot.
+            let (handed, _) = call(
+                syscall::INVOKE,
+                ENDPOINT,
+                method::HAND,
+                [
+                    ENDPOINT,
+                    rights::READ | rights::DERIVE,
+                    dir::handle_writable(index, generation),
+                    0,
+                ],
+            );
+            if handed == status::OK {
+                answer(dir::OK, 0, u64::from(kind == Kind::Directory));
+            } else {
+                answer(dir::NOWHERE, handed, 0);
+            }
+        }
+        Err(outcome) => answer(outcome, 0, 0),
+    }
+    cache
+}
+
+/// Answers `WRITE_FROM`: bytes out of the caller's own memory, into the file
+/// this writable handle names, one bulk page at a time.
+fn write_from(
+    cache: Cache<'static, BlockService>,
+    badge: u64,
+    args: &[u64; 4],
+) -> Cache<'static, BlockService> {
+    let (index, generation) = dir::parts(badge);
+    let (caller_slot, length, offset) = (args[0], args[1] as usize, args[2]);
+    if length > 4096 {
+        // One transfer page is the stated unit; the caller loops. A limit
+        // announced beats a truncation discovered.
+        answer(dir::BAD_NAME, 0, 0);
+        return cache;
+    }
+    // The caller's bytes land in this program's bulk page -- DRAIN, the
+    // mirror of the FILL the read path has always used.
+    let (drained, _) = call(
+        syscall::INVOKE,
+        ENDPOINT,
+        method::DRAIN,
+        [caller_slot, BULK_AT, length as u64, 0],
+    );
+    if drained != status::OK {
+        answer(dir::NOWHERE, drained, 0);
+        return cache;
+    }
+    // SAFETY: the bulk page this program holds and mapped, `length` bounded
+    // to one page above.
+    let bytes = unsafe { core::slice::from_raw_parts(BULK_AT as *const u8, length) };
+    let (cache, wrote) = writing(cache, |volume| {
+        let file = volume.inode(index).map_err(|_| dir::GONE)?;
+        if file.generation != generation || file.kind != Kind::File {
+            return Err(dir::GONE);
+        }
+        volume.write(index, offset, bytes).map_err(|_| dir::REFUSED)
+    });
+    match wrote {
+        Ok(written) => answer(dir::OK, written as u64, 0),
+        Err(outcome) => answer(outcome, 0, 0),
+    }
+    cache
+}
+
+/// Answers `REMOVE_AT`: a name gone from a writable directory.
+fn remove_at(
+    cache: Cache<'static, BlockService>,
+    badge: u64,
+    args: &[u64; 4],
+) -> Cache<'static, BlockService> {
+    let chunk = Chunk::unpack(args);
+    let name = chunk.bytes();
+    if !is_one_component(name) || chunk.more() {
+        answer(dir::BAD_NAME, 0, 0);
+        return cache;
+    }
+    let (directory_index, generation) = dir::parts(badge);
+    let (cache, removed) = writing(cache, |volume| {
+        let directory = volume.inode(directory_index).map_err(|_| dir::GONE)?;
+        if directory.generation != generation || directory.kind != Kind::Directory {
+            return Err(dir::GONE);
+        }
+        volume
+            .remove(directory_index, name)
+            .map_err(|error| match error {
+                FsError::NotFound => dir::NO_SUCH_NAME,
+                _ => dir::REFUSED,
+            })
+    });
+    match removed {
+        Ok(()) => answer(dir::OK, 0, 0),
+        Err(outcome) => answer(outcome, 0, 0),
+    }
+    cache
+}
+
+/// Answers `LIST_AT`: entry `args[0]` of this directory, one per call, no
+/// session -- each question is whole and the service remembers nothing.
+fn list_at(cache: &mut Cache<'static, BlockService>, badge: u64, args: &[u64; 4]) {
+    let (directory_index, generation) = dir::parts(badge);
+    let wanted = args[0];
+    let Ok(mut mounted) = Filesystem::mount(cache) else {
+        answer(dir::GONE, 0, 0);
+        return;
+    };
+    let Ok(directory) = mounted.inode(directory_index) else {
+        answer(dir::GONE, 0, 0);
+        return;
+    };
+    if directory.generation != generation || directory.kind != Kind::Directory {
+        answer(dir::GONE, 0, 0);
+        return;
+    }
+    let mut index = 0u64;
+    let mut found: Option<([u8; 16], usize, u32)> = None;
+    let mut too_long = false;
+    mounted.list(&directory, |entry| {
+        if index == wanted {
+            let name = entry.name();
+            if name.len() > 16 {
+                too_long = true;
+            } else {
+                let mut packed = [0u8; 16];
+                packed[..name.len()].copy_from_slice(name);
+                found = Some((packed, name.len(), entry.inode));
+            }
+        }
+        index += 1;
+    });
+    if too_long {
+        answer(dir::NAME_TOO_LONG, 0, 0);
+        return;
+    }
+    let Some((packed, length, child)) = found else {
+        answer(dir::END, 0, 0);
+        return;
+    };
+    let is_directory = mounted
+        .inode(child)
+        .map(|inode| u64::from(inode.kind == Kind::Directory))
+        .unwrap_or(0);
+    let mut low = [0u8; 8];
+    let mut high = [0u8; 8];
+    low.copy_from_slice(&packed[..8]);
+    high.copy_from_slice(&packed[8..]);
+    answer_words([
+        dir::OK,
+        u64::from_le_bytes(low),
+        u64::from_le_bytes(high),
+        length as u64 | (is_directory << 8),
+    ]);
+}
+
 /// Whether a name is one component of a name and nothing else.
 ///
 /// Moved from the kernel unchanged, and the reasoning with it: the separator is
@@ -310,6 +532,7 @@ fn report(
     sectors: u64,
     directory: u64,
     stale: u64,
+    pkg: u64,
 ) {
     // SAFETY: the last page of the memory this program holds and mapped
     // writable, and nothing else in this program uses it.
@@ -322,6 +545,7 @@ fn report(
         core::ptr::write_volatile(at.add(5), sectors);
         core::ptr::write_volatile(at.add(7), directory);
         core::ptr::write_volatile(at.add(8), stale);
+        core::ptr::write_volatile(at.add(9), pkg);
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         core::ptr::write_volatile(at, MARKER);
     }
@@ -363,7 +587,7 @@ extern "C" fn fsd_main() -> ! {
     mark(2);
     let sectors = store.sectors;
     if sectors == 0 {
-        report(0, 0, 0, 0, 0, 0, 0);
+        report(0, 0, 0, 0, 0, 0, 0, 0);
         exit()
     }
 
@@ -373,7 +597,7 @@ extern "C" fn fsd_main() -> ! {
         unsafe { core::slice::from_raw_parts_mut(CACHE_AT as *mut u8, CACHE_PAGES * 4096) };
     mark(3);
     let Ok(mut cache) = Cache::new(frames, store) else {
-        report(0, 0, 0, 0, sectors, 0, 0);
+        report(0, 0, 0, 0, sectors, 0, 0, 0);
         exit()
     };
 
@@ -382,13 +606,13 @@ extern "C" fn fsd_main() -> ! {
     // came off a disk through another domain.
     mark(4);
     let Ok(mut mounted) = Filesystem::mount(&mut cache) else {
-        report(0, 0, 0, 0, sectors, 0, 0);
+        report(0, 0, 0, 0, sectors, 0, 0, 0);
         exit()
     };
     mark(6);
     let blocks = mounted.superblock().blocks;
     let Ok(root) = mounted.root() else {
-        report(blocks, 0, 0, 0, sectors, 0, 0);
+        report(blocks, 0, 0, 0, sectors, 0, 0, 0);
         exit()
     };
 
@@ -397,7 +621,7 @@ extern "C" fn fsd_main() -> ! {
     mounted.list(&root, |_| entries += 1);
 
     let Ok((_, inode)) = mounted.lookup(&root, b"on-a-disk") else {
-        report(blocks, entries, 0, 0, sectors, 0, 0);
+        report(blocks, entries, 0, 0, sectors, 0, 0, 0);
         exit()
     };
     mark(8);
@@ -427,6 +651,33 @@ extern "C" fn fsd_main() -> ! {
         let _ = mounted.lookup(&inode, b"absent");
     }
 
+    // RFC 0030 step 3: the `pkg` directory, made here if the image did not
+    // carry one -- which also exercises the journalled create on every boot,
+    // before anything depends on it. Its handle is what the kernel stamps
+    // into the shell's *writable* directory capability: the shell can change
+    // what is under /pkg, and nothing above it, because it holds nothing
+    // that names anything above it.
+    let pkg = {
+        let Ok((mut volume, _)) = Volume::mount(cache) else {
+            report(blocks, entries, read as u64, matched, sectors, 0, 0, 0);
+            exit()
+        };
+        let root_index = volume.superblock().root;
+        let made = match volume.lookup(root_index, b"pkg") {
+            Ok((index, inode)) if inode.kind == Kind::Directory => Ok((index, inode.generation)),
+            Ok(_) => Err(()),
+            Err(_) => volume
+                .create(root_index, b"pkg", Kind::Directory)
+                .and_then(|index| volume.inode(index).map(|inode| (index, inode.generation)))
+                .map_err(|_| ()),
+        };
+        cache = volume.into_cache();
+        match made {
+            Ok((index, generation)) => dir::handle_writable(index, generation),
+            Err(()) => 0,
+        }
+    };
+
     report(
         blocks,
         entries,
@@ -435,6 +686,7 @@ extern "C" fn fsd_main() -> ! {
         sectors,
         directory,
         stale,
+        pkg,
     );
 
     // Not `exit`. A service that has answered one question is not a service
@@ -645,6 +897,40 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
             lend(&mut cache, badge);
             continue;
         }
+        if method == dir::LIST_AT {
+            list_at(&mut cache, badge, &args);
+            continue;
+        }
+        // The write family, RFC 0030 step 3. Every arm checks the badge's
+        // writable bit first: the kernel stamped it, a caller cannot forge
+        // it, and a read-only handle asking to change things is refused
+        // with an outcome that says exactly that.
+        if method == dir::CREATE_AT || method == dir::MAKE_DIRECTORY_AT {
+            if refused_read_only(badge) {
+                continue;
+            }
+            let kind = if method == dir::CREATE_AT {
+                Kind::File
+            } else {
+                Kind::Directory
+            };
+            cache = create_at(cache, badge, &args, kind);
+            continue;
+        }
+        if method == dir::WRITE_FROM {
+            if refused_read_only(badge) {
+                continue;
+            }
+            cache = write_from(cache, badge, &args);
+            continue;
+        }
+        if method == dir::REMOVE_AT {
+            if refused_read_only(badge) {
+                continue;
+            }
+            cache = remove_at(cache, badge, &args);
+            continue;
+        }
         if method != dir::OPEN_AT {
             answer(dir::NO_SUCH_NAME, 0, 0);
             continue;
@@ -696,16 +982,22 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
         // say and this program cannot influence it: `HAND` puts it in the slot
         // the caller declared with `EXPECT`, and no argument here could name
         // another.
+        // RFC 0030 step 3: writability inherits through OPEN_AT. Write
+        // authority over a directory already implies authority over its
+        // children -- the holder could remove and recreate any of them --
+        // so a writable handle opening a child receives a writable child,
+        // and a read handle still receives a read one. The bit is copied
+        // from the asking badge, never minted from arguments.
+        let child_badge = if dir::writable(badge) {
+            dir::handle_writable(found, target.generation)
+        } else {
+            dir::handle(found, target.generation)
+        };
         let (handed, _) = call(
             syscall::INVOKE,
             ENDPOINT,
             method::HAND,
-            [
-                ENDPOINT,
-                rights::READ | rights::DERIVE,
-                dir::handle(found, target.generation),
-                0,
-            ],
+            [ENDPOINT, rights::READ | rights::DERIVE, child_badge, 0],
         );
         if handed == status::OK {
             answer(dir::OK, size, is_directory);

@@ -127,11 +127,93 @@ fn place(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Emits one package as an installable `.bpk`: the finished manifest first,
+/// then every payload at its path — the member order the format requires,
+/// which is why this writes through `tar -T` (an explicit member list, no
+/// name sort) instead of the image rule's sorted flags. Same ustar subset,
+/// same determinism flags, different ordering authority.
+fn emit_bpk(output: &Path, staging: &Path, root: &Path, source_path: &Path) -> Result<(), String> {
+    let source = finish(source_path, root)?;
+    if staging.exists() {
+        std::fs::remove_dir_all(staging)
+            .map_err(|error| format!("{}: {error}", staging.display()))?;
+    }
+    std::fs::create_dir_all(staging).map_err(|error| format!("{}: {error}", staging.display()))?;
+    std::fs::write(staging.join("manifest"), source.finished.as_bytes())
+        .map_err(|error| format!("manifest: {error}"))?;
+    let mut members = String::from(
+        "manifest
+",
+    );
+    for (payload, artifact) in &source.payloads {
+        place(artifact, &staging.join(payload))?;
+        let _ = writeln!(members, "{payload}");
+    }
+    let list = staging.join(".members");
+    std::fs::write(&list, members.as_bytes()).map_err(|error| format!("member list: {error}"))?;
+    let status = std::process::Command::new("tar")
+        .args([
+            "--format=ustar",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+            "--mtime=@0",
+            "-cf",
+        ])
+        .arg(output)
+        .arg("-C")
+        .arg(staging)
+        .arg("-T")
+        .arg(&list)
+        .status()
+        .map_err(|error| format!("tar: {error}"))?;
+    if !status.success() {
+        return Err(format!("tar exited {status}"));
+    }
+    // The consumer's verdict, not this tool's: the emitted package must
+    // verify with the same crate the installer uses, or nothing ships.
+    let bytes = std::fs::read(output).map_err(|error| format!("{}: {error}", output.display()))?;
+    bhaskix_pkg::package::verify(&bytes).map_err(|refusal| {
+        format!(
+            "{}: the emitted package failed verification: {refusal:?}",
+            output.display()
+        )
+    })?;
+    println!(
+        "built {} ({} bytes, {} payloads, verified)",
+        output.display(),
+        bytes.len(),
+        source.payloads.len(),
+    );
+    Ok(())
+}
+
 /// The tool. `mkimage <output.tar> <staging-dir> --root <repo> --static <dir>
-/// --package <manifest.in>...`
+/// --package <manifest.in>...`, or `mkimage --bpk <out.bpk> <staging> --root
+/// <repo> --package <one manifest.in>`.
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
-    let output = PathBuf::from(arguments.next().ok_or("usage: mkimage <output.tar> <staging> --root <dir> [--static <dir>] --package <manifest.in>...")?);
+    let first = arguments.next().ok_or("usage: mkimage <output.tar> <staging> --root <dir> [--static <dir>] --package <manifest.in>... | mkimage --bpk <out> <staging> --root <dir> --package <manifest.in>")?;
+    if first == "--bpk" {
+        let output = PathBuf::from(arguments.next().ok_or("--bpk needs an output path")?);
+        let staging = PathBuf::from(arguments.next().ok_or("missing staging directory")?);
+        let mut root = PathBuf::from(".");
+        let mut source = None;
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--root" => root = PathBuf::from(arguments.next().ok_or("--root needs a value")?),
+                "--package" => {
+                    source = Some(PathBuf::from(
+                        arguments.next().ok_or("--package needs a value")?,
+                    ))
+                }
+                other => return Err(format!("unknown argument {other}")),
+            }
+        }
+        let source = source.ok_or("--bpk needs exactly one --package")?;
+        return emit_bpk(&output, &staging, &root, &source);
+    }
+    let output = PathBuf::from(first);
     let staging = PathBuf::from(arguments.next().ok_or("missing staging directory")?);
 
     let mut root = PathBuf::from(".");

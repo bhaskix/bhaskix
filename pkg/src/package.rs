@@ -57,6 +57,17 @@ impl<'a> Verified<'a> {
         &self.manifest
     }
 
+    /// The manifest's raw bytes — the first member, exactly as it travelled.
+    /// An installer records these, not a re-rendering: the file reviewed is
+    /// the file installed, byte for byte.
+    #[must_use]
+    pub fn manifest_bytes(&self) -> &'a [u8] {
+        Archive::new(self.bytes)
+            .next()
+            .map(|entry| entry.data())
+            .unwrap_or(&[])
+    }
+
     /// The verified bytes of the payload at `path`.
     ///
     /// `None` only for a path the manifest does not carry: everything the

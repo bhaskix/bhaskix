@@ -537,6 +537,54 @@ pub mod dir {
     pub const GONE: u64 = 3;
     /// There was nowhere to put the answer: the caller declared no slot.
     pub const NOWHERE: u64 = 4;
+    /// The handle does not carry the write authority the method needs.
+    /// RFC 0030 step 3: writability rides the badge (see [`writable`]),
+    /// minted by the kernel or inherited through [`CREATE_AT`], never
+    /// invented by a caller.
+    pub const READ_ONLY: u64 = 5;
+    /// The name already exists, and the method needed it not to.
+    pub const EXISTS: u64 = 6;
+    /// The filesystem refused — out of space, out of inodes, or an inner
+    /// error the service reports rather than interprets. `args[1]` carries
+    /// a discriminant for the log, not for programs to branch on.
+    pub const REFUSED: u64 = 7;
+    /// A listing index past the last entry — the iteration's honest end.
+    pub const END: u64 = 8;
+    /// An entry's name does not fit one reply chunk. Sixteen bytes is the
+    /// listing's stated ceiling; a package name longer than that installs
+    /// fine and lists as this refusal — the trigger for multi-chunk
+    /// listing is the first real name that hits it.
+    pub const NAME_TOO_LONG: u64 = 9;
+
+    /// Create a file named by the [`crate::Chunk`] in `arg0..3` inside this
+    /// directory. Writable handles only. On [`OK`], a **writable** handle
+    /// to the new file is handed to the caller's [`crate::method::EXPECT`]
+    /// slot, and `args[1]` is zero (its size).
+    ///
+    /// RFC 0030 step 3: the first client-facing write the filesystem
+    /// service has offered — the journal underneath is RFC 0016's,
+    /// exercised until now only by its own demonstration.
+    pub const CREATE_AT: u64 = 4;
+    /// As [`CREATE_AT`], but the new thing is a directory, and the handle
+    /// handed back is a writable directory handle.
+    pub const MAKE_DIRECTORY_AT: u64 = 5;
+    /// Write bytes into the file this **writable** handle names.
+    ///
+    /// `arg0` = the caller's own slot holding a `Memory` object, `arg1` =
+    /// how many bytes, `arg2` = the file offset. The service drains the
+    /// caller's memory — [`crate::method::DRAIN`], [`crate::method::FILL`]'s
+    /// mirror — so the bytes cross without a register round trip each.
+    /// Replies with the count written in `args[1]`.
+    pub const WRITE_FROM: u64 = 6;
+    /// Remove the name in the [`crate::Chunk`] from this **writable**
+    /// directory. Removing a non-empty directory is refused by the
+    /// filesystem and reported as [`REFUSED`].
+    pub const REMOVE_AT: u64 = 7;
+    /// List this directory: `arg0` = an entry index, and each call is its
+    /// own question — no session, no cursor, nothing for a caller to leak.
+    /// Replies with the entry's name as a chunk in `args[1..3]`, its kind
+    /// in the reply's fourth word, [`END`] past the last entry.
+    pub const LIST_AT: u64 = 8;
 
     /// Packs an inode and a generation into the badge that names them.
     #[must_use]
@@ -544,10 +592,34 @@ pub mod dir {
         (inode as u64) | ((generation as u64) << 32)
     }
 
+    /// The writable bit, which is the badge's top bit — the generation
+    /// keeps thirty-one. Narrowed knowingly (RFC 0030 step 3): a
+    /// generation counts directory reuses, thirty-one bits of them is
+    /// beyond any machine lifetime this project will see, and the
+    /// alternative was a second badge namespace for one boolean.
+    pub const WRITABLE: u64 = 1 << 63;
+
+    /// A writable handle: [`handle`], plus the authority to change what
+    /// it names. Minted by the kernel at boot for the shell's root handle,
+    /// and by the service when a writable handle creates a child — never
+    /// from a caller's own arguments.
+    pub const fn handle_writable(inode: u32, generation: u32) -> u64 {
+        // The generation masked at packing, as `tcp::handle` masks its own:
+        // packing a generation the unpacking would truncate silently is how
+        // bit 63 gets stepped on.
+        (inode as u64) | (((generation & 0x7fff_ffff) as u64) << 32) | WRITABLE
+    }
+
+    /// Whether this badge carries the write authority.
+    #[must_use]
+    pub const fn writable(badge: u64) -> bool {
+        badge & WRITABLE != 0
+    }
+
     /// The inode and generation a badge names.
     #[must_use]
     pub const fn parts(badge: u64) -> (u32, u32) {
-        (badge as u32, (badge >> 32) as u32)
+        (badge as u32, ((badge & !WRITABLE) >> 32) as u32)
     }
 }
 

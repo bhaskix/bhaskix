@@ -59,6 +59,11 @@ TCPC_DIR     := user/tcpc
 TRACED_DIR   := user/traced
 FSD_DIR      := user/fsd
 SUP_DIR      := user/sup
+# RFC 0030 step 3's demonstration payload: built like every user program,
+# shipped as a .bpk rather than a line in the image.
+HELLO_DIR    := user/hello
+HELLO        := $(HELLO_DIR)/target/$(TARGET)/release/hello
+HELLO_BPK    := build/hello.bpk
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 USER_SUP     := $(SUP_DIR)/target/$(TARGET)/release/sup
 USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
@@ -229,13 +234,15 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
+	    --file hello.bpk=$(HELLO_BPK) \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
 	./$(MKIMAGE) $@.again $(INITRD_ROOT).again --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
+	    --file hello.bpk=$(HELLO_BPK) \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
 	cmp $@ $@.again
 	@rm -rf $@.again $(INITRD_ROOT).again
@@ -262,6 +269,20 @@ $(USER_SUP): $(SUP_DIR)/src/main.rs $(SUP_DIR)/link.ld $(SUP_DIR)/Cargo.toml \
 	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
+
+HELLO_FLAGS := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(HELLO_DIR)/link.ld
+$(HELLO): $(HELLO_DIR)/src/main.rs $(HELLO_DIR)/link.ld $(HELLO_DIR)/Cargo.toml \
+             $(wildcard abi/src/*.rs)
+	cd $(HELLO_DIR) && RUSTFLAGS="$(HELLO_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# The demonstration package, emitted and verified by the same tool and the
+# same parsers the installer uses.
+$(HELLO_BPK): $(MKIMAGE) $(HELLO) packages/demo/hello.manifest.in
+	./$(MKIMAGE) --bpk $@ build/bpk_stage --root . \
+	    --package packages/demo/hello.manifest.in
 
 # The filesystem service as a program, for the domain placement. Rebuilt when
 # the service crate changes too: the same crate is compiled into the kernel for

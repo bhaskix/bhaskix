@@ -111,6 +111,27 @@ and it is the biggest thing this RFC deliberately does not decide.
 
 ### Install, run, remove: the writable filesystem earns its journal
 
+**Step 3's verdict, recorded over the design it tested.** The write path exists and the
+whole install arc is gated: `pkg install hello.bpk` at a live prompt verifies with the
+same parser the host tools use, installs payload-first/record-last, lists, and refuses a
+second install off the record it wrote. The `dir` protocol grew `CREATE_AT`,
+`MAKE_DIRECTORY_AT`, `WRITE_FROM`, `REMOVE_AT` and `LIST_AT` — all service-defined; the
+kernel gained **no method and no object**: `DRAIN`, `FILL`'s mirror, already existed, and
+"packaging adds nothing to the kernel" held at the letter of code paths. What did change
+kernel-side, stated: two grant lines (the shell's writable `/pkg` handle, minted from the
+handle `bin/fsd` reports after ensuring `/pkg` exists — a journalled create exercised on
+every boot — and a sixteen-page staging object), and two stack sizes (shell and fsd,
+four pages to sixteen: a parsed manifest is an eight-kilobyte value and a mounted
+`Volume` carries its cache by value, and both floors were found by real faults with the
+addresses in the changelog). **Writability rides the badge's top bit** — `tcp::handle`'s
+listener-bit precedent, kernel-minted, never from arguments — and inherits *downward*
+through `OPEN_AT` only: write authority over a directory already implies authority over
+its children. The shell holds `/pkg` and nothing above it; the deliberate
+not-the-root narrowness of RFC 0016 survives packaging intact. One latent seam flagged
+rather than fixed: `DRAIN`'s kernel copy loop does not advance its destination across a
+multi-frame object — harmless for every current single-page user, written down in
+TRACKER before it can surprise anyone.
+
 The installed set lives at `/pkg` on RFC 0016's filesystem: one directory per package
 holding its payload, plus the manifest recorded beside it as the installation record —
 no second database to disagree with the first. The shell grows one command family

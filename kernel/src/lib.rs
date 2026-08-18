@@ -3880,7 +3880,11 @@ unsafe fn enter_user(who: &str, entry: u64, rsp: u64, arguments: [u64; 2]) -> ! 
 /// has both the same, neither says which one faulted.
 const FSD_STACK: u64 = 0x0000_0000_1300_0000;
 /// How many pages of it.
-const FSD_STACK_PAGES: u64 = 4;
+// Sixteen pages since RFC 0030 step 3, the shell's reason one domain over:
+// the write path mounts a Volume -- which carries the whole Cache by value
+// -- on this stack, and four pages put the floor eight kilobytes above
+// where a create's frames actually reach.
+const FSD_STACK_PAGES: u64 = 16;
 /// The filesystem service, in the archive.
 const FSD_PROGRAM: &[u8] = b"bin/fsd";
 /// The badge on the filesystem service's capability to the block service.
@@ -5852,6 +5856,10 @@ static FS_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 static FS_DIRECTORY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The badge that names a directory which is gone.
 static FS_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The writable handle to `/pkg`, as the filesystem service reported it —
+/// RFC 0030 step 3. Zero until the service says otherwise, and zero means
+/// the shell gets no writable directory rather than a wrong one.
+static FS_PKG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Where the direct map is, for the thread above.
 static DISK_HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -8202,11 +8210,11 @@ fn start_fs_domain(hhdm: u64) -> bool {
     }
 
     // The report page is the object's last frame, read through the direct map.
-    let mut words = [0u64; 9];
+    let mut words = [0u64; 10];
     for _ in 0..200 {
         // SAFETY: a frame this object owns, through the direct map, read as
-        // the six little-endian words the service writes there.
-        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 72) };
+        // the ten little-endian words the service writes there.
+        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 80) };
         for (index, word) in words.iter_mut().enumerate() {
             let mut buffer = [0u8; 8];
             buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -8236,6 +8244,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
         stage,
         directory,
         stale,
+        pkg,
     ] = words;
     // What the service says names `sub`. The kernel is the only thing that can
     // mint a capability, so the service supplies the badge and the kernel
@@ -8244,6 +8253,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
     FS_ENDPOINT.store(u64::from(serving.as_u32()), Ordering::Release);
     FS_DIRECTORY.store(directory, Ordering::Release);
     FS_STALE.store(stale, Ordering::Release);
+    FS_PKG.store(pkg, Ordering::Release);
     let _ = (directory, stale);
     let ok = matched == 1 && read == EXPECTED.len() as u64 && blocks > 0 && entries > 0;
     if ok {
@@ -8674,7 +8684,12 @@ extern "C" fn vfs_domain_entry(hhdm_base: u64) -> ! {
 /// and a program that cannot allocate keeps everything somewhere, which here
 /// is here.
 const SHELL_STACK: u64 = 0x0000_0000_1100_0000;
-const SHELL_STACK_PAGES: u64 = 4;
+// Sixteen pages since RFC 0030 step 3: `pkg install` verifies a package
+// with the same parser the host tools use, and a parsed manifest is a
+// fixed-capacity value of about eight kilobytes that lives on the stack --
+// the four-page stack blew through its floor at the first real install,
+// faulting at 0x10fff668 with rsp eighteen kilobytes under the base.
+const SHELL_STACK_PAGES: u64 = 16;
 
 /// Where the user-mode shell is in the filesystem.
 const SHELL_PROGRAM: &[u8] = b"bin/shell";
@@ -9224,6 +9239,50 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
                     return Err("a directory capability would not install");
                 }
             }
+
+            // RFC 0030 step 3: the shell's one *writable* directory, at slot
+            // 20 -- `/pkg`, whose handle the filesystem service reported and
+            // whose writable bit this mint is the only source of. Narrow on
+            // purpose: the shell can change what is under /pkg and nothing
+            // above it, because it holds nothing that names anything above
+            // it. Absent (zero) means the service could not make the
+            // directory, and the shell simply holds no writable handle --
+            // `pkg install` then refuses with the slot empty, which is the
+            // honest state rather than a forged one.
+            let pkg = FS_PKG.load(core::sync::atomic::Ordering::Acquire);
+            if pkg != 0 {
+                let handle = cap::with_arena(|arena| {
+                    let root = arena
+                        .insert_root(
+                            cap::ObjectRef::new(cap::ObjectKind::Endpoint, raw),
+                            cap::Rights::ALL,
+                            0,
+                        )
+                        .ok()?;
+                    arena
+                        .derive(root, cap::Rights::READ.union(cap::Rights::DERIVE), pkg)
+                        .ok()
+                })
+                .ok_or("the pkg directory capability would not be created")?;
+                if domain::with(realm, |owner| owner.cspace.install_at(20, handle).is_ok())
+                    != Some(true)
+                {
+                    return Err("the pkg directory capability would not install");
+                }
+            }
+        }
+    }
+
+    // RFC 0030 step 3: sixteen pages the shell stages a package archive in
+    // -- read out of the initrd through the vfs, verified in place with the
+    // same parser the host tools use, and drained from by the filesystem
+    // service one page at a time. At slot 21, mapped where the shell says.
+    {
+        let staging = shared::create(realm, 16 * bhaskix_mm::FRAME_SIZE)
+            .map_err(|_| "the shell's package staging memory would not be created")?;
+        let named = shared::name(staging).map_err(|_| "the staging memory would not be named")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(21, named).is_ok()) != Some(true) {
+            return Err("the staging memory would not install");
         }
     }
 
