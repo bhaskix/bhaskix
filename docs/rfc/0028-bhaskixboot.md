@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft — steps 1–6 implemented; step 7's parity work (KASLR, secondaries) landed 2026-08-18, with question 2 answered against its own sketch: bring-up lives in the kernel. What remains is the lane adopting the full gate set |
+| **Status** | Draft — **all seven steps implemented, 2026-08-18**; awaiting acceptance. The native lane answers the full Limine-lane gate set (74 gates, both loaders, same list — `tests/qemu/boot-test.sh native`), the loader-specific lane holds its 23 plus the negative arm, and the roadmap bullet is closed. Question 2 was answered against its own sketch: bring-up lives in the kernel |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot |
 | **Milestone** | Phase 2 — the roadmap's `bhaskixboot.efi` bullet, and half of the phase's exit criterion ("boots on its own bootloader") |
@@ -96,8 +96,9 @@ gap closes; *closed at step 7, and not as sketched here: the kernel grew its own
 see unresolved question 2*) and **KASLR** (unslid until the draw step; the lane's gate
 accepts "unslid, and said so" only while that step is pending — *closed at step 7: the
 loader draws, and the lane demands the kernel confirm the slide*). Phase 2's
-exit criterion is met when the native lane runs the **same 48 gates as the Limine lanes**,
-and not before.
+exit criterion is met when the native lane runs the **same gates as the Limine lanes** — 48
+when this was written, 74 by the day parity arrived, because the suite kept growing and
+parity was measured against the suite as it stood — and not before.
 
 ### What does not change
 

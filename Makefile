@@ -151,8 +151,8 @@ OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
-        test-boot-iommu-off test-boot-qemu64 test-placements mkfs \
-        test-shell test-faults fmt clippy gates clean distclean help
+        test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
+        test-placements mkfs test-shell test-faults fmt clippy gates clean distclean help
 
 all: iso
 
@@ -404,7 +404,7 @@ run-uefi: $(ISO)
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
-      test-boot-qemu64 test-boot-native test-placements test-shell test-faults
+      test-boot-qemu64 test-boot-native test-boot-native-full test-placements test-shell test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -482,6 +482,14 @@ test-boot-qemu64: $(ISO)
 # per implemented step until it runs what the Limine lanes run.
 test-boot-native: $(BOOTEFI) $(ISO)
 	tests/qemu/native-boot-test.sh
+
+# RFC 0028 step 7's closing claim, executable: the native loader answers the
+# SAME gate list as every Limine lane -- boot-test.sh with only the boot
+# media changed. The loader-specific lane above keeps what this one cannot
+# express (payload checksums, the slide policy, the negative arm); this one
+# holds bhaskixboot to everything the incumbent is held to.
+test-boot-native-full: $(BOOTEFI) $(ISO)
+	tests/qemu/boot-test.sh native
 
 
 # Types at the machine over the serial line and asserts on the replies. The

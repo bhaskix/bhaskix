@@ -419,18 +419,18 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         initrd: (initrd_base, initrd_len),
         bsp_lapic_id,
     };
-    let (built, stack_top) = match handoff::assemble(block, &findings) {
+    let built = match handoff::assemble(block, &findings) {
         Ok(built) => built,
         Err(count) => refuse("the handoff would not assemble", count as u64),
     };
     serial::write("bhaskixboot: handoff assembled: version ");
-    serial::write_dec(u64::from(built.version));
+    serial::write_dec(u64::from(bhaskix_boot::HANDOFF_VERSION));
     serial::write(", ");
-    serial::write_dec(built.memory_map.len() as u64);
+    serial::write_dec(built.regions as u64);
     serial::write(" regions, initrd ");
-    serial::write_dec(built.initrd.map_or(0, <[u8]>::len) as u64);
+    serial::write_dec(built.initrd_bytes as u64);
     serial::write(" bytes, stack top ");
-    serial::write_hex(stack_top);
+    serial::write_hex(built.stack_top);
     serial::write("\r\n");
 
     // Step 6: the jump. Interrupts off for the entry contract; `EFER.NXE`
@@ -447,7 +447,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write(", cr3 ");
     serial::write_hex(world.root);
     serial::write(", handoff ");
-    serial::write_hex(block);
+    serial::write_hex(built.handoff);
     serial::write("\r\n");
     // SAFETY: RFC 0028's entry contract, held by construction above: the
     // root maps the identity view (this code keeps running), the kernel's
@@ -466,9 +466,9 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
             "xor ebp, ebp",
             "jmp r10",
             in("r8") world.root,
-            in("r9") stack_top,
+            in("r9") built.stack_top,
             in("r10") entry,
-            in("rdi") block,
+            in("rdi") built.handoff,
             in("rsi") bhaskix_boot::NATIVE_ENTRY_MAGIC,
             options(noreturn),
         )

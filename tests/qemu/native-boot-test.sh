@@ -3,15 +3,14 @@
 #
 # The native loader's lane -- RFC 0028, graduated on purpose.
 #
-# This script's gate list IS the honest statement of how far sovereignty
-# has come: it grows a check per implemented step, and the roadmap's
-# bhaskixboot bullet closes only when this lane runs the same gates the
-# Limine lanes do. Today it proves steps 1 through 7's parity work: the
-# payload byte-verified, the machine's shape taken, the kernel slid by a
-# drawn KASLR slide the kernel itself confirms, the jump through the
-# shim's second door, and four CPUs online -- found in the MADT and
-# started by the kernel's own INIT-SIPI, with no loader help. What
-# remains before the bullet closes is the full Limine-lane gate set.
+# The LOADER-specific gates: the payload byte-verified against a second
+# checksum implementation, the machine's shape taken, the kernel slid by
+# a drawn KASLR slide the kernel itself confirms, the jump through the
+# shim's second door, four CPUs online -- found in the MADT and started
+# by the kernel's own INIT-SIPI, with no loader help -- and the permanent
+# negative arm. Full-system parity lives next door: `boot-test.sh native`
+# runs the SAME gate list every Limine lane runs, which is what closed
+# the roadmap's bhaskixboot bullet (RFC 0028 step 7).
 #
 # Usage:
 #   tests/qemu/native-boot-test.sh

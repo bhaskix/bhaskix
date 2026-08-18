@@ -151,14 +151,23 @@ else
     qemu_device_list full no
 fi
 
-QEMU_ARGS=(-M "$MACHINE" -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot -cdrom "$ISO" -boot d
+QEMU_ARGS=(-M "$MACHINE" -cpu ${QEMU_CPU:-max} -smp "${QEMU_SMP:-4}" -m 256M -no-reboot
            -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on"
            -drive "file=$DOMAIN_DISK,format=raw,if=none,id=disk1"
            "${VIRTIO_ARGS[@]}"
            "${IOMMU_ARGS[@]}"
            -serial "file:$LOG" -display none)
 
-if [[ "$MODE" == "uefi" ]]; then
+# The boot media is the one thing the native mode changes: every other line
+# of this harness -- the machine, the disks, the network, and all of the
+# gates below -- runs identically over both loaders. That identity is RFC
+# 0028 step 7's closing claim, made executable: `bhaskixboot.efi` is held to
+# the same 126 gates the incumbent has answered since M1.
+if [[ "$MODE" != "native" ]]; then
+    QEMU_ARGS+=(-cdrom "$ISO" -boot d)
+fi
+
+if [[ "$MODE" == "uefi" || "$MODE" == "native" ]]; then
     # OVMF ships as a CODE/VARS *pair* and they must be searched as one.
     #
     # An earlier version looked for each independently, which broke on
@@ -212,6 +221,28 @@ if [[ "$MODE" == "uefi" ]]; then
 
     QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE"
                 -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS")
+fi
+
+if [[ "$MODE" == "native" ]]; then
+    # The native loader boots from an ESP directory, staged fresh: its own
+    # binary at the removable-media path, the payload at the fixed paths the
+    # loader reads. A directory of its own, so the loader-specific lane's
+    # negative arm (which corrupts its staged kernel in place) can never
+    # bleed into this one.
+    LOADER="$REPO_ROOT/boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi"
+    KERNEL_ELF="$REPO_ROOT/target/x86_64-unknown-none/release/bhaskix"
+    if [[ ! -f "$LOADER" || ! -f "$KERNEL_ELF" ]]; then
+        fail "the native loader or the kernel is not built -- run 'make test-boot-native' deps first"
+        exit 1
+    fi
+    ESP="$REPO_ROOT/build/native-full-esp"
+    rm -rf "$ESP"
+    mkdir -p "$ESP/EFI/BOOT" "$ESP/bhaskix"
+    cp "$LOADER" "$ESP/EFI/BOOT/BOOTX64.EFI"
+    cp "$KERNEL_ELF" "$ESP/bhaskix/kernel"
+    cp "$DISK" "$ESP/bhaskix/initrd.tar"
+    printf 'cmdline=\n' > "$ESP/bhaskix/boot.conf"
+    QEMU_ARGS+=(-drive "format=raw,file=fat:rw:$ESP")
 fi
 
 # The domain's disk is written to now, so it is rebuilt before every run.

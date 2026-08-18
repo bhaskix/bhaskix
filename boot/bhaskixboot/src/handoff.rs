@@ -75,16 +75,30 @@ pub struct Findings<'boot> {
     pub bsp_lapic_id: u32,
 }
 
+/// What [`assemble`] hands back: the two addresses the jump loads, and the
+/// two counts the report prints — numbers only, because the handoff
+/// addresses are direct-map addresses the loader cannot follow yet.
+pub struct Assembled {
+    /// Direct-map address of the `Handoff`, for the first argument register.
+    pub handoff: u64,
+    /// Direct-map address of the kernel's first stack top.
+    pub stack_top: u64,
+    /// Regions the map carried.
+    pub regions: usize,
+    /// Bytes the initrd reference covers.
+    pub initrd_bytes: usize,
+}
+
 /// Assembles the handoff in `block` (physical, identity-mapped, page
-/// aligned, [`BLOCK_PAGES`] long) and returns it with the stack top the
-/// kernel is entered on.
+/// aligned, [`BLOCK_PAGES`] long) and returns the addresses the jump
+/// loads.
 ///
 /// # Errors
 ///
 /// The region count when the firmware's map outgrows [`MAX_REGIONS`] — a
 /// refusal, never a truncation — or when the command line outgrows its
 /// page.
-pub fn assemble(block: u64, findings: &Findings<'_>) -> Result<(&'static Handoff, u64), usize> {
+pub fn assemble(block: u64, findings: &Findings<'_>) -> Result<Assembled, usize> {
     // The regions, translated, then insertion-sorted by base: the handoff
     // contract demands sorted and the specification does not promise it.
     let mut regions = [MemoryRegion {
@@ -177,27 +191,40 @@ pub fn assemble(block: u64, findings: &Findings<'_>) -> Result<(&'static Handoff
             },
         });
 
-    // The references, fabricated from the block: sound because the block is
+    // The references, fabricated from the block — **through the direct map,
+    // never through identity**. The kernel keeps these references long past
+    // its own entry and follows them from address spaces that map nothing
+    // below the higher half: a physical pointer here works exactly as long
+    // as the loader's identity view survives, and then a ring 3 program's
+    // ELF load reads the initrd from a user root and takes a kernel page
+    // fault at a plausible-looking low address. Found by the frame-dump
+    // instrument, not by reading this comment's first draft, which said
+    // "identity" and believed it. Sound because the block is
     // BootloaderReclaimable — the kernel's to read until it says otherwise
     // — and the loader never touches it again.
-    // SAFETY: the regions were written just above, at this address, with
-    // this count; the block outlives the loader by the contract stated in
-    // the module header.
-    let memory_map =
-        unsafe { core::slice::from_raw_parts(regions_at as *const MemoryRegion, count) };
+    // SAFETY: the regions were written just above, at this physical
+    // address, with this count; HHDM names the same bytes, and the block
+    // outlives the loader by the contract stated in the module header.
+    let memory_map = unsafe {
+        core::slice::from_raw_parts((HHDM_BASE + regions_at) as *const MemoryRegion, count)
+    };
     // SAFETY: as above, for the command line's bytes, which came from a
     // `&str` and are therefore valid UTF-8 unchanged.
     let cmdline = unsafe {
         core::str::from_utf8_unchecked(core::slice::from_raw_parts(
-            cmdline_at as *const u8,
+            (HHDM_BASE + cmdline_at) as *const u8,
             findings.cmdline.len(),
         ))
     };
     // SAFETY: the initrd's pages were allocated `LoaderCode` and filled
     // from the boot volume; they translate as KernelAndModules and are
     // never reclaimed.
-    let initrd =
-        unsafe { core::slice::from_raw_parts(findings.initrd.0 as *const u8, findings.initrd.1) };
+    let initrd = unsafe {
+        core::slice::from_raw_parts(
+            (HHDM_BASE + findings.initrd.0) as *const u8,
+            findings.initrd.1,
+        )
+    };
 
     let handoff = Handoff {
         version: HANDOFF_VERSION,
@@ -220,8 +247,17 @@ pub fn assemble(block: u64, findings: &Findings<'_>) -> Result<(&'static Handoff
     // needs, written once and read by the kernel alone after the jump.
     unsafe { core::ptr::write_volatile(block as *mut Handoff, handoff) };
 
-    // SAFETY: written just above; the reference lives as long as the block,
-    // which is for ever by the reclamation contract.
-    let handoff = unsafe { &*(block as *const Handoff) };
-    Ok((handoff, block + STACK_TOP))
+    // The returned addresses are direct-map addresses, for the same reason
+    // as every reference above: nothing the kernel is handed may depend on
+    // the identity view outliving the jump. They are returned as numbers,
+    // not references, because the direct map does not exist until the CR3
+    // switch — the loader printing its report through one of these would
+    // fault under the firmware's own paging, which is exactly how the
+    // first version of this comment was earned.
+    Ok(Assembled {
+        handoff: HHDM_BASE + block,
+        stack_top: HHDM_BASE + block + STACK_TOP,
+        regions: count,
+        initrd_bytes: findings.initrd.1,
+    })
 }

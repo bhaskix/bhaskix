@@ -61,4 +61,9 @@ opt-level = "s"
 # 97 at step 6: the jump -- one asm block that never returns: interrupts
 # off, EFER.NXE, the world's root into CR3, the kernel's stack, and the
 # door with the handoff and the magic in the argument registers.
-unsafe_budget = 97
+#
+# 103 at step 7's parity fix: the handoff's references are fabricated
+# through the direct map instead of identity -- same reads, six more
+# lines, because the kernel keeps those references long past the loader's
+# identity view and follows them from address spaces with no low half.
+unsafe_budget = 103

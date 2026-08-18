@@ -151,8 +151,8 @@ Order within the phase is flexible; dependencies are noted. Done so far — see
 framework, IOMMU discovery and per-device domains, the driver framework, the full VFS, and process
 management. Networking runs through TCP, both directions, measured, and programs speak it
 through `bhaskix-sock` rather than hand-rolled exchanges. The telemetry plane runs — typed
-events, per-CPU rings, a live reader. What remains is `bhaskixboot.efi`, package management,
-and libc.
+events, per-CPU rings, a live reader. The machine boots on its own loader — `bhaskixboot.efi`,
+held to the same gates as the incumbent. What remains is package management and libc.
 
 - ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
   M9-18 … M9-23. Capability-shaped rather than POSIX-shaped: no `fork` (it duplicates a capability
@@ -219,8 +219,13 @@ and libc.
   class's backpressure ring (reserved and refused until the audit RFC), a flight-recorder
   mode (one header bit, wanted by the next hang hunt), and the deliver-to-seen hop of the
   retired pipeline stamps, which no kernel crossing can see
-- ⬜ **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
-  sovereignty milestone the boot shim was designed to enable)
+- ✅ **`bhaskixboot.efi`** — our own UEFI loader, replacing Limine behind the same `Handoff` (the
+  sovereignty milestone the boot shim was designed to enable). [RFC 0028](rfc/0028-bhaskixboot.md),
+  steps 1–7 implemented, closed 2026-08-18: hand-rolled firmware bindings, byte-proven payload,
+  a drawn KASLR slide the kernel confirms, four CPUs the kernel starts itself (MADT discovery,
+  kernel-side INIT-SIPI), and **the full Limine-lane gate set answered natively** — 74 gates
+  green on both loaders, plus the loader-specific lane's 23 and its permanent negative arm.
+  Limine remains as the second lane, exactly as the RFC keeps it
 - ⬜ **Package management** and image building
 - ⬜ **libc** — enough for real userspace software. Belongs to the **Linux personality**
   ([RFC 0005](rfc/0005-linux-abi-compatibility.md)), not to native userspace: RFC 0008
