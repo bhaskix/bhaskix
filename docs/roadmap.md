@@ -248,11 +248,15 @@ derived from what their manifests ask. What remains is libc.
   every operation priced through the journal. The kernel gained no method and no object.
   Refused with written triggers: network fetch, signatures, dependency resolution,
   upgrades; install-time scripts refused flat — a postinst is ambient authority
-- ⬜ **libc** — enough for real userspace software. Belongs to the **Linux personality**
-  ([RFC 0005](rfc/0005-linux-abi-compatibility.md)), not to native userspace: RFC 0008
-  is accepted, and the native ABI *is* the capability interface, so a native program
-  links no libc at all. The user-mode shell at M6-05 is the demonstration — it has no
-  runtime and could not have one
+- ⬜ **libc** — resolved into the **Linux personality** ([RFC 0005](rfc/0005-linux-abi-compatibility.md),
+  revised for implementation 2026-08-19), exactly as that RFC's impact table asked: the
+  bullet conflated source compatibility with binary compatibility, and the native half
+  is a refusal already made — RFC 0008's ABI *is* the capability interface, a native
+  program links no libc at all, and the user-mode shell is the standing demonstration.
+  What remains is the binary half: the Linux `x86_64` ABI as a personality in a service
+  domain — statically linked Go first, tiers defined by traced workloads, `-ENOSYS`
+  through the telemetry plane, and the three rules that keep the nucleus free of
+  Linux-shaped concepts
 
 **Exit:** Bhaskix self-hosts its own userspace utilities, does useful network I/O, and boots on its
 own bootloader.

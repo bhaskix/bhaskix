@@ -133,6 +133,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **BB1** | `bhaskixboot.efi` | ✅ **Accepted 2026-08-18**, all seven steps implemented — **the machine boots on its own loader at full strength**: slid by a drawn KASLR slide, four CPUs the kernel started itself, and `boot-test.sh native` answering the **same 74 gates every Limine lane answers** (ring 3, services, shell path, network, filesystem — all of it), beside the loader-specific lane's 23 and its permanent negative arm. The roadmap bullet is closed | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
 | **IP6** | IPv6 | ✅ **Accepted 2026-08-18** — drafted, implemented (all six steps) and accepted in one day, on the working demonstration: dual stack gated on every networked lane, both families measured on one boot, the networking bullet closed | **A second address family, not a second stack.** The collection on RFC 0018's pre-paid abstraction: a `V6` variant on the one-variant `Address` enum (the compiler produces the work list), parsers and NDP as zero-`unsafe` arithmetic in `bhaskix-net`, SLAAC in `bin/ipd`, UDP/TCP over the same rings and capability handover — a v6 endpoint fits an IPC message's four words exactly. Refused with written triggers: extension headers, fragmentation, DHCPv6, privacy addresses, a resolver. One stated harness reduction: this QEMU's slirp cannot deliver inbound v6, so the LISTEN path's v6 wire proof waits on a newer QEMU or hardware | [RFC 0029](docs/rfc/0029-ipv6.md) |
 | **PKG** | Packages | ✅ **Accepted 2026-08-19** — drafted and implemented (all six steps) across two days, on the working demonstration: the image a function of the manifests, the full install/run/remove arc live at the shell, every operation priced, the kernel untouched | **A package is a program plus the authority it asks for, in one reviewable file.** `driver-model.md` §5's manifest principle generalised to every installable thing: a ustar `.bpk` with a line-grammar manifest naming binaries, capability requests and SHA-256 content identity (honest about being corruption-detection until Phase 3 signs it). Build time: the image becomes a deterministic function of `packages/` — byte-identical gated, the Makefile cp-list retires. Run time: install/run/remove on RFC 0016's filesystem, grants = intersection of manifest and granter, over-ask refused whole, crash-safe ordering. Design claim: zero new kernel code. Refused with triggers: fetch, signatures, dependency solving, upgrades; install-time scripts refused *flat* — ambient authority by definition | [RFC 0030](docs/rfc/0030-packages.md) |
+| **LP1** | Linux personality | ⬜ **Draft revised for implementation** 2026-08-19 — RFC 0005, ten-step decomposition; Phase 2's last bullet (`libc`, resolved into binary compatibility) | **The Linux x86_64 ABI as a personality: a translation layer in a service domain, never the native interface.** Three rules or revert: no Linux concepts in the nucleus, the personality translates and never manufactures authority, native software never pays. Go-first (static, `CGO_ENABLED=0`) because it removes the dynamic linker, libc and locale from the problem; tiers defined by traced workloads, not syscall tables; signals built first because they are where the design is most likely wrong; `ptrace`/BPF/namespaces refused permanently | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -764,6 +765,26 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-19 (RFC 0005 revised: the libc bullet resolves into a personality, on a machine that finally exists)
+
+**Phase 2's last bullet opens, and it is not a library.** RFC 0005 — drafted before M5,
+when the machine had no user mode, no filesystem and no network — is revised for
+implementation against what two phases built. Every prerequisite it named has shipped:
+domains proven cheap (its question 4 half-answered by RFC 0017's numbers), the
+fuzz-hardened ELF loader in a shared leaf crate, real filesystems and a real network for
+Tiers 1 and 2 to translate onto, the telemetry plane it wanted for `-ENOSYS` logging,
+and packages to ship its test corpus as reviewable manifests. The roadmap's `libc`
+bullet is resolved the way the RFC's own impact table asked: the native half is a
+refusal already made (RFC 0008 — the native ABI is the capability interface, no native
+libc, ever), and what remains is the binary half — the Linux `x86_64` ABI as a
+personality in a service domain, Go-first, tiers defined by traced workloads, and the
+three rules that keep the nucleus free of Linux-shaped concepts, with reversion named
+as the remedy if one ever leaks. Unchanged from the draft: the tension with RFC 0003
+stated plainly, the three hard parts (signals first, because they are where the design
+is most likely wrong), and the refusals — `ptrace`, BPF and namespaces permanently out.
+Still owed from outside: the motivating workload's trace; the public corpus is the work
+queue until it arrives. Decision-log row **LP1**.
 
 ### 2026-08-19 (RFC 0030 accepted: the manifest is the review, and the kernel never learned what a package is)
 

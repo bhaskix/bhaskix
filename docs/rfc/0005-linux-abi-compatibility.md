@@ -2,11 +2,41 @@
 
 | | |
 |---|---|
-| **Status** | **Draft — for discussion** |
+| **Status** | **Draft — revised for implementation 2026-08-19** (drafted before M5 existed; see "The machine this now lands on" below for what two phases changed) |
 | **Author(s)** | Tarun Kumar Kushwaha |
-| **Subsystem** | kernel, userspace; new subsystem `personality` |
-| **Milestone** | Decision now; Tier 0 after M6, Tier 1–2 in Phase 2 |
-| **Depends on** | M5 (capabilities, syscalls, user mode), M6 (ELF loader, VFS), [RFC 0003](0003-storage-architecture.md), [RFC 0004](0004-ot-security-gateway.md) |
+| **Subsystem** | kernel (dispatch tag only), userspace; new subsystem `personality` |
+| **Milestone** | Phase 2's last bullet — the roadmap's `libc` item, which this RFC resolves into a personality rather than a library |
+| **Depends on** | RFC 0008 (the native ABI this must never leak into), RFC 0013 (the service domain it runs as), RFC 0015/0016 (the filesystems Tier 1 translates onto), RFC 0018/0020/0027 (the network Tier 2 translates onto), RFC 0026 (the telemetry plane the `-ENOSYS` log rides). [RFC 0003](0003-storage-architecture.md)/[RFC 0004](0004-ot-security-gateway.md) remain drafts and remain motivation, not dependencies |
+
+---
+
+## The machine this now lands on (revision of 2026-08-19)
+
+This RFC was drafted when Bhaskix was at M4 — no user mode, no filesystem, no network.
+Every prerequisite it named has since shipped, and three of its guesses are now facts
+with numbers:
+
+- **User mode, domains, capabilities** (M5, RFC 0017): domains are cheap enough that
+  question 4's "how heavy do domains turn out to be" has an answer — a supervisor
+  creates, grants, starts and reaps one in ring 3 as a demonstration. Per-process
+  personality domains are affordable; the question stays open only on isolation grounds.
+- **The ELF loader** (M6, RFC 0028): static ELF64, fuzz-hardened through 10.97 billion
+  executions, extracted to a leaf crate three consumers share. The loader half of "the
+  initial process image" exists; the auxv/stack builder does not.
+- **Filesystems** (RFC 0015/0016) and **network including sockets** (RFC 0018–0029):
+  Tier 1 and Tier 2 translate onto real services now, not planned ones. The sequencing
+  note "Tier 2 cannot start before the Phase 2 network stack exists" is satisfied.
+- **The telemetry plane** (RFC 0026) is exactly the `-ENOSYS` logging channel the
+  failure-behaviour section asked for, typed events and all.
+- **Packages** (RFC 0030): the corpus programs this RFC's testing plan defines can ship
+  as installable packages with manifests stating their authority — a Linux-personality
+  domain's manifest names what the personality may translate onto, which is rule 2 made
+  reviewable.
+
+**What has not changed**: the three rules, the tension with RFC 0003, the tiering, the
+three hard parts, and the refusals. **What is still owed from outside**: the motivating
+workload's trace (implementation step 1) — the tiers stay provisional until a real
+binary's histogram exists, and the public corpus is the work queue in the meantime.
 
 ---
 
