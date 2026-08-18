@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | ✅ **Accepted 2026-08-19**, drafted and all six steps implemented across two days — accepted on the working demonstration: the boot image a deterministic function of the package set (byte-compared twice on every build, the fourteen boot programs' authority written down and shipped beside them), and the whole install/list/duplicate-refused/run/over-ask-refused/remove/refused-rerun/reinstall arc one typed conversation at a live shell, every reply asserted, every operation priced through the journal. The central design claim held at the letter: the kernel gained no method and no object. Question 3 answered at step 2 (`fs.img` stays `mkfs`'s — two tools, one image); question 2 measured at step 6 (zero per-utility kernel edits — met; three Makefile stanzas — approached, one build-system refactor away); question 1 (does the kernel's own bring-up read these manifests) stays open as the RFC left it, deliberately. The refusals keep their written triggers, and install-time scripts stay refused flat |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/shell`, `bin/sup`), fs, tools, new leaf crate `pkg/` |
 | **Milestone** | Phase 2 — the "package management and image building" bullet, one of the two left on the phase's list |

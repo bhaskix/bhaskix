@@ -237,8 +237,8 @@ derived from what their manifests ask. What remains is libc.
   kernel-side INIT-SIPI), and **the full Limine-lane gate set answered natively** — 74 gates
   green on both loaders, plus the loader-specific lane's 23 and its permanent negative arm.
   Limine remains as the second lane, exactly as the RFC keeps it
-- ✅ **Package management and image building** — [RFC 0030](rfc/0030-packages.md), all six
-  steps implemented 2026-08-19 (acceptance pending). A package is a program plus the
+- ✅ **Package management and image building** — [RFC 0030](rfc/0030-packages.md), accepted
+  2026-08-19, all six steps. A package is a program plus the
   authority it asks for, in one reviewable file: the boot image is a deterministic
   function of `packages/*.manifest.in` (assembled twice and byte-compared every build,
   the fourteen boot programs' authority written down and shipped), and `pkg
