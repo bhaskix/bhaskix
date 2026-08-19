@@ -43,6 +43,8 @@ dependencies = [
  "bhaskix-elf",
  "bhaskix-kernel",
  "bhaskix-net",
+ "bhaskix-personality",
+ "bhaskix-pkg",
  "bhaskix-service-vfs",
  "libfuzzer-sys",
 ]
@@ -58,6 +60,7 @@ dependencies = [
  "bhaskix-elf",
  "bhaskix-fs",
  "bhaskix-mm",
+ "bhaskix-personality",
  "bhaskix-rand",
  "bhaskix-service",
  "bhaskix-service-console",
@@ -75,6 +78,17 @@ dependencies = [
 [[package]]
 name = "bhaskix-net"
 version = "0.0.0"
+
+[[package]]
+name = "bhaskix-personality"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-pkg"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-ustar",
+]
 
 [[package]]
 name = "bhaskix-rand"
@@ -101,10 +115,15 @@ version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
  "bhaskix-service",
+ "bhaskix-ustar",
 ]
 
 [[package]]
 name = "bhaskix-telemetry"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-ustar"
 version = "0.0.0"
 
 [[package]]

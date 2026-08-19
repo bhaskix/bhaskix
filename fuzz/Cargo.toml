@@ -29,6 +29,7 @@ bhaskix-service-vfs = { path = "../services/vfs" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-net = { path = "../net" }
 bhaskix-pkg = { path = "../pkg" }
+bhaskix-personality = { path = "../personality" }
 
 [[bin]]
 name = "elf_parse"
@@ -141,6 +142,16 @@ bench = false
 [[bin]]
 name = "tcp_state"
 path = "fuzz_targets/tcp_state.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 0005 Tier 2's mandatory target: a `sockaddr` and an `epoll_event` are
+# bytes a hosted process wrote, at a length it chose. See the target's own
+# documentation for the two properties it asserts beyond "does not crash".
+[[bin]]
+name = "linux_sockaddr"
+path = "fuzz_targets/linux_sockaddr.rs"
 test = false
 doc = false
 bench = false

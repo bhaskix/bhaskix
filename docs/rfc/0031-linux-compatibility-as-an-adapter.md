@@ -241,6 +241,15 @@ The correction has a shape and a trigger, and deliberately does not happen this 
   `/proc`). Tier 1 is where the adapter starts holding per-process *state* — descriptor tables,
   path resolution, a `/proc` view — and moving stateful code is dearer than moving stateless code
   by an order of magnitude.
+
+  > **Strengthened 2026-08-19 by RFC 0005 step 9, from advisable to required.** Tier 2 is not
+  > merely unpleasant to build in ring 0 — it is **not buildable there**. `bhaskix-sock`, the
+  > sockets API every networked program here speaks, is a ring 3 client: every call in it ends in
+  > a `syscall` instruction, because a UDP socket is a badged capability from `bin/ipd` and a TCP
+  > connection is RFC 0022's three-leg handover with `bin/tcpd`. A hosted `connect()` has to become
+  > one of those calls, made on the process's behalf — and the code that would make it is currently
+  > the kernel, which would have to become an IPC client of its own services. The trigger does not
+  > move; it now has a second reason under it, and the second one is not a judgement call.
 - **Shape:** I1's frame becomes a real message to a domain; `foreign_*` moves to `bin/linuxd`
   behind the existing `personality/` crate; the memory calls become RFC 0009 `Memory` operations on
   the hosted domain's space; the signal frame is built by the adapter and installed through a

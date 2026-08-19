@@ -3178,9 +3178,56 @@ fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // judged the wrong dialect, and that is a different bug from a clone
     // that did not conclude.
     let foreign_before = syscall::FOREIGN_CALLS.load(Ordering::Relaxed);
+
+    // **Attempts, because the rendezvous this proves is a race the probe
+    // can lose without anything being wrong.** The child yields twice and
+    // spins to let the parent reach its `FUTEX_WAIT` first, but on a loaded
+    // emulated machine the parent can be delayed past that. When it is, the
+    // child's write lands before the parent evaluates the wait's condition,
+    // the parent correctly does not sleep at all, and the child's `WAKE`
+    // correctly finds nobody: `wait 0, woke 0` is *right*, and it is not the
+    // thing this test exists to demonstrate, which is that a wait **blocks**
+    // and a wake **releases** it.
+    //
+    // Retrying is the honest fix, and the alternative was considered and
+    // rejected: no amount of user-mode delay can *guarantee* the parent is
+    // asleep, because the only thing that knows is the kernel and the probe
+    // cannot ask it without a syscall invented for the test. So the race is
+    // detected -- `woke == 0` with a wait that returned 0 -- and run again.
+    // Seen once in a full suite on 2026-08-19, at which point the gate
+    // failed on a machine whose kernel had done nothing wrong.
+    for attempt in 1..=3u32 {
+        match clone_rendezvous_attempt(hhdm_base, CPU, foreign_before, attempt) {
+            Some(outcome) => return outcome,
+            None => continue,
+        }
+    }
+    println!(
+        "\x1b[91m    linux clone    FAILED: three attempts and the child won the race every \
+         time, so the sleeping path was never exercised\x1b[0m"
+    );
+    false
+}
+
+/// One clone-and-rendezvous attempt.
+///
+/// Answers `None` when the attempt *raced* — the parent never slept, so
+/// there was nothing for the child to wake — and `Some` with the verdict
+/// otherwise. See [`clone_self_test`] for why that distinction exists.
+fn clone_rendezvous_attempt(
+    hhdm_base: u64,
+    cpu: u32,
+    foreign_before: u64,
+    attempt: u32,
+) -> Option<bool> {
+    use core::sync::atomic::Ordering;
+
+    // Each attempt builds its own space and republishes the report page, so
+    // the previous attempt's address must not be read as this one's.
+    CLONE_REPORT_PA.store(0, Ordering::Release);
     let Ok(realm) = domain::create("clone", domain::ResourceEnvelope::new()) else {
         println!("\x1b[91m    linux clone    FAILED: no domain\x1b[0m");
-        return false;
+        return Some(false);
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
@@ -3188,14 +3235,14 @@ fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
     .is_none()
     {
         println!("\x1b[91m    linux clone    FAILED: the tag would not set\x1b[0m");
-        return false;
+        return Some(false);
     }
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
-    if sched::spawn_on_with(CPU, "clone", ring3_clone, hhdm_base, hhdm_base, options).is_err() {
+    if sched::spawn_on_with(cpu, "clone", ring3_clone, hhdm_base, hhdm_base, options).is_err() {
         println!("\x1b[91m    linux clone    FAILED: the probe would not spawn\x1b[0m");
-        return false;
+        return Some(false);
     }
 
     const MARKER: u64 = u64::from_le_bytes(*b"ETUFXKHB");
@@ -3230,19 +3277,35 @@ fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // The parent's view of the tid, its wait's answer, the word the child
     // set, the child's own tid, and how many the child's wake found.
     let [parent_saw, wait_answer, word, child_tid, woke] = answers;
+
+    // The race, before the verdict. Everything went right *except* that the
+    // parent never had to sleep, so the wake had nobody to find. Reported
+    // and retried rather than passed: a run in which nothing blocked has not
+    // shown what this test claims to show.
+    if marked && wait_answer == 0 && word == 42 && woke == 0 {
+        println!(
+            "\x1b[93m    linux clone    attempt {attempt}: the child won the race, so the \
+             parent never slept and the wake found nobody -- correct, and not the proof \
+             wanted; trying again\x1b[0m"
+        );
+        return None;
+    }
+
     let right = marked
         && parent_saw > 0
         && child_tid > 0
         && parent_saw == child_tid
         && wait_answer == 0
-        && word == 42;
+        && word == 42
+        && woke == 1;
     if right {
         println!(
             "    linux clone    a Linux program cloned a thread (tid {parent_saw}, which the \
              child agrees is its own), then the two met through a futex: the parent slept, the \
-             child set the word to 42 and woke {woke}, and the parent came back"
+             child set the word to 42 and woke {woke}, and the parent came back (attempt \
+             {attempt})"
         );
-        true
+        Some(true)
     } else {
         let foreign = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - foreign_before;
         println!(
@@ -3250,7 +3313,7 @@ fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
              child tid {}, woke {}, {foreign} foreign calls\x1b[0m",
             marked, parent_saw as i64, wait_answer as i64, word, child_tid as i64, woke as i64
         );
-        false
+        Some(false)
     }
 }
 

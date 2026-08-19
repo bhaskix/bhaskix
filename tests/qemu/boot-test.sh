@@ -1240,6 +1240,13 @@ fi
 # refused -- one thread cannot prove that a wait blocks and a wake releases
 # it, and the RFC is explicit that a subtly wrong futex produces a deadlock
 # under load rather than an error.
+#
+# `woke 1` is demanded and not relaxed, because it is the only word in that
+# sentence that says the parent actually *slept*. A run where the child wins
+# the race reports `wait 0, woke 0` -- which is correct behaviour and no
+# proof of anything -- so the self-test detects that case and runs the whole
+# rendezvous again rather than reporting it as success. Seen once in a full
+# suite on 2026-08-19, on a kernel that had done nothing wrong.
 if grep -qE "linux clone +a Linux program cloned a thread \(tid [1-9][0-9]*, which the child agrees is its own\), then the two met through a futex: the parent slept, the child set the word to 42 and woke 1" "$LOG"; then
     pass "clone makes a real thread, and the futex pairs a sleeper with a waker"
 else

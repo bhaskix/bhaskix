@@ -17,7 +17,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![forbid(unsafe_code)]
 
+pub mod event;
+pub mod file;
 pub mod memory;
 pub mod signal;
+pub mod socket;
 pub mod stack;
 pub mod thread;

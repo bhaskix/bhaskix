@@ -353,6 +353,14 @@ for the `/sys` probes, then `nanosleep`.
 
 ## Step 8's record (2026-08-19): `mprotect` exists, hints are honoured, and the Go allocator still says no
 
+> **Correction, 2026-08-19: this section is numbered wrong, and the number is
+> left alone so the commits and the tracker still match it.** Its content —
+> `mprotect` and `mmap` hints — is **step 5's**, finished late because step 7
+> was what revealed it was unfinished. The implementation plan's step 8 is
+> *Tier 1*: files, directories, synthetic `/proc`. That has not started. The
+> plan below is the authority on what a step number means; these record
+> sections are numbered by the order the work happened.
+
 Two real improvements, both host-tested and both gated by the corpus rather than by a probe:
 `mprotect` is implemented over the region map — **whole regions only**, which covers the
 pattern Go uses (reserve `PROT_NONE`, then make the whole of it writable) and refuses a
@@ -372,6 +380,91 @@ address's relationship to its arena hints being the first suspect, and the secon
 `munmap`/re-`mmap` sequence whose second half this personality answers differently from
 Linux. **Two full-boot cycles of guesswork produced less than one traced argument list**,
 which is this RFC's own instruction restated: trace the binary, do not reason about it.
+
+## Step 9's record (2026-08-19): Tier 2's arithmetic lands, and its wiring is proved impossible where the personality currently lives
+
+**The finding first, because it changes something outside this RFC.** Tier 2 —
+sockets and `epoll` — **cannot be implemented from inside the nucleus at all**,
+and that is a fact about the tree rather than a preference about design. The
+evidence is one crate: `bhaskix-sock`, the sockets API every networked program
+here already speaks, is a **ring 3 client**. Every call in it ends in a
+`syscall` instruction, because a UDP socket is a badged capability from
+`bin/ipd` and a TCP connection is RFC 0022's three-leg handover with `bin/tcpd`.
+For a hosted `connect()` to mean anything, something must *make those calls on
+the process's behalf* — and the thing that would make them is currently kernel
+code, which would have to become an IPC client of its own services to do it.
+
+So [RFC 0031](0031-linux-compatibility-as-an-adapter.md) §5's relocation stops
+being the advisable thing and becomes the **prerequisite**. That RFC set the
+trigger at "before Tier 1's file surface", reasoning that Tier 1 is where the
+adapter starts holding per-process state. Tier 2 sharpens it: Tier 1 would be
+*unpleasant* to build in ring 0, and Tier 2 is not buildable there. The trigger
+stands where it is and now has a second reason under it.
+
+**What did land, and it is the half that survives the move unchanged.** Tier 2's
+arithmetic, in the crate that has never held authority and never will —
+`no_std`, `#![forbid(unsafe_code)]`, 55 host tests where there were 29:
+
+- **`personality::file`** — the descriptor table, which is *Tier 2's*
+  prerequisite as much as Tier 1's: a socket is a descriptor, an `epoll` set is
+  a descriptor, and `epoll_ctl` names what it watches by descriptor. Linux's
+  allocation rule is implemented and tested as the rule it is — **the lowest
+  free number**, which is what makes a shell's `close(0); open(file)` redirect
+  standard input rather than open descriptor 4. Plus `openat` flag decoding
+  (with `O_DIRECT`, `O_ASYNC`, `O_PATH` and `O_TMPFILE` refused rather than
+  ignored, each saying why), `struct stat` and `getdents64` record layout.
+- **`personality::socket`** — `sockaddr_in`/`sockaddr_in6` in both directions,
+  and `socket()` argument decoding whose refusals are RFC 0031's invariants
+  doing their job: a raw or packet socket is a request for the network device's
+  own authority and is refused `EPERM`, and `AF_UNIX` is a request for the
+  global namespace RFC 0016 deleted.
+- **`personality::event`** — `epoll` registration, one-shot arming, and
+  reporting.
+
+**Three facts in that list are ones a personality gets wrong from memory, so
+none of them came from memory.** `struct stat`'s 144 bytes and field offsets,
+`sockaddr_in6`'s 28, and `struct epoll_event`'s **twelve** — packed, with its
+eight-byte `data` word at offset 4 and therefore unaligned — were taken from
+*this machine's own headers*, by a program compiled against `<sys/stat.h>`,
+`<netinet/in.h>` and `<sys/epoll.h>` printing `offsetof` and `sizeof`. The
+`epoll` one is the trap worth naming: every natural way to write that structure
+in a language with alignment produces sixteen bytes, and the symptom is a server
+that wakes for the wrong connection, because `data` is how a program knows which
+one.
+
+**Armed, because a test that has never failed proves nothing.** Setting
+`EVENT_BYTES` to 16 and `EVENT_DATA_AT` to 8 turned the layout and data-word
+tests red and left the behavioural ones green — which is itself the lesson:
+only a test that reads the bytes catches a byte-layout bug. Reading the port
+little-endian turned both `sockaddr` round trips red. Both reverted.
+
+**And the fuzz target the RFC makes mandatory exists and was armed too.**
+`fuzz/fuzz_targets/linux_sockaddr.rs` drives `parse_endpoint` with a
+caller-claimed length taken from the input — so the disagreement between what a
+process *says* it passed and what it *did* pass is reachable in one byte rather
+than by chance — and asserts two properties beyond "does not crash": an accepted
+address never fits in fewer bytes than its family needs, and writing an accepted
+address back reproduces it exactly. **67.9 million executions in five minutes,
+no crash, no hang, no artifact.** Then the v4 length check was loosened from 16
+bytes to 8, and the target found it in under a minute — reported as the property
+assertion it violated, not as a crash.
+
+**A racy instrument was found and fixed on the way, and the kernel was innocent.** The clone/futex
+gate went red in a full suite with `wait 0, woke 0`: the child won the race to the shared word, so
+the parent's `FUTEX_WAIT` found its condition already true and correctly never slept, and the
+child's `FUTEX_WAKE` correctly found nobody. The window is a few instructions wide — between the
+wait's first compare and its re-check under the queue lock — and **no user-mode delay closes it**,
+because the only thing that knows whether the parent is asleep is the kernel and the probe cannot
+ask without a syscall invented for the test. The self-test now detects that outcome and runs the
+whole rendezvous again, up to three times, rather than reporting it as success; the gate still
+demands `woke 1`, because that is the only word in its sentence that says the parent slept. This
+is step 6's instrument, not step 9's, and it is written down here because this is where it was
+found.
+
+**What is not done, stated as plainly as what is:** no hosted program has opened
+a file, made a socket or waited on an `epoll` set. Nothing above is reachable
+from ring 3 yet, and it will not be until the personality is where this RFC has
+always said it belongs.
 
 ## Design
 
