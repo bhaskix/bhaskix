@@ -1684,6 +1684,101 @@ mod linux {
     pub const RT_SIGRETURN: u64 = 15;
     /// `sigaltstack(ss, old_ss)`.
     pub const SIGALTSTACK: u64 = 131;
+    /// `mmap(addr, length, prot, flags, fd, offset)`.
+    pub const MMAP: u64 = 9;
+    /// `mprotect(addr, length, prot)`.
+    pub const MPROTECT: u64 = 10;
+    /// `munmap(addr, length)`.
+    pub const MUNMAP: u64 = 11;
+    /// `madvise(addr, length, advice)`.
+    pub const MADVISE: u64 = 28;
+}
+
+/// Where the personality places a mapping when the caller says "anywhere".
+///
+/// A bump, downward from a fixed base well clear of anything an image or a
+/// stack occupies. Not an allocator: a hosted program that unmaps and remaps
+/// will drift upward in address space until it runs out, which is a stated
+/// narrowing rather than a bug hiding — the trigger for a real region
+/// allocator is the first program that churns mappings, and Go's heap grows
+/// monotonically enough not to be it.
+static MMAP_NEXT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x0000_7000_0000_0000);
+
+/// Answers the Linux memory calls over the region map — RFC 0005 step 5.
+///
+/// The decoding is `bhaskix_personality::memory`'s and host-tested there;
+/// what happens here is the mapping itself, in the *calling* domain's own
+/// address space, which is the whole of rule 2: the personality maps memory
+/// the caller already has a domain to hold, and can no more conjure a frame
+/// than any other program can.
+fn foreign_memory_call(frame: &mut SyscallFrame) -> Option<u64> {
+    use bhaskix_personality::memory::{self, MapPlan};
+
+    let (first, second, third) = (frame.capability, frame.method, frame.arg0);
+    match frame.kind {
+        linux::MMAP => {
+            let plan = memory::plan_mmap(first, second, third, frame.arg1, frame.arg2 as i64);
+            let MapPlan::Map {
+                at,
+                pages,
+                read,
+                write,
+                execute,
+            } = plan
+            else {
+                let MapPlan::Refuse(errno) = plan else {
+                    return None;
+                };
+                return Some(errno as u64);
+            };
+            let protection = match (read, write, execute) {
+                (_, true, _) => bhaskix_mm::Protection::ReadWrite,
+                (_, _, true) => bhaskix_mm::Protection::ReadExecute,
+                (true, _, _) => bhaskix_mm::Protection::ReadOnly,
+                _ => bhaskix_mm::Protection::None,
+            };
+            let bytes = pages.checked_mul(memory::PAGE)?;
+            let address = match at {
+                Some(address) => address,
+                None => MMAP_NEXT.fetch_add(bytes, Ordering::Relaxed),
+            };
+            let range = bhaskix_mm::VirtRange::from_pages(bhaskix_boot::VirtAddr(address), pages)?;
+            // Lazily: a hosted program that asks for a gigabyte and touches
+            // a page should pay for a page, which is what Go's allocator
+            // assumes and what the fault handler already provides.
+            let mapped =
+                crate::vm::with_active(|space| space.map_anonymous_lazy(range, protection).is_ok());
+            match mapped {
+                Some(true) => Some(address),
+                _ => Some(memory::errno::ENOMEM as u64),
+            }
+        }
+        linux::MUNMAP => match memory::plan_munmap(first, second) {
+            Ok((address, _pages)) => {
+                let removed = crate::vm::with_active(|space| {
+                    space.unmap(bhaskix_boot::VirtAddr(address)).is_ok()
+                });
+                // A range that was not mapped is not an error worth
+                // distinguishing: Linux's `munmap` succeeds on unmapped
+                // pages, and a program tidying up should not have to
+                // remember what it still holds.
+                let _ = removed;
+                Some(0)
+            }
+            Err(errno) => Some(errno as u64),
+        },
+        linux::MPROTECT => {
+            // Changing protection on a live region needs the region map to
+            // split and re-enter ranges, which it does not offer yet.
+            // Refused with `ENOSYS` rather than answered `0`: a program told
+            // its pages are now read-only, and then able to write them, is
+            // worse off than one told the call does not exist.
+            Some(memory::errno::ENOSYS as u64)
+        }
+        linux::MADVISE => Some(memory::plan_madvise() as u64),
+        _ => None,
+    }
 }
 
 /// Reads a Linux `struct sigaction` out of a hosted process's memory.
@@ -1797,6 +1892,12 @@ fn foreign_call(frame: &mut SyscallFrame) {
     if let Some(domain) = crate::sched::current_domain()
         && let Some(value) = foreign_signal_call(frame, domain.as_u32())
     {
+        frame.kind = value;
+        return;
+    }
+
+    // The memory calls, RFC 0005 step 5, over this domain's own space.
+    if let Some(value) = foreign_memory_call(frame) {
         frame.kind = value;
         return;
     }

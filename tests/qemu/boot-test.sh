@@ -1235,6 +1235,17 @@ fi
 # The numbers are recorded, not gated -- a slow host is not a broken kernel --
 # but a networked boot that produced none measured nothing, and that is a
 # failure of the instrument.
+# RFC 0005 step 5: the memory calls over the region map -- which already
+# makes W^X unrepresentable, so a request for both is refused rather than
+# quietly downgraded. The probe writes into the *second* page of what it
+# mapped, so the lazy commit has to reach past the first, and unmaps.
+if grep -qE "linux memory +a Linux program mapped two anonymous pages at 0x[0-9a-f]+, wrote and read 42 in the second" "$LOG"; then
+    pass "a Linux program maps, uses and unmaps memory through the region map"
+else
+    fail "the Linux memory self-test did not conclude"
+    status=1
+fi
+
 # RFC 0005 step 4: signals, the part the RFC says to build first because it
 # is where the design is most likely to be wrong. A Linux program installs a
 # SIGSEGV handler, faults on purpose, reads cr2 out of the ucontext it was

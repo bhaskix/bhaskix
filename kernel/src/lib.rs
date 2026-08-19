@@ -532,6 +532,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux signal   FAILED\x1b[0m");
     }
+    if !memory_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux memory   FAILED\x1b[0m");
+    }
     frames_report();
     tickless_report();
     // Late on purpose: by here the self-tests above have poured real
@@ -2698,6 +2704,178 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// Where the foreigner's report page lands physically, told by the thread
 /// that mapped it so the test can read the answers through the direct map.
 static FOREIGNER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the memory probe's report page lands physically.
+static MEMORY_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the memory probe's code, stack and report live.
+const MEMORY_CODE_AT: u64 = 0x0000_0000_4000_0000;
+const MEMORY_STACK_AT: u64 = 0x0000_0000_4001_0000;
+const MEMORY_REPORT_AT: u64 = 0x0000_0000_4002_0000;
+
+/// The memory probe, hand-assembled: RFC 0005 step 5's witness. It asks for
+/// two anonymous pages, writes a pattern into the **second** one (so the
+/// lazy commit has to reach past the first), reads it back, unmaps the
+/// range, and gives `madvise` its advice. Each answer lands in the report.
+const MEMORY_CODE: [u8; 116] = [
+    0x49, 0x89, 0xff, // mov r15, rdi          ; report page
+    0x31, 0xff, // xor edi, edi          ; addr = NULL
+    0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192         ; length
+    0xba, 0x03, 0x00, 0x00, 0x00, // mov edx, 3            ; PROT_READ|WRITE
+    0x41, 0xba, 0x22, 0x00, 0x00, 0x00, // mov r10d, 0x22        ; PRIVATE|ANONYMOUS
+    0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov r8, -1            ; fd
+    0x4d, 0x31, 0xc9, // xor r9, r9            ; offset
+    0xb8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9            ; mmap
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x07, // mov [r15], rax        ; report the address
+    0x48, 0x89, 0xc3, // mov rbx, rax          ; keep it
+    0x48, 0x85, 0xc0, // test rax, rax
+    0x78, 0x41, // js done               ; refused: leave proof zero
+    0x48, 0xc7, 0x83, 0x00, 0x10, 0x00, 0x00, 0x2a, 0x00, 0x00,
+    0x00, // mov qword [rbx+0x1000], 42
+    0x48, 0x8b, 0x83, 0x00, 0x10, 0x00, 0x00, // mov rax, [rbx+0x1000]
+    0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax      ; report what read back
+    0x48, 0x89, 0xdf, // mov rdi, rbx
+    0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192
+    0xb8, 0x0b, 0x00, 0x00, 0x00, // mov eax, 11           ; munmap
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x10, // mov [r15+16], rax     ; report munmap's answer
+    0x48, 0x89, 0xdf, // mov rdi, rbx
+    0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192
+    0xba, 0x04, 0x00, 0x00, 0x00, // mov edx, 4
+    0xb8, 0x1c, 0x00, 0x00, 0x00, // mov eax, 28           ; madvise
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x18, // mov [r15+24], rax     ; report it
+    0xeb, 0xfe, // done: jmp $
+];
+
+/// The thread that becomes RFC 0005 step 5's witness.
+extern "C" fn ring3_memory(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, pages, protection) in [
+        (MEMORY_CODE_AT, 1, Protection::ReadExecute),
+        (MEMORY_STACK_AT, 2, Protection::ReadWrite),
+        (MEMORY_REPORT_AT, 1, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), pages) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let (Some(code_pa), Some(report_pa)) = (
+        space.translate(VirtAddr(MEMORY_CODE_AT)),
+        space.translate(VirtAddr(MEMORY_REPORT_AT)),
+    ) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the
+    // direct map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            MEMORY_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            MEMORY_CODE.len(),
+        );
+    }
+    MEMORY_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is in the user-executable page just written, `rsp`
+    // one past two user-writable stack pages.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            MEMORY_CODE_AT,
+            MEMORY_STACK_AT + 2 * 4096,
+            [MEMORY_REPORT_AT, 0],
+        )
+    }
+}
+
+/// RFC 0005 step 5's witness: a Linux program maps memory, uses the page the
+/// lazy commit had to reach for, unmaps it, and is given advice-taking
+/// silence by `madvise`.
+fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux memory   skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("mmap", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux memory   FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_none()
+    {
+        println!("\x1b[91m    linux memory   FAILED: the tag would not set\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "mmap", ring3_memory, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux memory   FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+
+    let mut answers = [0u64; 4];
+    let mut report_pa = 0;
+    for _ in 0..400 {
+        report_pa = MEMORY_REPORT_PA.load(Ordering::Acquire);
+        if report_pa != 0 {
+            // SAFETY: a frame the probe's space owns, through the direct map.
+            answers = unsafe {
+                [
+                    core::ptr::read_volatile((hhdm_base + report_pa) as *const u64),
+                    core::ptr::read_volatile((hhdm_base + report_pa + 8) as *const u64),
+                    core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
+                    core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
+                ]
+            };
+            if answers[1] == 42 {
+                break;
+            }
+        }
+        wait_millis(5);
+    }
+    domain::destroy(realm);
+    signal::forget(realm.as_u32());
+
+    // A plausible address, the pattern read back out of the second page,
+    // and both of the calls that answer zero having answered zero.
+    let mapped_somewhere = answers[0] >= 0x0000_7000_0000_0000 && answers[0] % 4096 == 0;
+    if report_pa != 0 && mapped_somewhere && answers[1] == 42 && answers[2] == 0 && answers[3] == 0
+    {
+        println!(
+            "    linux memory   a Linux program mapped two anonymous pages at {:#x}, wrote and \
+             read 42 in the second (so the lazy commit reached it), unmapped them, and had its \
+             madvise taken as advice",
+            answers[0]
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux memory   FAILED: mmap {:#x}, read back {}, munmap {}, madvise \
+             {}\x1b[0m",
+            answers[0], answers[1], answers[2] as i64, answers[3] as i64
+        );
+        false
+    }
+}
 
 /// Where the signal probe's report page lands physically.
 static SIGNAL_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

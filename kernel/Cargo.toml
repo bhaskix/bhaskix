@@ -291,7 +291,10 @@ workspace = true
 # (the frame out to the process's own stack, the sigcontext back in) and the
 # sigaction/sigaltstack reads. Every one is `uaccess`, which is the routine
 # whose whole contract is that a bad user pointer is ordinary input.
-unsafe_budget = 1371
+#
+# 1390 at RFC 0005 step 5 (2026-08-19): the memory witness -- its page fills,
+# ring 3 entry, and the four report words read back.
+unsafe_budget = 1394
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

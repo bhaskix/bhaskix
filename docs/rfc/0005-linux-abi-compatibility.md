@@ -231,6 +231,25 @@ for every compiled handler; the trigger for saving the full register file across
 stub is the first handler that deliberately edits a callee-saved register in the
 `ucontext` and expects it to take.
 
+## Step 5's record (2026-08-19): memory, and the refusal W^X makes for us
+
+`mmap`, `munmap` and `madvise` are answered; the decoding is host-tested
+arithmetic (`bhaskix-personality::memory`, nineteen tests) and the mapping happens in the
+calling domain's own address space, which is rule 2 in one sentence: the personality maps
+memory the caller already has a domain to hold. **`W^X` is not a check this layer
+performs** — `Protection` has no writable-executable variant, so a request for both is
+refused with `EACCES` rather than silently granted one half, which is the answer that
+would matter. Mappings are lazy, and the witness proves it by writing into the *second*
+page of what it asked for. Refused with reasons rather than half-done: file mappings and
+shared anonymous memory (`ENOSYS` — a domain shares by capability, not by a flag), and
+`mprotect` (`ENOSYS`, because the region map cannot split a live range yet, and a program
+told its pages are read-only while it can still write them is worse off than one told the
+call does not exist). `madvise` answers **zero**, deliberately: advice a kernel declines
+to follow is not an error, and `-ENOSYS` there makes Go's allocator take a slower path
+for nothing. Two stated narrownesses: placement is a downward bump, not an allocator (the
+trigger is the first program that churns mappings), and `munmap` succeeds on unmapped
+pages exactly as Linux's does.
+
 ## Design
 
 ### Where it lives
