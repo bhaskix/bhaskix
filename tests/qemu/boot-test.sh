@@ -1235,6 +1235,17 @@ fi
 # The numbers are recorded, not gated -- a slow host is not a broken kernel --
 # but a networked boot that produced none measured nothing, and that is a
 # failure of the instrument.
+# RFC 0005 step 6: the futex contract's edges, which is where the RFC says a
+# subtle mistake does not produce an error but a deadlock under load. A WAIT
+# whose word has already changed must refuse to sleep; a WAKE with nobody
+# asleep must wake none; a shared futex and a clone are refused with reasons.
+if grep -qE "linux futex +a Linux program asked its tid \([1-9][0-9]*\) and pid \([1-9][0-9]*\), yielded, and met the futex contract's edges" "$LOG"; then
+    pass "the futex contract holds at its edges, and the identity calls answer"
+else
+    fail "the Linux futex self-test did not conclude"
+    status=1
+fi
+
 # RFC 0005 step 5: the memory calls over the region map -- which already
 # makes W^X unrepresentable, so a request for both is refused rather than
 # quietly downgraded. The probe writes into the *second* page of what it
@@ -1278,7 +1289,7 @@ fi
 # number -- the tag is refused once a thread exists, and it dies with the
 # domain. The self-test asserts the exact sequence its probe issued; this
 # gate asserts the self-test ran and concluded.
-if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit_group: each answered ENOSYS, [1-9] foreign calls logged" "$LOG"; then
+if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit_group: the first answered, the other two ENOSYS, [1-9] foreign calls logged" "$LOG"; then
     pass "a Linux-tagged domain is refused in Linux's own dialect, and logged"
 else
     fail "the personality self-test did not conclude"

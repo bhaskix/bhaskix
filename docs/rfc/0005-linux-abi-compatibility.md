@@ -250,6 +250,45 @@ for nothing. Two stated narrownesses: placement is a downward bump, not an alloc
 trigger is the first program that churns mappings), and `munmap` succeeds on unmapped
 pages exactly as Linux's does.
 
+## Step 6's record (2026-08-19): futex holds at its edges; `clone` is refused, and that is the honest half
+
+**What works.** `futex(FUTEX_WAIT|FUTEX_WAKE, private)` over the kernel's own wait queues:
+the compare-and-sleep is exact (a word that already changed returns `EAGAIN` rather than
+sleeping through the wake that changed it), the condition is re-read under the queue's lock
+so the window between compare and sleep is closed, and a wake with nobody asleep wakes
+none. `gettid`, `getpid`, `sched_yield` and `exit_group` answer; ids are never zero, which
+runtimes treat as an error. Shared futexes are refused (`ENOSYS`) with a reason that is a
+design statement, not a gap: sharing here is a capability, not an address. The queues live
+outside the key table's lock — each carries its own — which is why the futex path adds no
+`unsafe` at all.
+
+**One defect worth the RFC's ink, because it is a shape this design invites.** The syscall
+entry decided "is this domain Linux-tagged" from the per-CPU telemetry hint — cheap, one
+relaxed load, and *wrong*: that hint is maintained on context switches, so a thread
+entering ring 3 for the first time can carry whichever domain last ran on the CPU. It
+passed every ordinary lane and went red only in the placement rebuilds, a hosted program's
+calls answered `BadSyscall` because they had been dispatched natively. Asking the
+scheduler instead was correct and put a runqueue lock on every system call in the machine
+— which promptly killed a shell lane with a kernel-mode fault. **The routing decision is
+per-thread and must be true, but it does not have to be expensive: `enter_user` sets the
+note at the one moment a thread becomes a user thread.** The rule for whoever extends
+this: the dialect is a property of the thread, and a per-CPU cache of it is only safe if
+something writes it where the property is established.
+
+**What does not, and why it is stated rather than approximated.** `clone` is **refused with
+`ENOSYS`**. The flag decoding is complete and host-tested (Go's exact set is recognised, a
+partial share is refused rather than approximated, `CLONE_NEWPID` is refused because a
+Linux process maps onto a domain and creating one is `START`'s business), but the mechanism
+to *enter ring 3 at a caller-chosen address on a caller-supplied stack, in an
+already-running domain*, does not exist in the scheduler's spawn path. A `clone` that
+returned a tid for a thread that never ran would be precisely the deadlock this step exists
+to avoid, so it returns a refusal a runtime can see. **Consequence, said plainly: Tier 0's
+corpus program 3 — ten thousand goroutines over channels — cannot pass until this lands,
+and neither can any Go program that creates an OS thread, which is most of them past
+startup.** The work is a new spawn entry point that takes a user entry and stack; it is
+the next thing to build, and it is why this step is recorded as half-delivered rather than
+done.
+
 ## Design
 
 ### Where it lives

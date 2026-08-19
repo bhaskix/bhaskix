@@ -538,6 +538,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux memory   FAILED\x1b[0m");
     }
+    if !thread_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux futex    FAILED\x1b[0m");
+    }
     frames_report();
     tickless_report();
     // Late on purpose: by here the self-tests above have poured real
@@ -2705,6 +2711,225 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// that mapped it so the test can read the answers through the direct map.
 static FOREIGNER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Where the thread probe's report page lands physically.
+static THREAD_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the thread probe's code, stack and report live.
+const THREAD_CODE_AT: u64 = 0x0000_0000_5000_0000;
+const THREAD_STACK_AT: u64 = 0x0000_0000_5001_0000;
+const THREAD_REPORT_AT: u64 = 0x0000_0000_5002_0000;
+
+/// The thread probe, hand-assembled: RFC 0005 step 6's witness. It asks its
+/// own thread and process ids, yields, and then exercises the futex
+/// contract's edges -- a `WAIT` whose word has already changed (which must
+/// *not* sleep), a `WAKE` with nobody asleep, a shared futex (refused), and
+/// a `clone` (refused, with the reason recorded in the RFC).
+const THREAD_CODE: [u8; 151] = [
+    0x49, 0x89, 0xff, // mov r15, rdi          ; report page
+    0xb8, 0xba, 0x00, 0x00, 0x00, // mov eax, 186          ; gettid
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x07, // mov [r15], rax
+    0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, 39           ; getpid
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax
+    0xb8, 0x18, 0x00, 0x00, 0x00, // mov eax, 24           ; sched_yield
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x10, // mov [r15+16], rax
+    0x49, 0xc7, 0x47, 0x40, 0x01, 0x00, 0x00, 0x00, // mov qword [r15+64], 1
+    0x4c, 0x89, 0xff, // mov rdi, r15
+    0x48, 0x83, 0xc7, 0x40, // add rdi, 64           ; &word
+    0xbe, 0x80, 0x00, 0x00, 0x00, // mov esi, 128          ; WAIT|PRIVATE
+    0x31, 0xd2, // xor edx, edx          ; expect 0, word is 1
+    0x4d, 0x31, 0xd2, // xor r10, r10          ; no timeout
+    0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202          ; futex
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x18, // mov [r15+24], rax     ; expect -EAGAIN
+    0xbe, 0x81, 0x00, 0x00, 0x00, // mov esi, 129          ; WAKE|PRIVATE
+    0xba, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+    0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x20, // mov [r15+32], rax     ; expect 0
+    0xbe, 0x00, 0x00, 0x00, 0x00, // mov esi, 0            ; WAIT, not private
+    0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x28, // mov [r15+40], rax     ; expect -ENOSYS
+    0xbf, 0x00, 0x01, 0x0f, 0x00, // mov edi, 0xf0100      ; Go's flag set (low)
+    0x81, 0xcf, 0x00, 0x00, 0x00, 0x00, // or edi, 0             ; (kept simple)
+    0xbe, 0x00, 0x80, 0x00, 0x00, // mov esi, 0x8000       ; a stack
+    0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56           ; clone
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x30, // mov [r15+48], rax     ; expect -ENOSYS
+    0x48, 0xb8, 0x45, 0x54, 0x55, 0x46, 0x58, 0x4b, 0x48, 0x42, // movabs rax, "BHKXFUTE"
+    0x49, 0x89, 0x47, 0x38, // mov [r15+56], rax     ; the marker, written last
+    0xeb, 0xfe, // jmp $
+];
+
+/// The thread that becomes RFC 0005 step 6's witness.
+extern "C" fn ring3_thread(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, pages, protection) in [
+        (THREAD_CODE_AT, 1, Protection::ReadExecute),
+        (THREAD_STACK_AT, 2, Protection::ReadWrite),
+        (THREAD_REPORT_AT, 1, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), pages) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let (Some(code_pa), Some(report_pa)) = (
+        space.translate(VirtAddr(THREAD_CODE_AT)),
+        space.translate(VirtAddr(THREAD_REPORT_AT)),
+    ) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the
+    // direct map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            THREAD_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            THREAD_CODE.len(),
+        );
+    }
+    THREAD_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // The domain note, for the same reason `enter_user` sets it: the syscall
+    // entry reads it to decide which ABI this thread speaks, and a thread
+    // entering ring 3 for the first time may not have been switched to on
+    // this CPU. These probes enter directly rather than through `enter_user`
+    // -- each builds its own space -- so each sets it. The memory probe found
+    // this by being answered `BadSyscall`; the futex probe had been passing
+    // on luck.
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
+    // SAFETY: the entry is in the user-executable page just written.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            THREAD_CODE_AT,
+            THREAD_STACK_AT + 2 * 4096,
+            [THREAD_REPORT_AT, 0],
+        )
+    }
+}
+
+/// RFC 0005 step 6's witness: the futex contract's edges, and the identity
+/// calls a runtime asks before it does anything else.
+fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux futex    skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("futex", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux futex    FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_none()
+    {
+        println!("\x1b[91m    linux futex    FAILED: the tag would not set\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "futex", ring3_thread, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux futex    FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+
+    // The marker, written last by the probe, is what says the seven words
+    // under it are its own. Without it this loop reads a frame that may
+    // have been recycled from an earlier domain and finds a plausible-looking
+    // set of numbers -- which is exactly what happened on the first run of
+    // this test, and is why every report page in this project is marked.
+    const MARKER: u64 = u64::from_le_bytes(*b"ETUFXKHB");
+    let mut answers = [0u64; 7];
+    let mut marked = false;
+    for _ in 0..400 {
+        let report_pa = THREAD_REPORT_PA.load(Ordering::Acquire);
+        if report_pa != 0 {
+            // SAFETY: a frame the probe's space owns, through the direct map.
+            let (marker, words) = unsafe {
+                (
+                    core::ptr::read_volatile((hhdm_base + report_pa + 56) as *const u64),
+                    [
+                        core::ptr::read_volatile((hhdm_base + report_pa) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 8) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 32) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 40) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 48) as *const u64),
+                    ],
+                )
+            };
+            if marker == MARKER {
+                answers = words;
+                marked = true;
+                break;
+            }
+        }
+        wait_millis(5);
+    }
+    domain::destroy(realm);
+    signal::forget(realm.as_u32());
+
+    let eagain = -11i64 as u64;
+    let enosys = -38i64 as u64;
+    // A tid and a pid that are never zero (a runtime treats zero as an
+    // error), a yield that answered, the compare-and-sleep refusing to
+    // sleep on a stale word, a wake with nobody asleep, and both refusals.
+    let right = marked
+        && answers[0] != 0
+        && answers[1] != 0
+        && answers[2] == 0
+        && answers[3] == eagain
+        && answers[4] == 0
+        && answers[5] == enosys
+        && answers[6] == enosys;
+    if right {
+        println!(
+            "    linux futex    a Linux program asked its tid ({}) and pid ({}), yielded, and \
+             met the futex contract's edges: a WAIT on a word that had already changed refused \
+             to sleep (EAGAIN), a WAKE with nobody asleep woke none, a shared futex and a clone \
+             were refused",
+            answers[0], answers[1]
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux futex    FAILED: tid {}, pid {}, yield {}, stale-wait {}, \
+             empty-wake {}, shared {}, clone {}\x1b[0m",
+            answers[0],
+            answers[1],
+            answers[2] as i64,
+            answers[3] as i64,
+            answers[4] as i64,
+            answers[5] as i64,
+            answers[6] as i64
+        );
+        false
+    }
+}
+
 /// Where the memory probe's report page lands physically.
 static MEMORY_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -2789,6 +3014,16 @@ extern "C" fn ring3_memory(hhdm_base: u64) -> ! {
     MEMORY_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
     // SAFETY: the higher half is copied from the running table.
     unsafe { vm::install(space) };
+    // The domain note, for the same reason `enter_user` sets it: the syscall
+    // entry reads it to decide which ABI this thread speaks, and a thread
+    // entering ring 3 for the first time may not have been switched to on
+    // this CPU. These probes enter directly rather than through `enter_user`
+    // -- each builds its own space -- so each sets it. The memory probe found
+    // this by being answered `BadSyscall`; the futex probe had been passing
+    // on luck.
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
     // SAFETY: the entry is in the user-executable page just written, `rsp`
     // one past two user-writable stack pages.
     unsafe {
@@ -2969,6 +3204,16 @@ extern "C" fn ring3_signal(hhdm_base: u64) -> ! {
     SIGNAL_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
     // SAFETY: the higher half is copied from the running table.
     unsafe { vm::install(space) };
+    // The domain note, for the same reason `enter_user` sets it: the syscall
+    // entry reads it to decide which ABI this thread speaks, and a thread
+    // entering ring 3 for the first time may not have been switched to on
+    // this CPU. These probes enter directly rather than through `enter_user`
+    // -- each builds its own space -- so each sets it. The memory probe found
+    // this by being answered `BadSyscall`; the futex probe had been passing
+    // on luck.
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
     // SAFETY: the entry is inside the user-executable page just written;
     // `rsp` is one past four user-writable stack pages -- the signal frame
     // is built below it, so the room is deliberate; `RSP0` was set by the
@@ -3174,6 +3419,16 @@ extern "C" fn ring3_foreigner(hhdm_base: u64) -> ! {
     FOREIGNER_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
     // SAFETY: the higher half is copied from the running table.
     unsafe { vm::install(space) };
+    // The domain note, for the same reason `enter_user` sets it: the syscall
+    // entry reads it to decide which ABI this thread speaks, and a thread
+    // entering ring 3 for the first time may not have been switched to on
+    // this CPU. These probes enter directly rather than through `enter_user`
+    // -- each builds its own space -- so each sets it. The memory probe found
+    // this by being answered `BadSyscall`; the futex probe had been passing
+    // on luck.
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
     // SAFETY: the entry is inside the user-executable page just written and
     // mapped; `rsp` is one past the user-writable report page in the same
     // space; `RSP0` for this CPU was set by the ring 3 test that ran first.
@@ -3280,6 +3535,16 @@ extern "C" fn ring3_auxv(hhdm_base: u64) -> ! {
     AUXV_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
     // SAFETY: the higher half is copied from the running table.
     unsafe { vm::install(space) };
+    // The domain note, for the same reason `enter_user` sets it: the syscall
+    // entry reads it to decide which ABI this thread speaks, and a thread
+    // entering ring 3 for the first time may not have been switched to on
+    // this CPU. These probes enter directly rather than through `enter_user`
+    // -- each builds its own space -- so each sets it. The memory probe found
+    // this by being answered `BadSyscall`; the futex probe had been passing
+    // on luck.
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
     // SAFETY: the entry is inside the user-executable page just written;
     // `rsp` points at the `argc` word of the image just built, which is
     // where Linux puts it; `RSP0` was set by the ring 3 test.
@@ -3479,7 +3744,12 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         ]
     };
     let enosys = -38i64 as u64;
-    let all_refused = answers.iter().all(|answer| *answer == enosys);
+    // `getpid` is *answered* since step 6 -- a domain-derived pid, never
+    // zero -- so the probe's first answer is a number and only the other two
+    // are refusals. This assertion said "all three refused" until step 6
+    // implemented one of them, which is the drift a self-test should catch
+    // in its own project rather than in someone else's runtime.
+    let all_refused = answers[0] != 0 && answers[1] == enosys && answers[2] == enosys;
 
     let logged = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - calls_before;
     let numbers = [
@@ -3496,9 +3766,9 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     if all_refused && logged == 3 && sequence_right && refused_late && bit_cleared {
         println!(
-            "    personality    a Linux-tagged domain asked getpid, write and exit_group: each \
-             answered ENOSYS, 3 foreign calls logged with their numbers, the tag refused once a \
-             thread existed, and cleared when the domain was put down"
+            "    personality    a Linux-tagged domain asked getpid, write and exit_group: the \
+             first answered, the other two ENOSYS, 3 foreign calls logged with their numbers, \
+             the tag refused once a thread existed, and cleared when the domain was put down"
         );
         true
     } else {
@@ -4709,6 +4979,20 @@ unsafe fn enter_user(who: &str, entry: u64, rsp: u64, arguments: [u64; 2]) -> ! 
     // space rather than losing it later. Checked here, immediately before the
     // jump, because after this there is no kernel left to ask.
     crate::sched::check_user_space(2);
+
+    // The per-CPU domain note, set *here* — RFC 0005 step 6's correction.
+    // The note is maintained on context switches, and a thread entering ring
+    // 3 for the first time has not necessarily been through one on this CPU,
+    // so it could carry whichever domain last ran here. That staleness is
+    // harmless for telemetry (an event stamped with a neighbour's id is a
+    // reporting nuisance) and *not* harmless for the syscall entry's
+    // personality check, which reads it to decide which ABI this thread
+    // speaks. Setting it at the one place a thread becomes a user thread
+    // makes it true from the first instruction, and keeps that check a
+    // relaxed load rather than a runqueue lock on every system call.
+    if let Some(domain) = crate::sched::current_domain() {
+        crate::telemetry::note_domain(domain.as_u32());
+    }
 
     // SAFETY: as above.
     unsafe { bhaskix_arch::syscall::enter_ring3(entry, rsp, arguments) }

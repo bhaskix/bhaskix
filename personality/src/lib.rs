@@ -20,3 +20,4 @@
 pub mod memory;
 pub mod signal;
 pub mod stack;
+pub mod thread;

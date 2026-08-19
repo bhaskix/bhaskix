@@ -294,7 +294,12 @@ workspace = true
 #
 # 1390 at RFC 0005 step 5 (2026-08-19): the memory witness -- its page fills,
 # ring 3 entry, and the four report words read back.
-unsafe_budget = 1394
+#
+# 1424 at RFC 0005 step 6 (2026-08-19): the futex witness -- page fills, ring
+# 3 entry, and its marker-plus-seven report words read as one block -- plus
+# the one fault-protected read of a futex word. The futex table itself needs none: the queues live outside the lock,
+# each carrying its own.
+unsafe_budget = 1424
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

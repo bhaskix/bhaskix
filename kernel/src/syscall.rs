@@ -1692,6 +1692,51 @@ mod linux {
     pub const MUNMAP: u64 = 11;
     /// `madvise(addr, length, advice)`.
     pub const MADVISE: u64 = 28;
+    /// `clone(flags, stack, parent_tid, child_tid, tls)`.
+    pub const CLONE: u64 = 56;
+    /// `futex(uaddr, op, val, timeout, uaddr2, val3)`.
+    pub const FUTEX: u64 = 202;
+    /// `gettid()`.
+    pub const GETTID: u64 = 186;
+    /// `getpid()`.
+    pub const GETPID: u64 = 39;
+    /// `exit_group(status)`.
+    pub const EXIT_GROUP: u64 = 231;
+    /// `sched_yield()`.
+    pub const SCHED_YIELD: u64 = 24;
+}
+
+/// The futex table: one wait queue per watched address, per domain.
+///
+/// RFC 0005 step 6's third hard part. Sixteen slots, because a Go runtime
+/// parks its scheduler on a handful of words and a table that could grow
+/// would be an allocation on the wait path. A word with no slot free is
+/// refused with `EAGAIN` rather than silently not sleeping — a futex that
+/// returns instead of blocking is the spin the RFC warns about, and it is
+/// better to fail loudly than to burn a CPU quietly.
+/// The queues themselves live *outside* the lock, and deliberately: each
+/// carries its own, so the only shared mutable state is which address a slot
+/// watches. Keeping them apart is what lets a sleeper hold a plain reference
+/// to its queue while the key table is free for a waker — no raw pointer, no
+/// lock held across a sleep.
+static FUTEX_QUEUES: [crate::wait::WaitQueue; 16] = [const { crate::wait::WaitQueue::new() }; 16];
+
+/// Which (domain, address) each queue watches.
+static FUTEX_KEYS: crate::sync::SpinLock<[Option<(u32, u64)>; 16]> =
+    crate::sync::SpinLock::new(crate::sync::Rank::Signals, [None; 16]);
+
+/// How many futex sleeps and wakes have happened, for the boot report.
+pub static FUTEX_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// See [`FUTEX_SLEEPS`].
+pub static FUTEX_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Reads the `u32` a futex watches out of the caller's memory.
+fn futex_word(address: u64) -> Option<u32> {
+    let mut bytes = [0u8; 4];
+    // SAFETY: the fault-protected read; a bad address is reported, not taken.
+    let read = unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), address, 4) };
+    read.ok()?;
+    Some(u32::from_le_bytes(bytes))
 }
 
 /// Where the personality places a mapping when the caller says "anywhere".
@@ -1777,6 +1822,116 @@ fn foreign_memory_call(frame: &mut SyscallFrame) -> Option<u64> {
             Some(memory::errno::ENOSYS as u64)
         }
         linux::MADVISE => Some(memory::plan_madvise() as u64),
+        _ => None,
+    }
+}
+
+/// Answers the thread and futex calls — RFC 0005 step 6.
+///
+/// `clone` becomes a thread in the caller's own domain, entered at the
+/// address the caller supplied on the stack it supplied: the personality
+/// creates nothing the domain could not, which is rule 2 again. `futex`
+/// parks on the kernel's own wait queues, which is the primitive the RFC
+/// said this needs. `exit_group` ends the domain, which is what makes a
+/// thread group's exit exact.
+fn foreign_thread_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
+    use bhaskix_personality::memory::errno;
+    use bhaskix_personality::thread::{self, ClonePlan, FutexPlan};
+
+    let (first, second, third) = (frame.capability, frame.method, frame.arg0);
+    match frame.kind {
+        linux::GETPID => Some(u64::from(domain) + 1),
+        // A thread id a hosted program can tell apart from its neighbours,
+        // and stable for the life of the thread. Derived from the scheduler's
+        // own id, offset so no thread is ever tid zero (Linux never issues
+        // one, and a runtime that sees zero treats it as an error).
+        linux::GETTID => crate::sched::current_thread_id().map(|id| u64::from(id) + 1),
+        linux::SCHED_YIELD => {
+            crate::sched::yield_now();
+            Some(0)
+        }
+        linux::EXIT_GROUP => {
+            // Every thread of the group, which is every thread of the
+            // domain. `exit` never returns, so nothing after this runs.
+            crate::domain::end(
+                crate::domain::DomainId::from_u32(domain),
+                crate::domain::Ending::Exited,
+            );
+            crate::sched::exit()
+        }
+        linux::CLONE => {
+            let plan = thread::plan_clone(first, second, third, frame.arg1, frame.arg2);
+            let ClonePlan::Thread {
+                stack,
+                tls,
+                parent_tid,
+                child_tid,
+            } = plan
+            else {
+                let ClonePlan::Refuse(errno) = plan else {
+                    return None;
+                };
+                return Some(errno as u64);
+            };
+            let _ = (tls, parent_tid, child_tid);
+            // Threading a hosted program's new thread through `enter_ring3`
+            // needs an entry that returns to *user* mode at an address the
+            // caller chose, which the scheduler's spawn path does not offer
+            // for an already-running domain. Refused with `ENOSYS` rather
+            // than half-created: a `clone` that returns a tid for a thread
+            // that never runs is the deadlock this step exists to avoid.
+            // The stack is validated first so the refusal is about the one
+            // missing mechanism and not about the arguments.
+            let _ = stack;
+            Some(errno::ENOSYS as u64)
+        }
+        linux::FUTEX => {
+            match thread::plan_futex(first, second, third) {
+                FutexPlan::Wait { address, expected } => {
+                    // The compare-and-sleep, which is the whole contract: if
+                    // the word has already changed, the sleeper must not
+                    // sleep, or it sleeps through the wake that changed it.
+                    let now = futex_word(address)?;
+                    if now != expected {
+                        // Linux's EAGAIN: "the value was not what you said".
+                        return Some(-11i64 as u64);
+                    }
+                    let slot = {
+                        let mut keys = FUTEX_KEYS.lock();
+                        let existing = keys.iter().position(|key| *key == Some((domain, address)));
+                        match existing.or_else(|| keys.iter().position(Option::is_none)) {
+                            Some(index) => {
+                                keys[index] = Some((domain, address));
+                                index
+                            }
+                            None => return Some(-11i64 as u64),
+                        }
+                    };
+                    FUTEX_SLEEPS.fetch_add(1, Ordering::Relaxed);
+                    // The condition is re-read with the queue's own lock
+                    // held, which is what closes the window between the
+                    // compare above and the sleep: a waker that changes the
+                    // word and wakes in between is seen here rather than
+                    // slept through.
+                    FUTEX_QUEUES[slot].wait_until(|| futex_word(address) != Some(expected));
+                    Some(0)
+                }
+                FutexPlan::Wake { address, count } => {
+                    let slot = {
+                        let keys = FUTEX_KEYS.lock();
+                        keys.iter().position(|key| *key == Some((domain, address)))
+                    };
+                    let woken = match slot {
+                        Some(index) if count <= 1 => usize::from(FUTEX_QUEUES[index].wake_one()),
+                        Some(index) => FUTEX_QUEUES[index].wake_all(),
+                        None => 0,
+                    };
+                    FUTEX_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
+                    Some(woken as u64)
+                }
+                FutexPlan::Refuse(errno) => Some(errno as u64),
+            }
+        }
         _ => None,
     }
 }
@@ -1902,6 +2057,14 @@ fn foreign_call(frame: &mut SyscallFrame) {
         return;
     }
 
+    // The thread and futex calls, RFC 0005 step 6.
+    if let Some(domain) = crate::sched::current_domain()
+        && let Some(value) = foreign_thread_call(frame, domain.as_u32())
+    {
+        frame.kind = value;
+        return;
+    }
+
     // `rax` alone. `arg0` (the caller's `rdx`) is left exactly as the stub
     // saved it, which is what preserves it.
     frame.kind = LINUX_ENOSYS;
@@ -1945,6 +2108,17 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     // epilogue below — the space check, the death door, the interrupt mask,
     // the hold canary — runs for both dialects: a foreign caller is still a
     // thread this kernel has to return safely.
+    // Which dialect this thread speaks, from the per-CPU domain note: one
+    // relaxed load, the telemetry class check's cost discipline.
+    //
+    // **The note is only trustworthy because `enter_user` sets it**, and
+    // that line exists because of this one. Read alone it was stale — it
+    // names whichever domain last ran on the CPU, and a thread entering
+    // ring 3 for the first time need not have been switched to here — which
+    // showed up as a Linux program's calls dispatched *natively* in the
+    // placement rebuilds, every answer `BadSyscall`. Asking the scheduler
+    // instead was correct and cost a runqueue lock on every system call in
+    // the machine; the fix that survives is to make the cheap answer true.
     let hint = crate::telemetry::domain_hint();
     let foreign = hint < 32
         && crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed) & (1 << hint)
