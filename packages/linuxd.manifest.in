@@ -1,0 +1,17 @@
+# The Linux personality, in a domain of its own -- RFC 0032 step 3, and the
+# first time RFC 0005's "a service domain, not the nucleus" has been true of
+# anything.
+#
+# One endpoint, and nothing else -- not even a console. That is the whole of
+# its authority, and it is what makes the containment claim checkable rather
+# than asserted: a bug in the largest untrusted-input parser this project will
+# ever have reaches one endpoint. When it grows a hosted process's files and
+# sockets it will hold *those*, and a reviewer will see them on this list.
+package linuxd
+version 0.1.0
+
+program bin/linuxd
+entry hertz
+cap serve linux
+
+payload bin/linuxd from user/linuxd/target/x86_64-unknown-none/release/linuxd

@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1512
+unsafe_budget = 1514
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -394,6 +394,12 @@ unsafe_budget = 1512
 # bound that makes it sound: the frame came from the target space's own
 # `translate` for that page, and the length is clamped to what is left in the
 # frame before either copy is issued.
+#
+# 1514 at RFC 0032 step 3, 2026-08-19. Two lines: `enter_user` for the Linux
+# adapter's own thread, which is the same line every service domain's entry
+# has and carries the same argument -- the entry is inside a user-executable
+# segment the loader accepted, and the stack address is one past user-writable
+# memory in the space just installed.
 
 [features]
 # Lets a *host* binary link this crate without inheriting the kernel's global

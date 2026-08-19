@@ -520,6 +520,17 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !capability_self_test() {
         println!("\x1b[91m    capabilities   FAILED\x1b[0m");
     }
+    // The adapter, before the programs that call it.
+    //
+    // Not cpu 0, for `start_supervisor`'s reason: ring 3 entry is pinned, and
+    // pinning this to the processor the boot thread runs on puts the two in
+    // contention. Not the probes' cpu 3 either -- a hosted thread blocks on
+    // this program's reply, and putting both on one processor makes every
+    // foreign call a context switch rather than a message.
+    let adapter_cpu = bhaskix_arch::percpu::online_count().saturating_sub(2);
+    if let Err(reason) = start_linux_domain(adapter_cpu, handoff.hhdm_base.as_u64()) {
+        println!("    linux domain   not started: {reason}");
+    }
     if !personality_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -2971,8 +2982,21 @@ fn wait_for_probe_threads(realm: domain::DomainId) {
 /// hosted program has no boundary to report on, and a mean over zero samples
 /// is a zero pretending to be a measurement.
 fn personality_boundary_report() {
+    let (answered, absent) = (
+        syscall::ADAPTER_ANSWERED.load(core::sync::atomic::Ordering::Relaxed),
+        syscall::ADAPTER_ABSENT.load(core::sync::atomic::Ordering::Relaxed),
+    );
     let (priced, floor, mean, dropped, excluded, interpreted) = syscall::foreign_cost();
-    if priced == 0 {
+    // Nothing foreign happened at all: no hosted program ran on this machine,
+    // so there is no boundary to report on.
+    //
+    // **Not "no sample was priced".** That was the condition until 2026-08-19,
+    // and when the first call moved to the adapter every sample went past the
+    // outlier cap and the entire report -- including the count of Linux
+    // numbers still in the nucleus, which is the number the whole refactor is
+    // measured by -- silently disappeared. A report that vanishes when its
+    // instrument saturates is worse than one that says it has no samples.
+    if answered + absent + excluded + priced + dropped == 0 {
         return;
     }
     // Every foreign call is accounted for, and the arithmetic is printed
@@ -2981,7 +3005,10 @@ fn personality_boundary_report() {
     // return path that was not being priced at all, and a report that only
     // showed the mean would have hidden it behind a plausible number.
     let total = syscall::FOREIGN_CALLS.load(core::sync::atomic::Ordering::Relaxed);
-    let counted = priced + dropped + excluded;
+    // Four categories now, not three: a call the adapter answered is priced by
+    // `adapter_call` rather than by the nucleus instrument, so it has to be
+    // counted here or the arithmetic would report the move itself as a leak.
+    let counted = priced + dropped + excluded + answered;
     let accounting = if counted == total {
         "all"
     } else {
@@ -2991,8 +3018,29 @@ fn personality_boundary_report() {
         "    personality    boundary: {interpreted} linux numbers interpreted in the nucleus \
          (RFC 0031 wants 0); floor {floor} cycles over {priced} non-blocking calls, mean \
          {mean}; {accounting} {counted} of {total} accounted ({excluded} block by \
-         construction, {dropped} preempted)"
+         construction, {dropped} preempted, {answered} answered in ring 3)"
     );
+    // What the adapter did, from the kernel's own counters rather than from
+    // the adapter's word for it -- which is the only kind of evidence
+    // available for a program that holds no console, and the better kind.
+    println!(
+        "    linux domain   the adapter in ring 3 answered {answered} foreign calls, and {absent} \
+         found no adapter to ask",
+    );
+    // **The cross-placement price, which is what RFC 0031 asked for before
+    // the move rather than after.** Two figures, one instrument, one boot: a
+    // call the nucleus answers, and the same shape of call answered by a
+    // program in ring 3 through an IPC round trip. The difference is what the
+    // containment costs, and it is a number a reviewer can argue with instead
+    // of an estimate.
+    let (adapter_priced, adapter_floor, adapter_mean) = syscall::adapter_cost();
+    if adapter_priced > 0 {
+        println!(
+            "    linux domain   the boundary priced in both placements: nucleus floor {floor} \
+             cycles, adapter floor {adapter_floor} over {adapter_priced} round trips (mean \
+             {adapter_mean}) -- what the containment costs"
+        );
+    }
 }
 
 /// RFC 0005 step 7: run a real static Go binary and say what it asked for.
@@ -4458,7 +4506,13 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // the probe's own spin is unreachable, and a nonzero word there would
     // mean a call that should have ended a thread came back from it.
     let ebadf = -9i64 as u64;
-    let all_refused = answers[0] != 0 && answers[1] == ebadf && answers[2] == 0;
+    // **A pid is a small positive number, and "not zero" was not enough.**
+    // When `getpid` moved out of the nucleus and the adapter was not yet
+    // running, it answered `-ENOSYS` -- and `-38 != 0`, so this test reported
+    // that "the pid answered" while the probe had been refused. An assertion
+    // that accepts an errno as a process id is an assertion about nothing.
+    let pid = answers[0] as i64;
+    let all_refused = pid > 0 && pid < 4096 && answers[1] == ebadf && answers[2] == 0;
 
     // **RFC 0031 §6's Test 1, in the arm this probe can already fund.** The
     // five numbers the probe smuggled are RFC 0008's own syscall kinds. If
@@ -6817,6 +6871,131 @@ extern "C" fn tcp_domain_entry(hhdm_base: u64) -> ! {
     // installed, `rsp` is one past user-writable memory in the same space, and
     // `RSP0` was set before this thread was spawned.
     unsafe { enter_user("tcp domain", entry, rsp, [hertz, 0]) }
+}
+
+/// Where `bin/linuxd`'s stack lives, and what it is called.
+const LINUXD_STACK: u64 = 0x0000_0000_1D00_0000;
+const LINUXD_STACK_PAGES: u64 = 8;
+const LINUXD_PROGRAM: &[u8] = b"bin/linuxd";
+
+/// Starts `bin/linuxd`, the Linux personality in a domain of its own.
+///
+/// [RFC 0032](../../docs/rfc/0032-a-supervisor-interface.md) step 3, and the
+/// first time [RFC 0005](../../docs/rfc/0005-linux-abi-compatibility.md)'s
+/// "Where it lives" has been true of anything: a foreign system call the
+/// nucleus does not answer is delivered here instead of being refused.
+///
+/// The shape is `start_tcp_domain`'s, because that shape has now carried three
+/// services and is the thing RFC 0013 promised would be repeatable: a console
+/// to report through, an endpoint of its own, and nothing else. **It holds no
+/// filesystem and no device**, which is what makes the containment claim
+/// checkable rather than asserted — a bug in the largest untrusted-input
+/// parser this project will ever have reaches a console and an endpoint.
+///
+/// Started *before* the Linux self-tests, because they are its first callers.
+///
+/// # Errors
+///
+/// A string naming what would not be built. Every one is survivable: a machine
+/// with no adapter answers every unhandled foreign call `-ENOSYS`, which is
+/// exactly what it did before this existed.
+fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
+    let realm = domain::create("linux", domain::ResourceEnvelope::new())
+        .map_err(|_| "the linux domain would not be created")?;
+
+    // Slot 0, and the only slot: the endpoint foreign calls arrive on. The
+    // adapter's own, and unbadged -- what distinguishes its callers is the
+    // badge the *kernel* stamps on delivery, which names the hosted domain and
+    // which no caller can supply.
+    //
+    // **Not even a console**, and not for tidiness: this is started before the
+    // console service exists, because its first callers are the Linux
+    // self-tests and those run long before `user_shell`. Rather than reorder
+    // the boot to give an adapter somewhere to print, it holds nothing and the
+    // boundary report says what it did from the kernel's own counters. The
+    // containment claim is the better for it: a bug in the largest
+    // untrusted-input parser this project will ever have reaches one endpoint.
+    let endpoint = ipc::create().map_err(|_| "no endpoint for the linux adapter")?;
+    let serving = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(endpoint.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the adapter's endpoint capability would not be created")?;
+
+    if domain::with(realm, |owner| owner.cspace.install_at(0, serving).is_ok()) != Some(true) {
+        return Err("the adapter's capabilities would not install");
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        cpu,
+        "linuxd",
+        linux_domain_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the adapter's thread would not spawn")?;
+
+    // Published only once the program is on its way, so a foreign call cannot
+    // find an endpoint whose server does not exist yet and block on it.
+    //
+    // It is still possible to arrive before the adapter's first `Recv` -- the
+    // caller queues, which is what an endpoint is for -- but not to arrive
+    // before there is anybody who will ever receive.
+    syscall::ADAPTER_ENDPOINT.store(
+        u64::from(endpoint.as_u32()),
+        core::sync::atomic::Ordering::Release,
+    );
+    Ok(())
+}
+
+/// Loads `bin/linuxd` and enters ring 3, the same way every other domain does.
+extern "C" fn linux_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    linux domain   {why}\x1b[0m");
+        sched::exit()
+    };
+    let Ok(file) = vfs::open(LINUXD_PROGRAM) else {
+        stop("bin/linuxd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/linuxd is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(LINUXD_STACK), LINUXD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/linuxd would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    let rsp = LINUXD_STACK + LINUXD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space, and
+    // `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("linux domain", entry, rsp, [hertz, 0]) }
 }
 
 /// The page `bin/ipd` leaves its findings in.
@@ -13933,11 +14112,11 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             // `bin/go-hello` -- RFC 0005 step 7's Tier 0 corpus program,
             // and the first entry here that is not ours at all: a real
             // static Go binary, built by whatever toolchain the machine
-            // has. Fifteen now, and this line caught it as designed,
-            // exactly as it caught `bin/traced`, `bin/tcpc` and `bin/tcpd`
-            // before it.
+            // has. Sixteen now -- `bin/linuxd` joined 2026-08-19 -- and this
+            // line caught each of them as designed, exactly as it caught
+            // `bin/traced`, `bin/tcpc` and `bin/tcpd` before them.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 15,
+            entries >= 3 && bin == 16,
         ),
         (
             "the user program is an ELF the loader accepts",

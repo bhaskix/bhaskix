@@ -196,6 +196,15 @@ LAYERS = {
     # makes, that a restart policy is writable in userspace with no new kernel
     # mechanism.
     "bhaskix-user-sup": -1,
+    # The Linux personality, RFC 0032 step 3 -- where RFC 0005's "a service
+    # domain, not the nucleus" finally becomes true of something. It links the
+    # ABI for its calls and `bhaskix-personality` for what the calls *mean*,
+    # which is the crate that was deliberately kept separate while the rest of
+    # the personality was in the kernel: the move changes where the code runs
+    # and not what it says. It holds one endpoint and nothing else -- not even
+    # a console -- and that list is the containment claim, so a wider
+    # dependency here should be a conversation and not a commit.
+    "bhaskix-user-linuxd": -1,
 }
 
 # Programs that *place* a service, and exactly what each may reach.

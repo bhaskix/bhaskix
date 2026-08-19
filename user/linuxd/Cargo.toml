@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The Linux personality, in a domain of its own.
+#
+# [RFC 0031](../../docs/rfc/0031-linux-compatibility-as-an-adapter.md) says
+# compatibility is an *adapter above* Bhaskix services and never a reason to
+# reproduce Linux kernel architecture inside Bhaskix;
+# [RFC 0005](../../docs/rfc/0005-linux-abi-compatibility.md) has said since it
+# was drafted that this belongs in a service domain and not the nucleus,
+# because it is a parser for ~300 system calls whose pointer and length
+# arguments come from the process being contained. This crate is where that
+# finally becomes true, one call at a time.
+#
+# Its own workspace, as every user program is: these crates need their own
+# code-generation settings, which a workspace member cannot have.
+[workspace]
+
+[package]
+name = "bhaskix-user-linuxd"
+description = "The Linux personality: a translator in ring 3, holding no authority a native program could not be given."
+version = "0.1.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "linuxd"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+# The half of the personality that needs no machine: what each system call's
+# arguments mean, as pure functions over bytes. Host-tested, zero `unsafe`, and
+# **unchanged by this move** -- which is the point of having kept it separate
+# while the rest of the personality was in the kernel.
+bhaskix-personality = { path = "../../personality" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# The syscall stub's one block, and nothing else. This program dereferences no
+# pointer: it answers questions about numbers, and the memory of the process it
+# hosts is reached through capabilities rather than through addresses -- which
+# is RFC 0032's whole shape and the reason this budget can stay this small
+# while the personality grows.
+unsafe_budget = 16

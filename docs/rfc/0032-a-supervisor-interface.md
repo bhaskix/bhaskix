@@ -262,6 +262,83 @@ was supposed to guard:
   (`NoSuchMethod`) from a domain with nowhere to put it (`NoSuchCapability`). A boolean could
   not tell them apart, and did not.
 
+## Step 3's record (2026-08-19): the personality answers from ring 3, and the boundary is priced in both placements
+
+**`bin/linuxd` exists, and a hosted program's `getpid` is answered by a program in ring 3.**
+The ratchet moved **18 → 17** — the first time it has moved, and the thing the whole
+refactor is measured by.
+
+**The delivery rule is better than this RFC originally specified, and simpler.** The design
+above imagined the nucleus knowing which numbers the adapter handles. It does not need to:
+the nucleus tries the handlers it still has, and **whatever none of them answers is sent to
+the adapter**. So a call moving out is a deletion in `mod linux` and an addition in
+`bin/linuxd`, with nothing in between that has to be kept in step — and the kernel gains no
+knowledge of Linux in the process. `getpid` was deleted from `foreign_thread_call` and from
+`ANSWERED` in the same change that taught `linuxd` to answer it.
+
+**The adapter holds one endpoint and nothing else — not even a console.** That was not the
+plan; it is what the boot order forced, and it is better. The adapter's first callers are the
+Linux self-tests, which run long before `user_shell` starts the console service, so rather
+than reorder the boot to give it somewhere to print, it holds nothing and the kernel reports
+what it did from its own counters. The evidence is stronger for it: what matters is that a
+hosted program got the right answer, not that the adapter said so.
+
+**The cross-placement price, which is what RFC 0031 asked for before the move rather than
+after.** One instrument, one boot, two figures:
+
+| Placement | Floor, cycles |
+|---|---|
+| In the nucleus, before any call moved | **4,916** |
+| Through the adapter, IPC round trip | **223,172 – 351,008** across boots |
+
+Roughly fifty times, under emulation — and emulation is where a cycle count is least
+trustworthy, which the report says rather than leaving to be assumed. **That is what the
+containment costs**, and it is now a number a reviewer can argue with instead of an estimate.
+The comparison is only honest because the two are priced separately: folding adapter round
+trips into the nucleus figure moved it from 4,916 to 17,520 and described neither placement,
+which is how the mistake was noticed.
+
+**Four things went wrong, and three of them are worth keeping.**
+
+**Zero is a perfectly good endpoint id.** `ADAPTER_ENDPOINT` used zero as "no adapter", and
+`ipc::create` handed out id zero — so the adapter was started, its thread was blocked in
+`Recv`, and every foreign call reported finding no adapter. The convention here is
+`u64::MAX`, which `NET_RING_REPORT` and `NET_CONFIG` already use, and this is the reason it
+is the convention.
+
+**A report that vanishes when its instrument saturates.** The outlier cap was 20,000 cycles,
+calibrated against a placement where an answered call costs a few thousand. The moment the
+first call moved, every sample went past it, `priced` fell to zero, and the *entire* boundary
+report — including the count of Linux numbers still in the nucleus — silently disappeared.
+The cap is a million cycles now, which is comfortably above the thing being measured and
+comfortably below a preemption; and the report prints whenever any foreign call happened at
+all, rather than when a sample survived.
+
+**An assertion that accepted an errno as a process id.** The personality self-test demanded
+only that `getpid`'s answer be non-zero — and `-ENOSYS` is `-38`, which is not zero. So the
+first boot after `getpid` left the nucleus reported that "the pid answered" while the probe
+had in fact been refused. It now demands a small positive number, which is what a pid is.
+**That test had been passing for a week on an assertion about nothing.**
+
+The fourth was ordinary: `/bin` gained an entry and the listing gate said so, exactly as it
+did for `bin/traced`, `bin/tcpc`, `bin/tcpd` and `bin/go-hello` before it.
+
+**Two gates, and they fail together.** The adapter gate demands it answered a hosted program
+and found no absences; the personality gate demands a pid that an `-ENOSYS` cannot satisfy.
+Arming by simply not starting the adapter turned both red at once, which is the coupling
+worth having: neither can be satisfied by the other.
+
+**And step 2's supervisor gate turned out to have a bound that was wrong in a way only load
+reveals.** It passed four times in isolation and failed under the full suite, and the cause
+was structural rather than a matter of margin: `bin/probe` mode 8's lifetime is spent in
+**its own yields**, while `bin/sup`'s progress depends on being scheduled at all. Under load
+the child runs ahead and dies before the supervisor has finished working on it. Two counts in
+different currencies, pulling opposite ways — the child must outlive the supervisor's dozen
+calls, and the supervisor must outwait whatever is left of the child, or the reap fails and
+the next spawn is refused for the budget. The margin now sits on the side that can lose it,
+sixteen to one. **Widening a timeout would have hidden this; the fix is that the two bounds
+are now written down as the pair they are.**
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -366,7 +443,8 @@ already in hand.
    installed. Proven by `bin/sup`, negative-armed. ✅ *Delivered 2026-08-19 — see the record
    below.*
 3. **`bin/linuxd`, and `getpid` end to end** — the whole path, one call, everything else
-   unchanged. The ratchet moves **18 → 17**, the first time it has moved.
+   unchanged. The ratchet moves **18 → 17**, the first time it has moved. ✅ *Delivered
+   2026-08-19 — see the record below.*
 4. **The memory calls**, which need RFC 0009's creation method.
 5. **Signals and the fault path** — the hard one: a fault cannot IPC out from
    `trap.rs:255`, so the faulting thread must be parked and the adapter woken. New

@@ -574,7 +574,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 15 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 16 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -1284,10 +1284,10 @@ fi
 # and which this suite has made before.
 if grep -qE "personality +boundary: [0-9]+ linux numbers interpreted in the nucleus" "$LOG"; then
     interpreted=$(sed -n 's/.*boundary: \([0-9]*\) linux numbers.*/\1/p' "$LOG" | head -1)
-    if [[ "$interpreted" -le 18 ]]; then
+    if [[ "$interpreted" -le 17 ]]; then
         pass "the personality boundary is $interpreted linux numbers wide, and may only narrow"
     else
-        fail "the nucleus interprets $interpreted linux numbers, up from 18 -- RFC 0031 I1 wants 0"
+        fail "the nucleus interprets $interpreted linux numbers, up from 17 -- RFC 0031 I1 wants 0"
         status=1
     fi
     # And the instrument accounts for itself. Every foreign call is priced,
@@ -1307,6 +1307,30 @@ else
     # has no boundary to report, and demanding the line there would gate on
     # the machine rather than on the kernel.
     pass "no hosted program on this machine, so the boundary had nothing to report"
+fi
+
+# RFC 0032 step 3: the personality, in ring 3, answering a real hosted program.
+#
+# This is the gate the whole relocation is for. `bin/linuxd` holds **one
+# endpoint and nothing else** -- not even a console -- and a foreign call the
+# nucleus does not answer is delivered to it as an ordinary IPC call made by
+# the hosted thread itself, which blocks until the reply.
+#
+# What makes it evidence rather than plumbing: `getpid` was *removed* from the
+# nucleus in the same change, so the pid a hosted program reads now comes from
+# a program in ring 3 -- and the personality self-test above demands a pid that
+# is a small positive number, which an `-ENOSYS` is not. Both gates have to
+# hold at once for this to pass, and neither can be satisfied by the other.
+#
+# The count is demanded to be non-zero rather than exact: how many calls fall
+# through to the adapter depends on which self-tests a machine could run.
+if grep -qE "linux domain   the adapter in ring 3 answered [1-9][0-9]* foreign calls, and 0 found no adapter to ask" "$LOG"; then
+    pass "the linux personality answered a hosted program from ring 3, holding one endpoint"
+elif grep -qE "linux domain   the adapter in ring 3 answered" "$LOG"; then
+    fail "the adapter was asked and did not answer, or was not there to ask"
+    status=1
+else
+    pass "no hosted program on this machine, so the adapter had nothing to answer"
 fi
 
 # RFC 0005 step 6, the clone half: two threads of one hosted program, meeting

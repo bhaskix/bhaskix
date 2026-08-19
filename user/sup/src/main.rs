@@ -76,7 +76,12 @@ const LINGER: u64 = 8;
 /// four placements and a shell test alongside this, and a bound that is ample
 /// on an idle boot is the kind that fails once in twenty runs and reads as a
 /// defect in whatever it was waiting for.
-const MAX_WAIT: u64 = 16384;
+///
+/// Sixteen times the child's own lifetime, deliberately. The two counts are
+/// spent in different currencies — the child's in its own yields, this one in
+/// whatever scheduling this program gets — so under load the child runs ahead
+/// and the margin has to be on this side.
+const MAX_WAIT: u64 = 131_072;
 /// Where the scratch page is mapped in this program's own space.
 const SCRATCH_AT: u64 = 0x0000_0000_1300_0000;
 

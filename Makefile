@@ -55,6 +55,7 @@ IPD_DIR      := user/ipd
 DHCPD_DIR    := user/dhcp
 UDP6_DIR     := user/udp6
 TCPD_DIR     := user/tcpd
+LINUXD_DIR   := user/linuxd
 TCPC_DIR     := user/tcpc
 TRACED_DIR   := user/traced
 FSD_DIR      := user/fsd
@@ -82,6 +83,7 @@ USER_IPD     := $(IPD_DIR)/target/$(TARGET)/release/ipd
 USER_DHCPD   := $(DHCPD_DIR)/target/$(TARGET)/release/dhcp
 USER_UDP6    := $(UDP6_DIR)/target/$(TARGET)/release/udp6
 USER_TCPD    := $(TCPD_DIR)/target/$(TARGET)/release/tcpd
+USER_LINUXD  := $(LINUXD_DIR)/target/$(TARGET)/release/linuxd
 USER_TCPC    := $(TCPC_DIR)/target/$(TARGET)/release/tcpc
 USER_TRACED  := $(TRACED_DIR)/target/$(TARGET)/release/traced
 BOOTEFI_DIR  := boot/bhaskixboot
@@ -115,6 +117,8 @@ UDP6_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(UDP6_DIR)/link.ld
 TCPD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(TCPD_DIR)/link.ld
+LINUXD_FLAGS := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(LINUXD_DIR)/link.ld
 TCPC_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(TCPC_DIR)/link.ld
 TRACED_FLAGS := -C relocation-model=static -C code-model=small \
@@ -242,7 +246,7 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(GO_HELLO)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(GO_HELLO)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
@@ -385,6 +389,17 @@ $(USER_TCPD): $(TCPD_DIR)/src/main.rs $(TCPD_DIR)/link.ld $(TCPD_DIR)/Cargo.toml
               $(wildcard abi/src/*.rs) $(wildcard net/src/*.rs) $(wildcard net/src/tcp/*.rs) \
               $(wildcard rand/src/*.rs)
 	cd $(TCPD_DIR) && RUSTFLAGS="$(TCPD_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# The Linux personality, in a domain of its own -- RFC 0032 step 3. It depends
+# on `personality/` as well as the ABI, because the half of the translation
+# that needs no machine was kept in that crate while the rest of it was in the
+# kernel, and this is what that separation was for: the move changes where the
+# code runs and not what it says.
+$(USER_LINUXD): $(LINUXD_DIR)/src/main.rs $(LINUXD_DIR)/link.ld $(LINUXD_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs) $(wildcard personality/src/*.rs)
+	cd $(LINUXD_DIR) && RUSTFLAGS="$(LINUXD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 

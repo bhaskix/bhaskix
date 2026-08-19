@@ -58,7 +58,7 @@ _start:
     //   3  yield for ever, so the only way out is a system call returning
     //   4  receive for ever on capability 0, and never reply
     //   6  say so on capability 0 and exit -- what a *started* program does
-    //   8  yield 1,024 times and exit -- alive long enough to be supervised,
+    //   8  yield 8,192 times and exit -- alive long enough to be supervised,
     //      and over without anybody having to kill it (RFC 0032)
     //
     // Both extra modes live in `bin/probe` rather than in programs of their
@@ -127,13 +127,17 @@ _start:
     // passes on a fast machine and fails on a loaded one.
     //
     // So: alive long enough to be worked on, and over without being killed.
-    // The count is generous against the twenty-odd system calls a supervisor
-    // makes in that window, and small against how long the supervisor will
-    // wait for it to end -- both matter, and the first version had it at
-    // 65,536, which outlasted the supervisor's patience and left a child that
-    // could not be reaped. It is not a timeout: it is a ceiling on how long a
-    // leftover child persists if the supervisor dies mid-way.
-    mov r15, 1024
+    // **Two bounds have to hold at once, and they pull in opposite
+    // directions.** This child must outlive the twenty-odd system calls its
+    // supervisor makes -- and the supervisor must outwait whatever is left of
+    // it afterwards, or the reap fails and the next spawn is refused for the
+    // budget. The first version had 65,536 here and outlasted the
+    // supervisor's patience; the second had 1,024 and died first *under
+    // load*, because this count is spent in the child's own yields while the
+    // supervisor's progress depends on being scheduled at all. Eight thousand
+    // against the supervisor's 131,072-yield wait is a sixteen-to-one margin
+    // on the side that matters.
+    mov r15, 8192
 11:
     mov rax, 4                  // Kind::Yield
     xor rdi, rdi

@@ -1731,8 +1731,6 @@ mod linux {
     pub const FUTEX: u64 = 202;
     /// `gettid()`.
     pub const GETTID: u64 = 186;
-    /// `getpid()`.
-    pub const GETPID: u64 = 39;
     /// `exit_group(status)` — every thread of the group.
     pub const EXIT_GROUP: u64 = 231;
     /// `exit(status)` — this thread only. Distinct numbers and distinct
@@ -1759,7 +1757,7 @@ mod linux {
     /// alternative, deriving it from the dispatch, needs the dispatch to be
     /// a table rather than a `match`, which is a change worth making when
     /// the personality moves rather than before.
-    pub const ANSWERED: [u64; 18] = [
+    pub const ANSWERED: [u64; 17] = [
         RT_SIGACTION,
         RT_SIGRETURN,
         SIGALTSTACK,
@@ -1770,7 +1768,6 @@ mod linux {
         CLONE,
         FUTEX,
         GETTID,
-        GETPID,
         EXIT_GROUP,
         EXIT,
         SCHED_YIELD,
@@ -1979,7 +1976,6 @@ fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
 
     let (first, second, third) = (call.first(), call.second(), call.third());
     match call.number {
-        linux::GETPID => Some(u64::from(domain) + 1),
         // The one call a hosted program needs before it can say anything.
         // Only the two standard streams, and only to this machine's console:
         // a hosted program writing to a descriptor it never opened is
@@ -2385,6 +2381,29 @@ fn foreign_call(frame: &mut SyscallFrame) {
         return;
     }
 
+    // **And what the nucleus does not answer is asked of the adapter** —
+    // RFC 0031's interface I1, and RFC 0032's delivery. Note what is *not*
+    // here: any list of which numbers the adapter handles. The kernel tries
+    // what it still has and hands over the rest, so a call moving out of the
+    // nucleus is a deletion here and an addition there, with nothing in
+    // between that has to be kept in step.
+    //
+    // The call is made by the hosted thread itself, which blocks until the
+    // reply. This is not the kernel becoming an IPC client: it is a trap
+    // becoming a call on an endpoint the domain was given, which is what a
+    // foreign system call has always been in this design.
+    if let Some(value) = adapter_call(&call) {
+        frame.kind = value;
+        // **Not priced here**, and that is what keeps the comparison honest:
+        // `adapter_call` prices its own round trips, and folding them into the
+        // nucleus figure would average two different placements into one
+        // number that describes neither. The nucleus floor was 4,916 cycles
+        // before any call moved; it went to 17,520 the moment adapter calls
+        // were priced into it, which is how this was noticed.
+        let _ = started;
+        return;
+    }
+
     // `rax` alone. `arg0` (the caller's `rdx`) is left exactly as the stub
     // saved it, which is what preserves it.
     frame.kind = bhaskix_personality::call::ENOSYS.value;
@@ -2392,6 +2411,125 @@ fn foreign_call(frame: &mut SyscallFrame) {
         price_foreign_call(started);
     }
 }
+
+/// The endpoint a foreign call is delivered to, or zero for none.
+///
+/// **Kernel-side, and deliberately not in the hosted domain's CSpace.**
+/// RFC 0031's interface I3: a hosted process holds no capabilities and can
+/// name none, so putting its adapter's endpoint where it could reach it would
+/// hand it exactly one — and the one that talks to the program with authority
+/// over it.
+///
+/// One adapter for the machine, for now. RFC 0031's interface I5 wants one per
+/// hosted workload, and this becomes a per-domain field when there is a second
+/// workload to tell apart. The trigger is written down rather than left as a
+/// surprise.
+///
+/// **`u64::MAX` is "none", and zero is a perfectly good endpoint id.** Using
+/// zero as the sentinel cost a boot: the adapter was started, its thread was
+/// blocked in `Recv`, and every foreign call reported finding no adapter —
+/// because `ipc::create` had handed out id zero, which this read as absence.
+/// The convention here is `u64::MAX`, as `NET_RING_REPORT` and `NET_CONFIG`
+/// already use, and it is the convention for exactly this reason.
+pub static ADAPTER_ENDPOINT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// How many foreign calls the adapter answered, and how many it could not be
+/// asked because it was not there.
+pub static ADAPTER_ANSWERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many times a foreign call found no adapter to ask.
+pub static ADAPTER_ABSENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Cycles spent in adapter round trips, how many were priced, and the
+/// cheapest — the domain placement's figures, against the nucleus placement's
+/// in [`FOREIGN_FLOOR`].
+pub static ADAPTER_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many adapter round trips contributed a sample.
+pub static ADAPTER_PRICED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The cheapest adapter round trip this boot.
+pub static ADAPTER_FLOOR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+/// The last reason a delivery was refused, so an absent adapter can be told
+/// from a refused one without a rebuild.
+pub static ADAPTER_REFUSAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Asks the adapter, blocking this thread until it answers.
+///
+/// `None` when there is no adapter, or when the endpoint has gone — in which
+/// case the caller falls back to `-ENOSYS`, because a hosted program told
+/// nothing at all would spin on a call that never returns.
+///
+/// The Linux call number travels as the message's `method` and the first four
+/// arguments as its words. **Five and six do not fit**, and that is why the
+/// calls needing them — `mmap` above all — are still answered in the nucleus:
+/// moving them needs a page shared with the adapter rather than a message, and
+/// a page needs somewhere to put it *per thread*, which is RFC 0032 step 4's
+/// work rather than a thing to improvise here.
+fn adapter_call(call: &PersonalityCall) -> Option<u64> {
+    let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
+    if endpoint == u64::MAX {
+        ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
+    let args = [call.first(), call.second(), call.third(), call.fourth()];
+
+    // Congestion is retried, and it is safe to retry precisely because it
+    // cannot half-happen: the message was refused *before* being queued, so
+    // the adapter never saw it. The endpoint's queue is sixteen deep, so an
+    // eighteenth hosted thread arriving at once would otherwise be told its
+    // system call failed for a reason that is nothing to do with the call.
+    // `bin/shell` has done this since RFC 0015 and says why at more length.
+    let started = bhaskix_arch::tsc::read();
+    for _ in 0..ADAPTER_RETRIES {
+        // The badge says which hosted domain is asking, and the kernel is
+        // what stamps it. A caller cannot supply its own, which is the whole
+        // reason the adapter can believe it.
+        match crate::ipc::call(endpoint, u64::from(call.domain), call.number, args) {
+            Ok(message) => {
+                ADAPTER_ANSWERED.fetch_add(1, Ordering::Relaxed);
+                // **Priced separately from the in-nucleus path, because the
+                // comparison is the point.** A single figure over both
+                // placements is an average of two different things and tells
+                // a reviewer nothing about what the move costs; two figures
+                // measured by the same instrument on the same boot is exactly
+                // what RFC 0031's performance section asks for.
+                if let Some(spent) = bhaskix_arch::tsc::read().checked_sub(started)
+                    && spent <= 100_000_000
+                {
+                    ADAPTER_CYCLES.fetch_add(spent, Ordering::Relaxed);
+                    ADAPTER_PRICED.fetch_add(1, Ordering::Relaxed);
+                    ADAPTER_FLOOR.fetch_min(spent, Ordering::Relaxed);
+                }
+                return Some(message.args[0]);
+            }
+            Err(crate::ipc::IpcError::Congested) => {
+                crate::sched::yield_now();
+            }
+            // The adapter has gone, or was never there. A hosted program is
+            // told `-ENOSYS` rather than left blocked on an answer that is not
+            // coming: the call it made is one this machine cannot perform, and
+            // that is true whichever way the adapter is absent.
+            Err(why) => {
+                ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
+                ADAPTER_REFUSAL.store(
+                    match why {
+                        crate::ipc::IpcError::NoSuchEndpoint => 1,
+                        crate::ipc::IpcError::ServerGone => 2,
+                        crate::ipc::IpcError::Congested => 3,
+                        _ => 4,
+                    },
+                    Ordering::Relaxed,
+                );
+                return None;
+            }
+        }
+    }
+    ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+/// How many times a congested delivery is retried before the call is refused.
+const ADAPTER_RETRIES: u32 = 1024;
 
 /// Whether a call spends its time somewhere other than the boundary, and is
 /// therefore not priced.
@@ -2426,10 +2564,17 @@ fn price_foreign_call(started: u64) {
         FOREIGN_COST_DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
     };
-    // Twenty thousand cycles is around six microseconds here: no call in the
-    // population above does that much work, so a sample past it was a
-    // preemption or a migration between the two readings rather than a cost.
-    if spent > 20_000 {
+    // **A million cycles, and the number moved once for a good reason.** It
+    // was twenty thousand, calibrated against the in-nucleus placement where
+    // an answered call is a few thousand — and when the first call moved to
+    // the adapter, *every* sample went past it and the whole report vanished,
+    // because a report that prints nothing when its instrument saturates is
+    // what this was. An IPC round trip to ring 3 is worth hundreds of
+    // thousands of cycles under emulation and that is the figure this
+    // instrument exists to capture, not to discard. What the cap is for is
+    // preemptions and migrations, which are milliseconds; a million cycles is
+    // comfortably below one and comfortably above the thing being measured.
+    if spent > 1_000_000 {
         FOREIGN_COST_DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -2466,6 +2611,21 @@ pub static FOREIGN_COST_EXCLUDED: core::sync::atomic::AtomicU64 =
 
 /// What the foreign path has cost: calls priced, mean cycles, samples
 /// dropped, and how many Linux numbers the nucleus declares it interprets.
+#[must_use]
+pub fn adapter_cost() -> (u64, u64, u64) {
+    let priced = ADAPTER_PRICED.load(Ordering::Relaxed);
+    let floor = ADAPTER_FLOOR.load(Ordering::Relaxed);
+    (
+        priced,
+        if floor == u64::MAX { 0 } else { floor },
+        ADAPTER_CYCLES
+            .load(Ordering::Relaxed)
+            .checked_div(priced)
+            .unwrap_or(0),
+    )
+}
+
+/// What an adapter round trip has cost: calls priced, floor, mean.
 #[must_use]
 pub fn foreign_cost() -> (u64, u64, u64, u64, u64, usize) {
     let priced = FOREIGN_PRICED.load(Ordering::Relaxed);
