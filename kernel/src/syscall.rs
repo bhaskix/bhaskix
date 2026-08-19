@@ -1676,6 +1676,96 @@ const LINUX_ENOSYS: u64 = -38i64 as u64;
 /// events is the personality's work queue: what a real workload asks for is
 /// the specification, and this refusal path is how it gets written down.
 /// Never silently succeed — the RFC names that as the one forbidden answer.
+/// Linux syscall numbers this personality answers rather than refuses.
+mod linux {
+    /// `rt_sigaction(sig, act, oldact, sigsetsize)`.
+    pub const RT_SIGACTION: u64 = 13;
+    /// `rt_sigreturn()` — never returns to its caller.
+    pub const RT_SIGRETURN: u64 = 15;
+    /// `sigaltstack(ss, old_ss)`.
+    pub const SIGALTSTACK: u64 = 131;
+}
+
+/// Reads a Linux `struct sigaction` out of a hosted process's memory.
+///
+/// Four words: handler, flags, restorer, mask — the x86-64 layout, and the
+/// order matters because `sa_restorer` sits *between* the flags and the mask
+/// on this architecture and nowhere else.
+fn read_sigaction(at: u64) -> Option<bhaskix_personality::signal::Handler> {
+    let mut bytes = [0u8; 32];
+    // SAFETY: the fault-protected read; a bad pointer is reported, not taken.
+    let read =
+        unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), at, bytes.len()) };
+    read.ok()?;
+    let word = |index: usize| -> u64 {
+        let mut value = [0u8; 8];
+        value.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+        u64::from_le_bytes(value)
+    };
+    Some(bhaskix_personality::signal::Handler {
+        entry: word(0),
+        flags: word(1),
+        restorer: word(2),
+        mask: word(3),
+    })
+}
+
+/// Answers the signal calls a hosted program must make before it can survive
+/// a fault — RFC 0005 step 4. Everything else is still `-ENOSYS`, and that
+/// is the RFC's tiering rather than an omission.
+///
+/// Returns `Some(value)` when the call was answered, `None` to refuse.
+fn foreign_signal_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
+    // **Linux's argument registers are not this ABI's argument fields, and
+    // the names in `SyscallFrame` are RFC 0008's.** Linux passes
+    // `rdi, rsi, rdx, r10, r8, r9`; this frame calls those `capability`,
+    // `method`, `arg0`, `arg1`, `arg2`, `arg3`. Reading `arg0` as the first
+    // argument is therefore reading `rdx` as `rdi` -- which is exactly what
+    // the first version of this function did, and the symptom was a handler
+    // that installed for signal-number-nothing and a fault that found none.
+    let (first, second) = (frame.capability, frame.method);
+    match frame.kind {
+        linux::RT_SIGACTION => {
+            // `first` = signal, `second` = the new action, `arg0` = where the
+            // old one goes (ignored: nothing hosted reads it yet, and
+            // pretending to write it would be worse than not).
+            if second == 0 {
+                // Querying, not installing. Answered as success with nothing
+                // written, which is what a caller asking about an unset
+                // handler would see anyway.
+                return Some(0);
+            }
+            let handler = read_sigaction(second)?;
+            crate::signal::install(domain, first, handler)?;
+            Some(0)
+        }
+        linux::SIGALTSTACK => {
+            // `first` = the new stack: base, flags, size.
+            if first == 0 {
+                return Some(0);
+            }
+            let mut bytes = [0u8; 24];
+            // SAFETY: the fault-protected read.
+            let read = unsafe {
+                bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), first, bytes.len())
+            };
+            read.ok()?;
+            let word = |index: usize| -> u64 {
+                let mut value = [0u8; 8];
+                value.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+                u64::from_le_bytes(value)
+            };
+            let alt = bhaskix_personality::signal::AltStack {
+                base: word(0),
+                flags: word(1),
+                size: word(2),
+            };
+            crate::signal::set_alt_stack(domain, alt).then_some(0)
+        }
+        _ => None,
+    }
+}
+
 fn foreign_call(frame: &mut SyscallFrame) {
     let number = frame.kind;
     let count = FOREIGN_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1691,6 +1781,26 @@ fn foreign_call(frame: &mut SyscallFrame) {
         crate::telemetry::domain_hint(),
         &event,
     );
+    // `rt_sigreturn` first and on its own, because it is the one call that
+    // must *not* write a return value: it restores `rax` from the frame the
+    // handler was given, and an answer written over that would be the
+    // interrupted program's own register clobbered by its resumption.
+    if number == linux::RT_SIGRETURN && crate::signal::sigreturn(frame) {
+        return;
+    }
+
+    // The signal calls, which a hosted program must make before it can
+    // survive a fault. Answered here rather than refused; everything else
+    // still gets `-ENOSYS`, which is the RFC's tiering rather than an
+    // omission. The telemetry event is emitted either way -- an *answered*
+    // foreign call is as much part of the histogram as a refused one.
+    if let Some(domain) = crate::sched::current_domain()
+        && let Some(value) = foreign_signal_call(frame, domain.as_u32())
+    {
+        frame.kind = value;
+        return;
+    }
+
     // `rax` alone. `arg0` (the caller's `rdx`) is left exactly as the stub
     // saved it, which is what preserves it.
     frame.kind = LINUX_ENOSYS;

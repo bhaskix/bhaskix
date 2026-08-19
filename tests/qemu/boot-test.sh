@@ -1235,6 +1235,21 @@ fi
 # The numbers are recorded, not gated -- a slow host is not a broken kernel --
 # but a networked boot that produced none measured nothing, and that is a
 # failure of the instrument.
+# RFC 0005 step 4: signals, the part the RFC says to build first because it
+# is where the design is most likely to be wrong. A Linux program installs a
+# SIGSEGV handler, faults on purpose, reads cr2 out of the ucontext it was
+# handed, edits the saved rip, and returns through rt_sigreturn -- which is
+# precisely how Go turns a null dereference into a recovered panic. Every
+# link is load-bearing: a wrong ucontext offset reads the wrong field, a
+# wrong rip slot resumes into the fault again, a broken sigreturn never
+# resumes at all.
+if grep -qE "linux signal +a Linux program faulted on purpose, its SIGSEGV handler read cr2 0x0 out of the ucontext, edited the saved rip, and rt_sigreturn resumed it where it said: 1 delivered, 1 returned" "$LOG"; then
+    pass "a Linux fault becomes a signal, and the handler's edit takes effect"
+else
+    fail "the signal round trip did not complete"
+    status=1
+fi
+
 # RFC 0005 step 3: the initial process image. A Linux program walks the
 # stack this kernel built -- argv, envp, the auxiliary vector -- and finds
 # the entropy AT_RANDOM promised, which Go's runtime treats as not optional.

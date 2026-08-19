@@ -202,6 +202,35 @@ RFC's "three hard parts" section warns, which is the argument for the corpus pro
 being real binaries rather than more of this. **No vDSO**, as designed: `AT_SYSINFO_EHDR`
 is absent and stays absent until a benchmark asks.
 
+## Step 4's record (2026-08-19): the fault becomes a signal, and the handler's edit takes
+
+Built before threading, as this RFC insists, and it earned the insistence. The layout half
+— dispositions, the alternate stack rule, and the `sigcontext` field offsets Go reads *and
+writes* — is host-tested arithmetic in `bhaskix-personality`; the machine half is a page
+fault that, in a tagged domain with a handler installed, writes a `ucontext` onto the
+process's own stack (through the fault-protected copy, so a hosted program with a broken
+stack gets a refused delivery rather than a kernel fault), points `rdi`/`rsi`/`rdx` at
+signal, `siginfo` and `ucontext`, and enters the handler with the restorer as its return
+address. `rt_sigaction`, `sigaltstack` and `rt_sigreturn` are now answered rather than
+refused; everything else is still `-ENOSYS`.
+
+The witness does what Go does: faults on purpose, reads `cr2` out of the `ucontext`, edits
+the saved `rip` past the faulting instruction, and returns — resuming where it said. Two
+findings. **Linux's argument registers are not this ABI's argument fields**: Linux passes
+`rdi, rsi, rdx, r10…`, and `SyscallFrame` calls those `capability, method, arg0, arg1…`,
+so reading `arg0` as the first argument reads `rdx` as `rdi` — the first version did, and
+the symptom was a handler installed for no signal at all. And the red-watch was more
+instructive than usual: moving `uc_mcontext` eight bytes made the handler's `rip` edit miss,
+so the program re-faulted **fourteen times** and never resumed — the exact "does not fail
+visibly" shape this section warns about, reproduced deliberately.
+
+**One narrowing, stated where it will be needed**: `rt_sigreturn` restores the caller-saved
+registers, `rip`, `rflags` and `rsp` — everything the system-call frame carries. The
+callee-saved four are preserved by the handler's own ABI obligation instead, which holds
+for every compiled handler; the trigger for saving the full register file across the entry
+stub is the first handler that deliberately edits a callee-saved register in the
+`ucontext` and expects it to take.
+
 ## Design
 
 ### Where it lives

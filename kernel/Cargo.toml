@@ -285,7 +285,13 @@ workspace = true
 # through the direct map (code, the built stack image, the report read back)
 # and its ring 3 entry. The image itself is built by `bhaskix-personality`,
 # which is zero-unsafe arithmetic; only the placing of it is here.
-unsafe_budget = 1344
+#
+# 1370 at RFC 0005 step 4 (2026-08-19): the signal witness -- its page fills
+# and ring 3 entry -- plus the delivery path's two fault-protected copies
+# (the frame out to the process's own stack, the sigcontext back in) and the
+# sigaction/sigaltstack reads. Every one is `uaccess`, which is the routine
+# whose whole contract is that a bad user pointer is ordinary input.
+unsafe_budget = 1371
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

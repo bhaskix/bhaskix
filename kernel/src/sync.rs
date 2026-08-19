@@ -218,8 +218,18 @@ pub enum Rank {
     /// not by blocking. Outside the console, because a driver reports what it
     /// found while holding itself.
     Block = 15,
+    /// `signal::DISPOSITIONS` — the Linux personality's per-domain handler
+    /// tables (RFC 0005 step 4).
+    ///
+    /// Nearly innermost, and taken from the page-fault handler: a user-mode
+    /// fault means the interrupted thread held no kernel lock at all, so
+    /// nothing outside is held when this is; and nothing is taken while it
+    /// is held — the frame is built into a local buffer and the lock
+    /// released before a single byte crosses to user memory. Outside the
+    /// console only because a delivery that refuses says so.
+    Signals = 16,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
-    Console = 16,
+    Console = 17,
 }
 
 impl Rank {
@@ -259,6 +269,7 @@ impl Rank {
             Self::IrqHandlers => "irq::HANDLERS",
             Self::Vectors => "vectors::TABLE",
             Self::Block => "virtio::DEVICE",
+            Self::Signals => "signal::DISPOSITIONS",
             Self::DmaWindow => "iommu::WINDOW",
             Self::Console => "console::CONSOLE",
         }

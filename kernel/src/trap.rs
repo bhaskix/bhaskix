@@ -247,6 +247,16 @@ fn handle(frame: &mut TrapFrame) {
         }
     }
 
+    // RFC 0005 step 4: in a Linux-tagged domain a fault is not necessarily
+    // the end. Go installs a `SIGSEGV` handler and turns a null dereference
+    // into a panic; delivering the signal is what makes that work, and it
+    // happens *before* the report, because a delivered signal is not an
+    // exception the machine needs to narrate.
+    if frame.from_user_mode() && crate::signal::deliver_for_fault(frame, read_cr2()) {
+        crate::sched::check_user_space(3);
+        return;
+    }
+
     report_exception(frame, dispatched);
 
     // A fault in ring 3 is the program's bug, not the machine's.

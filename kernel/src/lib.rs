@@ -49,6 +49,8 @@ pub mod sched;
 pub mod service;
 pub mod shared;
 pub mod shell;
+/// RFC 0005 step 4: Linux signal delivery for tagged domains.
+pub mod signal;
 pub mod smp;
 pub mod stack;
 pub mod sync;
@@ -523,6 +525,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         bhaskix_arch::percpu::online_count(),
     ) {
         println!("\x1b[91m    linux stack    FAILED\x1b[0m");
+    }
+    if !signal_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux signal   FAILED\x1b[0m");
     }
     frames_report();
     tickless_report();
@@ -2690,6 +2698,189 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// Where the foreigner's report page lands physically, told by the thread
 /// that mapped it so the test can read the answers through the direct map.
 static FOREIGNER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the signal probe's report page lands physically.
+static SIGNAL_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The signal probe, hand-assembled. RFC 0005 step 4's witness, and it does
+/// exactly what Go's runtime does with a fault:
+///
+/// 1. installs a `SIGSEGV` handler with `rt_sigaction`, `SA_RESTORER`
+///    pointing at its own two-instruction restorer;
+/// 2. dereferences null on purpose;
+/// 3. in the handler, reads `cr2` out of the `ucontext` it was handed,
+///    stores it, then **edits the saved `rip`** to point past the faulting
+///    instruction and returns through the restorer;
+/// 4. having resumed where it said, records that it got there and spins.
+///
+/// If any link is wrong the probe never reaches step 4: a wrong `ucontext`
+/// offset stores the wrong `cr2`, a wrong `rip` slot resumes into the fault
+/// again, and a broken `rt_sigreturn` never resumes at all.
+const SIGNAL_CODE: [u8; 103] = [
+    0x49, 0x89, 0xff, // mov r15, rdi          ; the report page
+    0x6a, 0x00, // push 0                ; sa_mask
+    0x48, 0x8d, 0x05, 0x52, 0x00, 0x00, 0x00, // lea rax, [rip+restorer]
+    0x50, // push rax              ; sa_restorer
+    0xb8, 0x04, 0x00, 0x00, 0x04, // mov eax, SA_SIGINFO|SA_RESTORER
+    0x50, // push rax              ; sa_flags
+    0x48, 0x8d, 0x05, 0x27, 0x00, 0x00, 0x00, // lea rax, [rip+handler]
+    0x50, // push rax              ; sa_handler
+    0x48, 0x89, 0xe6, // mov rsi, rsp          ; act
+    0xbf, 0x0b, 0x00, 0x00, 0x00, // mov edi, 11           ; SIGSEGV
+    0x31, 0xd2, // xor edx, edx          ; oldact
+    0x41, 0xba, 0x08, 0x00, 0x00, 0x00, // mov r10d, 8           ; sigsetsize
+    0xb8, 0x0d, 0x00, 0x00, 0x00, // mov eax, 13           ; rt_sigaction
+    0x0f, 0x05, // syscall
+    0x31, 0xc0, // xor eax, eax
+    0x48, 0x8b, 0x00, // mov rax, [rax]        ; #PF at null, 3 bytes
+    0x49, 0xc7, 0x47, 0x08, 0x01, 0x00, 0x00, 0x00, // mov qword [r15+8], 1  ; resumed
+    0xeb, 0xfe, // jmp $
+    0x48, 0x8b, 0x82, 0xd0, 0x00, 0x00, 0x00, // mov rax, [rdx+0xd0]   ; ucontext cr2
+    0x49, 0x89, 0x07, // mov [r15], rax        ; report it
+    0x48, 0x8b, 0x82, 0xa8, 0x00, 0x00, 0x00, // mov rax, [rdx+0xa8]   ; saved rip
+    0x48, 0x83, 0xc0, 0x03, // add rax, 3            ; past the faulting mov
+    0x48, 0x89, 0x82, 0xa8, 0x00, 0x00, 0x00, // mov [rdx+0xa8], rax   ; edit it
+    0xc3, // ret                   ; into the restorer
+    0xb8, 0x0f, 0x00, 0x00, 0x00, // mov eax, 15           ; rt_sigreturn
+    0x0f, 0x05, // syscall
+    0xeb, 0xfe, // jmp $                 ; never reached
+];
+
+/// Where the signal probe's code, stack and report live in its own space.
+const SIGNAL_CODE_AT: u64 = 0x0000_0000_3000_0000;
+const SIGNAL_STACK_AT: u64 = 0x0000_0000_3001_0000;
+const SIGNAL_REPORT_AT: u64 = 0x0000_0000_3002_0000;
+
+/// The thread that becomes RFC 0005 step 4's witness.
+extern "C" fn ring3_signal(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, pages, protection) in [
+        (SIGNAL_CODE_AT, 1, Protection::ReadExecute),
+        (SIGNAL_STACK_AT, 4, Protection::ReadWrite),
+        (SIGNAL_REPORT_AT, 1, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), pages) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let (Some(code_pa), Some(report_pa)) = (
+        space.translate(VirtAddr(SIGNAL_CODE_AT)),
+        space.translate(VirtAddr(SIGNAL_REPORT_AT)),
+    ) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped anonymous frame this space owns, filled
+    // through the direct map -- the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            SIGNAL_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            SIGNAL_CODE.len(),
+        );
+    }
+    SIGNAL_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is inside the user-executable page just written;
+    // `rsp` is one past four user-writable stack pages -- the signal frame
+    // is built below it, so the room is deliberate; `RSP0` was set by the
+    // ring 3 test.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            SIGNAL_CODE_AT,
+            SIGNAL_STACK_AT + 4 * 4096,
+            [SIGNAL_REPORT_AT, 0],
+        )
+    }
+}
+
+/// RFC 0005 step 4's witness: a Linux program installs a `SIGSEGV` handler,
+/// faults on purpose, reads the fault address out of the `ucontext` it was
+/// handed, edits the saved `rip` to resume past the faulting instruction,
+/// and returns through `rt_sigreturn` -- which is precisely how Go turns a
+/// null dereference into a recovered panic.
+fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux signal   skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let delivered_before = signal::DELIVERED.load(Ordering::Relaxed);
+    let returned_before = signal::RETURNED.load(Ordering::Relaxed);
+    let Ok(realm) = domain::create("sigsegv", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux signal   FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_none()
+    {
+        println!("\x1b[91m    linux signal   FAILED: the tag would not set\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "sigsegv", ring3_signal, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux signal   FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+
+    // The probe reports the fault address, then -- only if it resumed where
+    // the handler said -- a one. Bounded, paced.
+    let mut answers = [0u64; 2];
+    let mut report_pa = 0;
+    for _ in 0..400 {
+        report_pa = SIGNAL_REPORT_PA.load(Ordering::Acquire);
+        if report_pa != 0 {
+            // SAFETY: a frame the probe's space owns, through the direct map.
+            answers = unsafe {
+                [
+                    core::ptr::read_volatile((hhdm_base + report_pa) as *const u64),
+                    core::ptr::read_volatile((hhdm_base + report_pa + 8) as *const u64),
+                ]
+            };
+            if answers[1] == 1 {
+                break;
+            }
+        }
+        wait_millis(5);
+    }
+    domain::destroy(realm);
+    signal::forget(realm.as_u32());
+
+    let delivered = signal::DELIVERED.load(Ordering::Relaxed) - delivered_before;
+    let returned = signal::RETURNED.load(Ordering::Relaxed) - returned_before;
+    if report_pa != 0 && answers[0] == 0 && answers[1] == 1 && delivered == 1 && returned == 1 {
+        println!(
+            "    linux signal   a Linux program faulted on purpose, its SIGSEGV handler read \
+             cr2 0x0 out of the ucontext, edited the saved rip, and rt_sigreturn resumed it \
+             where it said: 1 delivered, 1 returned"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux signal   FAILED: cr2 {:#x}, resumed {}, delivered {delivered}, \
+             returned {returned}\x1b[0m",
+            answers[0], answers[1]
+        );
+        false
+    }
+}
 
 /// Where the auxv-reading probe's report page lands physically.
 static AUXV_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
