@@ -269,6 +269,29 @@ pub struct Thread {
     /// domains on one CPU did, and the only reason it had never happened is
     /// that there had never been two user programs on one CPU at once.
     pub space_root: u64,
+    /// This thread's floating-point and SSE register file, saved when it
+    /// leaves a CPU and restored when it arrives.
+    ///
+    /// **`CR4.OSFXSR` is the OS promising to do exactly this**, and the
+    /// promise is what makes enabling SSE safe: the register file is per
+    /// CPU and threads are not, so two threads sharing one would otherwise
+    /// read each other's floating-point values — silently, and only
+    /// sometimes, which is the worst shape a bug can have.
+    ///
+    /// Starts as the image `FXSAVE` produced of the machine's own initial
+    /// state, not as zeroes: a zeroed area is not a valid state image, and
+    /// `FXRSTOR` of one sets a control word no program asked for.
+    pub fx: FxArea,
+    /// The thread-local base this thread asked for with Linux's
+    /// `arch_prctl(ARCH_SET_FS)`, or zero.
+    ///
+    /// **Per thread, because the register is per CPU.** Writing the MSR in
+    /// the system call and leaving it there survives exactly until the next
+    /// context switch — and Go's `rt0` stores through `fs:` and reads it
+    /// back three instructions after asking, then executes `UD2` if the
+    /// value did not survive. It did not, and that `UD2` is how this field
+    /// came to exist.
+    pub fs_base: u64,
 
     /// The caller this thread received from and has not yet answered.
     ///
@@ -871,6 +894,8 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         held_locks: 0,
         held_count: 0,
         space_root: 0,
+        fs_base: 0,
+        fx: FxArea::initial(),
         reply_to: None,
         receive_slot: None,
         staged_gift: None,
@@ -1084,6 +1109,8 @@ pub fn spawn_on_with(
         held_locks: 0,
         held_count: 0,
         space_root: 0,
+        fs_base: 0,
+        fx: FxArea::initial(),
         reply_to: None,
         receive_slot: None,
         staged_gift: None,
@@ -1198,6 +1225,61 @@ pub fn deliver(thread: u32, message: crate::ipc::Message, from: u32) -> bool {
                 return false;
             }
             target.mailbox = Some((message, from));
+            return true;
+        }
+    }
+    false
+}
+
+/// A thread's `FXSAVE` area: 512 bytes, 16-byte aligned as the instruction
+/// requires.
+#[derive(Clone, Copy)]
+#[repr(align(16))]
+pub struct FxArea([u8; 512]);
+
+impl FxArea {
+    /// An area holding a valid initial state image, **built from constants
+    /// rather than taken from the machine**.
+    ///
+    /// The first version executed `FXSAVE` here, on the reasoning that a
+    /// real image beats an invented one. It was wrong twice over. Threads
+    /// are constructed before SSE is enabled on the CPU that will run them
+    /// — on the native-loader path an application processor builds its idle
+    /// thread on the way up — so the instruction faulted and that processor
+    /// simply never arrived, reported by the lane as "the cpus line is
+    /// missing or short of 4 online of 4". And copying the *running* state
+    /// would hand a new thread whatever the last one left in `xmm0`, which
+    /// is a leak between threads however tidy it looks.
+    ///
+    /// So the image is written: `FCW` = `0x037f` (the x87 control word after
+    /// `FNINIT`) and `MXCSR` = `0x1f80` (all SSE exceptions masked, round to
+    /// nearest), everything else zero. That is what a process starts with on
+    /// any system, and it depends on no instruction having been enabled yet.
+    #[must_use]
+    pub const fn initial() -> Self {
+        let mut area = [0u8; 512];
+        // `FCW` at 0, `MXCSR` at 24 — the layout `FXSAVE` writes and
+        // `FXRSTOR` reads.
+        area[0] = 0x7f;
+        area[1] = 0x03;
+        area[24] = 0x80;
+        area[25] = 0x1f;
+        Self(area)
+    }
+}
+
+/// Records a thread's `FS` base and loads it now, so the call that asked
+/// for it sees it on return.
+pub fn set_fs_base(thread: u32, base: u64) -> bool {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            target.fs_base = base;
+            // SAFETY: `IA32_FS_BASE` is a segment base for *user* accesses;
+            // every access through it is still a user-mode access under the
+            // caller's own page table, so a wrong value faults the caller
+            // and reaches nothing of the kernel's.
+            unsafe { bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, base) };
             return true;
         }
     }
@@ -2417,8 +2499,27 @@ pub fn preempt() {
         // changes which domain runs here, and skipping the note there left
         // the next thread's system calls judged by its predecessor's
         // dialect. RFC 0005 step 6 found that the hard way.
+        // The floating-point file travels with the thread: saved out of the
+        // CPU for whoever is leaving, restored for whoever is arriving.
+        // This is `CR4.OSFXSR`'s promise being kept.
+        if let Some(from_thread) = queue.threads[current].as_mut() {
+            // SAFETY: 512 aligned bytes belonging to the thread being
+            // switched away from, and this is its last instant on the CPU.
+            unsafe { bhaskix_arch::cpu::fx_save(from_thread.fx.0.as_mut_ptr()) };
+        }
         if let Some(to_thread) = queue.threads[next].as_ref() {
+            // SAFETY: an image `FXSAVE` wrote — every area starts as one.
+            unsafe { bhaskix_arch::cpu::fx_restore(to_thread.fx.0.as_ptr()) };
             crate::telemetry::note_domain(to_thread.domain);
+            // The thread-local base travels with the thread, because the
+            // register does not: it is one per CPU, and a hosted program
+            // that set one expects to find it after any switch.
+            if to_thread.fs_base != 0 {
+                // SAFETY: as `set_fs_base` -- a user-mode segment base.
+                unsafe {
+                    bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, to_thread.fs_base)
+                };
+            }
         }
         if let (Some(from_thread), Some(to_thread)) = (
             queue.threads[current].as_ref(),
@@ -2999,8 +3100,24 @@ pub fn block_self() {
                 // hold, not in the registers-unsaved window.
                 // As above: the note is about the incoming thread and is
                 // taken whether or not the outgoing slot still holds one.
+                // As above: the floating-point file travels with the thread.
+                if let Some(from_thread) = queue.threads[current].as_mut() {
+                    // SAFETY: as the other switch site.
+                    unsafe { bhaskix_arch::cpu::fx_save(from_thread.fx.0.as_mut_ptr()) };
+                }
                 if let Some(to_thread) = queue.threads[next].as_ref() {
+                    // SAFETY: as the other switch site.
+                    unsafe { bhaskix_arch::cpu::fx_restore(to_thread.fx.0.as_ptr()) };
                     crate::telemetry::note_domain(to_thread.domain);
+                    if to_thread.fs_base != 0 {
+                        // SAFETY: as above.
+                        unsafe {
+                            bhaskix_arch::msr::write(
+                                bhaskix_arch::msr::IA32_FS_BASE,
+                                to_thread.fs_base,
+                            )
+                        };
+                    }
                 }
                 if let (Some(from_thread), Some(to_thread)) = (
                     queue.threads[current].as_ref(),
@@ -3794,6 +3911,8 @@ mod tests {
             held_locks: 0,
             held_count: 0,
             space_root: 0,
+            fs_base: 0,
+            fx: FxArea::initial(),
             reply_to: None,
             receive_slot: None,
             staged_gift: None,

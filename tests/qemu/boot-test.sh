@@ -574,7 +574,7 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 14 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+if grep -qE "vfs +[0-9]+ entries in /, 15 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -1301,7 +1301,7 @@ fi
 # number -- the tag is refused once a thread exists, and it dies with the
 # domain. The self-test asserts the exact sequence its probe issued; this
 # gate asserts the self-test ran and concluded.
-if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit_group: the first answered, the other two ENOSYS, [1-9] foreign calls logged" "$LOG"; then
+if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit: the pid answered, the bad descriptor refused EBADF, and exit never came back; [1-9] foreign calls logged" "$LOG"; then
     pass "a Linux-tagged domain is refused in Linux's own dialect, and logged"
 else
     fail "the personality self-test did not conclude"

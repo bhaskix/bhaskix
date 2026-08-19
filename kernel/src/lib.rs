@@ -269,6 +269,12 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
             // SAFETY: init, and every deliberate access to user memory already
             // goes through `uaccess`.
             let (smep, smap) = unsafe { cpu::enable_supervisor_protections() };
+            // SSE, on this CPU. See `cpu::enable_sse`: the ABI requires it,
+            // nothing this kernel loaded had ever used it, and the first
+            // real Linux binary died on `xorps` three instructions in.
+            // SAFETY: init, before anything enters ring 3 here, and the
+            // switch path keeps `OSFXSR`'s promise.
+            unsafe { cpu::enable_sse() };
             bhaskix_arch::uaccess::set_smap_enabled(smap);
             println!(
                 "    supervisor     smep {}  smap {}  ({} exception-table {})",
@@ -549,6 +555,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         bhaskix_arch::percpu::online_count(),
     ) {
         println!("\x1b[91m    linux clone    FAILED\x1b[0m");
+    }
+    if !go_corpus_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    go corpus      FAILED\x1b[0m");
     }
     frames_report();
     tickless_report();
@@ -2770,6 +2782,206 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// that mapped it so the test can read the answers through the direct map.
 static FOREIGNER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Where a Tier 0 Go program's stack goes in its own space.
+const GO_STACK_AT: u64 = 0x0000_7ffe_0000_0000;
+/// How many pages of it. Go's runtime starts on this before it allocates
+/// its own; eight is more than `runtime.rt0_go` touches before `mmap`.
+const GO_STACK_PAGES: u64 = 8;
+/// The corpus program, in the image.
+const GO_PROGRAM: &[u8] = b"bin/go-hello";
+
+/// The thread that becomes RFC 0005 step 7's Tier 0 attempt: a **real static
+/// Go binary**, loaded by this kernel's own fuzz-hardened ELF loader into a
+/// Linux-tagged domain, entered on an initial process image built by
+/// `bhaskix-personality` — argv, envp, and the auxiliary vector Go's
+/// `runtime.sysargs` reads.
+///
+/// Whatever it does next is the specification: every system call it makes
+/// that this personality does not answer is logged with its number, and that
+/// histogram is the work queue RFC 0005 says to build from.
+extern "C" fn ring3_go(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use bhaskix_personality::stack::{Builder, ProcessInfo};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(file) = vfs::open(GO_PROGRAM) else {
+        println!("[93m    go corpus      absent: no bin/go-hello in the image[0m");
+        stop()
+    };
+    let bytes = file.bytes();
+    if bytes.is_empty() {
+        println!(
+            "[93m    go corpus      skipped: bin/go-hello is empty, which means this              machine had no Go toolchain when the image was built[0m"
+        );
+        stop()
+    }
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    // The program headers, before the load, because the auxiliary vector
+    // must tell the runtime where they are *in its own space*.
+    let Ok(parsed) = elf::parse(bytes) else {
+        println!("[91m    go corpus      FAILED: the loader refused the binary[0m");
+        stop()
+    };
+    let entry = parsed.entry;
+    // `AT_PHDR` is a **virtual address in the process's own space**, and the
+    // loader does not track it -- so it is computed here from the file's own
+    // header and the segment that carries it. Go's `runtime.sysargs` walks
+    // the headers from this pointer.
+    let word_at = |at: usize, width: usize| -> u64 {
+        let mut value = [0u8; 8];
+        let Some(slice) = bytes.get(at..at + width) else {
+            return 0;
+        };
+        value[..width].copy_from_slice(slice);
+        u64::from_le_bytes(value)
+    };
+    // ELF64 header: e_phoff at 32, e_phentsize at 54, e_phnum at 56.
+    let phoff = word_at(32, 8) as usize;
+    let phent = word_at(54, 2);
+    let phnum = word_at(56, 2);
+    let phdr = parsed
+        .segments()
+        .find(|segment| {
+            phoff >= segment.file_offset && phoff < segment.file_offset + segment.file_size
+        })
+        .map(|segment| segment.address + (phoff - segment.file_offset) as u64)
+        .unwrap_or(0);
+    if elf::load_into(&parsed, bytes, &mut space, hhdm_base).is_err() {
+        println!("[91m    go corpus      FAILED: the segments would not map[0m");
+        stop()
+    }
+    let Some(stack) = VirtRange::from_pages(VirtAddr(GO_STACK_AT), GO_STACK_PAGES) else {
+        stop()
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop()
+    }
+    let top = GO_STACK_AT + GO_STACK_PAGES * 4096;
+    let image_at = top - 4096;
+    let Some(image_pa) = space.translate(VirtAddr(image_at)) else {
+        stop()
+    };
+    let random = [
+        bhaskix_rand::u64().unwrap_or(0x5eed_0000_5eed_0000),
+        bhaskix_rand::u64().unwrap_or(0x0dd0_5eed_0dd0_5eed),
+    ];
+    let mut entropy = [0u8; 16];
+    entropy[..8].copy_from_slice(&random[0].to_le_bytes());
+    entropy[8..].copy_from_slice(&random[1].to_le_bytes());
+    let args: [&[u8]; 1] = [b"go-hello"];
+    let env: [&[u8]; 0] = [];
+    let builder = Builder::new(
+        &args,
+        &env,
+        ProcessInfo {
+            entry,
+            phdr,
+            phent,
+            phnum,
+            page_size: 4096,
+            hwcap: 0,
+            random: entropy,
+        },
+    );
+    // SAFETY: a frame this space owns, viewed through the direct map as the
+    // page it is -- the same idiom the loader uses to fill a segment.
+    let page = unsafe { core::slice::from_raw_parts_mut((hhdm_base + image_pa) as *mut u8, 4096) };
+    if builder.build(page, image_at).is_err() {
+        stop()
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
+    // SAFETY: `entry` is inside a user-executable segment the loader
+    // accepted and mapped; `image_at` is the `argc` word of the initial
+    // image just built, which is where Linux puts a process's `rsp`.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, image_at, [0, 0]) }
+}
+
+/// RFC 0005 step 7: run a real static Go binary and say what it asked for.
+///
+/// The RFC is explicit that **the surface is defined by tracing the actual
+/// binary**, not by reading a syscall table — so this test's deliverable is
+/// the *histogram*: every system call the Go runtime made, in order, with
+/// the ones this personality could not answer named. Whether the program
+/// reaches `main` is the headline; what it asked for on the way is the work
+/// queue.
+fn go_corpus_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    go corpus      skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let before = syscall::FOREIGN_CALLS.load(Ordering::Relaxed);
+    let Ok(realm) = domain::create("go", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    go corpus      FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_none()
+    {
+        println!("\x1b[91m    go corpus      FAILED: the tag would not set\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "go", ring3_go, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    go corpus      FAILED: the loader thread would not spawn\x1b[0m");
+        return false;
+    }
+
+    // Give it a second to get as far as it gets. This is not a wait for
+    // success: a Tier 0 attempt that stops early is exactly the result
+    // worth printing, and the histogram is the point either way.
+    for _ in 0..200 {
+        wait_millis(5);
+        if domain::with(realm, |_| ()).is_none() {
+            break;
+        }
+    }
+    let made = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - before;
+    domain::destroy(realm);
+    signal::forget(realm.as_u32());
+
+    if made == 0 {
+        println!(
+            "\x1b[93m    go corpus      the binary made no system calls: it is absent, empty, \
+             or it faulted before its first one\x1b[0m"
+        );
+        return true;
+    }
+
+    // The histogram, in the order the runtime asked. Truncated to what the
+    // table holds, and it says so rather than implying it saw everything.
+    print!("    go corpus      {made} calls, first asked:");
+    let mut shown = 0;
+    for slot in syscall::FOREIGN_SEEN.iter() {
+        let number = slot.load(Ordering::Relaxed);
+        if number == u64::MAX {
+            break;
+        }
+        print!(" {number}");
+        shown += 1;
+    }
+    if made > shown {
+        print!(" (and {} more)", made - shown);
+    }
+    println!();
+    true
+}
+
 /// Where the clone probe's report page lands physically.
 static CLONE_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -4020,13 +4232,17 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
             core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
         ]
     };
-    let enosys = -38i64 as u64;
-    // `getpid` is *answered* since step 6 -- a domain-derived pid, never
-    // zero -- so the probe's first answer is a number and only the other two
-    // are refusals. This assertion said "all three refused" until step 6
-    // implemented one of them, which is the drift a self-test should catch
-    // in its own project rather than in someone else's runtime.
-    let all_refused = answers[0] != 0 && answers[1] == enosys && answers[2] == enosys;
+    // What each of the probe's three calls now means, and the assertion has
+    // been rewritten twice as the personality implemented them -- which is
+    // the drift a self-test should catch in its own project rather than in
+    // someone else's runtime. `getpid` answers a pid (never zero). `write`
+    // is implemented, and the probe hands it the wrong descriptor, so it
+    // gets `EBADF` -- a refusal from a real implementation rather than an
+    // absence. And `exit` **never returns**, so the third slot stays zero:
+    // the probe's own spin is unreachable, and a nonzero word there would
+    // mean a call that should have ended a thread came back from it.
+    let ebadf = -9i64 as u64;
+    let all_refused = answers[0] != 0 && answers[1] == ebadf && answers[2] == 0;
 
     let logged = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - calls_before;
     let numbers = [
@@ -4043,9 +4259,10 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     if all_refused && logged == 3 && sequence_right && refused_late && bit_cleared {
         println!(
-            "    personality    a Linux-tagged domain asked getpid, write and exit_group: the \
-             first answered, the other two ENOSYS, 3 foreign calls logged with their numbers, \
-             the tag refused once a thread existed, and cleared when the domain was put down"
+            "    personality    a Linux-tagged domain asked getpid, write and exit: the pid \
+             answered, the bad descriptor refused EBADF, and exit never came back; 3 foreign \
+             calls logged with their numbers, the tag refused once a thread existed, and \
+             cleared when the domain ended"
         );
         true
     } else {
@@ -13469,11 +13686,14 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             // than "at least", so adding a fourteenth without noticing this
             // line is a failure rather than a silently weaker test -- which
             // it has now been for every program added, most recently
-            // `bin/traced`, whose arrival this line duly caught, as
-            // designed, exactly as it caught `bin/tcpc` and `bin/tcpd`
+            // `bin/go-hello` -- RFC 0005 step 7's Tier 0 corpus program,
+            // and the first entry here that is not ours at all: a real
+            // static Go binary, built by whatever toolchain the machine
+            // has. Fifteen now, and this line caught it as designed,
+            // exactly as it caught `bin/traced`, `bin/tcpc` and `bin/tcpd`
             // before it.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 14,
+            entries >= 3 && bin == 15,
         ),
         (
             "the user program is an ELF the loader accepts",

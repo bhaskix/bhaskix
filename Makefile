@@ -64,6 +64,13 @@ SUP_DIR      := user/sup
 HELLO_DIR    := user/hello
 HELLO        := $(HELLO_DIR)/target/$(TARGET)/release/hello
 HELLO_BPK    := build/hello.bpk
+# RFC 0005 step 7: the Tier 0 corpus. A real static Go binary, built with
+# the toolchain on this machine, carried into the image and loaded by the
+# kernel's own ELF loader into a Linux-tagged domain. Built only if `go` is
+# present -- a contributor without it still builds everything else, and the
+# boot test says the corpus is absent rather than failing.
+GO           := $(shell command -v go 2>/dev/null)
+GO_HELLO     := build/go-hello
 GREEDY_BPK   := build/greedy.bpk
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 USER_SUP     := $(SUP_DIR)/target/$(TARGET)/release/sup
@@ -235,17 +242,20 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(GO_HELLO)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
+	    --file bin/go-hello=$(GO_HELLO) \
+	    \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
 	./$(MKIMAGE) $@.again $(INITRD_ROOT).again --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
+	    --file bin/go-hello=$(GO_HELLO) \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
 	cmp $@ $@.again
 	@rm -rf $@.again $(INITRD_ROOT).again
@@ -280,6 +290,18 @@ $(HELLO): $(HELLO_DIR)/src/main.rs $(HELLO_DIR)/link.ld $(HELLO_DIR)/Cargo.toml 
 	cd $(HELLO_DIR) && RUSTFLAGS="$(HELLO_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
+
+# The Go corpus program. `-ldflags -s -w` strips it: the loader does not
+# read symbols and the image does not need 400 KiB of them.
+$(GO_HELLO): corpus/hello.go
+	@mkdir -p $(dir $@)
+	@if [ -n "$(GO)" ]; then \
+	    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -ldflags '-s -w' \
+	        -o $@ corpus/hello.go && echo "built $@ ($$(stat -c%s $@) bytes)"; \
+	else \
+	    : > $@; \
+	    echo "no go toolchain: $@ left empty, the corpus gate will say so"; \
+	fi
 
 # The demonstration package, emitted and verified by the same tool and the
 # same parsers the installer uses.

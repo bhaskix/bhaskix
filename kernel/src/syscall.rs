@@ -1654,16 +1654,8 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
 pub static FOREIGN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The first eight foreign syscall numbers seen, for the boot report — the
 /// self-test asserts the exact sequence its probe issued.
-pub static FOREIGN_SEEN: [core::sync::atomic::AtomicU64; 8] = [
-    core::sync::atomic::AtomicU64::new(u64::MAX),
-    core::sync::atomic::AtomicU64::new(u64::MAX),
-    core::sync::atomic::AtomicU64::new(u64::MAX),
-    core::sync::atomic::AtomicU64::new(u64::MAX),
-    core::sync::atomic::AtomicU64::new(u64::MAX),
-    core::sync::atomic::AtomicU64::new(u64::MAX),
-    core::sync::atomic::AtomicU64::new(u64::MAX),
-    core::sync::atomic::AtomicU64::new(u64::MAX),
-];
+pub static FOREIGN_SEEN: [core::sync::atomic::AtomicU64; 32] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 32];
 
 /// Linux's `-ENOSYS`, as the `u64` the register carries.
 const LINUX_ENOSYS: u64 = -38i64 as u64;
@@ -1700,10 +1692,22 @@ mod linux {
     pub const GETTID: u64 = 186;
     /// `getpid()`.
     pub const GETPID: u64 = 39;
-    /// `exit_group(status)`.
+    /// `exit_group(status)` — every thread of the group.
     pub const EXIT_GROUP: u64 = 231;
+    /// `exit(status)` — this thread only. Distinct numbers and distinct
+    /// meanings: a hosted program with one thread cannot tell them apart,
+    /// and one with many very much can.
+    pub const EXIT: u64 = 60;
     /// `sched_yield()`.
     pub const SCHED_YIELD: u64 = 24;
+    /// `write(fd, buf, count)`.
+    pub const WRITE: u64 = 1;
+    /// `arch_prctl(code, addr)` — `ARCH_SET_FS` is the one that matters.
+    pub const ARCH_PRCTL: u64 = 158;
+    /// `sched_getaffinity(pid, len, mask)`.
+    pub const SCHED_GETAFFINITY: u64 = 204;
+    /// `rt_sigprocmask(how, set, oldset, sigsetsize)`.
+    pub const RT_SIGPROCMASK: u64 = 14;
 }
 
 /// The futex table: one wait queue per watched address, per domain.
@@ -1841,6 +1845,81 @@ fn foreign_thread_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
     let (first, second, third) = (frame.capability, frame.method, frame.arg0);
     match frame.kind {
         linux::GETPID => Some(u64::from(domain) + 1),
+        // The one call a hosted program needs before it can say anything.
+        // Only the two standard streams, and only to this machine's console:
+        // a hosted program writing to a descriptor it never opened is
+        // asking for authority, and fd 1 and 2 are the two Linux hands
+        // every process without being asked.
+        linux::WRITE => {
+            let (fd, buffer, count) = (first, second, third as usize);
+            if fd != 1 && fd != 2 {
+                // A real descriptor table is Tier 1's; until then, anything
+                // else is honestly absent rather than silently swallowed.
+                return Some(-9i64 as u64); // EBADF
+            }
+            let mut bytes = [0u8; 256];
+            let take = count.min(bytes.len());
+            if take == 0 {
+                return Some(0);
+            }
+            // SAFETY: the fault-protected read; a bad pointer is reported.
+            let read =
+                unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), buffer, take) };
+            read.ok()?;
+            // Through the console the kernel already prints with, because a
+            // hosted program's output is output: the bytes are lossy-decoded
+            // as UTF-8 so a binary write cannot corrupt the log's framing.
+            let text = core::str::from_utf8(&bytes[..take]).unwrap_or("<non-utf8>");
+            crate::print!("{text}");
+            Some(take as u64)
+        }
+        // The thread-local base. Go sets it before it touches anything in
+        // `fs:`, which is nearly everything the runtime does -- so without
+        // this a hosted Go program faults on its own scheduler.
+        linux::ARCH_PRCTL => {
+            const ARCH_SET_FS: u64 = 0x1002;
+            if first != ARCH_SET_FS {
+                return Some(errno::ENOSYS as u64);
+            }
+            // Recorded on the thread and loaded now. Not written straight
+            // to the MSR and left there: the register is per CPU and the
+            // thread is not, so the value has to travel with the thread
+            // across every switch or it is gone at the first one -- which
+            // is what Go's `rt0` catches three instructions later.
+            let thread = crate::sched::current_thread_id()?;
+            if !crate::sched::set_fs_base(thread, second) {
+                return Some(errno::ENOSYS as u64);
+            }
+            Some(0)
+        }
+        // Answered rather than refused, because Go reads the affinity mask
+        // to size its scheduler and treats a refusal as one CPU. The mask
+        // says how many this machine really has -- a truthful answer that
+        // costs nothing.
+        linux::SCHED_GETAFFINITY => {
+            let (length, mask) = (second as usize, third);
+            if mask == 0 || length < 8 {
+                return Some(errno::EINVAL as u64);
+            }
+            let cpus = bhaskix_arch::percpu::online_count();
+            let bits: u64 = if cpus >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << cpus) - 1
+            };
+            // SAFETY: the fault-protected write into the caller's own mask.
+            let written = unsafe {
+                bhaskix_arch::uaccess::copy_to_user(mask, bits.to_le_bytes().as_ptr(), 8)
+            };
+            written.ok()?;
+            Some(8)
+        }
+        // Signal masking is recorded nowhere and honoured nowhere yet, and
+        // answering zero is the *correct* lie for a system that delivers
+        // only synchronous faults: nothing this personality can deliver is
+        // maskable, so a mask that changes nothing is accurate. The trigger
+        // for making it real is the first asynchronous signal.
+        linux::RT_SIGPROCMASK => Some(0),
         // A thread id a hosted program can tell apart from its neighbours,
         // and stable for the life of the thread. Derived from the scheduler's
         // own id, offset so no thread is ever tid zero (Linux never issues
@@ -1849,6 +1928,12 @@ fn foreign_thread_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
         linux::SCHED_YIELD => {
             crate::sched::yield_now();
             Some(0)
+        }
+        linux::EXIT => {
+            // This thread, not the group. The domain ends when its last
+            // thread does, which is RFC 0017's own rule and needs no help
+            // from here.
+            crate::sched::exit()
         }
         linux::EXIT_GROUP => {
             // Every thread of the group, which is every thread of the

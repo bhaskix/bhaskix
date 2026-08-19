@@ -112,7 +112,12 @@ workspace = true
 # it), and the INIT and STARTUP sends -- one shared ICR path, the same shape as
 # send_ipi. None avoidable: a CPU is brought out of reset by exactly these
 # stores, and there is no safe wrapper for a processor that does not exist yet.
-unsafe_budget = 1141
+#
+# 1152 at RFC 0005 step 7 (2026-08-19): SSE. Four control-register bits to
+# enable it -- CR0.EM cleared, CR0.MP, CR4.OSFXSR and CR4.OSXMMEXCPT set --
+# and the FXSAVE/FXRSTOR pair the middle of those four is a promise to
+# perform. Every line is a register the type system cannot describe.
+unsafe_budget = 1152
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

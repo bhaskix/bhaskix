@@ -310,6 +310,47 @@ startup.** The work is a new spawn entry point that takes a user entry and stack
 the next thing to build, and it is why this step is recorded as half-delivered rather than
 done.
 
+## Step 7's record (2026-08-19): a real Go binary runs, prints, and stops where it says
+
+**Tier 0 is attempted with the real thing.** `corpus/hello.go` is built by whatever Go
+toolchain the machine has (1.13.8 here), carried into the image, and loaded by this
+kernel's own fuzz-hardened ELF loader into a Linux-tagged domain, entered on an initial
+process image the personality builder produced. What happens next is the deliverable this
+RFC asked for: **the Go runtime starts, makes 212 system calls, writes to our console
+through our `write`, and reports its own failure** — `fatal error: runtime: cannot
+allocate memory` — which is `mprotect` answering `ENOSYS`, because Go reserves `PROT_NONE`
+and then makes it writable. That is a named, understood stopping point rather than a
+mystery, and it is the next thing to build.
+
+**The finding that mattered most was not a syscall at all: SSE had never been enabled.**
+The first real binary died with `#UD` on `xorps %xmm0,%xmm0`, three instructions into a
+runtime function. Nothing this system had ever loaded used an `xmm` register, so `CR0.EM`
+sat set and `CR4.OSFXSR` clear for the project's whole life. Enabling it is four bits —
+and `OSFXSR` is *the OS promising to save and restore that register file*, so the promise
+is kept in the same change: every thread carries a 512-byte `FXSAVE` area, saved when it
+leaves a CPU and restored when it arrives, starting from a real state image rather than
+zeroes. Enabling SSE without that would have let two threads silently corrupt each other's
+floating-point state, which is the worst shape a bug can have here.
+
+The `FXSAVE` area's *initial* value is written from constants — `FCW` `0x037f`, `MXCSR`
+`0x1f80` — and not captured from the running CPU, for two reasons found the hard way:
+threads are constructed before SSE is enabled on the processor that will run them (an
+application processor builds its idle thread on the way up, and the instruction faulted, so
+that processor never arrived), and copying the live state would hand every new thread
+whatever the last one left in `xmm0`.
+
+Two more, both real: `arch_prctl(ARCH_SET_FS)` wrote the MSR and left it there — the
+register is per CPU and threads are not, so Go's `rt0` caught it three instructions later
+by storing through `fs:` and reading back the wrong thing; the base is now per-thread and
+travels on every switch. And `exit` (60) and `exit_group` (231) are different numbers with
+different meanings — a single-threaded program cannot tell them apart and a threaded one
+very much can, so both are implemented, `exit` ending the thread and `exit_group` the
+domain. **Answered so far**: `write` (fds 1 and 2 only), `arch_prctl`, `sched_getaffinity`
+(truthfully — Go sizes its scheduler from it), `rt_sigprocmask` (zero, honestly: nothing
+this personality delivers is maskable yet), `exit`, `exit_group`, plus everything steps 4
+to 6 landed. **Next, in the order the histogram asks**: `mprotect`, then `openat`/`read`
+for the `/sys` probes, then `nanosleep`.
+
 ## Design
 
 ### Where it lives

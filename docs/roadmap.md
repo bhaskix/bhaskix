@@ -6,11 +6,19 @@
 [TRACKER.md](../TRACKER.md) does, and where the two disagree about what is done, TRACKER wins. The
 status markers here are a summary of it and nothing more.*
 
-We do not publish dates. An unfunded volunteer kernel project that publishes dates publishes
-disappointments. What we publish instead is **ordering** and **exit criteria**: a milestone is done
-when its criteria pass in CI, and not before.
+We do not publish dates for *engineering* milestones. An unfunded volunteer kernel project that
+publishes dates publishes disappointments. What we publish instead is **ordering** and **exit
+criteria**: a milestone is done when its criteria pass in CI, and not before.
 
 Every milestone has an exit criterion that a stranger can verify by running a command.
+
+**One exception, set deliberately by the project lead: the first release has a date.** A release is
+not an engineering milestone — it is a decision to stop and publish what exists — and a dated one
+forces the questions a date is good at forcing: what is in, what is out, and what the honest gaps
+are on the day. See [First release](#first-release--29-november-2026) below. The scope is written to
+fit the date rather than the date stretched to fit an ambition, and if the criteria are not met the
+project publishes what it has *with the shortfall stated*, which is the only way a date and honesty
+survive in the same document.
 
 ---
 
@@ -322,6 +330,43 @@ Editions are configurations of one kernel and one service set, not forks.
 
 Desktop is deliberately last. It is the largest driver surface and the least differentiating work,
 and doing it early would consume the project.
+
+---
+
+## First release — 29 November 2026
+
+**Set by the project lead on 2026-08-19.** The first public release of Bhaskix, from a machine that
+today boots on its own loader, runs services in isolated domains, speaks IPv4 and IPv6, installs
+packages onto a journalled filesystem, and loads a real Linux binary.
+
+### What the release is
+
+A **developer preview**: an ISO a stranger can boot in QEMU, plus the source, the RFC record, and
+the honest gap list. Not a product, not an installer for a daily machine, and not a claim of
+production readiness. The word for what this is, and the word the release notes will use, is
+*preview*.
+
+### Release criteria — all verifiable by running a command
+
+| | Criterion | Where it stands on 2026-08-19 |
+|---|---|---|
+| R1 | `make test` green on every placement and lane, from a clean clone | met, and kept green commit by commit |
+| R2 | The ISO boots to a user-mode shell on BIOS, UEFI, and our own loader | met |
+| R3 | A package installs, runs with manifest-derived grants, and removes | met (RFC 0030) |
+| R4 | Networking answers on both address families, measured | met (RFC 0018–0029) |
+| R5 | **Boots on one piece of real hardware** | **not met** — M1-17, blocked on a machine |
+| R6 | The design documents reviewed by two people who did not write them | **not met** — Phase 0's own criterion |
+| R7 | A release note that states the gaps above as plainly as the features | to write |
+
+**R5 and R6 are the two that decide what the release can say.** If they are still unmet on the day,
+the release ships and says so — a preview that boots only under emulation, reviewed by one person,
+is a truthful thing to publish and a dishonest thing to dress up.
+
+### What is explicitly *not* in the first release
+
+A libc, self-hosting, a package repository, signatures, containers, VMs, a desktop, or a promise of
+ABI stability. The Linux personality ships as far as it has got — which by the release will be
+further than it is today — described by what it runs, not by what it aspires to.
 
 ---
 

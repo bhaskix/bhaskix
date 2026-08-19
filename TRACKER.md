@@ -22,6 +22,7 @@ What can be counted honestly, with how to recount it:
 
 | | | how it is derived |
 |---|---|---|
+| **First release** | **29 November 2026** — set by the project lead 2026-08-19; a developer preview, scope in `docs/roadmap.md` | Seven criteria, five met today. The two that are not are the ones that decide what the release may claim: **R5** boots on real hardware (M1-17, blocked on a machine) and **R6** two independent document reviewers (Phase 0's own unmet criterion). If either is still open on the day, the release ships saying so |
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **9 of 9 done** | §4 below; the ninth — package management and image building — closed 2026-08-19 with RFC 0030 (accepted the same day), the eighth — networking — on 2026-08-18 with RFC 0029. The table has grown as bullets became rows: 7 until telemetry joined 2026-08-17, 8 until packages joined 2026-08-19 |
 | Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
@@ -133,7 +134,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **BB1** | `bhaskixboot.efi` | ✅ **Accepted 2026-08-18**, all seven steps implemented — **the machine boots on its own loader at full strength**: slid by a drawn KASLR slide, four CPUs the kernel started itself, and `boot-test.sh native` answering the **same 74 gates every Limine lane answers** (ring 3, services, shell path, network, filesystem — all of it), beside the loader-specific lane's 23 and its permanent negative arm. The roadmap bullet is closed | **A UEFI loader of our own, and the native boot protocol is the `Handoff` we already own.** Hand-rolled firmware bindings (the external allowlist stays empty — a boot loader is the worst place for the first exception), the fuzz-hardened ELF parser reused via a leaf-crate extraction, entry through a second front door in the shim, and **graduated parity**: Limine keeps every existing lane while the native OVMF lane earns the same 48 gates step by step, secondaries and KASLR named as the two reductions that persist past first entry. Phase 2's exit criterion closes at gate parity, not at first link. Seven steps | [RFC 0028](docs/rfc/0028-bhaskixboot.md) |
 | **IP6** | IPv6 | ✅ **Accepted 2026-08-18** — drafted, implemented (all six steps) and accepted in one day, on the working demonstration: dual stack gated on every networked lane, both families measured on one boot, the networking bullet closed | **A second address family, not a second stack.** The collection on RFC 0018's pre-paid abstraction: a `V6` variant on the one-variant `Address` enum (the compiler produces the work list), parsers and NDP as zero-`unsafe` arithmetic in `bhaskix-net`, SLAAC in `bin/ipd`, UDP/TCP over the same rings and capability handover — a v6 endpoint fits an IPC message's four words exactly. Refused with written triggers: extension headers, fragmentation, DHCPv6, privacy addresses, a resolver. One stated harness reduction: this QEMU's slirp cannot deliver inbound v6, so the LISTEN path's v6 wire proof waits on a newer QEMU or hardware | [RFC 0029](docs/rfc/0029-ipv6.md) |
 | **PKG** | Packages | ✅ **Accepted 2026-08-19** — drafted and implemented (all six steps) across two days, on the working demonstration: the image a function of the manifests, the full install/run/remove arc live at the shell, every operation priced, the kernel untouched | **A package is a program plus the authority it asks for, in one reviewable file.** `driver-model.md` §5's manifest principle generalised to every installable thing: a ustar `.bpk` with a line-grammar manifest naming binaries, capability requests and SHA-256 content identity (honest about being corruption-detection until Phase 3 signs it). Build time: the image becomes a deterministic function of `packages/` — byte-identical gated, the Makefile cp-list retires. Run time: install/run/remove on RFC 0016's filesystem, grants = intersection of manifest and granter, over-ask refused whole, crash-safe ordering. Design claim: zero new kernel code. Refused with triggers: fetch, signatures, dependency solving, upgrades; install-time scripts refused *flat* — ambient authority by definition | [RFC 0030](docs/rfc/0030-packages.md) |
-| **LP1** | Linux personality | ⬜ **Steps 2–6 done** 2026-08-19 — RFC 0005; the tag and its `-ENOSYS` telemetry, the initial process image, the signal round trip, the memory calls, and threads: futex proven by two threads of one hosted program meeting through it, `clone` adopting its domain's space | **The Linux x86_64 ABI as a personality: a translation layer in a service domain, never the native interface.** Three rules or revert: no Linux concepts in the nucleus, the personality translates and never manufactures authority, native software never pays. Go-first (static, `CGO_ENABLED=0`) because it removes the dynamic linker, libc and locale from the problem; tiers defined by traced workloads, not syscall tables; signals built first because they are where the design is most likely wrong; `ptrace`/BPF/namespaces refused permanently | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
+| **LP1** | Linux personality | ⬜ **Steps 2–6 done, 7 attempted with a real Go binary** 2026-08-19 — RFC 0005; the tag and its `-ENOSYS` telemetry, the initial process image, the signal round trip, the memory calls, and threads: futex proven by two threads of one hosted program meeting through it, `clone` adopting its domain's space | **The Linux x86_64 ABI as a personality: a translation layer in a service domain, never the native interface.** Three rules or revert: no Linux concepts in the nucleus, the personality translates and never manufactures authority, native software never pays. Go-first (static, `CGO_ENABLED=0`) because it removes the dynamic linker, libc and locale from the problem; tiers defined by traced workloads, not syscall tables; signals built first because they are where the design is most likely wrong; `ptrace`/BPF/namespaces refused permanently | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -765,6 +766,77 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-19 (a date, for the first time: the first release is set for 29 November 2026)
+
+**The project lead set a release date**, and `docs/roadmap.md` gains its first one. The policy it
+sits beside is unchanged and now says why: engineering milestones still carry no dates, because an
+unfunded volunteer kernel that publishes dates publishes disappointments — but *a release is not an
+engineering milestone*. It is a decision to stop and publish what exists, and a date is good at
+forcing the three questions a release needs answered: what is in, what is out, and what the honest
+gaps are on the day.
+
+**What is set**: a developer preview on 2026-11-29 — an ISO a stranger can boot in QEMU, the source,
+the RFC record, and the gap list. Seven criteria, written so a stranger can check each by running a
+command; five are met today (the suite green on every placement, the ISO booting to a user-mode
+shell on three loaders, packages installing and running under manifest-derived grants, both address
+families answering and measured). **The two that are not met are the two that decide what the
+release may claim**: booting on real hardware (M1-17, blocked on a machine since M1) and the design
+documents reviewed by two people who did not write them (Phase 0's own criterion, open since Phase
+0). If they are still open on 29 November, the release ships **and says so** — a preview that boots
+only under emulation and was reviewed by one person is a truthful thing to publish and a dishonest
+thing to dress up. Explicitly not in scope: libc, self-hosting, a repository, signatures,
+containers, VMs, a desktop, or any ABI-stability promise.
+
+### 2026-08-19 (RFC 0005 step 7: a real Go binary runs on this kernel, prints through it, and names its own stopping point)
+
+**A static Go binary — built by this machine's own toolchain, not a stand-in — is loaded by
+Bhaskix's ELF loader into a Linux-tagged domain and runs.** It makes **212 system calls**,
+writes to the console through our `write`, and stops with its own diagnostic: `fatal error:
+runtime: cannot allocate memory`, which is `mprotect` answering `ENOSYS` because Go reserves
+`PROT_NONE` and then makes it writable. A named, understood stopping point, and the next
+thing to build. The histogram is printed on every networked boot, which is exactly what RFC
+0005 said the deliverable should be: *the surface is defined by tracing the actual binary*.
+
+**The finding that mattered most was not a system call: SSE had never been enabled on this
+machine.** The first real binary died with `#UD` on `xorps %xmm0,%xmm0` three instructions
+into a Go runtime function — `CR0.EM` set and `CR4.OSFXSR` clear for the project's entire
+life, because nothing it had ever loaded used an `xmm` register. Enabling it is four control
+bits, and `OSFXSR` is **the OS promising to save and restore that register file**, so the
+promise is kept in the same change: every thread now carries a 512-byte `FXSAVE` area,
+saved when it leaves a CPU and restored when it arrives, initialised from a real state image
+rather than zeroes. Enabling SSE without that would have let two threads silently corrupt
+each other's floating-point state.
+
+**The defect that cost the most, and the bisect that found it.** Enabling SSE came with a
+per-thread `FXSAVE` area, and the first version *took its initial image from the running
+CPU* — reasonable-sounding, and wrong twice over. Threads are constructed before SSE is
+enabled on the CPU that will run them: on the native-loader path an application processor
+builds its idle thread on the way up, so the `FXSAVE` faulted and **that processor never
+arrived**, reported by the lane as "the cpus line is missing or short of 4 online of 4".
+And copying the running state would have handed every new thread whatever the last one left
+in `xmm0`, which is a leak between threads however tidy it looks. The image is now written
+from constants — `FCW` `0x037f`, `MXCSR` `0x1f80`, the state any process starts with —
+and depends on no instruction being enabled yet.
+
+Worth recording is *how* it was found, because two earlier guesses were wrong: the Go
+binary tripling the initrd was suspected and cleared by rebuilding without it; disabling
+`enable_sse` alone appeared to exonerate SSE and did not, because it left `FXSAVE` illegal
+and reproduced the same hang for a different reason. What settled it was stashing the whole
+working tree, confirming the lane green at `HEAD`, restoring, and then disabling one piece
+at a time — SSE on with the switch-path save/restore off (still red), then the constructor's
+`FXSAVE` off as well (green). The lane names the CPU that never came; the bisect named the
+instruction.
+
+**Two more defects, both caught by the binary itself.** `arch_prctl(ARCH_SET_FS)` wrote the
+MSR and left it there — per-CPU state for a per-thread property — and Go's `rt0` caught it
+three instructions later by storing through `fs:` and reading back the wrong value, then
+executing its own `UD2`; the base is now per-thread and travels on every switch. And `exit`
+(60) and `exit_group` (231) are different numbers with different meanings: both are
+implemented now, and the penguin probe's assertion was rewritten a second time — its third
+call now **never returns**, which the test asserts by requiring that slot to stay zero.
+Two harness counts moved with the new file, both deliberately exact and both having caught
+it as designed. Kernel unsafe 1453 → 1482; arch 1141 → 1152.
 
 ### 2026-08-19 (RFC 0005 step 6: futex holds at its edges, and clone is refused rather than faked)
 

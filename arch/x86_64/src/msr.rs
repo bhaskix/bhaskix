@@ -14,6 +14,9 @@ pub const IA32_APIC_BASE: u32 = 0x1b;
 
 /// `IA32_EFER` — extended feature enables, including NX.
 pub const IA32_EFER: u32 = 0xc000_0080;
+/// The `FS` segment base, which is where thread-local storage lives on
+/// x86-64 — and what Linux's `arch_prctl(ARCH_SET_FS)` writes.
+pub const IA32_FS_BASE: u32 = 0xc000_0100;
 
 /// Reads a model-specific register.
 ///

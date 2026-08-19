@@ -197,6 +197,76 @@ pub unsafe fn enable_supervisor_protections() -> (bool, bool) {
     (features.smep, features.smap)
 }
 
+/// `CR4.OSFXSR` — the OS says it saves and restores SSE state.
+const CR4_OSFXSR: u64 = 1 << 9;
+/// `CR4.OSXMMEXCPT` — unmasked SSE exceptions arrive as `#XM`, not `#UD`.
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
+/// `CR0.MP` — monitor coprocessor.
+const CR0_MP: u64 = 1 << 1;
+/// `CR0.EM` — emulate the FPU, which on x86-64 means "fault on SSE".
+const CR0_EM: u64 = 1 << 2;
+
+/// Enables SSE for this CPU.
+///
+/// x86-64 requires SSE — the ABI passes floats in `xmm` registers — and yet
+/// a kernel whose own code is built soft-float can run for years without
+/// turning it on, because nothing it loads uses an `xmm` register. This one
+/// did: the first real Linux binary this system loaded died on `xorps
+/// %xmm0,%xmm0`, three instructions into a Go runtime function, with `#UD`.
+///
+/// Enabling it is four bits: clear `CR0.EM` so SSE instructions are not
+/// emulated-into-faults, set `CR0.MP`, and set `CR4.OSFXSR` and
+/// `CR4.OSXMMEXCPT` — the second of which is the OS promising to handle SSE
+/// exceptions as `#XM` rather than meeting them as `#UD`.
+///
+/// **`CR4.OSFXSR` is a promise, and `sched` keeps it**: the register file is
+/// per CPU and threads are not, so the switch path saves and restores it.
+/// Enabling this without that would let two threads sharing a CPU silently
+/// corrupt each other's floating-point state, which is the worst kind of
+/// bug this project can ship.
+///
+/// # Safety
+///
+/// Must run during init on each CPU, before anything enters ring 3 there.
+pub unsafe fn enable_sse() {
+    // SAFETY: `CR0` and `CR4` at CPL 0; only the four bits named are
+    // changed, and every other enable is preserved because clearing one
+    // mid-flight would be immediately fatal.
+    unsafe {
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack, preserves_flags));
+        cr0 = (cr0 & !CR0_EM) | CR0_MP;
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
+
+        let cr4 = read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT;
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+    }
+}
+
+/// Saves this CPU's floating-point and SSE state into `area`.
+///
+/// # Safety
+///
+/// `area` must be 512 bytes and 16-byte aligned — `FXSAVE`'s requirement,
+/// and the reason the caller's storage is a `repr(align(16))` type rather
+/// than a bare array.
+pub unsafe fn fx_save(area: *mut u8) {
+    // SAFETY: delegated to this function's contract.
+    unsafe { core::arch::asm!("fxsave [{}]", in(reg) area, options(nostack, preserves_flags)) };
+}
+
+/// Restores this CPU's floating-point and SSE state from `area`.
+///
+/// # Safety
+///
+/// As [`fx_save`], and `area` must hold a state image `FXSAVE` wrote — a
+/// zeroed area is *not* one, which is why threads start from a saved image
+/// of the machine's own initial state rather than from zeroes.
+pub unsafe fn fx_restore(area: *const u8) {
+    // SAFETY: delegated to this function's contract.
+    unsafe { core::arch::asm!("fxrstor [{}]", in(reg) area, options(nostack, preserves_flags)) };
+}
+
 /// Lifts SMAP for the current CPU by setting the `AC` flag.
 ///
 /// # Safety

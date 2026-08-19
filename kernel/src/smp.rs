@@ -87,6 +87,17 @@ extern "C" fn secondary_main(lapic_id: u32) -> ! {
         gdt::init_cpu(cpu_id as usize);
         idt::load_on_secondary();
 
+        // SSE, for this CPU too: the register file is per CPU, so the
+        // enable is as well, and a thread migrated here would meet `#UD`
+        // on its first floating-point instruction otherwise.
+        //
+        // **After the descriptor tables, not before them.** Placed at the
+        // top of this function it wrote control registers on a CPU with no
+        // IDT loaded, where any fault is a triple fault and the processor
+        // simply never arrives -- which is what the native lane reported
+        // as "the cpus line is missing or short of 4 online of 4".
+        bhaskix_arch::cpu::enable_sse();
+
         // Only now: the GDT load above cleared GS.base, so pointing GS at the
         // per-CPU area has to happen after it rather than before.
         percpu::activate(cpu_id);

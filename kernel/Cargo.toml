@@ -303,7 +303,12 @@ workspace = true
 # 1450 at the clone half of RFC 0005 step 6 (2026-08-19): the two-thread
 # witness -- page fills, ring 3 entry, marker-plus-five report words -- and
 # `cloned_thread`'s own entry into ring 3 at an address its caller chose.
-unsafe_budget = 1453
+#
+# 1482 at RFC 0005 step 7 (2026-08-19): SSE enabled on every CPU, the
+# floating-point file saved and restored at both switch sites (which is what
+# makes enabling it safe), the per-thread FS base, and the Tier 0 loader
+# thread that puts a real Go binary into a domain.
+unsafe_budget = 1491
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
