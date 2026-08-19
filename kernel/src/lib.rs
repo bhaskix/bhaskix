@@ -562,6 +562,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    go corpus      FAILED\x1b[0m");
     }
+    personality_boundary_report();
     frames_report();
     tickless_report();
     // Late on purpose: by here the self-tests above have poured real
@@ -2945,6 +2946,53 @@ fn wait_for_probe_threads(realm: domain::DomainId) {
         }
         wait_millis(5);
     }
+}
+
+/// What the personality boundary costs and how wide it is — RFC 0031's
+/// interface **I1**, made visible on every boot rather than left in a file.
+///
+/// Two numbers, and each answers a question that would otherwise be settled
+/// by opinion:
+///
+/// - **How many Linux numbers the nucleus interprets.** RFC 0031 says the
+///   nucleus should carry a foreign call's number without understanding it.
+///   It understands eighteen. Printing the count is what turns "we should
+///   move this" into a figure that can only go down, and the boot gate is a
+///   ratchet on it: it may shrink, and a change that grows it fails the
+///   build rather than being noticed in review or not at all.
+/// - **What a foreign call costs where it currently lives.** Relocating the
+///   personality into a domain buys containment and costs one IPC round trip
+///   per hosted system call. RFC 0031 requires the number *before* the move,
+///   not after — a measurement taken afterwards can only justify what was
+///   already done — so this is the in-nucleus placement's figure, taken with
+///   the instrument the domain placement will be taken with.
+///
+/// Prints nothing when no foreign call has been made: a machine that ran no
+/// hosted program has no boundary to report on, and a mean over zero samples
+/// is a zero pretending to be a measurement.
+fn personality_boundary_report() {
+    let (priced, floor, mean, dropped, excluded, interpreted) = syscall::foreign_cost();
+    if priced == 0 {
+        return;
+    }
+    // Every foreign call is accounted for, and the arithmetic is printed
+    // rather than trusted: priced plus dropped plus excluded must equal the
+    // total. When it did not -- 7 priced out of 212 -- the cause was a
+    // return path that was not being priced at all, and a report that only
+    // showed the mean would have hidden it behind a plausible number.
+    let total = syscall::FOREIGN_CALLS.load(core::sync::atomic::Ordering::Relaxed);
+    let counted = priced + dropped + excluded;
+    let accounting = if counted == total {
+        "all"
+    } else {
+        "SOME UNCOUNTED:"
+    };
+    println!(
+        "    personality    boundary: {interpreted} linux numbers interpreted in the nucleus \
+         (RFC 0031 wants 0); floor {floor} cycles over {priced} non-blocking calls, mean \
+         {mean}; {accounting} {counted} of {total} accounted ({excluded} block by \
+         construction, {dropped} preempted)"
+    );
 }
 
 /// RFC 0005 step 7: run a real static Go binary and say what it asked for.

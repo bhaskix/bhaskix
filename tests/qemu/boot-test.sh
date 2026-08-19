@@ -1235,6 +1235,47 @@ fi
 # The numbers are recorded, not gated -- a slow host is not a broken kernel --
 # but a networked boot that produced none measured nothing, and that is a
 # failure of the instrument.
+# RFC 0031 interface I1, as a ratchet. The nucleus is meant to carry a
+# foreign call's number without interpreting it; it interprets eighteen. The
+# count is printed on every boot that ran a hosted program, and this gate
+# lets it *shrink* and never grow -- so the boundary violation is a number
+# with a direction rather than a paragraph in an RFC. It reaches zero when
+# the personality moves into a domain (RFC 0031 section 5), and this gate is
+# what will say so.
+#
+# The cost figure beside it is the other half of RFC 0031's requirement: the
+# in-nucleus placement priced *before* the move, with the instrument the
+# domain placement will be priced by. It is reported and not gated -- a
+# threshold on a cycle count measured under an emulator would be a gate on
+# the host's load, which is the mistake `docs/coding-style.md` warns about
+# and which this suite has made before.
+if grep -qE "personality +boundary: [0-9]+ linux numbers interpreted in the nucleus" "$LOG"; then
+    interpreted=$(sed -n 's/.*boundary: \([0-9]*\) linux numbers.*/\1/p' "$LOG" | head -1)
+    if [[ "$interpreted" -le 18 ]]; then
+        pass "the personality boundary is $interpreted linux numbers wide, and may only narrow"
+    else
+        fail "the nucleus interprets $interpreted linux numbers, up from 18 -- RFC 0031 I1 wants 0"
+        status=1
+    fi
+    # And the instrument accounts for itself. Every foreign call is priced,
+    # excluded as blocking, or dropped as preempted, and the three must sum
+    # to the total -- which is how the first version was caught reporting a
+    # confident mean over 7 of 212 calls, because `exit` never returns to be
+    # priced and the exclusions were being counted on the way out. A cost
+    # figure whose population is unstated is not a measurement.
+    if grep -qE "personality +boundary:.* all [0-9]+ of [0-9]+ accounted" "$LOG"; then
+        pass "the boundary instrument accounts for every foreign call it priced"
+    else
+        fail "the boundary instrument left foreign calls unaccounted for -- its cost figure is over an unstated population"
+        status=1
+    fi
+else
+    # Not every machine runs a hosted program: a boot with no foreign call
+    # has no boundary to report, and demanding the line there would gate on
+    # the machine rather than on the kernel.
+    pass "no hosted program on this machine, so the boundary had nothing to report"
+fi
+
 # RFC 0005 step 6, the clone half: two threads of one hosted program, meeting
 # through a futex. This is the gate that could not exist while clone was
 # refused -- one thread cannot prove that a wait blocks and a wake releases

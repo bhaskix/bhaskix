@@ -466,6 +466,71 @@ a file, made a socket or waited on an `epoll` set. Nothing above is reachable
 from ring 3 yet, and it will not be until the personality is where this RFC has
 always said it belongs.
 
+## Step 10's record (2026-08-19): the gate is unmet, and it is reported unmet rather than redefined
+
+**Step 10 cannot be run, and the reason is not a shortfall in this
+project.** The step is *"the motivating workload runs under load"*, and the
+motivating workload has never been named. That is the same thing step 1 has
+been owed from outside since this RFC was drafted — the header still says so
+— and without it there is no gate to run, only a gate to invent. Inventing
+one would mean choosing a workload that happens to pass, which is the exact
+failure this document's own testing plan exists to prevent.
+
+It is blocked a second time regardless: step 10 needs Tiers 1 and 2 working,
+and step 9 established that Tier 2's wiring **cannot exist** while the
+personality is in the nucleus.
+
+So the work this step actually needs is the relocation, and what landed is
+[RFC 0031](0031-linux-compatibility-as-an-adapter.md)'s plan item 4 — the
+boundary made explicit, and the move **priced before it happens**.
+
+**The boundary, as a value.** `PersonalityCall` (in `personality::call`,
+zero-`unsafe`, host-tested) is what the nucleus now builds at the foreign
+entry and hands to every handler. None of them reads a kernel structure any
+more, which is what makes moving them a change of caller rather than a
+rewrite. It also makes one recurring bug unrepresentable: Linux passes
+arguments in `rdi, rsi, rdx, r10, r8, r9`, and the kernel's `SyscallFrame`
+calls those same registers `capability`, `method`, `arg0`, `arg1`, `arg2`,
+`arg3`, because RFC 0008's ABI is about capabilities. Reading `arg0` as "the
+first argument" reads `rdx` as `rdi` — **written wrongly twice in this
+project**, once installing a handler for signal-number-nothing and once
+decoding an `mmap` whose length was its protection. A `PersonalityCall` has
+one array in the dialect's order and no second naming to confuse it with.
+
+**The boundary, as a number that may only shrink.** The nucleus interprets
+**eighteen** Linux syscall numbers. That count is declared, printed on every
+boot that ran a hosted program, and gated as a ratchet: it may fall, and a
+change that raises it fails the build. RFC 0031 wants it at zero, and this is
+what will say when it gets there. The honest caveat is in the code: the list
+is kept by hand, so it measures *declared* interpretation — deriving it from
+the dispatch needs the dispatch to be a table, which is a change worth making
+when the personality moves rather than before.
+
+**The price, taken now because a measurement taken afterwards can only
+justify what was already done.** The floor is **4,916 cycles** per
+non-blocking foreign call in the nucleus placement, on this emulated machine.
+The domain placement will be measured with the same instrument, and the
+difference is what the containment costs.
+
+**Getting that number honest took two attempts, and the first one is the
+lesson.** Priced naively, the mean was **47,047 cycles with 107 of 236
+samples discarded** — which is not what a foreign call costs. It is what a
+`futex` sleeping and a `write` reaching a UART cost, and neither is the
+boundary nor changes when the personality moves. Calls that block by
+construction are now excluded at entry, the *floor* is reported beside the
+mean because a minimum over many samples is the figure two placements can be
+compared on, and — the part that caught the rest — **every call is accounted
+for**: priced plus excluded plus preempted must equal the total, printed, and
+gated. That arithmetic is what revealed the first version pricing 7 calls out
+of 212 and reporting a confident mean over them; `exit` never returns, so a
+price taken on the way out was a price never taken. **The sample is small and
+the report says so** — six to eight non-blocking calls a boot — because the
+Go corpus's traffic is overwhelmingly `write`. It grows when Tier 1 lands.
+
+Both gates were armed and watched red: growing the declared boundary to
+nineteen failed the ratchet, and removing the exclusion counter failed the
+accounting.
+
 ## Design
 
 ### Where it lives

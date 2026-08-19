@@ -1657,9 +1657,6 @@ pub static FOREIGN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 pub static FOREIGN_SEEN: [core::sync::atomic::AtomicU64; 32] =
     [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 32];
 
-/// Linux's `-ENOSYS`, as the `u64` the register carries.
-const LINUX_ENOSYS: u64 = -38i64 as u64;
-
 /// Answers one foreign system call: `-ENOSYS`, logged.
 ///
 /// RFC 0005 step 2, whole and deliberate: no translation exists yet, so
@@ -1668,7 +1665,19 @@ const LINUX_ENOSYS: u64 = -38i64 as u64;
 /// events is the personality's work queue: what a real workload asks for is
 /// the specification, and this refusal path is how it gets written down.
 /// Never silently succeed — the RFC names that as the one forbidden answer.
+/// The boundary type every foreign handler below takes — RFC 0031's
+/// interface I1, and the reason none of them reads a kernel structure.
+use bhaskix_personality::call::{Dialect, PersonalityCall};
+
 /// Linux syscall numbers this personality answers rather than refuses.
+///
+/// **This module is the measure of a boundary violation, and its size is
+/// meant to reach zero.** RFC 0031's interface I1 says the nucleus carries a
+/// foreign call's number without interpreting it; every constant below is a
+/// number the nucleus *does* interpret, and [`ANSWERED`] publishes the count
+/// so the violation is visible on every boot rather than discovered by
+/// reading the file. When the personality moves into a domain (RFC 0031 §5)
+/// this module goes with it and the count becomes zero.
 mod linux {
     /// `rt_sigaction(sig, act, oldact, sigsetsize)`.
     pub const RT_SIGACTION: u64 = 13;
@@ -1708,6 +1717,51 @@ mod linux {
     pub const SCHED_GETAFFINITY: u64 = 204;
     /// `rt_sigprocmask(how, set, oldset, sigsetsize)`.
     pub const RT_SIGPROCMASK: u64 = 14;
+
+    /// Every number above, once, so the boundary has a size.
+    ///
+    /// **Kept by hand, and the honest caveat is that nothing enforces it.**
+    /// A `match` arm added without a line here would leave this number too
+    /// small — so the boot report prints it as a count of *declared*
+    /// interpretation, and the gate is a ratchet on that declaration. The
+    /// alternative, deriving it from the dispatch, needs the dispatch to be
+    /// a table rather than a `match`, which is a change worth making when
+    /// the personality moves rather than before.
+    pub const ANSWERED: [u64; 18] = [
+        RT_SIGACTION,
+        RT_SIGRETURN,
+        SIGALTSTACK,
+        MMAP,
+        MUNMAP,
+        MPROTECT,
+        MADVISE,
+        CLONE,
+        FUTEX,
+        GETTID,
+        GETPID,
+        EXIT_GROUP,
+        EXIT,
+        SCHED_YIELD,
+        WRITE,
+        ARCH_PRCTL,
+        SCHED_GETAFFINITY,
+        RT_SIGPROCMASK,
+    ];
+
+    // No number appears twice: a duplicate would make the boundary look
+    // smaller than it is, which is the one direction this count must never
+    // be wrong in.
+    const _: () = {
+        let mut outer = 0;
+        while outer < ANSWERED.len() {
+            let mut inner = outer + 1;
+            while inner < ANSWERED.len() {
+                assert!(ANSWERED[outer] != ANSWERED[inner]);
+                inner += 1;
+            }
+            outer += 1;
+        }
+    };
 }
 
 /// The futex table: one wait queue per watched address, per domain.
@@ -1761,11 +1815,11 @@ static MMAP_NEXT: core::sync::atomic::AtomicU64 =
 /// address space, which is the whole of rule 2: the personality maps memory
 /// the caller already has a domain to hold, and can no more conjure a frame
 /// than any other program can.
-fn foreign_memory_call(frame: &mut SyscallFrame) -> Option<u64> {
+fn foreign_memory_call(call: &PersonalityCall) -> Option<u64> {
     use bhaskix_personality::memory::{self, MapPlan};
 
-    let (first, second, third) = (frame.capability, frame.method, frame.arg0);
-    match frame.kind {
+    let (first, second, third) = (call.first(), call.second(), call.third());
+    match call.number {
         linux::MMAP => {
             static TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let nth = TRACED.fetch_add(1, Ordering::Relaxed);
@@ -1773,10 +1827,10 @@ fn foreign_memory_call(frame: &mut SyscallFrame) -> Option<u64> {
                 crate::println!(
                     "    go trace       mmap#{nth} addr={first:#x} len={second:#x} \
                      prot={third:#x} flags={:#x}",
-                    frame.arg1
+                    call.fourth()
                 );
             }
-            let plan = memory::plan_mmap(first, second, third, frame.arg1, frame.arg2 as i64);
+            let plan = memory::plan_mmap(first, second, third, call.fourth(), call.fifth() as i64);
             let MapPlan::Map {
                 at,
                 hint,
@@ -1887,12 +1941,12 @@ fn foreign_memory_call(frame: &mut SyscallFrame) -> Option<u64> {
 /// parks on the kernel's own wait queues, which is the primitive the RFC
 /// said this needs. `exit_group` ends the domain, which is what makes a
 /// thread group's exit exact.
-fn foreign_thread_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
+fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
     use bhaskix_personality::memory::errno;
     use bhaskix_personality::thread::{self, ClonePlan, FutexPlan};
 
-    let (first, second, third) = (frame.capability, frame.method, frame.arg0);
-    match frame.kind {
+    let (first, second, third) = (call.first(), call.second(), call.third());
+    match call.number {
         linux::GETPID => Some(u64::from(domain) + 1),
         // The one call a hosted program needs before it can say anything.
         // Only the two standard streams, and only to this machine's console:
@@ -1994,7 +2048,7 @@ fn foreign_thread_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
             crate::sched::exit()
         }
         linux::CLONE => {
-            let plan = thread::plan_clone(first, second, third, frame.arg1, frame.arg2);
+            let plan = thread::plan_clone(first, second, third, call.fourth(), call.fifth());
             let ClonePlan::Thread {
                 stack,
                 tls,
@@ -2023,7 +2077,7 @@ fn foreign_thread_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
             // libc puts the entry). A hosted runtime that expects Linux's
             // "resume after the syscall" shape needs the register-file copy
             // this does not yet do -- written down, not pretended.
-            let entry = frame.arg3;
+            let entry = call.sixth();
             if entry == 0 {
                 return Some(errno::ENOSYS as u64);
             }
@@ -2132,16 +2186,19 @@ fn read_sigaction(at: u64) -> Option<bhaskix_personality::signal::Handler> {
 /// is the RFC's tiering rather than an omission.
 ///
 /// Returns `Some(value)` when the call was answered, `None` to refuse.
-fn foreign_signal_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
-    // **Linux's argument registers are not this ABI's argument fields, and
-    // the names in `SyscallFrame` are RFC 0008's.** Linux passes
-    // `rdi, rsi, rdx, r10, r8, r9`; this frame calls those `capability`,
-    // `method`, `arg0`, `arg1`, `arg2`, `arg3`. Reading `arg0` as the first
-    // argument is therefore reading `rdx` as `rdi` -- which is exactly what
-    // the first version of this function did, and the symptom was a handler
-    // that installed for signal-number-nothing and a fault that found none.
-    let (first, second) = (frame.capability, frame.method);
-    match frame.kind {
+fn foreign_signal_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
+    // **The argument naming that bit twice is now unrepresentable, and the
+    // history is kept because the type is only obviously right once you know
+    // what it prevents.** Linux passes `rdi, rsi, rdx, r10, r8, r9`; the
+    // kernel's `SyscallFrame` calls those `capability`, `method`, `arg0`,
+    // `arg1`, `arg2`, `arg3`, because RFC 0008's ABI is about capabilities.
+    // Reading `arg0` as "the first argument" is therefore reading `rdx` as
+    // `rdi` -- which is exactly what the first version of this function did,
+    // and the symptom was a handler installed for signal-number-nothing and
+    // a fault that found none. A [`PersonalityCall`] has one array in the
+    // dialect's own order and no second naming to confuse it with.
+    let (first, second) = (call.first(), call.second());
+    match call.number {
         linux::RT_SIGACTION => {
             // `first` = signal, `second` = the new action, `arg0` = where the
             // old one goes (ignored: nothing hosted reads it yet, and
@@ -2184,7 +2241,59 @@ fn foreign_signal_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
 }
 
 fn foreign_call(frame: &mut SyscallFrame) {
-    let number = frame.kind;
+    // **The boundary, as a value.** RFC 0031's interface I1: the nucleus is
+    // meant to carry a foreign call rather than understand it, and building
+    // this frame here is what makes the rest of this file a *personality*
+    // that happens to be linked into the kernel rather than kernel code that
+    // happens to speak Linux. When it moves into a domain (RFC 0031 §5) this
+    // is the message; nothing below it changes.
+    //
+    // The register order is Linux's -- `rdi, rsi, rdx, r10, r8, r9` -- and
+    // the frame's field names are RFC 0008's for the same six registers. The
+    // mapping is written once, here, instead of in each handler, which is
+    // where it was written wrongly twice.
+    let call = PersonalityCall::new(
+        Dialect::Linux,
+        frame.kind,
+        [
+            frame.capability,
+            frame.method,
+            frame.arg0,
+            frame.arg1,
+            frame.arg2,
+            frame.arg3,
+        ],
+        crate::sched::current_thread_id().unwrap_or(u32::MAX),
+        crate::telemetry::domain_hint(),
+    );
+
+    // **Priced before it moves, which is the order RFC 0031 asks for.**
+    // Relocating the personality into a domain costs one IPC round trip per
+    // hosted system call that this placement does not pay, and a decision
+    // taken on a guess about that number is a decision that cannot be
+    // reviewed. So the in-nucleus cost is measured *now*, while it is the
+    // only placement there is, and the domain placement will be measured the
+    // same way against the same instrument -- which is exactly what RFC 0013
+    // built the two-placement discipline for.
+    //
+    // Two `rdtsc`s on a path a hosted program takes hundreds of times per
+    // second, and no more: no serialising instruction, because the question
+    // is the mean over thousands of calls rather than any single one, and a
+    // fence here would price the fence.
+    //
+    // The exclusion is decided **here**, before dispatch, and not inside the
+    // pricing function where it began. Two calls a boot went unaccounted for
+    // otherwise, and the reason is worth keeping: `exit` and `exit_group`
+    // never return, so a price taken on the way out is a price never taken.
+    // Deciding on the way in also saves the `rdtsc` on every call that was
+    // never going to be priced.
+    let number = call.number;
+    let priced = !blocks_by_construction(number);
+    if !priced {
+        FOREIGN_COST_EXCLUDED.fetch_add(1, Ordering::Relaxed);
+    }
+    let started = if priced { bhaskix_arch::tsc::read() } else { 0 };
+
     let count = FOREIGN_CALLS.fetch_add(1, Ordering::Relaxed);
     if let Some(slot) = FOREIGN_SEEN.get(count as usize) {
         slot.store(number, Ordering::Relaxed);
@@ -2203,6 +2312,9 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // handler was given, and an answer written over that would be the
     // interrupted program's own register clobbered by its resumption.
     if number == linux::RT_SIGRETURN && crate::signal::sigreturn(frame) {
+        if priced {
+            price_foreign_call(started);
+        }
         return;
     }
 
@@ -2212,29 +2324,130 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // omission. The telemetry event is emitted either way -- an *answered*
     // foreign call is as much part of the histogram as a refused one.
     if let Some(domain) = crate::sched::current_domain()
-        && let Some(value) = foreign_signal_call(frame, domain.as_u32())
+        && let Some(value) = foreign_signal_call(&call, domain.as_u32())
     {
         frame.kind = value;
+        if priced {
+            price_foreign_call(started);
+        }
         return;
     }
 
     // The memory calls, RFC 0005 step 5, over this domain's own space.
-    if let Some(value) = foreign_memory_call(frame) {
+    if let Some(value) = foreign_memory_call(&call) {
         frame.kind = value;
+        if priced {
+            price_foreign_call(started);
+        }
         return;
     }
 
     // The thread and futex calls, RFC 0005 step 6.
     if let Some(domain) = crate::sched::current_domain()
-        && let Some(value) = foreign_thread_call(frame, domain.as_u32())
+        && let Some(value) = foreign_thread_call(&call, domain.as_u32())
     {
         frame.kind = value;
+        if priced {
+            price_foreign_call(started);
+        }
         return;
     }
 
     // `rax` alone. `arg0` (the caller's `rdx`) is left exactly as the stub
     // saved it, which is what preserves it.
-    frame.kind = LINUX_ENOSYS;
+    frame.kind = bhaskix_personality::call::ENOSYS.value;
+    if priced {
+        price_foreign_call(started);
+    }
+}
+
+/// Whether a call spends its time somewhere other than the boundary, and is
+/// therefore not priced.
+///
+/// **Excluding these is the difference between a measurement and a number.**
+/// The first version of this instrument priced everything and reported a
+/// mean of 47,047 cycles with 107 of 236 samples discarded — which is not
+/// what a foreign call costs, it is what a `futex` sleeping and a `write`
+/// reaching a UART cost. Neither is the boundary, and neither changes if the
+/// personality moves; both would have swamped the figure the move is meant
+/// to be judged on. A `futex` may sleep for ever, `sched_yield` gives up the
+/// CPU by definition, `clone` starts a thread, `exit` never returns, and
+/// `write` spends its time in a device.
+fn blocks_by_construction(number: u64) -> bool {
+    matches!(
+        number,
+        linux::FUTEX
+            | linux::SCHED_YIELD
+            | linux::CLONE
+            | linux::EXIT
+            | linux::EXIT_GROUP
+            | linux::RT_SIGRETURN
+            | linux::WRITE
+    )
+}
+
+/// Records what one foreign call cost. Only called for a call that
+/// [`blocks_by_construction`] said could be priced.
+fn price_foreign_call(started: u64) {
+    let ended = bhaskix_arch::tsc::read();
+    let Some(spent) = ended.checked_sub(started) else {
+        FOREIGN_COST_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    // Twenty thousand cycles is around six microseconds here: no call in the
+    // population above does that much work, so a sample past it was a
+    // preemption or a migration between the two readings rather than a cost.
+    if spent > 20_000 {
+        FOREIGN_COST_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    FOREIGN_CYCLES.fetch_add(spent, Ordering::Relaxed);
+    FOREIGN_PRICED.fetch_add(1, Ordering::Relaxed);
+    // The floor, which is the figure worth comparing placements on: a mean
+    // carries whatever else the machine was doing, and a minimum over
+    // hundreds of samples is the cost with nothing in the way.
+    FOREIGN_FLOOR.fetch_min(spent, Ordering::Relaxed);
+}
+
+/// Total cycles spent inside the foreign path, and how many calls that is.
+///
+/// RFC 0031's "priced first": the in-nucleus placement's number, taken now
+/// so the domain placement has something to be compared against.
+pub static FOREIGN_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many foreign calls contributed a usable sample.
+pub static FOREIGN_PRICED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many samples were thrown away as preemptions or migrations. Reported,
+/// because a mean over an unstated fraction of the calls is not a mean.
+pub static FOREIGN_COST_DROPPED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// The cheapest foreign call this boot — the boundary's cost with nothing in
+/// the way, and the figure two placements can honestly be compared on.
+pub static FOREIGN_FLOOR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+/// How many calls were excluded from pricing because they block by
+/// construction. Counted so the report can account for **every** foreign
+/// call: priced plus dropped plus excluded must equal the total, and when it
+/// does not, a return path is not being priced at all — which is exactly the
+/// discrepancy this counter was added to find.
+pub static FOREIGN_COST_EXCLUDED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// What the foreign path has cost: calls priced, mean cycles, samples
+/// dropped, and how many Linux numbers the nucleus declares it interprets.
+#[must_use]
+pub fn foreign_cost() -> (u64, u64, u64, u64, u64, usize) {
+    let priced = FOREIGN_PRICED.load(Ordering::Relaxed);
+    let cycles = FOREIGN_CYCLES.load(Ordering::Relaxed);
+    let mean = cycles.checked_div(priced).unwrap_or(0);
+    let floor = FOREIGN_FLOOR.load(Ordering::Relaxed);
+    (
+        priced,
+        if floor == u64::MAX { 0 } else { floor },
+        mean,
+        FOREIGN_COST_DROPPED.load(Ordering::Relaxed),
+        FOREIGN_COST_EXCLUDED.load(Ordering::Relaxed),
+        linux::ANSWERED.len(),
+    )
 }
 
 /// The entry point the assembly stub calls.

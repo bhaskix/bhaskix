@@ -368,10 +368,17 @@ Reference [security.md](../security.md) §1.
 
 Moving the personality out of the nucleus costs one IPC round trip per hosted system call that the
 in-nucleus version does not pay. That is the whole of the cost, and it is measurable before it is
-committed to: the existing telemetry `FOREIGN` event and RFC 0026's rings can price a foreign call
-in both placements — which is exactly the A/B the service framework was built for. **The number is
+committed to — which is exactly the A/B the service framework was built for. **The number is
 gathered before the move, not after**, and if it is unaffordable the RFC is superseded with the
 measurement attached rather than quietly not done.
+
+> **Half of it is gathered, 2026-08-19.** The in-nucleus placement's floor is **4,916 cycles** per
+> non-blocking foreign call under emulation, printed on every boot that ran a hosted program. The
+> domain placement's figure comes from the same instrument, and the difference is what the
+> containment costs. Two things are stated with it rather than left to be discovered: the sample is
+> **six to eight calls a boot**, because a Go binary's foreign traffic is overwhelmingly `write`,
+> and it grows when Tier 1 lands; and calls that block by construction are excluded, because the
+> first version of this measurement reported 47,047 cycles and was measuring a `futex` sleeping.
 
 ## Testing plan
 
@@ -413,7 +420,17 @@ boundaries must be fixed before the surface grows.
 3. **Test 4's Linux arm.** Revoke an adapter's directory capability; assert every derived
    descriptor is dead before the call returns.
 4. **I1's frame**, as a type — `PersonalityCall` — with the nucleus's Linux `match` count published
-   as a gate, so the boundary violation is visible before it is removed.
+   as a gate, so the boundary violation is visible before it is removed. ✅ *Delivered 2026-08-19.*
+   Every foreign handler takes a `PersonalityCall` and none reads a kernel structure; the nucleus
+   declares **18** interpreted Linux numbers, printed on every boot that ran a hosted program and
+   gated as a ratchet that may only fall. The move is also **priced**, as this RFC's performance
+   section requires and in the order it requires: the in-nucleus floor is **4,916 cycles** per
+   non-blocking foreign call, measured with the instrument the domain placement will be measured
+   by. Two gates, both armed red. The first version of the price was wrong in an instructive way —
+   47,047 cycles over an unstated population, because it priced `futex` sleeping and `write`
+   reaching a UART — so the instrument now excludes calls that block by construction, reports the
+   floor beside the mean, and **accounts for every call it saw**, which is a gate of its own and
+   the thing that caught the error.
 5. **Test 2's hostile driver.** A `bin/blkd` variant that aims DMA outside its window, refused by
    the IOMMU rather than by the driver's own good behaviour.
 6. **The relocation** (§5), triggered by Tier 1: `bin/linuxd`, the memory calls as `Memory`
