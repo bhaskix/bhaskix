@@ -1719,12 +1719,6 @@ mod linux {
     pub const SIGALTSTACK: u64 = 131;
     /// `mmap(addr, length, prot, flags, fd, offset)`.
     pub const MMAP: u64 = 9;
-    /// `mprotect(addr, length, prot)`.
-    pub const MPROTECT: u64 = 10;
-    /// `munmap(addr, length)`.
-    pub const MUNMAP: u64 = 11;
-    /// `madvise(addr, length, advice)`.
-    pub const MADVISE: u64 = 28;
     /// `clone(flags, stack, parent_tid, child_tid, tls)`.
     pub const CLONE: u64 = 56;
     /// `futex(uaddr, op, val, timeout, uaddr2, val3)`.
@@ -1757,14 +1751,11 @@ mod linux {
     /// alternative, deriving it from the dispatch, needs the dispatch to be
     /// a table rather than a `match`, which is a change worth making when
     /// the personality moves rather than before.
-    pub const ANSWERED: [u64; 17] = [
+    pub const ANSWERED: [u64; 14] = [
         RT_SIGACTION,
         RT_SIGRETURN,
         SIGALTSTACK,
         MMAP,
-        MUNMAP,
-        MPROTECT,
-        MADVISE,
         CLONE,
         FUTEX,
         GETTID,
@@ -1912,52 +1903,6 @@ fn foreign_memory_call(call: &PersonalityCall) -> Option<u64> {
                 _ => Some(memory::errno::ENOMEM as u64),
             }
         }
-        linux::MUNMAP => match memory::plan_munmap(first, second) {
-            Ok((address, _pages)) => {
-                let removed = crate::vm::with_active(|space| {
-                    space.unmap(bhaskix_boot::VirtAddr(address)).is_ok()
-                });
-                // A range that was not mapped is not an error worth
-                // distinguishing: Linux's `munmap` succeeds on unmapped
-                // pages, and a program tidying up should not have to
-                // remember what it still holds.
-                let _ = removed;
-                Some(0)
-            }
-            Err(errno) => Some(errno as u64),
-        },
-        linux::MPROTECT => {
-            // RFC 0005 step 8. Whole regions only -- see
-            // `AddressSpace::protect` for why splitting is refused rather
-            // than approximated -- which covers the pattern Go actually
-            // uses: reserve `PROT_NONE`, then make the whole of it
-            // readable and writable. That refusal is what stopped the Go
-            // runtime at step 7 with "cannot allocate memory".
-            let (address, pages, read, write, execute) =
-                match memory::plan_mprotect(first, second, third) {
-                    Ok(plan) => plan,
-                    Err(errno) => return Some(errno as u64),
-                };
-            let protection = match (read, write, execute) {
-                (_, true, _) => bhaskix_mm::Protection::ReadWrite,
-                (_, _, true) => bhaskix_mm::Protection::ReadExecute,
-                (true, _, _) => bhaskix_mm::Protection::ReadOnly,
-                _ => bhaskix_mm::Protection::None,
-            };
-            let changed = crate::vm::with_active(|space| {
-                space
-                    .protect(bhaskix_boot::VirtAddr(address), pages, protection)
-                    .is_ok()
-            });
-            match changed {
-                Some(true) => Some(0),
-                // Linux's `ENOMEM` is what `mprotect` returns for a range
-                // that is not entirely mapped, which is also the honest
-                // answer for a range this cannot change whole.
-                _ => Some(memory::errno::ENOMEM as u64),
-            }
-        }
-        linux::MADVISE => Some(memory::plan_madvise() as u64),
         _ => None,
     }
 }
@@ -2437,8 +2382,21 @@ pub static ADAPTER_ENDPOINT: core::sync::atomic::AtomicU64 =
 /// How many foreign calls the adapter answered, and how many it could not be
 /// asked because it was not there.
 pub static ADAPTER_ANSWERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// How many times a foreign call found no adapter to ask.
+/// How many times a foreign call found no adapter at all.
+///
+/// **Three different things used to share this counter**, and the report said
+/// only "found no adapter to ask" for every one of them: an adapter that was
+/// not there, an endpoint that refused the message, and a caller that gave up
+/// retrying against a queue that stayed full. They want different repairs — a
+/// boot-order bug, a dead adapter, a machine under load — and one number
+/// could not tell them apart. It took a deliberate three-way concurrent
+/// reproduction to find that out, which is the second time in a day an
+/// instrument has hidden the thing it was measuring.
 pub static ADAPTER_ABSENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many deliveries the endpoint refused outright.
+pub static ADAPTER_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many were given up on after [`ADAPTER_RETRIES`] congested attempts.
+pub static ADAPTER_GAVE_UP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Cycles spent in adapter round trips, how many were priced, and the
 /// cheapest — the domain placement's figures, against the nucleus placement's
 /// in [`FOREIGN_FLOOR`].
@@ -2471,6 +2429,9 @@ fn adapter_call(call: &PersonalityCall) -> Option<u64> {
         return None;
     }
     let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
+    // The adapter cannot touch a hosted process's memory without a capability
+    // to its domain, and the kernel is what has one to give.
+    ensure_adapter_holds(call.domain);
     let args = [call.first(), call.second(), call.third(), call.fourth()];
 
     // Congestion is retried, and it is safe to retry precisely because it
@@ -2510,7 +2471,7 @@ fn adapter_call(call: &PersonalityCall) -> Option<u64> {
             // coming: the call it made is one this machine cannot perform, and
             // that is true whichever way the adapter is absent.
             Err(why) => {
-                ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
+                ADAPTER_REFUSED.fetch_add(1, Ordering::Relaxed);
                 ADAPTER_REFUSAL.store(
                     match why {
                         crate::ipc::IpcError::NoSuchEndpoint => 1,
@@ -2524,12 +2485,91 @@ fn adapter_call(call: &PersonalityCall) -> Option<u64> {
             }
         }
     }
-    ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
+    ADAPTER_GAVE_UP.fetch_add(1, Ordering::Relaxed);
     None
 }
 
 /// How many times a congested delivery is retried before the call is refused.
 const ADAPTER_RETRIES: u32 = 1024;
+
+/// The adapter's own domain, so capabilities can be installed in its CSpace.
+pub static ADAPTER_DOMAIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Where a hosted domain's `Domain` capability lands in the adapter's CSpace.
+///
+/// Slot `ADAPTER_SLOT_BASE + id`, so the adapter computes it from the badge
+/// and no table has to be kept in step. A CSpace holds 64 and there are 32
+/// domains, so the upper half is exactly the right size for one each.
+const ADAPTER_SLOT_BASE: usize = 32;
+
+/// Which incarnation of each domain the adapter has been given, plus one —
+/// zero meaning none.
+///
+/// **Keyed by generation and not by "have we done this", because a domain
+/// slot is reused.** Handing the adapter a capability for domain 3 and
+/// leaving it there means the *next* domain 3 arrives with its predecessor's
+/// handle already installed, and every operation on it is refused for a
+/// reason that has nothing to do with what was asked. The kernel already
+/// learned this once, on 2026-08-19, when a thread outliving its domain
+/// decremented a counter the next occupant owned.
+static ADAPTER_HELD: [core::sync::atomic::AtomicU64; crate::domain::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::domain::MAX_DOMAINS];
+
+/// Makes sure the adapter holds a `Domain` capability for `domain`.
+///
+/// **This is the authority the adapter needs to do anything to a hosted
+/// process's memory**, and it is granted by the kernel because the kernel is
+/// what created the domain. RFC 0031's interface I5 wants the adapter to
+/// create hosted domains itself, at which point it holds the capability by
+/// construction and this function goes away; until something other than a
+/// self-test makes a Linux domain, this is the honest stand-in and it is
+/// written down as one.
+///
+/// Idempotent per incarnation: the generation is recorded, so this costs one
+/// relaxed load per foreign call once a domain is known.
+fn ensure_adapter_holds(domain: u32) -> bool {
+    let adapter = ADAPTER_DOMAIN.load(Ordering::Relaxed);
+    if adapter == u32::MAX {
+        return false;
+    }
+    let Some(slot) = ADAPTER_HELD.get(domain as usize) else {
+        return false;
+    };
+    let id = crate::domain::DomainId::from_u32(domain);
+    let Some(generation) = crate::domain::with(id, |owner| owner.generation()) else {
+        return false;
+    };
+    let wanted = u64::from(generation) + 1;
+    if slot.load(Ordering::Relaxed) == wanted {
+        return true;
+    }
+
+    let handle = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Domain, u64::from(domain)),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    });
+    let Some(handle) = handle else {
+        return false;
+    };
+    let index = ADAPTER_SLOT_BASE + domain as usize;
+    let installed = crate::domain::with(crate::domain::DomainId::from_u32(adapter), |owner| {
+        // Whatever a previous incarnation left is taken out first, which
+        // is what makes a reused domain slot safe here.
+        let _ = owner.cspace.remove(index);
+        owner.cspace.install_at(index, handle).is_ok()
+    });
+    if installed != Some(true) {
+        return false;
+    }
+    slot.store(wanted, Ordering::Relaxed);
+    true
+}
 
 /// Whether a call spends its time somewhere other than the boundary, and is
 /// therefore not priced.

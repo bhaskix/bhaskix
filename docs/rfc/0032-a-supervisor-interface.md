@@ -339,6 +339,58 @@ the next spawn is refused for the budget. The margin now sits on the side that c
 sixteen to one. **Widening a timeout would have hidden this; the fix is that the two bounds
 are now written down as the pair they are.**
 
+## Step 4's record (2026-08-19): three of the four memory calls move, and the prediction about what they would need was wrong
+
+`munmap`, `mprotect` and `madvise` are answered by `bin/linuxd`. The ratchet moved **17 → 14**.
+A hosted program maps two anonymous pages, writes and reads the second, unmaps them and has
+its `madvise` taken as advice — exactly as before, and it cannot tell that three of those
+calls are now serviced by a program in ring 3 through a capability invocation.
+
+**The prediction this RFC made about step 4 was wrong, and pleasantly.** It said the memory
+calls would need RFC 0009's unbuilt `Memory` creation method, "because a hosted `mmap` must
+make an object at runtime". They do not: `MAP_AT` maps *anonymous* pages into a domain, which
+is what an anonymous `mmap` is, so no object is created at all. The creation method is still
+unbuilt and is still owed — a hosted `mmap` of a *file* will need it — but it is not what was
+blocking this step, and saying so is cheaper than letting a wrong prediction stand.
+
+**What did block it was authority, and the shape of the fix is the design working.** The
+adapter cannot touch a hosted process's memory without a `Domain` capability for it, and it
+has no way to make one. So the kernel grants it: a capability per hosted domain, at CSpace
+slot `32 + id`, which the adapter computes from the badge — no table to keep in step. It is
+keyed by the domain's **generation**, not by "have we done this", because a domain slot is
+reused and handing the adapter a stale handle would leave the *next* domain 3 refused for a
+reason that has nothing to do with what it asked. This kernel learned that lesson once
+already, on the same day, when a thread outliving its domain decremented a counter the next
+occupant owned.
+
+That grant is a stand-in and is written down as one: RFC 0031's interface **I5** wants the
+adapter to create hosted domains itself, at which point it holds the capability by
+construction and the kernel does not grant anything. Until something other than a self-test
+makes a Linux domain, this is the honest arrangement.
+
+**`mmap` stays in the nucleus, and the reason is a sentence rather than a shrug.** It takes
+six arguments; an IPC message carries four. Moving it needs a page shared between kernel and
+adapter rather than a message — which is also what signal delivery needs, so it is one piece
+of work rather than two, and it is step 5's first piece.
+
+Armed by making the adapter stop answering `munmap`: the memory self-test went red with
+`munmap -38`, which is the proof that these calls really are being serviced in ring 3 and not
+merely appearing to be.
+
+**And the adapter gate failed once under the full suite, which found a counter measuring three
+things at once.** It reported "1 found no adapter to ask" — a sentence that could mean an
+adapter that was not there, an endpoint that refused the message, or a caller that gave up
+retrying against a queue that stayed full. Those want a boot-order fix, a dead-adapter fix and
+nothing at all, respectively, and one number could not tell them apart. They are three
+counters now, all three printed, and the gate quotes the line it saw when it fails — because
+under a full suite the serial log is a temporary file that is already gone by the time anyone
+reads the failure.
+
+**What is honestly known:** the suite is green, and a deliberate three-way concurrent
+reproduction produced zeros in all three counters. **What is not known** is which of the three
+the original failure was, because it happened before they were separated. The next occurrence
+will say. That is the whole of the claim, and it is smaller than "fixed".
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -445,7 +497,7 @@ already in hand.
 3. **`bin/linuxd`, and `getpid` end to end** — the whole path, one call, everything else
    unchanged. The ratchet moves **18 → 17**, the first time it has moved. ✅ *Delivered
    2026-08-19 — see the record below.*
-4. **The memory calls**, which need RFC 0009's creation method.
+4. **The memory calls.** ✅ *Delivered 2026-08-19, three of the four — see the record below.*
 5. **Signals and the fault path** — the hard one: a fault cannot IPC out from
    `trap.rs:255`, so the faulting thread must be parked and the adapter woken. New
    mechanism, not an extension.

@@ -38,8 +38,9 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{status, syscall};
+use bhaskix_abi::{method, status, syscall};
 use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
+use bhaskix_personality::memory;
 
 /// The endpoint hosted domains' calls arrive on, and the **only** capability
 /// this program holds.
@@ -114,6 +115,20 @@ struct Reply {
     args: [u64; 4],
 }
 
+/// Invokes a method on a capability, and turns the answer into an `errno`.
+///
+/// A hosted program is told `-EINVAL` when the invocation was refused: this
+/// program holds the authority or it does not, and a refusal here is not a
+/// distinction a Linux process has any way to act on.
+fn invoke(capability: u64, what: u64, args: [u64; 4]) -> Answer {
+    let reply = call(syscall::INVOKE, capability, what, args);
+    if reply.status == status::OK {
+        Answer::ok(0)
+    } else {
+        Answer::error(memory::errno::EINVAL)
+    }
+}
+
 /// Answers one foreign call.
 ///
 /// **This is the whole of the personality that has moved so far, and its size
@@ -135,6 +150,44 @@ fn answer(request: &PersonalityCall) -> Answer {
         // The number matches what the nucleus answered before the move, so a
         // hosted program cannot tell that anything changed. That is the test.
         GETPID => Answer::ok(u64::from(request.domain) + 1),
+        // The memory calls that fit in a message — RFC 0032 step 4. What each
+        // *means* is decided by `bhaskix_personality::memory`, host-tested and
+        // unchanged by the move; what it *does* is a capability invocation on
+        // the hosted domain. That split is the whole design: policy here,
+        // mechanism in the kernel, and the authority in hand rather than
+        // ambient.
+        //
+        // `mmap` is deliberately absent and still answered in the nucleus. It
+        // takes six arguments and a message carries four, so moving it needs a
+        // page shared with the kernel rather than a message — which is also
+        // what signal delivery will need, and is therefore one piece of work
+        // rather than two.
+        MUNMAP => match memory::plan_munmap(request.first(), request.second()) {
+            Ok((address, pages)) => {
+                let _ = pages;
+                invoke(
+                    SLOT_BASE + u64::from(request.domain),
+                    method::UNMAP_AT,
+                    [address, 0, 0, 0],
+                )
+            }
+            Err(errno) => Answer::error(errno),
+        },
+        MPROTECT => {
+            match memory::plan_mprotect(request.first(), request.second(), request.third()) {
+                Ok((address, pages, read, write, execute)) => invoke(
+                    SLOT_BASE + u64::from(request.domain),
+                    method::PROTECT_AT,
+                    [address, pages, protection_of(read, write, execute), 0],
+                ),
+                Err(errno) => Answer::error(errno),
+            }
+        }
+        // Advice, and this system takes none: every hint Go gives is about a
+        // page-reclaim policy that does not exist here. Answered rather than
+        // refused, because a runtime told its advice was rejected may take a
+        // slower path for no reason.
+        MADVISE => Answer::ok(memory::plan_madvise() as u64),
         // Everything else, for now. Not an omission — the RFC's tiering: a
         // refusal a runtime can *see*, logged with its number, so the set of
         // calls a real workload needs is discovered rather than guessed.
@@ -144,6 +197,45 @@ fn answer(request: &PersonalityCall) -> Answer {
 
 /// `getpid()`, from Linux's `x86_64` table.
 const GETPID: u64 = 39;
+/// `munmap(addr, length)`.
+const MUNMAP: u64 = 11;
+/// `mprotect(addr, length, prot)`.
+const MPROTECT: u64 = 10;
+/// `madvise(addr, length, advice)`.
+const MADVISE: u64 = 28;
+
+/// Where a hosted domain's `Domain` capability sits in this program's CSpace.
+///
+/// Slot `SLOT_BASE + id`, computed from the badge the kernel stamped, so no
+/// table has to be kept in step with anything. A CSpace holds 64 slots and
+/// there are 32 domains, which is exactly one each in the upper half.
+///
+/// **This capability is the whole of the authority to touch a hosted
+/// process's memory** — [RFC 0032](../../../docs/rfc/0032-a-supervisor-interface.md).
+/// Without it this program can answer questions about numbers and nothing
+/// else, which is what it could do an hour ago.
+const SLOT_BASE: u64 = 32;
+
+/// `MAP_AT`/`PROTECT_AT`'s protection encoding.
+const PROT_NONE: u64 = 0;
+const PROT_READ: u64 = 1;
+const PROT_READ_WRITE: u64 = 2;
+const PROT_READ_EXECUTE: u64 = 3;
+
+/// Translates a plan's three permission bits into the kernel's encoding.
+///
+/// **Writable-and-executable is not expressible on either side**, which is
+/// why this is a translation and not a check: `bhaskix_mm::Protection` has no
+/// such value, so a hosted program asking for both is refused by
+/// `plan_mprotect` before it ever reaches here.
+fn protection_of(read: bool, write: bool, execute: bool) -> u64 {
+    match (read, write, execute) {
+        (_, true, _) => PROT_READ_WRITE,
+        (_, _, true) => PROT_READ_EXECUTE,
+        (true, _, _) => PROT_READ,
+        _ => PROT_NONE,
+    }
+}
 
 /// The entry point. `hertz` arrives as every packaged program's manifest
 /// declares; this one has nothing to time and ignores it.

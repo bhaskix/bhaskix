@@ -1284,10 +1284,10 @@ fi
 # and which this suite has made before.
 if grep -qE "personality +boundary: [0-9]+ linux numbers interpreted in the nucleus" "$LOG"; then
     interpreted=$(sed -n 's/.*boundary: \([0-9]*\) linux numbers.*/\1/p' "$LOG" | head -1)
-    if [[ "$interpreted" -le 17 ]]; then
+    if [[ "$interpreted" -le 14 ]]; then
         pass "the personality boundary is $interpreted linux numbers wide, and may only narrow"
     else
-        fail "the nucleus interprets $interpreted linux numbers, up from 17 -- RFC 0031 I1 wants 0"
+        fail "the nucleus interprets $interpreted linux numbers, up from 14 -- RFC 0031 I1 wants 0"
         status=1
     fi
     # And the instrument accounts for itself. Every foreign call is priced,
@@ -1324,10 +1324,17 @@ fi
 #
 # The count is demanded to be non-zero rather than exact: how many calls fall
 # through to the adapter depends on which self-tests a machine could run.
-if grep -qE "linux domain   the adapter in ring 3 answered [1-9][0-9]* foreign calls, and 0 found no adapter to ask" "$LOG"; then
+if grep -qE "linux domain   the adapter in ring 3 answered [1-9][0-9]* foreign calls, and 0 found none to ask, 0 were refused by its endpoint" "$LOG"; then
     pass "the linux personality answered a hosted program from ring 3, holding one endpoint"
 elif grep -qE "linux domain   the adapter in ring 3 answered" "$LOG"; then
-    fail "the adapter was asked and did not answer, or was not there to ask"
+    # The line itself, because a gate that says only "it did not hold" sends
+    # the next reader back for another boot to find out which of four numbers
+    # was wrong -- and under a full suite the serial log is a temporary file
+    # that is already gone. Three of those numbers want different repairs: an
+    # adapter that was not there is a boot-order bug, one whose endpoint
+    # refused is a dead adapter, and one that gave up retrying is a machine
+    # under load.
+    fail "the adapter was asked and did not answer: $(grep -aoE 'the adapter in ring 3 answered.*' "$LOG" | head -1)"
     status=1
 else
     pass "no hosted program on this machine, so the adapter had nothing to answer"
