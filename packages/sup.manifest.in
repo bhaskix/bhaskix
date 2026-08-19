@@ -1,7 +1,10 @@
 # The supervisor, RFC 0017's restart policy in ring 3: a console to
 # report through, the authority to make one domain at a time, memory
 # holding the child's image (sized by the granter to the program it
-# stages), and the signal endings arrive on.
+# stages), the signal endings arrive on, and -- RFC 0032 -- one page of
+# scratch, which is what the supervisor interface's copies move through.
+# A supervisor names memory it already owns; it never names an address in
+# a domain it is reaching into.
 package sup
 version 0.1.0
 
@@ -11,5 +14,6 @@ cap endpoint console
 cap domain-control
 cap memory
 cap notification
+cap memory pages=1
 
 payload bin/sup from user/sup/target/x86_64-unknown-none/release/sup

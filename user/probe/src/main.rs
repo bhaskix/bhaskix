@@ -58,6 +58,8 @@ _start:
     //   3  yield for ever, so the only way out is a system call returning
     //   4  receive for ever on capability 0, and never reply
     //   6  say so on capability 0 and exit -- what a *started* program does
+    //   8  yield 1,024 times and exit -- alive long enough to be supervised,
+    //      and over without anybody having to kill it (RFC 0032)
     //
     // Both extra modes live in `bin/probe` rather than in programs of their
     // own because the loader path, the domain, the privilege stack and the
@@ -112,6 +114,36 @@ _start:
     syscall
     jmp 8b
 9:
+    cmp rdi, 8
+    jne 10f
+    // Mode 8: yield a fixed number of times, then exit -- a program that is
+    // *there* for a while and then is not.
+    //
+    // RFC 0032's supervisor interface needs a child to reach into, and the two
+    // long-lived modes above cannot be reached into safely: modes 2, 3 and 4
+    // never end, and a supervisor that started one would hold its single child
+    // slot for the rest of the boot. Mode 6 ends *immediately*, which makes any
+    // supervision of it a race with its own exit -- the shape of test that
+    // passes on a fast machine and fails on a loaded one.
+    //
+    // So: alive long enough to be worked on, and over without being killed.
+    // The count is generous against the twenty-odd system calls a supervisor
+    // makes in that window, and small against how long the supervisor will
+    // wait for it to end -- both matter, and the first version had it at
+    // 65,536, which outlasted the supervisor's patience and left a child that
+    // could not be reaped. It is not a timeout: it is a ceiling on how long a
+    // leftover child persists if the supervisor dies mid-way.
+    mov r15, 1024
+11:
+    mov rax, 4                  // Kind::Yield
+    xor rdi, rdi
+    syscall
+    dec r15
+    jnz 11b
+    mov rax, 5                  // Kind::Exit
+    syscall
+    ud2
+10:
     cmp rdi, 6
     jne 1f
     // What a program started by another program does: prove it is running, in

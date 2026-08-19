@@ -137,6 +137,11 @@ const _: () = {
     assert!(method::EXPECT == bhaskix_abi::method::EXPECT);
     assert!(method::DRAIN == bhaskix_abi::method::DRAIN);
     assert!(method::PERSONALITY == bhaskix_abi::method::PERSONALITY);
+    assert!(method::COPY_IN == bhaskix_abi::method::COPY_IN);
+    assert!(method::COPY_OUT == bhaskix_abi::method::COPY_OUT);
+    assert!(method::MAP_AT == bhaskix_abi::method::MAP_AT);
+    assert!(method::UNMAP_AT == bhaskix_abi::method::UNMAP_AT);
+    assert!(method::PROTECT_AT == bhaskix_abi::method::PROTECT_AT);
     assert!(method::GRANT == bhaskix_abi::method::GRANT);
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
@@ -273,6 +278,16 @@ pub mod method {
     pub const DISARM: u64 = 57;
     /// Set a `Domain`'s system-call dialect (RFC 0005 step 2).
     pub const PERSONALITY: u64 = 58;
+    /// Read a held domain's memory into an object the caller owns. RFC 0032.
+    pub const COPY_IN: u64 = 59;
+    /// Write an object the caller owns into a held domain's memory. RFC 0032.
+    pub const COPY_OUT: u64 = 60;
+    /// Map anonymous pages in a held domain. RFC 0032.
+    pub const MAP_AT: u64 = 61;
+    /// Unmap a region in a held domain. RFC 0032.
+    pub const UNMAP_AT: u64 = 62;
+    /// Re-protect a whole region in a held domain. RFC 0032.
+    pub const PROTECT_AT: u64 = 63;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -986,6 +1001,23 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     if kind == Some(Kind::Invoke)
         && matches!(frame.method, method::BIND | method::INFO | method::RELEASE)
         && let Some(outcome) = domain_lifecycle(frame)
+    {
+        return outcome;
+    }
+
+    // RFC 0032's supervisor interface, guarded by method number for the same
+    // reason the block above is: these take the domain table and the space
+    // table, and neither belongs on the hot path of every system call.
+    if kind == Some(Kind::Invoke)
+        && matches!(
+            frame.method,
+            method::COPY_IN
+                | method::COPY_OUT
+                | method::MAP_AT
+                | method::UNMAP_AT
+                | method::PROTECT_AT
+        )
+        && let Some(outcome) = domain_supervise(frame)
     {
         return outcome;
     }
@@ -2695,6 +2727,278 @@ fn spawn(frame: &SyscallFrame) -> Outcome {
 
     Outcome::ok(u64::from(child.as_u32()))
 }
+
+/// The supervisor interface: what a program may do to a domain it holds.
+///
+/// [RFC 0032](../../docs/rfc/0032-a-supervisor-interface.md). `START` lets a
+/// supervisor hand a child an image and let go; these five let it *keep hold*
+/// — read and write the child's memory, and change its mappings. Nothing here
+/// is a Linux concept: a debugger, a checkpointer and a container runtime want
+/// the same five, which is why they are proved by `bin/sup` rather than by the
+/// Linux personality that motivated them.
+///
+/// **The authority is the `Domain` capability carrying `WRITE`**, exactly as
+/// `START` and `PERSONALITY` already require. A program that was not given one
+/// can do none of this and has no way to obtain one by asking. Revoking it
+/// ends the reach before the call returns, like every capability here.
+///
+/// **The reach is one-directional.** The held domain gains nothing: its CSpace
+/// is untouched, which is what keeps RFC 0031's interface I3 true — a hosted
+/// process holds no capabilities and can name none, whatever its supervisor
+/// can do.
+///
+/// `None` when the capability is not a `Domain`, so the numbers stay available
+/// to the kinds that own them.
+fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
+    let me = crate::sched::current_domain()?;
+    let (object, rights) = domain::with(me, |owner| {
+        let slot = owner.cspace.get(frame.capability as usize)?;
+        cap::with_arena(|arena| arena.lookup(slot))
+    })
+    .flatten()?;
+    if object.kind != ObjectKind::Domain {
+        return None;
+    }
+    if !rights.contains(crate::cap::Rights::WRITE) {
+        return Some(Outcome::err(Status::InsufficientRights));
+    }
+    let target = domain::DomainId::from_u32(object.id as u32);
+
+    // Operating on yourself through this door is refused. Not because it is
+    // dangerous -- a domain can already map its own memory -- but because the
+    // two paths would then differ: `ATTACH` charges the caller and checks its
+    // own space, and this does neither. One room, one lock.
+    if target == me {
+        return Some(Outcome::err(Status::WrongObject));
+    }
+
+    // The target's page-table root *is* the authority to touch its memory, and
+    // it is fetched from the domain the capability named rather than supplied.
+    // A domain that has not started, or has ended, has none -- which is the
+    // honest refusal for "operate on a program that is not there".
+    let Some(root) = domain::space_root_of(target) else {
+        return Some(Outcome::err(Status::NoSuchCapability));
+    };
+
+    Some(match frame.method {
+        method::COPY_IN | method::COPY_OUT => {
+            let outward = frame.method == method::COPY_OUT;
+            // The caller's own object, resolved out of the caller's own
+            // CSpace with the rights the direction needs: reading the target
+            // into it is a write to the object, and vice versa.
+            let needs = if outward {
+                crate::cap::Rights::READ
+            } else {
+                crate::cap::Rights::WRITE
+            };
+            let Some(thread) = crate::sched::current_thread_id() else {
+                return Some(Outcome::err(Status::NoSuchCapability));
+            };
+            let Some(memory) = crate::shared::caller_object_for(thread, frame.arg0, needs) else {
+                return Some(Outcome::err(Status::NoSuchCapability));
+            };
+            let (offset, address, length) = (frame.arg1, frame.arg2, frame.arg3);
+            match copy_across(root, memory, offset, address, length, outward) {
+                Some(moved) => Outcome::ok(moved),
+                None => Outcome::err(Status::NoSuchCapability),
+            }
+        }
+        method::MAP_AT => {
+            let (address, pages, protection) = (frame.arg0, frame.arg1, frame.arg2);
+            let Some(protection) = protection_from(protection) else {
+                return Some(Outcome::err(Status::WrongObject));
+            };
+            if pages == 0 || pages > MAX_SUPERVISED_PAGES {
+                return Some(Outcome::err(Status::WrongObject));
+            }
+            let Some(range) =
+                bhaskix_mm::VirtRange::from_pages(bhaskix_boot::VirtAddr(address), pages)
+            else {
+                return Some(Outcome::err(Status::WrongObject));
+            };
+            // **Eagerly, and the reason is a limitation rather than a
+            // preference.** A supervisor maps a page in order to *write* it,
+            // and a copy needs a frame to write into: `translate` answers
+            // nothing for a lazily-mapped page, so `COPY_OUT` straight after a
+            // lazy `MAP_AT` is refused for a page that is legitimately mapped.
+            // That is exactly what happened the first time this was built.
+            //
+            // Servicing it properly means committing a lazy page on demand
+            // from outside the fault handler, and the commit is currently
+            // welded to `vm::handle_fault` — the active space, and this CPU's
+            // frame reserve, for reasons that are good ones there. Extracting
+            // it is step 4's work, because that is when a hosted `mmap` needs
+            // laziness for a reservation it will never touch all of. Until
+            // then a supervisor pays for what it maps, and the bound below is
+            // what stops that being unreasonable.
+            let mapped =
+                crate::vm::with_space(root, |space| space.map_anonymous(range, protection).is_ok());
+            match mapped {
+                Some(true) => Outcome::ok(address),
+                _ => Outcome::err(Status::QuotaExceeded),
+            }
+        }
+        method::UNMAP_AT => {
+            let unmapped = crate::vm::with_space(root, |space| {
+                space.unmap(bhaskix_boot::VirtAddr(frame.arg0)).is_ok()
+            });
+            match unmapped {
+                Some(true) => {
+                    // The target may be running on another CPU right now, so
+                    // the stale translation has to go the way `shared::revoke`
+                    // sends it. An unmap whose shootdown is skipped is a page
+                    // the other CPU can still write after it was taken away.
+                    crate::tlb::shootdown(frame.arg0);
+                    Outcome::ok(0)
+                }
+                _ => Outcome::err(Status::NoSuchCapability),
+            }
+        }
+        method::PROTECT_AT => {
+            let (address, pages, protection) = (frame.arg0, frame.arg1, frame.arg2);
+            let Some(protection) = protection_from(protection) else {
+                return Some(Outcome::err(Status::WrongObject));
+            };
+            let changed = crate::vm::with_space(root, |space| {
+                space
+                    .protect(bhaskix_boot::VirtAddr(address), pages, protection)
+                    .is_ok()
+            });
+            match changed {
+                Some(true) => {
+                    crate::tlb::shootdown(address);
+                    Outcome::ok(0)
+                }
+                _ => Outcome::err(Status::NoSuchCapability),
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Reads a protection word, refusing what the region map cannot represent.
+///
+/// The same encoding `ATTACH` takes. **Writable-and-executable is not a value
+/// this can return**, because [`bhaskix_mm::Protection`] has no such variant —
+/// so `W^X` is inherited by a supervisor for free rather than checked for.
+fn protection_from(word: u64) -> Option<bhaskix_mm::Protection> {
+    match word {
+        0 => Some(bhaskix_mm::Protection::None),
+        1 => Some(bhaskix_mm::Protection::ReadOnly),
+        2 => Some(bhaskix_mm::Protection::ReadWrite),
+        3 => Some(bhaskix_mm::Protection::ReadExecute),
+        _ => None,
+    }
+}
+
+/// Moves bytes between a `Memory` object and a domain's memory.
+///
+/// **Through the direct map, page by page, and never through a mapping.**
+/// `uaccess::copy_to_user` resolves through `CR3` and so can only reach the
+/// space that is loaded — which for a supervisor is its own, and the wrong
+/// one. The idiom here is `elf::load_into`'s: ask the space to `translate` an
+/// address to a frame, then write that frame through the direct map. It is
+/// the same reason and the same shape: the target's mapping may be read-only,
+/// or not yet faulted in, and neither should stop a supervisor that holds the
+/// authority to write it.
+///
+/// Answers how many bytes moved, or `None` if the range is not wholly mapped —
+/// **refused whole rather than partially moved**, because a supervisor told
+/// "300 of 4,096" cannot tell a short object from a hole in the target, and
+/// the two want different repairs.
+fn copy_across(
+    root: u64,
+    memory: crate::shared::MemoryId,
+    offset: u64,
+    address: u64,
+    length: u64,
+    outward: bool,
+) -> Option<u64> {
+    let length = usize::try_from(length).ok()?;
+    let offset = usize::try_from(offset).ok()?;
+    if length == 0 {
+        return Some(0);
+    }
+    // A bound the caller cannot raise: this is a system call, and a supervisor
+    // asking to move a gigabyte would hold the domain table for as long as it
+    // took. Larger transfers are more calls, which is also what makes them
+    // interruptible.
+    if length > MAX_SUPERVISED_COPY {
+        return None;
+    }
+    address.checked_add(length as u64)?;
+
+    let hhdm = crate::shared::hhdm();
+    let mut moved = 0usize;
+    while moved < length {
+        let at = address + moved as u64;
+        let page = at & !(bhaskix_mm::FRAME_SIZE - 1);
+        let within = (at - page) as usize;
+        let room = (bhaskix_mm::FRAME_SIZE as usize - within).min(length - moved);
+        // Translated per page, because a region is not one frame and a lazily
+        // mapped one has holes until it is touched.
+        let frame =
+            crate::vm::with_space(root, |space| space.translate(bhaskix_boot::VirtAddr(page)))??;
+        let physical = hhdm + (frame & !(bhaskix_mm::FRAME_SIZE - 1)) + within as u64;
+        let carried = if outward {
+            let mut taken = 0usize;
+            crate::shared::drain_into(memory, offset + moved + room, |chunk| {
+                // `drain_into` starts at the object's beginning, so the bytes
+                // before `offset + moved` are walked past rather than copied.
+                let skip = (offset + moved).saturating_sub(taken);
+                let start = skip.min(chunk.len());
+                let take = (chunk.len() - start).min(room);
+                if take > 0 {
+                    // SAFETY: `physical` is inside a frame the target's space
+                    // translated for this page, viewed through the direct map,
+                    // and `take` is bounded by what is left in this frame.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            chunk[start..].as_ptr(),
+                            physical as *mut u8,
+                            take,
+                        );
+                    }
+                }
+                taken += chunk.len();
+                chunk.len()
+            })?;
+            room
+        } else {
+            crate::shared::fill_from(memory, offset + moved, room, |slot| {
+                let take = slot.len().min(room);
+                // SAFETY: as above, in the other direction — the source is a
+                // frame the target's space translated, and `take` is bounded
+                // by both the object's slot and what is left in the frame.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(physical as *const u8, slot.as_mut_ptr(), take);
+                }
+                take
+            })?
+        };
+        if carried == 0 {
+            break;
+        }
+        moved += carried;
+    }
+    u64::try_from(moved).ok()
+}
+
+/// The most one `COPY_IN`/`COPY_OUT` will move.
+///
+/// One page. Not a performance number — a *latency* one: this runs inside a
+/// system call, and a supervisor that asked to move a gigabyte would make its
+/// own call the machine's longest. Larger transfers are more calls, and more
+/// calls are interruptible.
+const MAX_SUPERVISED_COPY: usize = bhaskix_mm::FRAME_SIZE as usize;
+
+/// The most pages one `MAP_AT` will map.
+///
+/// Sixty-four — a quarter of a megabyte — because the mapping is eager (see
+/// `MAP_AT`) and a system call that allocated an unbounded number of frames
+/// would be a system call that can exhaust the machine for whoever runs next.
+/// A supervisor wanting more asks again, which also makes it interruptible.
+const MAX_SUPERVISED_PAGES: u64 = 64;
 
 /// Watching a domain, asking after it, and reaping it: RFC 0017 step 6.
 ///

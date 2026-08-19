@@ -914,6 +914,39 @@ else
     status=1
 fi
 
+# RFC 0032's supervisor interface, and the reason this gate is here rather than
+# beside the Linux ones: the five methods exist *because* the Linux personality
+# needs to leave the nucleus, and they are worth having only if they are
+# generic. So they are proved by `bin/sup` -- a native supervisor that mentions
+# Linux nowhere -- reaching into a child it started: mapping a page that was not
+# there, writing a word across the domain boundary, scrubbing its own copy, and
+# reading the word back out of the child.
+#
+# The scrub is what makes the round trip mean something: without it the read
+# would pass against a copy that did nothing at all.
+#
+# **The refusals are demanded in the same line as the successes**, because an
+# interface that can reach into another domain is only as good as what it will
+# not do: an address the child has not mapped, a domain the caller does not
+# hold, a copy larger than one page, the same method on a capability that is
+# not a domain, and a protection value that does not exist -- the last standing
+# in for `W^X`, which has no encoding to ask for.
+#
+# **Two of those refusals were passing for the wrong reason until this gate was
+# armed**, and both are worth recording because they are the failure mode a
+# green test hides. The oversized copy ran past the mapping, so it was refused
+# for being *unmapped* and the size bound was never reached -- fixed by mapping
+# two pages so the length is the only thing wrong with it. And the "not a
+# domain" arm was aimed at the console, whose object id names no live domain,
+# so deleting the kind check entirely left the gate green; it is aimed at
+# `DomainControl` now, whose id is zero, and domain zero is real.
+if grep -qE "sup: supervised a running child -- mapped a page into it, wrote a word across, read it back, and was refused an unmapped address, a domain it does not hold, an oversized copy, a capability that is not a domain, and a protection that does not exist" "$LOG"; then
+    pass "a supervisor reached into a child it holds, and was refused everything it should be"
+else
+    fail "the supervisor interface did not hold"
+    status=1
+fi
+
 # And that the children *ran*, which the supervisor's own counters cannot show.
 # Each writes this line through a console capability the supervisor granted it,
 # so counting them separates "the supervisor looped" from "the children did

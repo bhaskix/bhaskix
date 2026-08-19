@@ -42,4 +42,16 @@ opt-level = "s"
 # every argument register has to be declared an output too, because the kernel
 # writes the whole frame back. Sixteen is what those two blocks measure; it was
 # guessed at 12 before either had been written.
-unsafe_budget = 16
+#
+# 18 at RFC 0032, 2026-08-19. Two more lines, and they are the first pointers
+# this program has ever dereferenced: one `ATTACH` maps a page of an object it
+# holds into its own space, and the scratch word is read and written through it.
+# That is still not reaching past its boundary -- the page is its own object at
+# an address it chose, and the frames came from the object rather than from
+# anything this program said, which is what `ATTACH` is for.
+#
+# It was 22 for an hour, because the first version kept two `static mut` flags
+# and read them through `unsafe`. Restructuring so the page is attached once,
+# where the failure can be reported, removed both -- the budget going *down*
+# after a feature landed is the ratchet working.
+unsafe_budget = 18

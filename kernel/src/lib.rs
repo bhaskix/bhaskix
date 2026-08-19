@@ -10268,6 +10268,15 @@ fn start_supervisor(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     })
     .ok_or("the supervisor's notification would not be created")?;
 
+    // Slot 5: one page of scratch, which is what RFC 0032's copies move
+    // through. A supervisor reading a child's memory must name **an object it
+    // already owns** for the bytes to land in — it never names an address in
+    // its own space, so the kernel is never asked to validate two addresses in
+    // two address spaces. This page is that object.
+    let scratch = shared::create(realm, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the supervisor's scratch page would not be created")?;
+    let scratch_cap = shared::name(scratch).map_err(|_| "the scratch page would not be named")?;
+
     // Slot 4 is left empty: it is where each child's `Domain` capability lands
     // and is given back from.
     if domain::with(realm, |owner| {
@@ -10275,6 +10284,7 @@ fn start_supervisor(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
             && owner.cspace.install_at(1, control).is_ok()
             && owner.cspace.install_at(2, staged).is_ok()
             && owner.cspace.install_at(3, signal).is_ok()
+            && owner.cspace.install_at(5, scratch_cap).is_ok()
     }) != Some(true)
     {
         return Err("the supervisor's capabilities would not install");

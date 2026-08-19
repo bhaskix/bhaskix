@@ -644,6 +644,40 @@ pub fn with_active<T>(f: impl FnOnce(&mut AddressSpace) -> T) -> Option<T> {
     Some(f(space))
 }
 
+/// Runs `f` against the address space with this page-table `root`, whether or
+/// not it is the one loaded on this CPU.
+///
+/// **The counterpart to [`with_active`], and the reason it did not exist until
+/// now is worth stating.** Every user of an address space until
+/// [RFC 0032](../../docs/rfc/0032-a-supervisor-interface.md) was operating on
+/// *its own*: a system call acts for its caller, and a fault is serviced for
+/// whoever faulted. `with_active` asks the hardware which that is, which is
+/// the honest question when the answer is "whoever is running".
+///
+/// A supervisor asks a different question — *that* domain's space, while its
+/// own is loaded — and no amount of asking `CR3` answers it. So the root comes
+/// from the caller's authority instead: `domain::space_root_of` for a domain
+/// the caller holds a capability to, which is checked before this is reached.
+/// **This function performs no authority check of its own and must never be
+/// given a root the caller did not earn.**
+///
+/// Editing a space that is live on another CPU is sound for the operations
+/// RFC 0032 offers, and not by luck: `shared::revoke` has unmapped pages from
+/// spaces it did not own since RFC 0009, by root, with a TLB shootdown per
+/// page. The same rule applies here — a mapping change must be followed by a
+/// shootdown, and the caller does it because only the caller knows the range.
+///
+/// `None` if no installed space has that root, which is the honest answer for
+/// a domain that has not started or has ended.
+pub fn with_space<T>(root: u64, f: impl FnOnce(&mut AddressSpace) -> T) -> Option<T> {
+    let mut spaces = SPACES.lock();
+    let space = spaces
+        .iter_mut()
+        .flatten()
+        .find(|space| space.root() == root)?;
+    Some(f(space))
+}
+
 /// What the fault handler did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultOutcome {

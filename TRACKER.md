@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-19 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. **TCP is complete and its RFC accepted 2026-08-16** ([RFC 0020](docs/rfc/0020-tcp.md), all six steps: `bin/tcpc` opens connections with rings its own domain owns, echoes through them both directions, and the boundary is measured — RFC 0022's capability-in-a-call is the mechanism underneath). **The sockets API exists** — `bhaskix-sock`, RFC 0027 accepted 2026-08-17 — and this cell said "no sockets API beyond UDP and TCP's own" until 2026-08-18, stale from the acceptance. **IPv6 is done** (RFC 0029, **accepted 2026-08-18**, all six steps): dual stack on every networked boot, both families measured on the same rings, and the networking bullet — the last open row of §4's table — is closed. **Packages are done** (RFC 0030, **accepted 2026-08-19**, all six steps): the image a deterministic function of the manifests, install/run/remove at the shell with manifest-derived grants, every operation priced. What remains on the roadmap's own Phase 2 list: libc — **RFC 0005 steps 2–8 of 10 are implemented**, a real static Go binary runs, and the translation sits in the nucleus where that RFC requires a service domain ([RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md), drafted 2026-08-19, carries the correction and its trigger) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed; the claim "no architecture question open" held from 2026-08-16 to 2026-08-19, when **A6** — where the Linux personality runs — was opened by RFC 0031) · **RFC 0026 ACCEPTED 2026-08-17** (the telemetry plane — six steps, drafted, built and accepted in one day) · **RFC 0027 ACCEPTED 2026-08-17** (a sockets API worth the name — `bhaskix-sock`, both ports paid) · **RFC 0028 ACCEPTED 2026-08-18** (`bhaskixboot.efi` — seven steps; the machine boots on its own loader at full gate parity, KASLR drawn and confirmed, four CPUs started by the kernel's own INIT-SIPI) · **RFC 0029 ACCEPTED 2026-08-18** (IPv6 — the second family, measured beside the first with no emulator in its numbers; drafted, built and accepted in one day, and the networking bullet — §4's last open row — closed with it) · **RFC 0030 ACCEPTED 2026-08-19** (packages — authority made reviewable: the image a function of the manifests, install/run/remove live at the shell with manifest-derived grants, every operation priced, and the kernel gained no method for any of it) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 59 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026's telemetry report line and then its round-trip check became gates; 48 until 2026-08-18, when RFC 0029's three joined — the SLAAC/NDP/echo gate, the v6 socket round trip, and the v6 TCP measurement instrument-check, each answered or its reduction stated per placement; the count sat at 48 through steps 3–5, stale from the moment the first v6 gate landed; 51 until 2026-08-19, when RFC 0005 step 2's personality gate joined, 53 when step 3's initial-image gate did, 54 when step 4's signal round trip did, 55 when step 5's memory calls did, 56 when step 6's futex edges did, and 57 when its clone half followed; 59 on 2026-08-19, when RFC 0031's two boundary gates joined -- the ratchet on how many Linux numbers the nucleus interprets, and the instrument's own accounting for every call it priced), 64 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 677 host tests, counted 2026-08-19 (649 before RFC 0005 step 9, 674 before step 10's boundary type) |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed; the claim "no architecture question open" held from 2026-08-16 to 2026-08-19, when **A6** — where the Linux personality runs — was opened by RFC 0031) · **RFC 0026 ACCEPTED 2026-08-17** (the telemetry plane — six steps, drafted, built and accepted in one day) · **RFC 0027 ACCEPTED 2026-08-17** (a sockets API worth the name — `bhaskix-sock`, both ports paid) · **RFC 0028 ACCEPTED 2026-08-18** (`bhaskixboot.efi` — seven steps; the machine boots on its own loader at full gate parity, KASLR drawn and confirmed, four CPUs started by the kernel's own INIT-SIPI) · **RFC 0029 ACCEPTED 2026-08-18** (IPv6 — the second family, measured beside the first with no emulator in its numbers; drafted, built and accepted in one day, and the networking bullet — §4's last open row — closed with it) · **RFC 0030 ACCEPTED 2026-08-19** (packages — authority made reviewable: the image a function of the manifests, install/run/remove live at the shell with manifest-derived grants, every operation priced, and the kernel gained no method for any of it) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 60 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026's telemetry report line and then its round-trip check became gates; 48 until 2026-08-18, when RFC 0029's three joined — the SLAAC/NDP/echo gate, the v6 socket round trip, and the v6 TCP measurement instrument-check, each answered or its reduction stated per placement; the count sat at 48 through steps 3–5, stale from the moment the first v6 gate landed; 51 until 2026-08-19, when RFC 0005 step 2's personality gate joined, 53 when step 3's initial-image gate did, 54 when step 4's signal round trip did, 55 when step 5's memory calls did, 56 when step 6's futex edges did, and 57 when its clone half followed; 59 on 2026-08-19, when RFC 0031's two boundary gates joined -- the ratchet on how many Linux numbers the nucleus interprets, and the instrument's own accounting for every call it priced; 60 on 2026-08-19, when RFC 0032's supervisor-interface gate joined), 64 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 677 host tests, counted 2026-08-19 (649 before RFC 0005 step 9, 674 before step 10's boundary type) |
 
 ### How far along is this, in numbers
 
@@ -136,6 +136,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **PKG** | Packages | ✅ **Accepted 2026-08-19** — drafted and implemented (all six steps) across two days, on the working demonstration: the image a function of the manifests, the full install/run/remove arc live at the shell, every operation priced, the kernel untouched | **A package is a program plus the authority it asks for, in one reviewable file.** `driver-model.md` §5's manifest principle generalised to every installable thing: a ustar `.bpk` with a line-grammar manifest naming binaries, capability requests and SHA-256 content identity (honest about being corruption-detection until Phase 3 signs it). Build time: the image becomes a deterministic function of `packages/` — byte-identical gated, the Makefile cp-list retires. Run time: install/run/remove on RFC 0016's filesystem, grants = intersection of manifest and granter, over-ask refused whole, crash-safe ordering. Design claim: zero new kernel code. Refused with triggers: fetch, signatures, dependency solving, upgrades; install-time scripts refused *flat* — ambient authority by definition | [RFC 0030](docs/rfc/0030-packages.md) |
 | **LP1** | Linux personality | ⬜ **Steps 2–8 done of 10; step 9 part-done and its wiring blocked; step 10 unmet and recorded unmet** 2026-08-19 — RFC 0005; the tag and its `-ENOSYS` telemetry, the initial process image, the signal round trip, the memory calls including `mprotect` and honoured `mmap` hints, and threads: futex proven by two threads of one hosted program meeting through it, `clone` adopting its domain's space; a real static Go binary runs and traces 212 calls. **The translation is in the nucleus, where this RFC requires a service domain** — recorded 2026-08-19, see **LC1**. Step 9 (Tier 2) landed its arithmetic — descriptors, `sockaddr`, `epoll`, host-tested and fuzzed — and proved its *wiring* impossible in ring 0: `bhaskix-sock` is a ring 3 client, so a hosted `connect()` must be a capability call to `bin/tcpd` that kernel code cannot make. The relocation is now the prerequisite, not the preference. Step 10 (the real gate) is **unmet and reported unmet rather than redefined**: its motivating workload has never been named, which is step 1's debt from outside. What landed instead is RFC 0031's plan item 4 — the boundary as a `PersonalityCall` every handler takes, the **18** interpreted Linux numbers declared and ratcheted, and the move **priced first** at a floor of 4,916 cycles | **The Linux x86_64 ABI as a personality: a translation layer in a service domain, never the native interface.** Three rules or revert: no Linux concepts in the nucleus, the personality translates and never manufactures authority, native software never pays. Go-first (static, `CGO_ENABLED=0`) because it removes the dynamic linker, libc and locale from the problem; tiers defined by traced workloads, not syscall tables; signals built first because they are where the design is most likely wrong; `ptrace`/BPF/namespaces refused permanently | [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) |
 | **LC1** | Linux compatibility as an adapter | ⬜ **Draft** 2026-08-19 — the strategic frame, drafted *after* eight of RFC 0005's steps had shipped, which is why its first deliverable is a correction rather than a design | **Linux compatibility is an adapter above Bhaskix services, never a reason to reproduce Linux kernel architecture inside Bhaskix.** Two invariants, each a property a test may attempt to violate rather than a slogan: Linux UID 0 ≠ Bhaskix unrestricted authority, and a Linux application compromise ≠ a Bhaskix system compromise. Five interfaces to stabilize now, while they are cheap: the personality frame the nucleus carries without interpreting; every Linux object backed by a capability the adapter *already held*; a hosted process holding none and unable to name one; a Linux domain's authority declared in a manifest as RFC 0030 declares a package's; one adapter per hosted workload rather than one system-wide server. Four security tests — hosted application escape, hostile driver, Linux `root`, revocation through derived descriptors — of which two are largely funded by gates that already run. Application milestones **L1–L4** (BusyBox/curl/OpenSSH → toolchains → nginx/MariaDB → containers), all unmet, lettered to avoid colliding with RFC 0005's syscall *tiers*. Records the drift it was written for: the personality is in the nucleus and RFC 0005 says it must not be | [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md) |
+| **SUP1** | A supervisor interface | ⬜ **Draft** 2026-08-19 — written *before* any of it is built, which is the order this project's rules ask for and the order the personality itself did not follow | **The authority to hold a program, held as a capability.** `START` lets a supervisor hand a child an image and let go; nothing lets it read the child's memory, change its mappings, or set a thread's registers — so anything that must is *kernel code*, which is why the Linux personality is in the nucleus and why RFC 0031's relocation could not start. Six methods on a `Domain` capability (`COPY_IN`/`COPY_OUT` naming a `Memory` object rather than a raw buffer, `MAP_AT`/`UNMAP_AT`/`PROTECT_AT` with `W^X` unrepresentable by type, `SPAWN_THREAD`), plus a `Thread` capability with full-register `SET`/`GET` — which retires `signal.rs`'s recorded `rbx`/`rbp`/`r12`–`r15` narrowing for free — and one new reply shape, `BLOCK_ON`, because **a server may hold exactly one outstanding reply** and an adapter that parked a futex sleeper would answer nobody else. The trade is stated rather than implied: **the nucleus grows a supervisor interface so the personality can leave entirely** — ~250 lines of generic mechanism in, ~3,240 lines of Linux ABI out. Surfaced two existing defects on the way, both recorded: `set_reply_target` overwrites a live reply obligation with no guard (a displaced caller hangs for ever, silently), and `ipc.rs`'s claim that a blocked caller "cancels itself on the way out" is stale | [RFC 0032](docs/rfc/0032-a-supervisor-interface.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -768,6 +769,107 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-19 (RFC 0032 step 2: the supervisor interface exists, and arming its gate found two tests that could not fail)
+
+**Five methods, and a native supervisor to prove them with.** `COPY_IN`, `COPY_OUT`,
+`MAP_AT`, `UNMAP_AT` and `PROTECT_AT` on a `Domain` capability carrying `WRITE`. `bin/sup` —
+which mentions Linux nowhere — starts a child, maps a page into it that was not there, writes
+a word across the domain boundary, **scrubs its own copy** so the read cannot pass against a
+copy that did nothing, and reads the word back out of the child. That is what makes the claim
+"these are generic" evidence rather than assertion. `SET_REGISTERS` and `SPAWN_THREAD` are
+deliberately not built: nothing needs them until signals and `clone` move, and an interface
+built before its first caller gets the shape wrong.
+
+The enabling change is one function — `vm::with_space(root, f)` beside `with_active`, which
+was `CR3`-gated and therefore could only ever reach the caller's own space. Copies go through
+`translate` + the direct map, the idiom `elf::load_into` has used since M6 for a space it has
+not installed, because `uaccess` resolves through `CR3` and is useless across a boundary.
+
+**Three things this cost, each worth more than the code.**
+
+**The child had to be given a lifetime.** A supervisor racing a child's own start is refused,
+correctly — `START` parks the image and the child's first thread builds the space — so the
+refusal is the signal to wait. But every existing probe mode was wrong for this: 2, 3 and 4
+never end, so a supervisor would hold its one child slot for the rest of the boot; 6 ends
+*immediately*, making any supervision of it a race with its own exit. Hence `bin/probe` mode
+8: yield a bounded number of times, then exit. Alive long enough to be worked on, over
+without anybody having to kill it — which matters, because a supervisor **cannot** kill a
+child it holds a handle to, and this demonstration deliberately does not need it to.
+
+**`MAP_AT` maps eagerly, and that is a limitation, not a choice.** A lazily mapped page has
+no frame until touched, so `translate` answers nothing and a `COPY_OUT` straight after a
+legitimate `MAP_AT` is refused. Committing a lazy page from outside the fault handler needs
+that commit extracted from `vm::handle_fault`, where it is welded to the active space and
+this CPU's frame reserve for reasons that are good ones there. Step 4's work, because that is
+when a hosted `mmap` needs laziness. Until then a supervisor pays for what it maps, bounded
+at 64 pages a call.
+
+**And arming the gate found two arms that could not fail** — the failure mode a green test
+hides, invisible without deliberately breaking the thing each was meant to guard. The
+*oversized copy* refusal ran past the end of the mapping, so it was refused for being
+**unmapped** and the size bound was never reached: raising the bound left the gate green.
+Fixed by mapping two pages, so the length is the only thing wrong with the request. The
+*not-a-domain* refusal was aimed at the console, whose object id names no live domain — so
+deleting the kind check outright left the gate green, **twice**. It is aimed at
+`DomainControl` now, whose id is zero, and domain zero is real and has an address space:
+without the check, that call would map a page into somebody else's program. And it is
+asserted by its **status** rather than by "it was refused", because every one of these fails
+somehow and only the value separates the handler declining the capability from a domain with
+nowhere to put it. A boolean could not tell them apart, and did not.
+
+The gate ledger moves **59 → 60** per placement.
+
+**One flake found and fixed on the way, and the fix was an instrument rather than a wider
+bound.** The gate failed once under the full suite, in the `console=nucleus vfs=nucleus`
+placement, and said only "the supervisor interface did not hold" — which sends the next
+reader back to the source to guess. Every arm now reports its own status when it fails, and
+the waits are sized against a *loaded* machine rather than a quiet one: four placements and a
+shell test run alongside this, and a bound that is ample on an idle boot is exactly the kind
+that fails once in twenty runs and reads as a defect in whatever it was waiting for.
+
+### 2026-08-19 (RFC 0032: the relocation was blocked on an authority that does not exist, and now it is specified)
+
+**The Linux personality cannot leave the nucleus because nothing lets a program hold another
+program.** `START` lets a supervisor hand a child an image and let go. Nothing lets it read the
+child's memory, change the child's mappings, or set a thread's registers — so anything that must do
+those things has to *be* kernel code. That, and not stubbornness, is why the personality is still
+in ring 0 and why RFC 0031 §5's relocation could not begin.
+
+**[RFC 0032](docs/rfc/0032-a-supervisor-interface.md) specifies it**, decision-log row **SUP1**:
+six methods on a `Domain` capability — `COPY_IN`/`COPY_OUT`, which name a `Memory` object the
+caller already owns rather than a raw buffer, so the kernel is never asked to validate two
+addresses in two spaces; `MAP_AT`/`UNMAP_AT`/`PROTECT_AT`, which inherit `W^X` unrepresentability
+from `Protection` for free; and `SPAWN_THREAD`. Plus a `Thread` capability with **full-register**
+`SET`/`GET`, which retires `signal.rs`'s recorded `rbx`/`rbp`/`r12`–`r15` narrowing rather than
+carrying it into the new design. None of the six is a Linux concept: a debugger, a checkpointer, a
+container runtime and a Linux adapter want the same six, and the plan proves that by building them
+against **`bin/sup`** — a native supervisor — rather than against Linux.
+
+**The trade is stated rather than implied**, because it is the thing to argue with: *the nucleus
+grows a supervisor interface so the personality can leave entirely.* Roughly 250 lines of generic
+mechanism in, so that the inventory's **~3,240 lines** of Linux ABI can go out — and so the largest
+untrusted-input parser this project will ever contain stops running in ring 0.
+
+**One constraint discovered while writing it changed the design.** A server may hold **exactly one**
+outstanding reply — `Thread::reply_to` is an `Option`, and `ipc.rs` states it as a protection: a
+service "cannot accumulate the ability to answer callers later". So an adapter cannot answer
+`FUTEX_WAIT` by not replying; it would answer nobody else. The reply therefore *is* the sleep:
+`BLOCK_ON(notification, badge)` asks the kernel to park the caller. Policy in the adapter, mechanism
+in the kernel. The lost-wakeup that shape would normally have is already closed by an existing
+decision — `notify::signal` publishes its pending bits **before** waking.
+
+**Two existing defects surfaced and are recorded rather than tidied away.** `sched::set_reply_target`
+overwrites a live reply obligation with no guard, so a server that receives twice without replying
+strands its first caller for ever, silently — and `abandon_caller` rescues only the current one. And
+`ipc.rs`'s claim that a thread blocked in `call` "cancels itself on the way out" is stale: it does
+not, and the case is covered only by `cancel_all` at exit. Neither is caused by RFC 0032 and neither
+blocks it.
+
+**Also decided here rather than discovered later:** `LINUX_DOMAINS` becomes `FOREIGN_DOMAINS` —
+same shape, same single relaxed load on the syscall fast path, which is the one place this whole
+refactor could regress and which has already been got wrong twice. It does *not* become a table
+naming which service serves which domain; the trigger for that is a second dialect.
 
 ### 2026-08-19 (RFC 0005 step 10: the gate is reported unmet, and the boundary is made explicit and priced instead)
 

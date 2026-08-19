@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1502
+unsafe_budget = 1512
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -384,6 +384,16 @@ unsafe_budget = 1502
 # argument for reading any of this probe's report: the frame belonged to the
 # probe's space, it is read before anything reuses it, and a load through the
 # direct map of a frame this kernel allocated cannot fault.
+#
+# 1512 at RFC 0032's supervisor interface, 2026-08-19. Ten lines, both blocks in
+# `copy_across`, which moves bytes between a `Memory` object and a domain the
+# caller holds a capability to. They are `unsafe` for the reason `elf::load_into`
+# is: the destination is a physical frame viewed through the direct map, because
+# `uaccess` resolves through `CR3` and can only reach the space that is *loaded*
+# -- which for a supervisor is its own, and the wrong one. Each carries the
+# bound that makes it sound: the frame came from the target space's own
+# `translate` for that page, and the length is clamped to what is left in the
+# frame before either copy is issued.
 
 [features]
 # Lets a *host* binary link this crate without inheriting the kernel's global

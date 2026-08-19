@@ -250,6 +250,13 @@ The correction has a shape and a trigger, and deliberately does not happen this 
   > one of those calls, made on the process's behalf — and the code that would make it is currently
   > the kernel, which would have to become an IPC client of its own services. The trigger does not
   > move; it now has a second reason under it, and the second one is not a judgement call.
+
+  > **The mechanism is specified, 2026-08-19: [RFC 0032](0032-a-supervisor-interface.md).** The
+  > relocation was blocked on something this RFC did not name — an adapter in ring 3 has no way
+  > to read a hosted process's memory, change its mappings, or set a thread's registers, because
+  > no capability confers any of that. RFC 0032 adds six methods on a `Domain` capability, none
+  > of them a Linux concept, and states the trade this document only implied: **the nucleus
+  > grows a supervisor interface so the personality can leave entirely.**
 - **Shape:** I1's frame becomes a real message to a domain; `foreign_*` moves to `bin/linuxd`
   behind the existing `personality/` crate; the memory calls become RFC 0009 `Memory` operations on
   the hosted domain's space; the signal frame is built by the adapter and installed through a

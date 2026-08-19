@@ -84,6 +84,13 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > §5 records how this happened, and fixes the correction's trigger — before Tier 1's file surface,
 > because that is when the adapter starts holding per-process state and moving it gets dear.
 >
+> **The mechanism the move needs is specified as of 2026-08-19**
+> ([RFC 0032](rfc/0032-a-supervisor-interface.md)): six methods on a `Domain` capability, so
+> that holding a program becomes an authority a program can be *given* rather than something
+> only the kernel can be. **This row's mitigation column does not become true when that RFC is
+> accepted — it becomes true when the personality actually moves**, which is several steps
+> later, and this note stays until then.
+>
 > Written here rather than only in the RFC because [RFC 0005](rfc/0005-linux-abi-compatibility.md)'s
 > own impact table asked for this row on the day it was drafted — *"The threat model gains an
 > in-scope adversary: a hostile process inside a Linux-personality domain… This is new and must be
@@ -272,6 +279,7 @@ target before it gets merged, not after.
 | CPU | `ResourceEnvelope` enforced by the scheduler ([scheduler.md](scheduler.md) §3) |
 | Physical memory | Per-frame `owner: DomainId`, enforced at allocation ([memory.md](memory.md) §2) |
 | Devices | Per-device IOMMU domain; a device is reachable only via capability |
+| A domain that holds another | A supervisor reaches into a domain **only** through a `Domain` capability carrying `WRITE`, and only into domains it was given one for — [RFC 0032](rfc/0032-a-supervisor-interface.md). Revoking that capability ends the reach before the call returns. The reach is one-directional: the held domain gains nothing, and its CSpace stays empty |
 | IPC | Endpoints are capabilities; there is no global name service to enumerate |
 | Time | Coarse time is free; fine-grained timers are rate-limited per domain (side-channel hygiene) |
 

@@ -216,6 +216,28 @@ pub mod method {
     /// does: choosing a dialect is shaping the domain, not observing it.
     pub const PERSONALITY: u64 = 58;
 
+    /// `COPY_IN(memory, offset, address, length)` on a `Domain` — read the
+    /// target domain's memory into a `Memory` object the caller holds.
+    ///
+    /// [RFC 0032](../../docs/rfc/0032-a-supervisor-interface.md). The
+    /// destination is an **object**, never an address: the caller names memory
+    /// it already owns, so the kernel is never asked to validate two addresses
+    /// in two address spaces, and a supervisor cannot ask for bytes to land
+    /// anywhere it could not already write.
+    pub const COPY_IN: u64 = 59;
+    /// `COPY_OUT(memory, offset, address, length)` on a `Domain` — write a
+    /// `Memory` object the caller holds into the target domain's memory.
+    pub const COPY_OUT: u64 = 60;
+    /// `MAP_AT(address, pages, protection)` on a `Domain` — anonymous pages in
+    /// the target domain. `protection` is the same encoding `ATTACH` uses, so
+    /// writable-and-executable is not expressible.
+    pub const MAP_AT: u64 = 61;
+    /// `UNMAP_AT(address)` on a `Domain` — the region starting there.
+    pub const UNMAP_AT: u64 = 62;
+    /// `PROTECT_AT(address, pages, protection)` on a `Domain` — whole regions
+    /// only, as `AddressSpace::protect` requires and for its reasons.
+    pub const PROTECT_AT: u64 = 63;
+
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
