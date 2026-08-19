@@ -518,6 +518,56 @@ that nothing built in Phase 1 or 2 has to be undone to accommodate it.
 > put the rings on CPUs — the producer is a CPU, often in interrupt context, not a domain — and
 > what a domain will eventually carry is per-class enable bits, deferred to their first consumer.
 
+### Personalities: a domain may speak a dialect that is not this system's
+
+A domain carries a **personality** — which system-call dialect its threads speak. `Native` is
+RFC 0008's six capability-invocation kinds. `Linux` means the domain's traps are delivered to a
+**compatibility adapter** instead of to the capability dispatcher, so a Linux binary that was
+compiled for a different operating system runs here without a Linux kernel underneath it.
+
+**This is a layer above the nucleus, and the direction of the arrow is the whole design:**
+
+```text
+                    BHASKIX OS
+                        │
+        ┌───────────────┼────────────────┐
+        │               │                │
+   Native apps    Linux compatibility   VMs
+        │               │                │
+        │        Linux ABI adapter       │
+        │               │                │
+        └───────────────┼────────────────┘
+                        │
+                Bhaskix services
+                        │
+             Capabilities + domains
+                        │
+                Bhaskix nucleus
+                        │
+                     Hardware
+```
+
+Four rules govern it, and [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md) is where each
+is argued:
+
+1. **The adapter is a peer of native applications, not of the nucleus.** It holds what its domain
+   was granted and nothing else. The nucleus's whole knowledge of Linux is "this domain speaks a
+   foreign dialect, here is the register frame, deliver it".
+2. **It translates and never manufactures authority.** A hosted `openat` resolves against a
+   directory capability the domain already holds; holding none is `EACCES`, and the refusal is the
+   absence of a capability rather than a check that said no.
+3. **A hosted process holds no capabilities and cannot name one.** Its CSpace is empty and the six
+   kinds are not reachable through a Linux syscall number, which is why `root` inside such a domain
+   is administrative *within its grants* and nothing more.
+4. **Native software never pays.** A domain that did not ask for a personality does not carry one.
+
+> **Partly built, and one part is in the wrong place.** The tag, the dispatch and eight of
+> [RFC 0005](rfc/0005-linux-abi-compatibility.md)'s steps run: a real static Go binary loads,
+> makes system calls, prints through the adapter and stops in its own allocator. But the
+> translation itself is currently **inside the nucleus** rather than in a service domain, which is
+> what RFC 0005 requires and what rule 1 above states. [security.md](security.md) §1's **T11** row
+> says what that costs while it lasts, and RFC 0031 §5 carries the correction and its trigger.
+
 ---
 
 ## 5. Crate layout
@@ -612,7 +662,8 @@ These are unresolved and should not be silently settled in code. Each needs an R
 | ~~A2~~ | ~~Syscall ABI shape~~ | ✅ **Resolved 2026-08-04: capability invocation**, six syscall kinds, all authority arriving as a capability argument ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md)). |
 | ~~A3~~ | ~~IPC style~~ | ✅ **Resolved 2026-08-04: synchronous rendezvous is primitive**; async is shared memory plus a notification, one layer up ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md)). |
 | ~~A4~~ | ~~Userspace ABI~~ | ✅ **Resolved 2026-08-04 by refusing the premise**: the native ABI *is* A2's syscall interface, so there is no separate document and no native libc; POSIX belongs to the Linux personality ([RFC 0008](rfc/0008-syscall-and-ipc-shape.md), [RFC 0005](rfc/0005-linux-abi-compatibility.md)). |
-| ~~A5~~ | ~~5-level paging~~ | ✅ **Resolved 2026-08-16: four-level on purpose**, with the boot-time refusal shipped and five-level waiting on a written trigger ([RFC 0025](rfc/0025-four-level-paging-on-purpose.md)). No architecture question in this table remains open. |
+| ~~A5~~ | ~~5-level paging~~ | ✅ **Resolved 2026-08-16: four-level on purpose**, with the boot-time refusal shipped and five-level waiting on a written trigger ([RFC 0025](rfc/0025-four-level-paging-on-purpose.md)). |
+| A6 | Where the Linux personality runs, and what a hosted process is | ⬜ **Open, and open because code overtook the design.** [RFC 0005](rfc/0005-linux-abi-compatibility.md) requires a service domain; the implementation is in the nucleus. [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md) proposes the boundary (one frame, no Linux structure read in ring 0), the correction's trigger (before Tier 1's file surface), and the questions under it — one domain per hosted *process* or per *workload*, and where a descriptor table lives. **This table said no architecture question remained open, from 2026-08-16 until 2026-08-19.** |
 
 ---
 

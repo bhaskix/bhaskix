@@ -1767,9 +1767,19 @@ fn foreign_memory_call(frame: &mut SyscallFrame) -> Option<u64> {
     let (first, second, third) = (frame.capability, frame.method, frame.arg0);
     match frame.kind {
         linux::MMAP => {
+            static TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let nth = TRACED.fetch_add(1, Ordering::Relaxed);
+            if nth < 12 {
+                crate::println!(
+                    "    go trace       mmap#{nth} addr={first:#x} len={second:#x} \
+                     prot={third:#x} flags={:#x}",
+                    frame.arg1
+                );
+            }
             let plan = memory::plan_mmap(first, second, third, frame.arg1, frame.arg2 as i64);
             let MapPlan::Map {
                 at,
+                hint,
                 pages,
                 read,
                 write,
@@ -1788,10 +1798,26 @@ fn foreign_memory_call(frame: &mut SyscallFrame) -> Option<u64> {
                 _ => bhaskix_mm::Protection::None,
             };
             let bytes = pages.checked_mul(memory::PAGE)?;
-            let address = match at {
-                Some(address) => address,
-                None => MMAP_NEXT.fetch_add(bytes, Ordering::Relaxed),
+            // A demand is honoured or refused; a *hint* is tried and then
+            // given up on. Trying it matters: an allocator that asked for
+            // its heap near one address and got another hands the mapping
+            // back, and after enough of those gives up entirely -- which is
+            // exactly how the Go runtime spent step 7 saying "cannot
+            // allocate memory" while nothing here had refused a thing.
+            let attempt = |address: u64| -> Option<bool> {
+                let range =
+                    bhaskix_mm::VirtRange::from_pages(bhaskix_boot::VirtAddr(address), pages)?;
+                crate::vm::with_active(|space| space.map_anonymous_lazy(range, protection).is_ok())
             };
+            if let Some(wanted) = at.or(hint)
+                && attempt(wanted) == Some(true)
+            {
+                return Some(wanted);
+            }
+            if at.is_some() {
+                return Some(memory::errno::ENOMEM as u64);
+            }
+            let address = MMAP_NEXT.fetch_add(bytes, Ordering::Relaxed);
             let range = bhaskix_mm::VirtRange::from_pages(bhaskix_boot::VirtAddr(address), pages)?;
             // Lazily: a hosted program that asks for a gigabyte and touches
             // a page should pay for a page, which is what Go's allocator
@@ -1818,12 +1844,35 @@ fn foreign_memory_call(frame: &mut SyscallFrame) -> Option<u64> {
             Err(errno) => Some(errno as u64),
         },
         linux::MPROTECT => {
-            // Changing protection on a live region needs the region map to
-            // split and re-enter ranges, which it does not offer yet.
-            // Refused with `ENOSYS` rather than answered `0`: a program told
-            // its pages are now read-only, and then able to write them, is
-            // worse off than one told the call does not exist.
-            Some(memory::errno::ENOSYS as u64)
+            // RFC 0005 step 8. Whole regions only -- see
+            // `AddressSpace::protect` for why splitting is refused rather
+            // than approximated -- which covers the pattern Go actually
+            // uses: reserve `PROT_NONE`, then make the whole of it
+            // readable and writable. That refusal is what stopped the Go
+            // runtime at step 7 with "cannot allocate memory".
+            let (address, pages, read, write, execute) =
+                match memory::plan_mprotect(first, second, third) {
+                    Ok(plan) => plan,
+                    Err(errno) => return Some(errno as u64),
+                };
+            let protection = match (read, write, execute) {
+                (_, true, _) => bhaskix_mm::Protection::ReadWrite,
+                (_, _, true) => bhaskix_mm::Protection::ReadExecute,
+                (true, _, _) => bhaskix_mm::Protection::ReadOnly,
+                _ => bhaskix_mm::Protection::None,
+            };
+            let changed = crate::vm::with_active(|space| {
+                space
+                    .protect(bhaskix_boot::VirtAddr(address), pages, protection)
+                    .is_ok()
+            });
+            match changed {
+                Some(true) => Some(0),
+                // Linux's `ENOMEM` is what `mprotect` returns for a range
+                // that is not entirely mapped, which is also the honest
+                // answer for a range this cannot change whole.
+                _ => Some(memory::errno::ENOMEM as u64),
+            }
         }
         linux::MADVISE => Some(memory::plan_madvise() as u64),
         _ => None,

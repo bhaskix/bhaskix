@@ -264,7 +264,11 @@ derived from what their manifests ask. What remains is libc.
   What remains is the binary half: the Linux `x86_64` ABI as a personality in a service
   domain — statically linked Go first, tiers defined by traced workloads, `-ENOSYS`
   through the telemetry plane, and the three rules that keep the nucleus free of
-  Linux-shaped concepts
+  Linux-shaped concepts. **Steps 2–8 are implemented and the service domain is not**: the
+  translation runs in the nucleus today, which [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md)
+  records with its correction trigger and [security.md](security.md) §1's T11 prices. RFC 0031
+  is also where this bullet's *destination* is written down — the L1–L4 application milestones
+  below, and the containment they must inherit
 
 **Exit:** Bhaskix self-hosts its own userspace utilities, does useful network I/O, and boots on its
 own bootloader.
@@ -288,9 +292,40 @@ own bootloader.
   containable, and leaving them here left `security.md` §1 T3 and T4 unfunded for the
   length of Phase 2
 - **Side-channel mitigations** — the documented Phase-1/2 gap in [security.md](security.md) §1
+- **Linux compatibility L1** — see the section below. It sits here because a container runtime that
+  cannot run BusyBox is a container runtime for nothing
 
 **Exit:** a signed, attestable Bhaskix boots, runs containers and VMs side by side under one
 scheduler, updates atomically, and survives an external security review of the stated threat model.
+
+---
+
+## Linux compatibility — L1 to L4
+
+**A goal, and every row below is unmet.** Bhaskix aims to run the Linux software ecosystem through
+an adapter above its own services — *not* by reproducing Linux kernel architecture inside itself,
+and not by running a Linux kernel underneath. [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md)
+is the architecture; [RFC 0005](rfc/0005-linux-abi-compatibility.md) is the translation.
+
+The letters exist to avoid a collision: RFC 0005 already uses **Tier** for *system-call* tiers
+defined by tracing a binary. **L** rows are *applications*.
+
+| | Target | What it demands beyond the row above | Status |
+|---|---|---|---|
+| **L1** | Static ELF binaries, BusyBox, shell utilities, `curl`, OpenSSH | Tier 1's file surface, `execve`, pipes, a `/proc` subset, terminal `ioctl`s | ⬜ not started — today a static Go binary loads, runs and traces 212 calls |
+| **L2** | Python, GCC, Clang, Rust, Go toolchains | The dynamic linker and a real libc's expectations, `fork`, process groups, filesystem breadth | ⬜ not started |
+| **L3** | nginx, Apache, PostgreSQL, MariaDB | Tier 2 sockets and `epoll`, `mmap`-heavy storage, `fsync` durability, users and permissions | ⬜ not started |
+| **L4** | Larger server software, container workloads | Resource control mapped onto `ResourceEnvelope`, image formats, orchestration | ⬜ not started |
+
+The demonstration these build toward: **Bhaskix boots → a compatibility domain → nginx + MariaDB +
+OpenSSH → network clients connect**, with no Linux kernel underneath. Until a gate proves a row, no
+document, release note or README may state or imply that it works — the same rule every other
+claim in this project lives under.
+
+**And the compatibility path inherits the containment or it is not worth having.** The security
+tests that say so — a hosted application attempting escape, a hostile driver, Linux `root` confined
+to its domain, revocation reaching every descriptor derived from a revoked capability — are
+specified in RFC 0031 §6 and become permanent boot gates as each is written.
 
 ---
 
@@ -366,7 +401,9 @@ is a truthful thing to publish and a dishonest thing to dress up.
 
 A libc, self-hosting, a package repository, signatures, containers, VMs, a desktop, or a promise of
 ABI stability. The Linux personality ships as far as it has got — which by the release will be
-further than it is today — described by what it runs, not by what it aspires to.
+further than it is today — described by what it runs, not by what it aspires to. **No L row is in
+this release**, and the release note says so in those words rather than describing the goal in a
+tense that could be mistaken for a state.
 
 ---
 

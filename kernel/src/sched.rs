@@ -3632,6 +3632,30 @@ fn domain_thread_departs(domain: u32) -> bool {
         .is_some_and(|count| count.fetch_sub(1, Ordering::AcqRel) == 1)
 }
 
+/// How many threads the departure counter still attributes to a domain slot.
+///
+/// **This is what makes a slot unsafe to reuse.** `domain::end` marks a
+/// domain's threads dying and returns; each stops at its own next safe
+/// point, and until it has, it still holds this slot's number and will
+/// decrement this counter when it goes. A slot handed out again in that
+/// window gets a stranger's departure counted against it -- and a
+/// departure that takes the count to zero *ends the innocent domain that
+/// now holds the slot*, revoking its capabilities and clearing its
+/// personality tag underneath a program that did nothing.
+///
+/// That is not a hypothesis. It was captured on 2026-08-19: the signal
+/// self-test's Linux domain took the slot the previous probe's domain had
+/// just released, the previous probe's thread exited a moment later, and
+/// the fault handler then found the domain's Linux tag cleared and
+/// delivered no signal -- `delivered 0`, with the handler demonstrably
+/// installed. `domain::create_under` uses this to refuse such a slot.
+#[must_use]
+pub fn threads_counted_in(domain: u32) -> u32 {
+    DOMAIN_LIVE_THREADS
+        .get(domain as usize)
+        .map_or(0, |count| count.load(Ordering::Relaxed))
+}
+
 /// How many threads still exist in `domain`, in any state but `Finished`.
 ///
 /// `Finished` is excluded because a finished thread is one that *has* stopped;

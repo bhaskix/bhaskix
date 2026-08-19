@@ -6,6 +6,20 @@ Bhaskix is not a Linux distribution. It is a new operating system built around i
 designed from the ground up with security, virtualization, scalability, and artificial intelligence
 as core architectural principles rather than optional additions.
 
+**A direction under consideration: run the Linux software ecosystem without being Linux.** Linux
+has accumulated powerful security mechanisms around a mature traditional architecture; Bhaskix
+explores what becomes possible when authority, isolation, service separation and device
+containment are architectural primitives from the first line. Compatibility would be an *adapter
+above* Bhaskix's own services — never a Linux kernel underneath, and never a reason to reproduce
+Linux's kernel architecture inside Bhaskix. Two properties have to survive that path or it is not
+worth having: Linux `root` is not Bhaskix authority, and a compromised Linux application is not a
+compromised system. → [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md), a draft
+
+> **A direction, not a commitment — and today it runs a static Go binary and nothing larger.** No
+> shell utility, web server or database has ever run here. The milestones are written down as
+> [L1–L4](docs/roadmap.md#linux-compatibility--l1-to-l4), every one of them unmet, and nothing in
+> this repository will say otherwise before a test proves it.
+
 **Bhaskix** — from *bhāskara* (भास्कर), Sanskrit for "the light-maker", the sun; and the name of two
 of India's great mathematician-astronomers. Bhāskara I (c. 600–680 CE) was the first person known to
 have written Hindu-Arabic numerals with a circle for zero, and gave a rational approximation of the

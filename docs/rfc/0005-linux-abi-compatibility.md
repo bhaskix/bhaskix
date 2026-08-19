@@ -351,6 +351,28 @@ this personality delivers is maskable yet), `exit`, `exit_group`, plus everythin
 to 6 landed. **Next, in the order the histogram asks**: `mprotect`, then `openat`/`read`
 for the `/sys` probes, then `nanosleep`.
 
+## Step 8's record (2026-08-19): `mprotect` exists, hints are honoured, and the Go allocator still says no
+
+Two real improvements, both host-tested and both gated by the corpus rather than by a probe:
+`mprotect` is implemented over the region map — **whole regions only**, which covers the
+pattern Go uses (reserve `PROT_NONE`, then make the whole of it writable) and refuses a
+sub-range split rather than granting a permission wider or narrower than asked; and `mmap`
+now **honours an address hint**, because an allocator that asked for its heap near one
+address and got another hands the mapping back and eventually gives up.
+
+**And the Go runtime still stops in the same place, which is the honest result.** With
+tracing on, its first two maps are ordinary — 8 KiB then 256 KiB, both anonymous, private,
+read-write, both satisfied — and then it throws `runtime: cannot allocate memory` without
+issuing a third. Nothing refused anything: no `mmap` and no `mprotect` returned an error in
+that run. So the failure is Go rejecting an *answer* rather than receiving a refusal, and
+the next investigator's starting point is precise: the string comes from
+`persistentalloc1`'s `sysAlloc` returning nil, so what to instrument is what
+`sysAlloc(256 KiB)` receives and why the runtime treats it as unusable — the returned
+address's relationship to its arena hints being the first suspect, and the second being a
+`munmap`/re-`mmap` sequence whose second half this personality answers differently from
+Linux. **Two full-boot cycles of guesswork produced less than one traced argument list**,
+which is this RFC's own instruction restated: trace the binary, do not reason about it.
+
 ## Design
 
 ### Where it lives
@@ -366,6 +388,31 @@ length arguments supplied by the process being contained — and it is the
 largest single piece of attack surface the project would have. Placing it in a
 domain means a bug in it is a compromise of that domain's authority, not of the
 kernel.
+
+> **Correction, 2026-08-19: the implementation contradicts the paragraph
+> above, and did so for eight steps before anybody wrote it down.**
+> `kernel/src/syscall.rs` holds `foreign_call` and the memory, signal and
+> thread call paths; `kernel/src/signal.rs` builds and restores Linux signal
+> frames. That is on the order of 700 lines of Linux ABI in ring 0. What *was*
+> kept out is the decision logic — `personality/`, 1,549 lines, `no_std`, zero
+> `unsafe`, host-tested — which is why the correction is a relocation and not
+> a rewrite.
+>
+> **Why, recorded because it was not carelessness:** steps 4 to 6 needed the
+> address space, the scheduler and the fault path, and the in-nucleus route
+> was the shortest path to a *measured* result — a real Go binary making 212
+> traced system calls, which is what this RFC asks for and what no amount of
+> further design would have produced. The mistake was not writing it down at
+> the time, so the tree's largest untrusted-input parser sat in ring 0 with
+> the design document still saying otherwise.
+>
+> **The correction has a trigger rather than a date:** before Tier 1's file
+> surface lands, because Tier 1 is where the adapter starts holding
+> per-process state — descriptor tables, path resolution, a `/proc` view — and
+> stateful code costs an order of magnitude more to move.
+> [RFC 0031](0031-linux-compatibility-as-an-adapter.md) §5 carries the shape,
+> and [security.md](../security.md) §1's **T11** row states what it costs
+> meanwhile.
 
 ### The initial process image
 

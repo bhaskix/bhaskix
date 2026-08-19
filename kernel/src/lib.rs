@@ -2904,6 +2904,49 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     unsafe { bhaskix_arch::syscall::enter_ring3(entry, image_at, [0, 0]) }
 }
 
+/// Puts a Linux probe's domain down and *waits for its threads to be gone*
+/// before returning.
+///
+/// Every probe below spins in ring 3 after it has reported, because a
+/// program whose `exit_group` is refused has no way out of its own; the
+/// test ends it. `domain::destroy` marks the threads dying and they stop
+/// at their next safe point -- but it also releases the address-space slot
+/// at once, so a test that returns immediately leaves a ring 3 thread
+/// running on a space whose slot the *next* probe's `vm::install` is free
+/// to claim. All six probes pin to the same CPU, so the next one starts
+/// exactly where the last one has not finished dying.
+///
+/// That is the shape of the flake this closes: the signal probe reporting
+/// `delivered 0` and the clone probe never concluding, in the same boot,
+/// with everything green on the next run. The wait is bounded and asks
+/// twice, because `sched::threads_in_domain` reports a runqueue it could
+/// not lock as empty.
+fn retire_probe(realm: domain::DomainId) {
+    domain::destroy(realm);
+    wait_for_probe_threads(realm);
+    signal::forget(realm.as_u32());
+}
+
+/// Waits, bounded, for a domain to have no threads left on any runqueue.
+///
+/// Asks twice, because [`sched::threads_in_domain`] counts a runqueue it
+/// could not lock as empty: one pass can answer zero for a thread that is
+/// merely on a busy CPU, and two passes either side of a wait cannot.
+fn wait_for_probe_threads(realm: domain::DomainId) {
+    let mut clear = 0;
+    for _ in 0..400 {
+        if sched::threads_in_domain(realm.as_u32()) == 0 {
+            clear += 1;
+            if clear == 2 {
+                break;
+            }
+        } else {
+            clear = 0;
+        }
+        wait_millis(5);
+    }
+}
+
 /// RFC 0005 step 7: run a real static Go binary and say what it asked for.
 ///
 /// The RFC is explicit that **the surface is defined by tracing the actual
@@ -2942,18 +2985,25 @@ fn go_corpus_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
-    // Give it a second to get as far as it gets. This is not a wait for
-    // success: a Tier 0 attempt that stops early is exactly the result
-    // worth printing, and the histogram is the point either way.
-    for _ in 0..200 {
+    // Time to get as far as it gets. This is not a wait for success: a
+    // Tier 0 attempt that stops early is exactly the result worth printing,
+    // and the histogram is the point either way.
+    //
+    // **Then it is put down, not destroyed under itself.** Destroying a
+    // domain whose thread is still running tears the address space out from
+    // under it, and the fault that follows lands in the middle of whatever
+    // the next self-test is printing -- which is how this first showed up: a
+    // console self-test reporting "16 of 5 bytes" while a page fault report
+    // interleaved with its own output. `retire_probe` waits for the threads
+    // to be gone, which is what the domain going away does not say.
+    for _ in 0..400 {
         wait_millis(5);
         if domain::with(realm, |_| ()).is_none() {
             break;
         }
     }
     let made = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - before;
-    domain::destroy(realm);
-    signal::forget(realm.as_u32());
+    retire_probe(realm);
 
     if made == 0 {
         println!(
@@ -3124,6 +3174,10 @@ fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
     const CPU: u32 = 3;
 
+    // As the signal test: a failure that made no foreign call at all was
+    // judged the wrong dialect, and that is a different bug from a clone
+    // that did not conclude.
+    let foreign_before = syscall::FOREIGN_CALLS.load(Ordering::Relaxed);
     let Ok(realm) = domain::create("clone", domain::ResourceEnvelope::new()) else {
         println!("\x1b[91m    linux clone    FAILED: no domain\x1b[0m");
         return false;
@@ -3171,8 +3225,7 @@ fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
         wait_millis(5);
     }
-    domain::destroy(realm);
-    signal::forget(realm.as_u32());
+    retire_probe(realm);
 
     // The parent's view of the tid, its wait's answer, the word the child
     // set, the child's own tid, and how many the child's wake found.
@@ -3191,9 +3244,10 @@ fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         true
     } else {
+        let foreign = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - foreign_before;
         println!(
             "\x1b[91m    linux clone    FAILED: marked {}, parent saw {}, wait {}, word {}, \
-             child tid {}, woke {}\x1b[0m",
+             child tid {}, woke {}, {foreign} foreign calls\x1b[0m",
             marked, parent_saw as i64, wait_answer as i64, word, child_tid as i64, woke as i64
         );
         false
@@ -3378,8 +3432,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
         wait_millis(5);
     }
-    domain::destroy(realm);
-    signal::forget(realm.as_u32());
+    retire_probe(realm);
 
     let eagain = -11i64 as u64;
     let enosys = -38i64 as u64;
@@ -3576,8 +3629,7 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
         wait_millis(5);
     }
-    domain::destroy(realm);
-    signal::forget(realm.as_u32());
+    retire_probe(realm);
 
     // A plausible address, the pattern read back out of the second page,
     // and both of the calls that answer zero having answered zero.
@@ -3732,6 +3784,12 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     let delivered_before = signal::DELIVERED.load(Ordering::Relaxed);
     let returned_before = signal::RETURNED.load(Ordering::Relaxed);
+    // Counted so a failure can say *which* failure it is. A probe that made
+    // no foreign call at all was dispatched natively -- its dialect was
+    // judged wrong -- and one that made calls and still delivered no signal
+    // failed somewhere in `signal`. The two have nothing in common but the
+    // report line they used to share.
+    let foreign_before = syscall::FOREIGN_CALLS.load(Ordering::Relaxed);
     let Ok(realm) = domain::create("sigsegv", domain::ResourceEnvelope::new()) else {
         println!("\x1b[91m    linux signal   FAILED: no domain\x1b[0m");
         return false;
@@ -3772,8 +3830,7 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
         wait_millis(5);
     }
-    domain::destroy(realm);
-    signal::forget(realm.as_u32());
+    retire_probe(realm);
 
     let delivered = signal::DELIVERED.load(Ordering::Relaxed) - delivered_before;
     let returned = signal::RETURNED.load(Ordering::Relaxed) - returned_before;
@@ -3785,9 +3842,10 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         true
     } else {
+        let foreign = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - foreign_before;
         println!(
             "\x1b[91m    linux signal   FAILED: cr2 {:#x}, resumed {}, delivered {delivered}, \
-             returned {returned}\x1b[0m",
+             returned {returned}, {foreign} foreign calls\x1b[0m",
             answers[0], answers[1]
         );
         false
@@ -3847,13 +3905,37 @@ const AUXV_CODE: [u8; 81] = [
 /// intentional fault dump tripped the shell test's blanket no-EXCEPTION
 /// check -- an instrument should not have to be excused from other
 /// instruments.)
-const FOREIGNER_CODE: [u8; 34] = [
+const FOREIGNER_CODE: [u8; 97] = [
     0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, 39   (getpid)
     0x0f, 0x05, //                   syscall
     0x48, 0x89, 0x07, //             mov [rdi], rax
     0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1    (write)
     0x0f, 0x05, //                   syscall
     0x48, 0x89, 0x47, 0x08, //       mov [rdi+8], rax
+    // The smuggle. Each of the five numbers below is one of RFC 0008's
+    // syscall kinds -- 0 Invoke, 2 Reply, 3 Recv, 4 Yield, 5 Exit -- and
+    // also an ordinary Linux call number this personality does not answer.
+    // A Linux program cannot name a capability, so the only way it could
+    // reach the native interface is by a number this kernel read in the
+    // wrong dialect. Each answer goes in the report; each must be -ENOSYS.
+    0xb8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0    (read / Invoke)
+    0x0f, 0x05, //                   syscall
+    0x48, 0x89, 0x47, 0x18, //       mov [rdi+24], rax
+    0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2    (open / Reply)
+    0x0f, 0x05, //                   syscall
+    0x48, 0x89, 0x47, 0x20, //       mov [rdi+32], rax
+    0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3    (close / Recv)
+    0x0f, 0x05, //                   syscall
+    0x48, 0x89, 0x47, 0x28, //       mov [rdi+40], rax
+    0xb8, 0x04, 0x00, 0x00, 0x00, // mov eax, 4    (stat / Yield)
+    0x0f, 0x05, //                   syscall
+    0x48, 0x89, 0x47, 0x30, //       mov [rdi+48], rax
+    0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5    (fstat / Exit)
+    0x0f, 0x05, //                   syscall
+    0x48, 0x89, 0x47, 0x38, //       mov [rdi+56], rax
+    // Reached only if the line above did not end this thread, which is the
+    // single strongest observation in this probe: read natively, 5 is Exit.
+    0x48, 0xc7, 0x47, 0x40, 0x01, 0x00, 0x00, 0x00, // mov qword [rdi+64], 1
     0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60   (exit_group)
     0x0f, 0x05, //                   syscall
     0x48, 0x89, 0x47, 0x10, //       mov [rdi+16], rax
@@ -4099,7 +4181,7 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
         wait_millis(5);
     }
-    domain::destroy(realm);
+    retire_probe(realm);
 
     let entropy = [
         AUXV_ENTROPY[0].load(Ordering::Acquire),
@@ -4176,9 +4258,14 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // arrival (threads still zero), successfully re-tagged the domain
     // Native -- and then watched its own probe run native and call the
     // check a failure. Ordering by observed effect, not by issue order.
+    //
+    // Waiting for **all eight**, not the first three: the probe's own exit
+    // is its last call, so a test that stopped waiting earlier would destroy
+    // the domain in the middle of the smuggle sequence and read a report
+    // half written. This said `+ 3` while the probe made three calls.
     let mut spoke = false;
     for _ in 0..400 {
-        if syscall::FOREIGN_CALLS.load(Ordering::Relaxed) >= calls_before + 3 {
+        if syscall::FOREIGN_CALLS.load(Ordering::Relaxed) >= calls_before + 8 {
             spoke = true;
             break;
         }
@@ -4220,6 +4307,10 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    personality    FAILED: the domain outlived its destruction\x1b[0m");
         return false;
     }
+    // The domain being gone is not its thread being gone -- see
+    // `retire_probe`. This probe's own `exit` should already have ended it,
+    // and the wait costs nothing when it has.
+    wait_for_probe_threads(realm);
 
     // The three answers, through the direct map. Linux's -ENOSYS is -38.
     // SAFETY: the report frame belonged to the probe's space; the space is
@@ -4232,6 +4323,20 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
             core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
         ]
     };
+    // And the smuggle's six words: five answers, then the survival mark.
+    // SAFETY: as above -- the same frame, read before anything reuses it.
+    let smuggled = unsafe {
+        [
+            core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
+            core::ptr::read_volatile((hhdm_base + report_pa + 32) as *const u64),
+            core::ptr::read_volatile((hhdm_base + report_pa + 40) as *const u64),
+            core::ptr::read_volatile((hhdm_base + report_pa + 48) as *const u64),
+            core::ptr::read_volatile((hhdm_base + report_pa + 56) as *const u64),
+        ]
+    };
+    // SAFETY: as above.
+    let survived =
+        unsafe { core::ptr::read_volatile((hhdm_base + report_pa + 64) as *const u64) } == 1;
     // What each of the probe's three calls now means, and the assertion has
     // been rewritten twice as the personality implemented them -- which is
     // the drift a self-test should catch in its own project rather than in
@@ -4244,31 +4349,49 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let ebadf = -9i64 as u64;
     let all_refused = answers[0] != 0 && answers[1] == ebadf && answers[2] == 0;
 
+    // **RFC 0031 §6's Test 1, in the arm this probe can already fund.** The
+    // five numbers the probe smuggled are RFC 0008's own syscall kinds. If
+    // the entry path ever read a Linux domain's `rax` as a `Kind`, a hosted
+    // program would reach the capability interface by arithmetic alone --
+    // which is why the dialects must not overlap, and why an assertion is
+    // worth more here than a comment. Each answer must be `-ENOSYS`, a
+    // number no native status can be, and the probe must **still be alive**:
+    // read natively, 5 is `Exit` and this thread would have ended at it.
+    let enosys = -38i64 as u64;
+    let no_smuggling = smuggled.iter().all(|answer| *answer == enosys) && survived;
+
     let logged = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - calls_before;
     let numbers = [
         syscall::FOREIGN_SEEN[0].load(Ordering::Relaxed),
         syscall::FOREIGN_SEEN[1].load(Ordering::Relaxed),
         syscall::FOREIGN_SEEN[2].load(Ordering::Relaxed),
+        syscall::FOREIGN_SEEN[3].load(Ordering::Relaxed),
+        syscall::FOREIGN_SEEN[4].load(Ordering::Relaxed),
+        syscall::FOREIGN_SEEN[5].load(Ordering::Relaxed),
+        syscall::FOREIGN_SEEN[6].load(Ordering::Relaxed),
+        syscall::FOREIGN_SEEN[7].load(Ordering::Relaxed),
     ];
-    let sequence_right = numbers == [39, 1, 60];
+    let sequence_right = numbers == [39, 1, 0, 2, 3, 4, 5, 60];
 
     // The tag must not survive the domain: the bitmask is keyed by slot and
     // a reused slot must never inherit a dialect.
     let bit_cleared =
         domain::LINUX_DOMAINS.load(Ordering::Relaxed) & (1 << (realm.as_u32() % 32)) == 0;
 
-    if all_refused && logged == 3 && sequence_right && refused_late && bit_cleared {
+    if all_refused && no_smuggling && logged == 8 && sequence_right && refused_late && bit_cleared {
         println!(
             "    personality    a Linux-tagged domain asked getpid, write and exit: the pid \
-             answered, the bad descriptor refused EBADF, and exit never came back; 3 foreign \
-             calls logged with their numbers, the tag refused once a thread existed, and \
-             cleared when the domain ended"
+             answered, the bad descriptor refused EBADF, and exit never came back; it then \
+             asked for all five of this kernel's own syscall kinds by number and got -ENOSYS \
+             five times, surviving the one that is Exit natively; 8 foreign calls logged in \
+             order, the tag refused once a thread existed, and cleared when the domain ended"
         );
         true
     } else {
         println!(
-            "\x1b[91m    personality    FAILED: answers {:#x} {:#x} {:#x}, logged {logged}, \
-             numbers {numbers:?}, late-refusal {refused_late}, bit-cleared {bit_cleared}\x1b[0m",
+            "\x1b[91m    personality    FAILED: answers {:#x} {:#x} {:#x}, smuggled \
+             {smuggled:x?} survived {survived}, logged {logged}, numbers {numbers:?}, \
+             late-refusal {refused_late}, bit-cleared {bit_cleared}\x1b[0m",
             answers[0], answers[1], answers[2]
         );
         false

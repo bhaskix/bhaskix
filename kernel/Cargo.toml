@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1491
+unsafe_budget = 1502
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -374,6 +374,16 @@ unsafe_budget = 1491
 # same argument: `elf::parse` refuses an entry point outside a user-executable
 # segment, every segment it accepted was mapped, and the stack address is one
 # past user-writable memory in the space just installed.
+#
+# 1502 at RFC 0031's first security-test arm, 2026-08-19. Ten lines, all of
+# them volatile reads of one report frame through the direct map, in
+# `personality_self_test`: the five answers a hosted program got when it asked
+# for this kernel's own syscall kinds by number, and the word it wrote to say
+# it was still alive after the one that is `Exit` natively. They carry the
+# same `SAFETY:` argument as the three reads directly above them, which is the
+# argument for reading any of this probe's report: the frame belonged to the
+# probe's space, it is read before anything reuses it, and a load through the
+# direct map of a frame this kernel allocated cannot fault.
 
 [features]
 # Lets a *host* binary link this crate without inheriting the kernel's global

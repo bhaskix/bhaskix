@@ -683,6 +683,58 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Changes the protection of the region containing `start` — Linux's
+    /// `mprotect`, RFC 0005 step 8's first call.
+    ///
+    /// **Whole regions only, and the narrowness is deliberate.** Splitting a
+    /// live range in three because a caller re-protected its middle is a
+    /// different piece of work with its own failure modes, and a hosted
+    /// program that asks for it gets a refusal it can see rather than a
+    /// silently wider or narrower permission than it requested. What this
+    /// does cover is the pattern the Go runtime actually uses and this
+    /// kernel refused until now: reserve a range `PROT_NONE`, then make the
+    /// whole of it readable and writable.
+    ///
+    /// The page table is updated for every page the region already has —
+    /// lazily-backed pages have none, and the fault handler will use the
+    /// region's new protection when it services them.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Region`] if no region starts at `start`, or if the range
+    /// asked for is not exactly that region's own.
+    pub fn protect(
+        &mut self,
+        start: VirtAddr,
+        pages: u64,
+        protection: Protection,
+    ) -> Result<(), VmError> {
+        let region = *self
+            .regions
+            .find(start)
+            .ok_or(VmError::Region(RangeMapError::NotFound))?;
+        if region.range.start != start || region.range.pages() != pages {
+            return Err(VmError::Region(RangeMapError::NotFound));
+        }
+
+        let root = self.root;
+        let hhdm = self.hhdm_base;
+        for page in region.range.pages_iter() {
+            let flags = Self::entry_flags(protection, page.as_u64());
+            // SAFETY: `root` is this space's PML4, and a page the region
+            // covers. A page with no mapping yet is left alone by
+            // `protect_page`, which is right: the fault handler will use
+            // the region's protection when it services it.
+            let _ = unsafe { paging::protect_page(root, page.as_u64(), flags, hhdm) };
+        }
+
+        self.regions.remove(region.range.start)?;
+        let mut updated = region;
+        updated.protection = protection;
+        self.regions.insert(updated)?;
+        Ok(())
+    }
+
     /// Marks an already-mapped range copy-on-write.
     ///
     /// Drops write permission in the page table while leaving the region's

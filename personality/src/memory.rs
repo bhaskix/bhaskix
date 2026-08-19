@@ -57,12 +57,19 @@ pub mod errno {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MapPlan {
     /// Map `pages` pages at this address with this protection. The address
-    /// is either the caller's demand (`MAP_FIXED`) or one the personality
-    /// picks; `fixed` says which, because "somewhere" and "exactly here" are
-    /// different promises and only one of them can fail with `EEXIST` later.
+    /// is either the caller's demand (`MAP_FIXED`), its *hint* (a non-zero
+    /// address without that flag), or one the personality picks.
+    ///
+    /// **A hint is not decoration.** Go's allocator asks for its heap near
+    /// specific addresses and, if the mapping lands elsewhere, hands it back
+    /// and tries the next hint — after enough of those it gives up with
+    /// "runtime: cannot allocate memory", which is precisely what this
+    /// personality earned by ignoring them.
     Map {
         /// Where, if the caller demanded a place.
         at: Option<u64>,
+        /// Where the caller would prefer, if it said.
+        hint: Option<u64>,
         /// How many pages.
         pages: u64,
         /// Readable.
@@ -124,6 +131,7 @@ pub fn plan_mmap(addr: u64, length: u64, protection: u64, flags: u64, fd: i64) -
     }
     MapPlan::Map {
         at: fixed.then_some(addr),
+        hint: (!fixed && addr != 0 && addr.is_multiple_of(PAGE)).then_some(addr),
         pages,
         read: protection & prot::READ != 0,
         write,
@@ -138,6 +146,33 @@ pub fn plan_munmap(addr: u64, length: u64) -> Result<(u64, u64), i64> {
     }
     let pages = pages_for(length).ok_or(errno::EINVAL)?;
     Ok((addr, pages))
+}
+
+/// What an `mprotect(addr, length, prot)` means: the range, and what it
+/// should become — or a refusal.
+///
+/// The `W^X` rule applies exactly as it does to `mmap`, and for the same
+/// reason: the region map cannot represent writable-and-executable, so
+/// asking for both is refused rather than silently granted one of them.
+///
+/// # Errors
+///
+/// A Linux `errno`.
+pub fn plan_mprotect(
+    addr: u64,
+    length: u64,
+    protection: u64,
+) -> Result<(u64, u64, bool, bool, bool), i64> {
+    if !addr.is_multiple_of(PAGE) || length == 0 {
+        return Err(errno::EINVAL);
+    }
+    let pages = pages_for(length).ok_or(errno::ENOMEM)?;
+    let write = protection & prot::WRITE != 0;
+    let execute = protection & prot::EXEC != 0;
+    if write && execute {
+        return Err(errno::EACCES);
+    }
+    Ok((addr, pages, protection & prot::READ != 0, write, execute))
 }
 
 /// `madvise` is advice, and this kernel takes none of it — every hint Go
@@ -163,6 +198,7 @@ mod tests {
             plan,
             MapPlan::Map {
                 at: None,
+                hint: None,
                 pages: 2,
                 read: true,
                 write: true,
@@ -243,12 +279,37 @@ mod tests {
             plan_mmap(0x2000, 4096, prot::READ, ANON_PRIVATE | flags::FIXED, -1),
             MapPlan::Map {
                 at: Some(0x2000),
+                hint: None,
                 pages: 1,
                 read: true,
                 write: false,
                 execute: false,
             }
         );
+    }
+
+    #[test]
+    fn a_hint_is_carried_because_go_hands_back_mappings_that_ignore_it() {
+        // Not MAP_FIXED, but not nothing either: the caller said where it
+        // would like the memory, and a personality that ignores that gets
+        // its mappings returned one at a time until the runtime gives up.
+        assert_eq!(
+            plan_mmap(0x00c0_0000_0000, 4096, prot::READ, ANON_PRIVATE, -1),
+            MapPlan::Map {
+                at: None,
+                hint: Some(0x00c0_0000_0000),
+                pages: 1,
+                read: true,
+                write: false,
+                execute: false,
+            }
+        );
+        // An unaligned hint is not one: it cannot be honoured, so it is
+        // dropped rather than rounded behind the caller's back.
+        assert!(matches!(
+            plan_mmap(0x00c0_0000_0001, 4096, prot::READ, ANON_PRIVATE, -1),
+            MapPlan::Map { hint: None, .. }
+        ));
     }
 
     #[test]
@@ -267,6 +328,27 @@ mod tests {
         assert_eq!(plan_munmap(0x2000, 8192), Ok((0x2000, 2)));
         assert_eq!(plan_munmap(0x2001, 4096), Err(errno::EINVAL), "unaligned");
         assert_eq!(plan_munmap(0x2000, 0), Err(errno::EINVAL), "empty");
+    }
+
+    #[test]
+    fn mprotect_is_planned_and_holds_the_same_w_xor_x_rule() {
+        assert_eq!(
+            plan_mprotect(0x2000, 8192, prot::READ | prot::WRITE),
+            Ok((0x2000, 2, true, true, false))
+        );
+        // The Go pattern this exists for: a PROT_NONE reservation made
+        // readable and writable.
+        assert_eq!(
+            plan_mprotect(0x4000, 4096, prot::READ | prot::WRITE),
+            Ok((0x4000, 1, true, true, false))
+        );
+        assert_eq!(plan_mprotect(0x2001, 4096, prot::READ), Err(errno::EINVAL));
+        assert_eq!(plan_mprotect(0x2000, 0, prot::READ), Err(errno::EINVAL));
+        assert_eq!(
+            plan_mprotect(0x2000, 4096, prot::READ | prot::WRITE | prot::EXEC),
+            Err(errno::EACCES),
+            "W^X is refused here as it is at mmap"
+        );
     }
 
     #[test]

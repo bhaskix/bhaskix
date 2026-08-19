@@ -915,10 +915,24 @@ pub fn create_under(
         }
     }
 
+    // A free slot is one with no live domain, no corpse waiting to be reaped,
+    // **and no thread of its previous incarnation still running**. The third
+    // condition is the one that is easy to miss and expensive to have missed:
+    // see `sched::threads_counted_in`. Refusing here costs a domain creation
+    // that could have waited a tick; not refusing cost an innocent domain its
+    // authority, intermittently, in a different self-test each time.
+    // Keyed by the slot's *position*, not by `Domain::id`: a slot that has
+    // never been used carries the `empty()` id of zero, so asking the domain
+    // would ask about slot 0 thirty-two times over.
     let index = table
         .domains
         .iter()
-        .position(|domain| !domain.live && domain.ended.is_none())
+        .enumerate()
+        .position(|(slot, domain)| {
+            !domain.live
+                && domain.ended.is_none()
+                && crate::sched::threads_counted_in(slot as u32) == 0
+        })
         .ok_or(DomainError::TooManyDomains)?;
 
     // The high-water mark of *occupied* slots, which is not the same as live

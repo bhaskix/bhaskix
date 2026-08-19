@@ -1301,8 +1301,19 @@ fi
 # number -- the tag is refused once a thread exists, and it dies with the
 # domain. The self-test asserts the exact sequence its probe issued; this
 # gate asserts the self-test ran and concluded.
-if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit: the pid answered, the bad descriptor refused EBADF, and exit never came back; [1-9] foreign calls logged" "$LOG"; then
-    pass "a Linux-tagged domain is refused in Linux's own dialect, and logged"
+#
+# RFC 0031 §6's Test 1, in the arm this probe funds: the same program asks
+# for all five of this kernel's own syscall kinds *by number* -- 0 Invoke,
+# 2 Reply, 3 Recv, 4 Yield, 5 Exit, each also an ordinary Linux call this
+# personality does not answer -- and is refused five times. The survival
+# clause is the load-bearing half and is demanded here rather than left to
+# the self-test's own arithmetic: read in the native dialect, 5 is Exit and
+# the probe would not have lived to report anything after it. A hosted
+# program holds no capabilities and cannot name one, so a number read in the
+# wrong dialect is the only route it could ever have had to the capability
+# interface.
+if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit: the pid answered, the bad descriptor refused EBADF, and exit never came back; it then asked for all five of this kernel's own syscall kinds by number and got -ENOSYS five times, surviving the one that is Exit natively; [1-9] foreign calls logged in order" "$LOG"; then
+    pass "a Linux program is refused in Linux's dialect, and cannot reach the native one by number"
 else
     fail "the personality self-test did not conclude"
     status=1

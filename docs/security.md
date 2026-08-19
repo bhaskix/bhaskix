@@ -24,6 +24,7 @@ we do **not** defend against. A threat model that claims to cover everything cov
 | T8 | Undetected compromise | Tamper-evident audit log; remote attestation; the telemetry plane is the audit source |
 | T9 | Memory-safety bugs in kernel code | Rust; `unsafe` budget tracked per crate; every `unsafe` block justified and reviewed |
 | T10 | Resource exhaustion by one domain denying service to others | `ResourceEnvelope` enforced at allocation and scheduling time, not by best effort |
+| T11 | A hostile or compromised **Linux application inside a compatibility domain**, attacking through malformed system-call arguments or through Linux privilege (`root`) | The Linux personality translates and never manufactures authority; a hosted process holds no capabilities and has no way to name one; a compatibility domain reaches only what it was granted ([RFC 0005](rfc/0005-linux-abi-compatibility.md), [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md)) |
 
 ### Out of scope — stated honestly
 
@@ -66,6 +67,28 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > This note said it would come out when the code landed. It is kept, rewritten, because the useful
 > version is not "delivered" but *under what conditions* — **a mitigation column is a claim, and a
 > claim whose limits are not written down is believed further than it should be.**
+
+> **T11 is in scope and is not mitigated today, and the difference matters more than the row.**
+> [RFC 0005](rfc/0005-linux-abi-compatibility.md) §"Where it lives" requires the Linux personality
+> to run in a **service domain**, precisely so that a bug in the largest untrusted-input parser in
+> the project is a compromise of that domain and not of the kernel. As of 2026-08-19 the
+> implementation is in the nucleus: `kernel/src/syscall.rs` holds the foreign-call path and the
+> Linux call numbers, and `kernel/src/signal.rs` builds and restores Linux signal frames — on the
+> order of 700 lines of Linux ABI in ring 0. Only the decision logic is outside it (`personality/`,
+> zero `unsafe`, host-tested).
+>
+> **So the honest mitigation column for T11, today, is the first half of it and not the second.** A
+> hosted process still holds no capabilities and cannot name one, and its domain still reaches only
+> what it was granted — those are structural and hold. What does *not* hold is the containment of a
+> bug **in the translator**: today that is a kernel bug. [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md)
+> §5 records how this happened, and fixes the correction's trigger — before Tier 1's file surface,
+> because that is when the adapter starts holding per-process state and moving it gets dear.
+>
+> Written here rather than only in the RFC because [RFC 0005](rfc/0005-linux-abi-compatibility.md)'s
+> own impact table asked for this row on the day it was drafted — *"The threat model gains an
+> in-scope adversary: a hostile process inside a Linux-personality domain… This is new and must be
+> written down, not assumed covered"* — and it was not written until now, while five of that RFC's
+> steps shipped.
 
 **If you find that a mitigation listed as "in scope" does not actually work, that is a security bug
 and we want the report.** See §9.
@@ -256,6 +279,25 @@ target before it gets merged, not after.
 wrong one: it puts the cost on the freeing path (often latency-sensitive teardown) and it can be
 skipped by a crash. Zero-on-allocation cannot be skipped, because the receiving domain's correctness
 depends on it. A frame never reaches a domain carrying another domain's data.
+
+### A Linux compatibility domain is a domain, and nothing in this table changes for it
+
+Every boundary above applies to a hosted Linux workload unchanged, and it is worth saying why
+rather than assuming a reader will infer it. **Linux privilege does not appear in this table**,
+because there is nothing for it to appear as: authority here is a capability a domain holds, and
+`root` inside a compatibility domain is a number in that domain's own process table. It buys the
+files, ports and processes the domain was already granted, and nothing else, because there is no
+mechanism by which being UID 0 could add a capability.
+
+```text
+Linux UID 0                   ≠  Bhaskix unrestricted authority
+Linux application compromise  ≠  Bhaskix system compromise
+```
+
+Both lines are properties a test may attempt to violate rather than assurances — see
+[RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md) §6, which specifies four of them.
+**Two of the four are largely funded by gates that already run** (driver containment and
+capability revocation); the Linux-facing two are not written yet, and the row above says so.
 
 ---
 
