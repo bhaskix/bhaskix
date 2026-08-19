@@ -299,7 +299,11 @@ workspace = true
 # 3 entry, and its marker-plus-seven report words read as one block -- plus
 # the one fault-protected read of a futex word. The futex table itself needs none: the queues live outside the lock,
 # each carrying its own.
-unsafe_budget = 1424
+#
+# 1450 at the clone half of RFC 0005 step 6 (2026-08-19): the two-thread
+# witness -- page fills, ring 3 entry, marker-plus-five report words -- and
+# `cloned_thread`'s own entry into ring 3 at an address its caller chose.
+unsafe_budget = 1453
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

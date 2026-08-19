@@ -403,6 +403,11 @@ pub struct Domain {
     /// a thread entry point takes one word and this needs three, and a domain
     /// is the identity both sides already agree on.
     pending_start: Option<(crate::shared::MemoryId, usize, u64)>,
+    /// A Linux `clone`'s parameters, waiting for the thread it creates —
+    /// RFC 0005 step 6's missing half. `(entry, stack, tls)`, all three the
+    /// caller's own: the personality creates a thread in the domain the
+    /// caller already has, running code the caller already mapped.
+    pending_clone: Option<(u64, u64, u64)>,
     /// What it may touch.
     pub cspace: CSpace,
     /// What it may consume.
@@ -443,6 +448,7 @@ impl Domain {
             ended: None,
             notify: None,
             pending_start: None,
+            pending_clone: None,
             cspace: CSpace::new(),
             envelope: ResourceEnvelope::new(),
             charged_frames: 0,
@@ -645,6 +651,37 @@ impl core::fmt::Debug for Name {
 /// Which CPU the next started program is pinned to.
 static NEXT_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Parks a `clone`'s parameters for the thread about to be spawned.
+///
+/// Refused if one is already waiting: two clones racing for one slot would
+/// have a thread start on the other's stack, which is the corruption this
+/// whole step exists to avoid.
+///
+/// # Errors
+///
+/// [`DomainError::NoSuchDomain`], or [`DomainError::HasThreads`] when a
+/// clone is already pending — the nearest existing variant for "not now".
+pub fn record_pending_clone(
+    id: DomainId,
+    entry: u64,
+    stack: u64,
+    tls: u64,
+) -> Result<(), DomainError> {
+    with(id, |domain| {
+        if domain.pending_clone.is_some() {
+            return Err(DomainError::HasThreads);
+        }
+        domain.pending_clone = Some((entry, stack, tls));
+        Ok(())
+    })
+    .unwrap_or(Err(DomainError::NoSuchDomain))
+}
+
+/// Takes the parked `clone` parameters, if any.
+pub fn take_pending_clone(id: DomainId) -> Option<(u64, u64, u64)> {
+    with(id, |domain| domain.pending_clone.take()).flatten()
+}
+
 /// Records the image a domain is about to be started with.
 ///
 /// Kept in the domain itself, under the table lock that already exists, rather
@@ -795,6 +832,14 @@ pub fn root_capability(id: DomainId) -> Option<SlotRef> {
     with(id, |domain| domain.root).flatten()
 }
 
+/// The page-table root a domain's program runs in, or `None` before one is
+/// installed. RFC 0005 step 6's clone needs it: a new thread of a running
+/// domain does not build a space, it *adopts* the one its siblings are in.
+#[must_use]
+pub fn space_root_of(id: DomainId) -> Option<u64> {
+    with(id, |domain| domain.space_root).filter(|root| *root != 0)
+}
+
 /// Records the page table a domain's program runs in, so [`end`] can give the
 /// address-space slot back.
 ///
@@ -919,6 +964,7 @@ pub fn create_under(
         ended: None,
         notify: None,
         pending_start: None,
+        pending_clone: None,
         cspace: CSpace::new(),
         envelope,
         charged_frames: 0,

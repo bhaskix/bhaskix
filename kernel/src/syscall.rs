@@ -1873,17 +1873,50 @@ fn foreign_thread_call(frame: &mut SyscallFrame, domain: u32) -> Option<u64> {
                 };
                 return Some(errno as u64);
             };
-            let _ = (tls, parent_tid, child_tid);
-            // Threading a hosted program's new thread through `enter_ring3`
-            // needs an entry that returns to *user* mode at an address the
-            // caller chose, which the scheduler's spawn path does not offer
-            // for an already-running domain. Refused with `ENOSYS` rather
-            // than half-created: a `clone` that returns a tid for a thread
-            // that never runs is the deadlock this step exists to avoid.
-            // The stack is validated first so the refusal is about the one
-            // missing mechanism and not about the arguments.
-            let _ = stack;
-            Some(errno::ENOSYS as u64)
+            // Linux's `clone` returns in *both* threads: zero in the child,
+            // the child's tid in the parent. The child never returns through
+            // this path at all -- it starts at the entry the caller named,
+            // with the caller's own stack -- so the zero is delivered by
+            // construction rather than by writing a register: there is no
+            // return for it to be written to.
+            //
+            // The entry is `rip`'s successor in the caller's code, which for
+            // Go is the function it wants the thread to run: the runtime
+            // puts it in the child's stack and jumps there. This
+            // personality's contract is narrower and stated: the thread
+            // starts at the address in `arg3` (Linux's fifth argument slot
+            // is `tls`, and the sixth, `r9`, is where a caller with no
+            // libc puts the entry). A hosted runtime that expects Linux's
+            // "resume after the syscall" shape needs the register-file copy
+            // this does not yet do -- written down, not pretended.
+            let entry = frame.arg3;
+            if entry == 0 {
+                return Some(errno::ENOSYS as u64);
+            }
+            let _ = (parent_tid, child_tid);
+            crate::domain::record_pending_clone(
+                crate::domain::DomainId::from_u32(domain),
+                entry,
+                stack,
+                tls.unwrap_or(0),
+            )
+            .ok()?;
+            let cpu = crate::domain::next_start_cpu();
+            let options = crate::sched::SpawnOptions::new().pinned().in_domain(domain);
+            match crate::sched::spawn_on_with(
+                cpu,
+                "cloned",
+                crate::cloned_thread,
+                u64::from(domain),
+                crate::shared::hhdm(),
+                options,
+            ) {
+                Ok(id) => Some(u64::from(id) + 1),
+                Err(_) => {
+                    crate::domain::take_pending_clone(crate::domain::DomainId::from_u32(domain));
+                    Some(-11i64 as u64)
+                }
+            }
         }
         linux::FUTEX => {
             match thread::plan_futex(first, second, third) {

@@ -275,8 +275,29 @@ note at the one moment a thread becomes a user thread.** The rule for whoever ex
 this: the dialect is a property of the thread, and a per-CPU cache of it is only safe if
 something writes it where the property is established.
 
-**What does not, and why it is stated rather than approximated.** `clone` is **refused with
-`ENOSYS`**. The flag decoding is complete and host-tested (Go's exact set is recognised, a
+**`clone` landed the same day it was refused, and the refusal's paragraph is kept below
+because the reasoning was right and the conclusion was temporary.** A `clone` now parks
+`(entry, stack, tls)` on the domain and spawns a thread that adopts the domain's *existing*
+address space and enters ring 3 at the caller's address on the caller's stack — the
+personality creating a thread in a domain the caller already holds, running code the caller
+already mapped, conjuring nothing. The witness is two threads of one hosted program meeting
+through a futex: the parent sleeps, the child sets a word and wakes exactly one, and the
+parent comes back. That is the pairing one thread could never prove.
+
+Four defects on the way, each of which named itself: the cloned thread had **no address
+space** (`expects space 0x0`, a user fetch at its entry) until it adopted its domain's root;
+the child had no way to reach shared memory until the `tls` argument was delivered to it in
+`rdi` — **a stated convention**, since no TLS base install exists, whose trigger is the
+first runtime that reads `fs:` before making a call; the per-CPU domain note was skipped
+whenever the *outgoing* thread's slot was already empty, so a thread following an exited
+one on the same CPU was judged by its predecessor's dialect (the memory probe caught it,
+answered `BadSyscall`); and the probe's own flag constant omitted three shares, which the
+decoder refused exactly as designed. What remains stated: `clone` returns zero in the child
+by construction rather than by writing a register, because the child never returns through
+the syscall path at all — a runtime expecting Linux's resume-after-the-syscall shape needs a
+register-file copy this does not do.
+
+**The original refusal, kept for its reasoning.** `clone` was **refused with `ENOSYS`**. The flag decoding is complete and host-tested (Go's exact set is recognised, a
 partial share is refused rather than approximated, `CLONE_NEWPID` is refused because a
 Linux process maps onto a domain and creating one is `START`'s business), but the mechanism
 to *enter ring 3 at a caller-chosen address on a caller-supplied stack, in an

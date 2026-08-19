@@ -2411,11 +2411,20 @@ pub fn preempt() {
         // cost lengthens a lock hold the contention map can see, not the
         // one window the save/restore disease lives in. Emit takes no lock,
         // so holding one over it is sound.
+        // The note is about the thread being switched *to*, so it is taken
+        // before the pair below and not inside it: a switch whose outgoing
+        // slot is already empty -- the previous thread exited -- still
+        // changes which domain runs here, and skipping the note there left
+        // the next thread's system calls judged by its predecessor's
+        // dialect. RFC 0005 step 6 found that the hard way.
+        if let Some(to_thread) = queue.threads[next].as_ref() {
+            crate::telemetry::note_domain(to_thread.domain);
+        }
         if let (Some(from_thread), Some(to_thread)) = (
             queue.threads[current].as_ref(),
             queue.threads[next].as_ref(),
         ) {
-            crate::telemetry::note_domain(to_thread.domain);
+            let _ = to_thread;
             let mut handover = [0u8; 8];
             handover[..4].copy_from_slice(&from_thread.id.to_le_bytes());
             handover[4..].copy_from_slice(&to_thread.id.to_le_bytes());
@@ -2988,11 +2997,16 @@ pub fn block_self() {
                 // RFC 0026's dispatch event, under the lock for the same
                 // reason as on preempt's path: the cost lands in a lock
                 // hold, not in the registers-unsaved window.
+                // As above: the note is about the incoming thread and is
+                // taken whether or not the outgoing slot still holds one.
+                if let Some(to_thread) = queue.threads[next].as_ref() {
+                    crate::telemetry::note_domain(to_thread.domain);
+                }
                 if let (Some(from_thread), Some(to_thread)) = (
                     queue.threads[current].as_ref(),
                     queue.threads[next].as_ref(),
                 ) {
-                    crate::telemetry::note_domain(to_thread.domain);
+                    let _ = to_thread;
                     let mut handover = [0u8; 8];
                     handover[..4].copy_from_slice(&from_thread.id.to_le_bytes());
                     handover[4..].copy_from_slice(&to_thread.id.to_le_bytes());

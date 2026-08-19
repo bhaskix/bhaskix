@@ -1235,6 +1235,18 @@ fi
 # The numbers are recorded, not gated -- a slow host is not a broken kernel --
 # but a networked boot that produced none measured nothing, and that is a
 # failure of the instrument.
+# RFC 0005 step 6, the clone half: two threads of one hosted program, meeting
+# through a futex. This is the gate that could not exist while clone was
+# refused -- one thread cannot prove that a wait blocks and a wake releases
+# it, and the RFC is explicit that a subtly wrong futex produces a deadlock
+# under load rather than an error.
+if grep -qE "linux clone +a Linux program cloned a thread \(tid [1-9][0-9]*, which the child agrees is its own\), then the two met through a futex: the parent slept, the child set the word to 42 and woke 1" "$LOG"; then
+    pass "clone makes a real thread, and the futex pairs a sleeper with a waker"
+else
+    fail "the Linux clone self-test did not conclude"
+    status=1
+fi
+
 # RFC 0005 step 6: the futex contract's edges, which is where the RFC says a
 # subtle mistake does not produce an error but a deadlock under load. A WAIT
 # whose word has already changed must refuse to sleep; a WAKE with nobody

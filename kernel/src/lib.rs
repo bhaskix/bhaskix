@@ -544,6 +544,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux futex    FAILED\x1b[0m");
     }
+    if !clone_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux clone    FAILED\x1b[0m");
+    }
     frames_report();
     tickless_report();
     // Late on purpose: by here the self-tests above have poured real
@@ -2173,6 +2179,59 @@ const STARTED_STACK_PAGES: u64 = 4;
 /// name any size could ask the kernel to allocate until it stopped.
 const STARTED_IMAGE_MAX: usize = 256 * 1024;
 
+/// The kernel side of a Linux `clone`: a new thread of an existing domain,
+/// entering ring 3 at the address its creator chose, on the stack its
+/// creator supplied.
+///
+/// RFC 0005 step 6's missing half. Everything this needs already existed —
+/// the domain, its address space, its capabilities — which is the point:
+/// the personality creates a thread in a domain the caller already holds,
+/// running code the caller already mapped. It conjures nothing.
+///
+/// The address space is **not** installed here: this thread belongs to a
+/// domain whose space is already live, and the scheduler switches to it the
+/// same way it does for every other thread of that domain.
+pub extern "C" fn cloned_thread(domain: u64) -> ! {
+    let id = domain::DomainId::from_u32(domain as u32);
+    let Some((entry, stack, tls)) = domain::take_pending_clone(id) else {
+        sched::exit()
+    };
+    // **The child's one argument.** Linux installs `tls` as a segment base
+    // and the child finds its arguments on the stack its creator prepared;
+    // this personality has no TLS install yet, so the value is delivered in
+    // `rdi` instead -- a stated convention, not an accident, and the trigger
+    // for changing it is the first hosted runtime that reads `fs:` before it
+    // has made a system call. Documented in RFC 0005 step 6's record.
+    let argument = tls;
+    // **The space this thread runs in is its domain's, already live.** A
+    // cloned thread builds nothing: its siblings are running in a page
+    // table the domain recorded when its program started, and this thread
+    // adopts it. Without this the thread is scheduled with no space of its
+    // own, runs on the kernel's table, and faults on its first instruction
+    // -- which is exactly what the first boot of this path did, reporting
+    // `expects space 0x0` next to a user-mode fetch at the caller's entry.
+    let Some(root) = domain::space_root_of(id) else {
+        sched::exit()
+    };
+    if let Some(thread) = sched::current_thread_id() {
+        sched::set_space_root(thread, root);
+    }
+    // SAFETY: the root a sibling of this thread is already running in, and
+    // the higher half of every space in this system is the kernel's own --
+    // the same promise `enter_space` makes on every switch into a thread
+    // that has one. Loaded here rather than left to the next switch because
+    // this thread enters ring 3 without going through one.
+    unsafe { bhaskix_arch::paging::switch_address_space(root) };
+    // The note, as every direct entry into ring 3 must: this thread speaks
+    // Linux because its domain does, and the syscall entry reads it.
+    telemetry::note_domain(domain as u32);
+    // SAFETY: `entry` and `stack` are the *caller's own* addresses in the
+    // caller's own space -- a hosted program pointing at memory it does not
+    // hold gets a fault in ring 3, which ends the thread, exactly as a
+    // native program's bad jump does. Nothing here dereferences either.
+    unsafe { bhaskix_arch::syscall::enter_ring3(entry, stack, [argument, 0]) }
+}
+
 /// Loads and runs the program a `START` left waiting for this domain.
 ///
 /// Runs as the domain's first thread rather than inside the system call, and
@@ -2710,6 +2769,224 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// Where the foreigner's report page lands physically, told by the thread
 /// that mapped it so the test can read the answers through the direct map.
 static FOREIGNER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the clone probe's report page lands physically.
+static CLONE_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the clone probe's code, stack and shared page live.
+const CLONE_CODE_AT: u64 = 0x0000_0000_6000_0000;
+const CLONE_STACK_AT: u64 = 0x0000_0000_6001_0000;
+const CLONE_REPORT_AT: u64 = 0x0000_0000_6002_0000;
+
+/// The clone probe: **two threads of one hosted program**, rendezvousing
+/// through a futex. The parent clones a child with Go's own flag set, then
+/// sleeps on a futex word; the child records its own tid, sets the word, and
+/// wakes it. Nothing about this works unless `clone` creates a real thread
+/// in the same address space *and* the futex wait/wake pair actually
+/// blocks and releases — which is the half step 6 could not prove with one
+/// thread, and the half Go's scheduler lives on.
+const CLONE_CODE: [u8; 183] = [
+    0x49, 0x89, 0xff, // mov r15, rdi          ; report page (shared, both threads)
+    0x4c, 0x89, 0xfe, // mov rsi, r15
+    0x48, 0x81, 0xc6, 0x00, 0x08, 0x00, 0x00, // add rsi, 0x800        ; child stack top
+    0xbf, 0x00, 0x0f, 0x0d, 0x00, // mov edi, 0xd0f00      ; ...|SETTLS, which is
+    //                                   what carries the child's one argument
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // (padding: the six bytes the first
+    //                                     version wasted on an `add edi, 0`
+    //                                     after getting the constant wrong --
+    //                                     0xf0100 omitted FS, FILES and
+    //                                     SIGHAND, and the decoder refused it
+    //                                     exactly as it should have)
+    0x31, 0xd2, // xor edx, edx          ; parent_tid
+    0x4d, 0x31, 0xd2, // xor r10, r10          ; child_tid
+    0x4d, 0x89, 0xf8, // mov r8, r15           ; tls = the shared page, which
+    //                                   this personality hands the child in
+    //                                   rdi (see cloned_thread)
+    0x4c, 0x8d, 0x0d, 0x44, 0x00, 0x00, 0x00, // lea r9, [rip+child]   ; the entry
+    0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56           ; clone
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax      ; the tid the parent got
+    0x48, 0x85, 0xc0, // test rax, rax
+    0x78, 0x24, // js parent_done        ; refused: stop here
+    0x4c, 0x89, 0xff, // mov rdi, r15
+    0x48, 0x83, 0xc7, 0x40, // add rdi, 64           ; &word
+    0xbe, 0x80, 0x00, 0x00, 0x00, // mov esi, 128          ; WAIT|PRIVATE
+    0x31, 0xd2, // xor edx, edx          ; expect 0
+    0x4d, 0x31, 0xd2, // xor r10, r10
+    0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202          ; futex
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x10, // mov [r15+16], rax     ; the wait's answer
+    0x49, 0x8b, 0x47, 0x40, // mov rax, [r15+64]
+    0x49, 0x89, 0x47, 0x18, // mov [r15+24], rax     ; the word the child set
+    0x48, 0xb8, 0x45, 0x54, 0x55, 0x46, 0x58, 0x4b, 0x48, 0x42, // movabs rax, marker
+    0x49, 0x89, 0x47, 0x38, // mov [r15+56], rax     ; marker last
+    0xeb, 0xfe, // jmp $
+    0x49, 0x89, 0xff, // child: mov r15, rdi   ; the page, as handed over
+    // Let the parent reach its sleep first. Without this the child wins the
+    // race, the parent's WAIT sees a word that already changed and returns
+    // EAGAIN -- correct behaviour, and a test that never exercises the
+    // sleeping path. Yielding twice is enough on an emulated machine and
+    // costs nothing if it is not.
+    0xb8, 0x18, 0x00, 0x00, 0x00, // mov eax, 24           ; sched_yield
+    0x0f, 0x05, // syscall
+    0xb8, 0x18, 0x00, 0x00, 0x00, // mov eax, 24
+    0x0f, 0x05, // syscall
+    0xb9, 0x00, 0x00, 0x40, 0x00, // mov ecx, 0x400000     ; and a short spin
+    0x48, 0xff, 0xc9, // spin: dec rcx
+    0x75, 0xfb, // jnz spin
+    0xb8, 0xba, 0x00, 0x00, 0x00, // mov eax, 186          ; gettid
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x20, // mov [r15+32], rax     ; the child's own tid
+    0x49, 0xc7, 0x47, 0x40, 0x2a, 0x00, 0x00, 0x00, // mov qword [r15+64], 42
+    0x4c, 0x89, 0xff, // mov rdi, r15
+    0x48, 0x83, 0xc7, 0x40, // add rdi, 64
+    0xbe, 0x81, 0x00, 0x00, 0x00, // mov esi, 129          ; WAKE|PRIVATE
+    0xba, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+    0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x28, // mov [r15+40], rax     ; how many it woke
+    0xeb, 0xfe, // jmp $
+];
+
+/// The thread that becomes the clone probe's parent.
+extern "C" fn ring3_clone(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, pages, protection) in [
+        (CLONE_CODE_AT, 1, Protection::ReadExecute),
+        (CLONE_STACK_AT, 2, Protection::ReadWrite),
+        (CLONE_REPORT_AT, 1, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), pages) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let (Some(code_pa), Some(report_pa)) = (
+        space.translate(VirtAddr(CLONE_CODE_AT)),
+        space.translate(VirtAddr(CLONE_REPORT_AT)),
+    ) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the
+    // direct map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            CLONE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            CLONE_CODE.len(),
+        );
+    }
+    CLONE_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // The domain note, as every direct entry sets it.
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
+    // SAFETY: the entry is in the user-executable page just written.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            CLONE_CODE_AT,
+            CLONE_STACK_AT + 2 * 4096,
+            [CLONE_REPORT_AT, 0],
+        )
+    }
+}
+
+/// The witness that `clone` makes a thread and the futex pairs across it.
+fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux clone    skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("clone", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux clone    FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_none()
+    {
+        println!("\x1b[91m    linux clone    FAILED: the tag would not set\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "clone", ring3_clone, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux clone    FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+
+    const MARKER: u64 = u64::from_le_bytes(*b"ETUFXKHB");
+    let mut answers = [0u64; 5];
+    let mut marked = false;
+    for _ in 0..600 {
+        let report_pa = CLONE_REPORT_PA.load(Ordering::Acquire);
+        if report_pa != 0 {
+            // SAFETY: a frame the probe's space owns, through the direct map.
+            let (marker, words) = unsafe {
+                (
+                    core::ptr::read_volatile((hhdm_base + report_pa + 56) as *const u64),
+                    [
+                        core::ptr::read_volatile((hhdm_base + report_pa + 8) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 32) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 40) as *const u64),
+                    ],
+                )
+            };
+            if marker == MARKER {
+                answers = words;
+                marked = true;
+                break;
+            }
+        }
+        wait_millis(5);
+    }
+    domain::destroy(realm);
+    signal::forget(realm.as_u32());
+
+    // The parent's view of the tid, its wait's answer, the word the child
+    // set, the child's own tid, and how many the child's wake found.
+    let [parent_saw, wait_answer, word, child_tid, woke] = answers;
+    let right = marked
+        && parent_saw > 0
+        && child_tid > 0
+        && parent_saw == child_tid
+        && wait_answer == 0
+        && word == 42;
+    if right {
+        println!(
+            "    linux clone    a Linux program cloned a thread (tid {parent_saw}, which the \
+             child agrees is its own), then the two met through a futex: the parent slept, the \
+             child set the word to 42 and woke {woke}, and the parent came back"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux clone    FAILED: marked {}, parent saw {}, wait {}, word {}, \
+             child tid {}, woke {}\x1b[0m",
+            marked, parent_saw as i64, wait_answer as i64, word, child_tid as i64, woke as i64
+        );
+        false
+    }
+}
 
 /// Where the thread probe's report page lands physically.
 static THREAD_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
