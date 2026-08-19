@@ -1235,6 +1235,18 @@ fi
 # The numbers are recorded, not gated -- a slow host is not a broken kernel --
 # but a networked boot that produced none measured nothing, and that is a
 # failure of the instrument.
+# RFC 0005 step 2: the personality tag exists and refuses. A Linux-tagged
+# domain's every system call is foreign -- answered ENOSYS, logged with its
+# number -- the tag is refused once a thread exists, and it dies with the
+# domain. The self-test asserts the exact sequence its probe issued; this
+# gate asserts the self-test ran and concluded.
+if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit_group: each answered ENOSYS, [1-9] foreign calls logged" "$LOG"; then
+    pass "a Linux-tagged domain is refused in Linux's own dialect, and logged"
+else
+    fail "the personality self-test did not conclude"
+    status=1
+fi
+
 if grep -qE "tcp client +echoed outbound" "$LOG" && ! grep -qE "tcp measure +handshake [0-9]+ us" "$LOG"; then
     fail "the networked boot produced no TCP measurement"
     status=1

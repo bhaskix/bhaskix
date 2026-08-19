@@ -512,6 +512,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !capability_self_test() {
         println!("\x1b[91m    capabilities   FAILED\x1b[0m");
     }
+    if !personality_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    personality    FAILED\x1b[0m");
+    }
     frames_report();
     tickless_report();
     // Late on purpose: by here the self-tests above have poured real
@@ -2675,6 +2681,230 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// executes at and never uses as a stack, so a call that reports them cannot
 /// have come from anywhere else. Counting system calls alone would look
 /// identical to calling the dispatcher directly.
+/// Where the foreigner's report page lands physically, told by the thread
+/// that mapped it so the test can read the answers through the direct map.
+static FOREIGNER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The Linux-shaped probe, hand-assembled: `getpid`, `write` and
+/// `exit_group`, each answer stored where `rdi` points -- then a spin,
+/// because a program whose every exit is refused has no way out at all:
+/// its own `exit_group` came back `-ENOSYS` two instructions ago. The
+/// test that made the domain destroys it, which is also the supervisor
+/// story a real Linux workload will live under until exit translates.
+/// (The first version ended on `ud2` instead, and its perfectly
+/// intentional fault dump tripped the shell test's blanket no-EXCEPTION
+/// check -- an instrument should not have to be excused from other
+/// instruments.)
+const FOREIGNER_CODE: [u8; 34] = [
+    0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, 39   (getpid)
+    0x0f, 0x05, //                   syscall
+    0x48, 0x89, 0x07, //             mov [rdi], rax
+    0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1    (write)
+    0x0f, 0x05, //                   syscall
+    0x48, 0x89, 0x47, 0x08, //       mov [rdi+8], rax
+    0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60   (exit_group)
+    0x0f, 0x05, //                   syscall
+    0x48, 0x89, 0x47, 0x10, //       mov [rdi+16], rax
+    0xeb, 0xfe, //                   jmp $ -- spin; the test puts it down
+];
+
+/// Where the foreigner's code and report pages sit in its own space.
+const FOREIGNER_CODE_AT: u64 = 0x0000_0000_1000_0000;
+const FOREIGNER_REPORT_AT: u64 = 0x0000_0000_1001_0000;
+
+/// The thread that becomes the Linux-tagged probe: builds a two-page space,
+/// copies the hand-assembled code in through the direct map (the mapping
+/// itself is never writable), and enters ring 3 with `rdi` naming the
+/// report page.
+extern "C" fn ring3_foreigner(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    let Some(code) = VirtRange::from_pages(VirtAddr(FOREIGNER_CODE_AT), 1) else {
+        stop()
+    };
+    if space.map_anonymous(code, Protection::ReadExecute).is_err() {
+        stop()
+    }
+    let Some(report) = VirtRange::from_pages(VirtAddr(FOREIGNER_REPORT_AT), 1) else {
+        stop()
+    };
+    if space.map_anonymous(report, Protection::ReadWrite).is_err() {
+        stop()
+    }
+    let (Some(code_pa), Some(report_pa)) = (
+        space.translate(VirtAddr(FOREIGNER_CODE_AT)),
+        space.translate(VirtAddr(FOREIGNER_REPORT_AT)),
+    ) else {
+        stop()
+    };
+    // SAFETY: freshly mapped anonymous frames this space owns, written
+    // through the direct map exactly as the ELF loader fills code pages --
+    // the executable mapping itself is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            FOREIGNER_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            FOREIGNER_CODE.len(),
+        );
+    }
+    FOREIGNER_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is inside the user-executable page just written and
+    // mapped; `rsp` is one past the user-writable report page in the same
+    // space; `RSP0` for this CPU was set by the ring 3 test that ran first.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            FOREIGNER_CODE_AT,
+            FOREIGNER_REPORT_AT + 4096,
+            [FOREIGNER_REPORT_AT, 0],
+        )
+    }
+}
+
+/// RFC 0005 step 2's witness: a Linux-tagged domain's system calls are all
+/// foreign, all answered `-ENOSYS`, all logged -- and the tag itself obeys
+/// its rules: refused once a thread exists, cleared when the domain ends.
+fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    personality    skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let calls_before = syscall::FOREIGN_CALLS.load(Ordering::Relaxed);
+    let Ok(realm) = domain::create("penguin", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    personality    FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    personality    FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(
+        CPU,
+        "penguin",
+        ring3_foreigner,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    personality    FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+
+    // Wait for the probe to have *spoken* before poking the tag again.
+    // The first version of this test raced itself: it tried the too-late
+    // refusal immediately after spawn, won the race against the thread's
+    // arrival (threads still zero), successfully re-tagged the domain
+    // Native -- and then watched its own probe run native and call the
+    // check a failure. Ordering by observed effect, not by issue order.
+    let mut spoke = false;
+    for _ in 0..400 {
+        if syscall::FOREIGN_CALLS.load(Ordering::Relaxed) >= calls_before + 3 {
+            spoke = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    if !spoke {
+        println!("[91m    personality    FAILED: no foreign calls arrived[0m");
+        return false;
+    }
+
+    // Too late now, and that refusal is part of the contract: a program
+    // half-run under one ABI and finished under another is not a state.
+    // `Err` is the live refusal; `None` means the domain already ended,
+    // which is a different way of being too late and proves the same rule.
+    let late = domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Native)
+    });
+    let refused_late = matches!(late, Some(Err(_)) | None);
+
+    // The probe has said everything it can say; it is spinning, because a
+    // program whose every exit is refused has no way out. Put it down --
+    // which is the supervisor story a Linux workload lives under until
+    // exit_group translates -- and watch the tag die with the domain.
+    let report_pa = FOREIGNER_REPORT_PA.load(Ordering::Acquire);
+    if report_pa == 0 {
+        println!("\x1b[91m    personality    FAILED: the probe never mapped its report\x1b[0m");
+        return false;
+    }
+    domain::destroy(realm);
+    let mut ended = false;
+    for _ in 0..400 {
+        if domain::with(realm, |_| ()).is_none() {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    if !ended {
+        println!("\x1b[91m    personality    FAILED: the domain outlived its destruction\x1b[0m");
+        return false;
+    }
+
+    // The three answers, through the direct map. Linux's -ENOSYS is -38.
+    // SAFETY: the report frame belonged to the probe's space; the space is
+    // gone but the frame is read before anything reuses it, and three loads
+    // of a page cannot fault through the direct map.
+    let answers = unsafe {
+        [
+            core::ptr::read_volatile((hhdm_base + report_pa) as *const u64),
+            core::ptr::read_volatile((hhdm_base + report_pa + 8) as *const u64),
+            core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
+        ]
+    };
+    let enosys = -38i64 as u64;
+    let all_refused = answers.iter().all(|answer| *answer == enosys);
+
+    let logged = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - calls_before;
+    let numbers = [
+        syscall::FOREIGN_SEEN[0].load(Ordering::Relaxed),
+        syscall::FOREIGN_SEEN[1].load(Ordering::Relaxed),
+        syscall::FOREIGN_SEEN[2].load(Ordering::Relaxed),
+    ];
+    let sequence_right = numbers == [39, 1, 60];
+
+    // The tag must not survive the domain: the bitmask is keyed by slot and
+    // a reused slot must never inherit a dialect.
+    let bit_cleared =
+        domain::LINUX_DOMAINS.load(Ordering::Relaxed) & (1 << (realm.as_u32() % 32)) == 0;
+
+    if all_refused && logged == 3 && sequence_right && refused_late && bit_cleared {
+        println!(
+            "    personality    a Linux-tagged domain asked getpid, write and exit_group: each \
+             answered ENOSYS, 3 foreign calls logged with their numbers, the tag refused once a \
+             thread existed, and cleared when the domain was put down"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    personality    FAILED: answers {:#x} {:#x} {:#x}, logged {logged}, \
+             numbers {numbers:?}, late-refusal {refused_late}, bit-cleared {bit_cleared}\x1b[0m",
+            answers[0], answers[1], answers[2]
+        );
+        false
+    }
+}
+
 fn ring3_self_test(hhdm_base: u64, cpus: u32) -> bool {
     if cpus < 2 {
         println!(

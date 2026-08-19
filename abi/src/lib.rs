@@ -206,6 +206,15 @@ pub mod method {
     /// a timer that has already fired and one that was never set look the same
     /// to the program that is cancelling it.
     pub const DISARM: u64 = 57;
+    /// Set which system-call dialect a `Domain`'s threads will speak.
+    ///
+    /// RFC 0005 step 2. `arg0` = 0 for the native interface, 1 for the
+    /// Linux x86_64 personality. Only before the domain's first thread:
+    /// a program half-run under one ABI and finished under another is not
+    /// a state anyone can reason about, and the refusal is
+    /// `SLOT_UNAVAILABLE` — too late, not wrong. Needs `WRITE`, as `START`
+    /// does: choosing a dialect is shaping the domain, not observing it.
+    pub const PERSONALITY: u64 = 58;
 
     /// Map the memory this capability names into the caller's address space.
     ///

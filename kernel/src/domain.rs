@@ -279,6 +279,8 @@ pub enum DomainError {
         /// The cap.
         limit: u64,
     },
+    /// The domain already has a thread, and the operation needed it not to.
+    HasThreads,
     /// The request would exceed the domain's capability envelope.
     CapabilityEnvelopeExceeded {
         /// Capabilities already held.
@@ -319,6 +321,30 @@ impl DomainId {
         Self(id)
     }
 }
+
+/// Which system-call dialect a domain's threads speak.
+///
+/// RFC 0005 step 2. `Native` is RFC 0008's capability interface; `Linux` is
+/// the personality: every syscall from such a domain is foreign, answered
+/// `-ENOSYS` and logged until a translator exists. The tag is the whole of
+/// what the nucleus knows about Linux -- rule 1 of the RFC, enforced by
+/// there being nowhere here to put more.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Personality {
+    /// RFC 0008: six syscall kinds, all authority a capability argument.
+    Native,
+    /// The Linux x86_64 ABI, translated -- or, until a translator exists,
+    /// refused with `-ENOSYS` and telemetry.
+    Linux,
+}
+
+/// Which domain slots are Linux-tagged, as a bitmask over the table of 32.
+///
+/// The syscall entry reads this once per call with a relaxed load -- the
+/// same cost discipline as the telemetry class check. Maintained by
+/// [`Domain::set_personality`] and cleared when a domain ends, so a reused
+/// slot never inherits a dialect.
+pub static LINUX_DOMAINS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The unit of isolation, accounting and scheduling.
 pub struct Domain {
@@ -387,6 +413,8 @@ pub struct Domain {
     held_capabilities: u32,
     /// Threads belonging to this domain.
     threads: u32,
+    /// Which system-call dialect this domain's threads speak.
+    personality: Personality,
     /// The capability naming this domain. Revoking it revokes everything the
     /// domain was ever granted, because everything was derived from it.
     root: Option<SlotRef>,
@@ -420,6 +448,7 @@ impl Domain {
             charged_frames: 0,
             held_capabilities: 0,
             threads: 0,
+            personality: Personality::Native,
             root: None,
             space_root: 0,
             live: false,
@@ -895,6 +924,7 @@ pub fn create_under(
         charged_frames: 0,
         held_capabilities: 0,
         threads: 0,
+        personality: Personality::Native,
         root: Some(root),
         space_root: 0,
         live: true,
@@ -1010,6 +1040,13 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
                 .is_some_and(|owner| owner.live);
         let domain = &mut table.domains[id.0 as usize];
         domain.ended = watched.then_some(reason);
+        // The dialect dies with the domain: a reused slot must never inherit
+        // a Linux tag, because the syscall entry's bitmask is keyed by slot.
+        domain.personality = Personality::Native;
+        LINUX_DOMAINS.fetch_and(
+            !(1u32 << (id.0 % 32)),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let notify = domain.notify.take();
         let parent_generation = domain.parent_generation;
         // Captured before the increment below: the children still recorded
@@ -1092,6 +1129,46 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
         cap::with_arena(|arena| arena.revoke_unchecked(root));
     }
     true
+}
+
+impl Domain {
+    /// The dialect this domain's threads speak.
+    #[must_use]
+    pub const fn personality(&self) -> Personality {
+        self.personality
+    }
+
+    /// Sets the dialect — refused once the domain has a thread, because a
+    /// program half-run under one ABI and finished under another is not a
+    /// state anyone can reason about. The bitmask the syscall entry reads
+    /// is maintained here and only here.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::HasThreads`] if a thread already exists.
+    pub fn set_personality(&mut self, personality: Personality) -> Result<(), DomainError> {
+        // Both thread counts, because they answer at different moments: the
+        // table's own field counts RFC 0017 `START`ed programs, and the
+        // scheduler's atomic counts every spawned thread from the instant of
+        // its spawn -- including kernel-spawned test threads, which is
+        // exactly what the first version of this guard missed. A tag change
+        // must lose to a thread that merely *exists*, not only to one that
+        // has registered.
+        if self.threads > 0 || crate::sched::threads_in_domain(self.id) > 0 {
+            return Err(DomainError::HasThreads);
+        }
+        self.personality = personality;
+        let bit = 1u32 << (self.id % 32);
+        match personality {
+            Personality::Linux => {
+                LINUX_DOMAINS.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+            }
+            Personality::Native => {
+                LINUX_DOMAINS.fetch_and(!bit, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Runs `f` against a live domain.

@@ -79,9 +79,21 @@ pub const SIGNAL: Schema = Schema {
     name: "notify-signal",
 };
 
+/// One foreign system call (RFC 0005 step 2): a call from a Linux-tagged
+/// domain, refused `-ENOSYS` until a translator exists. The Linux syscall
+/// number and the caller's `rip`, two little-endian `u64`s — the histogram
+/// of these events *is* the personality's work queue, which is why the
+/// refusal path logs before any translation exists to succeed.
+pub const FOREIGN: Schema = Schema {
+    id: 6,
+    version: 1,
+    size: 16,
+    name: "foreign",
+};
+
 /// Every schema this build knows. Extended in place as producers arrive
 /// (RFC 0026 steps 2 and 5); ids are append-only.
-pub static SCHEMAS: &[Schema] = &[PROBE, DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL];
+pub static SCHEMAS: &[Schema] = &[PROBE, DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL, FOREIGN];
 
 /// The table is checked at compile time: no payload wider than a slot's
 /// payload field, no duplicate ids. A build that violates either does not
@@ -172,14 +184,14 @@ mod tests {
             }
             hash
         }
-        let base = [PROBE, DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL];
+        let base = [PROBE, DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL, FOREIGN];
         assert_eq!(hash_of(&base), registry_hash(), "same table, same hash");
 
         // Each variation changes exactly one field of one entry, keeping the
         // table's shape — so a differing hash convicts the field, not the
         // length.
-        let rest = [DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL];
-        let vary = |first: Schema| [first, rest[0], rest[1], rest[2], rest[3]];
+        let rest = [DISPATCH, SYSCALL, RENDEZVOUS, SIGNAL, FOREIGN];
+        let vary = |first: Schema| [first, rest[0], rest[1], rest[2], rest[3], rest[4]];
         let bumped_version = vary(Schema {
             version: 2,
             ..base[0]

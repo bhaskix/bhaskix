@@ -272,7 +272,12 @@ workspace = true
 # measurement words read out through the direct map -- the same
 # report-reader shape the v4 measures pay at words four to nine, eight
 # lines for one more volatile block over the frame the client owns.
-unsafe_budget = 1302
+#
+# 1324 at RFC 0005 step 2 (2026-08-19): the personality self-test's probe --
+# hand-assembled code copied through the direct map exactly as the ELF
+# loader fills a page, the ring 3 entry, and the report frame read back.
+# All idioms this file already carries, pointed at a Linux-tagged domain.
+unsafe_budget = 1324
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

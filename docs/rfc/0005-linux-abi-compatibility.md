@@ -162,6 +162,26 @@ patched.
 
 ---
 
+## Step 2's record (2026-08-19): the tag exists, and the refusal is the feature
+
+Implemented as specified, with one narrowing stated: the syscall entry answers a
+Linux-tagged domain's calls with `-ENOSYS` **in the kernel** rather than delivering them
+to a personality service, because no such service exists yet — the delivery seam arrives
+with the first translated call. What exists and is gated per placement: the `Personality`
+tag on a domain (a bitmask the entry reads with one relaxed load — the telemetry class
+check's cost discipline), the `PERSONALITY` method (`WRITE`-gated like `START`, refused
+`SLOT_UNAVAILABLE` once a thread exists), the register contract held exactly (`rax`
+carries `-38`; `rdx` is preserved *by not touching the saved frame slot*; `rcx`/`r11`
+clobber matches Linux's own), the `foreign` telemetry schema carrying number and `rip` —
+the histogram that is this subsystem's work queue — and a hand-assembled Linux probe
+(`getpid`, `write`, `exit_group`, then `ud2`, the only honest exit when every exit is
+refused) asserting the exact answer, the exact log, the too-late refusal and the tag
+dying with its domain. Two findings: the self-test raced its own too-late check and
+un-tagged its probe before the thread arrived — ordering by observed effect fixed it —
+and the tag guard needed **both** thread counts (the domain table's `START`ed count and
+the scheduler's spawn-instant atomic), because a tag change must lose to a thread that
+merely exists.
+
 ## Design
 
 ### Where it lives

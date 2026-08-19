@@ -136,6 +136,7 @@ const _: () = {
     assert!(method::HAND == bhaskix_abi::method::HAND);
     assert!(method::EXPECT == bhaskix_abi::method::EXPECT);
     assert!(method::DRAIN == bhaskix_abi::method::DRAIN);
+    assert!(method::PERSONALITY == bhaskix_abi::method::PERSONALITY);
     assert!(method::GRANT == bhaskix_abi::method::GRANT);
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
@@ -270,6 +271,8 @@ pub mod method {
     pub const ARM: u64 = 56;
     /// Forget a notification's deadline. RFC 0019.
     pub const DISARM: u64 = 57;
+    /// Set a `Domain`'s system-call dialect (RFC 0005 step 2).
+    pub const PERSONALITY: u64 = 58;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1348,6 +1351,13 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         return start_program(frame);
     }
 
+    // Choosing a domain's system-call dialect (RFC 0005 step 2). Before
+    // START in a program's order and before the match blocks in this one,
+    // for the same two-CSpace reason as its neighbours.
+    if kind == Some(Kind::Invoke) && frame.method == method::PERSONALITY {
+        return set_personality(frame);
+    }
+
     // Giving a domain a capability, which is the middle of create-grant-start
     // and the only way authority reaches a child. Here for the same reason as
     // the two above: the giver's CSpace and the recipient's cannot be held at
@@ -1640,6 +1650,52 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     outcome
 }
 
+/// How many foreign (Linux-dialect) system calls have been refused.
+pub static FOREIGN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The first eight foreign syscall numbers seen, for the boot report — the
+/// self-test asserts the exact sequence its probe issued.
+pub static FOREIGN_SEEN: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+];
+
+/// Linux's `-ENOSYS`, as the `u64` the register carries.
+const LINUX_ENOSYS: u64 = -38i64 as u64;
+
+/// Answers one foreign system call: `-ENOSYS`, logged.
+///
+/// RFC 0005 step 2, whole and deliberate: no translation exists yet, so
+/// every call is refused — but *observed*. The telemetry event carries the
+/// Linux syscall number and the caller's `rip`, and the histogram of these
+/// events is the personality's work queue: what a real workload asks for is
+/// the specification, and this refusal path is how it gets written down.
+/// Never silently succeed — the RFC names that as the one forbidden answer.
+fn foreign_call(frame: &mut SyscallFrame) {
+    let number = frame.kind;
+    let count = FOREIGN_CALLS.fetch_add(1, Ordering::Relaxed);
+    if let Some(slot) = FOREIGN_SEEN.get(count as usize) {
+        slot.store(number, Ordering::Relaxed);
+    }
+    let mut event = [0u8; 16];
+    event[..8].copy_from_slice(&number.to_le_bytes());
+    event[8..].copy_from_slice(&frame.rip.to_le_bytes());
+    crate::telemetry::emit(
+        bhaskix_telemetry::EventClass::Syscall,
+        bhaskix_telemetry::schema::FOREIGN.id,
+        crate::telemetry::domain_hint(),
+        &event,
+    );
+    // `rax` alone. `arg0` (the caller's `rdx`) is left exactly as the stub
+    // saved it, which is what preserves it.
+    frame.kind = LINUX_ENOSYS;
+}
+
 /// The entry point the assembly stub calls.
 ///
 /// # Safety
@@ -1669,7 +1725,24 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     // handler.
     unsafe { bhaskix_arch::cpu::enable_interrupts() };
 
-    let outcome = dispatch(frame);
+    // RFC 0005 step 2: a Linux-tagged domain's system calls are foreign.
+    // One relaxed load and a predicted branch on the native path — the same
+    // cost discipline as the telemetry class check. When the branch is
+    // taken, nothing native runs: the number in `rax` is a Linux syscall
+    // number, not a Kind, and interpreting it natively would hand a hosted
+    // binary whatever capability method happens to share the value. The
+    // epilogue below — the space check, the death door, the interrupt mask,
+    // the hold canary — runs for both dialects: a foreign caller is still a
+    // thread this kernel has to return safely.
+    let hint = crate::telemetry::domain_hint();
+    let foreign = hint < 32
+        && crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed) & (1 << hint)
+            != 0;
+    if foreign {
+        foreign_call(frame);
+    }
+
+    let outcome = if foreign { None } else { Some(dispatch(frame)) };
 
     // Every system call returns to ring 3, so this needs no condition. See
     // `sched::check_user_space`: the switch instrumentation proved some return
@@ -1678,9 +1751,15 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     crate::sched::check_user_space(0);
 
     // The results go back through the same two registers the ABI names, which
-    // the stub pops into `rax` and `rdx`.
-    frame.kind = outcome.status.as_u64();
-    frame.arg0 = outcome.value;
+    // the stub pops into `rax` and `rdx`. A foreign call wrote its own `rax`
+    // in `foreign_call` and deliberately left `arg0` untouched — the entry
+    // stub stored the caller's `rdx` there, so leaving it is what *preserves*
+    // `rdx`, which is Linux's contract: a syscall clobbers `rax`, `rcx` and
+    // `r11` and nothing else.
+    if let Some(outcome) = outcome {
+        frame.kind = outcome.status.as_u64();
+        frame.arg0 = outcome.value;
+    }
 
     // The first of the two safe points where a thread told to stop actually
     // stops. Here, and not where it was told, because *here* it demonstrably
@@ -2055,6 +2134,42 @@ fn grant_to_domain(frame: &SyscallFrame) -> Option<Outcome> {
 /// address space; doing that inside a system call would make an untrusted
 /// image's size the caller's syscall latency, and would put a parser on the
 /// dispatch path.
+/// Sets the dialect a domain's threads will speak — RFC 0005 step 2.
+///
+/// The same resolution and the same `WRITE` requirement as `START`, because
+/// choosing an ABI is shaping the domain. Refused with `SlotUnavailable`
+/// once a thread exists: too late, not wrong.
+fn set_personality(frame: &SyscallFrame) -> Outcome {
+    let Some(me) = crate::sched::current_domain() else {
+        return Outcome::err(Status::NoDomain);
+    };
+    let resolved = crate::domain::with(me, |owner| {
+        let slot = owner.cspace.get(frame.capability as usize)?;
+        crate::cap::with_arena(|arena| arena.lookup(slot))
+    })
+    .flatten();
+    let Some((object, rights)) = resolved else {
+        return Outcome::err(Status::NoSuchCapability);
+    };
+    if object.kind != ObjectKind::Domain {
+        return Outcome::err(Status::WrongObject);
+    }
+    if !rights.contains(crate::cap::Rights::WRITE) {
+        return Outcome::err(Status::InsufficientRights);
+    }
+    let target = crate::domain::DomainId::from_u32(object.id as u32);
+    let dialect = match frame.arg0 {
+        0 => crate::domain::Personality::Native,
+        1 => crate::domain::Personality::Linux,
+        _ => return Outcome::err(Status::BadSyscall),
+    };
+    match crate::domain::with(target, |owner| owner.set_personality(dialect)) {
+        Some(Ok(())) => Outcome::ok(0),
+        Some(Err(_)) => Outcome::err(Status::SlotUnavailable),
+        None => Outcome::err(Status::NoDomain),
+    }
+}
+
 fn start_program(frame: &SyscallFrame) -> Outcome {
     let Some(me) = crate::sched::current_domain() else {
         return Outcome::err(Status::NoDomain);
