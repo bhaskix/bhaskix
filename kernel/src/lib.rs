@@ -518,6 +518,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    personality    FAILED\x1b[0m");
     }
+    if !auxv_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux stack    FAILED\x1b[0m");
+    }
     frames_report();
     tickless_report();
     // Late on purpose: by here the self-tests above have poured real
@@ -2685,6 +2691,49 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// that mapped it so the test can read the answers through the direct map.
 static FOREIGNER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Where the auxv-reading probe's report page lands physically.
+static AUXV_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The auxv-reading probe, hand-assembled: walks the initial stack the way
+/// a real `_start` does — over `argv`, over `envp`, then pair by pair
+/// through the auxiliary vector — finds `AT_RANDOM` (25), copies the two
+/// entropy words it points at into its report page beside `argc` and
+/// `AT_ENTRY`, and spins. RFC 0005 step 3's witness: the image is right
+/// only if a program that reads it the way Go does finds what was put there.
+///
+/// ```text
+///   rsp -> argc, argv..., NULL, envp..., NULL, (type,value)..., AT_NULL
+///   rdi =  the report page
+/// ```
+const AUXV_CODE: [u8; 81] = [
+    0x48, 0x8b, 0x04, 0x24, //             mov rax, [rsp]        ; argc
+    0x48, 0x89, 0x07, //                   mov [rdi], rax
+    0x48, 0x8d, 0x74, 0x24, 0x08, //       lea rsi, [rsp+8]      ; &argv[0]
+    0x48, 0x8d, 0x34, 0xc6, //             lea rsi, [rsi+rax*8]  ; past argv
+    0x48, 0x83, 0xc6, 0x08, //             add rsi, 8            ; past NULL
+    // skip envp: advance until the word is zero
+    0x48, 0x8b, 0x06, //             1:    mov rax, [rsi]
+    0x48, 0x83, 0xc6, 0x08, //             add rsi, 8
+    0x48, 0x85, 0xc0, //                   test rax, rax
+    0x75, 0xf4, //                         jnz 1b
+    // walk auxv pairs looking for AT_RANDOM (25) and AT_ENTRY (9)
+    0x48, 0x8b, 0x06, //             2:    mov rax, [rsi]        ; type
+    0x48, 0x8b, 0x5e, 0x08, //             mov rbx, [rsi+8]      ; value
+    0x48, 0x83, 0xc6, 0x10, //             add rsi, 16
+    0x48, 0x83, 0xf8, 0x09, //             cmp rax, 9            ; AT_ENTRY
+    0x75, 0x04, //                         jne 3f
+    0x48, 0x89, 0x5f, 0x08, //             mov [rdi+8], rbx
+    0x48, 0x83, 0xf8, 0x19, //       3:    cmp rax, 25           ; AT_RANDOM
+    0x75, 0x0f, //                         jne 4f   (over 15 bytes)
+    0x48, 0x8b, 0x0b, //                   mov rcx, [rbx]        ; entropy lo
+    0x48, 0x89, 0x4f, 0x10, //             mov [rdi+16], rcx
+    0x48, 0x8b, 0x4b, 0x08, //             mov rcx, [rbx+8]      ; entropy hi
+    0x48, 0x89, 0x4f, 0x18, //             mov [rdi+24], rcx
+    0x48, 0x85, 0xc0, //             4:    test rax, rax         ; AT_NULL?
+    0x75, 0xd1, //                         jnz 2b   (47 bytes back)
+    0xeb, 0xfe, //                         jmp $
+];
+
 /// The Linux-shaped probe, hand-assembled: `getpid`, `write` and
 /// `exit_group`, each answer stored where `rdi` points -- then a spin,
 /// because a program whose every exit is refused has no way out at all:
@@ -2765,6 +2814,194 @@ extern "C" fn ring3_foreigner(hhdm_base: u64) -> ! {
             FOREIGNER_REPORT_AT + 4096,
             [FOREIGNER_REPORT_AT, 0],
         )
+    }
+}
+
+/// Where the auxv probe's code, stack and report live in its own space.
+const AUXV_CODE_AT: u64 = 0x0000_0000_2000_0000;
+const AUXV_STACK_AT: u64 = 0x0000_0000_2001_0000;
+const AUXV_REPORT_AT: u64 = 0x0000_0000_2002_0000;
+
+/// The entropy the initial image carries, kept so the test can compare what
+/// the probe read against what was written.
+static AUXV_ENTROPY: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// The thread that becomes RFC 0005 step 3's witness: builds a Linux
+/// initial process image with `bhaskix_personality::stack` -- the same
+/// builder the host tests check byte for byte -- and enters ring 3 on it.
+extern "C" fn ring3_auxv(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use bhaskix_personality::stack::{Builder, ProcessInfo};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (AUXV_CODE_AT, Protection::ReadExecute),
+        (AUXV_STACK_AT, Protection::ReadWrite),
+        (AUXV_REPORT_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let (Some(code_pa), Some(stack_pa), Some(report_pa)) = (
+        space.translate(VirtAddr(AUXV_CODE_AT)),
+        space.translate(VirtAddr(AUXV_STACK_AT)),
+        space.translate(VirtAddr(AUXV_REPORT_AT)),
+    ) else {
+        stop()
+    };
+
+    // Entropy from the machine's own source, or a fixed pattern when it has
+    // none -- RFC 0021's policy, stated: a machine that cannot be
+    // unpredictable says so rather than pretending.
+    let entropy = [
+        bhaskix_rand::u64().unwrap_or(0x0123_4567_89ab_cdef),
+        bhaskix_rand::u64().unwrap_or(0xfedc_ba98_7654_3210),
+    ];
+    AUXV_ENTROPY[0].store(entropy[0], core::sync::atomic::Ordering::Release);
+    AUXV_ENTROPY[1].store(entropy[1], core::sync::atomic::Ordering::Release);
+    let mut random = [0u8; 16];
+    random[..8].copy_from_slice(&entropy[0].to_le_bytes());
+    random[8..].copy_from_slice(&entropy[1].to_le_bytes());
+
+    let args: [&[u8]; 2] = [b"penguin", b"--auxv"];
+    let env: [&[u8]; 1] = [b"BHASKIX=1"];
+    let builder = Builder::new(
+        &args,
+        &env,
+        ProcessInfo {
+            entry: AUXV_CODE_AT,
+            phdr: AUXV_CODE_AT + 64,
+            phent: 56,
+            phnum: 1,
+            page_size: bhaskix_mm::FRAME_SIZE,
+            hwcap: 0,
+            random,
+        },
+    );
+    // SAFETY: a freshly mapped anonymous frame this space owns, viewed
+    // through the direct map as the page it is -- the same idiom the ELF
+    // loader uses to fill a segment.
+    let stack_page =
+        unsafe { core::slice::from_raw_parts_mut((hhdm_base + stack_pa) as *mut u8, 4096) };
+    if builder.build(stack_page, AUXV_STACK_AT).is_err() {
+        stop()
+    }
+
+    // SAFETY: as above, for the code page; the mapping itself is never
+    // writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            AUXV_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            AUXV_CODE.len(),
+        );
+    }
+    AUXV_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is inside the user-executable page just written;
+    // `rsp` points at the `argc` word of the image just built, which is
+    // where Linux puts it; `RSP0` was set by the ring 3 test.
+    unsafe { bhaskix_arch::syscall::enter_ring3(AUXV_CODE_AT, AUXV_STACK_AT, [AUXV_REPORT_AT, 0]) }
+}
+
+/// RFC 0005 step 3's witness: a Linux program walks the initial process
+/// image this kernel built -- argv, envp, the auxiliary vector -- and finds
+/// the entropy `AT_RANDOM` promised, which is the one auxv entry Go treats
+/// as not optional.
+fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux stack    skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("auxv", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux stack    FAILED: no domain\x1b[0m");
+        return false;
+    };
+    // Tagged Linux, because that is the domain a real hosted binary runs in
+    // -- and because it proves the image is built for a domain whose every
+    // system call is still refused: the stack is what a program reads
+    // *before* it makes any.
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_none()
+    {
+        println!("\x1b[91m    linux stack    FAILED: the tag would not set\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "auxv", ring3_auxv, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux stack    FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+
+    // The probe walks the image and spins. Wait for its four words, bounded.
+    let mut report_pa = 0;
+    let mut answers = [0u64; 4];
+    for _ in 0..400 {
+        report_pa = AUXV_REPORT_PA.load(Ordering::Acquire);
+        if report_pa != 0 {
+            // SAFETY: a frame the probe's space owns, read through the
+            // direct map; four loads of one page cannot fault.
+            answers = unsafe {
+                [
+                    core::ptr::read_volatile((hhdm_base + report_pa) as *const u64),
+                    core::ptr::read_volatile((hhdm_base + report_pa + 8) as *const u64),
+                    core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
+                    core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
+                ]
+            };
+            if answers[2] != 0 || answers[3] != 0 {
+                break;
+            }
+        }
+        wait_millis(5);
+    }
+    domain::destroy(realm);
+
+    let entropy = [
+        AUXV_ENTROPY[0].load(Ordering::Acquire),
+        AUXV_ENTROPY[1].load(Ordering::Acquire),
+    ];
+    let right = report_pa != 0
+        && answers[0] == 2
+        && answers[1] == AUXV_CODE_AT
+        && answers[2] == entropy[0]
+        && answers[3] == entropy[1];
+    if right {
+        println!(
+            "    linux stack    a Linux program walked the initial image this kernel built: \
+             argc 2, AT_ENTRY {:#x}, and the sixteen AT_RANDOM bytes it found are the entropy \
+             that was put there",
+            AUXV_CODE_AT
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux stack    FAILED: argc {}, entry {:#x}, random {:#x} {:#x} \
+             against entropy {:#x} {:#x}\x1b[0m",
+            answers[0], answers[1], answers[2], answers[3], entropy[0], entropy[1]
+        );
+        false
     }
 }
 

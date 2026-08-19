@@ -72,6 +72,12 @@ members = [
     # and two copies of "what is a well-formed header" would drift.
     "ustar",
 
+    # Phase 2 — RFC 0005 step 3. The Linux personality's arithmetic: the
+    # initial process image now, the syscall surface as tiers land. Depends
+    # on nothing, because the kernel builds real stacks with it and a host
+    # test checks the bytes.
+    "personality",
+
     # Phase 2 — RFC 0030 step 1. The package format: the manifest grammar,
     # the archive walk, and SHA-256 as arithmetic. Host-testable, fuzzed,
     # zero unsafe; `mkimage` grows here at step 2 the way `mkfs` lives in

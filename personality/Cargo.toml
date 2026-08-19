@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0005: the Linux personality's pure arithmetic. What a process's initial
+# state *is* -- the stack image, the auxiliary vector, the argument and
+# environment layout -- as functions over byte buffers, with no kernel and no
+# `unsafe` under them, host-tested byte-for-byte. The kernel builds a real
+# stack by calling these; a host test checks the bytes against a known-good
+# image. The syscall translation that comes later lives here too, one tier at
+# a time, for the same reason RFC 0005 gives: it is a parser of entirely
+# untrusted input and belongs where it can be tested without a machine.
+[package]
+name = "bhaskix-personality"
+description = "The Linux personality as arithmetic: the initial process image, and the syscall surface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_personality"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Arithmetic over byte buffers -- the whole point of the leaf crate is that
+# nothing here needs a pointer. RFC 0005 writes this zero as a claim.
+unsafe_budget = 0

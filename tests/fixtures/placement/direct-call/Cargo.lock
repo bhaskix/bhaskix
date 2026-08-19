@@ -40,6 +40,7 @@ dependencies = [
  "bhaskix-elf",
  "bhaskix-fs",
  "bhaskix-mm",
+ "bhaskix-personality",
  "bhaskix-rand",
  "bhaskix-service",
  "bhaskix-service-console",
@@ -53,6 +54,10 @@ version = "0.0.0"
 dependencies = [
  "bhaskix-boot",
 ]
+
+[[package]]
+name = "bhaskix-personality"
+version = "0.0.0"
 
 [[package]]
 name = "bhaskix-rand"

@@ -84,6 +84,10 @@ LAYERS = {
     # the VFS reads the initrd with it, the pkg crate reads packages with
     # it, and the fuzz target drives it -- one copy, depending on nothing.
     "bhaskix-ustar": -3,
+    # The Linux personality's arithmetic, RFC 0005: the kernel builds a real
+    # initial stack with it and a host test checks the bytes, so it depends
+    # on nothing -- the leaf-layer argument a seventh time.
+    "bhaskix-personality": -3,
     # The package format, RFC 0030: manifest, archive walk, SHA-256. A rung
     # above the leaves because it reads archives through `bhaskix-ustar`;
     # nothing below the programs and the host tools depends on it.

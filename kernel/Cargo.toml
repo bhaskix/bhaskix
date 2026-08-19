@@ -31,6 +31,9 @@ bhaskix-rand = { path = "../rand" }
 # registry, and every ring decision. The kernel contributes the stores and
 # the interrupt discipline; the decisions stay host-tested in the crate.
 bhaskix-telemetry = { path = "../telemetry" }
+# RFC 0005: the Linux personality's arithmetic. The kernel builds a real
+# initial process stack by calling into it; the bytes are host-tested there.
+bhaskix-personality = { path = "../personality" }
 # RFC 0013: the framework, and the services placed in the nucleus. The arrow
 # points this way and only this way -- a service crate never depends back.
 bhaskix-service = { path = "../service" }
@@ -277,7 +280,12 @@ workspace = true
 # hand-assembled code copied through the direct map exactly as the ELF
 # loader fills a page, the ring 3 entry, and the report frame read back.
 # All idioms this file already carries, pointed at a Linux-tagged domain.
-unsafe_budget = 1324
+#
+# 1344 at RFC 0005 step 3 (2026-08-19): the auxv witness -- three page fills
+# through the direct map (code, the built stack image, the report read back)
+# and its ring 3 entry. The image itself is built by `bhaskix-personality`,
+# which is zero-unsafe arithmetic; only the placing of it is here.
+unsafe_budget = 1344
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

@@ -182,6 +182,26 @@ and the tag guard needed **both** thread counts (the domain table's `START`ed co
 the scheduler's spawn-instant atomic), because a tag change must lose to a thread that
 merely exists.
 
+## Step 3's record (2026-08-19): a Linux program reads the image, and finds its entropy
+
+The builder lives in `bhaskix-personality` — a leaf crate of pure arithmetic, zero
+`unsafe`, host-tested byte for byte, which is what this RFC's testing plan asked for and
+the only way the auxv gets built correctly: an eight-byte slip in a pointer does not fail
+visibly, it hands the runtime the wrong `AT_RANDOM`. The kernel calls that builder to
+place a real image (arguments, environment, the seven auxv entries Go reads, and sixteen
+bytes of `RDRAND` entropy — or a stated fixed pattern on a machine that cannot be
+unpredictable, RFC 0021's policy), then enters ring 3 on it. The witness is eighty-one
+bytes of hand-assembled Linux code that walks the image exactly as `_start` does — over
+`argv`, over `envp`, pair by pair through the vector — and reports `argc`, `AT_ENTRY`,
+and the two entropy words it found by dereferencing `AT_RANDOM`. All three match, gated
+per placement, and watched red twice: an `AT_RANDOM` pointer moved eight bytes fails the
+host test, an `AT_ENTRY` moved sixteen fails the boot gate. Two jump displacements in the
+probe were wrong on the first run (a `jne` over fifteen bytes counted as twelve, a loop
+back forty-seven counted as forty-five) — hand assembly is exactly as unforgiving as this
+RFC's "three hard parts" section warns, which is the argument for the corpus programs
+being real binaries rather than more of this. **No vDSO**, as designed: `AT_SYSINFO_EHDR`
+is absent and stays absent until a benchmark asks.
+
 ## Design
 
 ### Where it lives

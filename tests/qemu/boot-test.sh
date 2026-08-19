@@ -1235,6 +1235,18 @@ fi
 # The numbers are recorded, not gated -- a slow host is not a broken kernel --
 # but a networked boot that produced none measured nothing, and that is a
 # failure of the instrument.
+# RFC 0005 step 3: the initial process image. A Linux program walks the
+# stack this kernel built -- argv, envp, the auxiliary vector -- and finds
+# the entropy AT_RANDOM promised, which Go's runtime treats as not optional.
+# The builder itself is host-tested byte for byte; this is the proof that a
+# program reading it the way Go does finds what was put there.
+if grep -qE "linux stack +a Linux program walked the initial image this kernel built: argc 2, AT_ENTRY 0x[0-9a-f]+, and the sixteen AT_RANDOM bytes it found are the entropy" "$LOG"; then
+    pass "a Linux program reads the initial image, auxiliary vector and all"
+else
+    fail "the initial-image self-test did not conclude"
+    status=1
+fi
+
 # RFC 0005 step 2: the personality tag exists and refuses. A Linux-tagged
 # domain's every system call is foreign -- answered ENOSYS, logged with its
 # number -- the tag is refused once a thread exists, and it dies with the
