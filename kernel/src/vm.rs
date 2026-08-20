@@ -581,7 +581,7 @@ pub fn self_test(hhdm_base: u64, iterations: u32) -> bool {
 /// kernel simply kept a single installed space, because until there were two
 /// programs to run at once nothing could tell. What told was two services in
 /// domains landing on the same CPU and running in each other's page table.
-pub const MAX_SPACES: usize = 12;
+pub const MAX_SPACES: usize = 32;
 
 /// Every user address space the kernel has installed, found by its root.
 ///

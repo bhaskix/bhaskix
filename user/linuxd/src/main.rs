@@ -38,7 +38,7 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{method, status, syscall};
+use bhaskix_abi::{limits, method, status, syscall};
 use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
 use bhaskix_personality::memory;
 use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
@@ -310,7 +310,7 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
             }
             let made = call(
                 syscall::INVOKE,
-                SLOT_BASE + u64::from(domain),
+                handle_of(domain),
                 method::SPAWN_THREAD,
                 [r9, stack, tls.unwrap_or(0), 0],
             );
@@ -402,7 +402,7 @@ fn copy_in(domain: u32, address: u64, out: &mut [u8]) -> bool {
     }
     let moved = call(
         syscall::INVOKE,
-        SLOT_BASE + u64::from(domain),
+        handle_of(domain),
         method::COPY_IN,
         [REPORT, SCRATCH_AT_OFFSET, address, out.len() as u64],
     );
@@ -435,7 +435,7 @@ fn copy_out(domain: u32, address: u64, bytes: &[u8]) -> bool {
     }
     let moved = call(
         syscall::INVOKE,
-        SLOT_BASE + u64::from(domain),
+        handle_of(domain),
         method::COPY_OUT,
         [REPORT, SCRATCH_AT_OFFSET, address, bytes.len() as u64],
     );
@@ -623,7 +623,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
                 execute,
             } => {
                 let protection = protection_of(read, write, execute);
-                let domain = SLOT_BASE + u64::from(request.domain);
+                let domain = handle_of(request.domain);
                 trace(
                     request.first(),
                     request.second(),
@@ -665,7 +665,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
             Ok((address, pages)) => {
                 let _ = pages;
                 invoke(
-                    SLOT_BASE + u64::from(request.domain),
+                    handle_of(request.domain),
                     method::UNMAP_AT,
                     [address, 0, 0, 0],
                 )
@@ -675,7 +675,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         MPROTECT => {
             match memory::plan_mprotect(request.first(), request.second(), request.third()) {
                 Ok((address, pages, read, write, execute)) => invoke(
-                    SLOT_BASE + u64::from(request.domain),
+                    handle_of(request.domain),
                     method::PROTECT_AT,
                     [address, pages, protection_of(read, write, execute), 0],
                 ),
@@ -740,7 +740,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
             }
             let set = call(
                 syscall::INVOKE,
-                SLOT_BASE + u64::from(request.domain),
+                handle_of(request.domain),
                 method::SET_TLS,
                 [nucleus_thread(request), request.second(), 0, 0],
             );
@@ -832,7 +832,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
             write_scratch(bits);
             let moved = call(
                 syscall::INVOKE,
-                SLOT_BASE + u64::from(request.domain),
+                handle_of(request.domain),
                 method::COPY_OUT,
                 [REPORT, SCRATCH_AT_OFFSET, mask, 8],
             );
@@ -956,7 +956,8 @@ const SIGALTSTACK: u64 = 131;
 /// table is a bug in one ring 3 program that holds one endpoint, two pages
 /// and a handle to each domain it hosts. It was a kernel table until
 /// 2026-08-20.
-static mut DISPOSITIONS: [Dispositions; 32] = [const { Dispositions::new() }; 32];
+static mut DISPOSITIONS: [Dispositions; limits::MAX_DOMAINS] =
+    [const { Dispositions::new() }; limits::MAX_DOMAINS];
 
 /// Who is asleep in a futex, by wake slot.
 ///
@@ -1068,7 +1069,7 @@ fn answer_futex(request: &PersonalityCall) -> (u64, Answer) {
 /// second caller inside this function and no interrupt that runs its code.
 /// A lock here would be a lock nothing can contend.
 fn dispositions_of(domain: u32) -> &'static mut Dispositions {
-    let index = (domain as usize) % 32;
+    let index = (domain as usize) % limits::MAX_DOMAINS;
     // SAFETY: single-threaded by construction, as above; the index is masked
     // into the array's own length.
     unsafe { &mut *core::ptr::addr_of_mut!(DISPOSITIONS[index]) }
@@ -1098,17 +1099,49 @@ const UCONTEXT_MCONTEXT: usize = 40;
 /// than a constant that happens to be right.
 const CPUS_REPORTED: u64 = 4;
 
-/// Where a hosted domain's `Domain` capability sits in this program's CSpace.
+/// The method that says where a hosted domain's `Domain` capability landed.
 ///
-/// Slot `SLOT_BASE + id`, computed from the badge the kernel stamped, so no
-/// table has to be kept in step with anything. A CSpace holds 64 slots and
-/// there are 32 domains, which is exactly one each in the upper half.
+/// `u64::MAX - 3`, beside [`FORGET_METHOD`] and for the same reason: no Linux
+/// number can collide with it. Sent by the kernel once per incarnation,
+/// before the first foreign call of that domain arrives — the message is a
+/// call made by the hosted thread itself, so it is answered before the call
+/// that provoked it.
+const HANDLE_METHOD: u64 = u64::MAX - 3;
+
+/// Where each hosted domain's `Domain` capability sits in this program's
+/// CSpace, plus one — zero meaning "none, and nothing may be done to it".
+///
+/// **It used to be `32 + domain id`, and the arithmetic was the problem** —
+/// RFC 0033 step 3. Computing the slot needed no table on either side, and
+/// reserved one slot per domain *whether or not that domain existed*: half a
+/// CSpace held against a machine running two hosted programs. A descriptor is
+/// a capability this program holds, so that reservation is precisely what L1
+/// would have run out of. The kernel allocates now and says where.
 ///
 /// **This capability is the whole of the authority to touch a hosted
 /// process's memory** — [RFC 0032](../../../docs/rfc/0032-a-supervisor-interface.md).
 /// Without it this program can answer questions about numbers and nothing
-/// else, which is what it could do an hour ago.
-const SLOT_BASE: u64 = 32;
+/// else.
+static mut HANDLES: [u32; limits::MAX_DOMAINS] = [0; limits::MAX_DOMAINS];
+
+/// The slot holding `domain`'s handle, or [`NO_HANDLE`] if the kernel has not
+/// said.
+///
+/// Answering a sentinel rather than refusing to compile is deliberate: an
+/// invocation on `NO_HANDLE` is refused by the kernel as an empty slot, which
+/// is exactly what "this program cannot touch that domain" should look like
+/// from every call site, and it costs no branch at any of them.
+fn handle_of(domain: u32) -> u64 {
+    // SAFETY: one thread, one request at a time -- as `dispositions_of`.
+    let handles = unsafe { &*core::ptr::addr_of!(HANDLES) };
+    match handles.get(domain as usize % limits::MAX_DOMAINS) {
+        Some(0) | None => NO_HANDLE,
+        Some(slot) => u64::from(slot - 1),
+    }
+}
+
+/// A slot index no CSpace has, so an invocation on it is refused.
+const NO_HANDLE: u64 = u64::MAX;
 
 /// `MAP_AT`'s lazy flag: record the region, take no frame until it is touched.
 const MAP_LAZY: u64 = 1;
@@ -1207,6 +1240,17 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
         // this only ever sees faults nothing wanted — which is exactly the
         // set that should end. When the dispositions move, this arm grows a
         // decision and the kernel's delivery goes away.
+        // Where this program's handle for a hosted domain is — RFC 0033 step
+        // 3. Recorded and acknowledged; the capability itself was installed
+        // by the kernel before this message was sent.
+        if received.method == HANDLE_METHOD {
+            let domain = (received.badge as u32) as usize % limits::MAX_DOMAINS;
+            // SAFETY: one thread, one request at a time -- as `sleepers`.
+            let handles = unsafe { &mut *core::ptr::addr_of_mut!(HANDLES) };
+            handles[domain] = (args[0] as u32).saturating_add(1);
+            let _ = call(syscall::REPLY, 0, 0, [0; 4]);
+            continue;
+        }
         if received.method == FORGET_METHOD {
             *dispositions_of(received.badge as u32) = Dispositions::new();
             // And whatever it left asleep. A sleeper keyed by a domain id

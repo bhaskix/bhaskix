@@ -64,7 +64,7 @@ use crate::sync::{Rank, SpinLock};
 /// Fixed, so that creating a domain cannot fail for want of heap on a path
 /// that may run during memory pressure — which is exactly when a supervisor
 /// most wants to start a replacement.
-pub const MAX_DOMAINS: usize = 32;
+pub const MAX_DOMAINS: usize = 64;
 // Thirty-two, and now for a measured reason rather than an assumed one.
 //
 // It was raised to 64 on 2026-08-12 on the belief that a `NO_DOMAIN` refusal
@@ -338,13 +338,47 @@ pub enum Personality {
     Linux,
 }
 
-/// Which domain slots are Linux-tagged, as a bitmask over the table of 32.
+/// Which domain slots are Linux-tagged, as a bitmask over the whole table.
 ///
 /// The syscall entry reads this once per call with a relaxed load -- the
 /// same cost discipline as the telemetry class check. Maintained by
 /// [`Domain::set_personality`] and cleared when a domain ends, so a reused
 /// slot never inherits a dialect.
-pub static LINUX_DOMAINS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+///
+/// **One bit per domain, and the assertion below is what keeps that true.**
+/// It was a `u32` masked with `% 32` while the table held 32, which is the
+/// same number by coincidence rather than by construction: raising
+/// [`MAX_DOMAINS`] to 64 without widening this would have made domain 33
+/// alias domain 1, so a *native* domain would have had its system calls read
+/// in Linux's dialect and handed to the adapter. Found by raising the
+/// constant at RFC 0033 step 3; the assertion is so that the next raise
+/// fails to build instead.
+pub static LINUX_DOMAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// One bit per domain, or the mask aliases and a dialect is applied to the
+// wrong program. See `LINUX_DOMAINS`.
+const _: () = {
+    assert!(MAX_DOMAINS <= u64::BITS as usize);
+    // The arena attributes capabilities to owners by domain id, so its table
+    // and this one are the same table wearing two names. They are declared
+    // apart on purpose (see `cap::MAX_OWNERS`) and checked together here.
+    assert!(MAX_DOMAINS == crate::cap::MAX_OWNERS);
+    // And a *ring 3* server that keeps a table per hosted domain sizes it by
+    // the ABI's copy of this number. A server holding 32 rows for a 64-domain
+    // machine would give two domains one row of signal handlers.
+    assert!(MAX_DOMAINS == bhaskix_abi::limits::MAX_DOMAINS);
+};
+
+/// What one entry of the domain table costs.
+///
+/// For the boot report's bill — RFC 0033 step 3 raised the table from 32 to
+/// 64 and the CSpace inside each entry from 64 slots to 128, which is four
+/// times the memory. A number printed on every boot is a number a reviewer
+/// can object to; an estimate in a commit message is not.
+#[must_use]
+pub fn size_of_domain() -> usize {
+    core::mem::size_of::<Domain>()
+}
 
 /// The unit of isolation, accounting and scheduling.
 pub struct Domain {
@@ -1104,7 +1138,7 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
         // a Linux tag, because the syscall entry's bitmask is keyed by slot.
         domain.personality = Personality::Native;
         LINUX_DOMAINS.fetch_and(
-            !(1u32 << (id.0 % 32)),
+            !(1u64 << (id.0 as usize % MAX_DOMAINS)),
             core::sync::atomic::Ordering::Relaxed,
         );
         let notify = domain.notify.take();
@@ -1218,7 +1252,7 @@ impl Domain {
             return Err(DomainError::HasThreads);
         }
         self.personality = personality;
-        let bit = 1u32 << (self.id % 32);
+        let bit = 1u64 << (self.id as usize % MAX_DOMAINS);
         match personality {
             Personality::Linux => {
                 LINUX_DOMAINS.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);

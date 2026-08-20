@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-19 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. **TCP is complete and its RFC accepted 2026-08-16** ([RFC 0020](docs/rfc/0020-tcp.md), all six steps: `bin/tcpc` opens connections with rings its own domain owns, echoes through them both directions, and the boundary is measured — RFC 0022's capability-in-a-call is the mechanism underneath). **The sockets API exists** — `bhaskix-sock`, RFC 0027 accepted 2026-08-17 — and this cell said "no sockets API beyond UDP and TCP's own" until 2026-08-18, stale from the acceptance. **IPv6 is done** (RFC 0029, **accepted 2026-08-18**, all six steps): dual stack on every networked boot, both families measured on the same rings, and the networking bullet — the last open row of §4's table — is closed. **Packages are done** (RFC 0030, **accepted 2026-08-19**, all six steps): the image a deterministic function of the manifests, install/run/remove at the shell with manifest-derived grants, every operation priced. What remains on the roadmap's own Phase 2 list: libc — **RFC 0005 steps 2–8 of 10 are implemented**, a real static Go binary runs, and the translation sits in the nucleus where that RFC requires a service domain ([RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md), drafted 2026-08-19, carries the correction and its trigger) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed; the claim "no architecture question open" held from 2026-08-16 to 2026-08-19, when **A6** — where the Linux personality runs — was opened by RFC 0031) · **RFC 0026 ACCEPTED 2026-08-17** (the telemetry plane — six steps, drafted, built and accepted in one day) · **RFC 0027 ACCEPTED 2026-08-17** (a sockets API worth the name — `bhaskix-sock`, both ports paid) · **RFC 0028 ACCEPTED 2026-08-18** (`bhaskixboot.efi` — seven steps; the machine boots on its own loader at full gate parity, KASLR drawn and confirmed, four CPUs started by the kernel's own INIT-SIPI) · **RFC 0029 ACCEPTED 2026-08-18** (IPv6 — the second family, measured beside the first with no emulator in its numbers; drafted, built and accepted in one day, and the networking bullet — §4's last open row — closed with it) · **RFC 0030 ACCEPTED 2026-08-19** (packages — authority made reviewable: the image a function of the manifests, install/run/remove live at the shell with manifest-derived grants, every operation priced, and the kernel gained no method for any of it) · **RFC 0032 ACCEPTED 2026-08-20** (a supervisor interface — ten steps; the Linux personality left the nucleus entirely and the gated count of Linux syscall numbers the nucleus interprets went 18 → 0, while the kernel's `unsafe` budget *fell* across the move) · **RFC 0033 drafted 2026-08-20** (what a hosted process is — A6's second half; nothing built) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 62 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026's telemetry report line and then its round-trip check became gates; 48 until 2026-08-18, when RFC 0029's three joined — the SLAAC/NDP/echo gate, the v6 socket round trip, and the v6 TCP measurement instrument-check, each answered or its reduction stated per placement; the count sat at 48 through steps 3–5, stale from the moment the first v6 gate landed; 51 until 2026-08-19, when RFC 0005 step 2's personality gate joined, 53 when step 3's initial-image gate did, 54 when step 4's signal round trip did, 55 when step 5's memory calls did, 56 when step 6's futex edges did, and 57 when its clone half followed; 59 on 2026-08-19, when RFC 0031's two boundary gates joined -- the ratchet on how many Linux numbers the nucleus interprets, and the instrument's own accounting for every call it priced; 60 on 2026-08-19, when RFC 0032's supervisor-interface gate joined, and 61 when step 3's adapter gate did; 62 on 2026-08-20, when RFC 0032 step 6's fault crossing joined), 64 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 692 host tests, counted 2026-08-20 (677 before RFC 0033 step 2's process record; 649 before RFC 0005 step 9, 674 before step 10's boundary type) |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed; the claim "no architecture question open" held from 2026-08-16 to 2026-08-19, when **A6** — where the Linux personality runs — was opened by RFC 0031) · **RFC 0026 ACCEPTED 2026-08-17** (the telemetry plane — six steps, drafted, built and accepted in one day) · **RFC 0027 ACCEPTED 2026-08-17** (a sockets API worth the name — `bhaskix-sock`, both ports paid) · **RFC 0028 ACCEPTED 2026-08-18** (`bhaskixboot.efi` — seven steps; the machine boots on its own loader at full gate parity, KASLR drawn and confirmed, four CPUs started by the kernel's own INIT-SIPI) · **RFC 0029 ACCEPTED 2026-08-18** (IPv6 — the second family, measured beside the first with no emulator in its numbers; drafted, built and accepted in one day, and the networking bullet — §4's last open row — closed with it) · **RFC 0030 ACCEPTED 2026-08-19** (packages — authority made reviewable: the image a function of the manifests, install/run/remove live at the shell with manifest-derived grants, every operation priced, and the kernel gained no method for any of it) · **RFC 0032 ACCEPTED 2026-08-20** (a supervisor interface — ten steps; the Linux personality left the nucleus entirely and the gated count of Linux syscall numbers the nucleus interprets went 18 → 0, while the kernel's `unsafe` budget *fell* across the move) · **RFC 0033 drafted 2026-08-20** (what a hosted process is — A6's second half; nothing built) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 64 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026's telemetry report line and then its round-trip check became gates; 48 until 2026-08-18, when RFC 0029's three joined — the SLAAC/NDP/echo gate, the v6 socket round trip, and the v6 TCP measurement instrument-check, each answered or its reduction stated per placement; the count sat at 48 through steps 3–5, stale from the moment the first v6 gate landed; 51 until 2026-08-19, when RFC 0005 step 2's personality gate joined, 53 when step 3's initial-image gate did, 54 when step 4's signal round trip did, 55 when step 5's memory calls did, 56 when step 6's futex edges did, and 57 when its clone half followed; 59 on 2026-08-19, when RFC 0031's two boundary gates joined -- the ratchet on how many Linux numbers the nucleus interprets, and the instrument's own accounting for every call it priced; 60 on 2026-08-19, when RFC 0032's supervisor-interface gate joined, and 61 when step 3's adapter gate did; 62 on 2026-08-20, when RFC 0032 step 6's fault crossing joined, and 64 on 2026-08-20 when RFC 0033 step 3's two joined -- the free address-space count and the fixed tables' printed bill), 66 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 692 host tests, counted 2026-08-20 (677 before RFC 0033 step 2's process record; 649 before RFC 0005 step 9, 674 before step 10's boundary type) |
 
 ### How far along is this, in numbers
 
@@ -138,6 +138,7 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 | **LC1** | Linux compatibility as an adapter | ⬜ **Draft** 2026-08-19 — the strategic frame, drafted *after* eight of RFC 0005's steps had shipped, which is why its first deliverable is a correction rather than a design | **Linux compatibility is an adapter above Bhaskix services, never a reason to reproduce Linux kernel architecture inside Bhaskix.** Two invariants, each a property a test may attempt to violate rather than a slogan: Linux UID 0 ≠ Bhaskix unrestricted authority, and a Linux application compromise ≠ a Bhaskix system compromise. Five interfaces to stabilize now, while they are cheap: the personality frame the nucleus carries without interpreting; every Linux object backed by a capability the adapter *already held*; a hosted process holding none and unable to name one; a Linux domain's authority declared in a manifest as RFC 0030 declares a package's; one adapter per hosted workload rather than one system-wide server. Four security tests — hosted application escape, hostile driver, Linux `root`, revocation through derived descriptors — of which two are largely funded by gates that already run. Application milestones **L1–L4** (BusyBox/curl/OpenSSH → toolchains → nginx/MariaDB → containers), all unmet, lettered to avoid colliding with RFC 0005's syscall *tiers*. Records the drift it was written for: the personality is in the nucleus and RFC 0005 says it must not be | [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md) |
 | **SUP1** | A supervisor interface | ✅ **ACCEPTED 2026-08-20 — all ten steps; the ratchet reads 0 of 18** — written *before* any of it is built, which is the order this project's rules ask for and the order the personality itself did not follow. Seven methods exist, not the six drafted: `SET_TLS` joined at step 9 because a thread's TLS base is a thing only the kernel can set and a supervisor must be able to ask for. `futex` and `write` finished the move at step 10, each with the capability it was waiting for — a pool of sixteen notifications, and a **write-only** console | **The authority to hold a program, held as a capability.** `START` lets a supervisor hand a child an image and let go; nothing lets it read the child's memory, change its mappings, or set a thread's registers — so anything that must was *kernel code*, which is why the Linux personality was in the nucleus and why RFC 0031's relocation could not start. Six methods on a `Domain` capability (`COPY_IN`/`COPY_OUT` naming a `Memory` object rather than a raw buffer, `MAP_AT`/`UNMAP_AT`/`PROTECT_AT` with `W^X` unrepresentable by type, `SPAWN_THREAD`), plus a `Thread` capability with full-register `SET`/`GET` — which retires `signal.rs`'s recorded `rbx`/`rbp`/`r12`–`r15` narrowing for free — and one new reply shape, `BLOCK_ON`, because **a server may hold exactly one outstanding reply** and an adapter that parked a futex sleeper would answer nobody else. The trade is stated rather than implied: **the nucleus grows a supervisor interface so the personality can leave entirely** — ~250 lines of generic mechanism in, ~3,240 lines of Linux ABI out. Surfaced two existing defects on the way, both recorded: `set_reply_target` overwrites a live reply obligation with no guard (a displaced caller hangs for ever, silently), and `ipc.rs`'s claim that a blocked caller "cancels itself on the way out" is stale | [RFC 0032](docs/rfc/0032-a-supervisor-interface.md) |
 | **HP1** | What a hosted process is | ⬜ **Draft 2026-08-20** — the other half of **A6**, opened the day its first half closed; nothing built | **A Linux process is a record in `bin/linuxd`, bound one-to-one to a Bhaskix domain.** Identity in ring 3 because identity is a Linux concept; isolation in the domain because isolation is the product. Four decisions asked for: one domain per hosted process (the alternative lets one Linux process read another's memory); a pid **invented by the adapter**, not the domain id — `getpid` answers *domain + 1* today, which leaks a Bhaskix identifier and pins a Linux lifetime to a Bhaskix one, and `execve` must change the domain because `START` refuses one with threads; a descriptor is a capability the adapter holds and the process names by an integer; `execve` needs no new kernel mechanism and `fork` gets one only if a measurement says so, with the trigger written down. Names the three fixed tables L1 walks into — `MAX_SPACES` 12 (7 used), `MAX_DOMAINS` 32 (11 used), `CSPACE_SLOTS` 64 with 12 free in the adapter — so **this machine holds five concurrent hosted processes**. Says plainly what it costs: the adapter would gain `DomainControl` and a filesystem subtree, so an adapter compromise would reach every hosted process's files | [RFC 0033](docs/rfc/0033-what-a-hosted-process-is.md) |
+| **AD1** | The adoption case | ⬜ **Draft 2026-08-20** — a strategy relayed for consideration and recorded as a **ledger** rather than adopted as a direction; nothing built, and no existing claim changed by it | **Keep Linux software compatibility, replace the underlying architecture** — so a Linux user is never asked to choose between the ecosystem they have and the security architecture they do not. Five properties (Compatible, Secure, Understandable, Performant, Independent), five audiences, and a set of rules about how the project describes itself. Largely [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md)'s argument restated, which is why the RFC's value is the **audit** rather than the argument: every claim carries a status and the line in this tree that decides it. **Two ✅, five 🔨, eight ⬜, one ❌** — the security architecture the pitch sells is largely real and better-evidenced than the pitch knew, and the compatibility half is entirely future, with every audience story but one resting on it. Three findings nobody had written down: **"Performant" is not a tracked property of this project at all** (one perf gate in CI, and `architecture.md`'s "Native software never pays" has none, while `vision.md` refuses the benchmark-first premise on purpose); **the proposed demonstration is stronger than the one specified** — RFC 0031 §6 Test 1 is a synthetic probe that proves the boundary is *shaped* right and never explodes anything, against a real application really exploited with its neighbour still serving; and **`SecSphere` appears nowhere in this repository**. One row is *stronger* than claimed: `Cargo.lock` holds 20 packages and all 20 are `bhaskix-*` — zero external dependencies. Raises **G1**, a governance item: `vision.md` line 82 lists binary compatibility as an anti-goal and has contradicted RFC 0031, RFC 0005 and the L1–L4 roadmap rows since 2026-08-19, unnoticed when RFC 0031 was drafted; it is an *adopted* document, so per `GOVERNANCE.md` §2 the project lead decides and this RFC does not edit it | [RFC 0034](docs/rfc/0034-the-adoption-case.md) |
 
 > **This table is missing two rows, recorded rather than quietly left out.** RFC 0014 (driver
 > framework) and RFC 0015 (filesystem) are both accepted and implemented — `M8` and `M9-01`…`M9-08`
@@ -757,6 +758,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | Limine containment (only `boot/` may name it) | M1 | architecture.md §1 |
 | Dependency direction / no cycles | M1 | architecture.md §5 |
 | No vendor strings in published files | M1 | Project policy |
+| No AI-vendor attribution — **refused at commit time** by `tools/git-hooks/{pre-commit,commit-msg}`, and the hooks' installation is itself checked | M1 (hooks 2026-08-20) | Project policy; CONTRIBUTING.md §"AI-assisted contributions" cond. 3 |
 | Frame-leak test (1000 address spaces, zero drift) | M3 | memory.md §7 |
 | RT latency p99.9 < 50 µs | M4 | scheduler.md §4 |
 | Fuzz targets on every untrusted parser | M6 | coding-style.md §8 |
@@ -770,6 +772,170 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-20 (the attribution rule stops being a policy and becomes a hook: refused before the commit object exists)
+
+**The rule was already checked; it was never *enforced*.** `tools/check-containment.sh` scans the
+working tree, every commit message, author, tag and ref, and every blob in history — thoroughly, and
+**after the commit exists**. Its own comment says the part that matters: history is permanent,
+mirrored and indexed, and a string that reaches a public push cannot be taken back without rewriting
+the repository. A scan that runs at `make gates` can therefore only ever report damage that is
+already done. Two hooks now refuse it at the only moment it is still cheap.
+
+**`tools/git-hooks/pre-commit`** reads the **index**, not the working tree — `git show :path`, so a
+file edited after `git add` is judged on the bytes that would actually be committed. **`commit-msg`**
+is separate and has to be: pre-commit never sees the message, because the message does not exist when
+it runs, and a trailer added automatically by tooling is precisely the leak being guarded against.
+
+**The trailer ban catches a shape rather than guessing a vocabulary**, which is why bare model words
+are deliberately *not* in the pattern. "opus", "sonnet", "haiku", "fable", "llama" are ordinary
+English and a kernel tree may one day use them innocently; an attribution carrying one would appear
+in a commit trailer, and `Co-Authored-By:`/`Generated with`/`Assisted-by:`/`On-behalf-of:` are refused
+whoever they name. Bare `gpt` is excluded for a concrete reason: this is a UEFI project and GPT is the
+GUID Partition Table, so a partition parser in `boot/bhaskixboot` would trip it. Every exclusion has
+its trigger written beside it in `tools/vendor-pattern.sh`.
+
+**The pattern moved to one file so three copies could not become three patterns.** `vendor-pattern.sh`
+is sourced by the script and both hooks; the day they disagree would be the day the weakest one is the
+rule. It broadened while it moved — five more vendor spellings joined, each with zero hits anywhere in
+the tree, so nothing existing had to change. Every enforcement file is written with its strings
+assembled from fragments and **contains none of them literally**, verified: a literal grep over all six
+returns 0, which is what keeps the un-exemptable blob-history scan green once they are committed.
+
+**A hook nobody installed prevents nothing, so the installation is itself a gate.** `check-containment.sh`
+now fails when `core.hooksPath` is not `tools/git-hooks`, checked as configuration rather than by
+looking for files — hooks present but not pointed at are decoration. `make hooks` installs them and
+`tools/setup-dev.sh` does it during setup, so a fresh clone that skips it gets a red build rather than
+a silent hole.
+
+**All five checks were watched failing before being believed**, per the standing rule. Armed in a
+throwaway repository so no history here was touched: a staged file carrying a vendor name (refused); a
+staged file carrying one of the *newly* covered names (refused, so the broadening is real); the same
+name in a commit message with clean files (refused); a `Co-Authored-By:` naming an ordinary person and
+no vendor at all (refused — the shape, not the vocabulary); and `core.hooksPath` unset, which turned
+the gate red and green again on restore. **The control matters as much**: a conventional
+`Signed-off-by:` commit with clean content still passes, so this is a gate and not a wall.
+
+**The installation check would have turned CI permanently red, and was caught before it did.** CI
+checks out a fresh tree and never creates a commit, so `core.hooksPath` is unset there by
+construction — a gate demanding it would have failed every run forever. It is skipped when `CI` is
+set, and says so on the line rather than staying quiet. The skip does not weaken anything: hooks
+protect the *creation* of a commit, which happens on developer machines, and CI's backstop is the
+three history scans that do run there. Verified in both directions — with `core.hooksPath` unset,
+`CI=true` exits 0 and a developer shell exits 1.
+
+**One pre-existing mislabel corrected on the way.** `check-containment.sh`'s section 3 header read
+"SPDX headers" while the block beneath it was the git-history scan — a copy-paste that had been there
+since the history check was added. Corrected rather than deleted.
+
+**Documented where a contributor actually looks**: `CONTRIBUTING.md`'s "AI-assisted contributions"
+gains a third condition and the enforcement list; `docs/coding-style.md` §9 gains the trailer rule
+beside the commit format it already specifies. **Both state the rule without naming a single vendor**,
+which is not squeamishness — a document that spelled the words would be a document that trips its own
+gate.
+
+### 2026-08-20 (RFC 0034 drafted: the adoption case audited against the tree, and three claims found with nothing under them)
+
+**A strategy was relayed for consideration and is recorded as a ledger rather than adopted as a
+direction.** *Keep Linux software compatibility, replace the underlying architecture* — five
+properties, five audiences, a set of rules about how the project describes itself. Roughly two
+thirds of it describes what this tree genuinely does, which is exactly the dangerous ratio: a
+document where most rows are true is one where the false rows travel unchallenged. So the RFC's
+deliverable is not the argument, which is largely RFC 0031's restated, but the **audit** — every
+claim carrying a status and the line in this tree that decides it. **Two ✅, five 🔨, eight ⬜,
+one ❌.**
+
+**The honest reading is unflattering to the pitch and flattering to the tree.** The security
+architecture it sells is largely real, gated, and better-evidenced than the pitch knew. The
+compatibility half is entirely future, and every audience story but one rests on it.
+
+**Three things nobody had written down.** *"Performant" is not a tracked property of this project
+at all* — §6 lists one performance gate, `architecture.md`'s "Native software never pays" has none,
+and `vision.md` refuses the benchmark-first premise on purpose, so the claim has nothing behind it
+and the recommendation is to withdraw it rather than manufacture a suite to back a pitch. *The
+proposed demonstration is stronger than the one specified* — RFC 0031 §6 Test 1 is a synthetic probe
+that proves the boundary is **shaped** right and never explodes anything, against a real application
+really exploited with its neighbour still serving; recommended as L3's demonstration criterion,
+which costs nothing now and cannot be faked early. And *`SecSphere` appears nowhere in this
+repository*, so the name stays out of these documents until something introduces it.
+
+**One row is stronger than the pitch claimed it.** `Cargo.lock` holds 20 packages and all 20 are
+`bhaskix-*` — this workspace has zero external dependencies, which is a supply-chain position the
+material undersold and `security.md` §1 lists as an out-of-scope threat with "Phase 2" beside it.
+
+**A governance item, G1, is raised and deliberately not resolved.** `vision.md` line 82 lists
+binary compatibility as an anti-goal — "**Not** binary compatibility with Linux" — and has
+contradicted RFC 0031, RFC 0005 and the L1–L4 roadmap rows **since 2026-08-19**, unnoticed on the
+day RFC 0031 was drafted. `vision.md` is an *adopted* document whose header requires a governance
+decision, and `GOVERNANCE.md` §2 puts architecture direction with the project lead after an RFC. The
+RFC quotes it, states that its second clause ("never a nucleus concern") is not merely satisfied but
+gated at 0, recommends amendment, and **edits nothing**.
+
+**A stale number was caught on the way and is named rather than used.** The RFC's first claim was
+drafted citing **five** concurrent hosted processes — which RFC 0033's Summary, `roadmap.md`'s L1
+row and this file's **HP1** row all still say. Step 3, the entry directly below this one, raised the
+four limits behind that figure the same day; `abi/src/lib.rs` reads `MAX_DOMAINS` 64 and the true
+figure is **twenty-five**. Step 3 recorded itself here and in RFC 0033's own step-3 section and did
+not update the three places carrying the old one — working rule 1's exact failure. Not fixed in this
+change, because it belongs to step 3's; named so the next person to quote "five" does not have to
+find it again.
+
+**No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
+unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
+in plain text.
+
+### 2026-08-20 (RFC 0033 step 3: four limits raised, a latent aliasing bug found, and the bill printed)
+
+**The machine holds twenty-five spare address spaces where it held five.** `MAX_SPACES` 12 → 32,
+`MAX_DOMAINS` 32 → 64, `CSPACE_SLOTS` 64 → 128, and a fourth the RFC had not counted —
+`MAX_CAPABILITIES` 1,024 → 4,096, because **a descriptor is a capability in that arena** and 64
+descriptors across fifteen hosted processes is 960 of the thousand that existed. Found by walking
+toward the ceiling rather than by hitting it.
+
+**The bill is printed on every boot rather than estimated in a commit message**: `spaces 32 x 40B,
+domains 64 x 1736B, cspace 128 slots, arena 4096 x 40B -- 269 KiB of static kernel memory`. Sizes
+and not counts, because `size_of` is what moves when a field is added to what a table holds. Gated
+on being *said*: a threshold on static memory would be a gate on a linker's arithmetic, but a line
+that quietly stopped printing would take the pricing with it.
+
+**The raise would have introduced a real bug, and the assertion is the fix.** `LINUX_DOMAINS` — the
+bitmask the syscall entry reads once per call to decide whether a domain's calls are foreign — was a
+`u32` masked with `% 32`, sized by coincidence with `MAX_DOMAINS` rather than by construction. At 64
+domains, **domain 33 would have aliased domain 1**: a native domain's system calls read in Linux's
+dialect and handed to the adapter. The mask is a `u64`, and a `const` assertion refuses a table
+wider than the bits — verified by setting the constant to 128 and watching the build stop. **The
+same shape existed in ring 3**, where `bin/linuxd` sized its signal dispositions at 32 and indexed
+them `% 32` — two hosted domains sharing a row of signal handlers. Both sides read one constant now,
+`abi::limits::MAX_DOMAINS`, and the kernel asserts its own against it.
+
+**The adapter's handles are allocated rather than computed.** `slot = 32 + domain id` needed no table
+and reserved half a CSpace against a machine running two hosted programs — and a descriptor is a
+capability the adapter holds, so that reservation is what L1 would have run out of. The kernel takes
+the lowest free slot above its fixed grants and **says where**, in a message beside `FORGET`
+(`HANDLE_METHOD`). Ordering makes it safe: the message is a call made by the hosted thread itself,
+so it is answered before the foreign call that provoked it, and the old incarnation's slot is handed
+back before a new one is allocated. **Armed** by installing the capability and not saying where: the
+memory, clone and futex self-tests went red together.
+
+**A fault of a known shape was seen once, and is recorded rather than explained away.** The first
+full suite after the raise produced a kernel fault in the `console=nucleus vfs=nucleus` placement: a
+thread reached ring 3 in **somebody else's address space**. Fourteen repeats of that lane since —
+five immediately, eight in a controlled run — are clean, and no other lane has shown it. **This is a
+fault with a history here**: found on 2026-08-13 in `vm::install` (the space loaded before the thread
+recorded owning it), fixed, verified at 0 in 50 boots, and instrumented at three paths back to ring 3
+— with the fourth named in that same entry as uncovered: *"an exception return to user mode — a
+demand-paging fault serviced and retried"*. The capture points straight at it: the exit-check counter
+reads **`wrong space: 0 (0 not checked)`** while the faulting thread was demonstrably in the wrong
+space, which is a fault on the one path the check cannot see. Not claimed caused by this step — the
+shape, the counter and the recorded gap all point elsewhere, and one in fourteen is not what a new
+deterministic breakage looks like — and not claimed innocent either: more concurrent address spaces
+is more exposure to that window. **The next instrument is the fourth exit check**, and it belongs to
+its own change with its own verification.
+
+**Two new gates, both armed.** The address-space line now says how many are free and demands **at
+least eight** — a shell pipeline's worth of hosted processes — which read `5 free` with the old
+constant. And the bill must be printed. `bin/linuxd`'s `unsafe` budget rises 44 → 46, one borrow
+each way of the handle table.
 
 ### 2026-08-20 (RFC 0033 step 2: the process record exists, in fifteen host tests and no wiring)
 

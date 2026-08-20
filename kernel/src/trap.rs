@@ -275,7 +275,7 @@ fn handle(frame: &mut TrapFrame) {
     if frame.from_user_mode()
         && let Some(domain) = crate::sched::current_domain()
         && crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed)
-            & (1 << (domain.as_u32() % 32))
+            & (1u64 << (domain.as_u32() as usize % crate::domain::MAX_DOMAINS))
             != 0
     {
         // **The personality gets the fault, because deciding what a fault

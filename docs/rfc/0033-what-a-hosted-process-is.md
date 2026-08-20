@@ -308,6 +308,97 @@ keyed by domain rather than a field of this record. Moving them in is a later st
 an exec owes them is commented at the place it will go, because a handler surviving an exec would
 call an address that is no longer code.
 
+## Step 3's record (2026-08-20): four limits, a latent aliasing bug, and 269 KiB
+
+**The machine holds twenty-five spare address spaces where it held five.** `MAX_SPACES` 12 → 32,
+`MAX_DOMAINS` 32 → 64, `CSPACE_SLOTS` 64 → 128 — and a fourth this RFC had not counted:
+`MAX_CAPABILITIES` 1,024 → 4,096, because **a descriptor is a capability in that arena**, and 64
+descriptors across fifteen hosted processes is 960 of the thousand that existed. A ceiling found by
+walking toward it rather than by being hit.
+
+**The bill is printed on every boot rather than estimated here:**
+
+```text
+fixed tables   spaces 32 x 40B, domains 64 x 1736B, cspace 128 slots, arena 4096 x 40B
+               -- 269 KiB of static kernel memory
+```
+
+Sizes and not counts, because `size_of` is what moves when a field is added to what a table holds —
+the change most likely to make one of these expensive without anybody noticing. The line is gated
+on being *said*, not on a threshold: a limit on static memory would be a gate on a linker's
+arithmetic, but a report line that quietly stopped printing would take the pricing with it.
+
+### The bug the raise would have introduced, and the assertion that will not let it back
+
+`domain::LINUX_DOMAINS` — the bitmask the syscall entry reads once per call to decide whether a
+domain's calls are foreign — was a **`u32`, masked with `% 32`**, sized by a coincidence with
+`MAX_DOMAINS` rather than by construction. Raising the table to 64 without widening it would have
+made **domain 33 alias domain 1**: a native domain's system calls read in Linux's dialect and
+handed to the adapter, or a hosted domain's answered natively. The mask is a `u64` now, and a
+`const` assertion refuses to build a table wider than the bits — verified by setting `MAX_DOMAINS`
+to 128 and watching `assertion failed: MAX_DOMAINS <= u64::BITS` stop the build.
+
+**The same shape existed in ring 3**, where `bin/linuxd` sized its signal-disposition table at 32
+and indexed it `% 32`. Two hosted domains sharing a row of signal handlers is the same class of
+fault with a worse blast radius. Both sides now read **one** constant — `abi::limits::MAX_DOMAINS`
+— and the kernel asserts its own against it, because a constant that exists twice is a constant
+that will disagree once.
+
+### The adapter's handles are allocated now, and the kernel says where
+
+`slot = 32 + domain id` needed no table on either side and reserved **half a CSpace against a
+machine running two hosted programs**. Since a descriptor is a capability the adapter holds, that
+reservation is exactly what L1 would have run out of.
+
+The kernel takes the lowest free slot at or above a floor above its fixed grants, installs the
+handle there, and sends a message — `HANDLE_METHOD`, `u64::MAX - 3`, beside `FORGET` — naming the
+domain and the slot. Ordering is what makes it safe: the message is an ordinary call made by *the
+hosted thread itself*, so it is answered before the foreign call that provoked it, and on a reused
+domain the `FORGET` goes first so an adapter clearing its row does not clear the slot it is about
+to be told. The old incarnation's slot is handed back before the new one is allocated — a stale
+handle is authority over a domain that no longer exists.
+
+**Armed** by having the kernel install the capability and *not* say where: the memory, clone and
+futex self-tests all went red at once, which is what "this program can answer questions about
+numbers and nothing else" looks like from the outside.
+
+### A fault of a known shape, seen once, and what its own instrument says about it
+
+The first full suite after the raise produced a kernel fault in the `console=nucleus vfs=nucleus`
+placement: a hosted thread reached ring 3 in **somebody else's address space**, faulting on an
+instruction fetch at a garbage address. Fourteen repeats of that lane since — five immediately and
+eight in a controlled run — have been clean, and it has not recurred in any other lane.
+
+**It is a fault this project has met before, fixed, and left one path uncovered.** On 2026-08-13 the
+cause was found in `vm::install` — the address space was loaded before the thread recorded owning it,
+so a preemption inside that window left `finish_switch` calling `enter_space(0)` and the previous
+`CR3` in place. The fix (record before loading) was verified at **0 faults in 50 boots** against a
+prior rate of one in ten, and an exit check was added at three paths back to ring 3. The tracker
+entry ends by naming what those three do not cover: *"the uncovered one is an **exception** return to
+user mode — a demand-paging fault serviced and retried — which is not the interrupt path and is the
+obvious next site."*
+
+**The capture points at exactly that.** Its exit-check counter reads `exits to ring 3 with the wrong
+space: 0 (0 not checked)` — the three instrumented paths all say they were clean — while the thread
+that faulted was demonstrably in the wrong space. A fault the check cannot see, on the path the check
+does not cover.
+
+**What this step claims and does not claim.** It does not claim the raise caused it: the shape,
+the counter and the recorded open gap all point elsewhere, and the rate is not what a new
+deterministic breakage looks like. It does not claim the raise is innocent either: more concurrent
+address spaces is more exposure to a wrong-`CR3` window, and that is an honest consequence of raising
+the limit. What is written down is the observation, the evidence, and the next instrument — the
+fourth exit check, on the exception return — which belongs to its own change with its own
+verification rather than bolted onto this one.
+
+### What did not move
+
+The gate for the free count is **at least eight**, not "more than before": eight is a shell
+pipeline's worth of hosted processes, and a future service quietly eating the headroom is caught
+there rather than by the eleventh program faulting in a space that could not be installed. Armed by
+putting `MAX_SPACES` back to 12 — `found 7 used and 5 free`, which is the sentence this step
+exists to stop being true.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -420,6 +511,7 @@ later step consumes them.
    `CSPACE_SLOTS` 64 → 128, and the adapter's `base + domain id` slot scheme replaced by an
    allocated one. The bill printed in the boot report beside the counts that already print. Gated by
    the existing "each program in its own address space" check, extended to say how many are free.
+   ✅ *Delivered 2026-08-20 — four limits, not three; see the record below.*
 4. **`getpid` stops being the domain id.** The adapter allocates pids; the record maps them. One
    gate: two hosted processes have different pids and neither equals a domain id.
 5. **`execve`**, end to end: `DomainControl` granted to the adapter, a path resolved, an image

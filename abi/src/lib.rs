@@ -80,6 +80,26 @@ pub mod syscall {
     pub const EXIT: u64 = 5;
 }
 
+/// Fixed limits both sides of the boundary have to agree on.
+///
+/// **A constant that exists twice is a constant that will disagree once.** The
+/// kernel's domain table and a server's per-domain table are the same table
+/// seen from two rings: if one holds 64 entries and the other 32 and the
+/// second is indexed by `domain % 32`, two domains share a row — and the row
+/// is signal handlers, or a capability slot. That is exactly the aliasing
+/// found in `LINUX_DOMAINS` at RFC 0033 step 3, where the mask was a `u32`
+/// and the table was about to hold 64.
+///
+/// So the number lives here, once, and the kernel asserts its own against it.
+pub mod limits {
+    /// Domains this machine can have at once — `domain::MAX_DOMAINS`.
+    ///
+    /// A server that keeps a table per hosted domain sizes it by this and
+    /// indexes it by the domain id in a badge, which the kernel stamps and no
+    /// caller can forge.
+    pub const MAX_DOMAINS: usize = 64;
+}
+
 /// Methods invoked on a capability, for the programs that need to name one.
 ///
 /// Only the ones an unprivileged program uses are here. The kernel keeps the

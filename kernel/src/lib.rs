@@ -4821,8 +4821,9 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     // The tag must not survive the domain: the bitmask is keyed by slot and
     // a reused slot must never inherit a dialect.
-    let bit_cleared =
-        domain::LINUX_DOMAINS.load(Ordering::Relaxed) & (1 << (realm.as_u32() % 32)) == 0;
+    let bit_cleared = domain::LINUX_DOMAINS.load(Ordering::Relaxed)
+        & (1u64 << (realm.as_u32() as usize % domain::MAX_DOMAINS))
+        == 0;
 
     if all_refused && no_smuggling && logged == 8 && sequence_right && refused_late && bit_cleared {
         println!(
@@ -11767,8 +11768,10 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // whose real concurrency was three. The gate below it asked for "at least
     // 3" and got it from corpses.
     println!(
-        "    address spaces {} in use at once, each program in its own",
-        vm::peak()
+        "    address spaces {} of {} in use at once, each program in its own ({} free)",
+        vm::peak(),
+        vm::MAX_SPACES,
+        vm::MAX_SPACES.saturating_sub(vm::peak())
     );
     // Occupied rather than live, and the distinction is the whole point: a
     // domain that has ended keeps its slot until somebody reaps it, so this is
@@ -11785,6 +11788,33 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         "    memory objects {} of {} live at once",
         shared::peak_live(),
         shared::MAX_OBJECTS
+    );
+    // **The bill for the four fixed tables, printed rather than estimated** —
+    // RFC 0033 step 3. Each was raised because L1 walks into it: five
+    // concurrent hosted processes was the machine's ceiling, and a hosted
+    // process is a domain with an address space, a CSpace full of descriptors
+    // and a capability in the arena for each one. What it cost is arithmetic,
+    // and arithmetic belongs in the log rather than in a paragraph nobody can
+    // check.
+    //
+    // Sizes, not counts: `size_of` is the honest measure of a static table,
+    // and it moves when a field is added to what the table holds -- which is
+    // the change most likely to make one of these expensive without anybody
+    // noticing.
+    println!(
+        "    fixed tables   spaces {} x {}B, domains {} x {}B, cspace {} slots, arena {} x {}B \
+         -- {} KiB of static kernel memory",
+        vm::MAX_SPACES,
+        core::mem::size_of::<Option<vm::AddressSpace>>(),
+        domain::MAX_DOMAINS,
+        domain::size_of_domain(),
+        cap::CSPACE_SLOTS,
+        cap::MAX_CAPABILITIES,
+        cap::size_of_node(),
+        (vm::MAX_SPACES * core::mem::size_of::<Option<vm::AddressSpace>>()
+            + domain::MAX_DOMAINS * domain::size_of_domain()
+            + cap::MAX_CAPABILITIES * cap::size_of_node())
+            / 1024
     );
     // Whether anything read after this point is complete. The transmitter drops
     // a byte rather than hang, which is right, and it did so silently until a

@@ -2169,12 +2169,35 @@ const ADAPTER_RETRIES: u32 = 1024;
 pub static ADAPTER_DOMAIN: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
-/// Where a hosted domain's `Domain` capability lands in the adapter's CSpace.
+/// The lowest CSpace slot a hosted domain's `Domain` capability may be put in.
 ///
-/// Slot `ADAPTER_SLOT_BASE + id`, so the adapter computes it from the badge
-/// and no table has to be kept in step. A CSpace holds 64 and there are 32
-/// domains, so the upper half is exactly the right size for one each.
-const ADAPTER_SLOT_BASE: usize = 32;
+/// **Allocated from here rather than computed — RFC 0033 step 3.** It used to
+/// be `32 + domain id`, which needed no table on either side and reserved one
+/// slot per domain *whether or not that domain existed*: half a CSpace, held
+/// against a machine that has two hosted programs. A descriptor is a
+/// capability the adapter holds, so that reservation is exactly what L1 would
+/// have run out of.
+///
+/// Now the kernel takes the lowest free slot at or above this floor and
+/// **tells the adapter which** ([`HANDLE_METHOD`]). The floor is above the
+/// fixed grants `start_linux_domain` makes — the endpoint, two pages, the
+/// console and the futex pool — so an allocation can never collide with one.
+const ADAPTER_SLOT_FLOOR: usize = 20;
+
+/// The method that says "your `Domain` capability for this domain is in this
+/// slot".
+///
+/// `u64::MAX - 3`, beside [`FORGET_METHOD`] and for the same reason: no Linux
+/// number can collide with it, and a hosted program never chooses a method
+/// anyway. Sent once per incarnation, before the first foreign call of that
+/// domain is delivered — the message is an ordinary call made by the hosted
+/// thread itself, so it completes before the call that provoked it.
+pub const HANDLE_METHOD: u64 = u64::MAX - 3;
+
+/// Which CSpace slot each domain's handle was put in, plus one — zero meaning
+/// none has been allocated.
+static ADAPTER_SLOT: [core::sync::atomic::AtomicU32; crate::domain::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::domain::MAX_DOMAINS];
 
 /// Which incarnation of each domain the adapter has been given, plus one —
 /// zero meaning none.
@@ -2271,27 +2294,41 @@ fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
             .ok()
     });
     let handle = handle?;
-    let index = ADAPTER_SLOT_BASE + domain as usize;
-    let installed = crate::domain::with(crate::domain::DomainId::from_u32(adapter), |owner| {
-        // Whatever a previous incarnation left is taken out first, which
-        // is what makes a reused domain slot safe here.
-        let _ = owner.cspace.remove(index);
-        owner.cspace.install_at(index, handle).is_ok()
-    });
-    if installed != Some(true) {
-        return Some(false);
-    }
+    let previous = ADAPTER_SLOT.get(domain as usize)?;
+    let adapter_id = crate::domain::DomainId::from_u32(adapter);
+    // The slot is allocated, and the *old* one is given back first: a
+    // previous incarnation's handle is authority over a domain that no longer
+    // exists, and leaving it installed would both leak a slot and leave the
+    // adapter able to name a stale capability.
+    let index = crate::domain::with(adapter_id, |owner| {
+        if let Some(held) = previous.load(Ordering::Relaxed).checked_sub(1) {
+            let _ = owner.cspace.remove(held as usize);
+        }
+        let index = owner.cspace.first_free_at_or_above(ADAPTER_SLOT_FLOOR)?;
+        owner.cspace.install_at(index, handle).ok()?;
+        Some(index)
+    })??;
+    previous.store(index as u32 + 1, Ordering::Relaxed);
     slot.store(wanted, Ordering::Relaxed);
     // **Only when a *previous* incarnation was remembered.** The first grant
     // for a fresh slot has nothing to forget, and telling the adapter to
     // forget something it never knew would cost a round trip on the first
     // foreign call of every hosted program.
-    if held != 0 {
-        let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
-        if endpoint != u64::MAX {
-            let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
+    let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
+    if endpoint != u64::MAX {
+        let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
+        if held != 0 {
             let _ = crate::ipc::call(endpoint, u64::from(domain), FORGET_METHOD, [0; 4]);
         }
+        // **And where to find it**, which is no longer computable from the
+        // domain id. Sent after the forget, so an adapter that clears its row
+        // for a reused domain does not clear the slot it is about to be told.
+        let _ = crate::ipc::call(
+            endpoint,
+            u64::from(domain),
+            HANDLE_METHOD,
+            [index as u64, 0, 0, 0],
+        );
     }
     Some(true)
 }
@@ -2423,8 +2460,9 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     // instead was correct and cost a runqueue lock on every system call in
     // the machine; the fix that survives is to make the cheap answer true.
     let hint = crate::telemetry::domain_hint();
-    let foreign = hint < 32
-        && crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed) & (1 << hint)
+    let foreign = (hint as usize) < crate::domain::MAX_DOMAINS
+        && crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed)
+            & (1u64 << hint)
             != 0;
     if foreign {
         foreign_call(frame);

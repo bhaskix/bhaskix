@@ -1636,13 +1636,34 @@ fi
 # The expectation is derived rather than fixed: the shell always has one, and
 # each service placed in a domain is another program with its own memory. A
 # fixed number would have to be wrong in three of the four placements.
+#
+# **And how many are left**, which RFC 0033 step 3 makes a gate rather than a
+# curiosity: a hosted Linux process is a domain with an address space of its
+# own, so the free count is the number of them this machine can still hold.
+# It read five before that step raised the table. Demanded to be at least
+# eight so that a shell pipeline's worth of hosted processes fits, and so that
+# a future service quietly consuming the headroom is caught here rather than
+# by an eleventh program faulting in a space that could not be installed.
 domains=$(grep -o "=domain" <<<"$expected" | wc -l)
 want=$((1 + domains))
-spaces=$(sed -n 's/.*address spaces \([0-9]*\) in use at once.*/\1/p' "$LOG" | tail -1)
-if [[ -n $spaces ]] && ((spaces >= want)); then
-    pass "each user program has an address space of its own ($spaces, wanted $want)"
+spaces=$(sed -n 's/.*address spaces \([0-9]*\) of [0-9]* in use at once.*/\1/p' "$LOG" | tail -1)
+free=$(sed -n 's/.*address spaces [0-9]* of [0-9]* in use at once[^(]*(\([0-9]*\) free).*/\1/p' "$LOG" | tail -1)
+if [[ -n $spaces ]] && ((spaces >= want)) && [[ -n $free ]] && ((free >= 8)); then
+    pass "each user program has an address space of its own ($spaces, wanted $want; $free free for hosted processes)"
 else
-    fail "wanted at least $want address spaces in use, found ${spaces:-none}"
+    fail "wanted at least $want address spaces in use and 8 free, found ${spaces:-none} used and ${free:-none} free"
+    status=1
+fi
+
+# The bill for the four fixed tables RFC 0033 step 3 raised, printed on every
+# boot. Not gated on a size -- a threshold on static memory would be a gate on
+# a linker's arithmetic -- but gated on being *said*: the numbers exist so that
+# raising a limit is priced where a reviewer sees it, and a report line that
+# quietly stopped printing would take that with it.
+if grep -qE "fixed tables   spaces [0-9]+ x [0-9]+B, domains [0-9]+ x [0-9]+B, cspace [0-9]+ slots, arena [0-9]+ x [0-9]+B -- [0-9]+ KiB" "$LOG"; then
+    pass "the fixed tables' cost is printed, not estimated"
+else
+    fail "the boot did not price its fixed tables"
     status=1
 fi
 

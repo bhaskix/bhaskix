@@ -60,17 +60,17 @@ use crate::sync::{Rank, SpinLock};
 /// path that must not allocate. It is also a denial-of-service surface: a
 /// domain that derives in a loop exhausts a global resource. Per-domain quotas
 /// belong in `ResourceEnvelope` and are recorded as outstanding.
-pub const MAX_CAPABILITIES: usize = 1024;
+pub const MAX_CAPABILITIES: usize = 4096;
 
 /// Capability slots one domain can hold.
-pub const CSPACE_SLOTS: usize = 64;
+pub const CSPACE_SLOTS: usize = 128;
 
 /// Distinct owners the arena can attribute capabilities to.
 ///
 /// Matches `domain::MAX_DOMAINS`, and is declared here rather than imported so
 /// that the arena does not depend on the domain table — the dependency runs
 /// the other way, and a cycle would make either one impossible to test alone.
-pub const MAX_OWNERS: usize = 32;
+pub const MAX_OWNERS: usize = 64;
 
 /// The owner of a capability the kernel created for itself.
 pub const OWNER_KERNEL: u32 = u32::MAX;
@@ -252,6 +252,12 @@ pub struct NodeId(u16);
 pub struct SlotRef {
     node: NodeId,
     generation: u32,
+}
+
+/// What one capability costs in the arena, for the boot report's bill.
+#[must_use]
+pub fn size_of_node() -> usize {
+    core::mem::size_of::<Option<CapNode>>()
 }
 
 /// One node of the derivation tree.
@@ -753,6 +759,24 @@ impl CSpace {
         }
         self.slots[index] = Some(slot);
         Ok(())
+    }
+
+    /// The lowest empty slot at or above `floor`, if there is one.
+    ///
+    /// For a caller that does not care *where* a capability lands but must
+    /// know afterwards — the kernel granting a hosted domain's handle to the
+    /// Linux adapter, which then has to be told the number
+    /// ([RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md) step 3).
+    /// The floor exists so an allocation cannot land on a fixed grant a boot
+    /// path made by hand.
+    #[must_use]
+    pub fn first_free_at_or_above(&self, floor: usize) -> Option<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .skip(floor)
+            .find(|(_, slot)| slot.is_none())
+            .map(|(index, _)| index)
     }
 
     /// The reference at `index`, if the domain holds one there.
