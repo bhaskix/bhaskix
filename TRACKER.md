@@ -804,6 +804,16 @@ a generic copy-on-write `COPY_SPACE` method only when a fork above a megabyte co
 Linux's on the same emulated machine, or a real workload spends five per cent of its wall clock
 forking.
 
+**Step 1 — the record — is complete the same day**, which for this RFC means the six documents its
+impact table names: `architecture.md` §8's A6 row; RFC 0031's first two unresolved questions, each
+now pointing at the answer; **RFC 0005's Tier 1 paragraph**, which named `getpid`, `execve` and
+`wait4` without ever saying whose descriptor table or whose pid; **`security.md` §1's T11**, which
+now states *before it happens* what an accepted RFC 0033 would add to the adapter's authority;
+**`roadmap.md`'s L1 row**, which is the first milestone whose prerequisite is a decision rather than
+code; and `bin/linuxd`'s manifest, where the grammar gaps found at RFC 0032 step 10 stop being an
+inconvenience — a list that cannot say *write-only*, cannot say *sixteen*, and would have to say *a
+subtree of the filesystem* is not yet the reviewable artifact RFC 0030 claims.
+
 ### 2026-08-20 (RFC 0032 step 10 and ACCEPTED: the ratchet reads zero — the nucleus interprets no Linux syscall number)
 
 **`futex` and `write` are answered by `bin/linuxd`, and `mod linux` is empty.** The count of

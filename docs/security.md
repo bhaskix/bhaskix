@@ -108,6 +108,14 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > **What this row does not claim:** that the adapter is correct. It claims that a bug in it is
 > contained, which is a statement about placement and is now true.
 >
+> **And what would change it, written before it happens.**
+> [RFC 0033](rfc/0033-what-a-hosted-process-is.md) — drafted 2026-08-20, not accepted, nothing
+> built — proposes that a hosted process gets files, pipes and an `execve`. Serving those needs the
+> adapter to hold `DomainControl` and a directory capability, so **an adapter compromise would then
+> reach every hosted process's files and could create domains within its own envelope.** That is a
+> real increase over the list above and it belongs in this row on the day it lands, not after. The
+> structural half — a hosted process holds no capabilities and can name none — is unaffected by it.
+>
 > Written here rather than only in the RFC because [RFC 0005](rfc/0005-linux-abi-compatibility.md)'s
 > own impact table asked for this row on the day it was drafted — *"The threat model gains an
 > in-scope adversary: a hostile process inside a Linux-personality domain… This is new and must be

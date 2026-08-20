@@ -38,6 +38,15 @@
 # hosted domains appear, and is not a fixed grant. When it grows a hosted
 # process's files and sockets it will hold *those*, and a reviewer will see
 # them on this list.
+#
+# **That day has a date on it now.** RFC 0033 (`what a hosted process is`,
+# drafted 2026-08-20) proposes giving this domain `DomainControl` and a
+# directory capability so it can serve `execve` and files -- the largest grant
+# it will have asked for, and the one that most needs to be written on a list a
+# reviewer reads. The grammar gaps above stop being an inconvenience there: a
+# list that cannot say *write-only*, cannot say *sixteen*, and would have to
+# say *a subtree of the filesystem* is not yet the reviewable artifact RFC 0030
+# claims. Fixing the grammar is part of that RFC's step, not a follow-up.
 package linuxd
 version 0.1.0
 

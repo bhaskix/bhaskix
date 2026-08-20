@@ -634,6 +634,17 @@ and terminate.
 `dup3`, `uname`, `getpid`, `wait4`, `execve`, plus a minimal synthetic `/proc`
 covering `self/exe`, `self/maps`, and `self/status`.
 
+> **Whose descriptor table, whose pid — 2026-08-20.** Every call in that
+> paragraph assumes a process with a descriptor table, and this RFC never said
+> where either lives.
+> [RFC 0033](0033-what-a-hosted-process-is.md) proposes the answer and is a
+> draft: a hosted process is a **record in `bin/linuxd`** bound one-to-one to a
+> domain; a descriptor is a capability the *adapter* holds and the process names
+> by an integer; the pid is invented in ring 3 and survives `execve`, which must
+> build a new domain because `START` refuses one that has threads. Read that
+> before building any of this paragraph — three of these calls (`getpid`,
+> `execve`, `wait4`) mean different things under the two models it weighs.
+
 **Tier 2 — network.** `socket`, `bind`, `listen`, `accept4`, `connect`,
 `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `getsockname`,
 `getpeername`, `shutdown`, `epoll_create1`, `epoll_ctl`, `epoll_pwait`. This

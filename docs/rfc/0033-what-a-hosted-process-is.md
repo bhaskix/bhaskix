@@ -358,7 +358,12 @@ Ordered so that each step is provable on its own, and front-loaded with the limi
 later step consumes them.
 
 1. **This document**, plus the corrections it names in `architecture.md` §8, RFC 0031's unresolved
-   list and the tracker.
+   list and the tracker. ✅ *Delivered 2026-08-20 — six documents, and two of them said something
+   that had been quietly wrong for longer than this RFC has existed: RFC 0005's Tier 1 paragraph
+   names `getpid`, `execve` and `wait4` without ever saying whose descriptor table or whose pid,
+   and `roadmap.md`'s L1 row listed prerequisites that are all downstream of a decision nobody had
+   taken. `security.md` §1's T11 states what an accepted RFC 0033 would add to the adapter's
+   authority **before** it is added, which is the only time such a note is worth anything.*
 2. **The record, host-tested, with nothing wired.** `personality/` grows a process table: pids,
    parents, groups, descriptors, the exec-survival list, the exit-status encoding. Pure logic, zero
    `unsafe`, no behaviour change on a booting machine.

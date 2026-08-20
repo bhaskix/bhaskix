@@ -312,9 +312,15 @@ is the architecture; [RFC 0005](rfc/0005-linux-abi-compatibility.md) is the tran
 The letters exist to avoid a collision: RFC 0005 already uses **Tier** for *system-call* tiers
 defined by tracing a binary. **L** rows are *applications*.
 
+**L1 is the first row whose prerequisite is a decision rather than code.** Every call it names —
+`execve`, `wait4`, `pipe2`, `openat`, `/proc/self/*` — means something different depending on
+whether a Linux process is a Bhaskix domain or a share of one, and on where its descriptor table
+lives. That is [RFC 0033](rfc/0033-what-a-hosted-process-is.md), which is a draft: the row below
+cannot start before it is settled, and says so rather than discovering it halfway.
+
 | | Target | What it demands beyond the row above | Status |
 |---|---|---|---|
-| **L1** | Static ELF binaries, BusyBox, shell utilities, `curl`, OpenSSH | Tier 1's file surface, `execve`, pipes, a `/proc` subset, terminal `ioctl`s | ⬜ not started — today a static Go binary loads, runs and traces 212 calls |
+| **L1** | Static ELF binaries, BusyBox, shell utilities, `curl`, OpenSSH | Tier 1's file surface, `execve`, pipes, a `/proc` subset, terminal `ioctl`s — and, before any of them, **what a hosted process is** ([RFC 0033](rfc/0033-what-a-hosted-process-is.md), drafted 2026-08-20): a process record and a pid that survives an exec, a descriptor table held by the adapter, and three fixed tables raised — this machine holds **five** concurrent hosted processes today | ⬜ not started — today a static Go binary loads, runs and traces 212 calls, answered entirely from ring 3 |
 | **L2** | Python, GCC, Clang, Rust, Go toolchains | The dynamic linker and a real libc's expectations, `fork`, process groups, filesystem breadth | ⬜ not started |
 | **L3** | nginx, Apache, PostgreSQL, MariaDB | Tier 2 sockets and `epoll`, `mmap`-heavy storage, `fsync` durability, users and permissions | ⬜ not started |
 | **L4** | Larger server software, container workloads | Resource control mapped onto `ResourceEnvelope`, image formats, orchestration | ⬜ not started |
