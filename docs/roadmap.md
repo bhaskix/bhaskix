@@ -82,7 +82,11 @@ on QEMU, and boots on at least one piece of real hardware.
 - GDT, TSS, per-CPU data, IST stacks for double-fault and NMI
 - IDT, all 32 CPU exceptions with useful register dumps
 - Local APIC, IO-APIC, APIC timer
-- `arch::Arch` trait boundary defined ([architecture.md](architecture.md) §7)
+- ~~`arch::Arch` trait boundary defined~~ — **deferred at M2 on 2026-08-03, and this bullet said
+  otherwise until 2026-08-20.** A portability trait written with one implementation and no second
+  architecture in sight documents today's code instead of constraining tomorrow's; it is written
+  when AArch64 work begins. There is no `trait Arch` in the tree. What is enforced instead is the
+  crate dependency direction, in CI ([architecture.md](architecture.md) §7)
 - Boot-time bump allocator ([memory.md](memory.md) §1)
 
 **Exit:** every exception vector produces a clear diagnostic instead of a triple fault. A test that

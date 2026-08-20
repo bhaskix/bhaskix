@@ -887,6 +887,32 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-20 (AArch64 was filed under the wrong phase in two documents, and the portability boundary was described as a rule it is not)
+
+**`README.md` and `architecture.md` both said AArch64 is a Phase 3 concern. `roadmap.md` has never
+said that** — it is the Embedded edition, Phase 5, and roadmap owns scope. Both are corrected to
+Phase 5, in place, with what they said recorded.
+
+**Pulling that thread found two more claims with less under them than they appeared to have:**
+
+- **`roadmap.md` listed "`arch::Arch` trait boundary defined" as a completed M2 bullet, under a
+  heading marked ✅.** It was **deferred at M2 on 2026-08-03**, deliberately and for a good reason
+  written down in `architecture.md` §7 — a portability trait with one implementation documents
+  today's code instead of constraining tomorrow's. `grep 'trait Arch'` returns nothing. The bullet
+  is struck through with the deferral and its date rather than deleted.
+- **`architecture.md` §7 claimed "architecture-specific instructions appear only in `arch/`, and CI
+  checks the dependency direction".** Half of that is true and gated: `tools/check-deps.py` runs in
+  `make gates`. The other half is not: **`asm!` appears 40 times in `arch/` and 20 times outside
+  it** — `kernel/`, `boot/`, `rand/`, `net/`, `sock/` — before counting ring 3 programs. Most of the
+  twenty are deliberate and justified where they sit (`rand/` is two `RDRAND` instructions, `sock/`
+  is one memory-wait written once, `kernel/` reads `RSP` and `CS` and injects faults on purpose).
+  **The problem is not the exceptions; it is that the boundary was described as a rule and enforced
+  as a habit**, and the paragraph now says so rather than implying a gate that does not exist.
+
+Whether an instruction-containment gate is worth building is left to whoever starts the second
+architecture, which is the same moment the trait gets written. Nothing was built here; three
+documents were made to agree with the tree.
+
 ### 2026-08-20 (Phase 3 is ordered, and the reorder is smaller than it was asked to be)
 
 **`roadmap.md`'s Phase 3 was an unordered bullet list and now states an order**, with the rows that

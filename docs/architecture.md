@@ -3,7 +3,9 @@
 *Status: draft for review. This is the document every other design document derives from.*
 
 - **Language:** Rust (`#![no_std]`) with minimal assembly. See [coding-style.md](coding-style.md).
-- **Initial target:** `x86_64`. AArch64 is a Phase 3 concern, but the arch boundary is defined now.
+- **Initial target:** `x86_64`. **AArch64 is Phase 5** — the Embedded edition in
+  [roadmap.md](roadmap.md), which is where it has always been; this line said Phase 3 until
+  2026-08-20. The arch boundary is *partly* enforced, and §7 says exactly which part.
 - **Boot:** Limine protocol on UEFI (and BIOS, free of charge). See [Boot](#1-boot-architecture).
 
 ---
@@ -645,8 +647,21 @@ implementation honest from the start is a chore, and we choose the chore.
 **Revised at M2 (2026-08-03):** the trait was originally scheduled for M2 and has been deferred.
 Writing a portability boundary with exactly one implementation and no second architecture in sight
 produces a trait shaped like x86 — it would document today's code rather than constrain tomorrow's,
-which is the opposite of the point. The concrete boundary that matters now is enforced instead:
-architecture-specific instructions appear only in `arch/`, and CI checks the dependency direction.
+which is the opposite of the point. The concrete boundary that matters now is enforced instead — and **the enforcement is narrower than
+this paragraph claimed until 2026-08-20**, so here is what it is. `tools/check-deps.py`, run by
+`make gates` in CI, checks the crate dependency direction and refuses an external crate. **Nothing
+checks where an instruction may appear**, and the sentence that used to stand here — *architecture-
+specific instructions appear only in `arch/`* — is not true of the tree: `asm!` appears 40 times in
+`arch/` and 20 times outside it, in `kernel/`, `boot/`, `rand/`, `net/` and `sock/`, before counting
+ring 3 programs.
+
+Most of those twenty are deliberate and are justified where they sit — `rand/` is two `RDRAND`
+instructions and says so, `sock/` is one memory-wait written once rather than copied, `kernel/` is
+reading `RSP`, reading `CS`, and injecting faults on purpose to test the exception path. **The
+problem is not the exceptions; it is that the boundary was described as a rule and enforced as a
+habit.** Whether it becomes a gate is a decision for whoever starts the second architecture, and
+the honest position until then is this paragraph.
+
 The trait will be defined when AArch64 work begins, which is when there is a second implementation
 to keep it honest.
 
