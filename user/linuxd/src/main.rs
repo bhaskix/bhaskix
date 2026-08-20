@@ -489,7 +489,30 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
     if matches!(request.number, CLONE | RT_SIGRETURN) {
         return (REPLY_NEED_FRAME, Answer::ok(0));
     }
+    // Acts on the caller that only the kernel can perform. **Which** of them,
+    // and whether at all, is this dialect's decision -- so the reply says
+    // what to do rather than the nucleus knowing what the number meant.
+    match request.number {
+        SCHED_YIELD => return (REPLY_YIELD, Answer::ok(0)),
+        EXIT => return (REPLY_END_THREAD, Answer::ok(0)),
+        // A Linux thread group's exit is every thread of it, and a hosted
+        // process is a domain.
+        EXIT_GROUP => return (REPLY_END_DOMAIN, Answer::ok(0)),
+        _ => {}
+    }
     (REPLY_VALUE, answer_from_message(request))
+}
+
+/// The scheduler's own name for the calling thread.
+///
+/// Every tid this personality hands a hosted program is the nucleus's thread
+/// id **plus one** — `clone` returns the child that way and `gettid` answers
+/// that way, because Linux never issues tid zero and a runtime that sees one
+/// treats it as an error. The badge is stamped the same way, so that zero can
+/// mean *no thread*. Naming the thread back to the nucleus undoes the offset,
+/// and it is done here, once, rather than at each call site.
+fn nucleus_thread(request: &PersonalityCall) -> u64 {
+    u64::from(request.thread.saturating_sub(1))
 }
 
 /// Everything that can be decided from four words and this program's own
@@ -624,6 +647,31 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // takes a slower path for a promise nothing here breaks: no signal is
         // delivered asynchronously, so a mask has nothing to hide from.
         RT_SIGPROCMASK => Answer::ok(0),
+        // A thread id a hosted program can tell apart from its neighbours,
+        // and stable for the life of the thread. **It arrives in the badge**,
+        // whose high half the kernel stamps with the calling thread — a
+        // caller cannot supply one, which is why it can be believed.
+        GETTID => Answer::ok(u64::from(request.thread)),
+        // The thread-local base. Per *thread*, because the register holding
+        // it is per *CPU*: a value written straight to the MSR is gone at the
+        // first switch, which is what Go's `rt0` catches three instructions
+        // later.
+        ARCH_PRCTL => {
+            if request.first() != ARCH_SET_FS {
+                return bhaskix_personality::call::ENOSYS;
+            }
+            let set = call(
+                syscall::INVOKE,
+                SLOT_BASE + u64::from(request.domain),
+                method::SET_TLS,
+                [nucleus_thread(request), request.second(), 0, 0],
+            );
+            if set.status == status::OK {
+                Answer::ok(0)
+            } else {
+                bhaskix_personality::call::ENOSYS
+            }
+        }
         // Both need more than a message carries: `clone` takes five
         // arguments, and `rt_sigreturn` takes none but needs the interrupted
         // stack pointer to find the frame its handler was given. Asking for
@@ -749,10 +797,6 @@ const FAULT_METHOD: u64 = u64::MAX;
 /// End the faulting program.
 const FAULT_END: u64 = 0;
 /// Resume it, with the registers left in the slot.
-#[expect(
-    dead_code,
-    reason = "the kernel's half of step 6 exists before the adapter's"
-)]
 const FAULT_RESUME: u64 = 1;
 /// The method that says a domain slot has been reused, so whatever this
 /// program remembers about it belongs to somebody else.
@@ -777,6 +821,26 @@ const REPLY_VALUE: u64 = 0;
 const REPLY_NEED_FRAME: u64 = 2;
 /// Resume the caller from the registers in the slot named, not from a value.
 const REPLY_RESTORE: u64 = 3;
+
+/// Give up the caller's slice, then answer it.
+const REPLY_YIELD: u64 = 4;
+/// End the calling thread.
+const REPLY_END_THREAD: u64 = 5;
+/// End the caller's whole domain.
+const REPLY_END_DOMAIN: u64 = 6;
+
+/// `gettid()`.
+const GETTID: u64 = 186;
+/// `sched_yield()`.
+const SCHED_YIELD: u64 = 24;
+/// `exit(status)` — this thread only.
+const EXIT: u64 = 60;
+/// `exit_group(status)` — every thread of the group.
+const EXIT_GROUP: u64 = 231;
+/// `arch_prctl(code, addr)`.
+const ARCH_PRCTL: u64 = 158;
+/// `ARCH_SET_FS`, the one code that matters.
+const ARCH_SET_FS: u64 = 0x1002;
 
 /// `clone(flags, stack, parent_tid, child_tid, tls)` — five arguments.
 const CLONE: u64 = 56;
@@ -969,11 +1033,14 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
             continue;
         }
 
+        // The badge's low half is the hosted domain and its high half the
+        // calling thread, both stamped by the kernel from the capability
+        // actually used. A caller can forge neither.
         let request = PersonalityCall::new(
             Dialect::Linux,
             received.method,
             [args[0], args[1], args[2], args[3], 0, 0],
-            0,
+            (received.badge >> 32) as u32,
             received.badge as u32,
         );
         let (how, reply) = answer(&request);

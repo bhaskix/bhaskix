@@ -252,6 +252,14 @@ pub mod method {
     /// personality decides what that means to the dialect it speaks. Answers
     /// the new thread's id.
     pub const SPAWN_THREAD: u64 = 64;
+    /// `SET_TLS(thread, base)` on a `Domain` — a thread's thread-local base.
+    ///
+    /// [RFC 0032](../../docs/rfc/0032-a-supervisor-interface.md). Generic:
+    /// every ABI has a thread-local base and this architecture keeps it in a
+    /// register that is **per CPU**, so the value has to travel with the
+    /// thread across every switch or it is gone at the first one. Which
+    /// dialect asked, and under what name, is the personality's business.
+    pub const SET_TLS: u64 = 65;
 
     /// Map the memory this capability names into the caller's address space.
     ///

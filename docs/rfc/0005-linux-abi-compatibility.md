@@ -571,6 +571,15 @@ kernel.
 > [RFC 0031](0031-linux-compatibility-as-an-adapter.md) §5 carries the shape,
 > and [security.md](../security.md) §1's **T11** row states what it costs
 > meanwhile.
+>
+> **Where it stands, 2026-08-20:** the trigger was met and the move is nine
+> steps in ([RFC 0032](0032-a-supervisor-interface.md)). `kernel/src/signal.rs`
+> is deleted, `bin/linuxd` answers foreign calls from ring 3, and the count of
+> Linux numbers the nucleus still interprets — gated on every boot as a ratchet
+> that may only fall — reads **2**: `futex` and `write`. The paragraph above
+> this correction is what the tree does again, for everything but those two,
+> and each of those waits on a capability the adapter does not yet hold rather
+> than on code.
 
 ### The initial process image
 

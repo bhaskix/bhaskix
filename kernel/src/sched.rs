@@ -1273,13 +1273,23 @@ impl FxArea {
 pub fn set_fs_base(thread: u32, base: u64) -> bool {
     for queue in QUEUES.iter().take(percpu::online_count() as usize) {
         let mut queue = queue.lock();
+        let running = queue.threads[queue.current].as_ref().map(|t| t.id);
         if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
             target.fs_base = base;
-            // SAFETY: `IA32_FS_BASE` is a segment base for *user* accesses;
-            // every access through it is still a user-mode access under the
-            // caller's own page table, so a wrong value faults the caller
-            // and reaches nothing of the kernel's.
-            unsafe { bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, base) };
+            // **Loaded only for the thread that is on this CPU right now.**
+            // The register is one per CPU and the value belongs to a thread,
+            // so writing it for anybody else would hand this CPU's current
+            // thread a base that is not its own -- which became reachable the
+            // moment a supervisor could set another thread's TLS from
+            // outside it (RFC 0032 step 9). Every other thread gets it at its
+            // next switch, which is where the base travels.
+            if running == Some(thread) {
+                // SAFETY: `IA32_FS_BASE` is a segment base for *user*
+                // accesses; every access through it is still a user-mode
+                // access under the caller's own page table, so a wrong value
+                // faults the caller and reaches nothing of the kernel's.
+                unsafe { bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, base) };
+            }
             return true;
         }
     }
@@ -2502,6 +2512,7 @@ pub fn preempt() {
         // The floating-point file travels with the thread: saved out of the
         // CPU for whoever is leaving, restored for whoever is arriving.
         // This is `CR4.OSFXSR`'s promise being kept.
+        let leaving_base = queue.threads[current].as_ref().map_or(0, |t| t.fs_base);
         if let Some(from_thread) = queue.threads[current].as_mut() {
             // SAFETY: 512 aligned bytes belonging to the thread being
             // switched away from, and this is its last instant on the CPU.
@@ -2513,8 +2524,14 @@ pub fn preempt() {
             crate::telemetry::note_domain(to_thread.domain);
             // The thread-local base travels with the thread, because the
             // register does not: it is one per CPU, and a hosted program
-            // that set one expects to find it after any switch.
-            if to_thread.fs_base != 0 {
+            // that set one expects to find it after any switch. **The
+            // arriving thread's base is loaded even when it is zero** --
+            // otherwise a thread that never set one keeps its predecessor's,
+            // which is another domain's pointer sitting in this thread's
+            // segment base. The comparison is against what the CPU already
+            // holds, which is the leaving thread's, so the common case where
+            // neither uses TLS still writes no MSR.
+            if to_thread.fs_base != leaving_base {
                 // SAFETY: as `set_fs_base` -- a user-mode segment base.
                 unsafe {
                     bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, to_thread.fs_base)
@@ -3101,6 +3118,7 @@ pub fn block_self() {
                 // As above: the note is about the incoming thread and is
                 // taken whether or not the outgoing slot still holds one.
                 // As above: the floating-point file travels with the thread.
+                let leaving_base = queue.threads[current].as_ref().map_or(0, |t| t.fs_base);
                 if let Some(from_thread) = queue.threads[current].as_mut() {
                     // SAFETY: as the other switch site.
                     unsafe { bhaskix_arch::cpu::fx_save(from_thread.fx.0.as_mut_ptr()) };
@@ -3109,7 +3127,9 @@ pub fn block_self() {
                     // SAFETY: as the other switch site.
                     unsafe { bhaskix_arch::cpu::fx_restore(to_thread.fx.0.as_ptr()) };
                     crate::telemetry::note_domain(to_thread.domain);
-                    if to_thread.fs_base != 0 {
+                    // As the other site: the arriving thread's base, zero
+                    // included, against what the CPU already holds.
+                    if to_thread.fs_base != leaving_base {
                         // SAFETY: as above.
                         unsafe {
                             bhaskix_arch::msr::write(

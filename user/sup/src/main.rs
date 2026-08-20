@@ -325,7 +325,12 @@ fn supervise(image_bytes: u64) -> bool {
     held
 }
 
-/// The five methods, against a child that is running.
+/// A thread-local base to ask for. Never installed anywhere: the one call
+/// that names it is a refusal arm, and a supervisor that could set another
+/// domain's thread base could point a program's `fs:` wherever it liked.
+const TLS_BASE: u64 = 0x0000_7000_0000_0000;
+
+/// The methods, against a child that is running.
 fn supervise_child() -> bool {
     if !attach_scratch() {
         write(b"sup: could not map its own scratch page\n");
@@ -460,11 +465,20 @@ fn supervise_child() -> bool {
     // gives. Deleting the kind check turns this into the latter, and only an
     // assertion on the value can tell. A boolean could not, and did not: the
     // check was deleted and this gate stayed green.
+    // A thread that is alive and is **not this child's** -- RFC 0032 step 9.
+    // Thread 1 is the machine's own, in domain zero, so this asks a
+    // supervisor to set the TLS base of a thread it has no authority over.
+    // Aiming at a thread id that does not exist would be refused by the
+    // scheduler's own lookup and would say nothing about ownership; this arm
+    // is refused by the ownership check or not at all, which is why it is
+    // aimed at a thread that is certainly there.
+    let (not_its_thread, _) = call(syscall::INVOKE, CHILD, method::SET_TLS, [1, TLS_BASE, 0, 0]);
     let refused = unmapped_read != status::OK
         && not_held != status::OK
         && too_long != status::OK
         && not_a_domain == status::NO_SUCH_METHOD
-        && no_such_protection != status::OK;
+        && no_such_protection != status::OK
+        && not_its_thread == status::NO_SUCH_CAPABILITY;
     if !refused {
         // **Which one, and what it answered.** A line saying only that
         // something was allowed sends the next reader back to the source to
@@ -482,7 +496,11 @@ fn supervise_child() -> bool {
         write_number(status::NO_SUCH_METHOD);
         write(b"), protection ");
         write_number(no_such_protection);
-        write(b"\n");
+        write(b", not-its-thread ");
+        write_number(not_its_thread);
+        write(b" (wanted ");
+        write_number(status::NO_SUCH_CAPABILITY);
+        write(b")\n");
         return false;
     }
 
@@ -501,8 +519,8 @@ fn supervise_child() -> bool {
     write(
         b"sup: supervised a running child -- mapped a page into it, wrote a word across, \
 read it back, and was refused an unmapped address, a domain it \
-does not hold, an oversized copy, a capability that is not a domain, and a protection that \
-does not exist\n",
+does not hold, an oversized copy, a capability that is not a domain, a protection that \
+does not exist, and a thread that is not its own\n",
     );
     true
 }

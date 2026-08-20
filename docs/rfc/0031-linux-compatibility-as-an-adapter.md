@@ -230,6 +230,13 @@ of Linux ABI in ring 0. The pure decision logic *was* kept out — `personality/
 rewrite, but the parsing of untrusted pointers and the mutation of address spaces are in the
 nucleus today.
 
+> **Where it stands, 2026-08-20.** Nine steps of [RFC 0032](0032-a-supervisor-interface.md)
+> later, the paragraph above describes the tree it was written about and not the tree today:
+> `kernel/src/signal.rs` is deleted, `foreign_signal_call` and `foreign_memory_call` are gone
+> with it, and `foreign_thread_call` answers two numbers rather than a family. The ratchet reads
+> **2** — `futex` and `write` — and both wait on a capability the adapter cannot yet hold: a
+> notification pool and a console.
+
 Why it happened is worth recording, because it is not carelessness: steps 2–8 needed the address
 space, the scheduler and the fault path, and the in-nucleus route was the shortest path to a
 *measured* result — a real Go binary making 212 traced system calls, which is what the RFC asks for
@@ -254,7 +261,9 @@ The correction has a shape and a trigger, and deliberately does not happen this 
   > **The mechanism is specified, 2026-08-19: [RFC 0032](0032-a-supervisor-interface.md).** The
   > relocation was blocked on something this RFC did not name — an adapter in ring 3 has no way
   > to read a hosted process's memory, change its mappings, or set a thread's registers, because
-  > no capability confers any of that. RFC 0032 adds six methods on a `Domain` capability, none
+  > no capability confers any of that. RFC 0032 adds seven methods on a `Domain` capability — six
+  > as drafted, plus `SET_TLS` at its step 9, when a thread-local base turned out to be another
+  > thing only the kernel can set — none
   > of them a Linux concept, and states the trade this document only implied: **the nucleus
   > grows a supervisor interface so the personality can leave entirely.**
 - **Shape:** I1's frame becomes a real message to a domain; `foreign_*` moves to `bin/linuxd`

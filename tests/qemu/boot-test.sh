@@ -940,7 +940,7 @@ fi
 # domain" arm was aimed at the console, whose object id names no live domain,
 # so deleting the kind check entirely left the gate green; it is aimed at
 # `DomainControl` now, whose id is zero, and domain zero is real.
-if grep -qE "sup: supervised a running child -- mapped a page into it, wrote a word across, read it back, and was refused an unmapped address, a domain it does not hold, an oversized copy, a capability that is not a domain, and a protection that does not exist" "$LOG"; then
+if grep -qE "sup: supervised a running child -- mapped a page into it, wrote a word across, read it back, and was refused an unmapped address, a domain it does not hold, an oversized copy, a capability that is not a domain, a protection that does not exist, and a thread that is not its own" "$LOG"; then
     pass "a supervisor reached into a child it holds, and was refused everything it should be"
 else
     fail "the supervisor interface did not hold"
@@ -1284,10 +1284,10 @@ fi
 # and which this suite has made before.
 if grep -qE "personality +boundary: [0-9]+ linux numbers interpreted in the nucleus" "$LOG"; then
     interpreted=$(sed -n 's/.*boundary: \([0-9]*\) linux numbers.*/\1/p' "$LOG" | head -1)
-    if [[ "$interpreted" -le 7 ]]; then
+    if [[ "$interpreted" -le 2 ]]; then
         pass "the personality boundary is $interpreted linux numbers wide, and may only narrow"
     else
-        fail "the nucleus interprets $interpreted linux numbers, up from 7 -- RFC 0031 I1 wants 0"
+        fail "the nucleus interprets $interpreted linux numbers, up from 2 -- RFC 0031 I1 wants 0"
         status=1
     fi
     # And the instrument accounts for itself. Every foreign call is priced,
@@ -1387,7 +1387,7 @@ fi
 # proof of anything -- so the self-test detects that case and runs the whole
 # rendezvous again rather than reporting it as success. Seen once in a full
 # suite on 2026-08-19, on a kernel that had done nothing wrong.
-if grep -qE "linux clone +a Linux program cloned a thread \(tid [1-9][0-9]*, which the child agrees is its own\), then the two met through a futex: the parent slept, the child set the word to 42 and woke 1" "$LOG"; then
+if grep -qE "linux clone +a Linux program cloned a thread \(tid [1-9][0-9]*, which the child agrees is its own\), then the two met through a futex: the parent slept, the child set the word to 42 and woke 1, and the parent came back; its exit_group then took the spinning child with it" "$LOG"; then
     pass "clone makes a real thread, and the futex pairs a sleeper with a waker"
 else
     fail "the Linux clone self-test did not conclude"
@@ -1398,8 +1398,14 @@ fi
 # subtle mistake does not produce an error but a deadlock under load. A WAIT
 # whose word has already changed must refuse to sleep; a WAKE with nobody
 # asleep must wake none; a shared futex and a clone are refused with reasons.
-if grep -qE "linux futex +a Linux program asked its tid \([1-9][0-9]*\) and pid \([1-9][0-9]*\), yielded, and met the futex contract's edges" "$LOG"; then
-    pass "the futex contract holds at its edges, and the identity calls answer"
+# The tail of the same sentence is RFC 0032 step 9's: `arch_prctl` is answered
+# by a program in ring 3 now, which sets a *hosted* thread's TLS base from
+# outside that thread. The witness value read back through `fs:[0]` is what
+# says the base reached the thread it named rather than the CPU the adapter
+# happened to run on -- a distinction an answer of zero cannot make.
+if grep -qE "linux futex +a Linux program asked its tid \([1-9][0-9]*\) and pid \([1-9][0-9]*\), yielded, and met the futex contract's edges" "$LOG" \
+    && grep -qE "then it set its TLS base and read 0x5afe back through it" "$LOG"; then
+    pass "the futex contract holds at its edges, and the identity and TLS calls answer"
 else
     fail "the Linux futex self-test did not conclude"
     status=1

@@ -686,6 +686,83 @@ refactor is finished even though the count is not zero.
   service exists.
 - **`arch_prctl`** sets a thread's TLS base — a seventh supervisor method, and a generic one.
 
+## Step 9's record (2026-08-20): five more numbers leave, and the ratchet reads two
+
+**`gettid`, `arch_prctl`, `sched_yield`, `exit` and `exit_group` are answered in ring 3.** The
+ratchet reads **2** — `futex` and `write`, and each is two because a capability that does not
+exist yet, not because the boundary was drawn there on purpose.
+
+**Three of the five are not questions at all, they are acts on the caller** — give up a slice,
+end this thread, end this thread group — and only the kernel can perform them. The shape that
+carries them is the one step 6 already built: the reply says *what to do* rather than
+returning a value. Three new reply words, `YIELD`, `END_THREAD` and `END_DOMAIN`, and the
+nucleus still does not know which Linux number meant which. That distinction is the whole
+design in one line: `exit_group` ending a *domain* is a decision made in ring 3 by the dialect
+that knows what a thread group is.
+
+**`gettid` needed the badge to say more, and a badge is the one identifier a caller cannot
+forge.** Its low half was already the hosted domain; its high half is now the calling thread,
+stamped by the kernel from the capability actually used. The tid a hosted program sees is that
+number, offset by one so no thread is ever tid zero — the same offset `clone` already returned
+and the same one the nucleus used before the move, so a hosted program cannot tell that
+anything changed. Naming the thread *back* to the nucleus undoes the offset, in one place.
+
+**`SET_TLS` is the seventh supervisor method, and it is where this step found a real bug.**
+`sched::set_fs_base` wrote `IA32_FS_BASE` unconditionally — correct for every caller it had,
+because the only caller was a thread setting its own. A supervisor setting *another* thread's
+base made that wrong: the write landed on whatever thread was on the supervisor's CPU. It now
+loads the register only for the thread that is running here, and the switch loads the arriving
+thread's base **even when it is zero**, because the old `!= 0` test let a thread with no TLS
+inherit its predecessor's — another domain's pointer sitting in this thread's segment base.
+The first half is gated; the second is reasoned, and what would show it is a thread with no
+TLS reading `fs:` after one that had some, which nothing in this system does yet.
+
+### Four gates that could not fail, and now can
+
+- **`exit` never returns** was read out of a slot that a fresh page had already zeroed. An
+  `exit` that came back answering zero looked identical to one that never came back. The probe
+  seeds the slot with `0xe217` before the call now, so the value survives only if the store
+  after it never ran — and with the seed in place, an adapter that answered `exit` as a value
+  turned the gate red.
+- **`exit_group` had no gate at all.** No probe called 231; the Go corpus does, and the corpus
+  is not gated. The clone probe's parent now waits for a word the test writes *after* reading
+  its numbers — the domain's report frame is what those numbers live in — and then calls
+  `exit_group` while the child is still spinning. What is counted is the **child**: the thread
+  that asked for nothing. Armed by answering `exit_group` as `END_THREAD`, which left the child
+  running and the gate red.
+- **`arch_prctl` had no gate either.** The thread probe now sets its base to a witness word in
+  its own report page and reads it back through `fs:[0]`. The read is what makes the answer
+  mean anything: a call that wrote the register on the wrong CPU also answers zero. And the
+  base is set by a *different thread*, in ring 3, while the caller is blocked in the
+  rendezvous — so a base that did not travel with the thread through the switch back could not
+  produce this value.
+- **A supervisor setting a thread it does not own** is refused, and `bin/sup` asks for thread
+  1 — a live thread in domain zero — rather than an id that does not exist. An id that does
+  not exist is refused by the scheduler's own lookup and says nothing about ownership. With the
+  ownership check deleted, that call succeeded and the gate went red.
+
+### The instrument stopped reporting a mean over nothing
+
+With the calls gone, the in-nucleus placement has **no sample to price**: `futex` blocks by
+construction and is excluded, and `write` may never be called. The boundary report printed
+`floor 0 cycles over 0 non-blocking calls, mean 0`, and the both-placements line printed
+`nucleus floor 0` — a confident zero standing for "nothing was measured", which is the exact
+confusion this instrument exists to prevent and which its own gate's comment warns about. Both
+say so in words now. The cross-placement comparison stands on the figure recorded in step 3's
+table, taken while there was still something in the nucleus to compare against.
+
+### What is left
+
+**`futex`** still needs `BLOCK_ON` and a notification pool the adapter cannot create, and
+**`write`** still needs a `Console` the adapter cannot be given before the console service
+exists. Both are capabilities, not code — which is why the ratchet reads two rather than
+zero, and why the remaining work is a grant rather than a translation.
+
+The kernel's `unsafe` budget **rose** for the first time in four steps, 1,504 → 1,507, and all
+three lines are instrument: two `read_volatile`s for the TLS witness and one `write_volatile`
+telling the clone probe it may end its group. The five calls that moved took no `unsafe` with
+them, which is why they were the ones left.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -797,9 +874,15 @@ already in hand.
    below. Signals moved to step 6 when the fault path turned out to need more than an
    extension.*
 6. **Signals and the fault path** — the hard one: the faulting thread must be parked and the
-   adapter woken.
-6. **Threads and futex** — `SPAWN_THREAD` and `BLOCK_ON`.
+   adapter woken. ✅ *Delivered 2026-08-20 — see the record below.*
 7. **Signals move entirely** — the dispositions, the delivery, the decision. ✅ *Delivered
    2026-08-20; see the record below.*
-8. **Threads and futex**, then delete what is left of `mod linux`. The ratchet reads **0**, and
-   T11's mitigation column becomes true.
+8. **The calls a message cannot carry** — `clone` and `rt_sigreturn`, over a staged register
+   frame. ✅ *Delivered 2026-08-20 — see the record below.*
+9. **The identity, scheduling and ending calls** — `gettid`, `arch_prctl`, `sched_yield`,
+   `exit`, `exit_group`. The ratchet reads **2**. ✅ *Delivered 2026-08-20 — see the record
+   below.*
+10. **`futex` and `write`**, then delete what is left of `mod linux`. Each needs a capability
+    the adapter does not hold — a notification pool and a console — so this step is a grant
+    before it is a translation. The ratchet reads **0**, and T11's mitigation column becomes
+    true.

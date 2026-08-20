@@ -3017,12 +3017,28 @@ fn personality_boundary_report() {
     } else {
         "SOME UNCOUNTED:"
     };
-    println!(
-        "    personality    boundary: {interpreted} linux numbers interpreted in the nucleus \
-         (RFC 0031 wants 0); floor {floor} cycles over {priced} non-blocking calls, mean \
-         {mean}; {accounting} {counted} of {total} accounted ({excluded} block by \
-         construction, {dropped} preempted, {answered} answered in ring 3)"
-    );
+    // **A mean over an empty population is not a measurement**, and as of
+    // RFC 0032 step 9 the population really is empty on an ordinary boot: the
+    // two numbers still read in the nucleus are `futex`, which blocks by
+    // construction and is excluded from pricing, and `write`, which a machine
+    // may never make. Printing `floor 0 cycles ... mean 0` there would be a
+    // confident zero standing for "nothing was priced" -- the same confusion
+    // this instrument was built to stop, so it says which it is.
+    if priced == 0 {
+        println!(
+            "    personality    boundary: {interpreted} linux numbers interpreted in the nucleus \
+             (RFC 0031 wants 0); no in-nucleus call was priced -- none was made; {accounting} \
+             {counted} of {total} accounted ({excluded} block by construction, {dropped} \
+             preempted, {answered} answered in ring 3)"
+        );
+    } else {
+        println!(
+            "    personality    boundary: {interpreted} linux numbers interpreted in the nucleus \
+             (RFC 0031 wants 0); floor {floor} cycles over {priced} non-blocking calls, mean \
+             {mean}; {accounting} {counted} of {total} accounted ({excluded} block by \
+             construction, {dropped} preempted, {answered} answered in ring 3)"
+        );
+    }
     // What the adapter did, from the kernel's own counters rather than from
     // the adapter's word for it -- which is the only kind of evidence
     // available for a program that holds no console, and the better kind.
@@ -3098,11 +3114,25 @@ fn personality_boundary_report() {
     }
     let (adapter_priced, adapter_floor, adapter_mean) = syscall::adapter_cost();
     if adapter_priced > 0 {
-        println!(
-            "    linux domain   the boundary priced in both placements: nucleus floor {floor} \
-             cycles, adapter floor {adapter_floor} over {adapter_priced} round trips (mean \
-             {adapter_mean}) -- what the containment costs"
-        );
+        if floor > 0 {
+            println!(
+                "    linux domain   the boundary priced in both placements: nucleus floor \
+                 {floor} cycles, adapter floor {adapter_floor} over {adapter_priced} round \
+                 trips (mean {adapter_mean}) -- what the containment costs"
+            );
+        } else {
+            // **The other placement no longer exists to be measured**, which
+            // is the point of RFC 0032 rather than a gap in the instrument.
+            // Printing `nucleus floor 0` would read as a free nucleus, so the
+            // half that has no sample this boot says so, and the comparison
+            // is left to the figure recorded when there was one: 4,916
+            // cycles, RFC 0032 step 3's table.
+            println!(
+                "    linux domain   the boundary priced in ring 3: adapter floor \
+                 {adapter_floor} cycles over {adapter_priced} round trips (mean \
+                 {adapter_mean}); no nucleus sample -- nothing is answered there to compare"
+            );
+        }
     }
 }
 
@@ -3206,7 +3236,7 @@ const CLONE_REPORT_AT: u64 = 0x0000_0000_6002_0000;
 /// in the same address space *and* the futex wait/wake pair actually
 /// blocks and releases — which is the half step 6 could not prove with one
 /// thread, and the half Go's scheduler lives on.
-const CLONE_CODE: [u8; 183] = [
+const CLONE_CODE: [u8; 199] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page (shared, both threads)
     0x4c, 0x89, 0xfe, // mov rsi, r15
     0x48, 0x81, 0xc6, 0x00, 0x08, 0x00, 0x00, // add rsi, 0x800        ; child stack top
@@ -3223,7 +3253,11 @@ const CLONE_CODE: [u8; 183] = [
     0x4d, 0x89, 0xf8, // mov r8, r15           ; tls = the shared page, which
     //                                   this personality hands the child in
     //                                   rdi (see cloned_thread)
-    0x4c, 0x8d, 0x0d, 0x44, 0x00, 0x00, 0x00, // lea r9, [rip+child]   ; the entry
+    0x4c, 0x8d, 0x0d, 0x54, 0x00, 0x00, 0x00, // lea r9, [rip+child]   ; the entry
+    //                                   (0x54, not 0x44: the parent's tail
+    //                                   grew by the sixteen bytes of the
+    //                                   `exit_group` wait below, and this
+    //                                   displacement reaches past it)
     0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56           ; clone
     0x0f, 0x05, // syscall
     0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax      ; the tid the parent got
@@ -3241,7 +3275,19 @@ const CLONE_CODE: [u8; 183] = [
     0x49, 0x89, 0x47, 0x18, // mov [r15+24], rax     ; the word the child set
     0x48, 0xb8, 0x45, 0x54, 0x55, 0x46, 0x58, 0x4b, 0x48, 0x42, // movabs rax, marker
     0x49, 0x89, 0x47, 0x38, // mov [r15+56], rax     ; marker last
-    0xeb, 0xfe, // jmp $
+    // **`exit_group`, on the kernel's word rather than at once** -- RFC 0032
+    // step 9. The claim is that ending a *group* ends the other thread too,
+    // and the only witness is the kernel counting the domain's threads. But
+    // a domain that ends takes its report frame with it, and the frame is
+    // what the numbers above are read out of. So the parent waits here for a
+    // word the test writes once it has read them, and only then ends the
+    // group -- the child is still spinning below when it does.
+    0x49, 0x8b, 0x47, 0x60, // wait: mov rax, [r15+96]
+    0x48, 0x85, 0xc0, //       test rax, rax
+    0x74, 0xf7, //             jz wait
+    0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231          ; exit_group
+    0x0f, 0x05, // syscall
+    0xeb, 0xfe, // jmp $                 ; unreachable if the group ended
     0x49, 0x89, 0xff, // child: mov r15, rdi   ; the page, as handed over
     // Let the parent reach its sleep first. Without this the child wins the
     // race, the parent's WAIT sees a word that already changed and returns
@@ -3431,6 +3477,38 @@ fn clone_rendezvous_attempt(
         }
         wait_millis(5);
     }
+
+    // **The group's exit, watched from outside it.** The numbers are read;
+    // the parent is told it may go; and what is counted is whether the
+    // *child* -- which is spinning and has asked for nothing -- goes with
+    // it. That is the whole difference between `exit` and `exit_group`, and
+    // nothing inside the domain could report it: the reporter would be one
+    // of the threads whose ending is the claim.
+    let mut group_ended = false;
+    if marked {
+        let report_pa = CLONE_REPORT_PA.load(Ordering::Acquire);
+        if report_pa != 0 {
+            // SAFETY: the frame the probe's space owns, through the direct
+            // map, and the domain is still alive: nothing has been retired.
+            unsafe { core::ptr::write_volatile((hhdm_base + report_pa + 96) as *mut u64, 1) };
+            // Asked twice, for the reason `wait_for_probe_threads` gives: a
+            // runqueue that could not be locked counts as empty, so one pass
+            // can answer zero for a thread that is merely on a busy CPU.
+            let mut clear = 0;
+            for _ in 0..400 {
+                if sched::threads_in_domain(realm.as_u32()) == 0 {
+                    clear += 1;
+                    if clear == 2 {
+                        group_ended = true;
+                        break;
+                    }
+                } else {
+                    clear = 0;
+                }
+                wait_millis(5);
+            }
+        }
+    }
     retire_probe(realm);
 
     // The parent's view of the tid, its wait's answer, the word the child
@@ -3456,21 +3534,28 @@ fn clone_rendezvous_attempt(
         && parent_saw == child_tid
         && wait_answer == 0
         && word == 42
-        && woke == 1;
+        && woke == 1
+        && group_ended;
     if right {
         println!(
             "    linux clone    a Linux program cloned a thread (tid {parent_saw}, which the \
              child agrees is its own), then the two met through a futex: the parent slept, the \
-             child set the word to 42 and woke {woke}, and the parent came back (attempt \
-             {attempt})"
+             child set the word to 42 and woke {woke}, and the parent came back; its \
+             exit_group then took the spinning child with it (attempt {attempt})"
         );
         Some(true)
     } else {
         let foreign = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - foreign_before;
         println!(
             "\x1b[91m    linux clone    FAILED: marked {}, parent saw {}, wait {}, word {}, \
-             child tid {}, woke {}, {foreign} foreign calls\x1b[0m",
-            marked, parent_saw as i64, wait_answer as i64, word, child_tid as i64, woke as i64
+             child tid {}, woke {}, group ended {}, {foreign} foreign calls\x1b[0m",
+            marked,
+            parent_saw as i64,
+            wait_answer as i64,
+            word,
+            child_tid as i64,
+            woke as i64,
+            group_ended
         );
         Some(false)
     }
@@ -3489,7 +3574,7 @@ const THREAD_REPORT_AT: u64 = 0x0000_0000_5002_0000;
 /// contract's edges -- a `WAIT` whose word has already changed (which must
 /// *not* sleep), a `WAKE` with nobody asleep, a shared futex (refused), and
 /// a `clone` (refused, with the reason recorded in the RFC).
-const THREAD_CODE: [u8; 151] = [
+const THREAD_CODE: [u8; 195] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page
     0xb8, 0xba, 0x00, 0x00, 0x00, // mov eax, 186          ; gettid
     0x0f, 0x05, // syscall
@@ -3524,6 +3609,22 @@ const THREAD_CODE: [u8; 151] = [
     0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56           ; clone
     0x0f, 0x05, // syscall
     0x49, 0x89, 0x47, 0x30, // mov [r15+48], rax     ; expect -ENOSYS
+    // The thread-local base, and then a read *through* it -- RFC 0032 step
+    // 9. The witness word is written into the report page, the base is set
+    // to point at it, and `fs:[0]` reads it back. Both halves matter: the
+    // answer says `arch_prctl` was accepted, and the read says the base
+    // survived the round trip through a program in ring 3 and the switch
+    // back -- which is the only way to see a base that was written to the
+    // wrong CPU's register.
+    0x49, 0xc7, 0x47, 0x58, 0xfe, 0x5a, 0x00, 0x00, // mov qword [r15+88], 0x5afe
+    0x4c, 0x89, 0xfe, // mov rsi, r15
+    0x48, 0x83, 0xc6, 0x58, // add rsi, 88           ; &witness
+    0xbf, 0x02, 0x10, 0x00, 0x00, // mov edi, 0x1002       ; ARCH_SET_FS
+    0xb8, 0x9e, 0x00, 0x00, 0x00, // mov eax, 158          ; arch_prctl
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x48, // mov [r15+72], rax     ; expect 0
+    0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov rax, fs:[0]
+    0x49, 0x89, 0x47, 0x50, // mov [r15+80], rax     ; expect 0x5afe
     0x48, 0xb8, 0x45, 0x54, 0x55, 0x46, 0x58, 0x4b, 0x48, 0x42, // movabs rax, "BHKXFUTE"
     0x49, 0x89, 0x47, 0x38, // mov [r15+56], rax     ; the marker, written last
     0xeb, 0xfe, // jmp $
@@ -3626,7 +3727,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // set of numbers -- which is exactly what happened on the first run of
     // this test, and is why every report page in this project is marked.
     const MARKER: u64 = u64::from_le_bytes(*b"ETUFXKHB");
-    let mut answers = [0u64; 7];
+    let mut answers = [0u64; 9];
     let mut marked = false;
     for _ in 0..400 {
         let report_pa = THREAD_REPORT_PA.load(Ordering::Acquire);
@@ -3643,6 +3744,8 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
                         core::ptr::read_volatile((hhdm_base + report_pa + 32) as *const u64),
                         core::ptr::read_volatile((hhdm_base + report_pa + 40) as *const u64),
                         core::ptr::read_volatile((hhdm_base + report_pa + 48) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 72) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 80) as *const u64),
                     ],
                 )
             };
@@ -3661,6 +3764,12 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // A tid and a pid that are never zero (a runtime treats zero as an
     // error), a yield that answered, the compare-and-sleep refusing to
     // sleep on a stale word, a wake with nobody asleep, and both refusals.
+    //
+    // The last two are RFC 0032 step 9's: `arch_prctl` accepted, and the
+    // witness word read back **through** the base it set. The second is what
+    // makes the first mean anything -- an answer of zero from a call that
+    // wrote the register on the wrong CPU would look identical.
+    const WITNESS: u64 = 0x5afe;
     let right = marked
         && answers[0] != 0
         && answers[1] != 0
@@ -3668,27 +3777,31 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
         && answers[3] == eagain
         && answers[4] == 0
         && answers[5] == enosys
-        && answers[6] == enosys;
+        && answers[6] == enosys
+        && answers[7] == 0
+        && answers[8] == WITNESS;
     if right {
         println!(
             "    linux futex    a Linux program asked its tid ({}) and pid ({}), yielded, and \
              met the futex contract's edges: a WAIT on a word that had already changed refused \
              to sleep (EAGAIN), a WAKE with nobody asleep woke none, a shared futex and a clone \
-             were refused",
-            answers[0], answers[1]
+             were refused; then it set its TLS base and read {:#x} back through it",
+            answers[0], answers[1], answers[8]
         );
         true
     } else {
         println!(
             "\x1b[91m    linux futex    FAILED: tid {}, pid {}, yield {}, stale-wait {}, \
-             empty-wake {}, shared {}, clone {}\x1b[0m",
+             empty-wake {}, shared {}, clone {}, arch_prctl {}, fs:[0] {:#x}\x1b[0m",
             answers[0],
             answers[1],
             answers[2] as i64,
             answers[3] as i64,
             answers[4] as i64,
             answers[5] as i64,
-            answers[6] as i64
+            answers[6] as i64,
+            answers[7] as i64,
+            answers[8]
         );
         false
     }
@@ -4132,7 +4245,7 @@ const AUXV_CODE: [u8; 81] = [
 /// intentional fault dump tripped the shell test's blanket no-EXCEPTION
 /// check -- an instrument should not have to be excused from other
 /// instruments.)
-const FOREIGNER_CODE: [u8; 97] = [
+const FOREIGNER_CODE: [u8; 105] = [
     0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, 39   (getpid)
     0x0f, 0x05, //                   syscall
     0x48, 0x89, 0x07, //             mov [rdi], rax
@@ -4163,7 +4276,15 @@ const FOREIGNER_CODE: [u8; 97] = [
     // Reached only if the line above did not end this thread, which is the
     // single strongest observation in this probe: read natively, 5 is Exit.
     0x48, 0xc7, 0x47, 0x40, 0x01, 0x00, 0x00, 0x00, // mov qword [rdi+64], 1
-    0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60   (exit_group)
+    // **The sentinel that makes the next slot mean something.** The claim is
+    // that `exit` never returns, and the slot below is how it is read -- but
+    // a fresh page is already zero, so a zero there proved nothing and an
+    // `exit` that came back answering zero would have looked identical. It
+    // did, when RFC 0032 step 9 moved the call to ring 3 and armed the gate.
+    // Seeded, the slot holds this value if and only if the store after the
+    // call never ran.
+    0x48, 0xc7, 0x47, 0x10, 0x17, 0xe2, 0x00, 0x00, // mov qword [rdi+16], 0xe217
+    0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60   (exit)
     0x0f, 0x05, //                   syscall
     0x48, 0x89, 0x47, 0x10, //       mov [rdi+16], rax
     0xeb, 0xfe, //                   jmp $ -- spin; the test puts it down
@@ -4580,7 +4701,10 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // that "the pid answered" while the probe had been refused. An assertion
     // that accepts an errno as a process id is an assertion about nothing.
     let pid = answers[0] as i64;
-    let all_refused = pid > 0 && pid < 4096 && answers[1] == ebadf && answers[2] == 0;
+    // The seed the probe wrote into the exit slot before calling `exit`. It
+    // survives if and only if the call never came back; see `FOREIGNER_CODE`.
+    const NEVER_RETURNED: u64 = 0xe217;
+    let all_refused = pid > 0 && pid < 4096 && answers[1] == ebadf && answers[2] == NEVER_RETURNED;
 
     // **RFC 0031 §6's Test 1, in the arm this probe can already fund.** The
     // five numbers the probe smuggled are RFC 0008's own syscall kinds. If

@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1504
+unsafe_budget = 1507
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -400,6 +400,18 @@ unsafe_budget = 1504
 # has and carries the same argument -- the entry is inside a user-executable
 # segment the loader accepted, and the stack address is one past user-writable
 # memory in the space just installed.
+#
+# **1507 at step 9, and the three lines are all instrument.** The five calls
+# that moved took no `unsafe` with them -- they were scalars and scheduler
+# calls, which is why they were the ones left. What was added is the evidence:
+# two more `read_volatile`s in the thread probe's report page, for the
+# `arch_prctl` answer and the word read back through the base it set, and one
+# `write_volatile` telling the clone probe's parent it may call `exit_group`
+# now that its numbers have been read. All three are the direct-map idiom
+# every probe beside them uses, on a frame the probe's own space owns. A
+# budget that rose for a self-test is worth more than one that stayed flat
+# with the path ungated -- and the gate is the reason `exit_group` can be
+# claimed to end a thread that never asked for anything.
 #
 # **1504 at step 8, down a third time**: `rt_sigreturn` left, and with it the
 # last `uaccess` read the personality had in the nucleus. Three consecutive

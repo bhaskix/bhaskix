@@ -143,6 +143,7 @@ const _: () = {
     assert!(method::UNMAP_AT == bhaskix_abi::method::UNMAP_AT);
     assert!(method::PROTECT_AT == bhaskix_abi::method::PROTECT_AT);
     assert!(method::SPAWN_THREAD == bhaskix_abi::method::SPAWN_THREAD);
+    assert!(method::SET_TLS == bhaskix_abi::method::SET_TLS);
     assert!(method::GRANT == bhaskix_abi::method::GRANT);
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
@@ -291,6 +292,8 @@ pub mod method {
     pub const PROTECT_AT: u64 = 63;
     /// Start a thread in a held domain. RFC 0032.
     pub const SPAWN_THREAD: u64 = 64;
+    /// Set a thread's thread-local base. RFC 0032.
+    pub const SET_TLS: u64 = 65;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1020,6 +1023,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 | method::UNMAP_AT
                 | method::PROTECT_AT
                 | method::SPAWN_THREAD
+                | method::SET_TLS
         )
         && let Some(outcome) = domain_supervise(frame)
     {
@@ -1717,20 +1721,8 @@ use bhaskix_personality::call::{Dialect, PersonalityCall};
 mod linux {
     /// `futex(uaddr, op, val, timeout, uaddr2, val3)`.
     pub const FUTEX: u64 = 202;
-    /// `gettid()`.
-    pub const GETTID: u64 = 186;
-    /// `exit_group(status)` — every thread of the group.
-    pub const EXIT_GROUP: u64 = 231;
-    /// `exit(status)` — this thread only. Distinct numbers and distinct
-    /// meanings: a hosted program with one thread cannot tell them apart,
-    /// and one with many very much can.
-    pub const EXIT: u64 = 60;
-    /// `sched_yield()`.
-    pub const SCHED_YIELD: u64 = 24;
     /// `write(fd, buf, count)`.
     pub const WRITE: u64 = 1;
-    /// `arch_prctl(code, addr)` — `ARCH_SET_FS` is the one that matters.
-    pub const ARCH_PRCTL: u64 = 158;
 
     /// Every number above, once, so the boundary has a size.
     ///
@@ -1741,15 +1733,7 @@ mod linux {
     /// alternative, deriving it from the dispatch, needs the dispatch to be
     /// a table rather than a `match`, which is a change worth making when
     /// the personality moves rather than before.
-    pub const ANSWERED: [u64; 7] = [
-        FUTEX,
-        GETTID,
-        EXIT_GROUP,
-        EXIT,
-        SCHED_YIELD,
-        WRITE,
-        ARCH_PRCTL,
-    ];
+    pub const ANSWERED: [u64; 2] = [FUTEX, WRITE];
 
     // No number appears twice: a duplicate would make the boundary look
     // smaller than it is, which is the one direction this count must never
@@ -1800,16 +1784,16 @@ fn futex_word(address: u64) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
-/// Answers the thread and futex calls — RFC 0005 step 6.
+/// Answers the two numbers still read here — RFC 0032 step 9.
 ///
-/// `clone` becomes a thread in the caller's own domain, entered at the
-/// address the caller supplied on the stack it supplied: the personality
-/// creates nothing the domain could not, which is rule 2 again. `futex`
-/// parks on the kernel's own wait queues, which is the primitive the RFC
-/// said this needs. `exit_group` ends the domain, which is what makes a
-/// thread group's exit exact.
+/// What is left is `futex`, which parks on the kernel's own wait queues, and
+/// `write`, which needs a console the adapter has not been given. Both are
+/// named in RFC 0032 as wanting a capability that does not exist yet: a
+/// blocking primitive the adapter could hold, and a `Console`. Until those
+/// exist these two are answered here and counted against the ratchet, which
+/// is the honest shape — the number is two because two capabilities are
+/// missing, not because the boundary was drawn there on purpose.
 fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
-    use bhaskix_personality::memory::errno;
     use bhaskix_personality::thread::{self, FutexPlan};
 
     let (first, second, third) = (call.first(), call.second(), call.third());
@@ -1845,55 +1829,6 @@ fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
         // The thread-local base. Go sets it before it touches anything in
         // `fs:`, which is nearly everything the runtime does -- so without
         // this a hosted Go program faults on its own scheduler.
-        linux::ARCH_PRCTL => {
-            const ARCH_SET_FS: u64 = 0x1002;
-            if first != ARCH_SET_FS {
-                return Some(errno::ENOSYS as u64);
-            }
-            // Recorded on the thread and loaded now. Not written straight
-            // to the MSR and left there: the register is per CPU and the
-            // thread is not, so the value has to travel with the thread
-            // across every switch or it is gone at the first one -- which
-            // is what Go's `rt0` catches three instructions later.
-            let thread = crate::sched::current_thread_id()?;
-            if !crate::sched::set_fs_base(thread, second) {
-                return Some(errno::ENOSYS as u64);
-            }
-            Some(0)
-        }
-        // Answered rather than refused, because Go reads the affinity mask
-        // to size its scheduler and treats a refusal as one CPU. The mask
-        // says how many this machine really has -- a truthful answer that
-        // costs nothing.
-        // Signal masking is recorded nowhere and honoured nowhere yet, and
-        // answering zero is the *correct* lie for a system that delivers
-        // only synchronous faults: nothing this personality can deliver is
-        // maskable, so a mask that changes nothing is accurate. The trigger
-        // for making it real is the first asynchronous signal.
-        // A thread id a hosted program can tell apart from its neighbours,
-        // and stable for the life of the thread. Derived from the scheduler's
-        // own id, offset so no thread is ever tid zero (Linux never issues
-        // one, and a runtime that sees zero treats it as an error).
-        linux::GETTID => crate::sched::current_thread_id().map(|id| u64::from(id) + 1),
-        linux::SCHED_YIELD => {
-            crate::sched::yield_now();
-            Some(0)
-        }
-        linux::EXIT => {
-            // This thread, not the group. The domain ends when its last
-            // thread does, which is RFC 0017's own rule and needs no help
-            // from here.
-            crate::sched::exit()
-        }
-        linux::EXIT_GROUP => {
-            // Every thread of the group, which is every thread of the
-            // domain. `exit` never returns, so nothing after this runs.
-            crate::domain::end(
-                crate::domain::DomainId::from_u32(domain),
-                crate::domain::Ending::Exited,
-            );
-            crate::sched::exit()
-        }
         linux::FUTEX => {
             match thread::plan_futex(first, second, third) {
                 FutexPlan::Wait { address, expected } => {
@@ -2176,6 +2111,21 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
             RESTORED.fetch_add(1, Ordering::Relaxed);
             Some(frame.kind)
         }
+        // Acts on the *caller* that only the kernel can perform, chosen by
+        // the dialect that knows what the call meant. None of them is a Linux
+        // concept: giving up a slice, ending a thread, ending a domain.
+        crate::fault::reply::YIELD => {
+            crate::sched::yield_now();
+            Some(answer.1)
+        }
+        crate::fault::reply::END_THREAD => crate::sched::exit(),
+        crate::fault::reply::END_DOMAIN => {
+            crate::domain::end(
+                crate::domain::DomainId::from_u32(call.domain),
+                crate::domain::Ending::Exited,
+            );
+            crate::sched::exit()
+        }
         _ => Some(answer.1),
     }
 }
@@ -2238,6 +2188,13 @@ fn ask_adapter_full(domain: u64, what: u64, args: [u64; 4]) -> Option<(u64, u64)
     // The adapter cannot touch a hosted process's memory without a capability
     // to its domain, and the kernel is what has one to give.
     ensure_adapter_holds(domain as u32);
+    // **The badge names the caller, and now names it fully.** Its low half is
+    // the hosted domain, as it always was; its high half is the calling
+    // thread, plus one so that no thread is ever zero. The adapter needs both
+    // and can forge neither -- the kernel stamps a badge from the capability
+    // actually used, which is the entire reason it can be believed.
+    let badge =
+        domain | (u64::from(crate::sched::current_thread_id().map_or(0, |id| id + 1)) << 32);
 
     // Congestion is retried, and it is safe to retry precisely because it
     // cannot half-happen: the message was refused *before* being queued, so
@@ -2250,7 +2207,7 @@ fn ask_adapter_full(domain: u64, what: u64, args: [u64; 4]) -> Option<(u64, u64)
         // The badge says which hosted domain is asking, and the kernel is
         // what stamps it. A caller cannot supply its own, which is the whole
         // reason the adapter can believe it.
-        match crate::ipc::call(endpoint, domain, what, args) {
+        match crate::ipc::call(endpoint, badge, what, args) {
             Ok(message) => {
                 // Counted only for a *system call*. A fault delivered through
                 // this same door is counted by `fault::HANDED`, and folding
@@ -2438,10 +2395,7 @@ fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
 /// CPU by definition, `clone` starts a thread, `exit` never returns, and
 /// `write` spends its time in a device.
 fn blocks_by_construction(number: u64) -> bool {
-    matches!(
-        number,
-        linux::FUTEX | linux::SCHED_YIELD | linux::EXIT | linux::EXIT_GROUP | linux::WRITE
-    )
+    matches!(number, linux::FUTEX | linux::WRITE)
 }
 
 /// Records what one foreign call cost. Only called for a call that
@@ -2939,6 +2893,23 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             match mapped {
                 Some(true) => Outcome::ok(address),
                 _ => Outcome::err(Status::QuotaExceeded),
+            }
+        }
+        method::SET_TLS => {
+            // The thread is named by id, and must belong to the domain this
+            // capability names -- a supervisor holds one domain's threads and
+            // not another's, and `set_fs_base` would happily set any.
+            let (thread, base) = (frame.arg0, frame.arg1);
+            let Ok(thread) = u32::try_from(thread) else {
+                return Some(Outcome::err(Status::WrongObject));
+            };
+            if crate::sched::domain_of(thread) != Some(target) {
+                return Some(Outcome::err(Status::NoSuchCapability));
+            }
+            if crate::sched::set_fs_base(thread, base) {
+                Outcome::ok(0)
+            } else {
+                Outcome::err(Status::NoSuchCapability)
             }
         }
         method::SPAWN_THREAD => {

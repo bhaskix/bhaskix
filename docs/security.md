@@ -68,28 +68,39 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > version is not "delivered" but *under what conditions* — **a mitigation column is a claim, and a
 > claim whose limits are not written down is believed further than it should be.**
 
-> **T11 is in scope and is not mitigated today, and the difference matters more than the row.**
+> **T11 is in scope and is mitigated *nearly*, which is a different sentence from the one this
+> note carried until 2026-08-20 and from the one it will carry when the move finishes.**
 > [RFC 0005](rfc/0005-linux-abi-compatibility.md) §"Where it lives" requires the Linux personality
 > to run in a **service domain**, precisely so that a bug in the largest untrusted-input parser in
-> the project is a compromise of that domain and not of the kernel. As of 2026-08-19 the
-> implementation is in the nucleus: `kernel/src/syscall.rs` holds the foreign-call path and the
-> Linux call numbers, and `kernel/src/signal.rs` builds and restores Linux signal frames — on the
-> order of 700 lines of Linux ABI in ring 0. Only the decision logic is outside it (`personality/`,
-> zero `unsafe`, host-tested).
+> the project is a compromise of that domain and not of the kernel. On 2026-08-19 the
+> implementation was in the nucleus: `kernel/src/syscall.rs` held the foreign-call path and
+> eighteen interpreted Linux call numbers, and `kernel/src/signal.rs` built and restored Linux
+> signal frames — on the order of 700 lines of Linux ABI in ring 0.
 >
-> **So the honest mitigation column for T11, today, is the first half of it and not the second.** A
-> hosted process still holds no capabilities and cannot name one, and its domain still reaches only
-> what it was granted — those are structural and hold. What does *not* hold is the containment of a
-> bug **in the translator**: today that is a kernel bug. [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md)
-> §5 records how this happened, and fixes the correction's trigger — before Tier 1's file surface,
-> because that is when the adapter starts holding per-process state and moving it gets dear.
+> **As of 2026-08-20 that is no longer where it lives.** `kernel/src/signal.rs` is deleted;
+> `bin/linuxd` answers foreign calls from ring 3, holding one endpoint and a supervisor capability
+> per hosted domain; and the count of Linux numbers the nucleus still interprets — printed on
+> every boot that ran a hosted program and gated as a ratchet that may only fall — reads **2**:
+> `futex` and `write`. Neither parses a hosted structure. Every parser, every signal frame, every
+> `mmap` decision and every descriptor is outside the kernel.
 >
-> **The mechanism the move needs is specified as of 2026-08-19**
-> ([RFC 0032](rfc/0032-a-supervisor-interface.md)): six methods on a `Domain` capability, so
-> that holding a program becomes an authority a program can be *given* rather than something
-> only the kernel can be. **This row's mitigation column does not become true when that RFC is
-> accepted — it becomes true when the personality actually moves**, which is several steps
-> later, and this note stays until then.
+> **So the honest mitigation column for T11, today: the first half holds structurally, and the
+> second holds for everything the adapter answers.** A hosted process holds no capabilities and
+> cannot name one, and its domain reaches only what it was granted. A bug in the translator is now
+> a bug in a ring 3 program that holds one endpoint and a supervisor capability over the domains it
+> serves — which is authority over hosted processes, and no authority over anything else. What is
+> not yet true is *entirely*: two calls are still answered in ring 0, and a bug in either is still
+> a kernel bug.
+> [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md) §5 records how the drift happened, and
+> fixed the correction's trigger — before Tier 1's file surface, because that is when the adapter
+> starts holding per-process state and moving it gets dear. That trigger was met.
+>
+> **The mechanism the move needed is [RFC 0032](rfc/0032-a-supervisor-interface.md)**: seven
+> methods on a `Domain` capability, so that holding a program is an authority a program can be
+> *given* rather than something only the kernel can be. **This row's column becomes wholly true
+> when the ratchet reads zero** — which needs the adapter to hold a notification pool (for
+> `futex`) and a console (for `write`), both grants rather than translations. This note stays,
+> with its number, until then.
 >
 > Written here rather than only in the RFC because [RFC 0005](rfc/0005-linux-abi-compatibility.md)'s
 > own impact table asked for this row on the day it was drafted — *"The threat model gains an

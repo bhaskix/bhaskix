@@ -70,6 +70,21 @@ pub mod reply {
     /// Resume the caller from the registers in the slot the first word
     /// names, rather than from a value — `rt_sigreturn`.
     pub const RESTORE: u64 = 3;
+    /// Give up the caller's slice, then answer it the first word.
+    ///
+    /// A scheduling act on the *caller*, which only the kernel can perform —
+    /// but *whether* to perform it is the dialect's business, and this is how
+    /// the dialect says so.
+    pub const YIELD: u64 = 4;
+    /// End the calling thread. It does not return.
+    pub const END_THREAD: u64 = 5;
+    /// End the caller's whole domain. It does not return.
+    ///
+    /// A Linux thread group's exit is every thread of it, and a hosted
+    /// process is a domain — so `exit_group` is this, and the exactness Go
+    /// depends on is the kernel's ordinary teardown rather than anything the
+    /// personality has to reproduce.
+    pub const END_DOMAIN: u64 = 6;
 }
 
 /// What the adapter answered.
