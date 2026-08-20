@@ -10,21 +10,49 @@ we do **not** defend against. A threat model that claims to cover everything cov
 
 ## 1. Threat model
 
+> ### Before any row below: what this evidence is worth
+>
+> **Nothing in this document has ever been observed on physical hardware** (M1-17). Every mitigation
+> marked built below is built and gated *in QEMU*, and QEMU is not a machine: its VT-d is a model of
+> an IOMMU, it has no SMM, no Management Engine, no firmware with its own opinions, and no device
+> that misbehaves in the way real devices do. That is not a reason to distrust the rows — the gates
+> are real and have each been watched go red — but it is a ceiling on how far any of them should be
+> believed, and it applies to all of them at once.
+>
+> The second ceiling is narrower and sharper: **the kernel image is loaded without any authenticity
+> check.** `bhaskixboot.efi` refuses a kernel that fails the *ELF parser* — the negative arm in
+> `tests/qemu/native-boot-test.sh` corrupts the magic and asserts the refusal — and that is
+> integrity against corruption, not authenticity against an attacker. Anyone who can write the ESP
+> replaces the kernel and owns ring 0 from the next boot. T6 and T7 below are that gap, and their
+> status column now says so.
+>
+> **The status column is new, 2026-08-20, and it exists because of a sentence already in this
+> document**: *a mitigation column is a claim, and a claim whose limits are not written down is
+> believed further than it should be.* **Three rows described mitigations that do not exist** (T5,
+> T6, T7) **and a fourth described one that is half-built** (T8), all in the present tense, and a
+> reader could not tell which. That is the failure mode this project exists to refuse, found in the
+> project's own security document.
+
 ### In scope — we intend to defend against these
 
-| # | Threat | Primary mitigation |
-|---|---|---|
-| T1 | A compromised userspace process attempts to gain kernel privilege | Capability system; no ambient authority; no setuid; W^X; SMEP/SMAP |
-| T2 | A compromised process attempts to access another domain's data | Address-space isolation; capabilities; no shared namespace by default |
-| T3 | A compromised or malicious **device driver** | IOMMU-enforced DMA windows; per-device capabilities; relocatable-service isolation |
-| T4 | A malicious peripheral performing DMA (evil maid, malicious PCIe/Thunderbolt device) | IOMMU on by default; devices default-denied until enumerated and granted |
-| T5 | A guest VM escaping to the host | Domain isolation is the same mechanism as containers; EPT/NPT; no shared hypervisor codebase to diverge |
-| T6 | Persistence across reboot (bootkit, tampered kernel or initrd) | UEFI Secure Boot chain; measured boot into TPM PCRs; signed, immutable system image |
-| T7 | Tampering with an update in transit or at rest | Signed A/B images; rollback protection via monotonic counter; verified before switch |
-| T8 | Undetected compromise | Tamper-evident audit log; remote attestation; the telemetry plane is the audit source |
-| T9 | Memory-safety bugs in kernel code | Rust; `unsafe` budget tracked per crate; every `unsafe` block justified and reviewed |
-| T10 | Resource exhaustion by one domain denying service to others | `ResourceEnvelope` enforced at allocation and scheduling time, not by best effort |
-| T11 | A hostile or compromised **Linux application inside a compatibility domain**, attacking through malformed system-call arguments or through Linux privilege (`root`) | The Linux personality translates and never manufactures authority; a hosted process holds no capabilities and has no way to name one; a compatibility domain reaches only what it was granted; and **the translator itself runs in a service domain** as of 2026-08-20 — the nucleus interprets no Linux syscall number, gated on every boot ([RFC 0005](rfc/0005-linux-abi-compatibility.md), [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md), [RFC 0032](rfc/0032-a-supervisor-interface.md)) |
+**Status** is what is true in the tree today, not what the design intends: **built** means
+implemented and held by a gate that has been watched fail; **partial** means some of the mitigation
+exists and the row says which part; **planned** means the mitigation column describes a design and
+nothing in the tree implements it yet.
+
+| # | Threat | Primary mitigation | Status |
+|---|---|---|---|
+| T1 | A compromised userspace process attempts to gain kernel privilege | Capability system; no ambient authority; no setuid; W^X; SMEP/SMAP | ✅ **built** — capability system, no ambient authority, SMEP/SMAP and the exception table gated on every boot. **One weakness named**: there is no ASLR for user programs; only the kernel image is slid |
+| T2 | A compromised process attempts to access another domain's data | Address-space isolation; capabilities; no shared namespace by default | ✅ **built** — address-space isolation and immediate transitive revocation, both gated |
+| T3 | A compromised or malicious **device driver** | IOMMU-enforced DMA windows; per-device capabilities; relocatable-service isolation | ✅ **built**, under the three conditions the note below states — and on a machine with no IOMMU a domain-hosted driver is refused outright rather than run unprotected |
+| T4 | A malicious peripheral performing DMA (evil maid, malicious PCIe/Thunderbolt device) | IOMMU on by default; devices default-denied until enumerated and granted | ✅ **built**, same three conditions; interrupt remapping is on by default and gated |
+| T5 | A guest VM escaping to the host | Domain isolation is the same mechanism as containers; EPT/NPT; no shared hypervisor codebase to diverge | ⬜ **planned** — domains exist and are the mechanism; **VMX/SVM and EPT/NPT do not**. There are no guests yet, so nothing has escaped and nothing has been prevented. Phase 3 |
+| T6 | Persistence across reboot (bootkit, tampered kernel or initrd) | UEFI Secure Boot chain; measured boot into TPM PCRs; signed, immutable system image | ⬜ **planned, not built** — no Secure Boot chain, no TPM measurement, no signed image. The loader refuses a kernel that fails the ELF *parser*, which is corruption-detection, not authenticity. **Whoever can write the ESP owns ring 0.** Phase 3 |
+| T7 | Tampering with an update in transit or at rest | Signed A/B images; rollback protection via monotonic counter; verified before switch | ⬜ **planned, not built** — no signing, no A/B slots, no rollback counter. There is no update mechanism at all yet, which is why nothing has been tampered with |
+| T8 | Undetected compromise | Tamper-evident audit log; remote attestation; the telemetry plane is the audit source | 🔨 **partial** — the telemetry plane is built and its `Audit` class applies backpressure rather than dropping ([RFC 0026](rfc/0026-telemetry-plane.md)); the tamper-evident log and remote attestation on top of it are Phase 3 and are not built |
+| T9 | Memory-safety bugs in kernel code | Rust; `unsafe` budget tracked per crate; every `unsafe` block justified and reviewed | 🔨 **partial, and permanently so** — Rust, `forbid(unsafe_op_in_unsafe_fn)`, `deny(undocumented_unsafe_blocks)`, and a per-crate budget enforced by the build. 4,170 lines of `unsafe` in tree, **2,740 of them (66%) in ring 0**. The discipline is built; the exposure is structural and does not go to zero |
+| T10 | Resource exhaustion by one domain denying service to others | `ResourceEnvelope` enforced at allocation and scheduling time, not by best effort | ✅ **built** — `ResourceEnvelope` enforced at allocation and scheduling time, gated ("envelope enforced, CPU share independent of thread count") |
+| T11 | A hostile or compromised **Linux application inside a compatibility domain**, attacking through malformed system-call arguments or through Linux privilege (`root`) | The Linux personality translates and never manufactures authority; a hosted process holds no capabilities and has no way to name one; a compatibility domain reaches only what it was granted; and **the translator itself runs in a service domain** as of 2026-08-20 — the nucleus interprets no Linux syscall number, gated on every boot ([RFC 0005](rfc/0005-linux-abi-compatibility.md), [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md), [RFC 0032](rfc/0032-a-supervisor-interface.md)) | 🔨 **mitigated 2026-08-20**, with the price written out in the note below rather than rounded to "contained" — the translator is in ring 3 and the nucleus interprets **0** Linux syscall numbers, gated; what a compromise of the adapter still reaches is enumerated |
 
 ### Out of scope — stated honestly
 
@@ -35,7 +63,8 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 | Physical attacker with unlimited time and equipment (bus probing, chip decapping, cold boot) | No software-only mitigation is credible | Memory encryption (SME/TME) — Phase 3, mitigation not solution |
 | Compromised firmware / SMM / Management Engine | Below our privilege level, by construction | Attestation *detects* some cases; it cannot prevent them |
 | Microarchitectural side channels (Spectre-class, MDS, port contention) | Requires per-CPU-generation mitigation work we cannot sustain yet | Phase 3: core scheduling, IBRS/STIBP, cache partitioning. Documented gap until then. |
-| Supply-chain compromise of the Rust toolchain or crates.io dependencies | Real, and not solved by us | Vendored + hash-pinned dependencies; minimal dependency count; reproducible builds — Phase 2 |
+| Supply-chain compromise of the Rust **toolchain** | Real, and not solved by us | Reproducible builds, and the boot image is already a deterministic function of its package set, byte-compared twice per build ([RFC 0030](rfc/0030-packages.md)) |
+| ~~Supply-chain compromise of crates.io dependencies~~ | **Corrected 2026-08-20: there are none.** `Cargo.lock` holds twenty packages and every one of them is `bhaskix-*`. This row previously promised "vendored + hash-pinned dependencies" as Phase 2 future work, which under-claimed what was already true — **there is nothing to vendor**, and an unearned understatement is as wrong as an unearned claim | Stays true only while it is checked. The build should fail on a non-`bhaskix` package entering the lockfile, and does not yet |
 | Denial of service by an authorised administrator | Authorisation is the boundary; we do not defend against correctly-authorised destruction | Audit log makes it *attributable*, not impossible |
 | Traffic analysis, timing, and power side channels on network paths | Out of scope for an OS kernel | — |
 
@@ -139,6 +168,26 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > in-scope adversary: a hostile process inside a Linux-personality domain… This is new and must be
 > written down, not assumed covered"* — and it was not written until now, while five of that RFC's
 > steps shipped.
+
+### Gaps found by the reassessment of 2026-08-20
+
+Neither a threat nor a mitigation: **work that is missing, ranked by what it would actually cost an
+attacker to exploit**, recorded here so the order survives the week it was decided in. Each was
+found by reading the tree rather than the documents, and each names what is true today.
+
+| | Gap | Why it ranks here |
+|---|---|---|
+| 1 | **The kernel image has no authenticity check** | The whole of T6. It became *this project's* problem when `bhaskixboot.efi` replaced a shipped loader, and it is the only gap on this list that hands an attacker ring 0 outright |
+| 2 | **`bin/linuxd` is the concentration point, and it is growing fastest** | It holds `DomainControl`, a directory capability and every hosted process's descriptors, it parses attacker-controlled arguments, and its `unsafe` went 42 → 85 in one day with L1 barely begun. On the evidence of the last week this is where the next real bug is |
+| 3 | **No ASLR for user programs** | Only the kernel image is slid. Bhaskix's own services are Rust, so this costs little today — but the code arriving under L1–L4 is C, and a hosted process at a fixed image base with a fixed stack turns any bug in BusyBox or `curl` into a reliable exploit. The domain still contains it; containment is the claim being sold, and cheap exploitation of the contained thing weakens it |
+| 4 | **The kernel's user-pointer copy path has one missing invariant** | Three bugs of the same shape landed on 2026-08-20, all of them "a supervisor's write to a lazily-mapped page". Three occurrences of one shape is a class, not three bugs, and it sits exactly where SMAP, the exception table and attacker-chosen addresses meet. It deserves a pass, not a fourth patch |
+| 5 | **A hostile disk image is not fuzzed** | ELF, `ustar`, both package formats and every network parser have coverage-guided targets under `fuzz/fuzz_targets/`. `fs` has none — and journal replay is code that runs *before* anything can refuse. `Superblock::parse` sanity-checks every field it later uses as an index, which is exactly why the target should be cheap to add |
+| 6 | **IPv6 and NDP have the mutation harness but no coverage-guided target** | `net/src/fuzz.rs` exercises them on every commit, which is more than nothing and less than the v4 path gets. They are also the newest parsers in the tree |
+| 7 | **One entropy source, no pool** | `RDRAND` only — no `RDSEED`, no mixing, no pool. Every unpredictable number in the system, including the KASLR slide and the TCP ISN key, traces to one instruction from one vendor. The design **fails closed** where most systems fail silently, which is why this is seventh and not first |
+
+**And the strongest fact in this document, which it had been under-claiming**: twenty packages in
+`Cargo.lock`, all of them `bhaskix-*`. **Zero external dependencies.** The out-of-scope table above
+is corrected accordingly.
 
 **If you find that a mitigation listed as "in scope" does not actually work, that is a security bug
 and we want the report.** See §9.

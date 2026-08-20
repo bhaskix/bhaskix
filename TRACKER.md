@@ -885,6 +885,44 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-20 (the threat model gets a status column, and three rows stop claiming what is not built)
+
+**`security.md` §1 was read against the tree rather than against itself**, and four of its eleven
+in-scope rows described mitigations in the present tense that do not exist:
+
+- **T5** (VM escape) — domains exist and are the right mechanism; **VMX/SVM and EPT/NPT do not**.
+  Nothing has escaped because there are no guests.
+- **T6** (persistence across reboot) — no Secure Boot chain, no TPM measurement, no signed image.
+  The loader refuses a kernel that fails the **ELF parser**, which is corruption-detection and not
+  authenticity: **whoever can write the ESP owns ring 0 from the next boot**. This became the
+  project's own problem when `bhaskixboot.efi` replaced a shipped loader.
+- **T7** (tampered update) — no signing, no A/B slots, no rollback counter, and no update mechanism
+  at all.
+- **T8** (undetected compromise) — the telemetry plane is built; the tamper-evident log and
+  attestation on top of it are not.
+
+**The column exists because of a sentence already in the document** — *a mitigation column is a
+claim, and a claim whose limits are not written down is believed further than it should be* — which
+had been written about T3/T4 and never applied to the rest of the table.
+
+**A correction in the other direction, which counts the same.** The out-of-scope table promised
+"vendored + hash-pinned dependencies … Phase 2" against crates.io supply chain. `Cargo.lock` holds
+**twenty packages and every one is `bhaskix-*`**: there is nothing to vendor. An unearned
+understatement is as wrong as an unearned claim, and the row now says so — with the check that would
+keep it true (a build that fails on a non-`bhaskix` package entering the lockfile) named as absent.
+
+**Seven gaps recorded and ranked by what they would cost an attacker**, found by reading the tree:
+image authenticity; `bin/linuxd` as the concentration point, growing fastest (`unsafe` 42 → 85 in a
+day with L1 barely begun); **no ASLR for user programs**, which costs little while the services are
+Rust and costs a great deal when L1–L4's C arrives; the kernel's user-pointer copy path, where three
+bugs of one shape landed in a single day and are therefore a class rather than three bugs; no fuzz
+target for a **hostile disk image**, though every network parser and both archive formats have one;
+IPv6/NDP covered by the mutation harness but not coverage-guided; and one entropy source with no
+pool, ranked seventh only because it **fails closed** where most systems fail silently.
+
+**Above every row, a ceiling**: nothing here has been observed on physical hardware. The gates are
+real and each has been watched go red, and all of them are QEMU.
+
 ### 2026-08-20 (RFC 0035 drafted: a system that repairs itself — a direction recorded, nothing built)
 
 **Asked as a question, not proposed as work**: whether a base OS that can self-heal, self-correct,
