@@ -39,8 +39,15 @@ tool = []
 workspace = true
 
 [package.metadata.bhaskix]
-# Zero, and it should stay zero. Every structure here is read out of bytes
+# Zero, and as of 2026-08-21 the compiler is what keeps it there:
+# `#![forbid(unsafe_code)]` at the crate root and in `bin/mkfs`, which is a
+# separate crate and needed its own. Every structure here is read out of bytes
 # somebody else supplied, which is the definition of untrusted input -- the
 # same standard `ustar` is held to, and for the same reason: this parser is
 # what stands between a corrupted disk and the rest of the system.
+#
+# The budget stays declared even though it can no longer be exceeded. It is
+# what `tools/check-unsafe-budget.py` reads, and a crate that dropped the line
+# because it had a stronger guarantee would fail the gate that checks every
+# crate declares one.
 unsafe_budget = 0

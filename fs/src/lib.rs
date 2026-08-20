@@ -12,6 +12,9 @@
 //! between a corrupted one and the rest of the system. So nothing in this file
 //! indexes without checking, nothing trusts a length it read, and the `unsafe`
 //! budget is zero — the same standard `ustar` is held to, for the same reason.
+//! **As of 2026-08-21 the compiler holds it there** rather than the budget: the
+//! crate root carries `#![forbid(unsafe_code)]`, so zero is no longer a number
+//! a future edit can raise by declaring a bigger one.
 //!
 //! # No allocation, and no kernel
 //!
@@ -19,15 +22,18 @@
 //! code build an image on a developer's machine, be tested on the host, and
 //! run in a service in a domain with no heap under it.
 #![no_std]
-#![cfg_attr(
-    test,
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::undocumented_unsafe_blocks
-    )
-)]
+// `forbid`, not `deny`, and the difference is the whole point: `deny` can be
+// turned off by an `allow` anywhere inside the crate, which makes it a default
+// rather than a rule. `forbid` cannot -- a module that tries is a compile
+// error naming the attribute that tried. For a parser whose entire input is
+// bytes somebody else wrote, the guarantee worth having is the one a future
+// edit cannot quietly opt out of.
+#![forbid(unsafe_code)]
+// `clippy::undocumented_unsafe_blocks` used to be allowed here for tests. It
+// is gone with the line above: `forbid(unsafe_code)` means there is no unsafe
+// block to leave undocumented, in tests or anywhere else, so the allow was a
+// permission for something that can no longer happen.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod cache;
 pub mod journal;

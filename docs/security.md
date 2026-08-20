@@ -371,9 +371,14 @@ kernel needs `unsafe`. So we manage it as a measured quantity:
 - **Whole crates refuse `unsafe` outright**, and that is the strongest form of confinement here
   because the compiler enforces it rather than a reviewer: `bhaskix-boot`, `bhaskix-elf`,
   `bhaskix-net` (twice — the crate root and `siphash`), `bhaskix-personality`, `bhaskix-pkg`,
-  `bhaskix-telemetry` and `bhaskix-ustar` carry `#![forbid(unsafe_code)]`; `bhaskix-mm` denies at
-  its root and forbids in `bump`. **`bhaskix-fs` is at zero without either** — held by its budget
-  and by discipline, which is weaker, and is the one to convert first.
+  `bhaskix-telemetry`, `bhaskix-ustar` and — since 2026-08-21 — **`bhaskix-fs`** carry
+  `#![forbid(unsafe_code)]`; `bhaskix-mm` denies at its root and forbids in `bump`.
+- **`forbid`, not `deny`, wherever the choice is free.** `deny` can be switched off by an `allow`
+  anywhere inside the crate, which makes it a default; `forbid` makes the `allow` itself a compile
+  error — *"allow(unsafe_code) incompatible with previous forbid"*. For a parser whose entire input
+  is bytes somebody else wrote, the guarantee worth having is the one a future edit cannot quietly
+  opt out of. `bhaskix-mm` is the deliberate exception: it needs `unsafe` in named places, so it
+  denies at the root and forbids in the module that must stay clean.
 - Everywhere else, **the budget is the confinement**. There is no module allow-list, and a number
   in a manifest is what a reviewer can actually check.
 - `unwrap()`, `expect()`, and panicking indexing are denied outside tests and one-time init paths.
@@ -405,8 +410,10 @@ metadata, network packets, IPC messages), and UBSan/ASan-equivalent debug featur
 >    something dangerous from asking `arch` to**, and a reader who does not know that will read
 >    every number on the table as worse than it is.
 >
-> What is true is what the bullets now say, and it is not a weaker claim: eight crates refuse
-> `unsafe` at compile time, every other crate declares a budget the build enforces, and every block
+> What is true is what the bullets now say, and it is not a weaker claim: **eight crates forbid
+> `unsafe` at their root** — `boot`, `elf`, `net`, `personality`, `pkg`, `telemetry`, `ustar` and,
+> since 2026-08-21, `fs` — and `mm` denies at its root while forbidding in `bump`, so nine refuse it
+> at compile time in whole or in part; every other crate declares a budget the build enforces, and every block
 > carries a `// SAFETY:` comment CI requires. **The confinement was real. The description of it was
 > written once, at M1, and never checked again** — which is the same failure this document found in
 > `architecture.md` §7 the same day, and the reason both now name what enforces them.

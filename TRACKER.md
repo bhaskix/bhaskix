@@ -888,6 +888,40 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (`bhaskix-fs` stops being at zero by discipline and starts being at zero by the compiler)
+
+Yesterday's correction to `security.md` §5 named one crate as the gap: **`bhaskix-fs` was at zero
+`unsafe` with neither `forbid` nor `deny`** — held by its budget and by whoever read the diff. It is
+the filesystem parser, whose entire input is bytes somebody else wrote, so it is the crate where
+that distinction matters most. It now carries `#![forbid(unsafe_code)]`, and so does `bin/mkfs`,
+which is a separate crate and needed its own.
+
+**`forbid`, not `deny`, and the difference is the whole point.** `deny` can be switched off by an
+`allow` anywhere inside the crate, which makes it a default rather than a rule. `forbid` makes the
+`allow` itself the error. Both were watched:
+
+| Arm | What happened |
+|---|---|
+| A plain `unsafe { *p }` added to `volume.rs` | `error: usage of an `unsafe` block` |
+| **`#[allow(unsafe_code)]` above it** — what `deny` would have permitted | `error[E0453]: allow(unsafe_code) incompatible with previous forbid … overruled by previous forbid` |
+| The same `allow` in `bin/mkfs` | `E0453` again — the binary's own attribute holding |
+
+**One line was deleted as a consequence, and the reason is worth recording.** The crate's test
+`cfg_attr` allowed `clippy::undocumented_unsafe_blocks`. With `forbid(unsafe_code)` there is no
+unsafe block to leave undocumented, in tests or anywhere else, so that allow was a permission for
+something that can no longer happen — and a permission nobody can use is one a reader has to reason
+about for nothing.
+
+**The budget stays declared even though it can no longer be exceeded**, because
+`tools/check-unsafe-budget.py` fails a crate that declares none, and a crate that dropped the line
+*because* it had a stronger guarantee would go red for having improved.
+
+`security.md` §5 is updated in the same change: eight crates forbid at their root and `mm` denies at
+its root while forbidding in `bump` — nine refusing `unsafe` at compile time in whole or in part —
+and the `forbid`-over-`deny` reasoning is now stated there rather than left as folklore.
+
+`make gates`, `make test-host` (38 suites), `make clippy` and the full `make test` all green.
+
 ### 2026-08-20 (the `unsafe` confinement claim was wrong in three ways, and one of them makes every number on the table read worse than it is)
 
 **`security.md` §5 said**: *"`unsafe` is confined to designated modules: `arch::*`, each driver's

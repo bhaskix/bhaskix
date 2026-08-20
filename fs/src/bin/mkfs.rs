@@ -19,6 +19,10 @@
 // This is a developer's tool, run on a developer's machine. The panic bans
 // exist to stop a fallible operation taking down the nucleus; here, failing
 // loudly with a message is the entire user interface.
+// A binary target is its own crate, so the library's `forbid` does not reach
+// here. Stated separately because a tool that writes filesystem images has the
+// same claim to make as the crate whose format it writes.
+#![forbid(unsafe_code)]
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::Write;
