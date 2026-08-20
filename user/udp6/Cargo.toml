@@ -35,6 +35,12 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
+# 2 — A ring 3 program is architecture-specific at the same few points, and
+# this budget is those points: the `_start` stub in `global_asm!` that the ABI
+# requires, the `syscall` sequence where the program carries its own rather than
+# taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
+# the kernel can see it.
+asm_budget = 2
 # 10, measured: the panic ud2, the page view (two sites -- the datagram is
 # built and read back through it), and the report writes -- the same
 # residues bin/dhcp keeps after RFC 0027 moved everything shared into

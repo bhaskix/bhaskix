@@ -92,6 +92,11 @@ members = [
 # what the fixture proves is what the check does.
 exclude = [
     "tests/fixtures/placement/direct-call",
+    # One instruction and no `asm_budget`, so `make gates` can watch
+    # `tools/check-instruction-containment.py` refuse it. It compiles fine and
+    # is excluded for the same reason as the others: it exists to be checked,
+    # not to be built.
+    "tests/fixtures/instructions",
     # Register blocks that are wrong about themselves. They must *not* compile,
     # and `make gates` asserts that -- so they cannot be workspace members,
     # because a member that never builds is a workspace that never builds.

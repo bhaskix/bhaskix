@@ -44,6 +44,10 @@ bhaskix-service-vfs = { path = "../services/vfs" }
 workspace = true
 
 [package.metadata.bhaskix]
+# 10 — three `CPUID` reads during SMP bring-up, reading `RSP` and `CS` where
+# no abstraction can answer, and four deliberate faults in `faultinject`, which
+# exists to prove the exception path by taking one. The rest is in `arch/`.
+asm_budget = 10
 # Confined to `sync` (the spinlock's UnsafeCell), `framebuffer` (the pixel
 # blitter), `trap` (control-register reads), and `faultinject` (deliberately
 # faulting instructions). No other module may contain `unsafe`; see

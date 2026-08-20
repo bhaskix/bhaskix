@@ -115,7 +115,7 @@ Read in this order:
 | | |
 |---|---|
 | Language | Rust (`no_std`, edition 2024) + minimal assembly |
-| Architecture | `x86_64` only. **AArch64 is Phase 5**, in the Embedded edition — this row said Phase 3 until 2026-08-20, which [roadmap.md](docs/roadmap.md) has never said. The portability boundary is *partly* enforced now: CI checks the crate dependency direction, and the `arch::Arch` trait is **deliberately not written** until a second implementation exists to keep it honest |
+| Architecture | `x86_64` only. **AArch64 is Phase 5**, in the Embedded edition — this row said Phase 3 until 2026-08-20, which [roadmap.md](docs/roadmap.md) has never said. The portability boundary is enforced in CI: the crate dependency direction, and **where an architecture-specific instruction may appear** — every crate holding one declares an `asm_budget` with its reason. The `arch::Arch` trait is **deliberately not written** until a second implementation exists to keep it honest |
 | Boot | UEFI via the Limine protocol, behind our own `Handoff` struct; native `bhaskixboot.efi` in Phase 2 |
 | Kernel model | Capability-based nucleus with relocatable services |
 | Isolation | Domains — containers and VMs are the same primitive |

@@ -37,6 +37,12 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
+# 3 — A ring 3 program is architecture-specific at the same few points, and
+# this budget is those points: the `_start` stub in `global_asm!` that the ABI
+# requires, the `syscall` sequence where the program carries its own rather than
+# taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
+# the kernel can see it. Plus the syscall stub a console service needs.
+asm_budget = 3
 # Two blocks, sixteen lines: the `syscall` instruction with its operand list
 # -- every argument register is an output, because the kernel writes the frame
 # back -- and the `ud2` a

@@ -29,6 +29,12 @@ bhaskix-pkg = { path = "../../pkg" }
 bhaskix-abi = { path = "../../abi" }
 
 [package.metadata.bhaskix]
+# 4 — A ring 3 program is architecture-specific at the same few points, and
+# this budget is those points: the `_start` stub in `global_asm!` that the ABI
+# requires, the `syscall` sequence where the program carries its own rather than
+# taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
+# the kernel can see it. Plus the syscall stub it does not take from `bhaskix-sock`.
+asm_budget = 4
 # `unsafe` in an unprivileged program is always a promise about something the
 # kernel did, and the promise is only as good as the capability behind it.
 # That is why this number is watched at all: a program with no authority has

@@ -23,6 +23,12 @@ name = "probe"
 path = "src/main.rs"
 
 [package.metadata.bhaskix]
+# 2 — A ring 3 program is architecture-specific at the same few points, and
+# this budget is those points: the `_start` stub in `global_asm!` that the ABI
+# requires, the `syscall` sequence where the program carries its own rather than
+# taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
+# the kernel can see it.
+asm_budget = 2
 # One: the `ud2` in the panic handler, which is the only way a ring 3 program
 # with no runtime can stop without asking the kernel's permission. The program
 # itself is a `global_asm!` block, which the budget does not count and could

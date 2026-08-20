@@ -760,6 +760,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | `unsafe` budget | M1 | coding-style.md §3 |
 | Limine containment (only `boot/` may name it) | M1 | architecture.md §1 |
 | Dependency direction / no cycles | M1 | architecture.md §5 |
+| **Instruction containment** — every crate holding an architecture-specific instruction declares an `asm_budget` and a reason; undeclared is a hard failure, and the gate is watched refusing a fixture on every run | 2026-08-20 | architecture.md §7 |
 | No vendor strings in published files | M1 | Project policy |
 | No AI-vendor attribution — **refused at commit time** by `tools/git-hooks/{pre-commit,commit-msg}`, and the hooks' installation is itself checked | M1 (hooks 2026-08-20) | Project policy; CONTRIBUTING.md §"AI-assisted contributions" cond. 3 |
 | Frame-leak test (1000 address spaces, zero drift) | M3 | memory.md §7 |
@@ -886,6 +887,65 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-20 (the instruction-containment gate is built, and the boundary stops being a habit)
+
+**`architecture.md` §7 claimed for a long time that architecture-specific instructions appear only
+in `arch/`. Nothing checked it, and it was not true.** `tools/check-instruction-containment.py` is
+the gate that closes the distance between those two sentences, and it runs in `make gates`, so it
+runs in CI.
+
+**The rule**: a crate holding an architecture-specific instruction declares `asm_budget` in
+`Cargo.toml` with a comment saying why that crate must know what an x86 is. Exceeding it fails.
+**Holding one with no budget declared fails**, and that is the half that matters — a crate cannot
+grow its first instruction quietly, so the list of crates that may hold any *is* the list that
+declares one. A crate at zero declares nothing, which is the deliberate difference from the
+`unsafe` budget: `unsafe` is expected everywhere and its quantity is the question, while an
+instruction outside `arch/` is an exception and its existence is. Twenty crates would otherwise
+carry `asm_budget = 0` to say nothing.
+
+**The number, now that something counts it: 37 sites in `arch/`, and 60 more across 23 other
+crates.** Every one is now declared with a reason. `rand/` is `RDRAND` and the `CPUID` that detects
+it; `sock/` is the syscall stub and the cycle counter, written once instead of copied; `kernel/` is
+three `CPUID` reads in SMP bring-up, `RSP` and `CS` where no abstraction can answer, and four
+deliberate faults in `faultinject`, which exists to prove the exception path by taking one; every
+ring 3 program has an `_start` stub, a `ud2`, and sometimes its own `syscall` sequence. The problem
+was never the exceptions. **The sum of those budgets is now a fair estimate of what an AArch64 port
+costs**, which is the thing `architecture.md` §7 wanted a boundary for in the first place.
+
+**Two decisions inside the tool, both stated in it because a metric nobody states gets misread:**
+
+- **Sites, not lines.** One `asm!` block is one place that knows what an x86 is, whether it emits
+  one instruction or thirty. This differs from the `unsafe` budget on purpose, which counts lines
+  inside blocks.
+- **Four forms, not one.** `asm!`, `global_asm!`, `naked_asm!` (none in the tree — counted so the
+  first is visible), and `core::arch::x86_64::` intrinsics, which are architecture-specific without
+  being assembly. A grep for `asm!` misses the intrinsics, and the kernel has three of them.
+
+**Comments are stripped before counting, and that was found the hard way.** The first survey counted
+`net/src/siphash.rs`, whose only match is the sentence *"`bhaskix-rand` is two `asm!` blocks and a
+retry loop"* — in a doc comment. **A budget inflated by prose has room underneath it for a real
+instruction nobody declared**, so the fixture's own source mentions all three forms in a comment,
+and a run that counts them is a run that has stopped reading code.
+
+**Watched red five ways before being believed**, which is the only reason to trust any of it:
+
+| Arm | What was done | What happened |
+|---|---|---|
+| Undeclared | the permanent fixture — one instruction, no budget | refused, and for that reason |
+| Over budget | a `nop` added to `bhaskix-rand` | `3 sites exceed budget 2` |
+| **Not `asm!` at all** | a `__cpuid` added to `kernel/src/smp.rs` | `11 exceed 10` — the arm a grep would miss |
+| Declaration removed | `asm_budget` deleted from `sock/Cargo.toml` | `2 sites and no asm_budget declared` |
+| Prose | a comment naming all three forms | **still green**, which is the point |
+
+The fixture lives at `tests/fixtures/instructions/` and is **wrong in exactly one way** — it carries
+an SPDX header, declares `unsafe_budget = 0`, uses `global_asm!` so it needs no `unsafe`, compiles
+clean, and is excluded from the workspace. A fixture that is wrong twice can pass a gate for the
+wrong reason and still look like proof. `make gates` fails if the fixture is accepted **or** if it
+is rejected for the wrong reason.
+
+`make gates`, `make test-host` (38 suites) and `make clippy` all green. No kernel code changed:
+one tool, one fixture, one Makefile stanza, and 23 manifests that now say what they hold.
 
 ### 2026-08-20 (AArch64 was filed under the wrong phase in two documents, and the portability boundary was described as a rule it is not)
 

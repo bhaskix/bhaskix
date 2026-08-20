@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# **Wrong in exactly one way, on purpose.** This crate contains an
+# architecture-specific instruction and declares no `asm_budget`, which is what
+# `tools/check-instruction-containment.py` exists to refuse. `make gates` runs
+# the tool against this directory and fails if the fixture is *accepted*, or if
+# it is rejected for any other reason.
+#
+# One way, deliberately: a fixture that is wrong twice can pass a gate for the
+# wrong reason and still look like proof. So it carries an SPDX header, declares
+# `unsafe_budget = 0`, and uses `global_asm!`, which needs no `unsafe` at all —
+# every other gate in `make gates` finds it correct.
+#
+# It is a fixture rather than a temporary edit to a real crate because making a
+# real crate wrong to watch a gate fail is a change somebody forgets to undo —
+# the argument `tools/check-one-machine.sh`'s fixture already makes, and this
+# follows it. The instruction tool skips `tests/fixtures/` on a normal run, so
+# this crate cannot make the real gate red.
+#
+# Excluded from the workspace and never built.
+[package]
+name = "bhaskix-fixture-instructions"
+version = "0.0.0"
+edition = "2024"
+
+[package.metadata.bhaskix]
+# Zero, and the crate holds no `unsafe` at all — see the note above on being
+# wrong in one way only. `asm_budget` is deliberately absent; that absence is
+# the whole fixture.
+unsafe_budget = 0

@@ -21,6 +21,8 @@ bhaskix-service = { path = "../service" }
 workspace = true
 
 [package.metadata.bhaskix]
+# 1 — the syscall stub a service placed in a domain needs to reach the kernel.
+asm_budget = 1
 # One `unsafe` block: the `syscall` instruction, whose operand list is what
 # makes it fifteen lines. Everything a domain does goes through it, and nothing
 # else here could need a raw pointer -- the whole exchange is registers, which

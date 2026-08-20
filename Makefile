@@ -685,6 +685,24 @@ gates:
 	    && printf '  \033[1;32mok\033[0m    the package image assembler still builds\n' \
 	    || { echo "  FAIL  the package image assembler does not build"; exit 1; }
 	tools/check-unsafe-budget.py
+	tools/check-instruction-containment.py
+# And watched refusing one. `architecture.md` §7 claimed for a year that
+# architecture-specific instructions appear only in `arch/` while nothing checked
+# it; the fixture is a crate holding one instruction and declaring no budget,
+# which is the shape that claim was wrong in. Its own source also mentions `asm!`
+# in a comment, so accepting it would prove the counter reads prose.
+	@mkdir -p build
+	@if tools/check-instruction-containment.py --root tests/fixtures/instructions \
+	        >build/instructions-fixture.log 2>&1; then \
+	    echo "  FAIL  the instruction check accepted an undeclared instruction"; \
+	    exit 1; \
+	elif ! grep -q "no asm_budget declared" build/instructions-fixture.log; then \
+	    echo "  FAIL  the instruction check rejected the fixture for the wrong reason:"; \
+	    cat build/instructions-fixture.log; \
+	    exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the instruction check rejects an undeclared instruction\n'; \
+	fi
 	tools/check-deps.py
 	tools/check-one-machine.sh
 # And watched refusing one, against a fixture that is wrong on purpose. The

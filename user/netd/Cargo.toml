@@ -34,6 +34,12 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
+# 3 — A ring 3 program is architecture-specific at the same few points, and
+# this budget is those points: the `_start` stub in `global_asm!` that the ABI
+# requires, the `syscall` sequence where the program carries its own rather than
+# taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
+# the kernel can see it. Plus the device accesses a driver holding hardware cannot avoid.
+asm_budget = 3
 # Measured, not guessed. A driver is mostly `unsafe` because a driver is mostly
 # registers and rings: every access is a volatile read or write of a mapping the
 # kernel made on request, and every descriptor is a store into memory a device

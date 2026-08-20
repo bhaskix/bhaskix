@@ -33,6 +33,9 @@ path = "src/lib.rs"
 workspace = true
 
 [package.metadata.bhaskix]
+# 2 — `RDRAND` and the `CPUID` that detects it. RFC 0021's whole point is that
+# this crate is two instructions and the arithmetic around them.
+asm_budget = 2
 # Two instructions, and nothing else in the crate is `unsafe` at all.
 #
 # It is small deliberately. RFC 0021's argument is that the difficulty here is

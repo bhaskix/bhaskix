@@ -39,6 +39,12 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
+# 4 — A ring 3 program is architecture-specific at the same few points, and
+# this budget is those points: the `_start` stub in `global_asm!` that the ABI
+# requires, the `syscall` sequence where the program carries its own rather than
+# taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
+# the kernel can see it. Plus the ring accesses and the cycle counter it measures with.
+asm_budget = 4
 # 50, measured. A fifth of either driver's, and that is the point rather than a
 # coincidence: this program touches two mappings and no hardware at all. Every
 # line of it is a copy out of a region another domain writes, or a store into

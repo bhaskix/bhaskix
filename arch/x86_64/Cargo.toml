@@ -26,6 +26,10 @@ bhaskix-rand = { path = "../../rand" }
 workspace = true
 
 [package.metadata.bhaskix]
+# 37 — **this is the home**, and the only crate where an instruction needs no
+# excuse. The number is here so that growth is visible and so that the day a
+# second architecture arrives, this is the size of the port.
+asm_budget = 37
 # `arch` is one of the places `unsafe` is permitted (docs/coding-style.md §3):
 # port I/O and CPU control instructions cannot be expressed any other way.
 #

@@ -36,6 +36,12 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
+# 4 — A ring 3 program is architecture-specific at the same few points, and
+# this budget is those points: the `_start` stub in `global_asm!` that the ABI
+# requires, the `syscall` sequence where the program carries its own rather than
+# taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
+# the kernel can see it. Plus the syscall stub and the page accesses a filesystem service makes.
+asm_budget = 4
 # 55 at RFC 0030 step 3 (2026-08-18): two more lines for the bulk page
 # viewed read-only in WRITE_FROM -- the same page, the same promise, the
 # read direction.

@@ -25,6 +25,8 @@ bhaskix-arch-x86-64 = { path = "../../arch/x86_64" }
 workspace = true
 
 [package.metadata.bhaskix]
+# 1 — one `cli; hlt`, the only way to stop a machine that has no kernel yet.
+asm_budget = 1
 # Reading bootloader-owned memory through raw pointers is inherently unsafe and
 # is the entire job of this crate. Confined to `limine.rs`.
 unsafe_budget = 60

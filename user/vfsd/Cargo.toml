@@ -37,6 +37,12 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
+# 3 — A ring 3 program is architecture-specific at the same few points, and
+# this budget is those points: the `_start` stub in `global_asm!` that the ABI
+# requires, the `syscall` sequence where the program carries its own rather than
+# taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
+# the kernel can see it. Plus the syscall stub a VFS service needs.
+asm_budget = 3
 # Four blocks, eighteen lines: the `syscall` instruction with its operand list,
 # the `ud2` a panic ends at, the slice built from the mapping the kernel hands
 # over at entry, and the mount of that slice. Every one is about the boundary

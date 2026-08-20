@@ -647,23 +647,35 @@ implementation honest from the start is a chore, and we choose the chore.
 **Revised at M2 (2026-08-03):** the trait was originally scheduled for M2 and has been deferred.
 Writing a portability boundary with exactly one implementation and no second architecture in sight
 produces a trait shaped like x86 — it would document today's code rather than constrain tomorrow's,
-which is the opposite of the point. The concrete boundary that matters now is enforced instead — and **the enforcement is narrower than
-this paragraph claimed until 2026-08-20**, so here is what it is. `tools/check-deps.py`, run by
-`make gates` in CI, checks the crate dependency direction and refuses an external crate. **Nothing
-checks where an instruction may appear**, and the sentence that used to stand here — *architecture-
-specific instructions appear only in `arch/`* — is not true of the tree: `asm!` appears 40 times in
-`arch/` and 20 times outside it, in `kernel/`, `boot/`, `rand/`, `net/` and `sock/`, before counting
-ring 3 programs.
+which is the opposite of the point. The concrete boundary that matters now is enforced instead, and **as of 2026-08-20 it is enforced by
+a gate rather than by habit.** Two checks, both run by `make gates` in CI:
 
-Most of those twenty are deliberate and are justified where they sit — `rand/` is two `RDRAND`
-instructions and says so, `sock/` is one memory-wait written once rather than copied, `kernel/` is
-reading `RSP`, reading `CS`, and injecting faults on purpose to test the exception path. **The
-problem is not the exceptions; it is that the boundary was described as a rule and enforced as a
-habit.** Whether it becomes a gate is a decision for whoever starts the second architecture, and
-the honest position until then is this paragraph.
+- `tools/check-deps.py` — the crate dependency direction, and no external crate.
+- `tools/check-instruction-containment.py` — **where an architecture-specific instruction may
+  appear.** A crate that contains one declares `asm_budget` in `Cargo.toml`, with a comment saying
+  why that crate must know what an x86 is. Exceeding the budget fails the build; **containing an
+  instruction with no budget declared fails the build**, which is the half that matters — a crate
+  cannot grow its first instruction quietly, so the list of crates that may hold any is the list
+  that declares one, and a reviewer can read it.
+
+**This paragraph used to say "architecture-specific instructions appear only in `arch/`", and that
+was never true of the tree.** When the gate was written the count was 37 sites in `arch/` and 23
+crates outside it holding 60 more. Almost all of them are deliberate and are now justified where
+they sit — `rand/` is `RDRAND` and the `CPUID` that detects it, `sock/` is the syscall stub and the
+cycle counter written once instead of copied, `kernel/` reads `RSP` and `CS` and deliberately faults
+in `faultinject`, and every ring 3 program has an `_start` stub and a `ud2`. **The problem was never
+the exceptions; it was that the boundary was described as a rule and enforced as a habit**, so the
+declarations are the rule and the gate is the enforcement.
+
+The metric is **sites, not lines** — one `asm!` block is one place that knows what an x86 is,
+whether it emits one instruction or thirty — and it counts four forms, including
+`core::arch::x86_64::` intrinsics, which are architecture-specific without being assembly and which
+a grep for `asm!` misses. Comments are stripped before counting: the first survey counted a doc
+comment in `net/src/siphash.rs` that merely *mentions* `asm!`, and a budget inflated by prose has
+room underneath it for a real instruction nobody declared.
 
 The trait will be defined when AArch64 work begins, which is when there is a second implementation
-to keep it honest.
+to keep it honest — and the sum of those budgets is now a fair estimate of what that port costs.
 
 ---
 

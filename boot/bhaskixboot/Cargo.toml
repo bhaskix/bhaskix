@@ -38,6 +38,10 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
+# 5 — a UEFI loader runs before anything abstracts the machine: two port
+# accesses for the serial line, one `hlt` to stop, one long jump into the
+# kernel, and one `CPUID` to learn what it is running on.
+asm_budget = 5
 # 11, measured, no headroom: the serial port I/O, the signature-checked
 # firmware table reads and the console call through them, and the panic
 # halt. Grows step by step with the loader, and every growth is a line in
