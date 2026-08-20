@@ -32,6 +32,7 @@ pub mod cap;
 pub mod console;
 pub mod domain;
 pub mod elf;
+pub mod fault;
 pub mod faultinject;
 pub mod font;
 pub mod framebuffer;
@@ -2984,10 +2985,11 @@ fn wait_for_probe_threads(realm: domain::DomainId) {
 fn personality_boundary_report() {
     let order = core::sync::atomic::Ordering::Relaxed;
     let answered = syscall::ADAPTER_ANSWERED.load(order);
-    let (absent, refused, gave_up) = (
+    let (absent, refused, gave_up, caller_gone) = (
         syscall::ADAPTER_ABSENT.load(order),
         syscall::ADAPTER_REFUSED.load(order),
         syscall::ADAPTER_GAVE_UP.load(order),
+        syscall::ADAPTER_CALLER_GONE.load(order),
     );
     let (priced, floor, mean, dropped, excluded, interpreted) = syscall::foreign_cost();
     // Nothing foreign happened at all: no hosted program ran on this machine,
@@ -3012,7 +3014,7 @@ fn personality_boundary_report() {
     // `adapter_call` rather than by the nucleus instrument, so it has to be
     // counted here or the arithmetic would report the move itself as a leak.
     let counted = priced + dropped + excluded + answered;
-    let _ = (refused, gave_up);
+    let _ = (refused, gave_up, caller_gone);
     let accounting = if counted == total {
         "all"
     } else {
@@ -3029,8 +3031,9 @@ fn personality_boundary_report() {
     // available for a program that holds no console, and the better kind.
     println!(
         "    linux domain   the adapter in ring 3 answered {answered} foreign calls, and {absent} \
-         found none to ask, {refused} were refused by its endpoint, and {gave_up} gave up \
-         retrying a full queue (last refusal {})",
+         found none to ask, {refused} were refused by its endpoint, {gave_up} gave up \
+         retrying a full queue, and {caller_gone} were for a caller already being killed \
+         (last refusal {})",
         syscall::ADAPTER_REFUSAL.load(order)
     );
     // **The cross-placement price, which is what RFC 0031 asked for before
@@ -3085,6 +3088,16 @@ fn personality_boundary_report() {
                 );
             }
         }
+    }
+    // What the fault path did. Printed whenever anything was handed over,
+    // because a fault reaching the personality at all is the claim step 6
+    // makes and the only evidence for it.
+    let (handed, resumed, crowded) = fault::statistics();
+    if handed > 0 {
+        println!(
+            "    linux fault    {handed} faults handed to the personality in ring 3, {resumed} \
+             resumed, {crowded} found no free slot"
+        );
     }
     let (adapter_priced, adapter_floor, adapter_mean) = syscall::adapter_cost();
     if adapter_priced > 0 {
@@ -7000,6 +7013,20 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     }
     ADAPTER_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
 
+    // Slot 2: the page a hosted program's fault is handed over in. One slot
+    // per fault in flight -- see `fault.rs` for why a single buffer would give
+    // one faulting CPU another's registers.
+    let faults = shared::create(realm, fault::SLOTS as u64 * fault::SLOT_BYTES)
+        .map_err(|_| "the adapter's fault page would not be created")?;
+    let fault_named =
+        shared::name(faults).map_err(|_| "the adapter's fault page would not be named")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(2, fault_named).is_ok()
+    }) != Some(true)
+    {
+        return Err("the adapter's fault page would not install");
+    }
+
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -7020,6 +7047,7 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     // caller queues, which is what an endpoint is for -- but not to arrive
     // before there is anybody who will ever receive.
     syscall::ADAPTER_DOMAIN.store(realm.as_u32(), core::sync::atomic::Ordering::Release);
+    fault::PAGE.store(faults.as_u64(), core::sync::atomic::Ordering::Release);
     syscall::ADAPTER_ENDPOINT.store(
         u64::from(endpoint.as_u32()),
         core::sync::atomic::Ordering::Release,

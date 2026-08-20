@@ -469,6 +469,97 @@ program bug, and nothing else can tell the two apart.
 **The corpus is a witness, not a gate**, which is why none of this turned the suite red: what
 the boot demands is that the histogram be printed, and the histogram is the deliverable.
 
+## Step 6's record (2026-08-20): a hosted program's fault crosses to ring 3
+
+**A fault now reaches the personality.** The kernel writes the faulting
+register file into a slot of a page it shares with `bin/linuxd`, calls the
+adapter through the same door a system call goes through, and the adapter
+answers *resume* — having edited the registers — or *end this program*. Two
+more calls moved with it (`rt_sigprocmask`, `sched_getaffinity`), taking the
+ratchet **13 → 11**.
+
+**Two facts had to be established before any of it could be attempted, and
+neither came from reasoning about the design.** The first exploration for
+RFC 0032 concluded flatly that *"the fault path cannot IPC"*. That was half
+right and the half it got wrong is what made this step possible:
+
+- The IDT uses **interrupt gates**, so a fault arrives with `IF` clear. A
+  thread that blocks with the mask up leaves its CPU deaf to the tick, the
+  wake and the shootdown that would resume it — the exact hazard that once
+  hung this kernel. So interrupts are enabled first, with the same argument
+  the syscall entry already makes for doing it there, and the same
+  precondition: a user-mode fault holds no kernel lock.
+- The page fault is **deliberately not on an IST**, and `idt.rs` says why:
+  *"IST stacks do not nest — a second page fault while handling the first
+  would overwrite the first one's frame."* It runs on the faulting thread's
+  own kernel stack. **That is what makes blocking sound at all** — the frame
+  belongs to the thread, so being switched away preserves it exactly as a
+  blocked system call's is preserved.
+
+Both were read out of the code that states them. Neither is in the earlier
+exploration's answer.
+
+**What the adapter may do to a resuming program is bounded by the kernel, not
+by the adapter's good behaviour.** It gets fifteen general registers, `rip`
+and `rsp` — which is what a signal handler is — and cannot set `cs`, `ss` or
+the error code, because an adapter that could write those could resume a
+hosted program in ring 0. `rflags` is masked to the arithmetic and direction
+bits: not `IF`, so it cannot disable interrupts; not `IOPL`, so it cannot
+reach the ports.
+
+**One slot per fault in flight, claimed atomically**, because two CPUs can
+fault at once and a single buffer would hand one of them the other's
+registers. A fault that finds no slot ends the program rather than waiting,
+because a thread waiting for a slot while holding nothing is a hang with no
+diagnosis.
+
+### What this step did not do, and why that is the honest boundary
+
+The adapter answers **END** to every fault, and that is correct rather than
+unfinished: while `rt_sigaction` is still in the nucleus, the adapter does not
+own the signal dispositions, so it cannot know whether a program had a
+handler. The kernel's own delivery runs first, so the only faults the adapter
+sees are the ones nothing wanted — exactly the set that should end. When the
+dispositions move, that arm grows a decision and the kernel's delivery goes
+away. **`0 resumed` is the right answer today, and the gate demands the
+crossing rather than the resume for that reason.**
+
+### Two instruments caught their keeper
+
+**The boundary report's own arithmetic.** Faults travel through the same call
+as system calls, so they were counted as answered calls — and the accounting
+line said *"SOME UNCOUNTED: 37 of 36"* before any human noticed. It was built
+to catch exactly this, and it did, in the first boot after the mistake.
+
+**And the new gate could not fail, until it was armed.** Its first version
+asked only whether the crossing had been reported; disabling the crossing
+entirely made it fall into the "nothing faulted" branch and pass. That is the
+**third** gate in this suite with that shape and the third found by
+deliberately breaking what it guards. It now keys on the hosted program's own
+fault line — which prints whatever happens next — so "a program faulted and
+the personality never saw it" is a failure rather than a silence.
+
+**And a third instrument found a fourth thing sharing one counter.** The suite
+reported *"1 were refused by its endpoint"* — and because the gate had been
+made to quote the line it saw, the diagnosis was in the failure rather than a
+rebuild away. A hosted thread whose domain is being killed is woken out of its
+wait with `Abandoned`, which reaches the caller as `NoSuchEndpoint`: the same
+value a genuinely missing endpoint gives. **A caller being killed is teardown
+working, not an adapter failing**, and the thread's own dying flag is what
+separates them. That is now a counter of its own, and the gate ignores it.
+
+Counting the ones already split out, this is the fourth time in two days that
+a single number has been found standing for several different conditions. The
+pattern is worth naming: *a counter whose name is a sentence about intent
+rather than about a distinguishable event will eventually be measured by
+someone who needs the distinction.*
+
+**The kernel's `unsafe` budget went down while this was added**: 1,514 to
+1,512. The memory calls left with their `uaccess` copies, and handing a fault
+to ring 3 needs one `unsafe` line — the `enable_interrupts` above. A
+personality leaving the kernel takes its pointer arithmetic with it, which is
+this whole RFC's argument stated as a number.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |

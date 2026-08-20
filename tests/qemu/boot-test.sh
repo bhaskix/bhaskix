@@ -1284,10 +1284,10 @@ fi
 # and which this suite has made before.
 if grep -qE "personality +boundary: [0-9]+ linux numbers interpreted in the nucleus" "$LOG"; then
     interpreted=$(sed -n 's/.*boundary: \([0-9]*\) linux numbers.*/\1/p' "$LOG" | head -1)
-    if [[ "$interpreted" -le 13 ]]; then
+    if [[ "$interpreted" -le 11 ]]; then
         pass "the personality boundary is $interpreted linux numbers wide, and may only narrow"
     else
-        fail "the nucleus interprets $interpreted linux numbers, up from 13 -- RFC 0031 I1 wants 0"
+        fail "the nucleus interprets $interpreted linux numbers, up from 11 -- RFC 0031 I1 wants 0"
         status=1
     fi
     # And the instrument accounts for itself. Every foreign call is priced,
@@ -1324,7 +1324,7 @@ fi
 #
 # The count is demanded to be non-zero rather than exact: how many calls fall
 # through to the adapter depends on which self-tests a machine could run.
-if grep -qE "linux domain   the adapter in ring 3 answered [1-9][0-9]* foreign calls, and 0 found none to ask, 0 were refused by its endpoint" "$LOG"; then
+if grep -qE "linux domain   the adapter in ring 3 answered [1-9][0-9]* foreign calls, and 0 found none to ask, 0 were refused by its endpoint, 0 gave up" "$LOG"; then
     pass "the linux personality answered a hosted program from ring 3, holding one endpoint"
 elif grep -qE "linux domain   the adapter in ring 3 answered" "$LOG"; then
     # The line itself, because a gate that says only "it did not hold" sends
@@ -1338,6 +1338,41 @@ elif grep -qE "linux domain   the adapter in ring 3 answered" "$LOG"; then
     status=1
 else
     pass "no hosted program on this machine, so the adapter had nothing to answer"
+fi
+
+# RFC 0032 step 6: a hosted program's *fault* reaching the personality.
+#
+# This is the crossing that could not be made until two facts were
+# established, both of them in the code rather than in an opinion: the page
+# fault is deliberately not on an IST, so it runs on the faulting thread's own
+# kernel stack and blocking preserves its frame; and it arrives through an
+# interrupt gate with the mask up, so interrupts must be enabled before
+# anything blocks or the CPU goes deaf to the tick that would resume it.
+#
+# What the gate demands is that a fault was *handed over* -- the kernel wrote
+# the register file into a slot, called `bin/linuxd`, and got an answer back.
+# It does not demand a resume: while `rt_sigaction` still lives in the nucleus
+# the adapter does not own the dispositions, so every fault it sees is one
+# nothing wanted, and `0 resumed` is the correct answer rather than a
+# shortfall.
+# **Keyed on a fault having happened, not on the crossing being reported.**
+# The first version asked only whether the crossing line was present, and
+# disabling the crossing entirely made it fall into the "nothing faulted"
+# branch and pass -- the third arm in this suite to have that shape, and the
+# third to be found by deliberately breaking what it guards. A hosted program
+# that faults says so in its own line whatever happens next, so that line is
+# what decides which question this gate asks.
+if grep -qE "linux fault    a hosted program faulted at" "$LOG"; then
+    if grep -qE "linux fault    [1-9][0-9]* faults handed to the personality in ring 3, [0-9]+ resumed, 0 found no free slot" "$LOG"; then
+        pass "a hosted program's fault crossed to ring 3 and was decided there"
+    else
+        fail "a hosted program faulted and the personality never saw it: $(grep -aoE 'linux fault    [0-9]+ faults handed.*' "$LOG" | head -1)"
+        status=1
+    fi
+else
+    # No hosted program faulted on this machine -- the corpus needs a
+    # filesystem to load from, and a lane without one has nothing to fault.
+    pass "no hosted program faulted on this machine, so nothing crossed"
 fi
 
 # RFC 0005 step 6, the clone half: two threads of one hosted program, meeting

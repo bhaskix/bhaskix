@@ -1735,10 +1735,6 @@ mod linux {
     pub const WRITE: u64 = 1;
     /// `arch_prctl(code, addr)` — `ARCH_SET_FS` is the one that matters.
     pub const ARCH_PRCTL: u64 = 158;
-    /// `sched_getaffinity(pid, len, mask)`.
-    pub const SCHED_GETAFFINITY: u64 = 204;
-    /// `rt_sigprocmask(how, set, oldset, sigsetsize)`.
-    pub const RT_SIGPROCMASK: u64 = 14;
 
     /// Every number above, once, so the boundary has a size.
     ///
@@ -1749,7 +1745,7 @@ mod linux {
     /// alternative, deriving it from the dispatch, needs the dispatch to be
     /// a table rather than a `match`, which is a change worth making when
     /// the personality moves rather than before.
-    pub const ANSWERED: [u64; 13] = [
+    pub const ANSWERED: [u64; 11] = [
         RT_SIGACTION,
         RT_SIGRETURN,
         SIGALTSTACK,
@@ -1761,8 +1757,6 @@ mod linux {
         SCHED_YIELD,
         WRITE,
         ARCH_PRCTL,
-        SCHED_GETAFFINITY,
-        RT_SIGPROCMASK,
     ];
 
     // No number appears twice: a duplicate would make the boundary look
@@ -1879,30 +1873,11 @@ fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
         // to size its scheduler and treats a refusal as one CPU. The mask
         // says how many this machine really has -- a truthful answer that
         // costs nothing.
-        linux::SCHED_GETAFFINITY => {
-            let (length, mask) = (second as usize, third);
-            if mask == 0 || length < 8 {
-                return Some(errno::EINVAL as u64);
-            }
-            let cpus = bhaskix_arch::percpu::online_count();
-            let bits: u64 = if cpus >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << cpus) - 1
-            };
-            // SAFETY: the fault-protected write into the caller's own mask.
-            let written = unsafe {
-                bhaskix_arch::uaccess::copy_to_user(mask, bits.to_le_bytes().as_ptr(), 8)
-            };
-            written.ok()?;
-            Some(8)
-        }
         // Signal masking is recorded nowhere and honoured nowhere yet, and
         // answering zero is the *correct* lie for a system that delivers
         // only synchronous faults: nothing this personality can deliver is
         // maskable, so a mask that changes nothing is accurate. The trigger
         // for making it real is the first asynchronous signal.
-        linux::RT_SIGPROCMASK => Some(0),
         // A thread id a hosted program can tell apart from its neighbours,
         // and stable for the life of the thread. Derived from the scheduler's
         // own id, offset so no thread is ever tid zero (Linux never issues
@@ -2300,6 +2275,9 @@ pub static ADAPTER_ABSENT: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 pub static ADAPTER_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// How many were given up on after [`ADAPTER_RETRIES`] congested attempts.
 pub static ADAPTER_GAVE_UP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many deliveries ended because the *caller* was being killed.
+pub static ADAPTER_CALLER_GONE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 /// Cycles spent in adapter round trips, how many were priced, and the
 /// cheapest — the domain placement's figures, against the nucleus placement's
 /// in [`FOREIGN_FLOOR`].
@@ -2326,6 +2304,22 @@ pub static ADAPTER_REFUSAL: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// a page needs somewhere to put it *per thread*, which is RFC 0032 step 4's
 /// work rather than a thing to improvise here.
 fn adapter_call(call: &PersonalityCall) -> Option<u64> {
+    ask_adapter(
+        u64::from(call.domain),
+        call.number,
+        [call.first(), call.second(), call.third(), call.fourth()],
+    )
+}
+
+/// Asks the adapter one question, blocking this thread until it answers.
+///
+/// Shared by the system-call path and the fault path — RFC 0032 step 6 — so
+/// that a fault is delivered by the same door a call is, with the same badge
+/// discipline and the same congestion retry. The fault's *method* is
+/// [`crate::fault::FAULT_METHOD`], which no Linux number can collide with.
+///
+/// `None` when there is no adapter, or when the endpoint has gone.
+pub fn ask_adapter(domain: u64, what: u64, args: [u64; 4]) -> Option<u64> {
     let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
     if endpoint == u64::MAX {
         ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
@@ -2334,8 +2328,7 @@ fn adapter_call(call: &PersonalityCall) -> Option<u64> {
     let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
     // The adapter cannot touch a hosted process's memory without a capability
     // to its domain, and the kernel is what has one to give.
-    ensure_adapter_holds(call.domain);
-    let args = [call.first(), call.second(), call.third(), call.fourth()];
+    ensure_adapter_holds(domain as u32);
 
     // Congestion is retried, and it is safe to retry precisely because it
     // cannot half-happen: the message was refused *before* being queued, so
@@ -2348,9 +2341,16 @@ fn adapter_call(call: &PersonalityCall) -> Option<u64> {
         // The badge says which hosted domain is asking, and the kernel is
         // what stamps it. A caller cannot supply its own, which is the whole
         // reason the adapter can believe it.
-        match crate::ipc::call(endpoint, u64::from(call.domain), call.number, args) {
+        match crate::ipc::call(endpoint, domain, what, args) {
             Ok(message) => {
-                ADAPTER_ANSWERED.fetch_add(1, Ordering::Relaxed);
+                // Counted only for a *system call*. A fault delivered through
+                // this same door is counted by `fault::HANDED`, and folding
+                // the two together broke the boundary report's own arithmetic
+                // -- "37 of 36 accounted" -- which is the instrument catching
+                // its keeper, exactly as it was built to.
+                if what != crate::fault::FAULT_METHOD {
+                    ADAPTER_ANSWERED.fetch_add(1, Ordering::Relaxed);
+                }
                 // **Priced separately from the in-nucleus path, because the
                 // comparison is the point.** A single figure over both
                 // placements is an average of two different things and tells
@@ -2373,6 +2373,18 @@ fn adapter_call(call: &PersonalityCall) -> Option<u64> {
             // told `-ENOSYS` rather than left blocked on an answer that is not
             // coming: the call it made is one this machine cannot perform, and
             // that is true whichever way the adapter is absent.
+            // **A caller that is being killed is not an adapter failure**,
+            // and telling them apart matters because one is a defect and the
+            // other is teardown working. A thread whose domain has been ended
+            // is woken out of its wait with `Abandoned`, which arrives here
+            // as `NoSuchEndpoint` — the same value a genuinely missing
+            // endpoint gives. The thread's own dying flag is what separates
+            // them, and without this the suite reported "1 were refused by
+            // its endpoint" for a boot in which nothing was wrong.
+            Err(crate::ipc::IpcError::NoSuchEndpoint) if crate::sched::should_die() => {
+                ADAPTER_CALLER_GONE.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
             Err(why) => {
                 ADAPTER_REFUSED.fetch_add(1, Ordering::Relaxed);
                 ADAPTER_REFUSAL.store(

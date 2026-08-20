@@ -279,6 +279,22 @@ fn handle(frame: &mut TrapFrame) {
             & (1 << (domain.as_u32() % 32))
             != 0
     {
+        // **The personality gets the fault, because deciding what a fault
+        // means is its business** — RFC 0032 step 6. A Go program installs a
+        // `SIGSEGV` handler and turns a null dereference into a recovered
+        // panic; that decision belongs with the rest of the Linux ABI, which
+        // is leaving the nucleus. See `fault.rs` for why this can block at all
+        // and what had to be true first.
+        //
+        // Tried after the kernel's own delivery rather than instead of it:
+        // while `rt_sigaction` still lives here, the dispositions the kernel
+        // holds are the only ones there are, and asking the adapter about a
+        // handler it does not yet own would end programs the machine can
+        // still save.
+        if crate::fault::hand_over(frame, read_cr2()) {
+            crate::sched::check_user_space(3);
+            return;
+        }
         let why = crate::signal::WHY_NOT.load(core::sync::atomic::Ordering::Relaxed);
         println!(
             "    linux fault    a hosted program faulted at {:#x} (rip {:#x}) and was ended: {}",

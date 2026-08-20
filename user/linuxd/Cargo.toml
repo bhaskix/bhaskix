@@ -50,4 +50,11 @@ opt-level = "s"
 # step 5 touch this program's *own* page, at an address it chose, whose frames
 # came from its own object; not one of them names anything belonging to a
 # process it hosts.
-unsafe_budget = 25
+#
+# 30 at step 6, and the same sentence still holds: two more stores, recording
+# that a fault was handed over, into the same page this program owns. The
+# faulting process's registers are *not* touched through a pointer -- they
+# arrive in a slot of a shared object and go back the same way, which is why a
+# module that decides what a fault means costs this program five lines and no
+# new authority.
+unsafe_budget = 30

@@ -153,6 +153,48 @@ fn trace(addr: u64, length: u64, pages: u64, protection: u64, fixed: bool, hinte
 /// How many `mmap` requests have been traced.
 static TRACED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Records that a fault was handed over, in the report page the kernel reads.
+///
+/// The adapter has no console; this is how it says anything at all. Two words
+/// — the slot and the address — are enough to prove the exchange happened and
+/// to say where, which is what this step is for.
+fn faults_seen(slot: u64, address: u64) {
+    let seen = FAULTS_TAKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if seen >= 4 {
+        return;
+    }
+    let at = REPORT_AT + FAULT_LOG_OFFSET + seen * 16;
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // past the trace records and the scratch word, and bounded to four
+    // sixteen-byte entries well inside 4,096 bytes.
+    unsafe {
+        core::ptr::write_volatile(at as *mut u64, slot);
+        core::ptr::write_volatile((at + 8) as *mut u64, address);
+    }
+}
+
+/// How many faults have been handed to this program.
+static FAULTS_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the fault log sits in the report page, after the trace and scratch.
+const FAULT_LOG_OFFSET: u64 = 8 * 32 + 64;
+
+/// Where in the report page the scratch word lives.
+///
+/// After the eight trace records, so a trace and a copy cannot overwrite each
+/// other. The same page serves both because it is the only memory this
+/// program owns, and a second object would be a second thing to explain in
+/// the manifest for no gain.
+const SCRATCH_AT_OFFSET: u64 = 8 * 32;
+
+/// Writes the scratch word this program copies out of.
+fn write_scratch(value: u64) {
+    // SAFETY: `REPORT_AT + SCRATCH_AT_OFFSET` is inside the page `ATTACH`
+    // mapped from this program's own object, past the trace records and well
+    // inside 4,096 bytes.
+    unsafe { core::ptr::write_volatile((REPORT_AT + SCRATCH_AT_OFFSET) as *mut u64, value) };
+}
+
 /// Maps `pages` lazily at `address` in a hosted domain.
 ///
 /// Lazily, because a hosted `mmap` is a *reservation*: a runtime that asks for
@@ -316,6 +358,38 @@ fn answer(request: &PersonalityCall) -> Answer {
         // refused, because a runtime told its advice was rejected may take a
         // slower path for no reason.
         MADVISE => Answer::ok(memory::plan_madvise() as u64),
+        // Signal masking is recorded nowhere and honoured nowhere yet. Zero
+        // rather than `-ENOSYS`, because a runtime told it cannot mask signals
+        // takes a slower path for a promise nothing here breaks: no signal is
+        // delivered asynchronously, so a mask has nothing to hide from.
+        RT_SIGPROCMASK => Answer::ok(0),
+        // The affinity mask, written into the caller's own memory through the
+        // one capability this program holds for it. **This is the first call
+        // to reach into a hosted process's memory from ring 3** — everything
+        // before it either answered a number or changed a mapping.
+        SCHED_GETAFFINITY => {
+            let (length, mask) = (request.second(), request.third());
+            if mask == 0 || length < 8 {
+                return Answer::error(memory::errno::EINVAL);
+            }
+            let bits: u64 = if CPUS_REPORTED >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << CPUS_REPORTED) - 1
+            };
+            write_scratch(bits);
+            let moved = call(
+                syscall::INVOKE,
+                SLOT_BASE + u64::from(request.domain),
+                method::COPY_OUT,
+                [REPORT, SCRATCH_AT_OFFSET, mask, 8],
+            );
+            if moved.status == status::OK {
+                Answer::ok(8)
+            } else {
+                Answer::error(bhaskix_personality::socket::errno::EFAULT)
+            }
+        }
         // Everything else, for now. Not an omission — the RFC's tiering: a
         // refusal a runtime can *see*, logged with its number, so the set of
         // calls a real workload needs is discovered rather than guessed.
@@ -335,6 +409,45 @@ const MUNMAP: u64 = 11;
 const MPROTECT: u64 = 10;
 /// `madvise(addr, length, advice)`.
 const MADVISE: u64 = 28;
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)`.
+const RT_SIGPROCMASK: u64 = 14;
+/// `sched_getaffinity(pid, length, mask)`.
+const SCHED_GETAFFINITY: u64 = 204;
+
+/// The method a *fault* arrives under, rather than a system call.
+///
+/// `u64::MAX`, which no Linux number can collide with — and which a hosted
+/// program could not choose anyway, because it never chooses the method: the
+/// kernel does.
+const FAULT_METHOD: u64 = u64::MAX;
+/// End the faulting program.
+const FAULT_END: u64 = 0;
+/// Resume it, with the registers left in the slot. Not sent yet: this program
+/// does not own the signal dispositions until they move, so it has nothing to
+/// resume *into*. Kept because the kernel already understands it and the arm
+/// that sends it is the next step's whole content.
+#[expect(
+    dead_code,
+    reason = "the kernel's half of step 6 exists before the adapter's"
+)]
+const FAULT_RESUME: u64 = 1;
+/// Where the fault exchange page sits in this program's own space.
+const FAULTS: u64 = 2;
+const FAULTS_AT: u64 = 0x0000_0000_1F00_0000;
+/// Bytes per fault slot, and how many faults were handed over.
+const FAULT_SLOT_BYTES: u64 = 512;
+
+/// How many processors a hosted program is told it has.
+///
+/// **Four, and written down as a stated narrowing rather than asked.** The
+/// adapter has no way to count them: `online_count` is the scheduler's and
+/// there is no capability that reports it. Telling a runtime the wrong number
+/// costs it parallelism, not correctness — Go sizes its scheduler by this and
+/// then blocks on futexes either way — and the trigger for making it real is
+/// the first workload whose *throughput* is measured, at which point a
+/// capability that answers "how big is this machine" is the honest fix rather
+/// than a constant that happens to be right.
+const CPUS_REPORTED: u64 = 4;
 
 /// Where a hosted domain's `Domain` capability sits in this program's CSpace.
 ///
@@ -400,6 +513,15 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
         method::ATTACH,
         [REPORT_AT, 1, 0, 0],
     );
+    // The fault exchange page, likewise. A fault arrives as a slot index into
+    // this; nothing else about it travels in the message.
+    let _ = call(
+        syscall::INVOKE,
+        FAULTS,
+        method::ATTACH,
+        [FAULTS_AT, 1, 0, 0],
+    );
+    let _ = FAULT_SLOT_BYTES;
 
     loop {
         let received = call(syscall::RECV, ENDPOINT, 0, [0; 4]);
@@ -423,6 +545,25 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
         // capability actually used. A caller cannot supply it, which is the
         // entire reason it can be trusted to say who is asking.
         let args = received.args;
+
+        // **A fault, not a system call.** RFC 0032 step 6: deciding what a
+        // fault *means* is the personality's business, so the kernel hands it
+        // over the same way it hands over a call — same endpoint, same badge,
+        // a method no Linux number can be.
+        //
+        // Answered `END` for now, and the reason is a boundary rather than a
+        // shrug: this program does not yet own the signal dispositions, so it
+        // cannot know whether the program had a handler. While `rt_sigaction`
+        // is still in the nucleus the kernel's own delivery runs first and
+        // this only ever sees faults nothing wanted — which is exactly the
+        // set that should end. When the dispositions move, this arm grows a
+        // decision and the kernel's delivery goes away.
+        if received.method == FAULT_METHOD {
+            faults_seen(args[0], args[1]);
+            let _ = call(syscall::REPLY, 0, 0, [FAULT_END, 0, 0, 0]);
+            continue;
+        }
+
         let request = PersonalityCall::new(
             Dialect::Linux,
             received.method,
