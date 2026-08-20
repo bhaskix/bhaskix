@@ -369,19 +369,33 @@ placement: a hosted thread reached ring 3 in **somebody else's address space**, 
 instruction fetch at a garbage address. Fourteen repeats of that lane since — five immediately and
 eight in a controlled run — have been clean, and it has not recurred in any other lane.
 
-**It is a fault this project has met before, fixed, and left one path uncovered.** On 2026-08-13 the
-cause was found in `vm::install` — the address space was loaded before the thread recorded owning it,
-so a preemption inside that window left `finish_switch` calling `enter_space(0)` and the previous
-`CR3` in place. The fix (record before loading) was verified at **0 faults in 50 boots** against a
-prior rate of one in ten, and an exit check was added at three paths back to ring 3. The tracker
-entry ends by naming what those three do not cover: *"the uncovered one is an **exception** return to
-user mode — a demand-paging fault serviced and retried — which is not the interrupt path and is the
-obvious next site."*
+**It is a fault this project has met before and fixed.** On 2026-08-13 the cause was found in
+`vm::install` — the address space was loaded before the thread recorded owning it, so a preemption
+inside that window left `finish_switch` calling `enter_space(0)` and the previous `CR3` in place. The
+fix (record before loading) was verified at **0 faults in 50 boots** against a prior rate of one in
+ten, and an exit check was added at the paths back to ring 3.
 
-**The capture points at exactly that.** Its exit-check counter reads `exits to ring 3 with the wrong
-space: 0 (0 not checked)` — the three instrumented paths all say they were clean — while the thread
-that faulted was demonstrably in the wrong space. A fault the check cannot see, on the path the check
-does not cover.
+> **Correction, 2026-08-20 (same day).** This section first said the tracker's *"the uncovered one is
+> an exception return to user mode"* still stood, and that the capture pointed at that missing fourth
+> check. **It is not missing.** `check_user_space(3)` is called from three places in `trap.rs` — the
+> serviced page fault, the fault handed to the personality, and the faulting-domain end — and has
+> been since RFC 0005 step 4. The tracker sentence was written before that and was read here as
+> current. What follows is what the evidence actually supports.
+
+**The capture says the check was clean while the thread was not, and that turned out to be a blind
+spot in the check itself.** Its counter reads `exits to ring 3 with the wrong space: 0 (0 not
+checked)` — all four instrumented paths clean — while the faulting thread was demonstrably in the
+wrong space. Reading `check_user_space` explains it: it compares a thread's *recorded* root against
+`CR3`, and when the recorded root is **zero** it returned **silently** — no counter, no trace. A
+thread resumed with no space recorded is exactly what the switch replay showed, and exactly how
+`enter_space(0)` leaves somebody else's `CR3` loaded. The instrument could not see the shape of the
+fault it exists for.
+
+**Both halves are closed now**, in a change of their own beside this step: a return to ring 3 by a
+thread owning no address space is counted, traced with its site and thread, reported on every boot,
+and **fails the boot**. So does a wrong space — which was printed in red and failed nothing, so a
+detector that fired would have reported into an empty room. Armed: forcing every user return to look
+rootless, and forcing every comparison to look wrong, each turned the boot red.
 
 **What this step claims and does not claim.** It does not claim the raise caused it: the shape,
 the counter and the recorded open gap all point elsewhere, and the rate is not what a new

@@ -53,6 +53,16 @@ FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
                  # precisely how a leaked slot per ended domain read for six
                  # days as a broken block driver.
                  "address space  no free slot"
+                 # **The instrument that hunts the wrong-`CR3` fault, made
+                 # fatal.** Both lines were printed in red and neither failed a
+                 # boot: a thread that reached ring 3 in somebody else's
+                 # address space, and -- since 2026-08-20 -- one that reached it
+                 # owning no space at all, which is the case the check skipped
+                 # silently for a week while the fault it exists for was
+                 # arriving in exactly that shape. A detector nobody fails on is
+                 # a detector that reports into an empty room.
+                 "exits to ring 3 held somebody else's space"
+                 "exits to ring 3 owned no space at all"
                  # Every self-test the kernel runs reports failure with this
                  # word, and until 2026-08-11 nothing looked for it. A failure
                  # was caught only where a *positive* gate below asserted that
@@ -1652,6 +1662,16 @@ if [[ -n $spaces ]] && ((spaces >= want)) && [[ -n $free ]] && ((free >= 8)); th
     pass "each user program has an address space of its own ($spaces, wanted $want; $free free for hosted processes)"
 else
     fail "wanted at least $want address spaces in use and 8 free, found ${spaces:-none} used and ${free:-none} free"
+    status=1
+fi
+
+# And the exit check says so positively, not only by not failing. A line that
+# stopped printing would take the whole instrument with it and nothing would
+# notice -- which is how this project has lost a check before.
+if grep -qF "none returned to ring 3 owning no space" "$LOG"; then
+    pass "every exit to ring 3 owned an address space, and the check says so"
+else
+    fail "the boot did not say whether any exit to ring 3 owned no address space"
     status=1
 fi
 

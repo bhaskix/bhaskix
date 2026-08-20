@@ -2058,6 +2058,25 @@ static EXIT_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 static EXIT_WRONG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static EXIT_UNCHECKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Returns to ring 3 by a thread with **no address space recorded**.
+///
+/// **The blind spot this instrument had for a week, and the exact shape of the
+/// fault it was built to hunt.** `check_user_space` compared a thread's
+/// recorded root against `CR3` and returned *silently* when the root was zero
+/// — so a thread about to run in ring 3 owning no space was the one case the
+/// check could not see, while `finish_switch` calling `enter_space(0)` and
+/// leaving somebody else's `CR3` loaded is precisely how the fault of
+/// 2026-08-13 arrived. Counted since 2026-08-20, when a capture read
+/// `wrong space: 0` beside a thread that was demonstrably in the wrong one.
+///
+/// A ring 3 thread that owns no address space is never correct: it either has
+/// one or it has no business in user mode.
+static EXIT_ROOTLESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The first rootless return, packed `site << 62 | thread`, or `u64::MAX`.
+static EXIT_ROOTLESS_FIRST: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// Checks that the thread about to run in ring 3 owns the loaded address space.
 ///
 /// **The last moment the kernel can tell.** The switch instrumentation showed a
@@ -2099,6 +2118,15 @@ pub fn check_user_space(site: u64) {
     drop(queue);
 
     if root == 0 {
+        // **Not silence.** See `EXIT_ROOTLESS`: this is the one case the check
+        // could not see, and it is the shape of the fault it exists for.
+        EXIT_ROOTLESS.fetch_add(1, Ordering::Relaxed);
+        let _ = EXIT_ROOTLESS_FIRST.compare_exchange(
+            u64::MAX,
+            (site << 62) | u64::from(who),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         return;
     }
     // SAFETY: reading CR3 at CPL 0 has no side effects.
@@ -2123,6 +2151,22 @@ pub fn exit_check_counts() -> (u64, u64) {
         EXIT_WRONG.load(Ordering::Relaxed),
         EXIT_UNCHECKED.load(Ordering::Relaxed),
     )
+}
+
+/// Returns to ring 3 by a thread owning no address space, and the first one:
+/// `(count, site, thread)`.
+///
+/// Zero is the only correct answer. See [`EXIT_ROOTLESS`].
+#[must_use]
+pub fn rootless_exits() -> (u64, u64, u32) {
+    use core::sync::atomic::Ordering;
+    let first = EXIT_ROOTLESS_FIRST.load(Ordering::Relaxed);
+    let (site, thread) = if first == u64::MAX {
+        (0, 0)
+    } else {
+        (first >> 62, (first & 0xffff_ffff) as u32)
+    };
+    (EXIT_ROOTLESS.load(Ordering::Relaxed), site, thread)
 }
 
 /// Replays the exit ring, oldest first, as `(site, thread, loaded space)`.

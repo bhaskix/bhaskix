@@ -631,10 +631,29 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // all.
         let (wrong_space, unchecked) = sched::exit_check_counts();
         let (no_space, no_thread) = sched::switch_gaps();
-        if wrong_space == 0 {
+        // **And the case the check could not see until 2026-08-20**: a thread
+        // returning to ring 3 owning no address space at all. The comparison
+        // above needs a root to compare against, so a root of zero was skipped
+        // *silently* -- and `enter_space(0)` leaving somebody else's `CR3`
+        // loaded is exactly how the fault this instrument hunts arrives. Zero
+        // is the only correct answer, and the boot test fails on any other.
+        let (rootless, rootless_site, rootless_thread) = sched::rootless_exits();
+        if wrong_space == 0 && rootless == 0 {
             println!(
                 "    address space  every exit to ring 3 held its own space ({unchecked} unchecked, \
-                 runqueue busy; {no_space} switches loaded none, {no_thread} found no thread)"
+                 runqueue busy; {no_space} switches loaded none, {no_thread} found no thread; \
+                 none returned to ring 3 owning no space)"
+            );
+        } else if wrong_space == 0 {
+            let where_ = match rootless_site {
+                0 => "syscall",
+                1 => "interrupt",
+                2 => "first entry",
+                _ => "serviced fault",
+            };
+            println!(
+                "\x1b[91m    address space  {rootless} exits to ring 3 owned no space at all \
+                 (first: t{rootless_thread} leaving {where_})\x1b[0m"
             );
         } else {
             println!(
