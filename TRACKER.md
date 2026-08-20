@@ -725,7 +725,7 @@ what is actually ahead.
 | Package management and image building | ✅ **done 2026-08-19** | **A package is a program plus the authority it asks for, in one reviewable file** ([RFC 0030](docs/rfc/0030-packages.md), **accepted 2026-08-19**, all six steps). Build time: the image is a deterministic function of `packages/*.manifest.in` -- assembled twice and byte-compared on every build, the fourteen boot programs' authority written down and shipped beside them. Run time: `pkg install / list / run / remove` at the shell, verified in ring 3 with the same zero-`unsafe` parser the host tools use, payload-first/record-last ordering proven by what a reinstall does not hit, grants derived from the installed manifest with over-asks refused whole before a domain exists, and every operation saying its price through the journal. The kernel gained no method and no object for any of it. Refused with written triggers: fetch, signatures, dependency solving, upgrades; install-time scripts refused flat |
 | Telemetry plane | ✅ **done** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) **accepted 2026-08-17**, drafted, implemented and accepted the same day | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
 | libc — resolved into the Linux personality | ⬜ **in progress** — [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) steps 2–8 of 10 | **This row did not exist until 2026-08-19**, while the roadmap carried the bullet and eight of the RFC's steps shipped — the same omission this table's own preamble describes. What runs: the personality tag and its `-ENOSYS` telemetry, the initial process image with a real auxiliary vector, the signal round trip (fault → handler → `rt_sigreturn`), the memory calls including `mprotect` and honoured `mmap` hints, `clone` and `futex` proven by two threads of one hosted program meeting, and a **real static Go binary** that loads, runs, prints through the adapter and stops in its own allocator after 212 traced calls. What does not: Tier 1 (files, `/proc`) has not started, and Tier 2 (sockets, `epoll`) has its arithmetic and neither its wiring nor a way to build one where the personality currently lives; the RFC's step 10 gate needs a workload from outside. **And one thing is in the wrong place:** the translation runs in the nucleus, where RFC 0005 §"Where it lives" requires a service domain — recorded 2026-08-19 in that RFC, in `security.md` §1 as **T11**, and in [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md) §5 with its correction trigger |
-| **A fuzz target for the filesystem** — a hostile disk image | ⬜ **owed**, opened 2026-08-20 | **A debt against a binding rule, not new scope.** `coding-style.md` §8 and `security.md` §5 both say a parser touching untrusted input gets a fuzz target *before* it merges. `fuzz/fuzz_targets/` holds fourteen — ELF, `ustar`, `DMAR`, both package formats and every network parser — and **none for `fs`**. Journal replay is the code that runs before anything can refuse. `Superblock::parse` already sanity-checks every field it later uses as an index, which is why this should be cheap; the target is what proves it. Found by the security reassessment of 2026-08-20, ranked fifth there by attacker cost and kept out of the roadmap deliberately — promoting a merge-gate obligation to a phase item turns a rule into a plan |
+| **A fuzz target for the filesystem** — a hostile disk image | ✅ **DONE 2026-08-21** — `fuzz/fuzz_targets/fs_image.rs`, four arms, 123,501 executions clean | **A debt against a binding rule, not new scope.** `coding-style.md` §8 and `security.md` §5 both say a parser touching untrusted input gets a fuzz target *before* it merges. `fuzz/fuzz_targets/` holds fourteen — ELF, `ustar`, `DMAR`, both package formats and every network parser — and **none for `fs`**. Journal replay is the code that runs before anything can refuse. `Superblock::parse` already sanity-checks every field it later uses as an index, which is why this should be cheap; the target is what proves it. Found by the security reassessment of 2026-08-20, ranked fifth there by attacker cost and kept out of the roadmap deliberately — promoting a merge-gate obligation to a phase item turns a rule into a plan |
 | **A coverage-guided fuzz target for IPv6 and NDP** | ⬜ **owed**, opened 2026-08-20 | The v6 parsers are covered by `net/src/fuzz.rs`'s seeded mutation harness, which runs on every commit and is **the weaker of the two mechanisms `coding-style.md` §8 names** — the v4 path has both. They are also the newest parsers in the tree ([RFC 0029](docs/rfc/0029-ipv6.md), 2026-08-18), so they have had the least time under anything. Ranked sixth in the 2026-08-20 reassessment |
 
 ---
@@ -887,6 +887,53 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-21 (the filesystem gets its fuzz target, and the target's first finding was about itself)
+
+**Gap 5 of the 2026-08-20 reassessment is paid.** `fuzz/fuzz_targets/fs_image.rs` — the debt against
+`coding-style.md` §8 that had stood since RFC 0015, while ELF, `ustar`, both package formats and
+every network parser had theirs. **123,501 executions, no crash and no hang.**
+
+**The interesting part is not the clean run. It is that three of the four arms did not work, and
+counting executions would never have said so.**
+
+A superblock carries a magic, a version and an FNV-1a checksum, so random bytes die at the first
+check — a target that only fed raw bytes would report millions of executions having exercised one
+function. That much was designed around from the start: arm B overwrites the superblock's *fields*
+and re-writes it, which recomputes the checksum, so attacker-chosen geometry reaches the field
+validation. Recomputing is deliberate and is not cheating: a checksum defends against corruption,
+not against somebody who can write a disk.
+
+**What was missed is that inodes are checksummed too.** Arm C splices fuzzer bytes over the image
+body, so every inode fails its own checksum before a walker ever sees a block pointer. The harness
+was probed by panicking inside `Filesystem::list`'s callback, and it ran **16,132 executions without
+ever yielding a directory entry**. The superblock's wall had been climbed and the inode's, one level
+down, had not.
+
+**Arm D is the answer**: build a populated image, take the inode's fields from the fuzzer, and
+**re-encode**, which recomputes the inode checksum. That puts attacker-chosen block pointers, sizes
+and kinds behind a valid checksum — a pointer that came off the disk and is followed, which is the
+bug class `fs/src/journal.rs` already warns about in its own comment.
+
+**Five paths, each proven reachable by a deliberate panic rather than by a coverage number:**
+
+| Probe | Before arm D | After |
+|---|---|---|
+| `walk()` — anything mounts at all | reached | reached |
+| `journal::home` returning `Ok` — a replay destination read off the disk | reached | reached |
+| **A directory entry yielded by `list`** | **16,132 runs, never** | reached |
+| A block pointer followed and bytes returned | not reached | reached |
+| `Free::of` — the free bitmap parsed | not reached | reached |
+
+**The general lesson, worth more than the target**: *a fuzz target's execution count says nothing
+about what it reached.* On-disk formats fail this way by construction, because every integrity check
+the format has is also a wall against the fuzzer. The check is cheap — panic in the deepest place
+and see whether it fires — and this project should apply it to the targets it already has before
+trusting their numbers.
+
+Three crash artifacts from the probe runs were re-run against the clean target, execute without
+incident, and were removed. `fuzz/artifacts/` and `fuzz/corpus/` are gitignored; the 107 corpus
+units the campaign found are kept on disk for the next run.
 
 ### 2026-08-21 (`bhaskix-fs` stops being at zero by discipline and starts being at zero by the compiler)
 

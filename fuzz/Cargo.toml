@@ -26,6 +26,7 @@ libfuzzer-sys = "0.4"
 bhaskix-kernel = { path = "../kernel", features = ["host"] }
 bhaskix-elf = { path = "../elf" }
 bhaskix-service-vfs = { path = "../services/vfs" }
+bhaskix-fs = { path = "../fs" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-net = { path = "../net" }
 bhaskix-pkg = { path = "../pkg" }
@@ -152,6 +153,13 @@ bench = false
 [[bin]]
 name = "linux_sockaddr"
 path = "fuzz_targets/linux_sockaddr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fs_image"
+path = "fuzz_targets/fs_image.rs"
 test = false
 doc = false
 bench = false

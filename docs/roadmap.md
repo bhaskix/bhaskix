@@ -176,13 +176,15 @@ held to the same gates as the incumbent. Packages exist — the image is a funct
 reviewable manifests, and programs install, run and remove at the shell with grants
 derived from what their manifests ask. What remains is libc.
 
-**Two debts are owed inside this phase and are not bullets, because they are not new scope.**
+**Two debts were owed inside this phase and are not bullets, because they are not new scope.**
 [coding-style.md](coding-style.md) §8 binds this project to a fuzz target *before* an
 untrusted-input parser merges, and two parsers merged without one: the **filesystem** (a hostile
 disk image — and journal replay runs before anything can refuse) and **IPv6/NDP** (covered by the
-seeded mutation harness, which is a weaker mechanism and is not the same one). Both are tracked as
-tasks in [TRACKER.md](../TRACKER.md) §4 rather than scheduled here — promoting a merge-gate
-obligation to a phase item would turn a rule into a plan.
+seeded mutation harness, which is a weaker mechanism and is not the same one). **The filesystem's
+was paid on 2026-08-21** — `fuzz/fuzz_targets/fs_image.rs`, four arms, 123,501 executions clean, and
+every path in it proven reachable by a deliberate panic rather than assumed from a coverage number.
+IPv6/NDP is still owed. Both are tracked as tasks in [TRACKER.md](../TRACKER.md) §4 rather than
+scheduled here — promoting a merge-gate obligation to a phase item would turn a rule into a plan.
 
 - ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
   M9-18 … M9-23. Capability-shaped rather than POSIX-shaped: no `fork` (it duplicates a capability
