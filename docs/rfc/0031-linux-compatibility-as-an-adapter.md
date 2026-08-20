@@ -411,10 +411,13 @@ measurement attached rather than quietly not done.
 1. **What is a Linux process, in Bhaskix terms?** One domain per process, or one domain per
    *workload* with several hosted processes inside it? The second is cheaper and weaker; the first
    makes `fork` and `execve` expensive. Decided by whoever implements L1's `execve`, with a
-   measurement.
+   measurement. → **[RFC 0033](0033-what-a-hosted-process-is.md), drafted 2026-08-20**: one domain
+   per process, and the constants that make five of them the machine's limit named as the price.
 2. **Where does the file-descriptor table live** — in the adapter, or as capabilities in a hosted
    domain's CSpace it cannot name? The second is more faithful to the model and needs the nucleus
-   to hold state for a dialect it does not interpret.
+   to hold state for a dialect it does not interpret. → **[RFC 0033](0033-what-a-hosted-process-is.md)**:
+   in the adapter, for exactly that reason — a CSpace-held table is Linux-shaped state in the
+   nucleus, which is what the ratchet was built to drive out.
 3. **Does a hosted process ever get a `Notification`?** `epoll` wants one. Answering yes makes the
    adapter's event loop cheap and puts one Bhaskix concept inside the Linux boundary.
 4. **How is a Linux domain's manifest expressed** (I4)? Reuse RFC 0030's grammar, or a Linux-shaped
