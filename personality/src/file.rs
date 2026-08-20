@@ -300,6 +300,28 @@ impl Table {
         Ok((to, displaced))
     }
 
+    /// Closes every descriptor marked `FD_CLOEXEC`, handing each to
+    /// `released`, and answers how many went — [RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md).
+    ///
+    /// **The callback is not a convenience; it is the point.** Each entry
+    /// carried a handle the adapter holds a capability behind, and an exec
+    /// that dropped the rows without telling anybody would leak one per
+    /// closed descriptor for the life of the adapter. Handing them back makes
+    /// the release the caller's obligation and makes forgetting it visible in
+    /// the type rather than in a boot six weeks later.
+    pub fn close_on_exec(&mut self, mut released: impl FnMut(Entry)) -> usize {
+        let mut closed = 0;
+        for slot in &mut self.entries {
+            if slot.is_some_and(|entry| entry.close_on_exec)
+                && let Some(entry) = slot.take()
+            {
+                released(entry);
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     /// How many descriptors are open. For a test, and for a report line.
     #[must_use]
     pub fn open_count(&self) -> usize {

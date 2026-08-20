@@ -260,6 +260,54 @@ in this document needs a lock, and that is written here as the trigger.
 **`unsafe`:** none in the nucleus. In the adapter, the same two shapes that exist today: borrows of
 its own single-threaded tables, and reads and writes of its own pages.
 
+## Step 2's record (2026-08-20): the record exists, in fifteen host tests and no wiring
+
+**`personality/src/process.rs`: 15 tests, zero `unsafe`, and nothing calls it.** A booting machine
+behaves exactly as it did — which is the point of building the arithmetic before the plumbing, and
+the reason this crate exists at all.
+
+**Four decisions became code, and each is now a test rather than a paragraph.**
+
+- **A pid is never a domain id and never reused within a boot.** Linux reuses pids because it wraps
+  at `pid_max`; this hands out a fresh one until the counter would wrap and then answers `EAGAIN`. A
+  reused pid is a `kill` delivered to whoever inherited the number, which is the oldest race in
+  Unix, and a machine that has started four billion hosted processes can be rebooted.
+- **Pids start at 2.** Zero is `wait`'s "any process in my group" and a `kill` target meaning the
+  whole group; 1 is `init`, which this system does not have and should not pretend to be — a program
+  that finds itself pid 1 may reasonably start reaping orphans.
+- **A record is found by domain *and generation*.** A domain id is reused; a lookup by id alone
+  would answer for whoever holds the slot now. This is the third place in this project to need that
+  pairing, after the kernel's `FORGET` message and the thread-counter bug before it.
+- **What survives an exec is a list, and the list is the test.** Pid, parent, group, session,
+  credentials, working directory, root, and every descriptor without `FD_CLOEXEC`. The domain is the
+  thing that changes.
+
+**The exec sweep hands back what it closed, and that is a type telling the truth.** Each closed row
+carried a handle the adapter holds a capability behind, so `Table::close_on_exec` takes a callback
+rather than returning a count: an exec that dropped the rows silently would leak one capability per
+closed descriptor for the life of the adapter, and this makes forgetting it a compile error rather
+than a boot six weeks later.
+
+**Orphans go to nobody, not to `init`.** Linux gives them to pid 1; inventing one here would be a
+process that exists only to make a sentence true. A parent of zero means nothing will read that
+status, and the adapter may drop the record — which is what `discard` refuses to do while a parent
+is still there to read it.
+
+**`Processes` is deliberately not `Copy`**, alone in this crate: a `Process` carries a whole
+descriptor table, so the table is tens of kilobytes and a stray dereference would compile into a
+memcpy of all of it on a machine whose kernel stack is sixty-four kilobytes. A build-time assertion
+bounds the size, so a field added later is priced when it is written.
+
+**Six of the fifteen tests were watched red** by deliberate edits: pids reused, the exit status
+returned unshifted, a status collected twice, the generation check deleted, `wait(0)` read as "any
+child", and the exec keeping its `CLOEXEC` descriptors. Each failed exactly the test that names it —
+and the first three also failed *other* tests, which is what a table with real invariants does.
+
+**What this step deliberately did not do:** signal dispositions are still `bin/linuxd`'s own table
+keyed by domain rather than a field of this record. Moving them in is a later step; the reset that
+an exec owes them is commented at the place it will go, because a handler surviving an exec would
+call an address that is no longer code.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -366,7 +414,8 @@ later step consumes them.
    authority **before** it is added, which is the only time such a note is worth anything.*
 2. **The record, host-tested, with nothing wired.** `personality/` grows a process table: pids,
    parents, groups, descriptors, the exec-survival list, the exit-status encoding. Pure logic, zero
-   `unsafe`, no behaviour change on a booting machine.
+   `unsafe`, no behaviour change on a booting machine. ✅ *Delivered 2026-08-20 — see the record
+   below.*
 3. **The three limits, raised and measured.** `MAX_SPACES` 12 → 32, `MAX_DOMAINS` 32 → 64,
    `CSPACE_SLOTS` 64 → 128, and the adapter's `base + domain id` slot scheme replaced by an
    allocated one. The bill printed in the boot report beside the counts that already print. Gated by

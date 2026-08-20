@@ -21,6 +21,7 @@ pub mod call;
 pub mod event;
 pub mod file;
 pub mod memory;
+pub mod process;
 pub mod signal;
 pub mod socket;
 pub mod stack;
