@@ -42,6 +42,7 @@ use bhaskix_abi::{method, status, syscall};
 use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
 use bhaskix_personality::memory;
 use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
+use bhaskix_personality::thread::{self, ClonePlan};
 
 /// One page to report through, written by this program and read by the
 /// kernel. Not a console: this program is started before the console service
@@ -233,6 +234,86 @@ fn deliver(domain: u32, slot: u64, address: u64) -> u64 {
     FAULT_RESUME
 }
 
+/// Answers a call whose arguments did not fit in a message.
+///
+/// The register file is in `slot`, in the kernel's order — which is the one
+/// place both sides must agree and the reason that order is written down on
+/// each of them.
+fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
+    let mut image = [0u64; FAULT_REGISTERS];
+    if !read_slot(slot, &mut image) {
+        return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
+    }
+    // Linux's argument registers, out of the frame: rdi, rsi, rdx, r10, r8.
+    let (rdi, rsi, rdx, r10, r8, r9) = (image[5], image[4], image[3], image[9], image[7], image[8]);
+
+    match number {
+        CLONE => {
+            let plan = thread::plan_clone(rdi, rsi, rdx, r10, r8);
+            let ClonePlan::Thread { stack, tls, .. } = plan else {
+                let ClonePlan::Refuse(errno) = plan else {
+                    return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
+                };
+                return (REPLY_VALUE, Answer::error(errno));
+            };
+            // **The entry is `r9`, and that is this personality's own
+            // contract rather than Linux's.** Linux resumes the child after
+            // its own `syscall` instruction, which needs the child to start
+            // with the parent's whole register file; this system starts it at
+            // an address the caller named in the sixth slot. Stated here as
+            // it was stated in the nucleus, because moving code is not the
+            // moment to quietly change what it promises.
+            if r9 == 0 {
+                return (REPLY_VALUE, Answer::error(memory::errno::ENOSYS));
+            }
+            let made = call(
+                syscall::INVOKE,
+                SLOT_BASE + u64::from(domain),
+                method::SPAWN_THREAD,
+                [r9, stack, tls.unwrap_or(0), 0],
+            );
+            if made.status != status::OK {
+                return (REPLY_VALUE, Answer::error(-11));
+            }
+            // Linux's `clone` returns the child's tid to the parent and zero
+            // to the child. The child never returns through here at all -- it
+            // starts where the caller said -- so the zero is delivered by
+            // construction, and this is only the parent's half.
+            (REPLY_VALUE, Answer::ok(made.args[0] + 1))
+        }
+        RT_SIGRETURN => {
+            // The handler was entered with `rsp` at the frame base; the `ret`
+            // into the restorer consumed the return address, so the process's
+            // `rsp` is eight above it.
+            let base = image[17].wrapping_sub(8);
+            let mcontext = base + 8 + SIGINFO_BYTES as u64 + UCONTEXT_MCONTEXT as u64;
+            let mut bytes = [0u8; signal::sigcontext::SIZE];
+            if !copy_in(domain, mcontext, &mut bytes) {
+                return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
+            }
+            let Ok(registers) = Registers::read_sigcontext(&bytes) else {
+                return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
+            };
+            let mut edited = image;
+            edited[0] = registers.rax;
+            edited[3] = registers.rdx;
+            edited[4] = registers.rsi;
+            edited[5] = registers.rdi;
+            edited[7] = registers.r8;
+            edited[8] = registers.r9;
+            edited[9] = registers.r10;
+            edited[15] = registers.rip;
+            edited[16] = registers.eflags;
+            edited[17] = registers.rsp;
+            if !write_slot(slot, &edited) {
+                return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
+            }
+            (REPLY_RESTORE, Answer::ok(slot))
+        }
+        _ => (REPLY_VALUE, bhaskix_personality::call::ENOSYS),
+    }
+}
+
 /// How many register words a fault slot carries, in the kernel's order.
 const FAULT_REGISTERS: usize = 19;
 /// Where a slot's register words begin, after the address and error code.
@@ -402,7 +483,18 @@ fn invoke(capability: u64, what: u64, args: [u64; 4]) -> Answer {
 /// function grows and `mod linux`'s declared count shrinks. The boundary
 /// report prints that count on every boot, so the progress is a number rather
 /// than a claim.
-fn answer(request: &PersonalityCall) -> Answer {
+fn answer(request: &PersonalityCall) -> (u64, Answer) {
+    // The two that cannot be answered from a message alone say so, and the
+    // kernel asks again with the caller's register frame.
+    if matches!(request.number, CLONE | RT_SIGRETURN) {
+        return (REPLY_NEED_FRAME, Answer::ok(0));
+    }
+    (REPLY_VALUE, answer_from_message(request))
+}
+
+/// Everything that can be decided from four words and this program's own
+/// tables.
+fn answer_from_message(request: &PersonalityCall) -> Answer {
     match request.number {
         // `getpid`. A Linux process id is a *number a program compares and
         // prints*, not authority — so a personality may invent one, and this
@@ -532,6 +624,12 @@ fn answer(request: &PersonalityCall) -> Answer {
         // takes a slower path for a promise nothing here breaks: no signal is
         // delivered asynchronously, so a mask has nothing to hide from.
         RT_SIGPROCMASK => Answer::ok(0),
+        // Both need more than a message carries: `clone` takes five
+        // arguments, and `rt_sigreturn` takes none but needs the interrupted
+        // stack pointer to find the frame its handler was given. Asking for
+        // the register file is how this program says so, and the kernel
+        // stages one without learning why.
+        CLONE | RT_SIGRETURN => Answer::ok(0),
         // Installing a handler. The `struct sigaction` is in the hosted
         // process's memory, so it is read the only way this program can read
         // anything of a process it hosts: through the capability it holds for
@@ -664,6 +762,26 @@ const FAULT_RESUME: u64 = 1;
 /// that never installed one survive a fault it should have died on — which is
 /// worse than a crash, because it is a crash that did not happen.
 const FORGET_METHOD: u64 = u64::MAX - 1;
+
+/// The method a retry carrying the caller's register frame arrives under.
+///
+/// Some Linux calls take five or six arguments and a message carries four.
+/// Rather than teach the nucleus which ones — Linux knowledge arriving by the
+/// back door — this program answers [`REPLY_NEED_FRAME`], and the kernel asks
+/// again under this method with the frame staged in a slot.
+const FRAME_METHOD: u64 = u64::MAX - 2;
+
+/// What a reply *means*, in the reply's method word.
+const REPLY_VALUE: u64 = 0;
+/// Ask again with the caller's register frame.
+const REPLY_NEED_FRAME: u64 = 2;
+/// Resume the caller from the registers in the slot named, not from a value.
+const REPLY_RESTORE: u64 = 3;
+
+/// `clone(flags, stack, parent_tid, child_tid, tls)` — five arguments.
+const CLONE: u64 = 56;
+/// `rt_sigreturn()` — no arguments, and needs the interrupted stack pointer.
+const RT_SIGRETURN: u64 = 15;
 
 /// Where the fault exchange page sits in this program's own space.
 const FAULTS: u64 = 2;
@@ -838,6 +956,12 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
             let _ = call(syscall::REPLY, 0, 0, [0; 4]);
             continue;
         }
+        // The retry, carrying the register frame this program asked for.
+        if received.method == FRAME_METHOD {
+            let (how, reply) = answer_with_frame(received.badge as u32, args[0], args[1]);
+            let _ = call(syscall::REPLY, 0, how, [reply.value, 0, 0, 0]);
+            continue;
+        }
         if received.method == FAULT_METHOD {
             faults_seen(args[0], args[1]);
             let verdict = deliver(received.badge as u32, args[0], args[1]);
@@ -852,8 +976,8 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
             0,
             received.badge as u32,
         );
-        let reply = answer(&request);
-        let _ = call(syscall::REPLY, 0, 0, [reply.value, 0, 0, 0]);
+        let (how, reply) = answer(&request);
+        let _ = call(syscall::REPLY, 0, how, [reply.value, 0, 0, 0]);
     }
 
     // The endpoint went away, which happens when the machine is taking itself

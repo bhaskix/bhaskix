@@ -218,7 +218,11 @@ pub enum Rank {
     /// not by blocking. Outside the console, because a driver reports what it
     /// found while holding itself.
     Block = 15,
-    /// `signal::DISPOSITIONS` — the Linux personality's per-domain handler
+    /// `syscall::FUTEX_KEYS` — the Linux personality's futex queues, the last
+    /// of its tables left in the nucleus. It was `signal::DISPOSITIONS` too,
+    /// until those moved to `bin/linuxd` (RFC 0032 step 7) — the rank stayed
+    /// because the futexes did, and the name is corrected rather than the
+    /// number reused for something unrelated. Formerly: the per-domain handler
     /// tables (RFC 0005 step 4).
     ///
     /// Nearly innermost, and taken from the page-fault handler: a user-mode
@@ -269,7 +273,7 @@ impl Rank {
             Self::IrqHandlers => "irq::HANDLERS",
             Self::Vectors => "vectors::TABLE",
             Self::Block => "virtio::DEVICE",
-            Self::Signals => "signal::DISPOSITIONS",
+            Self::Signals => "syscall::FUTEX_KEYS",
             Self::DmaWindow => "iommu::WINDOW",
             Self::Console => "console::CONSOLE",
         }

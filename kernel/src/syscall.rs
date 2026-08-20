@@ -142,6 +142,7 @@ const _: () = {
     assert!(method::MAP_AT == bhaskix_abi::method::MAP_AT);
     assert!(method::UNMAP_AT == bhaskix_abi::method::UNMAP_AT);
     assert!(method::PROTECT_AT == bhaskix_abi::method::PROTECT_AT);
+    assert!(method::SPAWN_THREAD == bhaskix_abi::method::SPAWN_THREAD);
     assert!(method::GRANT == bhaskix_abi::method::GRANT);
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
@@ -288,6 +289,8 @@ pub mod method {
     pub const UNMAP_AT: u64 = 62;
     /// Re-protect a whole region in a held domain. RFC 0032.
     pub const PROTECT_AT: u64 = 63;
+    /// Start a thread in a held domain. RFC 0032.
+    pub const SPAWN_THREAD: u64 = 64;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1016,6 +1019,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 | method::MAP_AT
                 | method::UNMAP_AT
                 | method::PROTECT_AT
+                | method::SPAWN_THREAD
         )
         && let Some(outcome) = domain_supervise(frame)
     {
@@ -1711,10 +1715,6 @@ use bhaskix_personality::call::{Dialect, PersonalityCall};
 /// reading the file. When the personality moves into a domain (RFC 0031 §5)
 /// this module goes with it and the count becomes zero.
 mod linux {
-    /// `rt_sigreturn()` — never returns to its caller.
-    pub const RT_SIGRETURN: u64 = 15;
-    /// `clone(flags, stack, parent_tid, child_tid, tls)`.
-    pub const CLONE: u64 = 56;
     /// `futex(uaddr, op, val, timeout, uaddr2, val3)`.
     pub const FUTEX: u64 = 202;
     /// `gettid()`.
@@ -1741,9 +1741,7 @@ mod linux {
     /// alternative, deriving it from the dispatch, needs the dispatch to be
     /// a table rather than a `match`, which is a change worth making when
     /// the personality moves rather than before.
-    pub const ANSWERED: [u64; 9] = [
-        RT_SIGRETURN,
-        CLONE,
+    pub const ANSWERED: [u64; 7] = [
         FUTEX,
         GETTID,
         EXIT_GROUP,
@@ -1812,7 +1810,7 @@ fn futex_word(address: u64) -> Option<u32> {
 /// thread group's exit exact.
 fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
     use bhaskix_personality::memory::errno;
-    use bhaskix_personality::thread::{self, ClonePlan, FutexPlan};
+    use bhaskix_personality::thread::{self, FutexPlan};
 
     let (first, second, third) = (call.first(), call.second(), call.third());
     match call.number {
@@ -1895,65 +1893,6 @@ fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
                 crate::domain::Ending::Exited,
             );
             crate::sched::exit()
-        }
-        linux::CLONE => {
-            let plan = thread::plan_clone(first, second, third, call.fourth(), call.fifth());
-            let ClonePlan::Thread {
-                stack,
-                tls,
-                parent_tid,
-                child_tid,
-            } = plan
-            else {
-                let ClonePlan::Refuse(errno) = plan else {
-                    return None;
-                };
-                return Some(errno as u64);
-            };
-            // Linux's `clone` returns in *both* threads: zero in the child,
-            // the child's tid in the parent. The child never returns through
-            // this path at all -- it starts at the entry the caller named,
-            // with the caller's own stack -- so the zero is delivered by
-            // construction rather than by writing a register: there is no
-            // return for it to be written to.
-            //
-            // The entry is `rip`'s successor in the caller's code, which for
-            // Go is the function it wants the thread to run: the runtime
-            // puts it in the child's stack and jumps there. This
-            // personality's contract is narrower and stated: the thread
-            // starts at the address in `arg3` (Linux's fifth argument slot
-            // is `tls`, and the sixth, `r9`, is where a caller with no
-            // libc puts the entry). A hosted runtime that expects Linux's
-            // "resume after the syscall" shape needs the register-file copy
-            // this does not yet do -- written down, not pretended.
-            let entry = call.sixth();
-            if entry == 0 {
-                return Some(errno::ENOSYS as u64);
-            }
-            let _ = (parent_tid, child_tid);
-            crate::domain::record_pending_clone(
-                crate::domain::DomainId::from_u32(domain),
-                entry,
-                stack,
-                tls.unwrap_or(0),
-            )
-            .ok()?;
-            let cpu = crate::domain::next_start_cpu();
-            let options = crate::sched::SpawnOptions::new().pinned().in_domain(domain);
-            match crate::sched::spawn_on_with(
-                cpu,
-                "cloned",
-                crate::cloned_thread,
-                u64::from(domain),
-                crate::shared::hhdm(),
-                options,
-            ) {
-                Ok(id) => Some(u64::from(id) + 1),
-                Err(_) => {
-                    crate::domain::take_pending_clone(crate::domain::DomainId::from_u32(domain));
-                    Some(-11i64 as u64)
-                }
-            }
         }
         linux::FUTEX => {
             match thread::plan_futex(first, second, third) {
@@ -2073,16 +2012,11 @@ fn foreign_call(frame: &mut SyscallFrame) {
         crate::telemetry::domain_hint(),
         &event,
     );
-    // `rt_sigreturn` first and on its own, because it is the one call that
-    // must *not* write a return value: it restores `rax` from the frame the
-    // handler was given, and an answer written over that would be the
-    // interrupted program's own register clobbered by its resumption.
-    if number == linux::RT_SIGRETURN && crate::signal::sigreturn(frame) {
-        if priced {
-            price_foreign_call(started);
-        }
-        return;
-    }
+    // `rt_sigreturn` used to be answered here, first and on its own, because
+    // it is the one call that must not write a return value. It is the
+    // adapter's now, and the shape survived the move: its reply is a
+    // *register image* rather than a number, which is the same statement
+    // made through the boundary instead of inside it.
 
     // The memory calls used to be tried here. All four now live in
     // `bin/linuxd` (RFC 0032 steps 4 and 5), so there is nothing between the
@@ -2111,7 +2045,7 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // reply. This is not the kernel becoming an IPC client: it is a trap
     // becoming a call on an endpoint the domain was given, which is what a
     // foreign system call has always been in this design.
-    if let Some(value) = adapter_call(&call) {
+    if let Some(value) = adapter_call(frame, &call) {
         frame.kind = value;
         // **Not priced here**, and that is what keeps the comparison honest:
         // `adapter_call` prices its own round trips, and folding them into the
@@ -2199,13 +2133,86 @@ pub static ADAPTER_REFUSAL: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// moving them needs a page shared with the adapter rather than a message, and
 /// a page needs somewhere to put it *per thread*, which is RFC 0032 step 4's
 /// work rather than a thing to improvise here.
-fn adapter_call(call: &PersonalityCall) -> Option<u64> {
-    ask_adapter(
+fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64> {
+    let answer = ask_adapter_full(
         u64::from(call.domain),
         call.number,
         [call.first(), call.second(), call.third(), call.fourth()],
-    )
+    )?;
+    match answer.0 {
+        // **The adapter needs more than a message can carry.** Some Linux
+        // calls take five or six arguments and a message has four, so the
+        // caller's whole register frame is staged in a slot and the question
+        // asked again. The nucleus never learns *which* calls those are,
+        // which is the point -- teaching it would be Linux knowledge arriving
+        // by the back door -- and only the calls that need it pay for it.
+        crate::fault::reply::NEED_FRAME => {
+            let slot = crate::fault::stage_frame(frame)?;
+            let again = ask_adapter_full(
+                u64::from(call.domain),
+                crate::fault::FRAME_METHOD,
+                [slot as u64, call.number, 0, 0],
+            );
+            let value = match again {
+                Some((crate::fault::reply::RESTORE, _)) => {
+                    restore_from_slot(frame, slot);
+                    crate::fault::give_back(slot);
+                    RESTORED.fetch_add(1, Ordering::Relaxed);
+                    return Some(frame.kind);
+                }
+                Some((_, value)) => Some(value),
+                None => None,
+            };
+            crate::fault::give_back(slot);
+            value
+        }
+        // Resume from a register image rather than from a value, which is
+        // what `rt_sigreturn` is: the answer is not a number, it is the
+        // thread's own state as its handler left it.
+        crate::fault::reply::RESTORE => {
+            let slot = usize::try_from(answer.1).ok()?;
+            restore_from_slot(frame, slot);
+            crate::fault::give_back(slot);
+            RESTORED.fetch_add(1, Ordering::Relaxed);
+            Some(frame.kind)
+        }
+        _ => Some(answer.1),
+    }
 }
+
+/// Puts a staged register image back into the system-call frame.
+///
+/// **Only what the frame carries**, which is the caller-saved set the entry
+/// stub saved: `rax`, `rdi`, `rsi`, `rdx`, `r8`-`r10`, and `rip`, `rflags`
+/// and the user stack pointer. `rbx`, `rbp` and `r12`-`r15` were never saved
+/// and cannot be restored here -- the same stated narrowing `rt_sigreturn`
+/// has carried since RFC 0005 step 4, and structural rather than a shortcut:
+/// widening it means widening the entry stub.
+fn restore_from_slot(frame: &mut SyscallFrame, slot: usize) {
+    let Some(image) = crate::fault::take_frame(slot) else {
+        return;
+    };
+    frame.kind = image[0];
+    frame.arg0 = image[3];
+    frame.method = image[4];
+    frame.capability = image[5];
+    frame.arg2 = image[7];
+    frame.arg3 = image[8];
+    frame.arg1 = image[9];
+    frame.rip = image[15];
+    // The flags a hosted program may choose, and no others -- as the fault
+    // path's own restore, and for the same reason.
+    frame.rflags = (frame.rflags & !USER_FLAGS) | (image[16] & USER_FLAGS);
+    frame.user_rsp = image[17];
+}
+
+/// The `rflags` bits a hosted program may choose when it is resumed.
+const USER_FLAGS: u64 = 0x0000_0CD5;
+
+/// How many callers the adapter resumed from a register image rather than
+/// answering with a value — which is what `rt_sigreturn` is, counted where
+/// the kernel performs it because that is the only side that can see it now.
+pub static RESTORED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Asks the adapter one question, blocking this thread until it answers.
 ///
@@ -2216,6 +2223,12 @@ fn adapter_call(call: &PersonalityCall) -> Option<u64> {
 ///
 /// `None` when there is no adapter, or when the endpoint has gone.
 pub fn ask_adapter(domain: u64, what: u64, args: [u64; 4]) -> Option<u64> {
+    ask_adapter_full(domain, what, args).map(|(_, value)| value)
+}
+
+/// As [`ask_adapter`], but answering the reply's *method* as well as its
+/// value -- which is how the adapter says the answer is not a number.
+fn ask_adapter_full(domain: u64, what: u64, args: [u64; 4]) -> Option<(u64, u64)> {
     let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
     if endpoint == u64::MAX {
         ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
@@ -2244,7 +2257,15 @@ pub fn ask_adapter(domain: u64, what: u64, args: [u64; 4]) -> Option<u64> {
                 // the two together broke the boundary report's own arithmetic
                 // -- "37 of 36 accounted" -- which is the instrument catching
                 // its keeper, exactly as it was built to.
-                if what != crate::fault::FAULT_METHOD {
+                // Neither a fault nor a *retry* is a system call. The retry
+                // is the second half of one already counted, and counting it
+                // again broke the boundary report's arithmetic the first boot
+                // after it existed -- the same instrument catching the same
+                // class of mistake for the second time in two steps.
+                if what != crate::fault::FAULT_METHOD
+                    && what != crate::fault::FRAME_METHOD
+                    && what != FORGET_METHOD
+                {
                     ADAPTER_ANSWERED.fetch_add(1, Ordering::Relaxed);
                 }
                 // **Priced separately from the in-nucleus path, because the
@@ -2260,7 +2281,7 @@ pub fn ask_adapter(domain: u64, what: u64, args: [u64; 4]) -> Option<u64> {
                     ADAPTER_PRICED.fetch_add(1, Ordering::Relaxed);
                     ADAPTER_FLOOR.fetch_min(spent, Ordering::Relaxed);
                 }
-                return Some(message.args[0]);
+                return Some((message.method, message.args[0]));
             }
             Err(crate::ipc::IpcError::Congested) => {
                 crate::sched::yield_now();
@@ -2419,13 +2440,7 @@ fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
 fn blocks_by_construction(number: u64) -> bool {
     matches!(
         number,
-        linux::FUTEX
-            | linux::SCHED_YIELD
-            | linux::CLONE
-            | linux::EXIT
-            | linux::EXIT_GROUP
-            | linux::RT_SIGRETURN
-            | linux::WRITE
+        linux::FUTEX | linux::SCHED_YIELD | linux::EXIT | linux::EXIT_GROUP | linux::WRITE
     )
 }
 
@@ -2924,6 +2939,37 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             match mapped {
                 Some(true) => Outcome::ok(address),
                 _ => Outcome::err(Status::QuotaExceeded),
+            }
+        }
+        method::SPAWN_THREAD => {
+            // The mechanism `clone` needs, and none of `clone`'s meaning: an
+            // entry, a stack, and one word handed over in `rdi`. Which flags
+            // made this legal, what a thread group is, and what the caller
+            // gets back are the personality's, in ring 3.
+            let (entry, stack, argument) = (frame.arg0, frame.arg1, frame.arg2);
+            if entry == 0 || stack == 0 {
+                return Some(Outcome::err(Status::WrongObject));
+            }
+            if crate::domain::record_pending_clone(target, entry, stack, argument).is_err() {
+                return Some(Outcome::err(Status::QuotaExceeded));
+            }
+            let cpu = crate::domain::next_start_cpu();
+            let options = crate::sched::SpawnOptions::new()
+                .pinned()
+                .in_domain(target.as_u32());
+            match crate::sched::spawn_on_with(
+                cpu,
+                "cloned",
+                crate::cloned_thread,
+                u64::from(target.as_u32()),
+                crate::shared::hhdm(),
+                options,
+            ) {
+                Ok(id) => Outcome::ok(u64::from(id)),
+                Err(_) => {
+                    crate::domain::take_pending_clone(target);
+                    Outcome::err(Status::Exhausted)
+                }
             }
         }
         method::UNMAP_AT => {

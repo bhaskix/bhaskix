@@ -50,6 +50,28 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// never chooses the method at all — the kernel does.
 pub const FAULT_METHOD: u64 = u64::MAX;
 
+/// The method a *retry with the register frame* arrives under.
+///
+/// **The kernel does not know which calls need more than four arguments**,
+/// and this is how it avoids having to. A message carries four words; some
+/// Linux calls take five or six. Rather than teach the nucleus which ones —
+/// which would be Linux knowledge arriving through the back door — the
+/// adapter answers [`reply::NEED_FRAME`], the kernel writes the caller's
+/// whole register frame into a slot and asks again under this method, and
+/// only the calls that need it pay for it.
+pub const FRAME_METHOD: u64 = u64::MAX - 2;
+
+/// What the adapter's reply *means*, in the reply's method word.
+pub mod reply {
+    /// The first word is the answer, for `rax`.
+    pub const VALUE: u64 = 0;
+    /// The adapter needs the caller's register frame; ask again with one.
+    pub const NEED_FRAME: u64 = 2;
+    /// Resume the caller from the registers in the slot the first word
+    /// names, rather than from a value — `rt_sigreturn`.
+    pub const RESTORE: u64 = 3;
+}
+
 /// What the adapter answered.
 pub mod verdict {
     /// End the program. The fault was fatal, or nothing wanted it.
@@ -292,6 +314,102 @@ pub fn hand_over(frame: &mut bhaskix_arch::trap::TrapFrame, address: u64) -> boo
     };
     release(slot);
     resume
+}
+
+/// Writes a *system call's* register frame into a slot, for a call whose
+/// arguments do not fit in a message.
+///
+/// **The image has holes, and they are the truth rather than an omission.**
+/// A system call arrives through the `SYSCALL` entry stub, which saves what
+/// the ABI says is caller-saved and nothing else — so `rbx`, `rbp` and
+/// `r12`–`r15` are not in the frame and read as zero here. Every Linux call
+/// that needs a fifth or sixth argument takes it in `r10`, `r8` or `r9`,
+/// which *are* saved; a call that wanted a callee-saved register would be a
+/// call this cannot serve, and the zero says so rather than inventing one.
+///
+/// Answers the slot, or `None` when none is free.
+pub fn stage_frame(frame: &bhaskix_arch::syscall::SyscallFrame) -> Option<usize> {
+    let page = PAGE.load(Ordering::Acquire);
+    if page == u64::MAX {
+        return None;
+    }
+    let slot = claim()?;
+    let mut image = [0u64; REGISTERS];
+    image[0] = frame.kind; //        rax
+    image[2] = 0; //                 rcx -- destroyed by SYSCALL itself
+    image[3] = frame.arg0; //        rdx
+    image[4] = frame.method; //      rsi
+    image[5] = frame.capability; //  rdi
+    image[7] = frame.arg2; //        r8
+    image[8] = frame.arg3; //        r9
+    image[9] = frame.arg1; //        r10
+    image[15] = frame.rip;
+    image[16] = frame.rflags;
+    image[17] = frame.user_rsp;
+
+    let object = crate::shared::MemoryId::from_u64(page);
+    let at = slot as u64 * SLOT_BYTES;
+    let mut bytes = [0u8; (word::FIRST_REGISTER + REGISTERS) * 8];
+    for (index, value) in image.iter().enumerate() {
+        let start = (word::FIRST_REGISTER + index) * 8;
+        bytes[start..start + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let mut written = 0usize;
+    let filled = crate::shared::fill_from(
+        object,
+        at as usize,
+        bytes.len(),
+        &mut |into: &mut [u8]| {
+            let take = into.len().min(bytes.len() - written);
+            into[..take].copy_from_slice(&bytes[written..written + take]);
+            written += take;
+            take
+        },
+    );
+    if filled.is_none() {
+        release(slot);
+        return None;
+    }
+    Some(slot)
+}
+
+/// Reads a slot's register image back, for a caller that is being resumed.
+pub fn take_frame(slot: usize) -> Option<[u64; REGISTERS]> {
+    let page = PAGE.load(Ordering::Acquire);
+    if page == u64::MAX || slot >= SLOTS {
+        return None;
+    }
+    let object = crate::shared::MemoryId::from_u64(page);
+    let at = slot as u64 * SLOT_BYTES;
+    let mut back = [0u8; REGISTERS * 8];
+    let mut read = 0usize;
+    let drained = crate::shared::drain_into(
+        object,
+        (at as usize) + (word::FIRST_REGISTER * 8) + back.len(),
+        &mut |chunk: &[u8]| {
+            let skip = ((at as usize) + word::FIRST_REGISTER * 8).saturating_sub(read);
+            let start = skip.min(chunk.len());
+            let take = (chunk.len() - start).min(back.len());
+            if take > 0 {
+                back[..take].copy_from_slice(&chunk[start..start + take]);
+            }
+            read += chunk.len();
+            chunk.len()
+        },
+    )?;
+    let _ = drained;
+    let mut image = [0u64; REGISTERS];
+    for (index, value) in image.iter_mut().enumerate() {
+        let mut eight = [0u8; 8];
+        eight.copy_from_slice(&back[index * 8..index * 8 + 8]);
+        *value = u64::from_le_bytes(eight);
+    }
+    Some(image)
+}
+
+/// Gives a staged slot back.
+pub fn give_back(slot: usize) {
+    release(slot);
 }
 
 /// What the fault path has done: handed over, resumed, and crowded out.

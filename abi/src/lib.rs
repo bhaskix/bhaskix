@@ -243,6 +243,15 @@ pub mod method {
     /// `PROTECT_AT(address, pages, protection)` on a `Domain` — whole regions
     /// only, as `AddressSpace::protect` requires and for its reasons.
     pub const PROTECT_AT: u64 = 63;
+    /// `SPAWN_THREAD(entry, stack, argument)` on a `Domain` — start a thread
+    /// in the target domain, in the address space it already has.
+    ///
+    /// [RFC 0032](../../docs/rfc/0032-a-supervisor-interface.md). The
+    /// mechanism `clone` needs and nothing of `clone`'s flags: a supervisor
+    /// says where to start, on what stack, with what one word — and a
+    /// personality decides what that means to the dialect it speaks. Answers
+    /// the new thread's id.
+    pub const SPAWN_THREAD: u64 = 64;
 
     /// Map the memory this capability names into the caller's address space.
     ///

@@ -616,6 +616,76 @@ kernel path still running underneath.
 **The kernel's `unsafe` budget fell again**, 1,512 to 1,507. Two steps, two reductions, while
 the machine gained a fault upcall and a personality that decides what a signal means.
 
+## Step 8's record (2026-08-20): `clone` and `rt_sigreturn` move, and the four-word wall comes down
+
+**Both of the calls that could not fit in a message now live in ring 3.** `clone` takes five
+arguments; `rt_sigreturn` takes none but needs the interrupted stack pointer. A message
+carries four words. The ratchet reads **7**.
+
+**The answer keeps the nucleus ignorant, which is the whole test.** The kernel does *not* know
+which calls need more than four arguments — teaching it would be Linux knowledge arriving by
+the back door. Instead the adapter answers **"ask me again with the register frame"**, the
+kernel stages the caller's frame in a slot of the page it already shares for faults, and asks
+again under a method no Linux number can be. Only the calls that need it pay for it, and the
+list of which those are lives entirely in ring 3.
+
+The same mechanism gave `rt_sigreturn` its answer shape: its reply is not a number but a
+**register image**, so the kernel resumes the caller from the slot rather than writing `rax`.
+That was always what `rt_sigreturn` did; it is now said through the boundary instead of inside
+it.
+
+**The staged frame has holes, and they are the truth.** A system call arrives through the
+`SYSCALL` stub, which saves the caller-saved set and nothing else, so `rbx`, `rbp` and
+`r12`–`r15` read as zero. Every Linux call needing a fifth or sixth argument takes it in
+`r10`, `r8` or `r9`, which *are* saved. A call wanting a callee-saved register is one this
+cannot serve, and the zero says so rather than inventing a value.
+
+**`SPAWN_THREAD` is the sixth supervisor method**, and it carries none of `clone`'s meaning: an
+entry, a stack, one word in `rdi`. Which flags made the request legal, what a thread group is,
+and what the caller gets back are all decided in ring 3. This personality's own contract —
+that the child starts at the address in the *sixth* argument slot rather than resuming after
+the `syscall` as Linux does — moved across unchanged and still says so, because moving code is
+not the moment to quietly change what it promises.
+
+**`kernel/src/signal.rs` is gone.** It was 238 lines two steps ago; its last resident,
+`rt_sigreturn`, left with this one. The lock rank it held is still there because the futex
+queues still use it, and its documentation now names what actually lives at that rank rather
+than what used to.
+
+**The accounting instrument caught the same class of mistake for the second time in two
+steps**: the retry is the second half of a call already counted, and counting it again made the
+report say *"SOME UNCOUNTED"* on the first boot after the mechanism existed. Faults, retries
+and forget-messages are all deliveries that are not system calls, and all three are excluded
+by name now.
+
+**Armed** by having the adapter spawn a thread at entry zero: the clone self-test went red with
+`parent saw -11`, which is the refusal travelling all the way back from `SPAWN_THREAD` to a
+hosted program's `errno`.
+
+**The kernel's `unsafe` budget fell a third time**, 1,507 → 1,504 — the last `uaccess` read the
+personality had in the nucleus went with `rt_sigreturn`. Three consecutive steps, three
+reductions, while the machine gained a supervisor interface, a fault upcall, a register-frame
+exchange and a personality that decides what a signal means.
+
+### What is left, and what each one needs
+
+Seven numbers: `futex`, `gettid`, `exit`, `exit_group`, `sched_yield`, `write`, `arch_prctl`.
+None is a parser and none reads a hosted structure, which is why the interesting half of this
+refactor is finished even though the count is not zero.
+
+- **`futex`** needs `BLOCK_ON` — and that needs the adapter to *hold notifications*, which it
+  cannot create. Boot can grant it a pool, and the adapter's single thread makes the
+  compare-and-queue atomic against other futex operations for free. The lost wakeup that shape
+  would normally have is already closed by `notify::signal` publishing its pending bits before
+  waking.
+- **`gettid`** needs the thread's identity, which the badge could carry beside the domain.
+- **`exit` and `exit_group`** need a way to end a thread or a domain from a capability, which
+  RFC 0017 deliberately left open.
+- **`sched_yield`** must yield the *caller's* thread, which only the kernel can do.
+- **`write`** needs the adapter to hold a console, which it cannot be given before the console
+  service exists.
+- **`arch_prctl`** sets a thread's TLS base — a seventh supervisor method, and a generic one.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |

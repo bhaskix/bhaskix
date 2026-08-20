@@ -50,7 +50,6 @@ pub mod sched;
 pub mod service;
 pub mod shared;
 pub mod shell;
-pub mod signal;
 pub mod smp;
 pub mod stack;
 pub mod sync;
@@ -4011,7 +4010,7 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // many faults it *resumed* on the personality's say-so, which is the same
     // event seen from the side that performed it.
     let delivered_before = fault::RESUMED.load(Ordering::Relaxed);
-    let returned_before = signal::RETURNED.load(Ordering::Relaxed);
+    let returned_before = syscall::RESTORED.load(Ordering::Relaxed);
     // Counted so a failure can say *which* failure it is. A probe that made
     // no foreign call at all was dispatched natively -- its dialect was
     // judged wrong -- and one that made calls and still delivered no signal
@@ -4061,7 +4060,7 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
     retire_probe(realm);
 
     let delivered = fault::RESUMED.load(Ordering::Relaxed) - delivered_before;
-    let returned = signal::RETURNED.load(Ordering::Relaxed) - returned_before;
+    let returned = syscall::RESTORED.load(Ordering::Relaxed) - returned_before;
     if report_pa != 0 && answers[0] == 0 && answers[1] == 1 && delivered == 1 && returned == 1 {
         println!(
             "    linux signal   a Linux program faulted on purpose, its SIGSEGV handler read \
