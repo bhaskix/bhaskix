@@ -368,14 +368,48 @@ kernel needs `unsafe`. So we manage it as a measured quantity:
 - **Per-crate `unsafe` budgets**, declared in `Cargo.toml` metadata and checked in CI. Raising a
   budget requires the PR description to say why. The number is reported on every PR so growth is
   visible rather than gradual.
-- `unsafe` is **confined to designated modules**: `arch::*`, each driver's `hal` submodule, and the
-  allocator internals. Business logic in `fs`, `net`, `sched`, and service code contains none, and
-  CI enforces that with a `#![forbid(unsafe_code)]` at those crate roots.
+- **Whole crates refuse `unsafe` outright**, and that is the strongest form of confinement here
+  because the compiler enforces it rather than a reviewer: `bhaskix-boot`, `bhaskix-elf`,
+  `bhaskix-net` (twice — the crate root and `siphash`), `bhaskix-personality`, `bhaskix-pkg`,
+  `bhaskix-telemetry` and `bhaskix-ustar` carry `#![forbid(unsafe_code)]`; `bhaskix-mm` denies at
+  its root and forbids in `bump`. **`bhaskix-fs` is at zero without either** — held by its budget
+  and by discipline, which is weaker, and is the one to convert first.
+- Everywhere else, **the budget is the confinement**. There is no module allow-list, and a number
+  in a manifest is what a reviewer can actually check.
 - `unwrap()`, `expect()`, and panicking indexing are denied outside tests and one-time init paths.
   A panic in the nucleus is a denial of service.
 
 Additionally: `miri` on host-testable crates, `cargo-fuzz` targets on every parser (ELF, filesystem
 metadata, network packets, IPC messages), and UBSan/ASan-equivalent debug features in the allocator.
+
+> **Correction, 2026-08-20. The two bullets above replace one that was wrong in three ways**, and it
+> had been wrong for long enough that it was quoted rather than checked. It read: *"`unsafe` is
+> confined to designated modules: `arch::*`, each driver's `hal` submodule, and the allocator
+> internals. Business logic in `fs`, `net`, `sched`, and service code contains none, and CI enforces
+> that with a `#![forbid(unsafe_code)]` at those crate roots."*
+>
+> 1. **There is no module allow-list, and there never was one to enforce.** `unsafe` lives in 25
+>    files in `kernel/` and 21 in `arch/`, plus 24 other crates. The kernel's own manifest carried
+>    the same sentence — *confined to `sync`, `framebuffer`, `trap` and `faultinject`; no other
+>    module may contain `unsafe`* — directly above a dated growth log that records it spreading into
+>    `memory`, `vm`, `stack` and per-CPU bring-up. **The header was refuted by the history printed
+>    underneath it**, and both are in one file that reviewers read.
+> 2. **There is no `hal` submodule anywhere in the tree.** [RFC 0014](rfc/0014-driver-framework.md)
+>    chose `register_block!` and `Mmio<T>` instead, which is a better answer — the sentence just
+>    outlived the design it described.
+> 3. **`sched` — named in that sentence as containing none — has 36 lines.** And this is the part
+>    worth keeping: **almost all of them are calls into `arch`**, not dangerous work.
+>    `cpu::disable_interrupts()`, `fx_save`/`fx_restore`, `bhaskix_context_switch` — `arch` exposes
+>    them as `unsafe fn`, so calling one needs a block, and the metric counts that block's line the
+>    same as it counts a raw pointer dereference. **A module's number does not distinguish doing
+>    something dangerous from asking `arch` to**, and a reader who does not know that will read
+>    every number on the table as worse than it is.
+>
+> What is true is what the bullets now say, and it is not a weaker claim: eight crates refuse
+> `unsafe` at compile time, every other crate declares a budget the build enforces, and every block
+> carries a `// SAFETY:` comment CI requires. **The confinement was real. The description of it was
+> written once, at M1, and never checked again** — which is the same failure this document found in
+> `architecture.md` §7 the same day, and the reason both now name what enforces them.
 
 **Parsers are where kernels get exploited.** Every parser that touches untrusted input gets a fuzz
 target before it gets merged, not after.

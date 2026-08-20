@@ -888,6 +888,44 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-20 (the `unsafe` confinement claim was wrong in three ways, and one of them makes every number on the table read worse than it is)
+
+**`security.md` §5 said**: *"`unsafe` is confined to designated modules: `arch::*`, each driver's
+`hal` submodule, and the allocator internals. Business logic in `fs`, `net`, `sched`, and service
+code contains none, and CI enforces that with a `#![forbid(unsafe_code)]` at those crate roots."*
+Checked against the tree, on the same day and by the same method that found `architecture.md` §7's
+instruction claim:
+
+1. **There is no module allow-list and there never was one to enforce.** `unsafe` lives in 25 files
+   in `kernel/` and 21 in `arch/`, plus 24 other crates. **`kernel/Cargo.toml` carried the same
+   sentence** — *confined to `sync`, `framebuffer`, `trap` and `faultinject`; no other module may
+   contain `unsafe`* — **directly above a dated growth log recording it spreading into `memory`,
+   `vm`, `stack` and per-CPU bring-up**. The header was refuted by the history printed underneath
+   it, in one file, for months. A header is read once; a log is appended to.
+2. **There is no `hal` submodule anywhere in the tree.** RFC 0014 chose `register_block!` and
+   `Mmio<T>` instead — a better answer. The sentence outlived the design it described.
+3. **`sched`, named as containing none, has 36 lines — and this is the part worth keeping.**
+   Almost all of them are **calls into `arch`**: `cpu::disable_interrupts()`, `fx_save`/`fx_restore`,
+   `bhaskix_context_switch`. `arch` exposes those as `unsafe fn`, so calling one needs a block, and
+   the metric counts that block's line exactly as it counts a raw pointer dereference. **A module's
+   number does not distinguish doing something dangerous from asking `arch` to**, and a reader who
+   does not know that reads every number on the budget table as worse than it is. That nuance is now
+   in §5, because the alternative is a table that quietly overstates its own alarm.
+
+**What is true is not a weaker claim.** Eight crates refuse `unsafe` at compile time —
+`bhaskix-boot`, `bhaskix-elf`, `bhaskix-net` (root and `siphash`), `bhaskix-personality`,
+`bhaskix-pkg`, `bhaskix-telemetry`, `bhaskix-ustar`, and `bhaskix-mm` denies at its root while
+`bump` forbids. Every other crate declares a budget the build enforces, and every block carries a
+`// SAFETY:` comment CI requires. **`bhaskix-fs` is at zero with neither `forbid` nor `deny`** — held
+by its budget and by discipline, which is weaker, and is named as the one to convert first.
+
+**The confinement was real. The description of it was written once, at M1, and never checked again.**
+That is the third claim of this shape found in two days — after `architecture.md` §7's instructions
+and the roadmap's ELF-fuzzing criterion — and all three share a mechanism: a sentence written when it
+was true, in a document nobody re-derives, next to a number that kept moving. The gate built earlier
+today is the answer for §7's version. §5's answer is that the budgets already were the enforcement,
+and the prose has stopped claiming a different one.
+
 ### 2026-08-20 (the instruction-containment gate is built, and the boundary stops being a habit)
 
 **`architecture.md` §7 claimed for a long time that architecture-specific instructions appear only

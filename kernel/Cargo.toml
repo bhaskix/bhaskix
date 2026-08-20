@@ -48,10 +48,19 @@ workspace = true
 # no abstraction can answer, and four deliberate faults in `faultinject`, which
 # exists to prove the exception path by taking one. The rest is in `arch/`.
 asm_budget = 10
-# Confined to `sync` (the spinlock's UnsafeCell), `framebuffer` (the pixel
-# blitter), `trap` (control-register reads), and `faultinject` (deliberately
-# faulting instructions). No other module may contain `unsafe`; see
-# docs/coding-style.md §3.
+# **This header said, from M1 until 2026-08-20, that `unsafe` here is confined
+# to `sync`, `framebuffer`, `trap` and `faultinject`, and that no other module
+# may contain any. The log below refutes it in its own words** -- it records the
+# growth into `memory`, `vm`, `stack`, per-CPU bring-up and the rest -- and the
+# two sat in this file together, unnoticed, because a header is read once and a
+# log is appended to.
+#
+# What is true: 1588 lines across 25 files, the largest being `lib.rs` (612 --
+# the boot report and the hosted probes), `iommu` (201), `virtio` (152), `vm`
+# (147), `smp` (106) and `irq` (103). The confinement that exists is this
+# number and the `// SAFETY:` comment on every block, both checked by CI. See
+# docs/security.md §5, which carried the same wrong sentence and now carries
+# the correction.
 #
 # Measured: 24 at M1, 57 after exceptions, 119 after interrupt bring-up.
 # The last increase is the APIC and PIC setup sequence in `trap::enable` and
