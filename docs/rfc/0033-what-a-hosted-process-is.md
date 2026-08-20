@@ -413,6 +413,46 @@ there rather than by the eleventh program faulting in a space that could not be 
 putting `MAX_SPACES` back to 12 — `found 7 used and 5 free`, which is the sentence this step
 exists to stop being true.
 
+## Step 4's record (2026-08-20): a pid a coincidence cannot explain
+
+**`bin/linuxd` holds the process table now, and `getpid` answers out of it.** The record built in
+step 2 is wired: a hosted domain's first foreign call admits a process, `getpid` returns its pid,
+and the kernel's `FORGET` — "this domain slot is somebody else now" — retires it.
+
+**The gate is stronger than the one this RFC asked for.** "Two hosted processes have different
+pids" would pass on almost anything; "neither equals a domain id" is a coincidence away from
+meaningless, since both are small numbers. What is gated instead is a property the old scheme could
+not have satisfied:
+
+```text
+linux pid      pid 2 in domain 2; pid 3 in domain 2;
+               distinct pids across 2 hosted programs, 1 of which shared a domain slot
+```
+
+**Two programs ran in the same domain slot and were given different pids.** Under `pid = domain + 1`
+they were both pid 3, because the number was a function of the slot. Both halves are demanded —
+`distinct`, *and* at least one pair sharing a slot — because "distinct" alone would pass on a boot
+where no two programs happened to share one, which is a property of the boot rather than of the
+personality. **Armed** by putting `domain + 1` back: `REUSED pids across 2 hosted programs`.
+
+**An arm that did *not* go red, reported rather than quietly dropped.** The adapter keeps an
+incarnation counter per domain slot so that a stale record cannot be found after the slot is reused.
+Removing the bump changed nothing any test could see — because the record is also *dropped* on
+`FORGET`, and the drop always succeeds while no hosted process has a parent to read its status. The
+counter is not decoration; it stops being unobservable the moment `discard` can refuse, which is the
+moment `fork` gives a process a parent. Written at the code and here rather than left as a green
+tick over an untested line.
+
+**Two things this step deliberately leaves wrong**, because fixing either is a later step and
+pretending otherwise would be worse:
+
+- **`gettid` still answers the kernel's thread id plus one**, so a hosted process's main thread has
+  a tid that is not its pid. Linux guarantees they are equal, and `tgkill(tgid, tid)` is where that
+  matters. The fix belongs with the record's thread list, not here.
+- **The exit status handed to a retiring record is `0`**, invented, because the `FORGET` message
+  does not carry the domain's `Ending`. Nobody can read it — no hosted process has a parent — so it
+  is a lie with no reader today and a bug the day `wait4` lands.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -527,7 +567,8 @@ later step consumes them.
    the existing "each program in its own address space" check, extended to say how many are free.
    ✅ *Delivered 2026-08-20 — four limits, not three; see the record below.*
 4. **`getpid` stops being the domain id.** The adapter allocates pids; the record maps them. One
-   gate: two hosted processes have different pids and neither equals a domain id.
+   gate: two hosted processes have different pids and neither equals a domain id. ✅ *Delivered
+   2026-08-20 — with a stronger gate than the one written here; see the record below.*
 5. **`execve`**, end to end: `DomainControl` granted to the adapter, a path resolved, an image
    loaded, a new domain started, the record moved, the old domain ended. The gate is **pid
    stability** — a hosted program that execs and reports the same pid on both sides.

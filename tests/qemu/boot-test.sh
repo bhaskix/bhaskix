@@ -1665,6 +1665,25 @@ else
     status=1
 fi
 
+# RFC 0033 step 4: a pid is invented by the adapter and is **not** the domain
+# id. The claim a coincidence cannot satisfy is the one gated here: two hosted
+# programs that ran in the *same domain slot* were given **different** pids.
+# Under the scheme this replaced -- `pid = domain + 1` -- they could not have
+# been, because the number was a function of the slot, so arming it by putting
+# that expression back turns `distinct` into `REUSED` and this red.
+#
+# Both halves are demanded: "distinct" alone would pass on a machine where no
+# two programs ever shared a slot, which is a property of the boot rather than
+# of the personality.
+if grep -qE "linux pid .*distinct pids across [0-9]+ hosted programs, [1-9][0-9]* of which shared a domain slot" "$LOG"; then
+    pass "a hosted pid is invented, not derived: a reused domain slot did not reuse a pid"
+elif grep -qE "linux pid " "$LOG"; then
+    fail "hosted pids: $(grep -aoE 'linux pid .*' "$LOG" | head -1)"
+    status=1
+else
+    pass "no hosted program on this machine, so no pid was handed out"
+fi
+
 # And the exit check says so positively, not only by not failing. A line that
 # stopped printing would take the whole instrument with it and nothing would
 # notice -- which is how this project has lost a check before.

@@ -41,6 +41,7 @@
 use bhaskix_abi::{limits, method, status, syscall};
 use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
 use bhaskix_personality::memory;
+use bhaskix_personality::process::{Exit, Process, Processes};
 use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
 
@@ -565,16 +566,25 @@ fn nucleus_thread(request: &PersonalityCall) -> u64 {
 fn answer_from_message(request: &PersonalityCall) -> Answer {
     match request.number {
         // `getpid`. A Linux process id is a *number a program compares and
-        // prints*, not authority — so a personality may invent one, and this
-        // one is the hosted domain's own id, offset so that no process is
-        // zero. It is the first call to be answered outside the kernel, and it
-        // was chosen for exactly that reason: nothing about it needs the
-        // hosted process's memory, its registers, or anything this program
-        // cannot yet reach.
+        // prints*, not authority — so a personality may invent one, and as of
+        // RFC 0033 step 4 this one invents it properly: a counter in the
+        // process record, never reused within a boot, and **not the domain
+        // id**.
         //
-        // The number matches what the nucleus answered before the move, so a
-        // hosted program cannot tell that anything changed. That is the test.
-        GETPID => Answer::ok(u64::from(request.domain) + 1),
+        // It answered `domain + 1` until then, which was wrong in two ways
+        // that only matter once a hosted program can `execve`. It leaked a
+        // Bhaskix identifier into a hosted process — cheap to remove now,
+        // expensive after software depends on the number. And it tied a Linux
+        // pid to a Bhaskix lifetime: `START` refuses a domain that has
+        // threads, so an exec must build a *new* domain, and a pid that moved
+        // with it would break `wait`, `$!` and every shell ever written.
+        //
+        // A machine with no room for another record answers `EAGAIN`, which is
+        // what Linux answers a `fork` it cannot serve.
+        GETPID => match process_for(request.domain) {
+            Some(process) => Answer::ok(u64::from(process.pid)),
+            None => Answer::error(bhaskix_personality::process::errno::EAGAIN),
+        },
         // The memory calls that fit in a message — RFC 0032 step 4. What each
         // *means* is decided by `bhaskix_personality::memory`, host-tested and
         // unchanged by the move; what it *does* is a capability invocation on
@@ -974,6 +984,48 @@ static mut SLEEPERS: [Sleeper; WAKES] = [Sleeper {
 /// Counts arrivals, so a `WAKE` of one takes the oldest sleeper.
 static mut ARRIVALS: u64 = 0;
 
+/// Every hosted process this adapter serves — [RFC 0033](../../../docs/rfc/0033-what-a-hosted-process-is.md).
+///
+/// **The identity of a Linux process lives here, in ring 3, and the domain is
+/// only what it runs in.** The arithmetic — which pid, what survives an exec,
+/// how a status is encoded — is `bhaskix_personality::process`, host-tested
+/// and with no way to name a capability. This is where it is kept.
+///
+/// Same `static mut` justification as [`DISPOSITIONS`]: one thread, one
+/// request at a time.
+static mut PROCESSES: Processes = Processes::new();
+
+/// How many times each domain slot has been handed to this program.
+///
+/// **A domain id is reused, and a record found by id alone would answer for
+/// whoever holds the slot now.** The kernel says when that happens — the
+/// `FORGET` message is exactly "this slot is somebody else now" — so this
+/// counter is bumped there, and a record is matched on the pair. The counter
+/// is this program's own: it need not agree with the kernel's generation, only
+/// change when the kernel says the slot did.
+static mut INCARNATION: [u32; limits::MAX_DOMAINS] = [0; limits::MAX_DOMAINS];
+
+/// The process record for a hosted domain, admitted on first sight.
+///
+/// **Admission is lazy because there is no other moment to do it in.** Nothing
+/// tells this program that a hosted domain has started; the first foreign call
+/// is the introduction, and a program that makes no call has no record and
+/// needs none. A table that is full answers `None`, and the caller turns that
+/// into the refusal Linux has for it.
+fn process_for(domain: u32) -> Option<&'static mut Process> {
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    let incarnations = unsafe { &*core::ptr::addr_of!(INCARNATION) };
+    let generation = incarnations[domain as usize % limits::MAX_DOMAINS];
+    // SAFETY: as above.
+    let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+    if processes.by_domain(domain, generation).is_none() {
+        // Parent zero: nothing hosted started it, so nothing will wait for it.
+        // When `fork` and `execve` exist, the parent is the process that asked.
+        processes.admit(0, domain, generation).ok()?;
+    }
+    processes.by_domain_mut(domain, generation)
+}
+
 /// The sleeper table, borrowed for the length of one request.
 fn sleepers() -> &'static mut [Sleeper; WAKES] {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
@@ -1260,6 +1312,33 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
             let gone = (received.badge as u32) + 1;
             for sleeper in sleepers().iter_mut().filter(|s| s.domain == gone) {
                 sleeper.domain = 0;
+            }
+            // And the process record, which is the identity itself — RFC 0033
+            // step 4. The record is dropped rather than left as a zombie:
+            // nothing hosted is its parent yet, so nobody will ever read its
+            // status. When `fork` exists, a process whose parent is alive
+            // becomes a zombie here instead, and `Exit::Status(0)` becomes a
+            // lie that matters — the real status has to come from the domain's
+            // own `Ending`, which this message does not carry.
+            //
+            // **The incarnation counter is not observable yet, and that is
+            // stated rather than implied.** Bumping it makes a stale record
+            // unfindable; dropping the record makes it unfindable too, and the
+            // drop always succeeds while no hosted process has a parent. So
+            // removing the bump changes nothing a test can see today. It stops
+            // being decoration the moment `discard` can refuse — which is the
+            // moment a parent exists to read the status.
+            let domain = received.badge as u32;
+            let slot = domain as usize % limits::MAX_DOMAINS;
+            // SAFETY: single-threaded by construction, as elsewhere here.
+            let incarnations = unsafe { &mut *core::ptr::addr_of_mut!(INCARNATION) };
+            let generation = incarnations[slot];
+            incarnations[slot] = generation.wrapping_add(1);
+            // SAFETY: as above.
+            let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+            if let Some(pid) = processes.by_domain(domain, generation).map(|p| p.pid) {
+                let _ = processes.ended(pid, Exit::Status(0));
+                let _ = processes.discard(pid);
             }
             let _ = call(syscall::REPLY, 0, 0, [0; 4]);
             continue;

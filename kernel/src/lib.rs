@@ -3148,6 +3148,36 @@ fn personality_boundary_report() {
              named, and none in the nucleus"
         );
     }
+    // **What each hosted program was told its pid is** — RFC 0033 step 4, and
+    // the claim is one a coincidence cannot satisfy: two programs that ran in
+    // *the same domain slot* were given **different** pids. Under the scheme
+    // this replaced — `pid = domain + 1` — they could not have been, because
+    // the number was a function of the slot. So the line reports the pairs and
+    // says how many of them shared a slot, and the boot test demands at least
+    // one.
+    let (pairs, count) = hosted_pids();
+    if count > 0 {
+        let mut distinct = true;
+        let mut shared_slot = 0;
+        for (index, (domain, pid)) in pairs.iter().take(count).enumerate() {
+            for (other_domain, other_pid) in pairs.iter().take(index) {
+                if other_pid == pid {
+                    distinct = false;
+                }
+                if other_domain == domain {
+                    shared_slot += 1;
+                }
+            }
+        }
+        print!("    linux pid      ");
+        for (domain, pid) in pairs.iter().take(count) {
+            print!("pid {pid} in domain {domain}; ");
+        }
+        println!(
+            "{} pids across {count} hosted programs, {shared_slot} of which shared a domain slot",
+            if distinct { "distinct" } else { "REUSED" }
+        );
+    }
     let (adapter_priced, adapter_floor, adapter_mean) = syscall::adapter_cost();
     if adapter_priced > 0 {
         if floor > 0 {
@@ -3646,6 +3676,44 @@ fn clone_rendezvous_attempt(
     }
 }
 
+/// What each hosted program was told its pid is, packed `domain << 32 | pid`.
+///
+/// **The evidence for RFC 0033 step 4**, and it has to be collected here
+/// because a pid is the *adapter's* answer to a *hosted program*: the kernel
+/// never sees one except by reading it out of a probe's report page, which is
+/// exactly what the self-tests already do. Eight slots because there are six
+/// probes and room to be wrong about that.
+static HOSTED_PIDS: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 8];
+static HOSTED_PIDS_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Records that the program in `domain` was told its pid is `pid`.
+fn note_hosted_pid(domain: u32, pid: u64) {
+    use core::sync::atomic::Ordering;
+    let at = HOSTED_PIDS_AT.fetch_add(1, Ordering::Relaxed);
+    if let Some(slot) = HOSTED_PIDS.get(at) {
+        slot.store(
+            (u64::from(domain) << 32) | (pid & 0xffff_ffff),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// What the hosted programs were told, as `(domain, pid)` pairs.
+fn hosted_pids() -> ([(u32, u64); 8], usize) {
+    use core::sync::atomic::Ordering;
+    let mut pairs = [(0u32, 0u64); 8];
+    let mut count = 0;
+    for slot in &HOSTED_PIDS {
+        let packed = slot.load(Ordering::Relaxed);
+        if packed != u64::MAX {
+            pairs[count] = ((packed >> 32) as u32, packed & 0xffff_ffff);
+            count += 1;
+        }
+    }
+    (pairs, count)
+}
+
 /// Where the thread probe's report page lands physically.
 static THREAD_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -3873,6 +3941,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // makes the first mean anything -- an answer of zero from a call that
     // wrote the register on the wrong CPU would look identical.
     const WITNESS: u64 = 0x5afe;
+    note_hosted_pid(realm.as_u32(), answers[1]);
     let right = marked
         && answers[0] != 0
         && answers[1] != 0
@@ -4809,6 +4878,7 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // that "the pid answered" while the probe had been refused. An assertion
     // that accepts an errno as a process id is an assertion about nothing.
     let pid = answers[0] as i64;
+    note_hosted_pid(realm.as_u32(), answers[0]);
     // The seed the probe wrote into the exit slot before calling `exit`. It
     // survives if and only if the call never came back; see `FOREIGNER_CODE`.
     const NEVER_RETURNED: u64 = 0xe217;
