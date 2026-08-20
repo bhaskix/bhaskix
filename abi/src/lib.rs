@@ -280,6 +280,24 @@ pub mod method {
     /// thread across every switch or it is gone at the first one. Which
     /// dialect asked, and under what name, is the personality's business.
     pub const SET_TLS: u64 = 65;
+    /// `MAKE_SPACE()` on a `Domain` — give it an address space of its own.
+    ///
+    /// [RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md) step 5, and
+    /// generic in the way RFC 0032 requires of anything the nucleus grows:
+    /// nothing about "this domain needs an address space" is a Linux concept.
+    ///
+    /// **Why it has to exist.** Every other way to get a space is to be a
+    /// thread inside the domain and have the kernel build one — which a
+    /// supervisor assembling a process by hand cannot be, because there is no
+    /// thread until it starts one, and it cannot map the pages that thread
+    /// will run in until the space exists. `execve` is the first caller: a
+    /// hosted process cannot exec in place, so the adapter builds its
+    /// successor and this is the successor's first breath.
+    ///
+    /// Refused on a domain that already has a space, and on one that has
+    /// threads: both mean somebody is already running in memory this would
+    /// replace.
+    pub const MAKE_SPACE: u64 = 66;
 
     /// Map the memory this capability names into the caller's address space.
     ///

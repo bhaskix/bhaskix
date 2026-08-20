@@ -453,6 +453,92 @@ pretending otherwise would be worse:
   does not carry the domain's `Ending`. Nobody can read it — no hosted process has a parent — so it
   is a lie with no reader today and a bug the day `wait4` lands.
 
+## Step 5's record (2026-08-20): a hosted program execs, and keeps its pid
+
+**A hosted program called `execve` and became another program, in another domain, with the same
+pid.** Three witnesses, none of which can produce another's answer:
+
+```text
+linux exec     a Linux program execed: its own domain ended and the program it became ran in another
+linux exec     pid 3 kept across an exec: domain 2 became domain 3
+execed pid 3                                    <- printed by the program that was exec'd
+```
+
+The kernel watched the execing domain's thread count reach zero. `bin/linuxd` reported, out of its
+own page, which pid it kept and across which two domains. And the program that replaced it asked
+`getpid` **in the new domain** and printed the answer. The gate demands that the last two name the
+same number and that the two domains differ — which a pid derived from a domain could not satisfy,
+and which is exactly why step 4 came first.
+
+### The sequence, and the one line worth reading twice
+
+```text
+SPAWN        a domain          (DomainControl, granted at boot; the envelope allows sixteen)
+PERSONALITY  Linux             (so its calls arrive at the adapter)
+MAKE_SPACE                     (new — see below)
+MAP_AT       code, stack       (read-execute and read-write, eagerly)
+COPY_OUT     the image
+SPAWN_THREAD at the entry
+exec_into    the record        (same pid, new domain)
+reply END_DOMAIN               (which is what ends the caller's domain)
+```
+
+**Nothing here can kill a domain**, and nothing needed to. RFC 0017 deliberately left "a supervisor
+may kill its child" out, and RFC 0032 did not add it. What ends the old domain is the *reply*: the
+caller is told to end, and the kernel does it to the thread that asked. An `execve` is therefore
+the calling program's own last act — which is precisely what `execve` is.
+
+### One kernel method this plan did not have
+
+`MAKE_SPACE`, on a `Domain` capability. A freshly created domain has **no address space**: every
+other way to get one is to be a thread inside the domain and have the kernel build it, and there is
+no thread until the supervisor starts one — which it cannot do until the pages that thread will run
+in exist. The circle is real, and one generic method breaks it. Nothing about "this domain needs an
+address space" is a Linux concept, which is the test RFC 0032 set for anything the nucleus grows;
+it is refused on a domain that already has one or that has threads, and it answers **nothing** — a
+page-table root is a fact about the machine that no capability handed over.
+
+### The narrowing this plan did not anticipate: there is one path
+
+`execve` resolves **`/bin/execed`** and answers `ENOENT` for everything else. There is no file
+surface yet — that is step 6 — so the program it execs is compiled into the adapter, forty-two
+bytes of hand-assembly that ask their pid and print it. **A path with one answer is still a path**:
+the argument is read out of the caller's memory through a capability, compared, and refused when it
+does not match. What is *not* real yet is resolution, `argv`, `envp`, and anything an ELF loader
+would do. Each is named here so that none of them is discovered later as a surprise.
+
+### Three mistakes, all of them arithmetic, all found by the instrument
+
+- **The record was moved after its key was invalidated.** The first version bumped the old domain's
+  incarnation *before* looking the record up, so the lookup missed, admitted a **fresh** record, and
+  exec'd that — the new program printed a pid one higher than the program it replaced. The gate
+  caught it as `kept='3 2 3', console says 'execed pid 4'`, which is the two-witness design doing
+  the only job it has.
+- **The exec record was written into the scratch area.** It sat at `REPORT_AT + 8 * 32`, which is
+  where `copy_in` stages its bytes, so every copy after the exec overwrote it and the kernel printed
+  the tail of a path as a pid (`pid 15 ... domain 750815947819084146`). It is past the scratch bound
+  now, and placed *relative* to it so that moving one moves the other.
+- **`drain_into` is named for its sink, not for consumption.** It reads from the object's beginning
+  every time; a "fix" that assumed the previous read had consumed 256 bytes made the kernel print
+  `mmap` record zero as a pid.
+
+**Armed**, both halves: replying with a value instead of `END_DOMAIN` left the execing domain alive
+and the self-test could not conclude; skipping `exec_into` gave the new program a fresh pid and the
+gate named both numbers.
+
+### What it cost
+
+The adapter's `unsafe` budget rises 50 → 56 and **not one of those lines is in `execve`**: a domain
+created, given an address space, mapped, filled and started, entirely through capability
+invocations, dereferencing nothing. The kernel's rises 1,510 → 1,525, of which thirteen are the
+exec *probe* — a hosted program has to be built by something not on the far side of the boundary it
+tests — and two are the read of the adapter's record.
+
+**`security.md` §1's T11 grows by one line**, as its own note said it would: the adapter holds
+`DomainControl` now, so a compromise of it can create domains within its envelope and do to them
+everything a supervisor can. A domain it creates is still **empty** — every authority it will ever
+hold is one the adapter passes from what it holds, and there is no ambient root.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -571,7 +657,9 @@ later step consumes them.
    2026-08-20 — with a stronger gate than the one written here; see the record below.*
 5. **`execve`**, end to end: `DomainControl` granted to the adapter, a path resolved, an image
    loaded, a new domain started, the record moved, the old domain ended. The gate is **pid
-   stability** — a hosted program that execs and reports the same pid on both sides.
+   stability** — a hosted program that execs and reports the same pid on both sides. ✅ *Delivered
+   2026-08-20 — with one narrowing this plan did not anticipate and one kernel method it did not
+   have; see the record below.*
 6. **Descriptors and `/proc/self/fd`**, with `open`, `close`, `dup`, `read`, `write` on files, and
    inheritance across exec.
 7. **Pipes**, and a blocked reader woken by a writer — `BLOCK_ON`, unchanged from step 10.

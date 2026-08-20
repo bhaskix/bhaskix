@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1510
+unsafe_budget = 1525
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -400,6 +400,19 @@ unsafe_budget = 1510
 # has and carries the same argument -- the entry is inside a user-executable
 # segment the loader accepted, and the stack address is one past user-writable
 # memory in the space just installed.
+#
+# **1525 at RFC 0033 step 5, and fifteen lines is what an `execve` witness
+# costs.** Thirteen are the exec probe's thread — a page mapped, the
+# hand-assembled blob copied in through the direct map, and `enter_ring3` — the
+# same shape every Linux probe in this file has had since RFC 0005 step 2, and
+# for the same reason: a hosted program that tests a boundary has to be built
+# by something that is not on the far side of it. Two are the read of the
+# adapter's exec record out of the page it shares.
+#
+# **Nothing in `execve` itself is here.** The domain is created, given an
+# address space, mapped, filled and started by `bin/linuxd` through
+# capabilities; the kernel's part is one generic method (`MAKE_SPACE`) written
+# in safe code over `vm::register_for`.
 #
 # **1510 at step 10.** One line left and five arrived, and the direction is
 # worth reading rather than the number: what left is `futex_word`'s `uaccess`

@@ -885,6 +885,40 @@ pub unsafe fn install(space: AddressSpace) {
     }
 }
 
+/// Puts a space in the table for a domain that is **not** the caller's, and
+/// loads nothing.
+///
+/// [RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md) step 5: a
+/// supervisor building a process by hand — mapping its pages, copying its
+/// image in, starting its thread — needs the domain to *have* an address space
+/// before any of that, and until now the only way to get one was to be a
+/// thread inside it and call [`install`]. A freshly created domain has no
+/// thread, which is precisely why it needs the space first.
+///
+/// **`CR3` is not touched**, and that is the difference from [`install`]:
+/// nothing about this concerns the CPU it runs on. The first thread spawned in
+/// the domain adopts the root — `cloned_thread` reads it from the domain — and
+/// loads it on the switch into that thread, which is the ordinary path.
+///
+/// Answers the root, or `None` if the table is full.
+pub fn register_for(domain: crate::domain::DomainId, space: AddressSpace) -> Option<u64> {
+    let root = space.root();
+    {
+        let mut spaces = SPACES.lock();
+        let slot = spaces
+            .iter()
+            .position(|held| held.as_ref().is_some_and(|held| held.root() == root))
+            .or_else(|| spaces.iter().position(Option::is_none))?;
+        spaces[slot] = Some(space);
+        let live = spaces.iter().flatten().count();
+        PEAK.fetch_max(live, core::sync::atomic::Ordering::Relaxed);
+    }
+    // Outside the `SPACES` guard, for the rank reason `install` states: the
+    // domain table may be taken after the space table and never inside it.
+    crate::domain::record_space_root(domain, root);
+    Some(root)
+}
+
 /// Gives back the table slot holding the space rooted at `root`.
 ///
 /// For [`crate::domain::end`], which is the only caller: a domain that has gone

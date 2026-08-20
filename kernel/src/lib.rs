@@ -542,6 +542,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux stack    FAILED\x1b[0m");
     }
+    if !exec_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux exec     FAILED\x1b[0m");
+    }
     if !signal_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -3127,6 +3133,54 @@ fn personality_boundary_report() {
             }
         }
     }
+    // **What an `execve` did, out of the adapter's own page** — RFC 0033 step
+    // 5. Three numbers: the pid, the domain the program was in, and the domain
+    // it is in now. The pid is the claim; the two domains are what make it a
+    // claim worth checking, because a pid that survived a domain change is one
+    // that was never derived from a domain.
+    //
+    // The other witness is the exec'd program itself, which asks `getpid` in
+    // the new domain and prints the answer. The boot test compares the two,
+    // and neither can produce the other's number.
+    if page != u64::MAX {
+        let object = shared::MemoryId::from_u64(page);
+        let mut record = [0u64; 3];
+        let mut at = 0usize;
+        // Past the eight `mmap` records, which is where the adapter puts it.
+        // **From the object's beginning, past the `mmap` records *and* the
+        // adapter's scratch area.** `drain_into` is named for a sink rather
+        // than for consumption: it reads from the start every time, so an
+        // offset is walked rather than resumed.
+        //
+        // The scratch area matters and cost two boots: it begins at 256, which
+        // is where this record first sat, so every `copy_in` after the exec
+        // overwrote it and the kernel printed the tail of a path as a pid.
+        // 1,280 = 256 of `mmap` records + 1,024 of scratch, which is where
+        // `bin/linuxd` puts it and says so.
+        const EXEC_RECORD_BYTE: usize = 8 * 32 + 1024;
+        const EXEC_RECORD_WORD: usize = EXEC_RECORD_BYTE / 8;
+        let taken = shared::drain_into(object, EXEC_RECORD_BYTE + 24, &mut |chunk: &[u8]| {
+            for word in chunk.chunks_exact(8) {
+                if at >= EXEC_RECORD_WORD + 3 {
+                    break;
+                }
+                if at >= EXEC_RECORD_WORD {
+                    let mut eight = [0u8; 8];
+                    eight.copy_from_slice(word);
+                    record[at - EXEC_RECORD_WORD] = u64::from_le_bytes(eight);
+                }
+                at += 1;
+            }
+            chunk.len()
+        });
+        if taken.is_some() && record[0] != 0 {
+            println!(
+                "    linux exec     pid {} kept across an exec: domain {} became domain {}",
+                record[0], record[1], record[2]
+            );
+        }
+    }
+
     // What the fault path did. Printed whenever anything was handed over,
     // because a fault reaching the personality at all is the claim step 6
     // makes and the only evidence for it.
@@ -4471,6 +4525,87 @@ const FOREIGNER_CODE: [u8; 105] = [
 const FOREIGNER_CODE_AT: u64 = 0x0000_0000_1000_0000;
 const FOREIGNER_REPORT_AT: u64 = 0x0000_0000_1001_0000;
 
+/// Where the exec probe's code and path live in its own space.
+const EXEC_PROBE_CODE_AT: u64 = 0x0000_0000_1200_0000;
+
+/// The exec probe, hand-assembled: it asks its pid, calls `execve`, and — if
+/// the call ever comes back, which is the failure this watches for — spins.
+///
+/// **RFC 0033 step 5's witness.** The pid it reads is the one the adapter gave
+/// it; the program it execs into reads the pid again and prints a line. The
+/// two numbers being equal across a *domain change* is the claim, and nothing
+/// inside one domain can make it.
+///
+/// The path sits at offset 33 and `rdi` is loaded with its address from `rip`:
+/// a supervisor-built program has no loader to relocate anything for it, which
+/// is exactly the constraint a hosted `execve` lives under.
+#[rustfmt::skip]
+const EXEC_PROBE_CODE: [u8; 44] = [
+    0xb8, 0x27, 0x00, 0x00, 0x00,        // mov eax, 39           ; getpid
+    0x0f, 0x05,                          // syscall
+    0x49, 0x89, 0xc7,                    // mov r15, rax          ; keep it
+    0x48, 0x8d, 0x3d, 0x10, 0x00, 0x00,  // lea rdi, [rip+16]     ; the path,
+    0x00,                                //                       ; at offset 33
+    0x31, 0xf6,                          // xor esi, esi          ; argv
+    0x31, 0xd2,                          // xor edx, edx          ; envp
+    0xb8, 0x3b, 0x00, 0x00, 0x00,        // mov eax, 59           ; execve
+    0x0f, 0x05,                          // syscall
+    // Only reached if the exec was refused, which is a failure this test can
+    // name rather than a silence it has to guess at.
+    0x48, 0x89, 0xc6,                    // mov rsi, rax
+    0xeb, 0xfe,                          // jmp $
+    // Offset 33: the path, and nothing after it.
+    b'/', b'b', b'i', b'n', b'/', b'e', b'x', b'e', b'c', b'e', b'd',
+];
+
+/// The thread that becomes the exec probe — RFC 0033 step 5.
+///
+/// One page, read-execute, and no report page at all: what this probe has to
+/// say it says by *execing*, and what the program it becomes has to say it
+/// says to the console. A probe that reported through a page would have to
+/// survive its own `execve` to write into it, which is the one thing an exec
+/// guarantees it does not do.
+extern "C" fn ring3_execer(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    let Some(code) = VirtRange::from_pages(VirtAddr(EXEC_PROBE_CODE_AT), 1) else {
+        stop()
+    };
+    if space.map_anonymous(code, Protection::ReadExecute).is_err() {
+        stop()
+    }
+    let Some(code_pa) = space.translate(VirtAddr(EXEC_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the
+    // direct map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            EXEC_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            EXEC_PROBE_CODE.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of a page mapped read-execute above,
+    // and the stack is one past the writable end of the same page -- this
+    // program pushes nothing, and `execve` is its second instruction pair.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            EXEC_PROBE_CODE_AT,
+            EXEC_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE,
+            [0, 0],
+        )
+    }
+}
+
 /// The thread that becomes the Linux-tagged probe: builds a two-page space,
 /// copies the hand-assembled code in through the direct map (the mapping
 /// itself is never writable), and enters ring 3 with `rdi` naming the
@@ -4733,6 +4868,69 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         false
     }
+}
+
+/// RFC 0033 step 5's witness: a hosted program `execve`s, and keeps its pid.
+///
+/// **What makes this a test rather than a demonstration is where the two
+/// numbers come from.** The probe asks its pid in one domain; the program it
+/// becomes runs in a *different* domain, created by `bin/linuxd` while the
+/// first was still alive, and asks again. Only a pid that lives in the
+/// adapter's record can be the same on both sides — one derived from the
+/// domain could not be, which is exactly what step 4 changed.
+///
+/// The kernel's part is small on purpose: create a Linux-tagged domain, start
+/// the probe, and wait for the domain to be gone. Everything between is the
+/// adapter's, which is the claim.
+fn exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux exec     skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("execer", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux exec     FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    linux exec     FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "execer", ring3_execer, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux exec     FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+
+    // The probe's own domain must *end*, because that is what an exec does to
+    // it: the adapter replies `END_DOMAIN` after building the successor. A
+    // probe still alive here either never reached its `execve` or was refused
+    // one, and both are failures this can name.
+    let mut ended = false;
+    for _ in 0..400 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    if ended {
+        println!(
+            "    linux exec     a Linux program execed: its own domain ended and the program it \
+             became ran in another"
+        );
+    } else {
+        println!("\x1b[91m    linux exec     FAILED: the execing domain is still alive\x1b[0m");
+    }
+    ended
 }
 
 /// RFC 0005 step 2's witness: a Linux-tagged domain's system calls are all
@@ -7284,8 +7482,19 @@ const FUTEX_WAKE_SLOT: usize = 4;
 const FUTEX_WAKES: usize = 16;
 
 fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
-    let realm = domain::create("linux", domain::ResourceEnvelope::new())
-        .map_err(|_| "the linux domain would not be created")?;
+    // **An envelope that allows children**, which is what `execve` needs — RFC
+    // 0033 step 5. A hosted process that execs becomes a *new* domain, and the
+    // adapter is what creates it, so the authority to create domains is the
+    // adapter's and the *number* of them is this envelope's. Sixteen, and the
+    // number is a limit rather than a guess: an exec'd domain is not reaped
+    // until `wait4` exists to reap it (RFC 0033 step 9), so this is also how
+    // many execs a boot may serve before the seventeenth is refused. A refusal
+    // a hosted program can see beats a machine that quietly stops working.
+    let realm = domain::create(
+        "linux",
+        domain::ResourceEnvelope::new().max_child_domains(16),
+    )
+    .map_err(|_| "the linux domain would not be created")?;
 
     // Slot 0, and the only slot: the endpoint foreign calls arrive on. The
     // adapter's own, and unbadged -- what distinguishes its callers is the
@@ -7404,6 +7613,32 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
         {
             return Err("a futex wake would not install");
         }
+    }
+
+    // Slot 20: the authority to create a domain — RFC 0033 step 5, and the
+    // largest grant this program has been given.
+    //
+    // **`execve` is why.** A hosted process that execs cannot reuse its own
+    // domain: `START` refuses a domain that has threads, and the thread asking
+    // is one. So the exec builds a new domain and ends the old one, and the
+    // thing that builds it is the adapter — which means the adapter holds
+    // `DomainControl`. Necessary and not sufficient: the envelope above says
+    // how many, and every capability the child gets is one the adapter passes.
+    //
+    // This is the grant `security.md` §1's T11 note said was coming. It is
+    // real now, and that note says so rather than predicting it.
+    let control = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::DomainControl, 0),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the adapter's DomainControl would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(20, control).is_ok()) != Some(true) {
+        return Err("the adapter's DomainControl would not install");
     }
 
     let options = sched::SpawnOptions::new()

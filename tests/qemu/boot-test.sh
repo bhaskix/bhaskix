@@ -1665,6 +1665,38 @@ else
     status=1
 fi
 
+# RFC 0033 step 5: `execve`. Three things have to be true at once, and no two
+# of them come from the same place.
+#
+#   1. The execing program's own domain **ended** -- the kernel watched its
+#      thread count reach zero, which is what the adapter's `END_DOMAIN` reply
+#      asks for and nothing else in the machine does.
+#   2. `bin/linuxd` says which pid it kept and which two domains it kept it
+#      across, out of its own report page.
+#   3. The program that was exec'd asked `getpid` **in the new domain** and
+#      printed the answer to the console.
+#
+# The gate demands that (2) and (3) name the *same* pid and that the two domains
+# in (2) differ. A pid derived from a domain could not satisfy that pair, which
+# is the whole of what step 4 changed and step 5 depends on -- and neither
+# witness can produce the other's number: one is the adapter's record, the other
+# is a hosted program's own observation of it.
+if grep -qF "a Linux program execed: its own domain ended" "$LOG"; then
+    kept=$(sed -n 's/.*linux exec *pid \([0-9]*\) kept across an exec: domain \([0-9]*\) became domain \([0-9]*\).*/\1 \2 \3/p' "$LOG" | tail -1)
+    read -r pid from to <<<"$kept"
+    if [[ -n $pid && -n $from && -n $to ]] && ((from != to)) && grep -qF "execed pid $pid" "$LOG"; then
+        pass "a hosted program execed: pid $pid survived domain $from becoming domain $to, and the new program agrees"
+    else
+        fail "the exec did not keep its pid across the domain change: kept='${kept:-nothing}', console says '$(grep -aoE 'execed pid [0-9]+' "$LOG" | head -1)'"
+        status=1
+    fi
+elif grep -qE "linux exec     skipped" "$LOG"; then
+    pass "no second cpu, so the exec self-test was skipped"
+else
+    fail "the exec self-test did not conclude"
+    status=1
+fi
+
 # RFC 0033 step 4: a pid is invented by the adapter and is **not** the domain
 # id. The claim a coincidence cannot satisfy is the one gated here: two hosted
 # programs that ran in the *same domain slot* were given **different** pids.

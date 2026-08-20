@@ -108,13 +108,24 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > **What this row does not claim:** that the adapter is correct. It claims that a bug in it is
 > contained, which is a statement about placement and is now true.
 >
-> **And what would change it, written before it happens.**
-> [RFC 0033](rfc/0033-what-a-hosted-process-is.md) — drafted 2026-08-20, not accepted, nothing
-> built — proposes that a hosted process gets files, pipes and an `execve`. Serving those needs the
-> adapter to hold `DomainControl` and a directory capability, so **an adapter compromise would then
-> reach every hosted process's files and could create domains within its own envelope.** That is a
-> real increase over the list above and it belongs in this row on the day it lands, not after. The
-> structural half — a hosted process holds no capabilities and can name none — is unaffected by it.
+> **And half of what that note predicted has happened, on the same day it was written.**
+> [RFC 0033](rfc/0033-what-a-hosted-process-is.md) step 5 gave the adapter **`DomainControl`**, so
+> that a hosted `execve` can build the domain its successor runs in — a hosted process cannot exec
+> in place, because `START` refuses a domain that has threads and the thread asking is one. So the
+> list above grows by one entry, and the sentence that goes with it is: **a compromised adapter can
+> create domains, up to the sixteen its own envelope allows, and can do to them everything a
+> supervisor can do — map their memory, write it, start threads in it.**
+>
+> What it still cannot do is name a capability it was not given. A domain it creates starts *empty*:
+> every authority that domain will ever hold is one the adapter passes from what it already holds,
+> which is one endpoint, three pages, a write-only console, sixteen notifications and a handle per
+> hosted domain. There is no ambient root, no device, no memory outside its own objects.
+>
+> **The other half has not happened**: the adapter holds no directory capability, so it cannot reach
+> a filesystem, and `execve` resolves exactly one path — `/bin/execed` — against a program compiled
+> into the adapter itself. When the file surface lands (RFC 0033 step 6), this note grows again,
+> and the sentence to write then is the one about a compromise reaching every hosted process's
+> files.
 >
 > Written here rather than only in the RFC because [RFC 0005](rfc/0005-linux-abi-compatibility.md)'s
 > own impact table asked for this row on the day it was drafted — *"The threat model gains an

@@ -198,6 +198,37 @@ fn trace(addr: u64, length: u64, pages: u64, protection: u64, fixed: bool, hinte
 /// How many `mmap` requests have been traced.
 static TRACED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// What an `execve` did, for the kernel to read out of the same page.
+///
+/// **Three numbers and a witness** — RFC 0033 step 5. The pid, the domain it
+/// was in, and the domain it is in now. The kernel prints them and the boot
+/// test compares the pid against what the exec'd *program* says its pid is,
+/// which it learns by asking `getpid` in the new domain: two witnesses that
+/// have to agree, one of them this program's own claim and the other a hosted
+/// program's own observation.
+///
+/// A fixed record rather than a ring: there is one exec in this machine's
+/// self-tests, and a second would overwrite the first loudly rather than
+/// scroll it away quietly.
+///
+/// **Past the scratch area, and the first version was not.** It sat at
+/// `REPORT_AT + 8 * 32`, which is exactly where `copy_in` and `copy_out` stage
+/// their bytes — so every copy after the exec overwrote it, and the kernel
+/// printed the tail of a path as a pid. The scratch area's own bound is what
+/// this is placed after, so moving one moves the other.
+const EXEC_RECORD_AT: u64 = REPORT_AT + SCRATCH_AT_OFFSET + SCRATCH_BYTES;
+
+/// Records an exec for the kernel's report.
+fn trace_exec(pid: u32, from: u32, to: u32) {
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // at an offset past the eight mmap records and well inside 4,096 bytes.
+    unsafe {
+        core::ptr::write_volatile(EXEC_RECORD_AT as *mut u64, u64::from(pid));
+        core::ptr::write_volatile((EXEC_RECORD_AT + 8) as *mut u64, u64::from(from));
+        core::ptr::write_volatile((EXEC_RECORD_AT + 16) as *mut u64, u64::from(to));
+    }
+}
+
 /// Turns a fault into a signal, or says the program should end.
 ///
 /// **This is the decision RFC 0005 built signal delivery for**: Go installs a
@@ -422,6 +453,16 @@ fn copy_in(domain: u32, address: u64, out: &mut [u8]) -> bool {
 
 /// Writes bytes into a hosted process's memory, the same way round.
 fn copy_out(domain: u32, address: u64, bytes: &[u8]) -> bool {
+    copy_out_through(handle_of(domain), address, bytes)
+}
+
+/// The same, naming the capability rather than the domain.
+///
+/// For `execve`, which writes into a domain it is *building* and holds in a
+/// slot of its own rather than one the kernel has named yet — the handle
+/// arrives from `SPAWN`, and the kernel's own grant for that domain does not
+/// exist until the program in it makes its first call.
+fn copy_out_through(handle: u64, address: u64, bytes: &[u8]) -> bool {
     if bytes.len() > SCRATCH_BYTES as usize {
         return false;
     }
@@ -436,7 +477,7 @@ fn copy_out(domain: u32, address: u64, bytes: &[u8]) -> bool {
     }
     let moved = call(
         syscall::INVOKE,
-        handle_of(domain),
+        handle,
         method::COPY_OUT,
         [REPORT, SCRATCH_AT_OFFSET, address, bytes.len() as u64],
     );
@@ -539,6 +580,8 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         // The one call whose answer may be "sleep", and the only one that
         // reads the caller's memory to decide.
         FUTEX => return answer_futex(request),
+        // The one call that ends the caller and starts a program in its place.
+        EXECVE => return answer_execve(request),
         SCHED_YIELD => return (REPLY_YIELD, Answer::ok(0)),
         EXIT => return (REPLY_END_THREAD, Answer::ok(0)),
         // A Linux thread group's exit is every thread of it, and a hosted
@@ -919,6 +962,80 @@ const REPLY_END_DOMAIN: u64 = 6;
 /// Park the caller on the notification this program names.
 const REPLY_BLOCK_ON: u64 = 7;
 
+/// `execve(path, argv, envp)`.
+const EXECVE: u64 = 59;
+/// The authority to create a domain, granted at boot — RFC 0033 step 5.
+const CONTROL: u64 = 20;
+/// Where the domain an `execve` is building is held, one at a time.
+///
+/// This program has one thread, so no second exec can be in flight while the
+/// first is between its `SPAWN` and its reply. The handle is given back with
+/// `DELETE` either way — a slot left occupied would refuse the *next* exec for
+/// a reason that has nothing to do with it.
+const CHILD: u64 = 21;
+/// The name the new domain is created under, packed as `SPAWN` wants it.
+const EXEC_NAME_LOW: u64 = u64::from_le_bytes(*b"execed\0\0");
+
+/// The one program this personality can exec, and the whole of its filesystem.
+///
+/// **A path with one answer is still a path.** There is no file surface yet —
+/// that is RFC 0033 step 6 — so `execve` resolves exactly this name and answers
+/// `ENOENT` for everything else, which is a Linux answer a program can act on
+/// and is not a lie about what is there. When directories arrive, this constant
+/// is what they replace.
+const EXEC_PATH: &[u8; 11] = b"/bin/execed";
+
+/// Where the exec'd program's code and stack land in its own space.
+const EXEC_CODE_AT: u64 = 0x0000_0000_2000_0000;
+const EXEC_STACK_AT: u64 = 0x0000_0000_2001_0000;
+/// Where the string sits inside the image, as an offset from its start.
+const EXEC_STRING_AT: u64 = 80;
+
+/// The program `/bin/execed` *is*: hand-assembled, and small on purpose.
+///
+/// It writes one line and ends its group. That is enough to prove what step 5
+/// claims — an `execve` that ran the new image, in a new domain, with the pid
+/// the old one had — and every byte of it is a Linux system call answered by
+/// this program, so nothing about the test can pass through a path the
+/// personality does not own.
+///
+/// `rdi` carries the address of its string, handed over by `SPAWN_THREAD`,
+/// because a program built by a supervisor has no other way to be told where
+/// anything is.
+#[rustfmt::skip]
+const EXEC_IMAGE: [u8; 96] = [
+    // The template is copied to the stack first, because the page it lives in
+    // is read-execute -- `W^X` is not suspended for a program's own data, so
+    // the byte this patches has to be patched somewhere writable.
+    0x48, 0x89, 0xfe,                    // mov rsi, rdi          ; the template
+    0x48, 0x8b, 0x06,                    // mov rax, [rsi]
+    0x48, 0x89, 0x44, 0x24, 0xe0,        // mov [rsp-32], rax
+    0x48, 0x8b, 0x46, 0x08,              // mov rax, [rsi+8]
+    0x48, 0x89, 0x44, 0x24, 0xe8,        // mov [rsp-24], rax
+    0xb8, 0x27, 0x00, 0x00, 0x00,        // mov eax, 39           ; getpid
+    0x0f, 0x05,                          // syscall
+    0x04, 0x30,                          // add al, '0'           ; one digit
+    0x88, 0x44, 0x24, 0xeb,              // mov [rsp-21], al      ; into the copy
+    0x48, 0x8d, 0x74, 0x24, 0xe0,        // lea rsi, [rsp-32]
+    0xbf, 0x01, 0x00, 0x00, 0x00,        // mov edi, 1            ; fd 1
+    0xba, 0x0d, 0x00, 0x00, 0x00,        // mov edx, 13
+    0xb8, 0x01, 0x00, 0x00, 0x00,        // mov eax, 1            ; write
+    0x0f, 0x05,                          // syscall
+    0x31, 0xff,                          // xor edi, edi          ; status 0
+    0xb8, 0xe7, 0x00, 0x00, 0x00,        // mov eax, 231          ; exit_group
+    0x0f, 0x05,                          // syscall
+    0xeb, 0xfe,                          // jmp $                 ; unreachable
+    // Padding to offset 80, where the template starts. `SPAWN_THREAD` hands
+    // that address over in `rdi`, and it is the one number this blob's
+    // arithmetic shares with the code that starts it.
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    // Offset 80: sixteen bytes, of which thirteen are written. The digit at
+    // index 11 is the placeholder.
+    b'e', b'x', b'e', b'c', b'e', b'd', b' ', b'p',
+    b'i', b'd', b' ', b'?', b'\n', 0x00, 0x00, 0x00,
+];
+
 /// `futex(address, operation, value, ...)`.
 const FUTEX: u64 = 202;
 /// `write(fd, buffer, count)`.
@@ -1030,6 +1147,157 @@ fn process_for(domain: u32) -> Option<&'static mut Process> {
 fn sleepers() -> &'static mut [Sleeper; WAKES] {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     unsafe { &mut *core::ptr::addr_of_mut!(SLEEPERS) }
+}
+
+/// Answers a hosted `execve` — [RFC 0033](../../../docs/rfc/0033-what-a-hosted-process-is.md) step 5.
+///
+/// **A hosted process cannot exec in place**, and the reason is structural
+/// rather than incidental: `START` refuses a domain that has threads, and the
+/// thread asking is one of them. So an exec *builds a new domain* and ends the
+/// old one — and the pid, the parent, the group and everything else Linux says
+/// survives an exec goes with the record rather than with the domain. That is
+/// the whole reason RFC 0033 moved identity into this program.
+///
+/// The sequence, all of it through capabilities this program holds:
+///
+/// ```text
+///   SPAWN        a domain, from DomainControl and the envelope's allowance
+///   PERSONALITY  Linux, so its calls arrive here
+///   MAP_AT       code (read-execute) and stack (read-write), eagerly
+///   COPY_OUT     the image into the code pages
+///   SPAWN_THREAD at the entry, on the stack
+///   exec_into    the record: same pid, new domain
+///   REPLY_END_DOMAIN   which is what ends the *caller's* domain
+/// ```
+///
+/// **The last line is the one worth reading twice.** Nothing here can kill a
+/// domain — RFC 0017 deliberately left that out, and a supervisor holding a
+/// child's handle still cannot. What ends the old domain is the *reply*: the
+/// caller is told "end your domain", and the kernel does it to the thread that
+/// asked. An exec is therefore the caller's own last act, which is exactly
+/// what `execve` is in Linux.
+fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
+    // The path, read out of the caller's memory through the `Domain`
+    // capability. **There is one program**, and asking for anything else is
+    // `ENOENT` rather than a lie -- see `EXEC_PATH`.
+    let mut path = [0u8; EXEC_PATH.len()];
+    if !copy_in(request.domain, request.first(), &mut path) {
+        return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+    }
+    if path != *EXEC_PATH {
+        return (REPLY_VALUE, Answer::error(-2)); // ENOENT
+    }
+
+    // A domain to become. The slot is this program's own scratch, and one at a
+    // time is enough: this program has one thread, so no second exec can be in
+    // flight while this one is between its first call and its last.
+    let made = call(
+        syscall::INVOKE,
+        CONTROL,
+        method::SPAWN,
+        [CHILD, EXEC_NAME_LOW, 0, 0],
+    );
+    if made.status != status::OK {
+        // The envelope's allowance is spent, which is a real limit and not a
+        // failure to be hidden: `EAGAIN` is what Linux answers when it cannot
+        // make a process.
+        return (REPLY_VALUE, Answer::error(-11));
+    }
+
+    let built = build_exec_image();
+    // The handle is given back either way. A slot left occupied would refuse
+    // the *next* exec for a reason that has nothing to do with it.
+    // **The record is looked up before anything moves it**, and the first
+    // version of this got that wrong: it bumped the old domain's incarnation
+    // first, so the lookup below found nothing, admitted a *fresh* record, and
+    // exec'd that — the exec'd program printed a pid one higher than the
+    // program it replaced, which is the exact failure this step exists to
+    // prevent. The old slot's incarnation moves when the kernel says it has
+    // been reused (`FORGET`), which is the only moment that is true.
+    let outcome = if built {
+        (REPLY_END_DOMAIN, Answer::ok(0))
+    } else {
+        (REPLY_VALUE, Answer::error(-12)) // ENOMEM
+    };
+    if built {
+        // The record moves to the new domain *before* the old one ends, so a
+        // call arriving from the new domain finds the same process. The
+        // generation is this program's own count of how often the slot has
+        // been handed over -- see `INCARNATION`.
+        let child = made.args[0] as u32;
+        let generation = incarnation_of(child);
+        if let Some(process) = process_for(request.domain) {
+            let pid = process.pid;
+            let from = process.domain;
+            process.exec_into(child, generation, |_| {});
+            trace_exec(pid, from, child);
+        }
+    }
+    let _ = call(syscall::INVOKE, CHILD, method::DELETE, [0; 4]);
+    outcome
+}
+
+/// Maps and fills the exec'd program's memory, and starts its thread.
+///
+/// Split out because the failure path is the same for all of it: whatever went
+/// wrong, the child is unusable and the caller is told `ENOMEM`.
+fn build_exec_image() -> bool {
+    if call(syscall::INVOKE, CHILD, method::PERSONALITY, [1, 0, 0, 0]).status != status::OK {
+        return false;
+    }
+    // **An address space, before anything can be put in it.** A domain that
+    // has just been created has none: every other way to get one is to be a
+    // thread inside the domain, and there is no thread until this program
+    // starts one — which it cannot do before the pages that thread will run in
+    // exist. `MAKE_SPACE` is the primitive that breaks the circle, added for
+    // exactly this call (RFC 0033 step 5).
+    if call(syscall::INVOKE, CHILD, method::MAKE_SPACE, [0; 4]).status != status::OK {
+        return false;
+    }
+    // Eagerly, both of them: `COPY_OUT` writes through the kernel's own view of
+    // the frames, so a lazily mapped page has nothing to write into yet.
+    // Read-execute for the code and read-write for the stack, which is `W^X`
+    // kept by construction rather than by promise -- the bytes arrive through
+    // a mapping this program never has writable.
+    if !map_at_eager(CHILD, EXEC_CODE_AT, 1, PROT_READ_EXECUTE)
+        || !map_at_eager(CHILD, EXEC_STACK_AT, 1, PROT_READ_WRITE)
+    {
+        return false;
+    }
+    if !copy_out_through(CHILD, EXEC_CODE_AT, &EXEC_IMAGE) {
+        return false;
+    }
+    let started = call(
+        syscall::INVOKE,
+        CHILD,
+        method::SPAWN_THREAD,
+        [
+            EXEC_CODE_AT,
+            EXEC_STACK_AT + 0x0f00,
+            EXEC_CODE_AT + EXEC_STRING_AT,
+            0,
+        ],
+    );
+    started.status == status::OK
+}
+
+/// Maps pages that must be readable by the kernel's copy immediately.
+fn map_at_eager(domain: u64, address: u64, pages: u64, protection: u64) -> bool {
+    call(
+        syscall::INVOKE,
+        domain,
+        method::MAP_AT,
+        [address, pages, protection, 0],
+    )
+    .status
+        == status::OK
+}
+
+/// This program's own count of how often a domain slot has been handed to it.
+fn incarnation_of(domain: u32) -> u32 {
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    let incarnations = unsafe { &*core::ptr::addr_of!(INCARNATION) };
+    incarnations[domain as usize % limits::MAX_DOMAINS]
 }
 
 /// Answers a hosted `futex` — RFC 0032 step 10.

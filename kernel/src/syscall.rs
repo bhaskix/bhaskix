@@ -144,6 +144,7 @@ const _: () = {
     assert!(method::PROTECT_AT == bhaskix_abi::method::PROTECT_AT);
     assert!(method::SPAWN_THREAD == bhaskix_abi::method::SPAWN_THREAD);
     assert!(method::SET_TLS == bhaskix_abi::method::SET_TLS);
+    assert!(method::MAKE_SPACE == bhaskix_abi::method::MAKE_SPACE);
     assert!(method::GRANT == bhaskix_abi::method::GRANT);
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
@@ -294,6 +295,8 @@ pub mod method {
     pub const SPAWN_THREAD: u64 = 64;
     /// Set a thread's thread-local base. RFC 0032.
     pub const SET_TLS: u64 = 65;
+    /// Give a `Domain` an address space of its own — RFC 0033 step 5.
+    pub const MAKE_SPACE: u64 = 66;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1024,6 +1027,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 | method::PROTECT_AT
                 | method::SPAWN_THREAD
                 | method::SET_TLS
+                | method::MAKE_SPACE
         )
         && let Some(outcome) = domain_supervise(frame)
     {
@@ -2182,7 +2186,7 @@ pub static ADAPTER_DOMAIN: core::sync::atomic::AtomicU32 =
 /// **tells the adapter which** ([`HANDLE_METHOD`]). The floor is above the
 /// fixed grants `start_linux_domain` makes — the endpoint, two pages, the
 /// console and the futex pool — so an allocation can never collide with one.
-const ADAPTER_SLOT_FLOOR: usize = 20;
+const ADAPTER_SLOT_FLOOR: usize = 24;
 
 /// The method that says "your `Domain` capability for this domain is in this
 /// slot".
@@ -2699,6 +2703,33 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
     // own space, and this does neither. One room, one lock.
     if target == me {
         return Some(Outcome::err(Status::WrongObject));
+    }
+
+    // **Before the root is demanded, because this is the call that makes one.**
+    // RFC 0033 step 5: a supervisor assembling a process by hand needs the
+    // domain to have an address space before it can map a page into it, and
+    // every other way to get one is to be a thread inside the domain — which
+    // there is not one of yet, and cannot be until its pages exist.
+    if frame.method == method::MAKE_SPACE {
+        if domain::space_root_of(target).is_some() {
+            // Already has one. Replacing it would unmap whatever is running in
+            // it, which is a different operation and needs its own argument.
+            return Some(Outcome::err(Status::SlotUnavailable));
+        }
+        if crate::sched::threads_counted_in(target.as_u32()) != 0 {
+            return Some(Outcome::err(Status::SlotUnavailable));
+        }
+        let Ok(space) = crate::vm::AddressSpace::new(crate::shared::hhdm()) else {
+            return Some(Outcome::err(Status::Exhausted));
+        };
+        return Some(match crate::vm::register_for(target, space) {
+            // The root is not answered: it is a physical address, and a
+            // program that could learn one would hold a fact about the machine
+            // that no capability gave it. The caller names the *domain* for
+            // everything it does next, which is what it held already.
+            Some(_) => Outcome::ok(0),
+            None => Outcome::err(Status::Exhausted),
+        });
     }
 
     // The target's page-table root *is* the authority to touch its memory, and
