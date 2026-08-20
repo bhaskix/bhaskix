@@ -264,11 +264,13 @@ derived from what their manifests ask. What remains is libc.
   What remains is the binary half: the Linux `x86_64` ABI as a personality in a service
   domain — statically linked Go first, tiers defined by traced workloads, `-ENOSYS`
   through the telemetry plane, and the three rules that keep the nucleus free of
-  Linux-shaped concepts. **Steps 2–8 are implemented and the service domain is not**: the
-  translation runs in the nucleus today, which [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md)
-  records with its correction trigger and [security.md](security.md) §1's T11 prices. RFC 0031
-  is also where this bullet's *destination* is written down — the L1–L4 application milestones
-  below, and the containment they must inherit
+  Linux-shaped concepts. **Steps 2–8 are implemented and the service domain now exists**:
+  the translation ran in the nucleus until 2026-08-20, which
+  [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md) records with its correction trigger
+  and [security.md](security.md) §1's T11 priced; [RFC 0032](rfc/0032-a-supervisor-interface.md)
+  moved it out in ten steps and the nucleus now interprets **no** Linux syscall number, gated on
+  every boot. RFC 0031 is also where this bullet's *destination* is written down — the L1–L4
+  application milestones below, and the containment they must inherit, all four still unmet
 
 **Exit:** Bhaskix self-hosts its own userspace utilities, does useful network I/O, and boots on its
 own bootloader.

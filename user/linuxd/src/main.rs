@@ -63,6 +63,48 @@ const REPORT_AT: u64 = 0x0000_0000_1E00_0000;
 /// that a hosted program got the right answer, not that this program said so.
 const ENDPOINT: u64 = 0;
 
+/// The machine's console, **write-only** — RFC 0032 step 10.
+///
+/// Granted at boot with `Rights::WRITE` and nothing else, so a hosted
+/// program's `write` reaches a console and this program cannot take a byte
+/// somebody typed at the shell. It is the whole of what this program may do
+/// to the machine outside the domains it serves.
+///
+/// The paragraph above [`ENDPOINT`] said "not even a console" and was true
+/// until this step; what made it stop being true is that `write` was the last
+/// Linux number the *nucleus* was printing on a hosted program's behalf.
+const CONSOLE: u64 = 3;
+
+/// The first of the notifications a hosted `futex(WAIT)` parks on, and how
+/// many there are — RFC 0032 step 10.
+///
+/// Granted at boot with `Rights::WRITE` and nothing else: this program may
+/// **wake** a sleeper and may not become one. A single-threaded server that
+/// could block on a notification could stop answering, and nothing a futex
+/// needs asks it to.
+///
+/// One notification per parked waiter rather than one per futex word. That is
+/// what makes `futex(WAKE, n)` exact — waking *n* means signalling *n* of
+/// them — where a notification shared by every sleeper on one word could only
+/// wake all or none.
+const WAKE_SLOT: u64 = 4;
+const WAKES: usize = 16;
+
+/// One hosted thread asleep in a futex: whose memory, which word, and which
+/// notification it is parked on.
+#[derive(Clone, Copy)]
+struct Sleeper {
+    /// Zero means the slot is free. Domains are numbered from zero, so the
+    /// hosted domain is kept as `domain + 1` — the same offset the badge
+    /// carries, and for the same reason.
+    domain: u32,
+    address: u64,
+    /// The order this sleeper arrived in, so a `WAKE` of one wakes the
+    /// *oldest* — Linux does not promise an order, but a queue that always
+    /// woke the newest can starve a waiter for ever under contention.
+    arrived: u64,
+}
+
 /// There is nothing to unwind and nowhere useful to print to.
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -493,6 +535,9 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
     // and whether at all, is this dialect's decision -- so the reply says
     // what to do rather than the nucleus knowing what the number meant.
     match request.number {
+        // The one call whose answer may be "sleep", and the only one that
+        // reads the caller's memory to decide.
+        FUTEX => return answer_futex(request),
         SCHED_YIELD => return (REPLY_YIELD, Answer::ok(0)),
         EXIT => return (REPLY_END_THREAD, Answer::ok(0)),
         // A Linux thread group's exit is every thread of it, and a hosted
@@ -652,6 +697,39 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // whose high half the kernel stamps with the calling thread — a
         // caller cannot supply one, which is why it can be believed.
         GETTID => Answer::ok(u64::from(request.thread)),
+        // The one call a hosted program needs before it can say anything.
+        // Only the two standard streams, and only to this machine's console: a
+        // hosted program writing to a descriptor it never opened is asking for
+        // authority, and 1 and 2 are the two Linux hands every process without
+        // being asked. A real descriptor table is Tier 1's.
+        WRITE => {
+            let (fd, buffer, count) = (request.first(), request.second(), request.third());
+            if fd != 1 && fd != 2 {
+                return Answer::error(-9); // EBADF
+            }
+            let take = (count as usize).min(WRITE_BYTES);
+            if take == 0 {
+                return Answer::ok(0);
+            }
+            let mut bytes = [0u8; WRITE_BYTES];
+            if !copy_in(request.domain, buffer, &mut bytes[..take]) {
+                return Answer::error(-14); // EFAULT
+            }
+            // A character at a time, because that is what a `Console`
+            // capability confers: the authority to put one. The cost is real
+            // and is priced by the boundary instrument like everything else
+            // here -- and it is the honest cost of a console that is a
+            // capability rather than a kernel function this program may call.
+            for byte in &bytes[..take] {
+                call(
+                    syscall::INVOKE,
+                    CONSOLE,
+                    method::PUT,
+                    [u64::from(*byte), 0, 0, 0],
+                );
+            }
+            Answer::ok(take as u64)
+        }
         // The thread-local base. Per *thread*, because the register holding
         // it is per *CPU*: a value written straight to the MSR is gone at the
         // first switch, which is what Go's `rt0` catches three instructions
@@ -828,7 +906,20 @@ const REPLY_YIELD: u64 = 4;
 const REPLY_END_THREAD: u64 = 5;
 /// End the caller's whole domain.
 const REPLY_END_DOMAIN: u64 = 6;
+/// Park the caller on the notification this program names.
+const REPLY_BLOCK_ON: u64 = 7;
 
+/// `futex(address, operation, value, ...)`.
+const FUTEX: u64 = 202;
+/// `write(fd, buffer, count)`.
+const WRITE: u64 = 1;
+/// As much of one `write` as this program will carry in a call.
+///
+/// A hosted program that writes more is told how much was taken, which is what
+/// a short write means in Linux and what every correct caller already handles.
+/// The bound is the scratch area's, because that is what the copy travels
+/// through.
+const WRITE_BYTES: usize = 256;
 /// `gettid()`.
 const GETTID: u64 = 186;
 /// `sched_yield()`.
@@ -866,6 +957,107 @@ const SIGALTSTACK: u64 = 131;
 /// and a handle to each domain it hosts. It was a kernel table until
 /// 2026-08-20.
 static mut DISPOSITIONS: [Dispositions; 32] = [const { Dispositions::new() }; 32];
+
+/// Who is asleep in a futex, by wake slot.
+///
+/// Same shape and same justification as [`DISPOSITIONS`]: one thread, one
+/// request at a time, so the compare-and-park below is atomic against every
+/// other futex operation without a lock. That is not a happy accident — it is
+/// the reason a futex can live in a single-threaded server at all.
+static mut SLEEPERS: [Sleeper; WAKES] = [Sleeper {
+    domain: 0,
+    address: 0,
+    arrived: 0,
+}; WAKES];
+
+/// Counts arrivals, so a `WAKE` of one takes the oldest sleeper.
+static mut ARRIVALS: u64 = 0;
+
+/// The sleeper table, borrowed for the length of one request.
+fn sleepers() -> &'static mut [Sleeper; WAKES] {
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    unsafe { &mut *core::ptr::addr_of_mut!(SLEEPERS) }
+}
+
+/// Answers a hosted `futex` — RFC 0032 step 10.
+///
+/// **The whole contract is the compare-and-park**, and it is why this is the
+/// last call to leave the nucleus: a `WAIT` whose word has already changed
+/// must not sleep, or it sleeps through the wake that changed it. Here the
+/// word is read out of the hosted process's memory through the `Domain`
+/// capability this program holds, compared, and — if it still matches — a
+/// notification is claimed and the reply tells the kernel to park the caller
+/// on it.
+///
+/// The window between that reply and the park is closed by the kernel rather
+/// than here: `notify::signal` publishes its bits before waking, so a wake
+/// arriving in the gap leaves the bit set and the park returns at once.
+fn answer_futex(request: &PersonalityCall) -> (u64, Answer) {
+    use bhaskix_personality::thread::{FutexPlan, plan_futex};
+
+    match plan_futex(request.first(), request.second(), request.third()) {
+        FutexPlan::Wait { address, expected } => {
+            let mut word = [0u8; 4];
+            if !copy_in(request.domain, address, &mut word) {
+                return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+            }
+            if u32::from_le_bytes(word) != expected {
+                // Linux's EAGAIN: "the value was not what you said". The
+                // caller re-reads and decides; it must not sleep.
+                return (REPLY_VALUE, Answer::error(-11));
+            }
+            let arrived = {
+                // SAFETY: single-threaded, as above.
+                let counter = unsafe { &mut *core::ptr::addr_of_mut!(ARRIVALS) };
+                *counter += 1;
+                *counter
+            };
+            let table = sleepers();
+            let Some(slot) = table.iter().position(|s| s.domain == 0) else {
+                // Every notification is spoken for. A refusal a caller can
+                // act on beats a sleeper the adapter cannot account for.
+                return (REPLY_VALUE, Answer::error(-11));
+            };
+            table[slot] = Sleeper {
+                domain: request.domain + 1,
+                address,
+                arrived,
+            };
+            (REPLY_BLOCK_ON, Answer::ok(WAKE_SLOT + slot as u64))
+        }
+        FutexPlan::Wake { address, count } => {
+            let table = sleepers();
+            let mut woken = 0u64;
+            while woken < u64::from(count) {
+                // The oldest sleeper on this word, so a contended futex does
+                // not starve whoever has been waiting longest.
+                let next = table
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.domain == request.domain + 1 && s.address == address)
+                    .min_by_key(|(_, s)| s.arrived)
+                    .map(|(index, _)| index);
+                let Some(index) = next else { break };
+                let signalled = call(
+                    syscall::INVOKE,
+                    WAKE_SLOT + index as u64,
+                    method::SIGNAL,
+                    [0; 4],
+                );
+                table[index].domain = 0;
+                if signalled.status != status::OK {
+                    // The sleeper is unparked or unreachable either way; the
+                    // slot is freed rather than leaked, and the count says
+                    // what actually happened.
+                    continue;
+                }
+                woken += 1;
+            }
+            (REPLY_VALUE, Answer::ok(woken))
+        }
+        FutexPlan::Refuse(errno) => (REPLY_VALUE, Answer::error(errno)),
+    }
+}
 
 /// The dispositions of one domain.
 ///
@@ -1017,6 +1209,14 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
         // decision and the kernel's delivery goes away.
         if received.method == FORGET_METHOD {
             *dispositions_of(received.badge as u32) = Dispositions::new();
+            // And whatever it left asleep. A sleeper keyed by a domain id
+            // that now names somebody else would let a `WAKE` from the new
+            // domain wake a notification the old one parked on -- the same
+            // class of mistake the dispositions above are cleared for.
+            let gone = (received.badge as u32) + 1;
+            for sleeper in sleepers().iter_mut().filter(|s| s.domain == gone) {
+                sleeper.domain = 0;
+            }
             let _ = call(syscall::REPLY, 0, 0, [0; 4]);
             continue;
         }

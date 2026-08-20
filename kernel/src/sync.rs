@@ -218,12 +218,16 @@ pub enum Rank {
     /// not by blocking. Outside the console, because a driver reports what it
     /// found while holding itself.
     Block = 15,
-    /// `syscall::FUTEX_KEYS` — the Linux personality's futex queues, the last
-    /// of its tables left in the nucleus. It was `signal::DISPOSITIONS` too,
-    /// until those moved to `bin/linuxd` (RFC 0032 step 7) — the rank stayed
-    /// because the futexes did, and the name is corrected rather than the
-    /// number reused for something unrelated. Formerly: the per-domain handler
-    /// tables (RFC 0005 step 4).
+    /// **Nothing holds this rank any more**, as of RFC 0032 step 10.
+    ///
+    /// It was `signal::DISPOSITIONS` (RFC 0005 step 4), then
+    /// `syscall::FUTEX_KEYS` when the dispositions moved to `bin/linuxd`
+    /// (step 7), and now the futex queues have moved there too — the last
+    /// Linux table in the nucleus. The variant is kept rather than removed
+    /// because the numbers are an *order*, and renumbering the ranks below it
+    /// to close a gap would rewrite the meaning of every recorded violation.
+    /// The next lock that belongs between `Block` and the console takes it,
+    /// with its own name.
     ///
     /// Nearly innermost, and taken from the page-fault handler: a user-mode
     /// fault means the interrupted thread held no kernel lock at all, so
@@ -273,7 +277,7 @@ impl Rank {
             Self::IrqHandlers => "irq::HANDLERS",
             Self::Vectors => "vectors::TABLE",
             Self::Block => "virtio::DEVICE",
-            Self::Signals => "syscall::FUTEX_KEYS",
+            Self::Signals => "(unused since RFC 0032 step 10)",
             Self::DmaWindow => "iommu::WINDOW",
             Self::Console => "console::CONSOLE",
         }

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft** 2026-08-19 — the prerequisite [RFC 0031](0031-linux-compatibility-as-an-adapter.md) §5's relocation turned out to need. Written before any of it is built, which is the order this project's rules ask for and the order the personality itself did not follow |
+| **Status** | ✅ **Accepted 2026-08-20** — all ten steps delivered and gated, and the number the RFC exists to move reads **0**: the nucleus interprets no Linux syscall number. Drafted 2026-08-19 as the prerequisite [RFC 0031](0031-linux-compatibility-as-an-adapter.md) §5's relocation turned out to need, before any of it was built — which is the order this project's rules ask for and the order the personality itself did not follow |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`vm`, `syscall`, `sched`), `abi`, userspace (`bin/sup`, later `bin/linuxd`) |
 | **Milestone** | Phase 2 — what unblocks the roadmap's last bullet, and Phase 3's container work after it |
@@ -763,6 +763,133 @@ three lines are instrument: two `read_volatile`s for the TLS witness and one `wr
 telling the clone probe it may end its group. The five calls that moved took no `unsafe` with
 them, which is why they were the ones left.
 
+## Step 10's record (2026-08-20): the ratchet reads zero, and `mod linux` is empty
+
+**`futex` and `write` are answered in ring 3, and the nucleus interprets no Linux number at
+all.** The boundary count that read **18** on 2026-08-19 reads **0**. Its gate is no longer a
+ratchet that may fall but an equality that may not move: a number here again is a Linux
+concept back in the nucleus, caught on the next boot rather than in review.
+
+**Both of the last two wanted a capability rather than code, exactly as step 8 predicted.**
+
+- **`write` needed a console.** The adapter is granted one at boot — `Rights::WRITE` and
+  nothing else, so it may put a character and may **not** take a byte somebody typed at the
+  shell. That narrowing was a comment until this step: the console path checked no rights,
+  because the console service was its only holder and held `Rights::ALL`, so a check would
+  have been unreachable code. It is a mechanism now, and arming it — granting `READ` instead
+  — turned the write gate red.
+- **`futex` needed a way to park a thread**, which is `BLOCK_ON`: the adapter always replies,
+  and when the answer is "sleep" the reply *is* the instruction to sleep. Sixteen
+  notifications are granted at boot, one per parked waiter, so `futex(WAKE, n)` is exact —
+  waking *n* means signalling *n* of them, where a notification shared by every sleeper on one
+  word could only wake all or none. The pool is also the limit: a seventeenth sleeper is
+  refused with `EAGAIN` rather than lost.
+
+**The compare-and-park is atomic without a lock, and the reason is structural.** The adapter
+has one thread and answers one request at a time, so nothing can change a futex word between
+the compare and the reply that parks on it. The remaining window — between the reply and the
+kernel's park — is closed by a decision made long before this RFC: `notify::signal` publishes
+its bits *before* waking, so a wake arriving in the gap leaves the bit set and the park
+returns at once. Neither half is new work; both are why this shape was chosen.
+
+**The instrument lost a boundary violation nobody had counted.** `blocks_by_construction` was
+a `match` on Linux syscall numbers in the nucleus, deciding which calls not to price. The
+ratchet never saw it, because the ratchet counts numbers that are *answered* and this one only
+decided *pricing* — a Linux list hiding behind an instrument. It went with the last number,
+and the calls that block are still excluded from the adapter's figure, but by where the round
+trip ends rather than by the kernel knowing what `futex` means.
+
+### What a hosted program's `write` costs now, and the property that changed with it
+
+A `Console` capability confers the authority to put **one character**. Sixteen bytes is
+sixteen invocations, and a write is therefore no longer atomic against other output: where the
+line begins depends on what the console was in the middle of. That is a real property of a
+console that is a capability rather than a kernel function the personality may call, and it is
+recorded here rather than hidden behind a stricter test pattern. The boot gate matches the
+string without anchoring it, and says why.
+
+### Four gates, and one path that has none
+
+`write` is gated in both halves — the count the adapter answered *and* the string appearing on
+the console, because a count with no string would pass on an adapter that answered and printed
+nothing. `futex` is gated by the rendezvous that already existed: a parent that sleeps, a
+child that wakes it, and `woke 1` demanded rather than relaxed. Each new path was watched red
+by a deliberate edit: the adapter answering `EAGAIN` instead of parking, the compare skipped
+so a stale word sleeps, `BLOCK_ON` naming a capability that is not a notification, and the
+wake signalling nothing.
+
+**The pool-exhaustion path is not gated**: nothing in this system starts seventeen hosted
+threads that sleep at once, and a test that did would be a test of the test. It is stated so
+that the next reader knows it is untested rather than assuming the count of armed gates
+covers it.
+
+### A hosted thread parked in a futex could not die, and the gate that watched it was blind
+
+**The last call to move brought the kernel a case it did not have.** A thread parked in
+`notify::wait` is an ordinary waiter — but `block_unless` refuses to mark a *dying* thread
+blocked, because sleeping is the one thing a thread told to stop must not do. So a hosted
+thread parked on a futex whose domain ended underneath it — a sibling calling `exit_group`,
+which is now an ordinary event — kept deciding to block, was refused, and spun through the
+scheduler for ever: a thread that could not die because it was waiting for something nobody
+would send. `notify::wait` checks `sched::should_die()` now and returns `Gone`, which is what
+every other blocking path in this kernel already does at its own safe point.
+
+**And the test that was meant to prove this passed while the bug was in.** It asked
+`threads_in_domain`, which treats a runqueue it could not lock as empty — and the failure it
+was looking for is a thread *spinning*, which keeps exactly that lock busy. The gate passed
+because the bug was bad enough to hide itself. It asks `threads_counted_in` now: an atomic
+maintained at create and exit, which nothing a thread does can make lie. Armed with the fix
+removed, it reads `parked true, group ended false`, which is the sentence the machine should
+say.
+
+The probe was rebuilt to prove the pair in one shot: the parent parks in a futex on a word
+nobody will ever change, and the **child** — a thread that asked for nothing — calls
+`exit_group`. What the test waits for before ending the group is not a sleep but two witnesses
+that cannot both be wrong: the parent's own word, written from ring 3 immediately before the
+call, and the kernel's count of threads parked by a `BLOCK_ON` reply.
+
+**A third mistake, and it is an old one in a new place**: `mov qword [r15+128], 1` assembles a
+`disp8`, which is *signed* — the announcement landed a hundred and twenty-eight bytes below
+the report page. The symptom was `parked false` with every other number right, which is what
+sent the search to the encoding rather than to the design.
+
+### A finding the manifest could not express
+
+`packages/linuxd.manifest.in` is meant to be the reviewable list of what this domain may do —
+RFC 0030's whole claim about packages. It cannot describe this domain. The grammar has no way
+to say **write-only** about a console, and no way to say **sixteen** notifications:
+`MAX_CAPS` is sixteen *distinct authorities*, and sixteen identical notifications are one
+authority with a multiplicity, which the memory line already has a spelling for (`pages=`).
+Twelve `cap notification` lines would fit and would be a *wrong* list, so the manifest
+describes them in prose and lists what it can. The trigger for `cap notification count=N` and
+`cap console write` is written down there: the first package that is **installed** rather than
+started by the kernel and needs either. Nothing is granted from that file today —
+`start_linux_domain` makes these grants at boot.
+
+### One event seen once, and not explained away
+
+A full-suite run printed `LOCK ORDER blocking on wait::WaitQueue (rank 9) while holding mask
+0b1000000000, at kernel/src/wait.rs:195` in the dark `qemu64` lane; two isolated runs of that
+lane and a second full suite were clean. `sync.rs`'s `Drop` documents **this exact sentence**
+as a false positive it fixed once — a rank bit cleared an instant late makes the next
+acquisition of the same rank look like two at once — and the only `WaitQueue`s left are two
+kernel self-tests, because this step deleted the sixteen futex queues. Recorded as *observed
+once, not reproduced*, which is smaller than "unrelated".
+
+### What this closes
+
+- The kernel's `unsafe` budget falls to **1,506**, and the line that went is the one that
+  mattered: `futex_word`'s `uaccess` read, the last time the nucleus dereferenced a pointer on
+  a Linux call's behalf.
+- `kernel/src/syscall.rs` has **no `if` between a foreign call arriving and the adapter being
+  asked**. Interface I1 is written as the absence of code rather than as a paragraph.
+- The lock rank that was `signal::DISPOSITIONS`, then `syscall::FUTEX_KEYS`, now holds
+  nothing. The variant stays, because rank numbers are an *order* and renumbering would
+  rewrite the meaning of every recorded violation.
+- `security.md` §1's **T11** mitigation column becomes true. A bug in the Linux translator is
+  now a bug in a ring 3 program holding one endpoint, three pages, a write-only console,
+  sixteen notifications, and a handle to each domain it hosts.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -885,4 +1012,4 @@ already in hand.
 10. **`futex` and `write`**, then delete what is left of `mod linux`. Each needs a capability
     the adapter does not hold — a notification pool and a console — so this step is a grant
     before it is a translation. The ratchet reads **0**, and T11's mitigation column becomes
-    true.
+    true. ✅ *Delivered 2026-08-20 — see the record below.*

@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1507
+unsafe_budget = 1510
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -400,6 +400,24 @@ unsafe_budget = 1507
 # has and carries the same argument -- the entry is inside a user-executable
 # segment the loader accepted, and the stack address is one past user-writable
 # memory in the space just installed.
+#
+# **1510 at step 10.** One line left and five arrived, and the direction is
+# worth reading rather than the number: what left is `futex_word`'s `uaccess`
+# read (see below); what arrived is five lines of *self-test*, in the clone
+# probe -- the go-words that tell a hosted parent it may park and a hosted
+# child it may end the group, and the read of the parent's own "parking"
+# announcement. All five touch a report page the probe's own space owns,
+# through the direct map, which is the idiom every probe beside them uses.
+# The gate they fund is the one that caught a hosted thread unable to die
+# while parked in a futex.
+#
+# **1506 of those, and the last Linux `uaccess` in the kernel, is gone with
+# it.** `futex_word` read a hosted process's futex word out of its memory with
+# a fault-protected copy; `bin/linuxd` reads the same word through a `Domain`
+# capability now, which is the difference the whole refactor is about — the
+# nucleus no longer dereferences a pointer on a Linux call's behalf, because
+# there are no Linux calls here to have a behalf. One line, and it is the one
+# that mattered.
 #
 # **1507 at step 9, and the three lines are all instrument.** The five calls
 # that moved took no `unsafe` with them -- they were scalars and scheduler

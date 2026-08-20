@@ -230,12 +230,12 @@ of Linux ABI in ring 0. The pure decision logic *was* kept out — `personality/
 rewrite, but the parsing of untrusted pointers and the mutation of address spaces are in the
 nucleus today.
 
-> **Where it stands, 2026-08-20.** Nine steps of [RFC 0032](0032-a-supervisor-interface.md)
+> **Where it stands, 2026-08-20.** Ten steps of [RFC 0032](0032-a-supervisor-interface.md)
 > later, the paragraph above describes the tree it was written about and not the tree today:
-> `kernel/src/signal.rs` is deleted, `foreign_signal_call` and `foreign_memory_call` are gone
-> with it, and `foreign_thread_call` answers two numbers rather than a family. The ratchet reads
-> **2** — `futex` and `write` — and both wait on a capability the adapter cannot yet hold: a
-> notification pool and a console.
+> `kernel/src/signal.rs` is deleted, and `foreign_signal_call`, `foreign_memory_call` and
+> `foreign_thread_call` are deleted with it. **The ratchet reads 0**, and interface I1 is now
+> written as the absence of code — there is no `if` in `kernel/src/syscall.rs` between a
+> foreign call arriving and the adapter being asked.
 
 Why it happened is worth recording, because it is not carelessness: steps 2–8 needed the address
 space, the scheduler and the fault path, and the in-nucleus route was the shortest path to a

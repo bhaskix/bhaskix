@@ -2988,7 +2988,7 @@ fn personality_boundary_report() {
         syscall::ADAPTER_GAVE_UP.load(order),
         syscall::ADAPTER_CALLER_GONE.load(order),
     );
-    let (priced, floor, mean, dropped, excluded, interpreted) = syscall::foreign_cost();
+    let (priced, floor, mean, dropped, interpreted) = syscall::foreign_cost();
     // Nothing foreign happened at all: no hosted program ran on this machine,
     // so there is no boundary to report on.
     //
@@ -2998,19 +2998,25 @@ fn personality_boundary_report() {
     // numbers still in the nucleus, which is the number the whole refactor is
     // measured by -- silently disappeared. A report that vanishes when its
     // instrument saturates is worse than one that says it has no samples.
-    if answered + absent + excluded + priced + dropped == 0 {
+    if answered + absent + priced + dropped == 0 {
         return;
     }
     // Every foreign call is accounted for, and the arithmetic is printed
-    // rather than trusted: priced plus dropped plus excluded must equal the
+    // rather than trusted: priced plus dropped plus answered must equal the
     // total. When it did not -- 7 priced out of 212 -- the cause was a
     // return path that was not being priced at all, and a report that only
     // showed the mean would have hidden it behind a plausible number.
+    //
+    // Three categories now, not four. "Blocks by construction" was a list of
+    // Linux numbers in the nucleus deciding what to price, and it went with
+    // the last of them at RFC 0032 step 10 -- the calls that block are still
+    // excluded from the *adapter's* figure, but by where the round trip ends
+    // rather than by the kernel knowing what `futex` means.
     let total = syscall::FOREIGN_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     // Four categories now, not three: a call the adapter answered is priced by
     // `adapter_call` rather than by the nucleus instrument, so it has to be
     // counted here or the arithmetic would report the move itself as a leak.
-    let counted = priced + dropped + excluded + answered;
+    let counted = priced + dropped + answered;
     let _ = (refused, gave_up, caller_gone);
     let accounting = if counted == total {
         "all"
@@ -3028,15 +3034,15 @@ fn personality_boundary_report() {
         println!(
             "    personality    boundary: {interpreted} linux numbers interpreted in the nucleus \
              (RFC 0031 wants 0); no in-nucleus call was priced -- none was made; {accounting} \
-             {counted} of {total} accounted ({excluded} block by construction, {dropped} \
-             preempted, {answered} answered in ring 3)"
+             {counted} of {total} accounted ({dropped} preempted, {answered} answered in \
+             ring 3)"
         );
     } else {
         println!(
             "    personality    boundary: {interpreted} linux numbers interpreted in the nucleus \
              (RFC 0031 wants 0); floor {floor} cycles over {priced} non-blocking calls, mean \
-             {mean}; {accounting} {counted} of {total} accounted ({excluded} block by \
-             construction, {dropped} preempted, {answered} answered in ring 3)"
+             {mean}; {accounting} {counted} of {total} accounted ({dropped} preempted, \
+             {answered} answered in ring 3)"
         );
     }
     // What the adapter did, from the kernel's own counters rather than from
@@ -3110,6 +3116,17 @@ fn personality_boundary_report() {
         println!(
             "    linux fault    {handed} faults handed to the personality in ring 3, {resumed} \
              resumed, {crowded} found no free slot"
+        );
+    }
+    // What the reply that *blocks* did — RFC 0032 step 10. Printed because a
+    // boot log is where this project's claims are checked, and "the futex
+    // moved to ring 3" is otherwise invisible: a parked thread looks exactly
+    // like a thread that was never asked to park.
+    let parked = syscall::BLOCKED.load(core::sync::atomic::Ordering::Relaxed);
+    if parked > 0 {
+        println!(
+            "    linux futex    {parked} hosted threads parked on a notification the adapter \
+             named, and none in the nucleus"
         );
     }
     let (adapter_priced, adapter_floor, adapter_mean) = syscall::adapter_cost();
@@ -3236,7 +3253,7 @@ const CLONE_REPORT_AT: u64 = 0x0000_0000_6002_0000;
 /// in the same address space *and* the futex wait/wake pair actually
 /// blocks and releases — which is the half step 6 could not prove with one
 /// thread, and the half Go's scheduler lives on.
-const CLONE_CODE: [u8; 199] = [
+const CLONE_CODE: [u8; 240] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page (shared, both threads)
     0x4c, 0x89, 0xfe, // mov rsi, r15
     0x48, 0x81, 0xc6, 0x00, 0x08, 0x00, 0x00, // add rsi, 0x800        ; child stack top
@@ -3253,11 +3270,12 @@ const CLONE_CODE: [u8; 199] = [
     0x4d, 0x89, 0xf8, // mov r8, r15           ; tls = the shared page, which
     //                                   this personality hands the child in
     //                                   rdi (see cloned_thread)
-    0x4c, 0x8d, 0x0d, 0x54, 0x00, 0x00, 0x00, // lea r9, [rip+child]   ; the entry
-    //                                   (0x54, not 0x44: the parent's tail
-    //                                   grew by the sixteen bytes of the
-    //                                   `exit_group` wait below, and this
-    //                                   displacement reaches past it)
+    0x4c, 0x8d, 0x0d, 0x6d, 0x00, 0x00, 0x00, // lea r9, [rip+child]   ; the entry
+    //                                   (0x6d, and it has moved twice: the
+    //                                   parent's tail grew a wait for the
+    //                                   test's word at step 9 and a futex
+    //                                   park at step 10, and this
+    //                                   displacement reaches past both)
     0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56           ; clone
     0x0f, 0x05, // syscall
     0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax      ; the tid the parent got
@@ -3285,9 +3303,24 @@ const CLONE_CODE: [u8; 199] = [
     0x49, 0x8b, 0x47, 0x60, // wait: mov rax, [r15+96]
     0x48, 0x85, 0xc0, //       test rax, rax
     0x74, 0xf7, //             jz wait
-    0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231          ; exit_group
+    // **And then the parent parks for ever**, on a word nobody will change.
+    // It is the *child* that ends the group, and what this proves is the pair:
+    // `exit_group` ends a thread that asked for nothing, and a thread parked
+    // in a futex -- blocked in the kernel on a notification -- dies with its
+    // domain rather than waiting for a wake that is never coming.
+    // **The offsets are 112 and 120, and not 128 and 136, because a `disp8`
+    // is signed**: `[r15+128]` assembles as `[r15-128]`, which stored the
+    // announcement a hundred and twenty-eight bytes *below* the report page
+    // and left this test reporting `parked false` with everything else right.
+    0x49, 0xc7, 0x47, 0x70, 0x01, 0x00, 0x00, 0x00, // mov qword [r15+112], 1 ; "parking"
+    0x4c, 0x89, 0xff, // mov rdi, r15
+    0x48, 0x83, 0xc7, 0x78, // add rdi, 120          ; &word
+    0xbe, 0x80, 0x00, 0x00, 0x00, // mov esi, 128          ; WAIT|PRIVATE
+    0x31, 0xd2, // xor edx, edx          ; expect 0, and it stays 0
+    0x4d, 0x31, 0xd2, // xor r10, r10
+    0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202          ; futex
     0x0f, 0x05, // syscall
-    0xeb, 0xfe, // jmp $                 ; unreachable if the group ended
+    0xeb, 0xfe, // jmp $                 ; only if the park ever returns
     0x49, 0x89, 0xff, // child: mov r15, rdi   ; the page, as handed over
     // Let the parent reach its sleep first. Without this the child wins the
     // race, the parent's WAIT sees a word that already changed and returns
@@ -3312,6 +3345,13 @@ const CLONE_CODE: [u8; 199] = [
     0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202
     0x0f, 0x05, // syscall
     0x49, 0x89, 0x47, 0x28, // mov [r15+40], rax     ; how many it woke
+    // The child waits for the test's word and then ends the group -- with the
+    // parent parked in a futex it will never be woken from.
+    0x49, 0x8b, 0x47, 0x68, // cwait: mov rax, [r15+104]
+    0x48, 0x85, 0xc0, //        test rax, rax
+    0x74, 0xf7, //              jz cwait
+    0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231          ; exit_group
+    0x0f, 0x05, // syscall
     0xeb, 0xfe, // jmp $
 ];
 
@@ -3485,25 +3525,48 @@ fn clone_rendezvous_attempt(
     // nothing inside the domain could report it: the reporter would be one
     // of the threads whose ending is the claim.
     let mut group_ended = false;
+    let mut parked = false;
     if marked {
         let report_pa = CLONE_REPORT_PA.load(Ordering::Acquire);
         if report_pa != 0 {
+            let parked_before = syscall::BLOCKED.load(Ordering::Relaxed);
             // SAFETY: the frame the probe's space owns, through the direct
             // map, and the domain is still alive: nothing has been retired.
             unsafe { core::ptr::write_volatile((hhdm_base + report_pa + 96) as *mut u64, 1) };
-            // Asked twice, for the reason `wait_for_probe_threads` gives: a
-            // runqueue that could not be locked counts as empty, so one pass
-            // can answer zero for a thread that is merely on a busy CPU.
-            let mut clear = 0;
+            // **Wait until the parent is really parked**, on two witnesses
+            // that cannot both be wrong: its own word, written from ring 3
+            // just before the call, and the kernel's count of threads parked
+            // by a `BLOCK_ON` reply, which only `adapter_call` increments. A
+            // sleep of some milliseconds instead would make the next step a
+            // race dressed as a test.
             for _ in 0..400 {
-                if sched::threads_in_domain(realm.as_u32()) == 0 {
-                    clear += 1;
-                    if clear == 2 {
-                        group_ended = true;
-                        break;
-                    }
-                } else {
-                    clear = 0;
+                // SAFETY: as above.
+                let announced = unsafe {
+                    core::ptr::read_volatile((hhdm_base + report_pa + 112) as *const u64)
+                };
+                if announced == 1 && syscall::BLOCKED.load(Ordering::Relaxed) > parked_before {
+                    parked = true;
+                    break;
+                }
+                wait_millis(5);
+            }
+            // Now the *child* ends the group, with its parent asleep in a
+            // futex nobody will ever wake.
+            // SAFETY: as above.
+            unsafe { core::ptr::write_volatile((hhdm_base + report_pa + 104) as *mut u64, 1) };
+            // **`threads_counted_in` and not `threads_in_domain`**, and the
+            // difference is the whole verdict. The scanning version treats a
+            // runqueue it could not lock as empty -- and the failure this test
+            // is looking for is a thread *spinning*, which keeps that very
+            // lock busy. Armed with the fix removed, the scan was blinded by
+            // the spin and reported the domain empty: a gate that passed
+            // because the bug was bad enough to hide itself. The counter is an
+            // atomic maintained at create and exit, so nothing a thread does
+            // can make it lie.
+            for _ in 0..400 {
+                if sched::threads_counted_in(realm.as_u32()) == 0 {
+                    group_ended = true;
+                    break;
                 }
                 wait_millis(5);
             }
@@ -3535,26 +3598,29 @@ fn clone_rendezvous_attempt(
         && wait_answer == 0
         && word == 42
         && woke == 1
+        && parked
         && group_ended;
     if right {
         println!(
             "    linux clone    a Linux program cloned a thread (tid {parent_saw}, which the \
              child agrees is its own), then the two met through a futex: the parent slept, the \
-             child set the word to 42 and woke {woke}, and the parent came back; its \
-             exit_group then took the spinning child with it (attempt {attempt})"
+             child set the word to 42 and woke {woke}, and the parent came back; the parent \
+             then parked in a futex and the child's exit_group ended them both (attempt \
+             {attempt})"
         );
         Some(true)
     } else {
         let foreign = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - foreign_before;
         println!(
             "\x1b[91m    linux clone    FAILED: marked {}, parent saw {}, wait {}, word {}, \
-             child tid {}, woke {}, group ended {}, {foreign} foreign calls\x1b[0m",
+             child tid {}, woke {}, parked {}, group ended {}, {foreign} foreign calls\x1b[0m",
             marked,
             parent_saw as i64,
             wait_answer as i64,
             word,
             child_tid as i64,
             woke as i64,
+            parked,
             group_ended
         );
         Some(false)
@@ -3574,7 +3640,7 @@ const THREAD_REPORT_AT: u64 = 0x0000_0000_5002_0000;
 /// contract's edges -- a `WAIT` whose word has already changed (which must
 /// *not* sleep), a `WAKE` with nobody asleep, a shared futex (refused), and
 /// a `clone` (refused, with the reason recorded in the RFC).
-const THREAD_CODE: [u8; 195] = [
+const THREAD_CODE: [u8; 251] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page
     0xb8, 0xba, 0x00, 0x00, 0x00, // mov eax, 186          ; gettid
     0x0f, 0x05, // syscall
@@ -3625,6 +3691,23 @@ const THREAD_CODE: [u8; 195] = [
     0x49, 0x89, 0x47, 0x48, // mov [r15+72], rax     ; expect 0
     0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov rax, fs:[0]
     0x49, 0x89, 0x47, 0x50, // mov [r15+80], rax     ; expect 0x5afe
+    // A `write` that succeeds — RFC 0032 step 10. The bad-descriptor half is
+    // the foreigner probe's; this is the other half, and it is the one that
+    // needs a console: the sixteen bytes below go from this hosted program's
+    // page, through `bin/linuxd`, out of a `Console` capability the adapter
+    // holds with `Rights::WRITE` and nothing else. What proves it is the
+    // string appearing in the log, which no counter could say.
+    0x48, 0xb8, 0x68, 0x6f, 0x73, 0x74, 0x65, 0x64, 0x20, 0x77, // movabs rax, "hosted w"
+    0x49, 0x89, 0x47, 0x68, // mov [r15+104], rax
+    0x48, 0xb8, 0x72, 0x69, 0x74, 0x65, 0x20, 0x6f, 0x6b, 0x0a, // movabs rax, "rite ok\n"
+    0x49, 0x89, 0x47, 0x70, // mov [r15+112], rax
+    0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1            ; fd 1
+    0x4c, 0x89, 0xfe, // mov rsi, r15
+    0x48, 0x83, 0xc6, 0x68, // add rsi, 104          ; &"hosted write ok\n"
+    0xba, 0x10, 0x00, 0x00, 0x00, // mov edx, 16
+    0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1            ; write
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x78, // mov [r15+120], rax    ; expect 16
     0x48, 0xb8, 0x45, 0x54, 0x55, 0x46, 0x58, 0x4b, 0x48, 0x42, // movabs rax, "BHKXFUTE"
     0x49, 0x89, 0x47, 0x38, // mov [r15+56], rax     ; the marker, written last
     0xeb, 0xfe, // jmp $
@@ -3727,7 +3810,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // set of numbers -- which is exactly what happened on the first run of
     // this test, and is why every report page in this project is marked.
     const MARKER: u64 = u64::from_le_bytes(*b"ETUFXKHB");
-    let mut answers = [0u64; 9];
+    let mut answers = [0u64; 10];
     let mut marked = false;
     for _ in 0..400 {
         let report_pa = THREAD_REPORT_PA.load(Ordering::Acquire);
@@ -3746,6 +3829,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
                         core::ptr::read_volatile((hhdm_base + report_pa + 48) as *const u64),
                         core::ptr::read_volatile((hhdm_base + report_pa + 72) as *const u64),
                         core::ptr::read_volatile((hhdm_base + report_pa + 80) as *const u64),
+                        core::ptr::read_volatile((hhdm_base + report_pa + 120) as *const u64),
                     ],
                 )
             };
@@ -3779,20 +3863,24 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
         && answers[5] == enosys
         && answers[6] == enosys
         && answers[7] == 0
-        && answers[8] == WITNESS;
+        && answers[8] == WITNESS
+        // Sixteen bytes, out of a console capability held in ring 3. The
+        // count is the answer; the string in the log above is the evidence.
+        && answers[9] == 16;
     if right {
         println!(
             "    linux futex    a Linux program asked its tid ({}) and pid ({}), yielded, and \
              met the futex contract's edges: a WAIT on a word that had already changed refused \
              to sleep (EAGAIN), a WAKE with nobody asleep woke none, a shared futex and a clone \
-             were refused; then it set its TLS base and read {:#x} back through it",
-            answers[0], answers[1], answers[8]
+             were refused; then it set its TLS base, read {:#x} back through it, and wrote {} \
+             bytes to the console through the adapter",
+            answers[0], answers[1], answers[8], answers[9]
         );
         true
     } else {
         println!(
             "\x1b[91m    linux futex    FAILED: tid {}, pid {}, yield {}, stale-wait {}, \
-             empty-wake {}, shared {}, clone {}, arch_prctl {}, fs:[0] {:#x}\x1b[0m",
+             empty-wake {}, shared {}, clone {}, arch_prctl {}, fs:[0] {:#x}, write {}\x1b[0m",
             answers[0],
             answers[1],
             answers[2] as i64,
@@ -3801,7 +3889,8 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
             answers[5] as i64,
             answers[6] as i64,
             answers[7] as i64,
-            answers[8]
+            answers[8],
+            answers[9] as i64
         );
         false
     }
@@ -7094,6 +7183,16 @@ const LINUXD_PROGRAM: &[u8] = b"bin/linuxd";
 /// A string naming what would not be built. Every one is survivable: a machine
 /// with no adapter answers every unhandled foreign call `-ENOSYS`, which is
 /// exactly what it did before this existed.
+/// The adapter's first futex-wake slot, and how many there are.
+///
+/// Sixteen because that is how many hosted threads may be asleep in a futex at
+/// once, and because the kernel's whole notification table is thirty-two
+/// ([`notify::MAX_NOTIFICATIONS`]) — half of it is as much as one personality
+/// may take. A seventeenth sleeper is refused with `EAGAIN`, which is a Linux
+/// answer a correct caller already retries.
+const FUTEX_WAKE_SLOT: usize = 4;
+const FUTEX_WAKES: usize = 16;
+
 fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     let realm = domain::create("linux", domain::ResourceEnvelope::new())
         .map_err(|_| "the linux domain would not be created")?;
@@ -7151,6 +7250,70 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     }) != Some(true)
     {
         return Err("the adapter's fault page would not install");
+    }
+
+    // Slot 3: the console, **write-only** -- RFC 0032 step 10. A hosted
+    // program's `write` has to reach a console somehow, and until now the
+    // nucleus did the printing on its behalf, which is the last thing it did
+    // for a Linux number. This capability is the whole of what the adapter may
+    // do to the machine's console: put a character. It cannot take a byte
+    // somebody typed, because `Rights::WRITE` does not include `READ` and the
+    // console path checks -- a check that was unreachable while the console
+    // service was the only holder.
+    //
+    // Granted here, at boot, and not through the console *service*: this
+    // domain starts before that service exists, and the object it names is the
+    // machine's console, which exists from the first `println!`.
+    let console = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Console, CONSOLE_OBJECT),
+                cap::Rights::WRITE,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the adapter's console capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(3, console).is_ok()) != Some(true) {
+        return Err("the adapter's console would not install");
+    }
+
+    // Slots 4 onwards: the notification pool — RFC 0032 step 10's other half.
+    //
+    // **A hosted `futex(WAIT)` has to park a thread, and only the kernel can
+    // park one.** The adapter says so with a `BLOCK_ON` reply naming one of
+    // these; the kernel blocks the calling thread on it and answers zero when
+    // it is signalled. One notification per parked waiter, which is what makes
+    // an exact wake count expressible in ring 3 -- `futex(WAKE, n)` signals
+    // *n* of them -- and what `notify::wait`'s one-waiter-at-a-time rule wants
+    // anyway.
+    //
+    // **`WRITE` and not `READ`**: the adapter may wake a sleeper and may not
+    // become one. A single-threaded server that could block on a notification
+    // could stop answering, and nothing about a futex needs it to.
+    //
+    // Granted at boot because a domain cannot create a notification -- there
+    // is no method for it, deliberately -- so the pool is a fixed grant and
+    // its size is a fixed limit: this many hosted threads may sleep in a futex
+    // at once, and the adapter refuses the next with EAGAIN rather than
+    // silently losing it.
+    for index in 0..FUTEX_WAKES {
+        let wake = crate::notify::create().map_err(|_| "a futex wake would not be created")?;
+        let handed = crate::notify::name(wake)
+            .ok()
+            .and_then(|root| {
+                cap::with_arena(|arena| arena.derive(root, cap::Rights::WRITE, 1).ok())
+            })
+            .ok_or("a futex wake would not be named")?;
+        if domain::with(realm, |owner| {
+            owner
+                .cspace
+                .install_at(FUTEX_WAKE_SLOT + index, handed)
+                .is_ok()
+        }) != Some(true)
+        {
+            return Err("a futex wake would not install");
+        }
     }
 
     let options = sched::SpawnOptions::new()

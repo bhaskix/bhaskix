@@ -572,14 +572,14 @@ kernel.
 > and [security.md](../security.md) §1's **T11** row states what it costs
 > meanwhile.
 >
-> **Where it stands, 2026-08-20:** the trigger was met and the move is nine
-> steps in ([RFC 0032](0032-a-supervisor-interface.md)). `kernel/src/signal.rs`
-> is deleted, `bin/linuxd` answers foreign calls from ring 3, and the count of
-> Linux numbers the nucleus still interprets — gated on every boot as a ratchet
-> that may only fall — reads **2**: `futex` and `write`. The paragraph above
-> this correction is what the tree does again, for everything but those two,
-> and each of those waits on a capability the adapter does not yet hold rather
-> than on code.
+> **Corrected, 2026-08-20: the paragraph above this correction is what the
+> tree does again.** The trigger was met and the move finished
+> ([RFC 0032](0032-a-supervisor-interface.md), ten steps, accepted the same
+> day). `kernel/src/signal.rs` is deleted, every foreign-call handler is
+> deleted, `bin/linuxd` answers from ring 3, and the count of Linux numbers the
+> nucleus interprets — gated on every boot — reads **0**. The gate is an
+> equality now rather than a ratchet, so the contradiction this correction
+> records cannot come back quietly.
 
 ### The initial process image
 

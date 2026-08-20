@@ -606,6 +606,17 @@ pub fn wait(id: NotificationId) -> Result<u64, NotifyError> {
         }) {
             break outcome;
         }
+        // **A thread that has been told to stop must stop waiting.**
+        // `block_unless` refuses to mark a dying thread blocked -- sleeping is
+        // the one thing it must not do -- so without this check the loop keeps
+        // deciding to block, is refused, and spins through the scheduler for
+        // ever: a thread that cannot die because it is waiting for something
+        // nobody will send. Reachable since RFC 0032 step 10, when a hosted
+        // `futex(WAIT)` became an ordinary waiter here and `exit_group` from a
+        // sibling became an ordinary way for its domain to end underneath it.
+        if crate::sched::should_die() {
+            break Err(NotifyError::Gone);
+        }
         crate::sched::block_self();
     };
 

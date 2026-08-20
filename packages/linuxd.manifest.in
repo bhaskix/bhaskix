@@ -2,16 +2,50 @@
 # first time RFC 0005's "a service domain, not the nucleus" has been true of
 # anything.
 #
-# One endpoint, and nothing else -- not even a console. That is the whole of
-# its authority, and it is what makes the containment claim checkable rather
-# than asserted: a bug in the largest untrusted-input parser this project will
-# ever have reaches one endpoint. When it grows a hosted process's files and
-# sockets it will hold *those*, and a reviewer will see them on this list.
+# **This list is the whole of its authority**, and it is what makes the
+# containment claim checkable rather than asserted: a bug in the largest
+# untrusted-input parser this project will ever have reaches exactly what is
+# written here. It said "one endpoint, and nothing else -- not even a console"
+# until 2026-08-20, when RFC 0032 step 10 moved the last two Linux calls out of
+# the nucleus and each needed the capability the kernel had been using on a
+# hosted program's behalf:
+#
+#   - two pages, to report through and to hand a faulting program's registers
+#     over in;
+#   - the console. The grant is **write-only** -- it may put a character and
+#     may not take a byte somebody typed at the shell -- but this grammar has
+#     no way to say so, so the line below claims *more* authority than the
+#     domain has. That is the safe direction for a reviewer to be wrong in,
+#     and the trigger for a `cap console` is the first package that is
+#     installed rather than started by the kernel and needs the narrower one;
+#   - sixteen notifications, which it may signal and may not wait on: one per
+#     hosted thread asleep in a `futex`, which is also the limit on how many
+#     may sleep at once.
+#
+# **Two of those three cannot be written in this grammar, and that is a finding
+# rather than an omission.** `cap console` cannot say *write-only*, and there
+# is no way at all to say *sixteen notifications*: `MAX_CAPS` is sixteen
+# "distinct authorities", and sixteen identical notifications are one authority
+# with a multiplicity, which the memory line already has a spelling for
+# (`pages=`). So the notifications are described here and not listed, because
+# twelve `cap notification` lines would be a *wrong* list where a paragraph is
+# an honest one. The trigger for `cap notification count=N` and
+# `cap console write` is the first package that is **installed** rather than
+# started by the kernel and needs either -- these grants are made by
+# `start_linux_domain` at boot, so nothing is granted from this file today.
+#
+# A supervisor handle to each domain it hosts is granted by the kernel as
+# hosted domains appear, and is not a fixed grant. When it grows a hosted
+# process's files and sockets it will hold *those*, and a reviewer will see
+# them on this list.
 package linuxd
 version 0.1.0
 
 program bin/linuxd
 entry hertz
 cap serve linux
+cap memory pages=1
+cap memory pages=1
+cap console
 
 payload bin/linuxd from user/linuxd/target/x86_64-unknown-none/release/linuxd

@@ -85,6 +85,27 @@ pub mod reply {
     /// depends on is the kernel's ordinary teardown rather than anything the
     /// personality has to reproduce.
     pub const END_DOMAIN: u64 = 6;
+    /// Park the calling thread on a notification the *adapter* holds, and
+    /// answer zero when it is signalled.
+    ///
+    /// **The reply that blocks, and the reason it has to be a reply.** A
+    /// server may hold exactly one outstanding reply — `Thread::reply_to` is
+    /// one `Option` — so an adapter that simply did not answer a sleeper
+    /// would answer nobody else either. Instead it always replies, and when
+    /// the answer is "sleep" the reply *is* the instruction to sleep: policy
+    /// (which word, which waiters, how many to wake) stays in ring 3, and
+    /// parking a thread stays in the kernel, which is the only thing that can
+    /// do it.
+    ///
+    /// The word beside this one is a capability index **in the adapter's own
+    /// CSpace**, not the caller's: a hosted process holds no capabilities and
+    /// can name none, which is RFC 0031's interface I3.
+    ///
+    /// The compare-and-block race is closed by an existing decision rather
+    /// than by anything here: [`crate::notify::signal`] publishes its bits
+    /// before waking, so a wake that arrives between the adapter's reply and
+    /// this park leaves the bit set and the park returns at once.
+    pub const BLOCK_ON: u64 = 7;
 }
 
 /// What the adapter answered.

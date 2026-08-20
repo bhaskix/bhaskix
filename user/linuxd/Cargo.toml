@@ -65,4 +65,15 @@ opt-level = "s"
 # kernel, through a capability, by naming an object -- so the program that now
 # decides what a `SIGSEGV` means holds one endpoint, two pages, and a handle to
 # each domain it hosts.
-unsafe_budget = 42
+# 44 at step 10, and the two lines are the futex table's: one borrow of the
+# sleeper array and one of the arrival counter, both `static mut` in a program
+# with one thread — the same shape and the same justification as the signal
+# dispositions above, which is that the kernel gives a server exactly one
+# outstanding reply, so there is no second caller inside these functions and a
+# lock here would be a lock nothing can contend.
+#
+# **The futex that arrived with them reads a hosted process's memory through a
+# capability, not a pointer**, which is why the last and most dangerous Linux
+# call to move costs two lines about this program's own arrays and none about
+# anybody else's memory.
+unsafe_budget = 44

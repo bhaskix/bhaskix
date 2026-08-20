@@ -1272,9 +1272,13 @@ fi
 # foreign call's number without interpreting it; it interprets eighteen. The
 # count is printed on every boot that ran a hosted program, and this gate
 # lets it *shrink* and never grow -- so the boundary violation is a number
-# with a direction rather than a paragraph in an RFC. It reaches zero when
-# the personality moves into a domain (RFC 0031 section 5), and this gate is
-# what will say so.
+# with a direction rather than a paragraph in an RFC.
+#
+# **It reached zero on 2026-08-20** (RFC 0032 step 10), so the ratchet is now
+# an equality: eighteen, then seven, then two, then none, and the gate that
+# allowed a fall no longer allows anything else. A number here again is a
+# Linux concept back in the nucleus, which is the thing RFC 0031 exists to
+# prevent -- and it is caught on the next boot rather than in review.
 #
 # The cost figure beside it is the other half of RFC 0031's requirement: the
 # in-nucleus placement priced *before* the move, with the instrument the
@@ -1284,10 +1288,10 @@ fi
 # and which this suite has made before.
 if grep -qE "personality +boundary: [0-9]+ linux numbers interpreted in the nucleus" "$LOG"; then
     interpreted=$(sed -n 's/.*boundary: \([0-9]*\) linux numbers.*/\1/p' "$LOG" | head -1)
-    if [[ "$interpreted" -le 2 ]]; then
-        pass "the personality boundary is $interpreted linux numbers wide, and may only narrow"
+    if [[ "$interpreted" -eq 0 ]]; then
+        pass "the nucleus interprets no linux number at all, and this gate holds it there"
     else
-        fail "the nucleus interprets $interpreted linux numbers, up from 2 -- RFC 0031 I1 wants 0"
+        fail "the nucleus interprets $interpreted linux numbers -- it reached 0 on 2026-08-20 and RFC 0031 I1 keeps it there"
         status=1
     fi
     # And the instrument accounts for itself. Every foreign call is priced,
@@ -1387,7 +1391,7 @@ fi
 # proof of anything -- so the self-test detects that case and runs the whole
 # rendezvous again rather than reporting it as success. Seen once in a full
 # suite on 2026-08-19, on a kernel that had done nothing wrong.
-if grep -qE "linux clone +a Linux program cloned a thread \(tid [1-9][0-9]*, which the child agrees is its own\), then the two met through a futex: the parent slept, the child set the word to 42 and woke 1, and the parent came back; its exit_group then took the spinning child with it" "$LOG"; then
+if grep -qE "linux clone +a Linux program cloned a thread \(tid [1-9][0-9]*, which the child agrees is its own\), then the two met through a futex: the parent slept, the child set the word to 42 and woke 1, and the parent came back; the parent then parked in a futex and the child.s exit_group ended them both" "$LOG"; then
     pass "clone makes a real thread, and the futex pairs a sleeper with a waker"
 else
     fail "the Linux clone self-test did not conclude"
@@ -1398,14 +1402,26 @@ fi
 # subtle mistake does not produce an error but a deadlock under load. A WAIT
 # whose word has already changed must refuse to sleep; a WAKE with nobody
 # asleep must wake none; a shared futex and a clone are refused with reasons.
+# And RFC 0032 step 10's `write`: **both halves are demanded**, because
+# neither can stand alone. The count says the adapter answered sixteen; the
+# string says those sixteen bytes reached the machine's console out of a
+# `Console` capability held in ring 3. A count with no string would pass on an
+# adapter that answered and printed nothing. The string is matched without an
+# anchor on purpose: the adapter puts **one character per invocation**, so
+# where the line begins depends on what the console was in the middle of --
+# a real property of a console that is a capability, recorded in RFC 0032
+# rather than hidden by a stricter pattern here. No kernel path prints these
+# bytes; they live in the hosted program's own page.
+#
 # The tail of the same sentence is RFC 0032 step 9's: `arch_prctl` is answered
 # by a program in ring 3 now, which sets a *hosted* thread's TLS base from
 # outside that thread. The witness value read back through `fs:[0]` is what
 # says the base reached the thread it named rather than the CPU the adapter
 # happened to run on -- a distinction an answer of zero cannot make.
 if grep -qE "linux futex +a Linux program asked its tid \([1-9][0-9]*\) and pid \([1-9][0-9]*\), yielded, and met the futex contract's edges" "$LOG" \
-    && grep -qE "then it set its TLS base and read 0x5afe back through it" "$LOG"; then
-    pass "the futex contract holds at its edges, and the identity and TLS calls answer"
+    && grep -qE "then it set its TLS base, read 0x5afe back through it, and wrote 16 bytes to the console through the adapter" "$LOG" \
+    && grep -qF "hosted write ok" "$LOG"; then
+    pass "the futex contract holds at its edges, and the identity, TLS and write calls answer"
 else
     fail "the Linux futex self-test did not conclude"
     status=1

@@ -1303,7 +1303,22 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             Ok(resolved) => resolved,
             Err(status) => return Outcome::err(status),
         };
-        let _ = resolved;
+        // **Putting and taking are separate authorities, and until RFC 0032
+        // step 10 nothing needed them to be.** One holder existed — the
+        // console service, holding `Rights::ALL` — so a rights check would
+        // have been unreachable code. The Linux adapter is the second holder
+        // and it is given `WRITE` alone: a hosted program's `write` reaches
+        // the console, and the adapter cannot take a byte somebody typed at
+        // the shell. Without this the narrowing would be a comment rather
+        // than a mechanism.
+        let wanted = if frame.method == method::PUT {
+            crate::cap::Rights::WRITE
+        } else {
+            crate::cap::Rights::READ
+        };
+        if !resolved.rights.contains(wanted) {
+            return Outcome::err(Status::InsufficientRights);
+        }
 
         return match frame.method {
             method::PUT => {
@@ -1711,173 +1726,25 @@ use bhaskix_personality::call::{Dialect, PersonalityCall};
 
 /// Linux syscall numbers this personality answers rather than refuses.
 ///
-/// **This module is the measure of a boundary violation, and its size is
-/// meant to reach zero.** RFC 0031's interface I1 says the nucleus carries a
-/// foreign call's number without interpreting it; every constant below is a
-/// number the nucleus *does* interpret, and [`ANSWERED`] publishes the count
-/// so the violation is visible on every boot rather than discovered by
-/// reading the file. When the personality moves into a domain (RFC 0031 §5)
-/// this module goes with it and the count becomes zero.
+/// **Empty, as of RFC 0032 step 10 — and it is kept rather than deleted so
+/// that it can be seen to be empty.** Its size was the measure of a boundary
+/// violation: RFC 0031's interface I1 says the nucleus carries a foreign
+/// call's number without interpreting it, every constant here was a number
+/// the nucleus *did* interpret, and [`ANSWERED`] published the count on every
+/// boot. It read eighteen on 2026-08-19 and reads zero now.
+///
+/// A number added back changes this array's length, which the boot report
+/// prints and a gate refuses to let rise. That is why the module stays: a
+/// deleted ratchet cannot hold anything.
 mod linux {
-    /// `futex(uaddr, op, val, timeout, uaddr2, val3)`.
-    pub const FUTEX: u64 = 202;
-    /// `write(fd, buf, count)`.
-    pub const WRITE: u64 = 1;
-
-    /// Every number above, once, so the boundary has a size.
+    /// Every number the nucleus interprets, once, so the boundary has a size.
     ///
-    /// **Kept by hand, and the honest caveat is that nothing enforces it.**
-    /// A `match` arm added without a line here would leave this number too
+    /// **Kept by hand, and the honest caveat is that nothing enforces it.** A
+    /// `match` arm added without a line here would leave this number too
     /// small — so the boot report prints it as a count of *declared*
-    /// interpretation, and the gate is a ratchet on that declaration. The
-    /// alternative, deriving it from the dispatch, needs the dispatch to be
-    /// a table rather than a `match`, which is a change worth making when
-    /// the personality moves rather than before.
-    pub const ANSWERED: [u64; 2] = [FUTEX, WRITE];
-
-    // No number appears twice: a duplicate would make the boundary look
-    // smaller than it is, which is the one direction this count must never
-    // be wrong in.
-    const _: () = {
-        let mut outer = 0;
-        while outer < ANSWERED.len() {
-            let mut inner = outer + 1;
-            while inner < ANSWERED.len() {
-                assert!(ANSWERED[outer] != ANSWERED[inner]);
-                inner += 1;
-            }
-            outer += 1;
-        }
-    };
-}
-
-/// The futex table: one wait queue per watched address, per domain.
-///
-/// RFC 0005 step 6's third hard part. Sixteen slots, because a Go runtime
-/// parks its scheduler on a handful of words and a table that could grow
-/// would be an allocation on the wait path. A word with no slot free is
-/// refused with `EAGAIN` rather than silently not sleeping — a futex that
-/// returns instead of blocking is the spin the RFC warns about, and it is
-/// better to fail loudly than to burn a CPU quietly.
-/// The queues themselves live *outside* the lock, and deliberately: each
-/// carries its own, so the only shared mutable state is which address a slot
-/// watches. Keeping them apart is what lets a sleeper hold a plain reference
-/// to its queue while the key table is free for a waker — no raw pointer, no
-/// lock held across a sleep.
-static FUTEX_QUEUES: [crate::wait::WaitQueue; 16] = [const { crate::wait::WaitQueue::new() }; 16];
-
-/// Which (domain, address) each queue watches.
-static FUTEX_KEYS: crate::sync::SpinLock<[Option<(u32, u64)>; 16]> =
-    crate::sync::SpinLock::new(crate::sync::Rank::Signals, [None; 16]);
-
-/// How many futex sleeps and wakes have happened, for the boot report.
-pub static FUTEX_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// See [`FUTEX_SLEEPS`].
-pub static FUTEX_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Reads the `u32` a futex watches out of the caller's memory.
-fn futex_word(address: u64) -> Option<u32> {
-    let mut bytes = [0u8; 4];
-    // SAFETY: the fault-protected read; a bad address is reported, not taken.
-    let read = unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), address, 4) };
-    read.ok()?;
-    Some(u32::from_le_bytes(bytes))
-}
-
-/// Answers the two numbers still read here — RFC 0032 step 9.
-///
-/// What is left is `futex`, which parks on the kernel's own wait queues, and
-/// `write`, which needs a console the adapter has not been given. Both are
-/// named in RFC 0032 as wanting a capability that does not exist yet: a
-/// blocking primitive the adapter could hold, and a `Console`. Until those
-/// exist these two are answered here and counted against the ratchet, which
-/// is the honest shape — the number is two because two capabilities are
-/// missing, not because the boundary was drawn there on purpose.
-fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
-    use bhaskix_personality::thread::{self, FutexPlan};
-
-    let (first, second, third) = (call.first(), call.second(), call.third());
-    match call.number {
-        // The one call a hosted program needs before it can say anything.
-        // Only the two standard streams, and only to this machine's console:
-        // a hosted program writing to a descriptor it never opened is
-        // asking for authority, and fd 1 and 2 are the two Linux hands
-        // every process without being asked.
-        linux::WRITE => {
-            let (fd, buffer, count) = (first, second, third as usize);
-            if fd != 1 && fd != 2 {
-                // A real descriptor table is Tier 1's; until then, anything
-                // else is honestly absent rather than silently swallowed.
-                return Some(-9i64 as u64); // EBADF
-            }
-            let mut bytes = [0u8; 256];
-            let take = count.min(bytes.len());
-            if take == 0 {
-                return Some(0);
-            }
-            // SAFETY: the fault-protected read; a bad pointer is reported.
-            let read =
-                unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), buffer, take) };
-            read.ok()?;
-            // Through the console the kernel already prints with, because a
-            // hosted program's output is output: the bytes are lossy-decoded
-            // as UTF-8 so a binary write cannot corrupt the log's framing.
-            let text = core::str::from_utf8(&bytes[..take]).unwrap_or("<non-utf8>");
-            crate::print!("{text}");
-            Some(take as u64)
-        }
-        // The thread-local base. Go sets it before it touches anything in
-        // `fs:`, which is nearly everything the runtime does -- so without
-        // this a hosted Go program faults on its own scheduler.
-        linux::FUTEX => {
-            match thread::plan_futex(first, second, third) {
-                FutexPlan::Wait { address, expected } => {
-                    // The compare-and-sleep, which is the whole contract: if
-                    // the word has already changed, the sleeper must not
-                    // sleep, or it sleeps through the wake that changed it.
-                    let now = futex_word(address)?;
-                    if now != expected {
-                        // Linux's EAGAIN: "the value was not what you said".
-                        return Some(-11i64 as u64);
-                    }
-                    let slot = {
-                        let mut keys = FUTEX_KEYS.lock();
-                        let existing = keys.iter().position(|key| *key == Some((domain, address)));
-                        match existing.or_else(|| keys.iter().position(Option::is_none)) {
-                            Some(index) => {
-                                keys[index] = Some((domain, address));
-                                index
-                            }
-                            None => return Some(-11i64 as u64),
-                        }
-                    };
-                    FUTEX_SLEEPS.fetch_add(1, Ordering::Relaxed);
-                    // The condition is re-read with the queue's own lock
-                    // held, which is what closes the window between the
-                    // compare above and the sleep: a waker that changes the
-                    // word and wakes in between is seen here rather than
-                    // slept through.
-                    FUTEX_QUEUES[slot].wait_until(|| futex_word(address) != Some(expected));
-                    Some(0)
-                }
-                FutexPlan::Wake { address, count } => {
-                    let slot = {
-                        let keys = FUTEX_KEYS.lock();
-                        keys.iter().position(|key| *key == Some((domain, address)))
-                    };
-                    let woken = match slot {
-                        Some(index) if count <= 1 => usize::from(FUTEX_QUEUES[index].wake_one()),
-                        Some(index) => FUTEX_QUEUES[index].wake_all(),
-                        None => 0,
-                    };
-                    FUTEX_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
-                    Some(woken as u64)
-                }
-                FutexPlan::Refuse(errno) => Some(errno as u64),
-            }
-        }
-        _ => None,
-    }
+    /// interpretation, and the gate is a ratchet on that declaration. There is
+    /// no longer any dispatch for it to be derived from, which is the point.
+    pub const ANSWERED: [u64; 0] = [];
 }
 
 fn foreign_call(frame: &mut SyscallFrame) {
@@ -1927,12 +1794,14 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // never return, so a price taken on the way out is a price never taken.
     // Deciding on the way in also saves the `rdtsc` on every call that was
     // never going to be priced.
+    // **The exclusion list went with the last number** — RFC 0032 step 10.
+    // It was itself a `match` on Linux syscall numbers in the nucleus, and
+    // one the ratchet never counted, because it decided *pricing* rather than
+    // *answers*: a boundary violation hiding behind an instrument. What is
+    // left here prices one thing, the `-ENOSYS` fall-through taken when there
+    // is no adapter, and that path cannot block.
     let number = call.number;
-    let priced = !blocks_by_construction(number);
-    if !priced {
-        FOREIGN_COST_EXCLUDED.fetch_add(1, Ordering::Relaxed);
-    }
-    let started = if priced { bhaskix_arch::tsc::read() } else { 0 };
+    let started = bhaskix_arch::tsc::read();
 
     let count = FOREIGN_CALLS.fetch_add(1, Ordering::Relaxed);
     if let Some(slot) = FOREIGN_SEEN.get(count as usize) {
@@ -1958,16 +1827,11 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // signal calls and the thread calls -- which is what this refactor looks
     // like from inside the nucleus: arms disappearing, one at a time.
 
-    // The thread and futex calls, RFC 0005 step 6.
-    if let Some(domain) = crate::sched::current_domain()
-        && let Some(value) = foreign_thread_call(&call, domain.as_u32())
-    {
-        frame.kind = value;
-        if priced {
-            price_foreign_call(started);
-        }
-        return;
-    }
+    // The thread and futex calls used to be tried here, and were the last to
+    // go (RFC 0032 steps 9 and 10). **There is now no `if` at all between a
+    // foreign call arriving and the adapter being asked** -- which is what
+    // interface I1 asked for, written as the absence of code rather than as a
+    // paragraph.
 
     // **And what the nucleus does not answer is asked of the adapter** —
     // RFC 0031's interface I1, and RFC 0032's delivery. Note what is *not*
@@ -1995,9 +1859,7 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // `rax` alone. `arg0` (the caller's `rdx`) is left exactly as the stub
     // saved it, which is what preserves it.
     frame.kind = bhaskix_personality::call::ENOSYS.value;
-    if priced {
-        price_foreign_call(started);
-    }
+    price_foreign_call(started);
 }
 
 /// The endpoint a foreign call is delivered to, or zero for none.
@@ -2117,6 +1979,28 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
         crate::fault::reply::YIELD => {
             crate::sched::yield_now();
             Some(answer.1)
+        }
+        // The reply that blocks. The adapter names one of the notifications it
+        // was granted at boot; the kernel parks *this* thread on it and
+        // answers zero when somebody signals it. One notification per parked
+        // waiter, which is what makes an exact wake count possible in ring 3
+        // and what `notify::wait`'s single-waiter rule wants anyway.
+        crate::fault::reply::BLOCK_ON => {
+            let Some(notification) = adapter_notification(answer.1) else {
+                // The adapter named something that is not a notification it
+                // holds. That is the adapter being wrong, not the caller, and
+                // a hosted program is told the truth it can act on: nothing
+                // slept, try again.
+                return Some(-11i64 as u64); // EAGAIN
+            };
+            BLOCKED.fetch_add(1, Ordering::Relaxed);
+            match crate::notify::wait(notification) {
+                Ok(_) => Some(0),
+                // Congested means another thread is already parked on this
+                // notification -- the adapter handed the same one out twice,
+                // which is its bug and is reported as one it cannot hide.
+                Err(_) => Some(-11i64 as u64),
+            }
         }
         crate::fault::reply::END_THREAD => crate::sched::exit(),
         crate::fault::reply::END_DOMAIN => {
@@ -2317,6 +2201,36 @@ static ADAPTER_HELD: [core::sync::atomic::AtomicU64; crate::domain::MAX_DOMAINS]
 ///
 /// Idempotent per incarnation: the generation is recorded, so this costs one
 /// relaxed load per foreign call once a domain is known.
+/// Resolves a capability index **in the adapter's CSpace** to a notification.
+///
+/// The one place kernel code reads another domain's CSpace for a hosted
+/// program's benefit, and it is deliberately narrow: the index comes from the
+/// adapter's own reply, the kind is checked, and what comes back is an object
+/// id rather than a capability. A hosted process never sees any of it.
+fn adapter_notification(index: u64) -> Option<crate::notify::NotificationId> {
+    let adapter = ADAPTER_DOMAIN.load(Ordering::Relaxed);
+    if adapter == u32::MAX {
+        return None;
+    }
+    let index = usize::try_from(index).ok()?;
+    let slot = crate::domain::with(crate::domain::DomainId::from_u32(adapter), |owner| {
+        owner.cspace.get(index)
+    })??;
+    let (object, _) = cap::with_arena(|arena| arena.lookup(slot))?;
+    if object.kind != cap::ObjectKind::Notification {
+        return None;
+    }
+    // Packed as every other reader of a `Notification` capability unpacks it:
+    // index in the low half, generation in the high.
+    Some(crate::notify::NotificationId::from_parts(
+        object.id as u32,
+        (object.id >> 32) as u32,
+    ))
+}
+
+/// Hosted threads parked on a notification by an adapter's `BLOCK_ON`.
+pub static BLOCKED: AtomicU64 = AtomicU64::new(0);
+
 fn ensure_adapter_holds(domain: u32) -> bool {
     ensure_adapter_holds_inner(domain).unwrap_or(false)
 }
@@ -2382,24 +2296,7 @@ fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
     Some(true)
 }
 
-/// Whether a call spends its time somewhere other than the boundary, and is
-/// therefore not priced.
-///
-/// **Excluding these is the difference between a measurement and a number.**
-/// The first version of this instrument priced everything and reported a
-/// mean of 47,047 cycles with 107 of 236 samples discarded — which is not
-/// what a foreign call costs, it is what a `futex` sleeping and a `write`
-/// reaching a UART cost. Neither is the boundary, and neither changes if the
-/// personality moves; both would have swamped the figure the move is meant
-/// to be judged on. A `futex` may sleep for ever, `sched_yield` gives up the
-/// CPU by definition, `clone` starts a thread, `exit` never returns, and
-/// `write` spends its time in a device.
-fn blocks_by_construction(number: u64) -> bool {
-    matches!(number, linux::FUTEX | linux::WRITE)
-}
-
-/// Records what one foreign call cost. Only called for a call that
-/// [`blocks_by_construction`] said could be priced.
+/// Records what one foreign call cost.
 fn price_foreign_call(started: u64) {
     let ended = bhaskix_arch::tsc::read();
     let Some(spent) = ended.checked_sub(started) else {
@@ -2443,13 +2340,6 @@ pub static FOREIGN_COST_DROPPED: core::sync::atomic::AtomicU64 =
 /// the way, and the figure two placements can honestly be compared on.
 pub static FOREIGN_FLOOR: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
-/// How many calls were excluded from pricing because they block by
-/// construction. Counted so the report can account for **every** foreign
-/// call: priced plus dropped plus excluded must equal the total, and when it
-/// does not, a return path is not being priced at all — which is exactly the
-/// discrepancy this counter was added to find.
-pub static FOREIGN_COST_EXCLUDED: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
 
 /// What the foreign path has cost: calls priced, mean cycles, samples
 /// dropped, and how many Linux numbers the nucleus declares it interprets.
@@ -2469,7 +2359,7 @@ pub fn adapter_cost() -> (u64, u64, u64) {
 
 /// What an adapter round trip has cost: calls priced, floor, mean.
 #[must_use]
-pub fn foreign_cost() -> (u64, u64, u64, u64, u64, usize) {
+pub fn foreign_cost() -> (u64, u64, u64, u64, usize) {
     let priced = FOREIGN_PRICED.load(Ordering::Relaxed);
     let cycles = FOREIGN_CYCLES.load(Ordering::Relaxed);
     let mean = cycles.checked_div(priced).unwrap_or(0);
@@ -2479,7 +2369,6 @@ pub fn foreign_cost() -> (u64, u64, u64, u64, u64, usize) {
         if floor == u64::MAX { 0 } else { floor },
         mean,
         FOREIGN_COST_DROPPED.load(Ordering::Relaxed),
-        FOREIGN_COST_EXCLUDED.load(Ordering::Relaxed),
         linux::ANSWERED.len(),
     )
 }
