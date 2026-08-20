@@ -175,7 +175,7 @@ CI enforces this with a grep.
 | `0xFFFF_A000_0000_0000` + | Per-CPU areas, kernel stacks (guard-paged) |
 | `0xFFFF_FFFF_8000_0000` + | Kernel image (text/rodata/data/bss) |
 
-KASLR shifts the kernel image base and the heap base at boot. Paging is **four-level, on
+KASLR shifts the kernel image base at boot. **It does not shift the heap base** — this line said it did until 2026-08-20, and [security.md](security.md) §4 had already corrected the claim on 2026-08-14: randomising the heap is a separate change with its own risk to the direct map, and it is RFC 0021's open question 2. Paging is **four-level, on
 purpose** ([RFC 0025](rfc/0025-four-level-paging-on-purpose.md)): the layout above is a bit-47
 statement throughout, bring-up refuses a machine entered with `CR4.LA57` live rather than
 corrupting addresses silently, and five-level support waits on a written trigger. This sentence

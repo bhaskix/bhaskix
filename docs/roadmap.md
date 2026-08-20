@@ -132,7 +132,7 @@ lock-rank assertions clean. Fairness test: two equal-weight workloads get 50/50 
 killed cleanly when it faults. A test asserts transitive revocation completes before the syscall
 returns. Two domains cannot see each other's memory — verified, not assumed.
 
-### M6 — Filesystem, ELF, shell ✅ *(the ELF loader's 24 hours of fuzzing is still owed)*
+### M6 — Filesystem, ELF, shell ✅ *(complete — the ELF loader's 24 hours of fuzzing was met 2026-08-13)*
 
 *Vision milestone 6.*
 
@@ -148,8 +148,15 @@ loader survives 24 hours of fuzzing without a crash.
 across four CPUs, runs programs in ring 3 that hold capabilities and nothing else, and answers a
 user-mode shell from services in their own domains.
 
-Two exit criteria are owed rather than met, and are tracked as such: M1-17 has never booted on
-physical hardware, and the ELF loader has not had its 24 hours of fuzzing.
+**One exit criterion is owed rather than met**, and is tracked as such: M1-17 has never booted on
+physical hardware.
+
+**Correction, 2026-08-20.** This paragraph and M6's heading both said the ELF loader's 24 hours of
+fuzzing was still owed. It was **met on 2026-08-13** — three campaigns ran the full twenty-four
+hours: 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`, 52 million over
+`ustar`, with no crash, no hang and no artifact. `TRACKER.md` recorded it that day and this file did
+not, for a week. The claim is corrected here rather than deleted, because a roadmap that
+under-reports is wrong in the same way one that over-reports is.
 
 ---
 
@@ -164,6 +171,14 @@ events, per-CPU rings, a live reader. The machine boots on its own loader — `b
 held to the same gates as the incumbent. Packages exist — the image is a function of
 reviewable manifests, and programs install, run and remove at the shell with grants
 derived from what their manifests ask. What remains is libc.
+
+**Two debts are owed inside this phase and are not bullets, because they are not new scope.**
+[coding-style.md](coding-style.md) §8 binds this project to a fuzz target *before* an
+untrusted-input parser merges, and two parsers merged without one: the **filesystem** (a hostile
+disk image — and journal replay runs before anything can refuse) and **IPv6/NDP** (covered by the
+seeded mutation harness, which is a weaker mechanism and is not the same one). Both are tracked as
+tasks in [TRACKER.md](../TRACKER.md) §4 rather than scheduled here — promoting a merge-gate
+obligation to a phase item would turn a rule into a plan.
 
 - ✅ **Process management** — [RFC 0017](rfc/0017-process-management.md), steps 1–6 implemented,
   M9-18 … M9-23. Capability-shaped rather than POSIX-shaped: no `fork` (it duplicates a capability
@@ -271,7 +286,8 @@ derived from what their manifests ask. What remains is libc.
   moved it out in ten steps and the nucleus now interprets **no** Linux syscall number, gated on
   every boot; [RFC 0033](rfc/0033-what-a-hosted-process-is.md), accepted the same day, then said what
   a hosted process *is* — a record in that service bound one-to-one to a domain — which closes
-  architecture question **A6** and unblocks L1 below. RFC 0031 is also where this bullet's *destination* is written down — the L1–L4
+  architecture question **A6** and unblocks L1 below. RFC 0031 is also where this bullet's
+  *destination* is written down — the L1–L4
   application milestones below, and the containment they must inherit, all four still unmet
 
 **Exit:** Bhaskix self-hosts its own userspace utilities, does useful network I/O, and boots on its
@@ -281,23 +297,73 @@ own bootloader.
 
 ## Phase 3 — Enterprise Features
 
+**Ordered, as of 2026-08-20, and this list was unordered until then.** The rows that fund
+[security.md](security.md) §1's *unmet* threat rows come first. The precedent is this project's
+own: part of the IOMMU moved out of this phase and into Phase 2 when
+[RFC 0012](rfc/0012-iommu.md) was accepted, because leaving it here left T3 and T4 unfunded for
+the length of Phase 2 — **a mitigation that arrives after the thing it protects has shipped was
+never funded, it was only listed.**
+
+The order is still by **dependency**, as line 3 of this file requires, and not by fear: each
+security row below names the prerequisite that actually gates it, and two of them are gated on
+things this project has not decided rather than on work it has not done. Nothing moved into
+Phase 2 — see [security.md](security.md) §1's gap list for why the ranking there is by *attacker
+cost* and is not a schedule.
+
+- **Secure boot chain** — Secure Boot, TPM measurement, sealed keys. **First, and the whole of
+  [security.md](security.md) §1's top-ranked gap**: the kernel image is loaded today with no
+  authenticity check at all, so whoever can write the ESP owns ring 0 from the next boot. Three
+  prerequisites, none of them optional and one of them not a task: the **TPM 2.0 driver**, which
+  is item 12 of [driver-model.md](driver-model.md)'s own Phase 3 list; a **`HANDOFF_VERSION` bump**,
+  because the TPM event log has no path into the kernel and carrying one means a new handoff field;
+  and **key custody, which is an open governance question** ([GOVERNANCE.md](../GOVERNANCE.md), and
+  `security.md` §10). [RFC 0030](rfc/0030-packages.md) already refused package signatures for
+  exactly that reason — *a signature without key storage, distribution or revocation is theatre
+  that trains reviewers to see green checkmarks* — and signing a kernel while the key story is open
+  would reproduce that refusal one layer down. The trigger is
+  [RFC 0028](rfc/0028-bhaskixboot.md)'s and it is already written: physical hardware, M1-17
+- **Secure update** — immutable root, A/B slots, rollback protection. Second because it needs the
+  same key infrastructure the row above builds, and because RFC 0030's deferred package signatures
+  are discharged here rather than separately. `security.md` §7 is its specification, written in
+  advance
+- **Audit framework** — hash-chained log over the telemetry plane, remote attestation. Third
+  because the plane it consumes **already exists** ([RFC 0026](rfc/0026-telemetry-plane.md),
+  Phase 2), which makes this the cheapest of the three to start and the one that moves T8 off
+  *partial*. What is owed is precise: the `Audit` class is **reserved and refused** today —
+  emitting it is counted and dropped — and this row is the backpressure ring, the hash chain, and
+  audit-grade naming
+- **Hosted-process address-space randomisation** — **before the L1 row below, and that is the
+  point.** Bhaskix's own services are Rust; the software L1–L4 brings is C, and a hosted process at
+  a fixed image base with a fixed stack turns any bug in BusyBox or `curl` into a reliable exploit.
+  The domain still contains it — containment is the claim being sold, and cheap exploitation of the
+  contained thing weakens it. **Scoped to the adapter**: this is `bin/linuxd`'s mapping policy, not
+  a kernel change. It does **not** touch Bhaskix's own programs, whose per-program fixed bases are
+  a deliberate decision taken on 2026-08-13 — they were all at one address, which made a debugger
+  useless — and are asserted by boot gates. Note also that the ELF loader refuses `ET_DYN` for ring
+  3 on purpose, to keep relocation processing out of the program loader; native ASLR would reopen
+  that and is a separate decision needing an RFC
+- **Linux compatibility L1** — see the section below. It sits here because a container runtime that
+  cannot run BusyBox is a container runtime for nothing. It is also what makes `bin/linuxd` the
+  largest concentration of authority in the system — supervisor handles, a directory capability and
+  every hosted process's descriptors — so the thing to watch as this row proceeds is its
+  **`unsafe` budget**, which the build already enforces per crate, and the authority list in
+  `security.md` §1's T11 note, which every step that adds to it must extend
 - **Container runtime** — container domains, OCI image support
 - **Virtual machines** — VMX/SVM, EPT/NPT, vCPU threads, virtio device backends
   (the domain abstraction from M5 is what makes this additive rather than a second kernel)
 - **Storage** — volume management, snapshots, encryption at rest
-- **Secure boot chain** — Secure Boot, TPM measurement, sealed keys
-- **Secure update** — immutable root, A/B slots, rollback protection
 - **RBAC** — `bhaskixd-authz` over capabilities
-- **Audit framework** — hash-chained log over the telemetry plane, remote attestation
 - **IOMMU, the rest of it** — nested translation for VMs, and AMD-Vi. Interrupt remapping landed in
   Phase 2 instead, and is on by default.
   Discovery, per-device domains and strict mapping moved to Phase 2 when
   [RFC 0012](rfc/0012-iommu.md) was accepted: they are what make a driver's mistakes
   containable, and leaving them here left `security.md` §1 T3 and T4 unfunded for the
   length of Phase 2
-- **Side-channel mitigations** — the documented Phase-1/2 gap in [security.md](security.md) §1
-- **Linux compatibility L1** — see the section below. It sits here because a container runtime that
-  cannot run BusyBox is a container runtime for nothing
+- **Side-channel mitigations** — the documented Phase-1/2 gap in [security.md](security.md) §1.
+  **Last, deliberately.** It is the only row here whose threat is *out of scope* in the threat
+  model rather than unmet within it, the mitigations are per-CPU-generation work this project
+  cannot yet sustain, and two of the mechanisms — KPTI-style isolation and core scheduling — are
+  still open questions in `security.md` §10 rather than decided work
 
 **Exit:** a signed, attestable Bhaskix boots, runs containers and VMs side by side under one
 scheduler, updates atomically, and survives an external security review of the stated threat model.
@@ -413,7 +479,14 @@ is a truthful thing to publish and a dishonest thing to dress up.
 ### What is explicitly *not* in the first release
 
 A libc, self-hosting, a package repository, signatures, containers, VMs, a desktop, or a promise of
-ABI stability. The Linux personality ships as far as it has got — which by the release will be
+ABI stability. **The signatures are the notable one**: the preview ships with a kernel the loader
+does not authenticate, which is [security.md](security.md) §1's top-ranked gap, deferred here for
+reasons that are written down rather than forgotten — it needs a TPM driver, a handoff change and a
+key-custody decision the project has not made. The release note says this in its own words; a
+preview that a stranger boots in QEMU is the one setting where the omission costs least, and that
+is an argument for shipping it stated plainly, not for leaving it unsaid.
+
+The Linux personality ships as far as it has got — which by the release will be
 further than it is today — described by what it runs, not by what it aspires to. **No L row is in
 this release**, and the release note says so in those words rather than describing the goal in a
 tense that could be mistaken for a state.

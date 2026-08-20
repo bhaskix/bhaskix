@@ -48,8 +48,8 @@ nothing in the tree implements it yet.
 | T4 | A malicious peripheral performing DMA (evil maid, malicious PCIe/Thunderbolt device) | IOMMU on by default; devices default-denied until enumerated and granted | ✅ **built**, same three conditions; interrupt remapping is on by default and gated |
 | T5 | A guest VM escaping to the host | Domain isolation is the same mechanism as containers; EPT/NPT; no shared hypervisor codebase to diverge | ⬜ **planned** — domains exist and are the mechanism; **VMX/SVM and EPT/NPT do not**. There are no guests yet, so nothing has escaped and nothing has been prevented. Phase 3 |
 | T6 | Persistence across reboot (bootkit, tampered kernel or initrd) | UEFI Secure Boot chain; measured boot into TPM PCRs; signed, immutable system image | ⬜ **planned, not built** — no Secure Boot chain, no TPM measurement, no signed image. The loader refuses a kernel that fails the ELF *parser*, which is corruption-detection, not authenticity. **Whoever can write the ESP owns ring 0.** Phase 3 |
-| T7 | Tampering with an update in transit or at rest | Signed A/B images; rollback protection via monotonic counter; verified before switch | ⬜ **planned, not built** — no signing, no A/B slots, no rollback counter. There is no update mechanism at all yet, which is why nothing has been tampered with |
-| T8 | Undetected compromise | Tamper-evident audit log; remote attestation; the telemetry plane is the audit source | 🔨 **partial** — the telemetry plane is built and its `Audit` class applies backpressure rather than dropping ([RFC 0026](rfc/0026-telemetry-plane.md)); the tamper-evident log and remote attestation on top of it are Phase 3 and are not built |
+| T7 | Tampering with an update in transit or at rest | Signed A/B images; rollback protection via monotonic counter; verified before switch | ⬜ **planned, not built** — no signing, no A/B slots, no rollback counter. There is no update mechanism at all yet, which is why nothing has been tampered with. Specified in §7; Phase 3 |
+| T8 | Undetected compromise | Tamper-evident audit log; remote attestation; the telemetry plane is the audit source | 🔨 **partial** — the telemetry plane is built ([RFC 0026](rfc/0026-telemetry-plane.md)); the `Audit` class in it is **reserved and refused**, not served — emitting it is counted and dropped, because a best-effort audit event is false assurance with a checksum (§8). The backpressure ring, the hash chain, and remote attestation are a future RFC and are Phase 3. **This cell claimed backpressure when it was first written, on 2026-08-20, and §8 four sections below already said otherwise** — an error introduced by the same edit that added this column to stop exactly that |
 | T9 | Memory-safety bugs in kernel code | Rust; `unsafe` budget tracked per crate; every `unsafe` block justified and reviewed | 🔨 **partial, and permanently so** — Rust, `forbid(unsafe_op_in_unsafe_fn)`, `deny(undocumented_unsafe_blocks)`, and a per-crate budget enforced by the build. 4,170 lines of `unsafe` in tree, **2,740 of them (66%) in ring 0**. The discipline is built; the exposure is structural and does not go to zero |
 | T10 | Resource exhaustion by one domain denying service to others | `ResourceEnvelope` enforced at allocation and scheduling time, not by best effort | ✅ **built** — `ResourceEnvelope` enforced at allocation and scheduling time, gated ("envelope enforced, CPU share independent of thread count") |
 | T11 | A hostile or compromised **Linux application inside a compatibility domain**, attacking through malformed system-call arguments or through Linux privilege (`root`) | The Linux personality translates and never manufactures authority; a hosted process holds no capabilities and has no way to name one; a compatibility domain reaches only what it was granted; and **the translator itself runs in a service domain** as of 2026-08-20 — the nucleus interprets no Linux syscall number, gated on every boot ([RFC 0005](rfc/0005-linux-abi-compatibility.md), [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md), [RFC 0032](rfc/0032-a-supervisor-interface.md)) | 🔨 **mitigated 2026-08-20**, with the price written out in the note below rather than rounded to "contained" — the translator is in ring 3 and the nucleus interprets **0** Linux syscall numbers, gated; what a compromise of the adapter still reaches is enumerated |
@@ -64,7 +64,7 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 | Compromised firmware / SMM / Management Engine | Below our privilege level, by construction | Attestation *detects* some cases; it cannot prevent them |
 | Microarchitectural side channels (Spectre-class, MDS, port contention) | Requires per-CPU-generation mitigation work we cannot sustain yet | Phase 3: core scheduling, IBRS/STIBP, cache partitioning. Documented gap until then. |
 | Supply-chain compromise of the Rust **toolchain** | Real, and not solved by us | Reproducible builds, and the boot image is already a deterministic function of its package set, byte-compared twice per build ([RFC 0030](rfc/0030-packages.md)) |
-| ~~Supply-chain compromise of crates.io dependencies~~ | **Corrected 2026-08-20: there are none.** `Cargo.lock` holds twenty packages and every one of them is `bhaskix-*`. This row previously promised "vendored + hash-pinned dependencies" as Phase 2 future work, which under-claimed what was already true — **there is nothing to vendor**, and an unearned understatement is as wrong as an unearned claim | Stays true only while it is checked. The build should fail on a non-`bhaskix` package entering the lockfile, and does not yet |
+| ~~Supply-chain compromise of crates.io dependencies~~ | **Corrected 2026-08-20: the shipped workspace has none.** `Cargo.lock` holds twenty packages and every one is `bhaskix-*`. This row previously promised "vendored + hash-pinned dependencies" as Phase 2 future work, which under-claimed what was already true — **there is nothing to vendor**, and an unearned understatement is as wrong as an unearned claim | Held by a gate, not by habit: `tools/check-deps.py`, run by `make gates` in CI, reads every manifest and rejects any external crate not in its `ALLOWED_EXTERNAL` set. That set holds exactly one name — `libfuzzer-sys`, reached only by `fuzz/`, **which is its own workspace on purpose and is never shipped** (its lockfile pulls ten transitive crates; none of them reach a booting machine) |
 | Denial of service by an authorised administrator | Authorisation is the boundary; we do not defend against correctly-authorised destruction | Audit log makes it *attributable*, not impossible |
 | Traffic analysis, timing, and power side channels on network paths | Out of scope for an OS kernel | — |
 
@@ -172,7 +172,15 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 ### Gaps found by the reassessment of 2026-08-20
 
 Neither a threat nor a mitigation: **work that is missing, ranked by what it would actually cost an
-attacker to exploit**, recorded here so the order survives the week it was decided in. Each was
+attacker to exploit**, recorded here so the order survives the week it was decided in.
+
+> **This ranking is by attacker cost. It is not a schedule, and the two orders differ on purpose.**
+> [roadmap.md](roadmap.md) orders by *dependency* — it says so in its own first lines — and gap 1
+> depends on a TPM driver, a `HANDOFF_VERSION` bump and a key-custody decision the project has not
+> made, while gap 5 depends on nothing at all. So the roadmap's Phase 3 was reordered on 2026-08-20
+> to put the rows that fund this section first *within that phase*, and **nothing was moved into
+> Phase 2**; gaps 5 and 6 are merge-gate debts under §5 rather than phase items, and gaps 2 and 4
+> are tracked as tasks. Reading this list as a delivery order would be reading it wrong. Each was
 found by reading the tree rather than the documents, and each names what is true today.
 
 | | Gap | Why it ranks here |
@@ -186,8 +194,19 @@ found by reading the tree rather than the documents, and each names what is true
 | 7 | **One entropy source, no pool** | `RDRAND` only — no `RDSEED`, no mixing, no pool. Every unpredictable number in the system, including the KASLR slide and the TCP ISN key, traces to one instruction from one vendor. The design **fails closed** where most systems fail silently, which is why this is seventh and not first |
 
 **And the strongest fact in this document, which it had been under-claiming**: twenty packages in
-`Cargo.lock`, all of them `bhaskix-*`. **Zero external dependencies.** The out-of-scope table above
-is corrected accordingly.
+`Cargo.lock`, all of them `bhaskix-*`. **The shipped workspace has zero external dependencies**, and
+`tools/check-deps.py` fails the build if one appears — a **manifest**-level check, not a lockfile one, which is equivalent here only because there is no external *direct* dependency for a transitive to arrive under. The out-of-scope table above is corrected
+accordingly.
+
+> **A correction inside the correction, made the same day, because it is exactly the mistake this
+> document exists to catch.** The first version of the row above said the keeping-check *did not
+> exist* — "the build should fail on a non-`bhaskix` package entering the lockfile, and does not
+> yet". **That was wrong.** `tools/check-deps.py` has been enforcing it, in `make gates`, in CI, for
+> longer than this reassessment took: it rejects any external crate not explicitly allowed and
+> prints the allowed set. It was asserted absent without being looked for, which is the same failure
+> as asserting a mitigation present without checking — the direction differs and the discipline does
+> not. What is true: the gate exists, its allow-list holds one name, and that name is reachable only
+> from `fuzz/`, a separate workspace that never ships.
 
 **If you find that a mitigation listed as "in scope" does not actually work, that is a security bug
 and we want the report.** See §9.

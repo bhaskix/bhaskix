@@ -725,6 +725,8 @@ what is actually ahead.
 | Package management and image building | ✅ **done 2026-08-19** | **A package is a program plus the authority it asks for, in one reviewable file** ([RFC 0030](docs/rfc/0030-packages.md), **accepted 2026-08-19**, all six steps). Build time: the image is a deterministic function of `packages/*.manifest.in` -- assembled twice and byte-compared on every build, the fourteen boot programs' authority written down and shipped beside them. Run time: `pkg install / list / run / remove` at the shell, verified in ring 3 with the same zero-`unsafe` parser the host tools use, payload-first/record-last ordering proven by what a reinstall does not hit, grants derived from the installed manifest with over-asks refused whole before a domain exists, and every operation saying its price through the journal. The kernel gained no method and no object for any of it. Refused with written triggers: fetch, signatures, dependency solving, upgrades; install-time scripts refused flat |
 | Telemetry plane | ✅ **done** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) **accepted 2026-08-17**, drafted, implemented and accepted the same day | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
 | libc — resolved into the Linux personality | ⬜ **in progress** — [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) steps 2–8 of 10 | **This row did not exist until 2026-08-19**, while the roadmap carried the bullet and eight of the RFC's steps shipped — the same omission this table's own preamble describes. What runs: the personality tag and its `-ENOSYS` telemetry, the initial process image with a real auxiliary vector, the signal round trip (fault → handler → `rt_sigreturn`), the memory calls including `mprotect` and honoured `mmap` hints, `clone` and `futex` proven by two threads of one hosted program meeting, and a **real static Go binary** that loads, runs, prints through the adapter and stops in its own allocator after 212 traced calls. What does not: Tier 1 (files, `/proc`) has not started, and Tier 2 (sockets, `epoll`) has its arithmetic and neither its wiring nor a way to build one where the personality currently lives; the RFC's step 10 gate needs a workload from outside. **And one thing is in the wrong place:** the translation runs in the nucleus, where RFC 0005 §"Where it lives" requires a service domain — recorded 2026-08-19 in that RFC, in `security.md` §1 as **T11**, and in [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md) §5 with its correction trigger |
+| **A fuzz target for the filesystem** — a hostile disk image | ⬜ **owed**, opened 2026-08-20 | **A debt against a binding rule, not new scope.** `coding-style.md` §8 and `security.md` §5 both say a parser touching untrusted input gets a fuzz target *before* it merges. `fuzz/fuzz_targets/` holds fourteen — ELF, `ustar`, `DMAR`, both package formats and every network parser — and **none for `fs`**. Journal replay is the code that runs before anything can refuse. `Superblock::parse` already sanity-checks every field it later uses as an index, which is why this should be cheap; the target is what proves it. Found by the security reassessment of 2026-08-20, ranked fifth there by attacker cost and kept out of the roadmap deliberately — promoting a merge-gate obligation to a phase item turns a rule into a plan |
+| **A coverage-guided fuzz target for IPv6 and NDP** | ⬜ **owed**, opened 2026-08-20 | The v6 parsers are covered by `net/src/fuzz.rs`'s seeded mutation harness, which runs on every commit and is **the weaker of the two mechanisms `coding-style.md` §8 names** — the v4 path has both. They are also the newest parsers in the tree ([RFC 0029](docs/rfc/0029-ipv6.md), 2026-08-18), so they have had the least time under anything. Ranked sixth in the 2026-08-20 reassessment |
 
 ---
 
@@ -885,6 +887,70 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-20 (Phase 3 is ordered, and the reorder is smaller than it was asked to be)
+
+**`roadmap.md`'s Phase 3 was an unordered bullet list and now states an order**, with the rows that
+fund `security.md` §1's unmet threat rows first: secure boot chain → secure update → audit framework
+→ hosted-process address-space randomisation → Linux compatibility L1 → containers → VMs → storage →
+RBAC → the rest of the IOMMU → side channels, last and deliberately. The precedent is this project's
+own, and the roadmap now says so: part of the IOMMU left Phase 3 for Phase 2 when RFC 0012 was
+accepted, because **a mitigation that arrives after the thing it protects has shipped was never
+funded, it was only listed**.
+
+**Nothing moved into Phase 2, and the reason is worth more than the reorder.** The ranking in
+`security.md` §1 is by *attacker cost*; `roadmap.md` orders by *dependency* and says so in its own
+first lines. Those are different criteria and they disagree — so the ranking now carries a note
+saying it is not a schedule, and the reorder happened *within* Phase 3 rather than across phases.
+Hoisting kernel-image signing into Phase 2 would have contradicted six documents at once: the
+release's own "not in the first release: … signatures", `vision.md`'s capability tiers,
+`driver-model.md`'s Phase 3 TPM driver, `GOVERNANCE.md`'s key custody, `security.md` §10's open
+questions — and **RFC 0030, which already refused package signatures on exactly this ground**: *a
+signature without key storage, distribution or revocation is theatre that trains reviewers to see
+green checkmarks.* Signing a kernel while the key story is open reproduces that refusal one layer
+down.
+
+**Three real prerequisites are now named in the roadmap rather than discovered later**: the TPM 2.0
+driver (item 12 of `driver-model.md`'s own Phase 3 list), a `HANDOFF_VERSION` bump (the TPM event
+log has no path into the kernel), and key custody — which is a governance decision, not a task.
+
+**The ASLR row split in two, and only half of it is worth doing.** The gap's justification is the C
+code L1–L4 brings, and hosted layout is `bin/linuxd`'s policy — a fixed `NEXT_MAPPING` base — not a
+kernel change. Bhaskix's *own* programs have fixed per-program bases **on purpose**, decided
+2026-08-13 because eight programs at one address made a debugger useless, and two boot gates assert
+the literal entry address. The roadmap row is scoped to the adapter and says the native half would
+reopen the ELF loader's deliberate `ET_DYN` refusal and needs its own RFC.
+
+**Two gaps were deliberately kept out of the roadmap** and are §4 tasks instead: the filesystem fuzz
+target and a coverage-guided IPv6/NDP target. Both are debts against `coding-style.md` §8's
+merge-gate rule, and promoting a merge-gate obligation to a phase item turns a rule into a plan.
+
+**Four corrections, three of them to work done earlier the same day:**
+
+- **T8's new status cell claimed the `Audit` class applies backpressure. It does not** — RFC 0026
+  reserves and refuses it: emitting is counted and dropped. §8 of the same document already said so,
+  four sections below. The error was introduced by the very edit that added the status column to
+  stop rows drifting from the tree, and the cell now records that.
+- **RFC 0035 repeated the same wrong claim** and depended on it. Corrected, and upgraded: the audit
+  RFC is now named a *hard prerequisite* for S1, since an autonomous action whose record was dropped
+  under load is an action nobody can audit.
+- **`architecture.md` said KASLR shifts the kernel image base and the heap base.** The heap base is
+  not randomised; `security.md` §4 corrected that on 2026-08-14 and `architecture.md` was never
+  updated.
+- **`roadmap.md` said in two places that the ELF loader's 24 hours of fuzzing was still owed.** It
+  was **met on 2026-08-13** — 10.97 billion executions over `elf::parse`, 11.34 billion over `DMAR`,
+  52 million over `ustar`, no crash and no artifact. TRACKER recorded it that day; the roadmap
+  under-reported for a week. M6's heading and Phase 1's closing paragraph are both corrected, and
+  Phase 1 now owes exactly one criterion: M1-17.
+- **M1-17 was filed under Phase 2.** RFC 0035 and this changelog both wrote "Phase 2's exit
+  criteria, M1-17 in particular". M1-17 is **M1's** criterion, in Phase 1. Two triggers, not one.
+
+**And the argument against doing any of this, recorded because it is strong.** Every input to the
+ranking is a QEMU observation, and `security.md` §1 says above its own table that this is a ceiling
+applying to all rows at once. Gap 1's exploit story is trivially true on emulated firmware with no
+Secure Boot and no vendor keys; gap 7's "fails closed" is verified against `-cpu max`, not silicon;
+gap 3's cost model assumes hosted C that has not run — **no BusyBox has run**. The reorder was kept
+inside one phase, and out of the exit criteria, for that reason.
+
 ### 2026-08-20 (the threat model gets a status column, and three rows stop claiming what is not built)
 
 **`security.md` §1 was read against the tree rather than against itself**, and four of its eleven
@@ -908,8 +974,18 @@ had been written about T3/T4 and never applied to the rest of the table.
 **A correction in the other direction, which counts the same.** The out-of-scope table promised
 "vendored + hash-pinned dependencies … Phase 2" against crates.io supply chain. `Cargo.lock` holds
 **twenty packages and every one is `bhaskix-*`**: there is nothing to vendor. An unearned
-understatement is as wrong as an unearned claim, and the row now says so — with the check that would
-keep it true (a build that fails on a non-`bhaskix` package entering the lockfile) named as absent.
+understatement is as wrong as an unearned claim, and the row now says so.
+
+**And a correction inside that correction, made an hour later, which is the more useful entry.** The
+first version of the row said the keeping-check *did not exist* — "a build that fails on a
+non-`bhaskix` package entering the lockfile … does not yet". **That was wrong**, and it was wrong in
+the way this project is supposed to be proof against: `tools/check-deps.py` has been enforcing
+exactly that, in `make gates`, in CI, since long before the reassessment — it reads every manifest,
+rejects any external crate not in `ALLOWED_EXTERNAL`, and prints the graph it accepted. The set
+holds one name, `libfuzzer-sys`, reachable only from `fuzz/`, which is its own workspace on purpose
+and never ships. **An absence asserted without being looked for is the same failure as a mitigation
+asserted without being checked** — the direction differs and the discipline does not. Both rows in
+`security.md` now say what is true, and the wrong version is quoted there rather than deleted.
 
 **Seven gaps recorded and ranked by what they would cost an attacker**, found by reading the tree:
 image authenticity; `bin/linuxd` as the concentration point, growing fastest (`unsafe` 42 → 85 in a
@@ -955,8 +1031,10 @@ threat class, and the reason a learned artifact may change ranking and never the
 undoing, and restart policy is policy. And no calling stages 1 and 2 "AI": they contain no model, and
 an unearned claim in these documents would discount the earned ones.
 
-**Nothing is scheduled.** The stated trigger for starting is Phase 2's exit criteria, M1-17 in
-particular — a self-healing system that has never met a real fault on a real machine is a slogan, and
+**Nothing is scheduled.** The stated triggers for starting are Phase 2's exit criteria **and**
+M1-17 — two triggers, not one, since M1-17 is M1's criterion in Phase 1 (this entry said "Phase 2's
+exit criteria, M1-17 in particular" when first written, which filed a Phase 1 criterion under
+Phase 2) — a self-healing system that has never met a real fault on a real machine is a slogan, and
 the faults worth healing are disproportionately hardware faults.
 
 ### 2026-08-20 (RFC 0033 ACCEPTED, and A6 is closed — both halves, in one day)

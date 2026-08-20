@@ -205,8 +205,12 @@ action        the capability invocation made
 result        what happened
 ```
 
-`Audit` events apply backpressure rather than drop (RFC 0026), which is exactly right here: an
-autonomous action whose record was dropped under load is an autonomous action nobody can audit.
+**The `Audit` class is reserved and refused today** — RFC 0026 counts an emission and drops it,
+because a best-effort audit event is false assurance with a checksum, and the backpressure ring is
+owed to a future RFC ([security.md](../security.md) §8). That is a **hard prerequisite for S1**, not
+a detail: an autonomous action whose record was dropped under load is an autonomous action nobody
+can audit, so the audit RFC lands before a keeper is allowed to act. This paragraph claimed the
+backpressure already existed when this RFC was first drafted; it does not.
 `ai-native.md` §7's sentence is the acceptance criterion — *"the model decided" is not an audit
 record* — and it applies to stages 1 and 2 as much as to 3, where there is no model to blame.
 
@@ -336,8 +340,10 @@ this after Phase 2, not a reason to weaken the gates.
 
 ## Implementation plan
 
-Not a schedule. **The trigger for starting is Phase 2's exit criteria**, and specifically M1-17: the
-first boot on physical hardware. Until then this document is the deliverable.
+Not a schedule. **The trigger for starting is Phase 2's exit criteria and M1-17 — the first boot on physical
+hardware.** Those are two triggers, not one: M1-17 is **M1's** criterion, in Phase 1, owed since
+Phase 1 closed, and this document said "Phase 2's exit criteria, M1-17 in particular" until
+2026-08-20, which put a Phase 1 criterion inside a Phase 2 clause. Until then this document is the deliverable.
 
 **S1 — self-healing**
 
