@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1525
+unsafe_budget = 1546
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -400,6 +400,13 @@ unsafe_budget = 1525
 # has and carries the same argument -- the entry is inside a user-executable
 # segment the loader accepted, and the stack address is one past user-writable
 # memory in the space just installed.
+#
+# **1546 at RFC 0033 step 6, and twenty-one lines is what a *file* witness
+# costs.** All of them are the file probe's thread and the read of the
+# adapter's file record: two pages mapped, a hand-assembled blob and a name
+# copied in through the direct map, `enter_ring3`, and the drain of three words
+# out of the page `bin/linuxd` writes. Not one of them is in a file path — the
+# kernel has no idea a hosted program opened anything, which is the claim.
 #
 # **1525 at RFC 0033 step 5, and fifteen lines is what an `execve` witness
 # costs.** Thirteen are the exec probe's thread — a page mapped, the

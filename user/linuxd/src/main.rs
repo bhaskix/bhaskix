@@ -218,6 +218,27 @@ static TRACED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 /// this is placed after, so moving one moves the other.
 const EXEC_RECORD_AT: u64 = REPORT_AT + SCRATCH_AT_OFFSET + SCRATCH_BYTES;
 
+/// Where the file record sits, three words past the exec record.
+const FILE_RECORD_AT: u64 = EXEC_RECORD_AT + 24;
+
+/// Records what the last `open` and `read` did, for the kernel's report.
+///
+/// **The same evidence shape as the exec record, and for the same reason**:
+/// what a hosted program's file calls did is this program's to say, and a boot
+/// where the bytes did not appear needs to distinguish "the open was refused"
+/// from "the read found nothing" from "the write went somewhere else". The
+/// first version of step 6 had no such line and cost a boot working out which
+/// of the three it was.
+fn trace_file(opened: i64, read: i64, size: u64) {
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // past the mmap records, the scratch area and the exec record.
+    unsafe {
+        core::ptr::write_volatile(FILE_RECORD_AT as *mut u64, opened as u64);
+        core::ptr::write_volatile((FILE_RECORD_AT + 8) as *mut u64, read as u64);
+        core::ptr::write_volatile((FILE_RECORD_AT + 16) as *mut u64, size);
+    }
+}
+
 /// Records an exec for the kernel's report.
 fn trace_exec(pid: u32, from: u32, to: u32) {
     // SAFETY: inside the page `ATTACH` mapped from this program's own object,
@@ -582,6 +603,24 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         FUTEX => return answer_futex(request),
         // The one call that ends the caller and starts a program in its place.
         EXECVE => return answer_execve(request),
+        // The file surface — RFC 0033 step 6. Each reads or writes the
+        // caller's memory, so each needs the `Domain` capability rather than
+        // only the message.
+        OPENAT => {
+            return (
+                REPLY_VALUE,
+                answer_openat(request, request.second(), request.third()),
+            );
+        }
+        OPEN => {
+            return (
+                REPLY_VALUE,
+                answer_openat(request, request.first(), request.second()),
+            );
+        }
+        READ => return (REPLY_VALUE, answer_read(request)),
+        CLOSE => return (REPLY_VALUE, answer_close(request)),
+        DUP | DUP2 | DUP3 => return (REPLY_VALUE, answer_dup(request)),
         SCHED_YIELD => return (REPLY_YIELD, Answer::ok(0)),
         EXIT => return (REPLY_END_THREAD, Answer::ok(0)),
         // A Linux thread group's exit is every thread of it, and a hosted
@@ -1036,6 +1075,73 @@ const EXEC_IMAGE: [u8; 96] = [
     b'i', b'd', b' ', b'?', b'\n', 0x00, 0x00, 0x00,
 ];
 
+/// `openat(dirfd, path, flags, mode)`, and `open(path, flags, mode)`.
+const OPENAT: u64 = 257;
+const OPEN: u64 = 2;
+/// `read(fd, buffer, count)`.
+const READ: u64 = 0;
+/// `close(fd)`.
+const CLOSE: u64 = 3;
+/// `dup(fd)`, `dup2(old, new)`, `dup3(old, new, flags)`.
+const DUP: u64 = 32;
+const DUP2: u64 = 33;
+const DUP3: u64 = 292;
+
+/// The directory a hosted process's `/` **is** — RFC 0033 step 6.
+///
+/// A badged endpoint capability to the filesystem service, granted by the
+/// kernel once that service exists. **This is a hosted process's whole
+/// filesystem**: it can open what is inside this directory and cannot name
+/// anything above it, because it holds nothing that names anything above it.
+/// That is `chroot` by construction rather than by check.
+///
+/// `READ` and `DERIVE` and no `WRITE`, so a hosted program opening a file for
+/// writing is told `EROFS` rather than being lied to.
+const ROOT_DIR: u64 = 22;
+/// Where a page lent by the filesystem service lands, one at a time.
+const LENT: u64 = 23;
+/// Where a lent page is mapped in this program's own space while it is read.
+///
+/// **Not `0x1D00_0000`, which is this program's own stack** — eight pages of
+/// it, mapped by the kernel before this program ever ran. `ATTACH` refused the
+/// overlap with `SlotUnavailable`, which is the one answer it gives for every
+/// unusable address on purpose, and the refusal reached a hosted program as a
+/// `read` that returned `EFAULT`.
+const LENT_AT: u64 = 0x0000_0000_1C00_0000;
+
+/// The slots open files are held in, allocated **downward** from the top.
+///
+/// The kernel allocates hosted-domain handles *upward* from slot 24, and this
+/// allocates from 127 down, so the two cannot meet: sixty-four domains and
+/// thirty-two open files is ninety-six of a hundred and twenty-eight. Written
+/// as a pair of directions rather than as two ranges, because a range is a
+/// number somebody will change on one side only.
+const FILE_SLOT_TOP: u64 = 127;
+const FILE_SLOTS: usize = 32;
+
+/// Which file slots are taken.
+static mut FILE_HELD: [bool; FILE_SLOTS] = [false; FILE_SLOTS];
+
+/// Takes a free slot for an open file, or `None` when there are none left.
+fn claim_file_slot() -> Option<u64> {
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    let held = unsafe { &mut *core::ptr::addr_of_mut!(FILE_HELD) };
+    let index = held.iter().position(|taken| !*taken)?;
+    held[index] = true;
+    Some(FILE_SLOT_TOP - index as u64)
+}
+
+/// Gives a file slot back, and drops whatever capability was in it.
+fn release_file_slot(slot: u64) {
+    let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
+    let index = (FILE_SLOT_TOP - slot) as usize;
+    // SAFETY: as `claim_file_slot`.
+    let held = unsafe { &mut *core::ptr::addr_of_mut!(FILE_HELD) };
+    if let Some(taken) = held.get_mut(index) {
+        *taken = false;
+    }
+}
+
 /// `futex(address, operation, value, ...)`.
 const FUTEX: u64 = 202;
 /// `write(fd, buffer, count)`.
@@ -1138,7 +1244,17 @@ fn process_for(domain: u32) -> Option<&'static mut Process> {
     if processes.by_domain(domain, generation).is_none() {
         // Parent zero: nothing hosted started it, so nothing will wait for it.
         // When `fork` and `execve` exist, the parent is the process that asked.
-        processes.admit(0, domain, generation).ok()?;
+        let pid = processes.admit(0, domain, generation).ok()?;
+        // **The three descriptors a Linux program is entitled to assume.** It
+        // does not open standard output; it writes to descriptor 1 and is
+        // entitled to find something there. Without them the first file a
+        // program opened became descriptor *zero* — its own standard input —
+        // which is the kind of wrong that runs for a while and then reads a
+        // file when it meant to read a terminal.
+        processes
+            .by_pid_mut(pid)?
+            .descriptors
+            .install_standard(CONSOLE);
     }
     processes.by_domain_mut(domain, generation)
 }
@@ -1148,6 +1264,362 @@ fn sleepers() -> &'static mut [Sleeper; WAKES] {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     unsafe { &mut *core::ptr::addr_of_mut!(SLEEPERS) }
 }
+
+/// Answers a hosted `openat` — RFC 0033 step 6.
+///
+/// **One component, against the directory this program was given.** The
+/// filesystem protocol resolves a *name* inside a directory a caller holds
+/// (RFC 0016); there is no method that takes a path, deliberately, because a
+/// path is a request to walk somewhere the caller may not hold. So a hosted
+/// program's `/inner` is the name `inner` inside the one directory this
+/// program has, and `/a/b` is `ENOENT` until a hosted process carries a
+/// working directory of its own.
+///
+/// The capability that comes back is held **here**, in a slot the hosted
+/// program cannot name, and what the program gets is a small integer into its
+/// own descriptor table. That is interface I3 in one function.
+fn answer_openat(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer {
+    open_the_file(request, path_at, flags)
+}
+
+/// Where an `open` stopped, for the record's second word. A hosted program
+/// sees one `ENOENT`; whoever is debugging sees which of four it was.
+const STAGE_BAD_NAME: i64 = -101;
+const STAGE_NO_DIRECTORY: i64 = -102;
+const STAGE_SERVICE_SILENT: i64 = -103;
+const STAGE_SERVICE_REFUSED: i64 = -104;
+/// And where a `read` stopped.
+const STAGE_NO_EXPECT: i64 = -105;
+const STAGE_MAP_SILENT: i64 = -106;
+const STAGE_MAP_REFUSED: i64 = -107;
+const STAGE_NOT_ATTACHED: i64 = -109;
+const STAGE_NOT_COPIED: i64 = -110;
+
+/// The work behind [`answer_openat`], so that every path through it is traced.
+fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer {
+    use bhaskix_personality::file::{Entry, Kind, open, plan_openat};
+
+    // Writing is refused before anything else, because the capability this
+    // program holds carries no `WRITE` right and a program told otherwise
+    // would discover it at the write.
+    if flags & open::ACCMODE != open::RDONLY {
+        return Answer::error(-30); // EROFS
+    }
+    let plan = match plan_openat(flags) {
+        Ok(plan) => plan,
+        Err(errno) => return Answer::error(errno),
+    };
+    let _ = plan;
+
+    let mut name = [0u8; MAX_NAME];
+    if !copy_in(request.domain, path_at, &mut name) {
+        return Answer::error(-14); // EFAULT
+    }
+    let Some(component) = one_component(&name) else {
+        // **Three different refusals answered `-2` and the record could not
+        // tell them apart** -- the mistake this project has now made five
+        // times, and the reason the second word of the record is a *stage*
+        // rather than more of the same number. The hosted program still sees
+        // `ENOENT`, which is the truth it can act on.
+        trace_file(-2, STAGE_BAD_NAME, 0);
+        return Answer::error(-2); // ENOENT
+    };
+
+    let Some(slot) = claim_file_slot() else {
+        return Answer::error(-24); // EMFILE
+    };
+    // Where the answer may land, said before asking and addressed to the
+    // service being asked -- the protocol's own rule, and what stops a
+    // capability arriving somewhere the caller did not choose.
+    let declared = call(syscall::INVOKE, ROOT_DIR, method::EXPECT, [slot, 0, 0, 0]);
+    if declared.status != status::OK {
+        release_file_slot(slot);
+        trace_file(-2, STAGE_NO_DIRECTORY, declared.status);
+        return Answer::error(-2);
+    }
+    let (chunk, rest) = bhaskix_abi::Chunk::take(component);
+    if !rest.is_empty() {
+        release_file_slot(slot);
+        return Answer::error(-36); // ENAMETOOLONG
+    }
+    // **`CALL` and not `INVOKE`.** A directory is a *badged endpoint to the
+    // filesystem service*, so opening a name is a message to that service
+    // rather than an operation the kernel performs. Invoking it asked the
+    // kernel to do something to an endpoint and was refused with
+    // `InsufficientRights` -- a refusal that says nothing about directories,
+    // and cost a boot to read.
+    let reply = call(
+        syscall::CALL,
+        ROOT_DIR,
+        bhaskix_abi::dir::OPEN_AT,
+        chunk.pack(0),
+    );
+    if reply.status != status::OK {
+        release_file_slot(slot);
+        trace_file(-2, STAGE_SERVICE_SILENT, reply.status);
+        return Answer::error(-2);
+    }
+    if reply.args[0] != bhaskix_abi::dir::OK {
+        release_file_slot(slot);
+        trace_file(-2, STAGE_SERVICE_REFUSED, reply.args[0]);
+        return Answer::error(-2); // ENOENT
+    }
+    let directory = reply.args[2] != 0;
+    let entry = Entry {
+        handle: slot,
+        kind: if directory {
+            Kind::Directory
+        } else {
+            Kind::File
+        },
+        close_on_exec: flags & open::CLOEXEC != 0,
+        offset: 0,
+        size: reply.args[1],
+        readable: true,
+        writable: false,
+    };
+    let Some(process) = process_for(request.domain) else {
+        release_file_slot(slot);
+        return Answer::error(-11); // EAGAIN
+    };
+    match process.descriptors.insert(entry, 0) {
+        Ok(descriptor) => {
+            trace_file(i64::from(descriptor), 0, entry.size);
+            Answer::ok(descriptor as u64)
+        }
+        Err(errno) => {
+            release_file_slot(slot);
+            Answer::error(errno)
+        }
+    }
+}
+
+/// Answers a hosted `read` — RFC 0033 step 6.
+///
+/// **The bytes are never carried through a message.** The filesystem service
+/// lends the page of its own cache the file's first block is in, read-only;
+/// this program maps it, copies what the caller asked for straight into the
+/// caller's memory with `COPY_OUT`, and gives the page back. Two capability
+/// invocations and one copy, and the service never reads the file on anybody's
+/// behalf.
+///
+/// **The first block only**, which is what `MAP` lends: a read past 4,096
+/// bytes answers zero, as a read at the end of a file does. That is a
+/// narrowing rather than a bug, and it is the protocol's — a file surface that
+/// reads a second block needs a method that lends a second page.
+fn answer_read(request: &PersonalityCall) -> Answer {
+    let (fd, buffer, count) = (request.first(), request.second(), request.third());
+    let Ok(descriptor) = i32::try_from(fd) else {
+        return Answer::error(-9); // EBADF
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    if !entry.readable || entry.kind != bhaskix_personality::file::Kind::File {
+        return Answer::error(-9);
+    }
+    let left = entry.size.saturating_sub(entry.offset);
+    let take = count.min(left).min(SCRATCH_BYTES);
+    if take == 0 {
+        return Answer::ok(0);
+    }
+
+    // The page, lent for as long as this call takes.
+    let _ = call(syscall::INVOKE, LENT, method::DELETE, [0; 4]);
+    let declared = call(
+        syscall::INVOKE,
+        entry.handle,
+        method::EXPECT,
+        [LENT, 0, 0, 0],
+    );
+    if declared.status != status::OK {
+        // Every refusal in this function is recorded with *where*, for the
+        // reason `open` learned twice over: three paths answering one errno
+        // is a record that cannot tell the next reader anything.
+        trace_file(-5, STAGE_NO_EXPECT, declared.status);
+        return Answer::error(-5); // EIO
+    }
+    let lent = call(syscall::CALL, entry.handle, bhaskix_abi::dir::MAP, [0; 4]);
+    if lent.status != status::OK {
+        trace_file(-5, STAGE_MAP_SILENT, lent.status);
+        return Answer::error(-5);
+    }
+    if lent.args[0] != bhaskix_abi::dir::OK {
+        trace_file(-5, STAGE_MAP_REFUSED, lent.args[0]);
+        return Answer::error(-5);
+    }
+    // **Attached read-only, and the second argument is why.** A non-zero word
+    // there asks for a *writable* mapping and needs `Rights::WRITE`, which a
+    // page of the service's own cache does not carry. Asking for one anyway
+    // was refused, and the refusal reached this test as a `read` that moved
+    // nothing.
+    let attached = call(syscall::INVOKE, LENT, method::ATTACH, [LENT_AT, 0, 0, 0]);
+    let moved = if attached.status == status::OK {
+        let mut bytes = [0u8; SCRATCH_BYTES as usize];
+        let take = take as usize;
+        for (index, byte) in bytes.iter_mut().take(take).enumerate() {
+            // SAFETY: inside the page `ATTACH` mapped read-only from the
+            // capability the service lent, bounded by the file's own size.
+            *byte = unsafe {
+                core::ptr::read_volatile((LENT_AT + entry.offset + index as u64) as *const u8)
+            };
+        }
+        let out = copy_out(request.domain, buffer, &bytes[..take]);
+        if !out {
+            trace_file(-14, STAGE_NOT_COPIED, 0);
+        }
+        out
+    } else {
+        trace_file(-5, STAGE_NOT_ATTACHED, attached.status);
+        false
+    };
+    // Given back either way: the service unpins the frame and revokes what it
+    // lent, which unmaps it from here. A page kept is a page its cache cannot
+    // evict.
+    let _ = call(
+        syscall::CALL,
+        entry.handle,
+        bhaskix_abi::dir::RELEASE,
+        [0; 4],
+    );
+    let _ = call(syscall::INVOKE, LENT, method::DELETE, [0; 4]);
+    if !moved {
+        // **Not traced here.** The two branches above each recorded *where*
+        // they stopped, and a record written at the join would overwrite the
+        // specific answer with a general one -- which it did, for one boot,
+        // and cost the very distinction the stages were added to make.
+        return Answer::error(-14); // EFAULT
+    }
+    if let Some(process) = process_for(request.domain)
+        && let Some(entry) = process.descriptors.get_mut(descriptor)
+    {
+        entry.offset += take;
+    }
+    trace_file(i64::from(descriptor), take as i64, entry.size);
+    Answer::ok(take)
+}
+
+/// Answers a hosted `close`, giving the capability back with the descriptor.
+fn answer_close(request: &PersonalityCall) -> Answer {
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9);
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    match process.descriptors.close(descriptor) {
+        Ok(entry) => {
+            // **The capability goes with the row**, and this is the whole
+            // reason `close` is not just a table edit: a descriptor closed
+            // without dropping what it named would leak one of this program's
+            // hundred and twenty-eight slots per open file, for the life of
+            // the machine.
+            if process.descriptors.holders(entry.handle) == 0
+                && matches!(
+                    entry.kind,
+                    bhaskix_personality::file::Kind::File
+                        | bhaskix_personality::file::Kind::Directory
+                )
+            {
+                release_file_slot(entry.handle);
+            }
+            Answer::ok(0)
+        }
+        Err(errno) => Answer::error(errno),
+    }
+}
+
+/// Answers `dup`, `dup2` and `dup3` — RFC 0033 step 6.
+///
+/// **Two descriptors, one open file, one capability.** A duplicate names the
+/// same handle this program holds; nothing is derived and nothing is asked of
+/// the filesystem service, because the authority is already held and a second
+/// integer pointing at it confers nothing new. What it does change is when the
+/// capability may be given back, which is why `close` counts the rows that
+/// name a handle rather than assuming it is the last.
+fn answer_dup(request: &PersonalityCall) -> Answer {
+    let Ok(from) = i32::try_from(request.first()) else {
+        return Answer::error(-9); // EBADF
+    };
+    let close_on_exec = request.number == DUP3 && request.third() & 0o2_000_000 != 0;
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    if request.number == DUP {
+        // The lowest free number, which is `dup`'s whole definition.
+        let Some(entry) = process.descriptors.get(from).copied() else {
+            return Answer::error(-9);
+        };
+        return match process.descriptors.insert(
+            bhaskix_personality::file::Entry {
+                close_on_exec: false,
+                ..entry
+            },
+            0,
+        ) {
+            Ok(descriptor) => Answer::ok(descriptor as u64),
+            Err(errno) => Answer::error(errno),
+        };
+    }
+    let Ok(to) = i32::try_from(request.second()) else {
+        return Answer::error(-9);
+    };
+    // `dup2(fd, fd)` succeeds and does nothing; `dup3` refuses it. The
+    // difference is Linux's and is kept rather than smoothed over: a program
+    // using `dup3` to set `O_CLOEXEC` on a descriptor is told that is not what
+    // this call does.
+    if from == to && request.number == DUP2 {
+        return match process.descriptors.get(from) {
+            Some(_) => Answer::ok(to as u64),
+            None => Answer::error(-9),
+        };
+    }
+    match process.descriptors.dup3(from, to, close_on_exec) {
+        Ok((descriptor, displaced)) => {
+            // Whatever `to` named is closed silently, which is `dup2`'s
+            // contract -- and its capability goes with it unless another
+            // descriptor still names the same file.
+            if let Some(entry) = displaced
+                && process.descriptors.holders(entry.handle) == 0
+                && matches!(
+                    entry.kind,
+                    bhaskix_personality::file::Kind::File
+                        | bhaskix_personality::file::Kind::Directory
+                )
+            {
+                release_file_slot(entry.handle);
+            }
+            Answer::ok(descriptor as u64)
+        }
+        Err(errno) => Answer::error(errno),
+    }
+}
+
+/// The one path component this personality resolves, or `None`.
+///
+/// Leading slashes are skipped and a trailing `NUL` ends it. A name with a
+/// separator *inside* it is refused rather than walked: walking is what a
+/// working directory and a second directory capability are for, and neither
+/// exists yet.
+fn one_component(name: &[u8]) -> Option<&[u8]> {
+    let start = name.iter().position(|byte| *byte != b'/')?;
+    let rest = &name[start..];
+    let end = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(rest.len());
+    let component = &rest[..end];
+    if component.is_empty() || component.contains(&b'/') {
+        return None;
+    }
+    Some(component)
+}
+
+/// The longest path this personality reads out of a hosted program.
+const MAX_NAME: usize = 64;
 
 /// Answers a hosted `execve` — [RFC 0033](../../../docs/rfc/0033-what-a-hosted-process-is.md) step 5.
 ///

@@ -560,6 +560,7 @@ mod tests {
                     kind: Kind::File,
                     close_on_exec,
                     offset: 0,
+                    size: 0,
                     readable: true,
                     writable: false,
                 },

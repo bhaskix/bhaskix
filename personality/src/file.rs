@@ -155,6 +155,13 @@ pub struct Entry {
     pub close_on_exec: bool,
     /// The read/write position, for the kinds that have one.
     pub offset: u64,
+    /// How many bytes there are, for the kinds that have a size.
+    ///
+    /// Learned when the file was opened and kept, because `read` has to know
+    /// where the end is and asking again would be a round trip per call. Zero
+    /// for a console or a socket, which have no size and answer `fstat`
+    /// differently.
+    pub size: u64,
     /// Whether the holder may read.
     pub readable: bool,
     /// Whether the holder may write.
@@ -205,6 +212,7 @@ impl Table {
                 kind: Kind::Console,
                 close_on_exec: false,
                 offset: 0,
+                size: 0,
                 readable,
                 writable,
             });
@@ -320,6 +328,22 @@ impl Table {
             }
         }
         closed
+    }
+
+    /// How many descriptors name `handle`.
+    ///
+    /// **`dup` is what makes this necessary.** Two descriptors may name one
+    /// open file, and whoever holds the capability behind that handle must not
+    /// give it back while a second row still points at it. Linux keeps a
+    /// reference count inside the file object; this crate has no objects, so
+    /// the count is a question asked of the table.
+    #[must_use]
+    pub fn holders(&self, handle: u64) -> usize {
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.handle == handle)
+            .count()
     }
 
     /// How many descriptors are open. For a test, and for a report line.
@@ -517,6 +541,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_duplicated_descriptor_is_counted_so_its_capability_is_not_dropped_early() {
+        let mut table = Table::new();
+        let entry = Entry {
+            handle: 99,
+            kind: Kind::File,
+            close_on_exec: false,
+            offset: 0,
+            size: 10,
+            readable: true,
+            writable: false,
+        };
+        let first = table.insert(entry, 0).expect("room");
+        assert_eq!(table.holders(99), 1);
+        let (second, displaced) = table.dup3(first, first + 5, false).expect("a free number");
+        assert!(displaced.is_none());
+        assert_eq!(table.holders(99), 2, "two rows name one open file");
+        table.close(first).expect("open");
+        assert_eq!(
+            table.holders(99),
+            1,
+            "the capability is still named, and must not be given back"
+        );
+        table.close(second).expect("open");
+        assert_eq!(table.holders(99), 0, "now it may be");
+    }
+
+    #[test]
     fn the_lowest_free_descriptor_is_the_one_handed_out() {
         let mut table = Table::new();
         table.install_standard(7);
@@ -525,6 +576,7 @@ mod tests {
             kind: Kind::File,
             close_on_exec: false,
             offset: 0,
+            size: 0,
             readable: true,
             writable: false,
         };
@@ -544,6 +596,7 @@ mod tests {
             kind: Kind::File,
             close_on_exec: false,
             offset: 0,
+            size: 0,
             readable: true,
             writable: false,
         };
@@ -573,6 +626,7 @@ mod tests {
             kind: Kind::File,
             close_on_exec: false,
             offset: 0,
+            size: 0,
             readable: true,
             writable: false,
         };

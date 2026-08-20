@@ -1484,14 +1484,23 @@ fi
 # RFC 0031 §6's Test 1, in the arm this probe funds: the same program asks
 # for all five of this kernel's own syscall kinds *by number* -- 0 Invoke,
 # 2 Reply, 3 Recv, 4 Yield, 5 Exit, each also an ordinary Linux call this
-# personality does not answer -- and is refused five times. The survival
-# clause is the load-bearing half and is demanded here rather than left to
-# the self-test's own arithmetic: read in the native dialect, 5 is Exit and
-# the probe would not have lived to report anything after it. A hosted
+# personality does not answer -- and is answered five times with a *Linux*
+# errno. The survival clause is the load-bearing half and is demanded here
+# rather than left to the self-test's own arithmetic: read in the native
+# dialect, 5 is Exit and the probe would not have lived to report anything
+# after it.
+#
+# **It said "-ENOSYS five times" until 2026-08-20**, which was true only while
+# this personality answered none of those numbers. RFC 0033 step 6 gave three
+# of them meanings -- 0, 2 and 3 are `read`, `open` and `close` -- so the claim
+# is now that every answer is *small and negative*, which no native status is,
+# and that the probe lived. Both are stronger than the old form: `-9` from
+# `read` is the personality refusing a descriptor, and a native `Recv` would
+# have blocked rather than answering at all. A hosted
 # program holds no capabilities and cannot name one, so a number read in the
 # wrong dialect is the only route it could ever have had to the capability
 # interface.
-if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit: the pid answered, the bad descriptor refused EBADF, and exit never came back; it then asked for all five of this kernel's own syscall kinds by number and got -ENOSYS five times, surviving the one that is Exit natively; [1-9] foreign calls logged in order" "$LOG"; then
+if grep -qE "personality +a Linux-tagged domain asked getpid, write and exit: the pid answered, the bad descriptor refused EBADF, and exit never came back; it then asked for all five of this kernel's own syscall kinds by number and got a Linux errno five times, surviving the one that is Exit natively; [1-9] foreign calls logged in order" "$LOG"; then
     pass "a Linux program is refused in Linux's dialect, and cannot reach the native one by number"
 else
     fail "the personality self-test did not conclude"
@@ -1662,6 +1671,31 @@ if [[ -n $spaces ]] && ((spaces >= want)) && [[ -n $free ]] && ((free >= 8)); th
     pass "each user program has an address space of its own ($spaces, wanted $want; $free free for hosted processes)"
 else
     fail "wanted at least $want address spaces in use and 8 free, found ${spaces:-none} used and ${free:-none} free"
+    status=1
+fi
+
+# RFC 0033 step 6: a hosted program opens a real file and prints what it read.
+#
+# **Two arms, and the dark one is the ordinary case here.** This lane has no
+# block service, so there is no filesystem service, so the adapter is granted no
+# directory and a hosted program has nothing to open. The lane that proves the
+# bright arm is `shell-test.sh disk`, where the filesystem comes off the device.
+#
+# What the bright arm demands is the file's *contents* -- a line the filesystem
+# was built with, which no part of the personality could invent -- beside the
+# adapter's own account of which descriptor it handed out and how many bytes it
+# read.
+if grep -qE "linux file     a Linux program opened a file through the adapter's directory, read [1-9][0-9]* of its [0-9]+ bytes" "$LOG"; then
+    if grep -qF "only reachable through the subdirectory" "$LOG"; then
+        pass "a hosted program read a real file through a capability the adapter holds"
+    else
+        fail "the adapter says it read a file, but its bytes never reached the console"
+        status=1
+    fi
+elif grep -qF "linux file     skipped: this machine has no filesystem service" "$LOG"; then
+    pass "no filesystem service on this machine, so hosted programs have no files to open"
+else
+    fail "the hosted file test did not conclude: $(grep -aoE 'linux file .*' "$LOG" | head -1)"
     status=1
 fi
 

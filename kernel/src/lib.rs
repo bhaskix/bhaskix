@@ -2982,6 +2982,45 @@ fn wait_for_probe_threads(realm: domain::DomainId) {
     }
 }
 
+/// What the adapter's last `open` and `read` answered, out of its own page.
+///
+/// **Read where the asking happens, not in the boot report.** The first
+/// version printed this with the boundary report, which runs with the other
+/// Linux self-tests — long before the file probe, because the adapter's
+/// directory capability does not exist until the filesystem service does. It
+/// printed three zeros every time, which is what a record written after its
+/// reader looks like.
+fn adapter_file_record() -> (i64, i64, u64) {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return (0, 0, 0);
+    }
+    // Past the eight `mmap` records, the scratch area and the exec record:
+    // 256 + 1,024 + 24. `bin/linuxd` places it there and says so.
+    const FIRST_WORD: usize = (8 * 32 + 1024 + 24) / 8;
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 3];
+    let mut at = 0usize;
+    let taken = shared::drain_into(object, (FIRST_WORD + 3) * 8, &mut |chunk: &[u8]| {
+        for word in chunk.chunks_exact(8) {
+            if at >= FIRST_WORD + 3 {
+                break;
+            }
+            if at >= FIRST_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    if taken.is_none() {
+        return (0, 0, 0);
+    }
+    (record[0] as i64, record[1] as i64, record[2])
+}
+
 /// What the personality boundary costs and how wide it is — RFC 0031's
 /// interface **I1**, made visible on every boot rather than left in a file.
 ///
@@ -4558,6 +4597,119 @@ const EXEC_PROBE_CODE: [u8; 44] = [
     b'/', b'b', b'i', b'n', b'/', b'e', b'x', b'e', b'c', b'e', b'd',
 ];
 
+/// Where the file probe's code lands in its own space.
+const FILE_PROBE_CODE_AT: u64 = 0x0000_0000_1300_0000;
+
+/// The file probe, hand-assembled: it opens a real file, reads it and prints
+/// what it read — RFC 0033 step 6.
+///
+/// **Every byte it prints came off a filesystem**, through a directory
+/// capability `bin/linuxd` holds and a page the filesystem service lent it.
+/// Nothing in this program knows what a file is; nothing in the kernel
+/// answered any of its three calls.
+///
+/// It reads into the second half of its own page, which is the same page its
+/// code is in — read-execute, so the read must go somewhere writable, and the
+/// stack page is what that is. `rdi` carries the stack, `rsi` the path.
+#[rustfmt::skip]
+const FILE_PROBE_CODE: [u8; 71] = [
+    0x49, 0x89, 0xfc,                    // mov r12, rdi          ; the buffer
+    0x48, 0x89, 0xf7,                    // mov rdi, rsi          ; the name
+    0x31, 0xf6,                          // xor esi, esi          ; O_RDONLY
+    0x31, 0xd2,                          // xor edx, edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,        // mov eax, 2            ; open
+    0x0f, 0x05,                          // syscall
+    0x48, 0x85, 0xc0,                    // test rax, rax
+    0x78, 0x26,                          // js done               ; refused
+    0x48, 0x89, 0xc7,                    // mov rdi, rax          ; the descriptor
+    0x4c, 0x89, 0xe6,                    // mov rsi, r12          ; where
+    0xba, 0x28, 0x00, 0x00, 0x00,        // mov edx, 40           ; how much
+    0x31, 0xc0,                          // xor eax, eax          ; read
+    0x0f, 0x05,                          // syscall
+    0x48, 0x85, 0xc0,                    // test rax, rax
+    0x7e, 0x12,                          // jle done              ; nothing read
+    0x48, 0x89, 0xc2,                    // mov rdx, rax          ; that many
+    0x4c, 0x89, 0xe6,                    // mov rsi, r12
+    0xbf, 0x01, 0x00, 0x00, 0x00,        // mov edi, 1            ; fd 1
+    0xb8, 0x01, 0x00, 0x00, 0x00,        // mov eax, 1            ; write
+    0x0f, 0x05,                          // syscall
+    0x31, 0xff,                          // done: xor edi, edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,        // mov eax, 231          ; exit_group
+    0x0f, 0x05,                          // syscall
+    0xeb, 0xfe,                          // jmp $
+];
+
+/// Where the name this probe opens is put, and the address it is handed.
+///
+/// **Handed over rather than computed**, and the first version was not: it
+/// found its own name with a `lea` from `rip`, which is three numbers that
+/// have to agree — the displacement, the padding, and where the constant
+/// actually landed. Two of them disagreed. The kernel puts the name in the
+/// page and passes its address in `rsi`, which is the affordance
+/// `enter_ring3` already has and the one every supervisor-built program will
+/// use.
+const FILE_PROBE_NAME_AT: u64 = 128;
+
+/// The thread that becomes the file probe — RFC 0033 step 6.
+///
+/// Two pages: one read-execute for the code and the name, one read-write for
+/// what it reads. The name is copied in beside the code and its address is
+/// handed over in `rsi`, so the program does no arithmetic about where its own
+/// data is.
+extern "C" fn ring3_filer(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const BUFFER_AT: u64 = FILE_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (FILE_PROBE_CODE_AT, Protection::ReadExecute),
+        (BUFFER_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(FILE_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the direct
+    // map; the executable mapping is never writable. The name goes at a fixed
+    // offset inside the same page, past the code.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            FILE_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            FILE_PROBE_CODE.len(),
+        );
+        let name = b"inner\0";
+        core::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (hhdm_base + code_pa + FILE_PROBE_NAME_AT) as *mut u8,
+            name.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page; `rdi` is
+    // the writable page it reads into and `rsi` the name beside its code.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            FILE_PROBE_CODE_AT,
+            BUFFER_AT + 0x0f00,
+            [BUFFER_AT, FILE_PROBE_CODE_AT + FILE_PROBE_NAME_AT],
+        )
+    }
+}
+
 /// The thread that becomes the exec probe — RFC 0033 step 5.
 ///
 /// One page, read-execute, and no report page at all: what this probe has to
@@ -4870,6 +5022,103 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
 }
 
+/// RFC 0033 step 6's witness: a hosted program reads a real file.
+///
+/// **Every byte it prints came off a filesystem.** The program opens a name it
+/// was handed, reads it, and writes what it read to its standard output — and
+/// each of those three calls is answered by `bin/linuxd`, out of a directory
+/// capability the kernel granted it and a page the filesystem service lent.
+/// The kernel's part is to start the program and watch its domain end.
+///
+/// The file's contents are the gate: the boot test looks for the line the
+/// filesystem was built with, which no part of the personality could invent.
+fn file_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux file     skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    // **A machine with no filesystem service has no directory to grant**, and a
+    // hosted program asking for a file there is not a failure of anything this
+    // step built. Said rather than assumed: the boot lane has no block service,
+    // so this is the ordinary case on four of the five placements, and a test
+    // that "passed" by finding nothing would be worth nothing.
+    // **Two different absences, and the first version answered them the same
+    // way.** A machine with no filesystem service has nothing to grant, and
+    // skipping is honest. A machine that *has* one and did not grant it is a
+    // bug in the grant — and the first version skipped there too, so moving
+    // the capability to the wrong slot turned this gate green. Armed once,
+    // caught once.
+    let machine_has_files = FS_ENDPOINT.load(core::sync::atomic::Ordering::Acquire) != u64::MAX;
+    let adapter = syscall::ADAPTER_DOMAIN.load(core::sync::atomic::Ordering::Relaxed);
+    let holds_directory = adapter != u32::MAX
+        && domain::with(domain::DomainId::from_u32(adapter), |owner| {
+            owner.cspace.get(22).is_some()
+        }) == Some(true);
+    if !machine_has_files {
+        println!(
+            "    linux file     skipped: this machine has no filesystem service, so there is no \
+             directory to give a hosted program"
+        );
+        return true;
+    }
+    if !holds_directory {
+        println!(
+            "\x1b[91m    linux file     FAILED: this machine has a filesystem and the adapter was \
+             given no directory\x1b[0m"
+        );
+        return false;
+    }
+
+    let Ok(realm) = domain::create("filer", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux file     FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    linux file     FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "filer", ring3_filer, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux file     FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+    let mut ended = false;
+    for _ in 0..400 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    // **What the adapter says it did**, beside what the program printed. The
+    // bytes on the console are the claim; these three numbers are what makes a
+    // boot where they did not appear say *which* call refused, rather than
+    // leaving the next reader to guess between three.
+    let (opened, read, size) = adapter_file_record();
+    let right = ended && opened >= 0 && read > 0;
+    if right {
+        println!(
+            "    linux file     a Linux program opened a file through the adapter's directory, \
+             read {read} of its {size} bytes at descriptor {opened}, and printed them"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux file     FAILED: ended {ended}, open answered {opened} (stage \
+             {read}, detail {size})\x1b[0m"
+        );
+    }
+    right
+}
+
 /// RFC 0033 step 5's witness: a hosted program `execve`s, and keeps its pid.
 ///
 /// **What makes this a test rather than a demonstration is where the two
@@ -5087,11 +5336,24 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // the entry path ever read a Linux domain's `rax` as a `Kind`, a hosted
     // program would reach the capability interface by arithmetic alone --
     // which is why the dialects must not overlap, and why an assertion is
-    // worth more here than a comment. Each answer must be `-ENOSYS`, a
-    // number no native status can be, and the probe must **still be alive**:
-    // read natively, 5 is `Exit` and this thread would have ended at it.
-    let enosys = -38i64 as u64;
-    let no_smuggling = smuggled.iter().all(|answer| *answer == enosys) && survived;
+    // worth more here than a comment.
+    //
+    // **The assertion changed at RFC 0033 step 6, and the claim did not.** It
+    // demanded `-ENOSYS` from all five, which was true only while this
+    // personality answered none of them: 0, 2 and 3 are `read`, `open` and
+    // `close`, and a file surface gives them Linux meanings. What has to
+    // remain true is that each answer is a **Linux** one -- a small negative
+    // errno, which no native status can be, since those are small positives --
+    // and that the probe is **still alive**, because read natively, 5 is
+    // `Exit` and this thread would have ended at it. Both are stronger than
+    // "all -ENOSYS" would be now: an answer of `-9` from `read` is this
+    // personality refusing a descriptor, and a native `Recv` would have
+    // blocked rather than answered anything at all.
+    let linux_shaped = |answer: &u64| {
+        let value = *answer as i64;
+        (-4096..0).contains(&value)
+    };
+    let no_smuggling = smuggled.iter().all(linux_shaped) && survived;
 
     let logged = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - calls_before;
     let numbers = [
@@ -5116,9 +5378,9 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!(
             "    personality    a Linux-tagged domain asked getpid, write and exit: the pid \
              answered, the bad descriptor refused EBADF, and exit never came back; it then \
-             asked for all five of this kernel's own syscall kinds by number and got -ENOSYS \
-             five times, surviving the one that is Exit natively; 8 foreign calls logged in \
-             order, the tag refused once a thread existed, and cleared when the domain ended"
+             asked for all five of this kernel's own syscall kinds by number and got a Linux \
+             errno five times, surviving the one that is Exit natively; 8 foreign calls logged \
+             in order, the tag refused once a thread existed, and cleared when the domain ended"
         );
         true
     } else {
@@ -11993,6 +12255,68 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
                 }
             }
 
+            // **And one for the Linux adapter** — RFC 0033 step 6, at slot 22
+            // of a domain that has been running since before the filesystem
+            // existed. Installed into a live CSpace, which is the same thing
+            // the kernel does when it hands the adapter a hosted domain's
+            // handle: a capability may arrive at any time; what may not is a
+            // program *asking* for one.
+            //
+            // The same directory the shell holds, `sub`, and deliberately not
+            // the root: a hosted Linux process's `/` is a directory capability
+            // the adapter was given, so it can open `inner` and cannot name
+            // `greeting` one level up. That is `chroot` by construction rather
+            // than by check, and it is the shape RFC 0031's interface I3
+            // asks for.
+            //
+            // `READ` and `DERIVE`, no `WRITE`: this filesystem is readable to a
+            // hosted program and not writable by one, which the personality
+            // reports as `EROFS` rather than pretending.
+            let adapter = syscall::ADAPTER_DOMAIN.load(core::sync::atomic::Ordering::Relaxed);
+            if adapter != u32::MAX {
+                let handle = cap::with_arena(|arena| {
+                    let root = arena
+                        .insert_root(
+                            cap::ObjectRef::new(cap::ObjectKind::Endpoint, raw),
+                            cap::Rights::ALL,
+                            0,
+                        )
+                        .ok()?;
+                    arena
+                        .derive(
+                            root,
+                            cap::Rights::READ.union(cap::Rights::DERIVE),
+                            FS_DIRECTORY.load(core::sync::atomic::Ordering::Acquire),
+                        )
+                        .ok()
+                });
+                match handle {
+                    Some(handle) => {
+                        if domain::with(domain::DomainId::from_u32(adapter), |owner| {
+                            owner.cspace.install_at(22, handle).is_ok()
+                        }) == Some(true)
+                        {
+                            // Said out loud, because a grant that silently did
+                            // not happen is indistinguishable from a hosted
+                            // program that cannot find a file -- which is
+                            // exactly the boot this line was added after.
+                            println!(
+                                "    linux domain   holds a directory now: hosted programs can \
+                                 open what is inside it and name nothing above it"
+                            );
+                        } else {
+                            println!(
+                                "\x1b[93m    linux domain   the directory would not install; \
+                                 hosted programs will find no files\x1b[0m"
+                            );
+                        }
+                    }
+                    None => println!(
+                        "\x1b[93m    linux domain   no directory capability could be made\x1b[0m"
+                    ),
+                }
+            }
+
             // RFC 0030 step 3: the shell's one *writable* directory, at slot
             // 20 -- `/pkg`, whose handle the filesystem service reported and
             // whose writable bit this mint is the only source of. Narrow on
@@ -12288,6 +12612,17 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
          {dead} naming a thread that has gone, {} cleared on the way",
         ipc::stranded_cleared()
     );
+
+    // **The file probe, here and not with the other Linux self-tests**, and the
+    // reason is the order of the boot: the adapter's directory capability is
+    // granted a few lines above this, because the filesystem service does not
+    // exist when the adapter starts. A hosted program that opens a file has to
+    // run after that, so it runs here — before the shell, which is what every
+    // other check placed late does, so that nothing is still printing when the
+    // shell begins.
+    if !file_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    linux file     FAILED\x1b[0m");
+    }
 
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
     println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");

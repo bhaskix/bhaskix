@@ -539,6 +539,98 @@ tests — and two are the read of the adapter's record.
 everything a supervisor can. A domain it creates is still **empty** — every authority it will ever
 hold is one the adapter passes from what it holds, and there is no ambient root.
 
+## Step 6's record (2026-08-20): a hosted program reads a real file
+
+**A Linux program opened a file, read it, and printed what it read — and every byte came off a
+filesystem.**
+
+```text
+linux domain   holds a directory now: hosted programs can open what is inside it and name
+               nothing above it
+linux file     a Linux program opened a file through the adapter's directory, read 40 of its 40
+               bytes at descriptor 3, and printed them
+only reachable through the subdirectory          <- the file's own contents, on the console
+```
+
+The gate demands the contents, not the count: that line is what the filesystem was built with and
+nothing in the personality could invent it. The adapter's own account — which descriptor, how many
+bytes, how big the file — sits beside it so that a boot where the bytes did not appear says *which*
+call refused rather than leaving the next reader to guess.
+
+**The chain has no kernel in it.** `open` is a message to `bin/vfsd` on a badged endpoint the
+adapter holds; `read` is that service **lending the page of its own cache** the block is in,
+read-only, which the adapter maps and copies straight into the hosted process's memory with
+`COPY_OUT`. No round trip carries the bytes, the service never reads the file on anybody's behalf,
+and the kernel has no idea a hosted program opened anything.
+
+### What a hosted process's filesystem *is*
+
+One directory capability, granted by the kernel when the filesystem service exists — which is after
+the adapter starts, so it is installed into a live CSpace, the same way a hosted domain's handle is.
+A hosted process can open what is inside that directory and **cannot name anything above it**,
+because it holds nothing that names anything above it. That is `chroot` by construction rather than
+by check, and it is RFC 0031's interface I3 in one grant.
+
+`READ` and `DERIVE` and no `WRITE`: a hosted program opening a file for writing is told `EROFS`
+rather than being lied to and finding out at the write.
+
+### Descriptors, and the count that `dup` made necessary
+
+A descriptor is a row in the process record naming a **slot in the adapter's CSpace**; the hosted
+program sees a small integer and can name nothing else. Slots are allocated **downward from 127**
+while the kernel allocates hosted-domain handles **upward from 24**, so the two cannot meet — a pair
+of directions rather than two ranges, because a range is a number somebody changes on one side only.
+
+`dup` gives two descriptors one open file, so `close` counts the rows that name a handle before
+giving the capability back. That count is a new `Table::holders`, host-tested: closing the first of
+two duplicates must not release what the second still names.
+
+**Standard descriptors are installed when a process is admitted.** Without them the first file a
+program opened became descriptor *zero* — its own standard input — which is the kind of wrong that
+runs for a while and then reads a file when it meant to read a terminal.
+
+### Five mistakes, and each one a boot
+
+- **`INVOKE` where `CALL` was meant.** A directory is a badged *endpoint*, so opening a name is a
+  message to a service, not an operation the kernel performs. Invoking it was refused with
+  `InsufficientRights` — a refusal that says nothing about directories.
+- **A writable mapping of a read-only page.** `ATTACH`'s second argument asks for one, and a page of
+  the service's cache does not carry `WRITE`.
+- **The lent page mapped over the adapter's own stack.** `0x1D00_0000` is eight pages of it,
+  and `ATTACH` answers `SlotUnavailable` for every unusable address on purpose, so the refusal
+  arrived as a `read` that returned `EFAULT`.
+- **Three refusals answering one errno.** Four `open` paths and four `read` paths all answered
+  `-2` or `-5`, and the record could not tell them apart — the fifth time this project has made that
+  mistake. The record's second word is a *stage* now, and the hosted program still sees the one
+  errno it can act on.
+- **A general trace overwriting a specific one.** The stages were written, then a trace at the join
+  overwrote them with a general answer, which is the same mistake at one remove.
+
+### Two gates, and the one that could be silenced
+
+The bright arm — the file's contents on the console — runs only where a filesystem service exists,
+which is the **IOMMU lane**: the block endpoint is published only when the device is contained, so
+four of the five placements have no filesystem at all and honestly skip.
+
+**The skip was a hole and is now closed.** The first version skipped whenever the adapter held no
+directory — so moving the grant to the wrong slot turned the gate *green* on the lane that was meant
+to prove it. It now distinguishes: no filesystem service is a skip, a filesystem the adapter was not
+given a directory to is a **failure**. Armed by moving the grant to slot 23, which now says exactly
+that.
+
+### What is not here
+
+**`/proc/self/fd` is not built.** It needs `getdents64` and a synthetic directory, which is a second
+kind of directory the adapter would have to *be* rather than hold. Named as a gap rather than
+delivered quietly.
+
+**A read past the first block answers zero**, because `MAP` lends one page — the protocol's
+narrowing, not this personality's, and a file surface that reads a second block needs a method that
+lends a second page. **Writing to a file is `EROFS`**, because the capability carries no `WRITE`.
+**Inheritance across an exec** is implemented in the record and host-tested, and is *not* proven by
+a boot gate: proving it needs the exec'd program to read an inherited descriptor, which is another
+hand-assembled program.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -661,7 +753,8 @@ later step consumes them.
    2026-08-20 — with one narrowing this plan did not anticipate and one kernel method it did not
    have; see the record below.*
 6. **Descriptors and `/proc/self/fd`**, with `open`, `close`, `dup`, `read`, `write` on files, and
-   inheritance across exec.
+   inheritance across exec. ✅ *Delivered 2026-08-20 — without `/proc/self/fd`, which needs
+   `getdents64` and a synthetic directory; see the record below.*
 7. **Pipes**, and a blocked reader woken by a writer — `BLOCK_ON`, unchanged from step 10.
 8. **`fork` by copying**, with the measurement that decides whether stage 2 exists.
 9. **`wait4` on domain death**, over `BIND` and the notification pool.
