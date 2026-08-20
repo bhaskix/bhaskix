@@ -566,6 +566,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux wait     FAILED\x1b[0m");
     }
+    if !proc_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux proc     FAILED\x1b[0m");
+    }
     if !signal_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -4615,6 +4621,65 @@ const EXEC_PROBE_CODE: [u8; 44] = [
     b'/', b'b', b'i', b'n', b'/', b'e', b'x', b'e', b'c', b'e', b'd',
 ];
 
+/// Where the `/proc` probe's code lands in its own space.
+///
+/// The address is in the blob: the probe loads its two path strings by
+/// absolute address, because they sit past its own code and a
+/// supervisor-built program has no loader to relocate anything for it.
+const PROC_PROBE_CODE_AT: u64 = 0x0000_0000_1700_0000;
+
+/// The `/proc` probe, assembled by the same script as the last three — RFC
+/// 0033 step 10.
+///
+/// It maps a page, then opens, reads and prints `/proc/self/status` and
+/// `/proc/self/maps`. **The second is the interesting one**: the line it
+/// prints for the page it just mapped is the personality's own region list,
+/// written back to the program that made it, in Linux's format — and if the
+/// two disagreed about where that page is, the line would say so.
+#[rustfmt::skip]
+const PROC_PROBE_CODE: [u8; 256] = [
+    0xbf, 0x00, 0x00, 0x00, 0x52, 0xbe, 0x00, 0x10,
+    0x00, 0x00, 0xba, 0x03, 0x00, 0x00, 0x00, 0x41,
+    0xba, 0x32, 0x00, 0x00, 0x00, 0x49, 0xc7, 0xc0,
+    0xff, 0xff, 0xff, 0xff, 0x4d, 0x31, 0xc9, 0xb8,
+    0x09, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x3d,
+    0x00, 0x00, 0x00, 0x52, 0x0f, 0x85, 0x9a, 0x00,
+    0x00, 0x00, 0x48, 0xc7, 0xc7, 0xd8, 0x00, 0x00,
+    0x17, 0x31, 0xf6, 0x31, 0xd2, 0xb8, 0x02, 0x00,
+    0x00, 0x00, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f,
+    0x88, 0x7f, 0x00, 0x00, 0x00, 0x48, 0x89, 0xc7,
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x52, 0xba,
+    0x00, 0x02, 0x00, 0x00, 0x31, 0xc0, 0x0f, 0x05,
+    0x48, 0x85, 0xc0, 0x0f, 0x8e, 0x63, 0x00, 0x00,
+    0x00, 0x48, 0x89, 0xc2, 0x48, 0xc7, 0xc6, 0x00,
+    0x00, 0x00, 0x52, 0xbf, 0x01, 0x00, 0x00, 0x00,
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48,
+    0xc7, 0xc7, 0xf0, 0x00, 0x00, 0x17, 0x31, 0xf6,
+    0x31, 0xd2, 0xb8, 0x02, 0x00, 0x00, 0x00, 0x0f,
+    0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88, 0x32, 0x00,
+    0x00, 0x00, 0x48, 0x89, 0xc7, 0x48, 0xc7, 0xc6,
+    0x00, 0x00, 0x00, 0x52, 0xba, 0x00, 0x02, 0x00,
+    0x00, 0x31, 0xc0, 0x0f, 0x05, 0x48, 0x85, 0xc0,
+    0x0f, 0x8e, 0x16, 0x00, 0x00, 0x00, 0x48, 0x89,
+    0xc2, 0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x52,
+    0xbf, 0x01, 0x00, 0x00, 0x00, 0xb8, 0x01, 0x00,
+    0x00, 0x00, 0x0f, 0x05, 0x31, 0xff, 0xb8, 0xe7,
+    0x00, 0x00, 0x00, 0x0f, 0x05, 0xeb, 0xfe, 0x00,
+    0x2f, 0x70, 0x72, 0x6f, 0x63, 0x2f, 0x73, 0x65,
+    0x6c, 0x66, 0x2f, 0x73, 0x74, 0x61, 0x74, 0x75,
+    0x73, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2f, 0x70, 0x72, 0x6f, 0x63, 0x2f, 0x73, 0x65,
+    0x6c, 0x66, 0x2f, 0x6d, 0x61, 0x70, 0x73, 0x00,
+];
+
+/// The line `/proc/self/maps` must carry for the page the probe maps.
+///
+/// **Not printed by the kernel**, for the reason the fork probe's marker
+/// records: a report line that quoted this would match the gate looking for
+/// it, and the gate would pass on a boot where the file was never read.
+#[expect(dead_code, reason = "the gate reads it from the log, not the kernel")]
+const PROC_PROBE_MAPPING: &str = "0000000052000000-0000000052001000 rw-p";
+
 /// Where the wait probe's code lands in its own space.
 const WAIT_PROBE_CODE_AT: u64 = 0x0000_0000_1600_0000;
 
@@ -4918,6 +4983,48 @@ const FILE_PROBE_CODE: [u8; 71] = [
 /// `enter_ring3` already has and the one every supervisor-built program will
 /// use.
 const FILE_PROBE_NAME_AT: u64 = 128;
+
+/// The thread that becomes the `/proc` probe — RFC 0033 step 10.
+extern "C" fn ring3_procer(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const STACK_AT: u64 = PROC_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (PROC_PROBE_CODE_AT, Protection::ReadExecute),
+        (STACK_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(PROC_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the direct
+    // map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            PROC_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            PROC_PROBE_CODE.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page, and the
+    // stack is inside the writable one.
+    unsafe { bhaskix_arch::syscall::enter_ring3(PROC_PROBE_CODE_AT, STACK_AT + 0x0f00, [0, 0]) }
+}
 
 /// The thread that becomes the wait probe — RFC 0033 step 9.
 extern "C" fn ring3_waiter(hhdm_base: u64) -> ! {
@@ -5423,6 +5530,68 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         false
     }
+}
+
+/// RFC 0033 step 10's witness: a hosted program reads `/proc` about itself.
+///
+/// **The claim is that what it reads is its own and nothing else's.** The
+/// probe maps a page and then prints `/proc/self/status` and
+/// `/proc/self/maps`; the gate looks for the line describing the page it just
+/// mapped, which is the personality's region list written back to the program
+/// that made it.
+///
+/// The *leak* half of this step is not a grep and cannot be: it is a host test
+/// in `personality::proc` that enumerates the field names this personality may
+/// publish and refuses any other. A boot gate can only look for what somebody
+/// thought to forbid; the host test looks for anything not explicitly allowed.
+fn proc_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux proc     skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("procer", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux proc     FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    linux proc     FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "procer", ring3_procer, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux proc     FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+    let mut ended = false;
+    for _ in 0..400 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+    if ended {
+        // **What this line may claim is what the kernel saw**: a program ran
+        // and ended. Whether it *read* anything is on the console, in the text
+        // the program printed, and the boot test reads it there — a report
+        // that asserted the reading would have said so on a boot where both
+        // opens were refused, which is what the first version did.
+        println!(
+            "    linux proc     a Linux program asked for /proc/self/status and /proc/self/maps; \
+             what it read is above, generated by the personality"
+        );
+    } else {
+        println!("\x1b[91m    linux proc     FAILED: the probe never ended\x1b[0m");
+    }
+    ended
 }
 
 /// RFC 0033 step 9's witness: a parent waits for its child and reads its status.

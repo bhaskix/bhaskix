@@ -146,6 +146,10 @@ pub enum Kind {
     /// step 7. Which end is `readable`/`writable`, and the ring itself lives
     /// in the adapter, named by `handle`.
     Pipe,
+    /// A `/proc` file the personality generates — RFC 0033 step 10. There is
+    /// nothing behind it: no capability, no service, no file. The `handle`
+    /// says *which* file, and its contents are written afresh on every read.
+    Proc,
 }
 
 /// One open descriptor.

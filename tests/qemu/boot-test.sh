@@ -1674,6 +1674,29 @@ else
     status=1
 fi
 
+# RFC 0033 step 10: `/proc`, and what a hosted program may learn about itself.
+#
+# The probe maps a page and then prints `/proc/self/status` and
+# `/proc/self/maps`. What is demanded is the **maps line for the page it just
+# mapped** -- the personality's own region list, written back in Linux's format
+# to the program that made it. If the two disagreed about where that page is,
+# the line would say so; if the file were never read, there would be no line.
+#
+# **The leak half of this step is not here, and cannot be.** A boot gate can
+# only look for what somebody thought to forbid. The check that matters is a
+# host test in `personality::proc` which enumerates the field names this
+# personality may publish and fails on any other -- it looks for anything not
+# explicitly allowed, which is the shape a leak has.
+if grep -qE "^0000000052000000-0000000052001000 rw-p" "$LOG" \
+    && grep -qE "^Pid:" "$LOG"; then
+    pass "a hosted program read /proc about itself, and its map says where its own page is"
+elif grep -qF "linux proc     skipped" "$LOG"; then
+    pass "no second cpu, so the /proc test was skipped"
+else
+    fail "the /proc test did not conclude: $(grep -aoE 'linux proc .*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0033 step 9: `wait4`. Two witnesses, and the number is the same in both.
 #
 # The child ends with `exit_group(7)`. The adapter's record says which child was

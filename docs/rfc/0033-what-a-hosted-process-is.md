@@ -830,6 +830,57 @@ back needs the adapter to hold the child's `Domain` capability after the exec, a
 is a slot per exec, bounded by the envelope's sixteen, and it is named here rather than left for
 somebody to find at the seventeenth.
 
+## Step 10's record (2026-08-20): a `/proc` that cannot leak what it has never seen
+
+**A hosted program read `/proc/self/status` and `/proc/self/maps` about itself**, and what it
+printed is its own:
+
+```text
+Pid:	9
+PPid:	0
+0000000052000000-0000000052001000 rw-p 00000000 00:00 0
+```
+
+That last line is the page the program mapped a moment earlier — the personality's own region list,
+written back in Linux's format to the program that made it. **Armed** by generating the line one
+page off, and by sending `/proc` to the filesystem service instead of generating it: both went red.
+
+### The leak test is a host test, and that is the point
+
+A boot gate can only look for what somebody thought to forbid. The check that matters enumerates
+what is **allowed**: `personality::proc`'s own test walks the generated text and fails on any field
+name outside a list of five, and asserts that `maps` contains no path column — which is where a leak
+would hide, and there is not one.
+
+**The text is generated in a crate that has never seen a capability**, and that is the whole design
+rather than tidiness. A file written where the capabilities are is one careless interpolation away
+from publishing one; `personality::proc` cannot name a domain, a slot or a physical address because
+it has no way to obtain any of them. Its `unsafe` budget is zero and its inputs are two integers and
+a region list.
+
+### What is in it, and what is deliberately not
+
+`status` and `maps`, because they are what programs actually read about themselves: a runtime asks
+`status` for its own pid when it cannot trust `getpid` across a `clone`, and every allocator, garbage
+collector and crash handler walks `maps`. **`cmdline` and `environ` are absent** and answer `ENOENT`
+— they wait on an `execve` that carries argv, which this personality does not have, and an empty file
+would be a lie where a refusal is a fact a program can act on.
+
+**Only `self`.** `/proc/<pid>/` of another process is a question about somebody else, and answering
+it means deciding whether the asker may — a permission question this personality has no answer for
+yet, and one that must be answered rather than assumed.
+
+### One mistake, and it is the same one twice
+
+`from_path` compared the **whole buffer** against a name. A path arrives as C sees it: the name, a
+`NUL`, and whatever else was in that memory behind it — sixty-four bytes compared against six, which
+never matched, so both opens were refused and the probe printed nothing. It stops at the `NUL` now,
+and a test feeds it a path in exactly the shape it arrives in.
+
+**And the report line was corrected to claim only what the kernel saw.** It said a program *read*
+both files, on a boot where both opens had been refused; what the kernel can see is that a program
+ran and ended, and what it read is on the console for the boot test to find.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -961,4 +1012,6 @@ later step consumes them.
    record below.*
 9. **`wait4` on domain death**, over `BIND` and the notification pool. ✅ *Delivered 2026-08-20 —
    without `BIND`, and the reason is better than the plan; see the record below.*
-10. **The `/proc` subset**, and the leak test: nothing in it names a Bhaskix object.
+10. **The `/proc` subset**, and the leak test: nothing in it names a Bhaskix object. ✅ *Delivered
+    2026-08-20 — two files, and the leak test is a host test rather than a gate; see the record
+    below.*

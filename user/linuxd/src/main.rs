@@ -43,6 +43,7 @@ use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
 use bhaskix_personality::file::Kind;
 use bhaskix_personality::memory;
 use bhaskix_personality::pipe::Pipe;
+use bhaskix_personality::proc::File as ProcFile;
 use bhaskix_personality::process::{Exit, Process, Processes, Region};
 use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
@@ -706,6 +707,10 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
                 Some((Kind::Pipe, handle)) => {
                     read_from_pipe(request, handle as usize, request.second(), request.third())
                 }
+                Some((Kind::Proc, handle)) => (
+                    REPLY_VALUE,
+                    read_proc(request, handle, request.second(), request.third()),
+                ),
                 _ => (REPLY_VALUE, answer_read(request)),
             };
         }
@@ -1669,6 +1674,14 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
     if !copy_in(request.domain, path_at, &mut name) {
         return Answer::error(-14); // EFAULT
     }
+    // **`/proc` is answered here and asked of nobody** — RFC 0033 step 10.
+    // The filesystem service has no such directory and should not: what a
+    // hosted process may read about itself is this personality's business, and
+    // a synthetic file generated in a crate that has never seen a capability
+    // cannot leak one.
+    if let Some(file) = ProcFile::from_path(&name) {
+        return open_proc(request, file, flags);
+    }
     let Some(component) = one_component(&name) else {
         // **Three different refusals answered `-2` and the record could not
         // tell them apart** -- the mistake this project has now made five
@@ -1746,6 +1759,100 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
             Answer::error(errno)
         }
     }
+}
+
+/// Opens one of the `/proc` files this personality generates.
+///
+/// The descriptor names *which* file, and nothing else: the text is generated
+/// again on every `read`, from the record and the region list, because a
+/// snapshot kept between calls would be a second copy of the truth and the
+/// wrong one by the time anybody read it.
+fn open_proc(request: &PersonalityCall, file: ProcFile, flags: u64) -> Answer {
+    use bhaskix_personality::file::{Entry, Kind, open};
+
+    if flags & open::ACCMODE != open::RDONLY {
+        return Answer::error(-30); // EROFS
+    }
+    let mut bytes = [0u8; bhaskix_personality::proc::MAX_BYTES];
+    let Some(size) = generate_proc(request.domain, file, &mut bytes) else {
+        return Answer::error(-11); // EAGAIN
+    };
+    let entry = Entry {
+        handle: match file {
+            ProcFile::Status => 0,
+            ProcFile::Maps => 1,
+        },
+        kind: Kind::Proc,
+        close_on_exec: flags & open::CLOEXEC != 0,
+        offset: 0,
+        size: size as u64,
+        readable: true,
+        writable: false,
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    match process.descriptors.insert(entry, 0) {
+        Ok(descriptor) => Answer::ok(descriptor as u64),
+        Err(errno) => Answer::error(errno),
+    }
+}
+
+/// Generates one `/proc` file's text, and answers its length.
+fn generate_proc(domain: u32, file: ProcFile, out: &mut [u8]) -> Option<usize> {
+    let process = process_for(domain)?;
+    Some(match file {
+        ProcFile::Status => bhaskix_personality::proc::write_status(
+            out,
+            process.pid,
+            process.ppid,
+            process.credentials.uid,
+        ),
+        // The protection word is the kernel's, and the personality carries it
+        // without interpreting it -- so the one value `maps` has to name,
+        // read-execute, is passed in rather than assumed there.
+        ProcFile::Maps => {
+            bhaskix_personality::proc::write_maps(out, &process.regions, PROT_READ_EXECUTE)
+        }
+    })
+}
+
+/// Reads from a `/proc` file, generating it afresh.
+fn read_proc(request: &PersonalityCall, handle: u64, buffer: u64, count: u64) -> Answer {
+    let file = if handle == 0 {
+        ProcFile::Status
+    } else {
+        ProcFile::Maps
+    };
+    let mut bytes = [0u8; bhaskix_personality::proc::MAX_BYTES];
+    let Some(length) = generate_proc(request.domain, file, &mut bytes) else {
+        return Answer::error(-11);
+    };
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9);
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    let offset = entry.offset as usize;
+    if offset >= length {
+        return Answer::ok(0);
+    }
+    let take = (count as usize)
+        .min(length - offset)
+        .min(SCRATCH_BYTES as usize);
+    if !copy_out(request.domain, buffer, &bytes[offset..offset + take]) {
+        return Answer::error(-14); // EFAULT
+    }
+    if let Some(process) = process_for(request.domain)
+        && let Some(entry) = process.descriptors.get_mut(descriptor)
+    {
+        entry.offset += take as u64;
+    }
+    Answer::ok(take as u64)
 }
 
 /// Answers a hosted `read` — RFC 0033 step 6.
