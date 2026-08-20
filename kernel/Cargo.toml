@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1568
+unsafe_budget = 1579
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -400,6 +400,14 @@ unsafe_budget = 1568
 # has and carries the same argument -- the entry is inside a user-executable
 # segment the loader accepted, and the stack address is one past user-writable
 # memory in the space just installed.
+#
+# **1579 at RFC 0033 step 9**, and the eleven are the wait probe's thread and
+# the read of the adapter's wait record. The sixth hosted probe with that shape.
+#
+# **`commit_page` added none.** Committing a lazily mapped page of another
+# domain's space is the fault handler's own body, called with the space the
+# caller found instead of the one `CR3` holds — a refactor of `handle_fault`
+# into a lookup and a body, and not a line of new `unsafe` between them.
 #
 # **1568 at RFC 0033 step 8**, and the eleven lines are the fork probe's
 # thread and the read of the adapter's fork record. The fifth hosted probe with

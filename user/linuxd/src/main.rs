@@ -260,6 +260,23 @@ fn trace_fork(pid: u32, copied: u64) {
     }
 }
 
+/// Where the wait record sits, two words past the fork record.
+const WAIT_RECORD_AT: u64 = FORK_RECORD_AT + 16;
+
+/// Records what a `wait4` answered: the child collected and its status word.
+///
+/// Written on every outcome, including the refusals, because a boot where
+/// nothing was printed has to say *which* of four answers the parent got --
+/// the lesson `open` learned twice and `read` once.
+fn trace_wait(collected: i64, status: u64) {
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // past every other record.
+    unsafe {
+        core::ptr::write_volatile(WAIT_RECORD_AT as *mut u64, collected as u64);
+        core::ptr::write_volatile((WAIT_RECORD_AT + 8) as *mut u64, status);
+    }
+}
+
 /// Records an exec for the kernel's report.
 fn trace_exec(pid: u32, from: u32, to: u32) {
     // SAFETY: inside the page `ATTACH` mapped from this program's own object,
@@ -284,11 +301,30 @@ fn deliver(domain: u32, slot: u64, address: u64) -> u64 {
         // Nothing wanted it. Ending is the honest answer, and the kernel says
         // so in one line rather than narrating an exception the machine did
         // not suffer.
+        //
+        // **And the status is recorded, because a parent may be waiting** —
+        // RFC 0033 step 9. A process killed by a signal is not one that
+        // exited: `wait` encodes the two differently, and a shell prints
+        // "Segmentation fault" from exactly that difference.
+        note_exit(
+            domain,
+            Exit::Signalled {
+                signal: SIGSEGV as u8,
+                core: false,
+            },
+        );
         return FAULT_END;
     };
 
     let mut image = [0u64; FAULT_REGISTERS];
     if !read_slot(slot, &mut image) {
+        note_exit(
+            domain,
+            Exit::Signalled {
+                signal: SIGSEGV as u8,
+                core: false,
+            },
+        );
         return FAULT_END;
     }
     let registers = Registers {
@@ -679,7 +715,18 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         EXIT => return (REPLY_END_THREAD, Answer::ok(0)),
         // A Linux thread group's exit is every thread of it, and a hosted
         // process is a domain.
-        EXIT_GROUP => return (REPLY_END_DOMAIN, Answer::ok(0)),
+        //
+        // **The status is recorded before the domain ends** — RFC 0033 step 9.
+        // It is in `rdi`, here, now: the adapter is answering the call that
+        // carries it. Until this step the record was given an invented zero,
+        // because the only other moment to learn a status was the domain's
+        // death, and a death carries none. A parent that reads `$?` reads this.
+        EXIT_GROUP => {
+            note_exit(request.domain, Exit::Status(request.first() as u8));
+            return (REPLY_END_DOMAIN, Answer::ok(0));
+        }
+        // `wait4(pid, status, options, rusage)`.
+        WAIT4 => return answer_wait(request),
         _ => {}
     }
     (REPLY_VALUE, answer_from_message(request))
@@ -1102,6 +1149,8 @@ const REPLY_BLOCK_ON: u64 = 7;
 /// a woken `futex` is answered with would be end of file.
 const REPLY_BLOCK_ON_RETRY: u64 = 8;
 
+/// `wait4(pid, status, options, rusage)`.
+const WAIT4: u64 = 61;
 /// `fork()`.
 const FORK: u64 = 57;
 /// The name a forked child's domain is created under.
@@ -1949,6 +1998,112 @@ fn one_component(name: &[u8]) -> Option<&[u8]> {
 /// The longest path this personality reads out of a hosted program.
 const MAX_NAME: usize = 64;
 
+/// Records how a hosted process ended, for whoever waits for it.
+///
+/// **The record becomes a zombie rather than disappearing**, because the exit
+/// status belongs to the parent and nothing else knows it. A process nobody
+/// started — every hosted probe in this tree — has a parent of zero, and
+/// `Processes::ended` reparents its children and leaves it collectable; the
+/// adapter drops such a record when the domain slot is reused, because nobody
+/// will ever read it.
+///
+/// And whoever is *waiting* is woken here, because a parent parked in `wait4`
+/// is parked on a notification this program holds and nothing else will signal
+/// it.
+fn note_exit(domain: u32, exit: Exit) {
+    let Some(process) = process_for(domain) else {
+        return;
+    };
+    let (pid, parent) = (process.pid, process.ppid);
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+    let _ = processes.ended(pid, exit);
+    wake_waiter(parent);
+}
+
+/// Wakes a process parked in `wait4`, if that is where it is.
+fn wake_waiter(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: as above.
+    let waiters = unsafe { &mut *core::ptr::addr_of_mut!(WAITERS) };
+    let Some(entry) = waiters.iter_mut().find(|entry| entry.0 == pid) else {
+        return;
+    };
+    let slot = entry.1;
+    *entry = (0, 0);
+    let _ = call(
+        syscall::INVOKE,
+        WAKE_SLOT + u64::from(slot),
+        method::SIGNAL,
+        [0; 4],
+    );
+    release_wake(slot as usize);
+}
+
+/// Who is parked in `wait4`, and on which wake slot: `(pid, slot)`.
+///
+/// One entry per waiting parent. Four, because a machine with more hosted
+/// processes waiting at once than that has other problems first — and a fifth
+/// is answered `EAGAIN` rather than left unwoken.
+static mut WAITERS: [(u32, u32); 4] = [(0, 0); 4];
+
+/// Answers a hosted `wait4` — RFC 0033 step 9.
+///
+/// **Three answers, and the middle one is why this needs a reply shape.** A
+/// dead child: its pid, and Linux's status word written where the caller
+/// asked. No children at all: `ECHILD`. Children, none dead: the caller
+/// *waits* — parked on a notification, woken by whichever child ends, and then
+/// asked again — unless it said `WNOHANG`, which answers zero.
+fn answer_wait(request: &PersonalityCall) -> (u64, Answer) {
+    use bhaskix_personality::process::{WaitFor, WaitOutcome};
+
+    const WNOHANG: u64 = 1;
+    let (which, status_at, options) = (request.first(), request.second(), request.third());
+    let Some(process) = process_for(request.domain) else {
+        return (REPLY_VALUE, Answer::error(-11));
+    };
+    let (pid, group) = (process.pid, process.pgid);
+    let wanted = WaitFor::from_argument(which as i64, group);
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+    match processes.collect(pid, wanted) {
+        Ok(WaitOutcome::Collected { pid: child, status }) => {
+            trace_wait(i64::from(child), u64::from(status));
+            // The status word goes where the caller asked, if it asked: a
+            // `wait4` with a null pointer is a reap and nothing more, which is
+            // what `wait(NULL)` has always meant.
+            if status_at != 0 && !copy_out(request.domain, status_at, &status.to_le_bytes()) {
+                return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+            }
+            (REPLY_VALUE, Answer::ok(u64::from(child)))
+        }
+        Ok(WaitOutcome::WouldBlock) if options & WNOHANG != 0 => {
+            trace_wait(-1, 0);
+            (REPLY_VALUE, Answer::ok(0))
+        }
+        Ok(WaitOutcome::WouldBlock) => {
+            let Some(slot) = claim_wake() else {
+                return (REPLY_VALUE, Answer::error(-11));
+            };
+            // SAFETY: as above.
+            let waiters = unsafe { &mut *core::ptr::addr_of_mut!(WAITERS) };
+            let Some(entry) = waiters.iter_mut().find(|entry| entry.0 == 0) else {
+                release_wake(slot);
+                return (REPLY_VALUE, Answer::error(-11));
+            };
+            *entry = (pid, slot as u32);
+            trace_wait(-2, u64::from(pid));
+            (REPLY_BLOCK_ON_RETRY, Answer::ok(WAKE_SLOT + slot as u64))
+        }
+        Err(errno) => {
+            trace_wait(errno, 0);
+            (REPLY_VALUE, Answer::error(errno))
+        }
+    }
+}
+
 /// Answers a hosted `fork` — RFC 0033 step 8, stage one.
 ///
 /// **By copying, and the copying is the point.** The RFC's stage two is a
@@ -2590,8 +2745,22 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
             incarnations[slot] = generation.wrapping_add(1);
             // SAFETY: as above.
             let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+            // **A domain slot reused means whoever was in it is gone**, and
+            // by now its status has either been recorded — `exit_group` and
+            // the fault path both do it before the domain ends — or there is
+            // none to record, because something outside ended it. The invented
+            // `Exit::Status(0)` that used to be written here was a lie with no
+            // reader while nothing could `wait4`; step 9 gave it one, so it is
+            // gone. What is left is the reap: a record whose parent cannot
+            // read it any more.
             if let Some(pid) = processes.by_domain(domain, generation).map(|p| p.pid) {
-                let _ = processes.ended(pid, Exit::Status(0));
+                let _ = processes.ended(
+                    pid,
+                    Exit::Signalled {
+                        signal: 9,
+                        core: false,
+                    },
+                );
                 let _ = processes.discard(pid);
             }
             let _ = call(syscall::REPLY, 0, 0, [0; 4]);

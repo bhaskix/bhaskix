@@ -767,6 +767,69 @@ it on every system call, measured.
   because the kernel printed `copied!` in its own sentence and the gate found it there. The marker
   is the *child's* to print, and the report no longer says it.
 
+## Step 9's record (2026-08-20): a status a parent can read, and one `EFAULT` that was the kernel's
+
+**A hosted parent forked, waited, and collected the number its child chose.**
+
+```text
+linux wait     a Linux program forked, its child ended, and the parent collected pid 8 with
+               status word 0x700
+s=7                                             <- printed by the parent, decoded itself
+```
+
+`0x700` is Linux's encoding of *exited, status 7*, and `s=7` is the parent shifting it back. The
+byte the child put in its register travels into the record, through `wait4`, and out again — and a
+`wait4` that invented a status prints `s=0`, which is what the record held before this step. **Armed
+exactly that way**, and a second time by never waking a parked parent: `ended false, wait4 answered
+-2`, the parent still asleep and its domain never ending.
+
+### Without `BIND`, and the reason is better than the plan
+
+This step was written as *"`wait4` on domain death, over `BIND` and the notification pool"* — the
+adapter would watch each child domain die and learn of it by signal. It does not, because **a death
+carries no status and the call that ends a process does**. `exit_group`'s argument is in a register
+the adapter is holding at the moment it answers; a fault that kills a program names the signal in
+the same place. So the status is recorded where it is *known*, and the death notification would have
+added a second path that knew less.
+
+What `BIND` is still for is written down rather than dropped: a hosted domain ended by **something
+other than the adapter** — a supervisor killing it — is a death the adapter never serves and would
+learn about only that way. Nothing does that yet, and the day something does is the trigger.
+
+### The `EFAULT` that was the kernel's fault, not the program's
+
+The parent's `wait4` collected the child and then answered `EFAULT`, and the probe printed nothing.
+The cause was not in the personality: **`COPY_OUT` cannot write into a lazily mapped page**. A
+supervisor writes through the kernel's own view of the frames, and a page a hosted program has
+mapped but never touched *has* no frame — so writing `wait4`'s status word into a fresh buffer
+failed, and would have failed identically for `pipe2`'s descriptor pair and every `read` into memory
+the program had just allocated.
+
+`copy_across` commits the page now, on **outward** copies only: a supervisor's write does exactly
+what the program's own first write would have done. A *read* of an untouched page stays a read of
+zeroes, because allocating a frame to prove that would turn an inspection into a change. The
+mechanism is the fault handler's own body, refactored into a lookup and a body so that it can be
+called for a space that is not the one `CR3` holds — and it added not one line of `unsafe`.
+
+**Three of this project's own bugs were the same shape**: the lazily mapped `MAP_AT` that `COPY_OUT`
+could not read at RFC 0032 step 4, the exec image copied into an eagerly mapped page because of it,
+and this. The rule that emerges is worth keeping: *a supervisor's write to a domain is a write, and
+a write commits*.
+
+### What step 4 left wrong, and what is now right
+
+- **The invented exit status is gone.** `exit_group` records what it was given; a fault that kills a
+  program records `Signalled`, which `wait` encodes differently and a shell prints "Segmentation
+  fault" from.
+- **A record whose domain slot is reused** is retired as killed rather than as exited-zero, because
+  something outside ended it and nobody can say with what.
+
+**What is still not done**: an exec'd or forked domain is not *reaped* — its slot is held until the
+boot ends. `wait4` collects the **record**, which is what a parent reads; giving the domain's slot
+back needs the adapter to hold the child's `Domain` capability after the exec, and it drops it. That
+is a slot per exec, bounded by the envelope's sixteen, and it is named here rather than left for
+somebody to find at the seventeenth.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -896,5 +959,6 @@ later step consumes them.
 8. **`fork` by copying**, with the measurement that decides whether stage 2 exists. ✅ *Delivered
    2026-08-20 — and the measurement is not the number this plan expected to argue about; see the
    record below.*
-9. **`wait4` on domain death**, over `BIND` and the notification pool.
+9. **`wait4` on domain death**, over `BIND` and the notification pool. ✅ *Delivered 2026-08-20 —
+   without `BIND`, and the reason is better than the plan; see the record below.*
 10. **The `/proc` subset**, and the leak test: nothing in it names a Bhaskix object.

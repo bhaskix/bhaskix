@@ -1012,7 +1012,31 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
     else {
         return FaultOutcome::NotOurs;
     };
+    service_fault(space, address, write)
+}
 
+/// Commits one page of **another domain's** space, as a fault on it would.
+///
+/// [RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md) step 9. A
+/// supervisor writing into a hosted process's memory — `wait4`'s status word,
+/// `pipe2`'s descriptor pair, the bytes of a `read` — writes through the
+/// kernel's own view of the frames, and a **lazily mapped page has no frame
+/// until something touches it**. Nothing had, so the write failed and the
+/// hosted program saw `EFAULT` for memory it had legitimately mapped.
+///
+/// This is that touch: the same servicing a fault would do, on a space that is
+/// not the one loaded. Refusing instead would make every supervisor write a
+/// question about whether the target had happened to touch the page first,
+/// which is not a contract anybody can program against.
+pub fn commit_page(root: u64, address: u64) -> bool {
+    with_space(root, |space| {
+        matches!(service_fault(space, address, true), FaultOutcome::Handled)
+    })
+    .unwrap_or(false)
+}
+
+/// The body of [`handle_fault`], against a space the caller has found.
+fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOutcome {
     let page = VirtAddr(address & !(PAGE_SIZE - 1));
     let Some(region) = space.regions.find(page).copied() else {
         return FaultOutcome::NotOurs;

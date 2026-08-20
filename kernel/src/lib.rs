@@ -560,6 +560,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux fork     FAILED\x1b[0m");
     }
+    if !wait_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux wait     FAILED\x1b[0m");
+    }
     if !signal_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -4609,6 +4615,89 @@ const EXEC_PROBE_CODE: [u8; 44] = [
     b'/', b'b', b'i', b'n', b'/', b'e', b'x', b'e', b'c', b'e', b'd',
 ];
 
+/// Where the wait probe's code lands in its own space.
+const WAIT_PROBE_CODE_AT: u64 = 0x0000_0000_1600_0000;
+
+/// The wait probe, assembled by the same script as the last two — RFC 0033
+/// step 9.
+///
+/// The parent forks; the child ends with `exit_group(7)`; the parent `wait4`s,
+/// takes the status word Linux encodes, and prints `s=7`. **Seven is the
+/// number**: it is in the child's register at the moment it ends, it travels
+/// into the record, it comes back through `wait4` shifted eight bits left, and
+/// the parent shifts it back. A `wait` that invented a status would print `s=0`
+/// — which is what the record held until this step, and what the boot said
+/// before it.
+///
+/// Like the fork probe, it maps a page and writes the routine into it, because
+/// a forked child can only run in memory the personality knows about.
+#[rustfmt::skip]
+const WAIT_PROBE_CODE: [u8; 430] = [
+    0xbf, 0x00, 0x00, 0x00, 0x51, 0xbe, 0x00, 0x10,
+    0x00, 0x00, 0xba, 0x03, 0x00, 0x00, 0x00, 0x41,
+    0xba, 0x32, 0x00, 0x00, 0x00, 0x49, 0xc7, 0xc0,
+    0xff, 0xff, 0xff, 0xff, 0x4d, 0x31, 0xc9, 0xb8,
+    0x09, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x3d,
+    0x00, 0x00, 0x00, 0x51, 0x0f, 0x85, 0x71, 0x01,
+    0x00, 0x00, 0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00,
+    0x51, 0x48, 0xb8, 0xb8, 0x39, 0x00, 0x00, 0x00,
+    0x0f, 0x05, 0x48, 0x48, 0x89, 0x81, 0x00, 0x00,
+    0x00, 0x00, 0x48, 0xb8, 0x85, 0xc0, 0x74, 0x5f,
+    0x48, 0xc7, 0xc7, 0xff, 0x48, 0x89, 0x81, 0x08,
+    0x00, 0x00, 0x00, 0x48, 0xb8, 0xff, 0xff, 0xff,
+    0xbe, 0x00, 0x00, 0x01, 0x51, 0x48, 0x89, 0x81,
+    0x10, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x31, 0xd2,
+    0x4d, 0x31, 0xd2, 0xb8, 0x3d, 0x00, 0x48, 0x89,
+    0x81, 0x18, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x00,
+    0x00, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x7e, 0x48,
+    0x89, 0x81, 0x20, 0x00, 0x00, 0x00, 0x48, 0xb8,
+    0x37, 0x48, 0xc7, 0xc1, 0x00, 0x00, 0x01, 0x51,
+    0x48, 0x89, 0x81, 0x28, 0x00, 0x00, 0x00, 0x48,
+    0xb8, 0x8b, 0x01, 0xc1, 0xe8, 0x08, 0x25, 0xff,
+    0x00, 0x48, 0x89, 0x81, 0x30, 0x00, 0x00, 0x00,
+    0x48, 0xb8, 0x00, 0x00, 0x0c, 0x30, 0x88, 0x41,
+    0x0a, 0xc6, 0x48, 0x89, 0x81, 0x38, 0x00, 0x00,
+    0x00, 0x48, 0xb8, 0x41, 0x08, 0x73, 0xc6, 0x41,
+    0x09, 0x3d, 0xc6, 0x48, 0x89, 0x81, 0x40, 0x00,
+    0x00, 0x00, 0x48, 0xb8, 0x41, 0x0b, 0x0a, 0xbf,
+    0x01, 0x00, 0x00, 0x00, 0x48, 0x89, 0x81, 0x48,
+    0x00, 0x00, 0x00, 0x48, 0xb8, 0x48, 0x8d, 0x71,
+    0x08, 0xba, 0x04, 0x00, 0x00, 0x48, 0x89, 0x81,
+    0x50, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x00, 0xb8,
+    0x01, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x89,
+    0x81, 0x58, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x31,
+    0xff, 0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x48,
+    0x89, 0x81, 0x60, 0x00, 0x00, 0x00, 0x48, 0xb8,
+    0x05, 0xeb, 0xfe, 0xbf, 0x07, 0x00, 0x00, 0x00,
+    0x48, 0x89, 0x81, 0x68, 0x00, 0x00, 0x00, 0x48,
+    0xb8, 0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05,
+    0xeb, 0x48, 0x89, 0x81, 0x70, 0x00, 0x00, 0x00,
+    0x48, 0xb8, 0xfe, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x48, 0x89, 0x81, 0x78, 0x00, 0x00,
+    0x00, 0xbf, 0x00, 0x00, 0x00, 0x51, 0xbe, 0x00,
+    0x10, 0x00, 0x00, 0xba, 0x05, 0x00, 0x00, 0x00,
+    0xb8, 0x0a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48,
+    0x85, 0xc0, 0x0f, 0x85, 0x3b, 0x00, 0x00, 0x00,
+    0xbf, 0x00, 0x00, 0x01, 0x51, 0xbe, 0x00, 0x10,
+    0x00, 0x00, 0xba, 0x03, 0x00, 0x00, 0x00, 0x41,
+    0xba, 0x32, 0x00, 0x00, 0x00, 0x49, 0xc7, 0xc0,
+    0xff, 0xff, 0xff, 0xff, 0x4d, 0x31, 0xc9, 0xb8,
+    0x09, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x3d,
+    0x00, 0x00, 0x01, 0x51, 0x0f, 0x85, 0x09, 0x00,
+    0x00, 0x00, 0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00,
+    0x51, 0xff, 0xe0, 0x31, 0xff, 0xb8, 0xe7, 0x00,
+    0x00, 0x00, 0x0f, 0x05, 0xeb, 0xfe,
+];
+
+/// What the child exits with, and the parent must print.
+///
+/// **Not named in the report line, and that is deliberate**: the gate looks for
+/// these bytes in the log, and a kernel line quoting them would match it — the
+/// fork probe's marker did exactly that one step ago, and two arms that should
+/// have gone red stayed green.
+#[expect(dead_code, reason = "the gate reads it from the log, not the kernel")]
+const WAIT_PROBE_STATUS: &str = "s=7";
+
 /// Where the fork probe's code lands in its own space.
 const FORK_PROBE_CODE_AT: u64 = 0x0000_0000_1500_0000;
 
@@ -4829,6 +4918,50 @@ const FILE_PROBE_CODE: [u8; 71] = [
 /// `enter_ring3` already has and the one every supervisor-built program will
 /// use.
 const FILE_PROBE_NAME_AT: u64 = 128;
+
+/// The thread that becomes the wait probe — RFC 0033 step 9.
+extern "C" fn ring3_waiter(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const PAGE_AT: u64 = WAIT_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (WAIT_PROBE_CODE_AT, Protection::ReadExecute),
+        (PAGE_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(WAIT_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the direct
+    // map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            WAIT_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            WAIT_PROBE_CODE.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page and the
+    // stack is inside the writable one.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(WAIT_PROBE_CODE_AT, PAGE_AT + 0x0f00, [PAGE_AT, 0])
+    }
+}
 
 /// The thread that becomes the fork probe — RFC 0033 step 8.
 extern "C" fn ring3_forker(hhdm_base: u64) -> ! {
@@ -5292,6 +5425,64 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
 }
 
+/// RFC 0033 step 9's witness: a parent waits for its child and reads its status.
+///
+/// **The status is the claim.** The child ends with `exit_group(7)`; the parent
+/// `wait4`s and prints `s=7`, having decoded Linux's status word itself. A
+/// `wait` that invented a status would print `s=0`, which is exactly what the
+/// record held before this step — so the number is what separates a `wait4`
+/// that works from one that merely returns.
+fn wait_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux wait     skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("waiter", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux wait     FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    linux wait     FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "waiter", ring3_waiter, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux wait     FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+    let mut ended = false;
+    for _ in 0..400 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    let (collected, status) = adapter_wait_record();
+    let right = ended && collected > 0 && status != 0;
+    if right {
+        println!(
+            "    linux wait     a Linux program forked, its child ended, and the parent collected \
+             pid {collected} with status word {status:#x}"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux wait     FAILED: ended {ended}, wait4 answered {collected}, status \
+             word {status:#x}\x1b[0m"
+        );
+    }
+    right
+}
+
 /// RFC 0033 step 8's witness: a hosted program forks, and its memory comes too.
 ///
 /// The parent writes eight bytes into a page of its own, forks, and yields; the
@@ -5353,6 +5544,37 @@ fn fork_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
     }
     right
+}
+
+/// What the adapter's last `wait4` answered: the child collected, and the
+/// status word. Negative firsts are refusals — see `bin/linuxd`'s `trace_wait`.
+fn adapter_wait_record() -> (i64, u64) {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return (0, 0);
+    }
+    const FIRST_WORD: usize = (8 * 32 + 1024 + 24 + 24 + 16) / 8;
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 2];
+    let mut at = 0usize;
+    let taken = shared::drain_into(object, (FIRST_WORD + 2) * 8, &mut |chunk: &[u8]| {
+        for word in chunk.chunks_exact(8) {
+            if at >= FIRST_WORD + 2 {
+                break;
+            }
+            if at >= FIRST_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    if taken.is_none() {
+        return (0, 0);
+    }
+    (record[0] as i64, record[1])
 }
 
 /// What the adapter's last `fork` did: the child's pid and the bytes copied.

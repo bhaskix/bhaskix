@@ -3054,8 +3054,28 @@ fn copy_across(
         let room = (bhaskix_mm::FRAME_SIZE as usize - within).min(length - moved);
         // Translated per page, because a region is not one frame and a lazily
         // mapped one has holes until it is touched.
-        let frame =
-            crate::vm::with_space(root, |space| space.translate(bhaskix_boot::VirtAddr(page)))??;
+        //
+        // **And a hole is committed rather than refused, when the copy is
+        // outward** — RFC 0033 step 9. A supervisor writing into a hosted
+        // process's memory writes through the kernel's own view of the frames,
+        // so a page the process has mapped but never touched has nothing to
+        // write into; refusing there made `wait4`'s status word, `pipe2`'s
+        // descriptor pair and every `read` into a fresh buffer answer `EFAULT`
+        // for memory the program had legitimately mapped. Committing it is
+        // exactly what the program's own first write would have done.
+        //
+        // Only outward: a *read* of a page nothing has written is a read of
+        // zeroes, and allocating a frame to prove it would turn an inspection
+        // into a change.
+        let frame = match crate::vm::with_space(root, |space| {
+            space.translate(bhaskix_boot::VirtAddr(page))
+        })? {
+            Some(frame) => frame,
+            None if outward && crate::vm::commit_page(root, page) => {
+                crate::vm::with_space(root, |space| space.translate(bhaskix_boot::VirtAddr(page)))??
+            }
+            None => return None,
+        };
         let physical = hhdm + (frame & !(bhaskix_mm::FRAME_SIZE - 1)) + within as u64;
         let carried = if outward {
             let mut taken = 0usize;

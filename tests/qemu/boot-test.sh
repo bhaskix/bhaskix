@@ -1674,6 +1674,27 @@ else
     status=1
 fi
 
+# RFC 0033 step 9: `wait4`. Two witnesses, and the number is the same in both.
+#
+# The child ends with `exit_group(7)`. The adapter's record says which child was
+# collected and the **status word** it handed back -- `0x700`, which is Linux's
+# encoding of "exited, status 7". And the parent decodes that word itself and
+# prints `s=7`, which is the byte the child put in its register travelling all
+# the way back through a record, a wait and a shift.
+#
+# A `wait4` that invented a status would print `s=0` -- which is exactly what
+# the record held before this step, so the number is what separates a `wait4`
+# that works from one that merely returns.
+if grep -qE "linux wait     a Linux program forked, its child ended, and the parent collected pid [1-9][0-9]* with status word 0x700" "$LOG" \
+    && grep -qF "s=7" "$LOG"; then
+    pass "a parent collected its child's exit status, and read the number the child chose"
+elif grep -qF "linux wait     skipped" "$LOG"; then
+    pass "no second cpu, so the wait test was skipped"
+else
+    fail "the wait test did not conclude: $(grep -aoE 'linux wait .*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0033 step 8: `fork`, by copying. Two things, and the second is the one a
 # fork that "worked" could not fake.
 #
