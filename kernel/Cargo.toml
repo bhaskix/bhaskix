@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1546
+unsafe_budget = 1557
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -400,6 +400,13 @@ unsafe_budget = 1546
 # has and carries the same argument -- the entry is inside a user-executable
 # segment the loader accepted, and the stack address is one past user-writable
 # memory in the space just installed.
+#
+# **1557 at RFC 0033 step 7**, and the eleven lines are the pipe probe's
+# thread: two mappings, the blob copied in through the direct map, and
+# `enter_ring3`. The fourth hosted probe in this file with that shape, and the
+# first whose *displacements were computed rather than counted* -- three
+# earlier ones had a jump or a `lea` off by one, so this one is a script's
+# output and the script patches its own branches.
 #
 # **1546 at RFC 0033 step 6, and twenty-one lines is what a *file* witness
 # costs.** All of them are the file probe's thread and the read of the

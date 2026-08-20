@@ -142,6 +142,10 @@ pub enum Kind {
     Socket,
     /// An `epoll` set.
     Epoll,
+    /// One end of a pipe — [RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md)
+    /// step 7. Which end is `readable`/`writable`, and the ring itself lives
+    /// in the adapter, named by `handle`.
+    Pipe,
 }
 
 /// One open descriptor.

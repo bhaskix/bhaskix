@@ -106,6 +106,17 @@ pub mod reply {
     /// before waking, so a wake that arrives between the adapter's reply and
     /// this park leaves the bit set and the park returns at once.
     pub const BLOCK_ON: u64 = 7;
+    /// Park the calling thread, and when it wakes **ask the same question
+    /// again** rather than answering it.
+    ///
+    /// [RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md) step 7. The
+    /// difference from [`BLOCK_ON`] is what the caller gets on waking: a
+    /// `futex` is answered zero, which is what Linux's futex returns, but a
+    /// `read` answered zero has been told *end of file* — and a shell pipeline
+    /// whose reader is told that at its producer's first pause exits. So a
+    /// blocking read parks with this and the adapter answers the second time
+    /// with the bytes that woke it.
+    pub const BLOCK_ON_RETRY: u64 = 8;
 }
 
 /// What the adapter answered.

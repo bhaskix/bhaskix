@@ -548,6 +548,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux exec     FAILED\x1b[0m");
     }
+    if !pipe_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux pipe     FAILED\x1b[0m");
+    }
     if !signal_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -4597,6 +4603,56 @@ const EXEC_PROBE_CODE: [u8; 44] = [
     b'/', b'b', b'i', b'n', b'/', b'e', b'x', b'e', b'c', b'e', b'd',
 ];
 
+/// Where the pipe probe's code lands in its own space.
+const PIPE_PROBE_CODE_AT: u64 = 0x0000_0000_1400_0000;
+
+/// The pipe probe, hand-assembled — RFC 0033 step 7.
+///
+/// **It proves the blocking half, which is the half that is easy to get
+/// wrong.** The parent makes a pipe, clones a thread, and reads — finding the
+/// pipe empty, so it parks. The child yields twice so the parent is certainly
+/// asleep, then writes; the parent wakes with the bytes and prints them. A
+/// reader that was told "end of file" instead would print nothing, and a
+/// reader that was never woken would hang and its domain would never end.
+///
+/// `rdi` is a writable page: the descriptor pair goes at its start, the child's
+/// stack at `+0x800`, and the bytes read at `+64`.
+///
+/// **Every displacement in it was computed rather than counted.** Three earlier
+/// probes in this file had a jump or a `lea` off by one because the padding and
+/// the label were counted by hand; this one was laid out by a script that patches
+/// its own branches, and the array below is that script's output.
+#[rustfmt::skip]
+const PIPE_PROBE_CODE: [u8; 179] = [
+    0x49, 0x89, 0xfc, 0x31, 0xf6, 0xb8, 0x25, 0x01,
+    0x00, 0x00, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x75,
+    0x54, 0xbf, 0x00, 0x0f, 0x0d, 0x00, 0x4c, 0x89,
+    0xe6, 0x48, 0x81, 0xc6, 0x00, 0x08, 0x00, 0x00,
+    0x31, 0xd2, 0x4d, 0x31, 0xd2, 0x4d, 0x89, 0xe0,
+    0x4c, 0x8d, 0x0d, 0x41, 0x00, 0x00, 0x00, 0xb8,
+    0x38, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x41, 0x8b,
+    0x3c, 0x24, 0x4c, 0x89, 0xe6, 0x48, 0x83, 0xc6,
+    0x40, 0xba, 0x20, 0x00, 0x00, 0x00, 0x31, 0xc0,
+    0x0f, 0x05, 0x48, 0x85, 0xc0, 0x7e, 0x16, 0x48,
+    0x89, 0xc2, 0x4c, 0x89, 0xe6, 0x48, 0x83, 0xc6,
+    0x40, 0xbf, 0x01, 0x00, 0x00, 0x00, 0xb8, 0x01,
+    0x00, 0x00, 0x00, 0x0f, 0x05, 0x31, 0xff, 0xb8,
+    0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xeb, 0xfe,
+    0x49, 0x89, 0xfc, 0xb8, 0x18, 0x00, 0x00, 0x00,
+    0x0f, 0x05, 0xb8, 0x18, 0x00, 0x00, 0x00, 0x0f,
+    0x05, 0x41, 0x8b, 0x7c, 0x24, 0x04, 0x48, 0x8d,
+    0x35, 0x17, 0x00, 0x00, 0x00, 0xba, 0x0f, 0x00,
+    0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f,
+    0x05, 0x31, 0xff, 0xb8, 0x3c, 0x00, 0x00, 0x00,
+    0x0f, 0x05, 0xeb, 0xfe, 0x74, 0x68, 0x72, 0x6f,
+    0x75, 0x67, 0x68, 0x20, 0x61, 0x20, 0x70, 0x69,
+    0x70, 0x65, 0x0a,
+];
+
+/// What the child writes, and what the parent must print. Fifteen bytes,
+/// inside the blob at a fixed offset the assembler above computed.
+const PIPE_PROBE_MESSAGE: &str = "through a pipe";
+
 /// Where the file probe's code lands in its own space.
 const FILE_PROBE_CODE_AT: u64 = 0x0000_0000_1300_0000;
 
@@ -4649,6 +4705,52 @@ const FILE_PROBE_CODE: [u8; 71] = [
 /// `enter_ring3` already has and the one every supervisor-built program will
 /// use.
 const FILE_PROBE_NAME_AT: u64 = 128;
+
+/// The thread that becomes the pipe probe — RFC 0033 step 7.
+extern "C" fn ring3_piper(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const PAGE_AT: u64 = PIPE_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, pages, protection) in [
+        (PIPE_PROBE_CODE_AT, 1, Protection::ReadExecute),
+        // Two pages of scratch: the descriptor pair and the bytes read at the
+        // start, the child's stack in the second half.
+        (PAGE_AT, 2, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), pages) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(PIPE_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the direct
+    // map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            PIPE_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            PIPE_PROBE_CODE.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page, the stack
+    // is inside the writable pair, and `rdi` is the page the probe works in.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(PIPE_PROBE_CODE_AT, PAGE_AT + 0x0700, [PAGE_AT, 0])
+    }
+}
 
 /// The thread that becomes the file probe — RFC 0033 step 6.
 ///
@@ -5020,6 +5122,100 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         false
     }
+}
+
+/// RFC 0033 step 7's witness: two hosted threads meet through a pipe.
+///
+/// **The blocking half is the half worth testing.** The parent makes a pipe and
+/// reads from it while it is empty, so it must *park*; the child yields twice
+/// and then writes, which must wake it. A reader told "end of file" instead
+/// would print nothing; a reader never woken would hang and its domain would
+/// not end. Both failures are visible from here, and neither can be produced by
+/// a pipe that works.
+fn pipe_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux pipe     skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    // **The writer can win, and a run where it did proves nothing.** If the
+    // child's write lands before the parent's read, the pipe is not empty when
+    // the parent looks, so nobody parks -- which is correct behaviour and no
+    // evidence about blocking at all. The clone probe learned this first, on
+    // 2026-08-19, and the answer is the same: detect that case, say so, and run
+    // it again rather than reporting it as success or as failure.
+    for attempt in 1..=4 {
+        match pipe_attempt(hhdm_base, attempt) {
+            Some(verdict) => return verdict,
+            None => continue,
+        }
+    }
+    println!(
+        "\x1b[91m    linux pipe     FAILED: the writer won the race four times; the reader never \
+         had an empty pipe to park on\x1b[0m"
+    );
+    false
+}
+
+/// One attempt at the pipe rendezvous. `None` means the race went the wrong
+/// way and nothing was proved.
+fn pipe_attempt(hhdm_base: u64, attempt: u32) -> Option<bool> {
+    use core::sync::atomic::Ordering;
+
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("piper", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux pipe     FAILED: no domain\x1b[0m");
+        return Some(false);
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    linux pipe     FAILED: the tag was refused\x1b[0m");
+        return Some(false);
+    }
+    let parked_before = syscall::BLOCKED.load(Ordering::Relaxed);
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "piper", ring3_piper, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux pipe     FAILED: the probe would not spawn\x1b[0m");
+        return Some(false);
+    }
+    let mut ended = false;
+    for _ in 0..400 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    // **That somebody parked is the claim**, and the kernel counts it: a
+    // `BLOCK_ON` reply is the only thing that increments this, and the only
+    // call in this probe that can produce one is the read of an empty pipe.
+    let parked = syscall::BLOCKED.load(Ordering::Relaxed) > parked_before;
+    if ended && !parked {
+        // The bytes crossed, and nobody had to wait for them. Correct, and not
+        // the proof this test exists for.
+        println!(
+            "\x1b[93m    linux pipe     attempt {attempt}: the writer won the race, so the reader \
+             never had an empty pipe to park on; trying again\x1b[0m"
+        );
+        return None;
+    }
+    if ended && parked {
+        println!(
+            "    linux pipe     two hosted threads met through a pipe: the reader parked on an \
+             empty one, the writer woke it, and `{PIPE_PROBE_MESSAGE}` crossed (attempt {attempt})"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux pipe     FAILED: ended {ended}, a reader parked {parked}\x1b[0m"
+        );
+    }
+    Some(ended && parked)
 }
 
 /// RFC 0033 step 6's witness: a hosted program reads a real file.

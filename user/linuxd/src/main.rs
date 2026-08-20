@@ -40,7 +40,9 @@
 
 use bhaskix_abi::{limits, method, status, syscall};
 use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
+use bhaskix_personality::file::Kind;
 use bhaskix_personality::memory;
+use bhaskix_personality::pipe::Pipe;
 use bhaskix_personality::process::{Exit, Process, Processes};
 use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
@@ -603,6 +605,13 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         FUTEX => return answer_futex(request),
         // The one call that ends the caller and starts a program in its place.
         EXECVE => return answer_execve(request),
+        PIPE2 => {
+            return (
+                REPLY_VALUE,
+                answer_pipe(request, request.first(), request.second()),
+            );
+        }
+        PIPE => return (REPLY_VALUE, answer_pipe(request, request.first(), 0)),
         // The file surface — RFC 0033 step 6. Each reads or writes the
         // caller's memory, so each needs the `Domain` capability rather than
         // only the message.
@@ -618,7 +627,17 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
                 answer_openat(request, request.first(), request.second()),
             );
         }
-        READ => return (REPLY_VALUE, answer_read(request)),
+        READ => {
+            // **Routed by what the descriptor *is*.** A pipe may have to park
+            // the caller, which is a reply shape rather than a value, so the
+            // choice has to be made here rather than inside an answer.
+            return match descriptor_kind(request, request.first()) {
+                Some((Kind::Pipe, handle)) => {
+                    read_from_pipe(request, handle as usize, request.second(), request.third())
+                }
+                _ => (REPLY_VALUE, answer_read(request)),
+            };
+        }
         CLOSE => return (REPLY_VALUE, answer_close(request)),
         DUP | DUP2 | DUP3 => return (REPLY_VALUE, answer_dup(request)),
         SCHED_YIELD => return (REPLY_YIELD, Answer::ok(0)),
@@ -796,6 +815,23 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // being asked. A real descriptor table is Tier 1's.
         WRITE => {
             let (fd, buffer, count) = (request.first(), request.second(), request.third());
+            // **A pipe's write end is a descriptor like any other** — RFC 0033
+            // step 7. Before this, `write` knew only the two standard streams
+            // and answered `EBADF` for everything else, which is what a
+            // personality with no descriptor table can say. There is a table
+            // now, so what a number *means* is a lookup.
+            match descriptor_kind(request, fd) {
+                Some((Kind::Pipe, handle)) => {
+                    return write_to_pipe(request, handle as usize, buffer, count);
+                }
+                Some((Kind::File | Kind::Directory, _)) => {
+                    // The directory capability this program holds carries no
+                    // `WRITE` right, so this is a truth rather than a refusal
+                    // to try.
+                    return Answer::error(-30); // EROFS
+                }
+                _ => {}
+            }
             if fd != 1 && fd != 2 {
                 return Answer::error(-9); // EBADF
             }
@@ -1000,6 +1036,11 @@ const REPLY_END_THREAD: u64 = 5;
 const REPLY_END_DOMAIN: u64 = 6;
 /// Park the caller on the notification this program names.
 const REPLY_BLOCK_ON: u64 = 7;
+/// Park the caller, and ask this question again when it wakes.
+///
+/// What a blocking `read` needs: it must come back with *bytes*, and the zero
+/// a woken `futex` is answered with would be end of file.
+const REPLY_BLOCK_ON_RETRY: u64 = 8;
 
 /// `execve(path, argv, envp)`.
 const EXECVE: u64 = 59;
@@ -1086,6 +1127,34 @@ const CLOSE: u64 = 3;
 const DUP: u64 = 32;
 const DUP2: u64 = 33;
 const DUP3: u64 = 292;
+
+/// `pipe2(fds, flags)`, and `pipe(fds)`.
+const PIPE2: u64 = 293;
+const PIPE: u64 = 22;
+
+/// How many pipes this adapter can hold at once.
+///
+/// Eight, and each is half a kilobyte of ring — four kilobytes of this
+/// program's memory whether or not anything uses them, because a server that
+/// cannot allocate pays for its tables up front. A ninth `pipe2` is `EMFILE`,
+/// which is a Linux answer a program already handles.
+const PIPES: usize = 8;
+
+/// The pipes, and who is asleep on each.
+///
+/// **A pipe is a ring buffer in this program**, not a kernel object: both ends
+/// belong to processes this program serves, so nothing about joining them needs
+/// authority it does not already hold. The moment a pipe became an `Endpoint`
+/// the kernel would be holding state for a dialect it does not interpret.
+static mut PIPES_HELD: [Option<Pipe>; PIPES] = [None; PIPES];
+
+/// Which futex wake slot a reader is parked on, per pipe, plus one.
+///
+/// **The same notification pool the futex uses**, because parking a thread is
+/// parking a thread: a reader waiting for bytes and a thread waiting on a word
+/// want the same mechanism, and having two would mean two ways to get the
+/// wake-up wrong. Zero means nobody is waiting.
+static mut PIPE_WAITERS: [u32; PIPES] = [0; PIPES];
 
 /// The directory a hosted process's `/` **is** — RFC 0033 step 6.
 ///
@@ -1263,6 +1332,150 @@ fn process_for(domain: u32) -> Option<&'static mut Process> {
 fn sleepers() -> &'static mut [Sleeper; WAKES] {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     unsafe { &mut *core::ptr::addr_of_mut!(SLEEPERS) }
+}
+
+/// Answers a hosted `pipe2` — RFC 0033 step 7.
+///
+/// Two descriptors into one ring: the low one reads, the high one writes,
+/// which is the order every program that has ever called `pipe` assumes. The
+/// ring is claimed from this program's own table and named by both rows, so
+/// closing one end is a count rather than a teardown.
+fn answer_pipe(request: &PersonalityCall, at: u64, flags: u64) -> Answer {
+    use bhaskix_personality::file::{Entry, Kind, open};
+
+    let close_on_exec = flags & open::CLOEXEC != 0;
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) };
+    let Some(index) = pipes.iter().position(Option::is_none) else {
+        return Answer::error(-24); // EMFILE
+    };
+    pipes[index] = Some(Pipe::new());
+
+    let row = |readable: bool| Entry {
+        handle: index as u64,
+        kind: Kind::Pipe,
+        close_on_exec,
+        offset: 0,
+        size: 0,
+        readable,
+        writable: !readable,
+    };
+    let Some(process) = process_for(request.domain) else {
+        pipes[index] = None;
+        return Answer::error(-11);
+    };
+    let Ok(reader) = process.descriptors.insert(row(true), 0) else {
+        pipes[index] = None;
+        return Answer::error(-24);
+    };
+    let Ok(writer) = process.descriptors.insert(row(false), 0) else {
+        let _ = process.descriptors.close(reader);
+        pipes[index] = None;
+        return Answer::error(-24);
+    };
+
+    // The pair goes back in the caller's memory, which is what makes this call
+    // need a `Domain` capability at all.
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&reader.to_le_bytes());
+    bytes[4..].copy_from_slice(&writer.to_le_bytes());
+    if !copy_out(request.domain, at, &bytes) {
+        let _ = process.descriptors.close(reader);
+        let _ = process.descriptors.close(writer);
+        pipes[index] = None;
+        return Answer::error(-14); // EFAULT
+    }
+    Answer::ok(0)
+}
+
+/// Reads from a pipe, parking the caller when there is nothing yet.
+///
+/// **Three answers, and choosing wrongly between them breaks a shell.** Bytes,
+/// if there are any. End of file — zero — only when no writer remains, because
+/// a reader told "finished" at its producer's first pause ends the pipeline.
+/// Otherwise the caller *waits*, on the same notification pool a `futex`
+/// sleeper uses, and a writer signals it.
+fn read_from_pipe(
+    request: &PersonalityCall,
+    index: usize,
+    buffer: u64,
+    count: u64,
+) -> (u64, Answer) {
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) };
+    let Some(pipe) = pipes.get_mut(index).and_then(Option::as_mut) else {
+        return (REPLY_VALUE, Answer::error(-9)); // EBADF
+    };
+    if pipe.would_block() {
+        // SAFETY: as above.
+        let waiters = unsafe { &mut *core::ptr::addr_of_mut!(PIPE_WAITERS) };
+        let Some(slot) = claim_wake() else {
+            return (REPLY_VALUE, Answer::error(-11)); // EAGAIN
+        };
+        waiters[index] = slot as u32 + 1;
+        return (REPLY_BLOCK_ON_RETRY, Answer::ok(WAKE_SLOT + slot as u64));
+    }
+    let mut bytes = [0u8; SCRATCH_BYTES as usize];
+    let take = (count as usize).min(bytes.len());
+    let moved = pipe.read(&mut bytes[..take]);
+    if moved == 0 {
+        // At end of file: no writer, nothing left. Zero is the answer, and it
+        // is the one every `cat | wc` in history stops on.
+        return (REPLY_VALUE, Answer::ok(0));
+    }
+    if !copy_out(request.domain, buffer, &bytes[..moved]) {
+        return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+    }
+    (REPLY_VALUE, Answer::ok(moved as u64))
+}
+
+/// Wakes whoever is parked on this pipe, if anybody is.
+///
+/// One waiter per pipe, which is what a pipe with one reader has. A second
+/// reader parking would overwrite the first's slot and strand it — stated
+/// rather than guarded, because nothing here creates a second reader yet and a
+/// guard for a case that cannot arise is a guard nobody can test.
+fn wake_pipe_reader(index: usize) {
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let waiters = unsafe { &mut *core::ptr::addr_of_mut!(PIPE_WAITERS) };
+    let Some(slot) = waiters.get_mut(index) else {
+        return;
+    };
+    let Some(wake) = slot.checked_sub(1) else {
+        return;
+    };
+    *slot = 0;
+    let _ = call(
+        syscall::INVOKE,
+        WAKE_SLOT + u64::from(wake),
+        method::SIGNAL,
+        [0; 4],
+    );
+    release_wake(wake as usize);
+}
+
+/// Writes into a pipe, waking a reader that was waiting for it.
+fn write_to_pipe(request: &PersonalityCall, index: usize, buffer: u64, count: u64) -> Answer {
+    let mut bytes = [0u8; SCRATCH_BYTES as usize];
+    let take = (count as usize).min(bytes.len());
+    if !copy_in(request.domain, buffer, &mut bytes[..take]) {
+        return Answer::error(-14); // EFAULT
+    }
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) };
+    let Some(pipe) = pipes.get_mut(index).and_then(Option::as_mut) else {
+        return Answer::error(-9);
+    };
+    let written = match pipe.write(&bytes[..take]) {
+        Ok(written) => written,
+        Err(errno) => return Answer::error(errno),
+    };
+    // **The wake comes after the bytes**, which is the same ordering
+    // `notify::signal` keeps for the same reason: a reader woken before the
+    // ring was written would find it empty and park again, holding the wake it
+    // was given.
+    wake_pipe_reader(index);
+    Answer::ok(written as u64)
 }
 
 /// Answers a hosted `openat` — RFC 0033 step 6.
@@ -1518,13 +1731,36 @@ fn answer_close(request: &PersonalityCall) -> Answer {
             // hundred and twenty-eight slots per open file, for the life of
             // the machine.
             if process.descriptors.holders(entry.handle) == 0
-                && matches!(
-                    entry.kind,
-                    bhaskix_personality::file::Kind::File
-                        | bhaskix_personality::file::Kind::Directory
-                )
+                && matches!(entry.kind, Kind::File | Kind::Directory)
             {
                 release_file_slot(entry.handle);
+            }
+            // **A pipe end closing is a count, not a teardown** — RFC 0033
+            // step 7. Which end matters: with no reader left a writer is told
+            // `EPIPE`, and with no writer left a reader is told end of file.
+            // Getting the two the wrong way round would make a pipeline either
+            // hang for ever or stop at its first pause.
+            if entry.kind == Kind::Pipe {
+                // SAFETY: single-threaded by construction, as elsewhere here.
+                let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) };
+                if let Some(slot) = pipes.get_mut(entry.handle as usize)
+                    && let Some(pipe) = slot.as_mut()
+                {
+                    if entry.readable {
+                        pipe.close_read_end();
+                    } else {
+                        pipe.close_write_end();
+                    }
+                    // A reader waiting on a pipe whose last writer has just
+                    // gone must be woken to be told so, or it waits for bytes
+                    // nobody will ever write.
+                    if pipe.at_end() {
+                        wake_pipe_reader(entry.handle as usize);
+                    }
+                    if pipe.abandoned() {
+                        *slot = None;
+                    }
+                }
             }
             Answer::ok(0)
         }
@@ -1770,6 +2006,44 @@ fn incarnation_of(domain: u32) -> u32 {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     let incarnations = unsafe { &*core::ptr::addr_of!(INCARNATION) };
     incarnations[domain as usize % limits::MAX_DOMAINS]
+}
+
+/// What a descriptor names, and the handle behind it.
+///
+/// The one lookup `read` and `write` share: both have to know whether a number
+/// is a file, a pipe or the console before they can do anything with it, and
+/// neither should have to reach into the process table itself to find out.
+fn descriptor_kind(request: &PersonalityCall, fd: u64) -> Option<(Kind, u64)> {
+    let descriptor = i32::try_from(fd).ok()?;
+    let process = process_for(request.domain)?;
+    let entry = process.descriptors.get(descriptor)?;
+    Some((entry.kind, entry.handle))
+}
+
+/// Takes a wake slot for something that is not a futex.
+///
+/// **One pool, because parking a thread is parking a thread.** A pipe reader
+/// waiting for bytes and a thread waiting on a futex word want the same
+/// mechanism, and two pools would mean two ways to get a wake-up wrong. The
+/// slot is marked with a domain no hosted domain can have, so a `futex(WAKE)`
+/// — which matches on the domain and address a sleeper gave — can never find
+/// it.
+fn claim_wake() -> Option<usize> {
+    let table = sleepers();
+    let index = table.iter().position(|sleeper| sleeper.domain == 0)?;
+    table[index] = Sleeper {
+        domain: u32::MAX,
+        address: 0,
+        arrived: 0,
+    };
+    Some(index)
+}
+
+/// Gives a wake slot back.
+fn release_wake(index: usize) {
+    if let Some(sleeper) = sleepers().get_mut(index) {
+        sleeper.domain = 0;
+    }
 }
 
 /// Answers a hosted `futex` — RFC 0032 step 10.

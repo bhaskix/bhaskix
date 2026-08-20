@@ -1935,87 +1935,122 @@ pub static ADAPTER_REFUSAL: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// a page needs somewhere to put it *per thread*, which is RFC 0032 step 4's
 /// work rather than a thing to improvise here.
 fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64> {
-    let answer = ask_adapter_full(
-        u64::from(call.domain),
-        call.number,
-        [call.first(), call.second(), call.third(), call.fourth()],
-    )?;
-    match answer.0 {
-        // **The adapter needs more than a message can carry.** Some Linux
-        // calls take five or six arguments and a message has four, so the
-        // caller's whole register frame is staged in a slot and the question
-        // asked again. The nucleus never learns *which* calls those are,
-        // which is the point -- teaching it would be Linux knowledge arriving
-        // by the back door -- and only the calls that need it pay for it.
-        crate::fault::reply::NEED_FRAME => {
-            let slot = crate::fault::stage_frame(frame)?;
-            let again = ask_adapter_full(
-                u64::from(call.domain),
-                crate::fault::FRAME_METHOD,
-                [slot as u64, call.number, 0, 0],
-            );
-            let value = match again {
-                Some((crate::fault::reply::RESTORE, _)) => {
-                    restore_from_slot(frame, slot);
-                    crate::fault::give_back(slot);
-                    RESTORED.fetch_add(1, Ordering::Relaxed);
-                    return Some(frame.kind);
-                }
-                Some((_, value)) => Some(value),
-                None => None,
-            };
-            crate::fault::give_back(slot);
-            value
-        }
-        // Resume from a register image rather than from a value, which is
-        // what `rt_sigreturn` is: the answer is not a number, it is the
-        // thread's own state as its handler left it.
-        crate::fault::reply::RESTORE => {
-            let slot = usize::try_from(answer.1).ok()?;
-            restore_from_slot(frame, slot);
-            crate::fault::give_back(slot);
-            RESTORED.fetch_add(1, Ordering::Relaxed);
-            Some(frame.kind)
-        }
-        // Acts on the *caller* that only the kernel can perform, chosen by
-        // the dialect that knows what the call meant. None of them is a Linux
-        // concept: giving up a slice, ending a thread, ending a domain.
-        crate::fault::reply::YIELD => {
-            crate::sched::yield_now();
-            Some(answer.1)
-        }
-        // The reply that blocks. The adapter names one of the notifications it
-        // was granted at boot; the kernel parks *this* thread on it and
-        // answers zero when somebody signals it. One notification per parked
-        // waiter, which is what makes an exact wake count possible in ring 3
-        // and what `notify::wait`'s single-waiter rule wants anyway.
-        crate::fault::reply::BLOCK_ON => {
-            let Some(notification) = adapter_notification(answer.1) else {
-                // The adapter named something that is not a notification it
-                // holds. That is the adapter being wrong, not the caller, and
-                // a hosted program is told the truth it can act on: nothing
-                // slept, try again.
-                return Some(-11i64 as u64); // EAGAIN
-            };
-            BLOCKED.fetch_add(1, Ordering::Relaxed);
-            match crate::notify::wait(notification) {
-                Ok(_) => Some(0),
-                // Congested means another thread is already parked on this
-                // notification -- the adapter handed the same one out twice,
-                // which is its bug and is reported as one it cannot hide.
-                Err(_) => Some(-11i64 as u64),
+    // **The loop is for one reply shape**: `BLOCK_ON_RETRY`, which parks the
+    // caller and then asks the same question again. A blocking `read` needs
+    // exactly that -- it must come back with *bytes*, not with the zero a
+    // `futex` is answered when it wakes -- and the alternative, teaching the
+    // nucleus which calls resume with what, is Linux knowledge arriving by the
+    // back door.
+    //
+    // Bounded, because an adapter parking for ever on a condition that never
+    // changes would otherwise loop here for ever. Sixteen turns is more than a
+    // wake-and-retry needs and is not a number a hosted program can choose;
+    // past it the caller is told `EAGAIN`.
+    let mut first = true;
+    for _ in 0..16 {
+        let answer = ask_adapter_counted(
+            u64::from(call.domain),
+            call.number,
+            [call.first(), call.second(), call.third(), call.fourth()],
+            first,
+        )?;
+        first = false;
+        match answer.0 {
+            // **The adapter needs more than a message can carry.** Some Linux
+            // calls take five or six arguments and a message has four, so the
+            // caller's whole register frame is staged in a slot and the question
+            // asked again. The nucleus never learns *which* calls those are,
+            // which is the point -- teaching it would be Linux knowledge arriving
+            // by the back door -- and only the calls that need it pay for it.
+            crate::fault::reply::NEED_FRAME => {
+                let slot = crate::fault::stage_frame(frame)?;
+                let again = ask_adapter_full(
+                    u64::from(call.domain),
+                    crate::fault::FRAME_METHOD,
+                    [slot as u64, call.number, 0, 0],
+                );
+                let value = match again {
+                    Some((crate::fault::reply::RESTORE, _)) => {
+                        restore_from_slot(frame, slot);
+                        crate::fault::give_back(slot);
+                        RESTORED.fetch_add(1, Ordering::Relaxed);
+                        return Some(frame.kind);
+                    }
+                    Some((_, value)) => Some(value),
+                    None => None,
+                };
+                crate::fault::give_back(slot);
+                return value;
             }
+            // Resume from a register image rather than from a value, which is
+            // what `rt_sigreturn` is: the answer is not a number, it is the
+            // thread's own state as its handler left it.
+            crate::fault::reply::RESTORE => {
+                let slot = usize::try_from(answer.1).ok()?;
+                restore_from_slot(frame, slot);
+                crate::fault::give_back(slot);
+                RESTORED.fetch_add(1, Ordering::Relaxed);
+                return Some(frame.kind);
+            }
+            // Acts on the *caller* that only the kernel can perform, chosen by
+            // the dialect that knows what the call meant. None of them is a Linux
+            // concept: giving up a slice, ending a thread, ending a domain.
+            crate::fault::reply::YIELD => {
+                crate::sched::yield_now();
+                return Some(answer.1);
+            }
+            // The reply that blocks. The adapter names one of the notifications it
+            // was granted at boot; the kernel parks *this* thread on it and
+            // answers zero when somebody signals it. One notification per parked
+            // waiter, which is what makes an exact wake count possible in ring 3
+            // and what `notify::wait`'s single-waiter rule wants anyway.
+            crate::fault::reply::BLOCK_ON_RETRY => {
+                // **Park, and then ask the same question again** -- RFC 0033 step
+                // 7. The difference from `BLOCK_ON` is what the caller gets when it
+                // wakes: a `futex` is answered zero, which is what Linux's futex
+                // returns, but a `read` answered zero has been told *end of file*.
+                // So this shape resumes the call rather than completing it, and the
+                // adapter answers the second time with the bytes that woke it.
+                let Some(notification) = adapter_notification(answer.1) else {
+                    return Some(-11i64 as u64); // EAGAIN
+                };
+                BLOCKED.fetch_add(1, Ordering::Relaxed);
+                if crate::notify::wait(notification).is_err() {
+                    return Some(-11i64 as u64);
+                }
+                continue;
+            }
+            crate::fault::reply::BLOCK_ON => {
+                let Some(notification) = adapter_notification(answer.1) else {
+                    // The adapter named something that is not a notification it
+                    // holds. That is the adapter being wrong, not the caller, and
+                    // a hosted program is told the truth it can act on: nothing
+                    // slept, try again.
+                    return Some(-11i64 as u64); // EAGAIN
+                };
+                BLOCKED.fetch_add(1, Ordering::Relaxed);
+                match crate::notify::wait(notification) {
+                    Ok(_) => return Some(0),
+                    // Congested means another thread is already parked on this
+                    // notification -- the adapter handed the same one out twice,
+                    // which is its bug and is reported as one it cannot hide.
+                    Err(_) => return Some(-11i64 as u64),
+                }
+            }
+            crate::fault::reply::END_THREAD => crate::sched::exit(),
+            crate::fault::reply::END_DOMAIN => {
+                crate::domain::end(
+                    crate::domain::DomainId::from_u32(call.domain),
+                    crate::domain::Ending::Exited,
+                );
+                crate::sched::exit()
+            }
+            _ => return Some(answer.1),
         }
-        crate::fault::reply::END_THREAD => crate::sched::exit(),
-        crate::fault::reply::END_DOMAIN => {
-            crate::domain::end(
-                crate::domain::DomainId::from_u32(call.domain),
-                crate::domain::Ending::Exited,
-            );
-            crate::sched::exit()
-        }
-        _ => Some(answer.1),
     }
+    // Sixteen parks for one call: whatever the adapter is waiting for is not
+    // coming, and a hosted program told to try again can decide for itself.
+    Some(-11i64 as u64)
 }
 
 /// Puts a staged register image back into the system-call frame.
@@ -2067,6 +2102,24 @@ pub fn ask_adapter(domain: u64, what: u64, args: [u64; 4]) -> Option<u64> {
 /// As [`ask_adapter`], but answering the reply's *method* as well as its
 /// value -- which is how the adapter says the answer is not a number.
 fn ask_adapter_full(domain: u64, what: u64, args: [u64; 4]) -> Option<(u64, u64)> {
+    ask_adapter_counted(domain, what, args, true)
+}
+
+/// As [`ask_adapter_full`], saying whether this ask is a *new* foreign call.
+///
+/// **A retry is the second half of one call, not a second call.** A blocking
+/// `read` parks and asks again (RFC 0033 step 7's `BLOCK_ON_RETRY`), and
+/// counting both asks made the boundary report say `SOME UNCOUNTED` on the
+/// first boot after it existed — the same arithmetic catching the same class of
+/// mistake for the *third* time. The fault path and the frame retry are
+/// excluded by method name; this one cannot be, because a retried `read` is the
+/// same number as the `read`.
+fn ask_adapter_counted(
+    domain: u64,
+    what: u64,
+    args: [u64; 4],
+    counted: bool,
+) -> Option<(u64, u64)> {
     let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
     if endpoint == u64::MAX {
         ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
@@ -2107,7 +2160,8 @@ fn ask_adapter_full(domain: u64, what: u64, args: [u64; 4]) -> Option<(u64, u64)
                 // again broke the boundary report's arithmetic the first boot
                 // after it existed -- the same instrument catching the same
                 // class of mistake for the second time in two steps.
-                if what != crate::fault::FAULT_METHOD
+                if counted
+                    && what != crate::fault::FAULT_METHOD
                     && what != crate::fault::FRAME_METHOD
                     && what != FORGET_METHOD
                 {

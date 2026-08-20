@@ -631,6 +631,79 @@ lends a second page. **Writing to a file is `EROFS`**, because the capability ca
 a boot gate: proving it needs the exec'd program to read an inherited descriptor, which is another
 hand-assembled program.
 
+## Step 7's record (2026-08-20): a pipe, and the reply shape it turned out to need
+
+**Two hosted threads met through a pipe, and the reader blocked.**
+
+```text
+linux pipe     two hosted threads met through a pipe: the reader parked on an empty one,
+               the writer woke it, and `through a pipe` crossed
+through a pipe                                  <- printed by the reader, after waking
+```
+
+The parent makes a pipe, clones a thread, and reads while it is empty — so it must park, which the
+kernel counts, because only a `BLOCK_ON` reply increments that counter and the only call in this
+probe that can produce one is a read of an empty pipe. The child yields twice and writes; the parent
+wakes with the bytes. **Armed both ways**: answering end of file instead of parking read
+`ended true, a reader parked false`, and a writer that does not wake read `ended false, a reader
+parked true` — the reader hung and its domain never ended.
+
+**The writer can win, and a run where it did proves nothing.** One full suite failed with
+`ended true, a reader parked false`: the child's write landed before the parent's read, so the pipe
+was not empty when the parent looked and nobody parked. That is correct behaviour and no evidence
+about blocking at all — the same shape the clone probe met on 2026-08-19 — so the test detects it,
+says which attempt it was, and runs the rendezvous again rather than reporting it as either success
+or failure. Four attempts, and four races is a failure with its own sentence.
+
+**A pipe is a ring buffer in `bin/linuxd`.** Both ends belong to processes it serves, so joining
+them needs no authority it does not hold; the moment a pipe became an `Endpoint` the kernel would be
+holding state for a dialect it does not interpret. The arithmetic — what a short write means, when
+an empty pipe is end of file rather than a wait, what a write to a pipe nobody reads answers — is
+`personality::pipe`, eight host tests, zero `unsafe`, and it cannot block: it says *whether* a reader
+must wait and the adapter decides *how*.
+
+### `BLOCK_ON` needed a sibling, and the difference is one number
+
+The mechanism from RFC 0032 step 10 parks the caller and answers **zero** when it wakes, which is
+exactly what Linux's `futex` returns. A `read` answered zero has been told **end of file** — and a
+shell pipeline whose reader is told that at its producer's first pause exits. So there is a second
+shape, `BLOCK_ON_RETRY`: park, and when the wake comes **ask the same question again**. The adapter
+answers the second time with the bytes that woke it.
+
+The nucleus still does not know which calls resume with what — teaching it would be Linux knowledge
+arriving by the back door. What it gained is a loop with a bound: sixteen parks for one call, after
+which the caller is told `EAGAIN`, because an adapter waiting for a condition that never changes
+would otherwise loop for ever.
+
+**And the retry broke the boundary accounting, which is the third time that arithmetic has caught
+this class of mistake.** A retried `read` asks the adapter twice for one foreign call, so the report
+said `SOME UNCOUNTED`. The fault path and the frame retry are excluded by *method name*; this one
+cannot be, because a retried `read` is the same number as the `read` — so the ask itself now says
+whether it is a new call.
+
+### One pool for parking, and one waiter per pipe
+
+A pipe reader takes a slot from the **same notification pool** a futex sleeper uses, marked with a
+domain no hosted domain can have so a `futex(WAKE)` can never find it. Parking a thread is parking a
+thread, and two pools would be two ways to get a wake-up wrong.
+
+**One waiter per pipe**, which is what a pipe with one reader has. A second reader parking would
+overwrite the first's slot and strand it — stated at the code rather than guarded, because nothing
+here creates a second reader yet and a guard for a case that cannot arise is a guard nobody can
+test.
+
+**The wake comes after the bytes**, which is the ordering `notify::signal` keeps for the same
+reason: a reader woken before the ring was written would find it empty, park again, and hold the
+wake it was given. And a reader parked on a pipe whose **last writer closes** is woken to be told so,
+or it waits for bytes nobody will write.
+
+### The probe was assembled by a script
+
+Three earlier hosted probes in `kernel/src/lib.rs` had a jump or a `lea` off by one, each costing a
+boot: the offsets, the padding and the labels were counted by hand. This one is a script's output —
+it lays the parent, the child and the message out, then patches its own branch displacements. The
+array in the source is what that script printed.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -756,6 +829,7 @@ later step consumes them.
    inheritance across exec. ✅ *Delivered 2026-08-20 — without `/proc/self/fd`, which needs
    `getdents64` and a synthetic directory; see the record below.*
 7. **Pipes**, and a blocked reader woken by a writer — `BLOCK_ON`, unchanged from step 10.
+   ✅ *Delivered 2026-08-20 — `BLOCK_ON` turned out to need a sibling; see the record below.*
 8. **`fork` by copying**, with the measurement that decides whether stage 2 exists.
 9. **`wait4` on domain death**, over `BIND` and the notification pool.
 10. **The `/proc` subset**, and the leak test: nothing in it names a Bhaskix object.

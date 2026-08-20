@@ -86,6 +86,13 @@ opt-level = "s"
 # The trade is a slot count: 32 slots reserved by arithmetic became one slot
 # per domain that actually exists, in exchange for two lines of `unsafe` and a
 # message per hosted domain per boot.
+# 72 at RFC 0033 step 7, and the six lines are borrows of two new tables: the
+# pipes themselves and the record of who is parked on each. A pipe is a ring
+# buffer in this program -- both its ends belong to processes this program
+# serves, so joining them needs no authority it does not hold, and the moment
+# one became an `Endpoint` the kernel would be holding state for a dialect it
+# does not interpret.
+#
 # 66 at RFC 0033 step 6, and the ten lines are two borrows and one page. Three
 # write the file record the kernel reads back, one is the read of a lent page
 # **of the filesystem service's own cache** -- mapped read-only into this
@@ -113,4 +120,4 @@ opt-level = "s"
 # which is the whole of RFC 0033 -- and it costs four lines of `static mut`
 # borrow in a single-threaded server, and no new authority at all: a pid is a
 # number, and the record holds handles this program already held.
-unsafe_budget = 66
+unsafe_budget = 72

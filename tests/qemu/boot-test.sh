@@ -1674,6 +1674,26 @@ else
     status=1
 fi
 
+# RFC 0033 step 7: two hosted threads meet through a pipe, and the *blocking*
+# half is what this gate is for. The reader finds the pipe empty and parks --
+# which the kernel counts, because only a `BLOCK_ON` reply increments that
+# counter and the only call in this probe that can produce one is a read of an
+# empty pipe. Then the writer wakes it and the bytes cross.
+#
+# Both halves are demanded: the report line, and the message itself on its own.
+# A reader told "end of file" instead of parking would print nothing and the
+# message would be missing; a reader never woken would hang and its domain would
+# never end. Neither failure can produce this pair.
+if grep -qE "linux pipe     two hosted threads met through a pipe: the reader parked on an empty one, the writer woke it, and .through a pipe. crossed \(attempt [1-4]\)" "$LOG" \
+    && grep -qE "^through a pipe" "$LOG"; then
+    pass "a pipe joined two hosted threads: the reader blocked, the writer woke it, the bytes crossed"
+elif grep -qF "linux pipe     skipped" "$LOG"; then
+    pass "no second cpu, so the pipe test was skipped"
+else
+    fail "the pipe test did not conclude: $(grep -aoE 'linux pipe .*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0033 step 6: a hosted program opens a real file and prints what it read.
 #
 # **Two arms, and the dark one is the ordinary case here.** This lane has no
