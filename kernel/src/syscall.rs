@@ -1711,12 +1711,8 @@ use bhaskix_personality::call::{Dialect, PersonalityCall};
 /// reading the file. When the personality moves into a domain (RFC 0031 §5)
 /// this module goes with it and the count becomes zero.
 mod linux {
-    /// `rt_sigaction(sig, act, oldact, sigsetsize)`.
-    pub const RT_SIGACTION: u64 = 13;
     /// `rt_sigreturn()` — never returns to its caller.
     pub const RT_SIGRETURN: u64 = 15;
-    /// `sigaltstack(ss, old_ss)`.
-    pub const SIGALTSTACK: u64 = 131;
     /// `clone(flags, stack, parent_tid, child_tid, tls)`.
     pub const CLONE: u64 = 56;
     /// `futex(uaddr, op, val, timeout, uaddr2, val3)`.
@@ -1745,10 +1741,8 @@ mod linux {
     /// alternative, deriving it from the dispatch, needs the dispatch to be
     /// a table rather than a `match`, which is a change worth making when
     /// the personality moves rather than before.
-    pub const ANSWERED: [u64; 11] = [
-        RT_SIGACTION,
+    pub const ANSWERED: [u64; 9] = [
         RT_SIGRETURN,
-        SIGALTSTACK,
         CLONE,
         FUTEX,
         GETTID,
@@ -2012,89 +2006,6 @@ fn foreign_thread_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
     }
 }
 
-/// Reads a Linux `struct sigaction` out of a hosted process's memory.
-///
-/// Four words: handler, flags, restorer, mask — the x86-64 layout, and the
-/// order matters because `sa_restorer` sits *between* the flags and the mask
-/// on this architecture and nowhere else.
-fn read_sigaction(at: u64) -> Option<bhaskix_personality::signal::Handler> {
-    let mut bytes = [0u8; 32];
-    // SAFETY: the fault-protected read; a bad pointer is reported, not taken.
-    let read =
-        unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), at, bytes.len()) };
-    read.ok()?;
-    let word = |index: usize| -> u64 {
-        let mut value = [0u8; 8];
-        value.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
-        u64::from_le_bytes(value)
-    };
-    Some(bhaskix_personality::signal::Handler {
-        entry: word(0),
-        flags: word(1),
-        restorer: word(2),
-        mask: word(3),
-    })
-}
-
-/// Answers the signal calls a hosted program must make before it can survive
-/// a fault — RFC 0005 step 4. Everything else is still `-ENOSYS`, and that
-/// is the RFC's tiering rather than an omission.
-///
-/// Returns `Some(value)` when the call was answered, `None` to refuse.
-fn foreign_signal_call(call: &PersonalityCall, domain: u32) -> Option<u64> {
-    // **The argument naming that bit twice is now unrepresentable, and the
-    // history is kept because the type is only obviously right once you know
-    // what it prevents.** Linux passes `rdi, rsi, rdx, r10, r8, r9`; the
-    // kernel's `SyscallFrame` calls those `capability`, `method`, `arg0`,
-    // `arg1`, `arg2`, `arg3`, because RFC 0008's ABI is about capabilities.
-    // Reading `arg0` as "the first argument" is therefore reading `rdx` as
-    // `rdi` -- which is exactly what the first version of this function did,
-    // and the symptom was a handler installed for signal-number-nothing and
-    // a fault that found none. A [`PersonalityCall`] has one array in the
-    // dialect's own order and no second naming to confuse it with.
-    let (first, second) = (call.first(), call.second());
-    match call.number {
-        linux::RT_SIGACTION => {
-            // `first` = signal, `second` = the new action, `arg0` = where the
-            // old one goes (ignored: nothing hosted reads it yet, and
-            // pretending to write it would be worse than not).
-            if second == 0 {
-                // Querying, not installing. Answered as success with nothing
-                // written, which is what a caller asking about an unset
-                // handler would see anyway.
-                return Some(0);
-            }
-            let handler = read_sigaction(second)?;
-            crate::signal::install(domain, first, handler)?;
-            Some(0)
-        }
-        linux::SIGALTSTACK => {
-            // `first` = the new stack: base, flags, size.
-            if first == 0 {
-                return Some(0);
-            }
-            let mut bytes = [0u8; 24];
-            // SAFETY: the fault-protected read.
-            let read = unsafe {
-                bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), first, bytes.len())
-            };
-            read.ok()?;
-            let word = |index: usize| -> u64 {
-                let mut value = [0u8; 8];
-                value.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
-                u64::from_le_bytes(value)
-            };
-            let alt = bhaskix_personality::signal::AltStack {
-                base: word(0),
-                flags: word(1),
-                size: word(2),
-            };
-            crate::signal::set_alt_stack(domain, alt).then_some(0)
-        }
-        _ => None,
-    }
-}
-
 fn foreign_call(frame: &mut SyscallFrame) {
     // **The boundary, as a value.** RFC 0031's interface I1: the nucleus is
     // meant to carry a foreign call rather than understand it, and building
@@ -2167,21 +2078,6 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // handler was given, and an answer written over that would be the
     // interrupted program's own register clobbered by its resumption.
     if number == linux::RT_SIGRETURN && crate::signal::sigreturn(frame) {
-        if priced {
-            price_foreign_call(started);
-        }
-        return;
-    }
-
-    // The signal calls, which a hosted program must make before it can
-    // survive a fault. Answered here rather than refused; everything else
-    // still gets `-ENOSYS`, which is the RFC's tiering rather than an
-    // omission. The telemetry event is emitted either way -- an *answered*
-    // foreign call is as much part of the histogram as a refused one.
-    if let Some(domain) = crate::sched::current_domain()
-        && let Some(value) = foreign_signal_call(&call, domain.as_u32())
-    {
-        frame.kind = value;
         if priced {
             price_foreign_call(started);
         }
@@ -2444,20 +2340,33 @@ static ADAPTER_HELD: [core::sync::atomic::AtomicU64; crate::domain::MAX_DOMAINS]
 /// Idempotent per incarnation: the generation is recorded, so this costs one
 /// relaxed load per foreign call once a domain is known.
 fn ensure_adapter_holds(domain: u32) -> bool {
+    ensure_adapter_holds_inner(domain).unwrap_or(false)
+}
+
+/// The forget message: this domain slot has been reused, so whatever the
+/// adapter remembers about it belongs to somebody else.
+///
+/// **A domain id is reused and the adapter keeps state keyed by it.** Signal
+/// dispositions moved out of the nucleus at RFC 0032 step 7, which means a
+/// new domain 3 would inherit the old domain 3's handlers — and a program
+/// that never installed one would survive a fault it should have died on.
+/// This kernel learned the same lesson twice already: once when a thread
+/// outliving its domain decremented its successor's counter, and once when
+/// the adapter was handed a stale `Domain` capability.
+pub const FORGET_METHOD: u64 = u64::MAX - 1;
+
+fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
     let adapter = ADAPTER_DOMAIN.load(Ordering::Relaxed);
     if adapter == u32::MAX {
-        return false;
+        return Some(false);
     }
-    let Some(slot) = ADAPTER_HELD.get(domain as usize) else {
-        return false;
-    };
+    let slot = ADAPTER_HELD.get(domain as usize)?;
     let id = crate::domain::DomainId::from_u32(domain);
-    let Some(generation) = crate::domain::with(id, |owner| owner.generation()) else {
-        return false;
-    };
+    let generation = crate::domain::with(id, |owner| owner.generation())?;
     let wanted = u64::from(generation) + 1;
-    if slot.load(Ordering::Relaxed) == wanted {
-        return true;
+    let held = slot.load(Ordering::Relaxed);
+    if held == wanted {
+        return Some(true);
     }
 
     let handle = cap::with_arena(|arena| {
@@ -2469,9 +2378,7 @@ fn ensure_adapter_holds(domain: u32) -> bool {
             )
             .ok()
     });
-    let Some(handle) = handle else {
-        return false;
-    };
+    let handle = handle?;
     let index = ADAPTER_SLOT_BASE + domain as usize;
     let installed = crate::domain::with(crate::domain::DomainId::from_u32(adapter), |owner| {
         // Whatever a previous incarnation left is taken out first, which
@@ -2480,10 +2387,21 @@ fn ensure_adapter_holds(domain: u32) -> bool {
         owner.cspace.install_at(index, handle).is_ok()
     });
     if installed != Some(true) {
-        return false;
+        return Some(false);
     }
     slot.store(wanted, Ordering::Relaxed);
-    true
+    // **Only when a *previous* incarnation was remembered.** The first grant
+    // for a fresh slot has nothing to forget, and telling the adapter to
+    // forget something it never knew would cost a round trip on the first
+    // foreign call of every hosted program.
+    if held != 0 {
+        let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
+        if endpoint != u64::MAX {
+            let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
+            let _ = crate::ipc::call(endpoint, u64::from(domain), FORGET_METHOD, [0; 4]);
+        }
+    }
+    Some(true)
 }
 
 /// Whether a call spends its time somewhere other than the boundary, and is

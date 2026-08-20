@@ -560,6 +560,62 @@ to ring 3 needs one `unsafe` line — the `enable_interrupts` above. A
 personality leaving the kernel takes its pointer arithmetic with it, which is
 this whole RFC's argument stated as a number.
 
+## Step 7's record (2026-08-20): the personality decides what a fault means, and the kernel stops knowing
+
+**A hosted program's `SIGSEGV` is now delivered by a program in ring 3.** It faults; the kernel
+hands the register file to `bin/linuxd`; the adapter finds the handler *in its own table*,
+builds the `ucontext`, writes it onto the faulting process's stack through a capability, edits
+the registers in the slot, and answers *resume*. The handler runs, reads `cr2` out of the
+`ucontext`, edits the saved `rip`, and `rt_sigreturn` puts it back. The ratchet reads **9**.
+
+**What the kernel no longer knows.** Which signals a domain has handlers for. What a
+`struct sigaction` looks like. Where an alternate stack is. What a `ucontext` contains, or
+that a handler takes three arguments. `kernel/src/signal.rs` was 238 lines and is now the
+`rt_sigreturn` half alone.
+
+**What it kept, and the boundary is worth stating precisely.** It puts registers back — and
+refuses `cs`, `ss` and `IF` whatever the adapter writes, so a personality bug cannot resume a
+hosted program in ring 0 or with interrupts off. It performs copies between an object and a
+domain, on a capability the caller holds. It knows a fault happened and to whom. Nothing in
+that list is Linux-shaped, which is the test RFC 0031's interface I1 sets.
+
+### The hazard that had to be handled with it
+
+**Domain ids are reused, and the adapter now keeps state keyed by them.** A new domain 3
+inheriting the old domain 3's handlers would let a program that never installed one *survive a
+fault it should have died on* — which is worse than a crash, because it is a crash that did
+not happen. So the kernel tells the adapter when a slot is reused, on the same endpoint, under
+a method no Linux number can be. It is sent **only when a previous incarnation was
+remembered**, so a fresh domain's first foreign call does not pay for a round trip that has
+nothing to forget.
+
+This is the third time this kernel has met that hazard in two days: a thread outliving its
+domain decremented its successor's counter; the adapter was handed a stale `Domain`
+capability; and now this. **Reused identifiers are this design's recurring sharp edge**, and
+each occurrence has been found by a different route — a flake, a refusal, and reasoning about
+what moving state means.
+
+### `rt_sigreturn` stays in the nucleus, with a reason rather than a shrug
+
+It needs the interrupted stack pointer to find the frame, and a message carries four words
+that are already the call's own arguments. Giving *every* foreign call a register frame would
+make the hot path pay for one call. The honest fix is a per-call slot when something else
+needs one; until then the kernel restores registers using the layout
+`bhaskix_personality::signal` has always owned, which is the same code the adapter builds them
+with — so the two cannot drift.
+
+Its documented narrowing survives the move unchanged, and is now known to be **structural**:
+`SyscallFrame` holds only the caller-saved registers, because the entry stub only saves those.
+A handler that edits `rbx` in the `ucontext` and expects the edit to take would need the stub
+widened, not the personality moved.
+
+**Armed:** making the adapter decline to find a handler turned the signal round trip red —
+`resumed 0, returned 0` — which is the proof that the delivery is the adapter's and not a
+kernel path still running underneath.
+
+**The kernel's `unsafe` budget fell again**, 1,512 to 1,507. Two steps, two reductions, while
+the machine gained a fault upcall and a personality that decides what a signal means.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -673,4 +729,7 @@ already in hand.
 6. **Signals and the fault path** — the hard one: the faulting thread must be parked and the
    adapter woken.
 6. **Threads and futex** — `SPAWN_THREAD` and `BLOCK_ON`.
-7. **Delete `mod linux`.** The ratchet reads **0**, and T11's mitigation column becomes true.
+7. **Signals move entirely** — the dispositions, the delivery, the decision. ✅ *Delivered
+   2026-08-20; see the record below.*
+8. **Threads and futex**, then delete what is left of `mod linux`. The ratchet reads **0**, and
+   T11's mitigation column becomes true.

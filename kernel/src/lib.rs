@@ -50,7 +50,6 @@ pub mod sched;
 pub mod service;
 pub mod shared;
 pub mod shell;
-/// RFC 0005 step 4: Linux signal delivery for tagged domains.
 pub mod signal;
 pub mod smp;
 pub mod stack;
@@ -2937,7 +2936,6 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
 fn retire_probe(realm: domain::DomainId) {
     domain::destroy(realm);
     wait_for_probe_threads(realm);
-    signal::forget(realm.as_u32());
 }
 
 /// Waits, bounded, for a domain to have no threads left on any runqueue.
@@ -4007,7 +4005,12 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
     const CPU: u32 = 3;
 
-    let delivered_before = signal::DELIVERED.load(Ordering::Relaxed);
+    // **Delivery is counted where delivery happens, which is no longer
+    // here.** The kernel's own `DELIVERED` counter went with the dispositions
+    // to `bin/linuxd` (RFC 0032 step 7); what the kernel still knows is how
+    // many faults it *resumed* on the personality's say-so, which is the same
+    // event seen from the side that performed it.
+    let delivered_before = fault::RESUMED.load(Ordering::Relaxed);
     let returned_before = signal::RETURNED.load(Ordering::Relaxed);
     // Counted so a failure can say *which* failure it is. A probe that made
     // no foreign call at all was dispatched natively -- its dialect was
@@ -4057,7 +4060,7 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
     retire_probe(realm);
 
-    let delivered = signal::DELIVERED.load(Ordering::Relaxed) - delivered_before;
+    let delivered = fault::RESUMED.load(Ordering::Relaxed) - delivered_before;
     let returned = signal::RETURNED.load(Ordering::Relaxed) - returned_before;
     if report_pa != 0 && answers[0] == 0 && answers[1] == 1 && delivered == 1 && returned == 1 {
         println!(

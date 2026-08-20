@@ -308,7 +308,7 @@ workspace = true
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1512
+unsafe_budget = 1507
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is
@@ -400,6 +400,11 @@ unsafe_budget = 1512
 # has and carries the same argument -- the entry is inside a user-executable
 # segment the loader accepted, and the stack address is one past user-writable
 # memory in the space just installed.
+#
+# **1507 at step 7, down again**: signal *delivery* left with its two
+# `uaccess` copies and its trap-frame writes, and what stayed behind --
+# `rt_sigreturn` -- needs one. Two steps, two reductions, while the machine
+# gained a fault upcall and a personality that decides what a signal means.
 #
 # **1512 at step 6, and it went *down* while a subsystem was added.** The
 # memory calls left the nucleus with their `uaccess` copies, and what replaced

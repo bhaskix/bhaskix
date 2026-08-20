@@ -57,4 +57,12 @@ opt-level = "s"
 # arrive in a slot of a shared object and go back the same way, which is why a
 # module that decides what a fault means costs this program five lines and no
 # new authority.
-unsafe_budget = 30
+#
+# 42 at step 7, when signal delivery itself moved here. Twelve more lines, and
+# every one of them reads or writes **this program's own two pages**: the
+# scratch area a copy stages through, and the fault slot a register image
+# arrives in. A hosted process's memory is still reached only by asking the
+# kernel, through a capability, by naming an object -- so the program that now
+# decides what a `SIGSEGV` means holds one endpoint, two pages, and a handle to
+# each domain it hosts.
+unsafe_budget = 42

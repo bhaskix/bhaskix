@@ -247,15 +247,14 @@ fn handle(frame: &mut TrapFrame) {
         }
     }
 
-    // RFC 0005 step 4: in a Linux-tagged domain a fault is not necessarily
-    // the end. Go installs a `SIGSEGV` handler and turns a null dereference
-    // into a panic; delivering the signal is what makes that work, and it
-    // happens *before* the report, because a delivered signal is not an
-    // exception the machine needs to narrate.
-    if frame.from_user_mode() && crate::signal::deliver_for_fault(frame, read_cr2()) {
-        crate::sched::check_user_space(3);
-        return;
-    }
+    // RFC 0005 step 4's delivery used to be here, and is not any more.
+    //
+    // **The kernel no longer knows what a fault means to a Linux program.**
+    // It knows how to hand one over and how to put registers back; deciding
+    // whether a `SIGSEGV` handler wants it, building the `ucontext` a handler
+    // reads, and choosing the alternate stack are all the personality's, and
+    // the personality is in ring 3 (RFC 0032 step 7). What is left below is
+    // the crossing.
     // **A hosted foreign program's fault is that program ending, not an
     // exception the machine needs to narrate.**
     //
@@ -286,27 +285,19 @@ fn handle(frame: &mut TrapFrame) {
         // is leaving the nucleus. See `fault.rs` for why this can block at all
         // and what had to be true first.
         //
-        // Tried after the kernel's own delivery rather than instead of it:
-        // while `rt_sigaction` still lives here, the dispositions the kernel
-        // holds are the only ones there are, and asking the adapter about a
-        // handler it does not yet own would end programs the machine can
-        // still save.
+        // The only path now. It was tried *after* the kernel's own delivery
+        // while `rt_sigaction` still lived in the nucleus, because the
+        // dispositions the kernel held were then the only ones there were.
+        // They are the adapter's, so this is the whole of it.
         if crate::fault::hand_over(frame, read_cr2()) {
             crate::sched::check_user_space(3);
             return;
         }
-        let why = crate::signal::WHY_NOT.load(core::sync::atomic::Ordering::Relaxed);
         println!(
-            "    linux fault    a hosted program faulted at {:#x} (rip {:#x}) and was ended: {}",
+            "    linux fault    a hosted program faulted at {:#x} (rip {:#x}) and was ended: \
+             the personality did not deliver a signal for it",
             read_cr2(),
-            frame.rip,
-            match why {
-                1 => "the faulting thread has no domain",
-                3 => "it had installed no signal handlers at all",
-                4 => "it had installed no handler for SIGSEGV",
-                5 => "the signal frame would not reach its stack",
-                _ => "the personality declined to deliver a signal",
-            }
+            frame.rip
         );
         crate::sched::check_user_space(3);
         end_faulting_domain()

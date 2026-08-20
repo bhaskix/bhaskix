@@ -41,6 +41,7 @@
 use bhaskix_abi::{method, status, syscall};
 use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
 use bhaskix_personality::memory;
+use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
 
 /// One page to report through, written by this program and read by the
 /// kernel. Not a console: this program is started before the console service
@@ -152,6 +153,174 @@ fn trace(addr: u64, length: u64, pages: u64, protection: u64, fixed: bool, hinte
 
 /// How many `mmap` requests have been traced.
 static TRACED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Turns a fault into a signal, or says the program should end.
+///
+/// **This is the decision RFC 0005 built signal delivery for**: Go installs a
+/// `SIGSEGV` handler and turns a null dereference into a recovered panic, and
+/// until 2026-08-20 the nucleus made this call. Everything it needs is here
+/// now — the dispositions this program keeps, the frame layout
+/// `bhaskix_personality::signal` has always owned, and two capability
+/// invocations to reach the faulting process's memory and registers.
+fn deliver(domain: u32, slot: u64, address: u64) -> u64 {
+    let Some(handler) = dispositions_of(domain).handler(SIGSEGV) else {
+        // Nothing wanted it. Ending is the honest answer, and the kernel says
+        // so in one line rather than narrating an exception the machine did
+        // not suffer.
+        return FAULT_END;
+    };
+
+    let mut image = [0u64; FAULT_REGISTERS];
+    if !read_slot(slot, &mut image) {
+        return FAULT_END;
+    }
+    let registers = Registers {
+        rax: image[0],
+        rbx: image[1],
+        rcx: image[2],
+        rdx: image[3],
+        rsi: image[4],
+        rdi: image[5],
+        rbp: image[6],
+        r8: image[7],
+        r9: image[8],
+        r10: image[9],
+        r11: image[10],
+        r12: image[11],
+        r13: image[12],
+        r14: image[13],
+        r15: image[14],
+        rip: image[15],
+        eflags: image[16],
+        rsp: image[17],
+        cr2: address,
+    };
+
+    // Below the delivery stack's top, sixteen-aligned as the ABI requires --
+    // and the return address then leaves `rsp % 16 == 8` at the handler's
+    // first instruction, exactly as a `call` would.
+    let top = dispositions_of(domain).delivery_stack(SIGSEGV, registers.rsp);
+    let frame_at = (top - FRAME_BYTES as u64) & !15;
+
+    let mut frame = [0u8; FRAME_BYTES];
+    frame[..8].copy_from_slice(&handler.restorer.to_le_bytes());
+    frame[8 + SIGINFO_ADDR..8 + SIGINFO_ADDR + 8].copy_from_slice(&address.to_le_bytes());
+    if registers
+        .write_sigcontext(&mut frame[8 + SIGINFO_BYTES + UCONTEXT_MCONTEXT..])
+        .is_err()
+    {
+        return FAULT_END;
+    }
+    // Into the hosted process's own stack. A process whose stack is unmapped
+    // gets an ending rather than a delivery, which is what the kernel did.
+    if !copy_out(domain, frame_at, &frame) {
+        return FAULT_END;
+    }
+
+    // The handler's three arguments and the redirect, written back into the
+    // slot the kernel will resume from. It may move this program's
+    // instruction pointer and stack and nothing else -- the kernel refuses
+    // `cs`, `ss` and the interrupt flag whatever is written here.
+    let mut edited = image;
+    edited[5] = SIGSEGV;
+    edited[4] = frame_at + 8;
+    edited[3] = frame_at + 8 + SIGINFO_BYTES as u64;
+    edited[15] = handler.entry;
+    edited[17] = frame_at;
+    if !write_slot(slot, &edited) {
+        return FAULT_END;
+    }
+    FAULT_RESUME
+}
+
+/// How many register words a fault slot carries, in the kernel's order.
+const FAULT_REGISTERS: usize = 19;
+/// Where a slot's register words begin, after the address and error code.
+const FAULT_FIRST_REGISTER: u64 = 16;
+
+/// Reads a fault slot's register image.
+fn read_slot(slot: u64, out: &mut [u64; FAULT_REGISTERS]) -> bool {
+    if slot >= 8 {
+        return false;
+    }
+    let at = FAULTS_AT + slot * FAULT_SLOT_BYTES + FAULT_FIRST_REGISTER;
+    for (index, word) in out.iter_mut().enumerate() {
+        // SAFETY: inside the fault page this program mapped from the object
+        // it holds; `slot` is bounded above and the image is nineteen words
+        // inside a 512-byte slot.
+        *word = unsafe { core::ptr::read_volatile((at + index as u64 * 8) as *const u64) };
+    }
+    true
+}
+
+/// Writes a fault slot's register image back.
+fn write_slot(slot: u64, image: &[u64; FAULT_REGISTERS]) -> bool {
+    if slot >= 8 {
+        return false;
+    }
+    let at = FAULTS_AT + slot * FAULT_SLOT_BYTES + FAULT_FIRST_REGISTER;
+    for (index, word) in image.iter().enumerate() {
+        // SAFETY: as `read_slot`, in the other direction.
+        unsafe { core::ptr::write_volatile((at + index as u64 * 8) as *mut u64, *word) };
+    }
+    true
+}
+
+/// Reads bytes out of a hosted process's memory, through the capability this
+/// program holds for its domain.
+///
+/// Via the scratch area of the report page: a copy names an **object** rather
+/// than an address, so the kernel is never asked to validate two addresses in
+/// two address spaces — RFC 0032's shape, and the reason this program cannot
+/// ask for bytes to land anywhere it could not already write.
+fn copy_in(domain: u32, address: u64, out: &mut [u8]) -> bool {
+    if out.len() > SCRATCH_BYTES as usize {
+        return false;
+    }
+    let moved = call(
+        syscall::INVOKE,
+        SLOT_BASE + u64::from(domain),
+        method::COPY_IN,
+        [REPORT, SCRATCH_AT_OFFSET, address, out.len() as u64],
+    );
+    if moved.status != status::OK {
+        return false;
+    }
+    for (index, byte) in out.iter_mut().enumerate() {
+        // SAFETY: inside the page `ATTACH` mapped from this program's own
+        // object, at the scratch area, bounded by the check above.
+        *byte = unsafe {
+            core::ptr::read_volatile((REPORT_AT + SCRATCH_AT_OFFSET + index as u64) as *const u8)
+        };
+    }
+    true
+}
+
+/// Writes bytes into a hosted process's memory, the same way round.
+fn copy_out(domain: u32, address: u64, bytes: &[u8]) -> bool {
+    if bytes.len() > SCRATCH_BYTES as usize {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        // SAFETY: as `copy_in`, in the other direction.
+        unsafe {
+            core::ptr::write_volatile(
+                (REPORT_AT + SCRATCH_AT_OFFSET + index as u64) as *mut u8,
+                *byte,
+            );
+        }
+    }
+    let moved = call(
+        syscall::INVOKE,
+        SLOT_BASE + u64::from(domain),
+        method::COPY_OUT,
+        [REPORT, SCRATCH_AT_OFFSET, address, bytes.len() as u64],
+    );
+    moved.status == status::OK
+}
+
+/// How much of the report page the copies may use.
+const SCRATCH_BYTES: u64 = 1024;
 
 /// Records that a fault was handed over, in the report page the kernel reads.
 ///
@@ -363,6 +532,65 @@ fn answer(request: &PersonalityCall) -> Answer {
         // takes a slower path for a promise nothing here breaks: no signal is
         // delivered asynchronously, so a mask has nothing to hide from.
         RT_SIGPROCMASK => Answer::ok(0),
+        // Installing a handler. The `struct sigaction` is in the hosted
+        // process's memory, so it is read the only way this program can read
+        // anything of a process it hosts: through the capability it holds for
+        // that domain.
+        //
+        // **Querying is answered as success with nothing written.** A caller
+        // asking about an unset handler would see exactly that anyway, and
+        // pretending to write the old one would be worse than not.
+        RT_SIGACTION => {
+            let (number, act) = (request.first(), request.second());
+            if act == 0 {
+                return Answer::ok(0);
+            }
+            let mut bytes = [0u8; 32];
+            if !copy_in(request.domain, act, &mut bytes) {
+                return Answer::error(bhaskix_personality::socket::errno::EFAULT);
+            }
+            let word = |index: usize| -> u64 {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+                u64::from_le_bytes(eight)
+            };
+            // The x86-64 order, and `sa_restorer` between the flags and the
+            // mask is the part a translator gets wrong from memory.
+            let handler = signal::Handler {
+                entry: word(0),
+                flags: word(1),
+                restorer: word(2),
+                mask: word(3),
+            };
+            if dispositions_of(request.domain)
+                .install(number, handler)
+                .is_err()
+            {
+                return Answer::error(memory::errno::EINVAL);
+            }
+            Answer::ok(0)
+        }
+        SIGALTSTACK => {
+            let new = request.first();
+            if new == 0 {
+                return Answer::ok(0);
+            }
+            let mut bytes = [0u8; 24];
+            if !copy_in(request.domain, new, &mut bytes) {
+                return Answer::error(bhaskix_personality::socket::errno::EFAULT);
+            }
+            let word = |index: usize| -> u64 {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+                u64::from_le_bytes(eight)
+            };
+            dispositions_of(request.domain).set_alt_stack(signal::AltStack {
+                base: word(0),
+                flags: word(1),
+                size: word(2),
+            });
+            Answer::ok(0)
+        }
         // The affinity mask, written into the caller's own memory through the
         // one capability this program holds for it. **This is the first call
         // to reach into a hosted process's memory from ring 3** — everything
@@ -422,20 +650,67 @@ const SCHED_GETAFFINITY: u64 = 204;
 const FAULT_METHOD: u64 = u64::MAX;
 /// End the faulting program.
 const FAULT_END: u64 = 0;
-/// Resume it, with the registers left in the slot. Not sent yet: this program
-/// does not own the signal dispositions until they move, so it has nothing to
-/// resume *into*. Kept because the kernel already understands it and the arm
-/// that sends it is the next step's whole content.
+/// Resume it, with the registers left in the slot.
 #[expect(
     dead_code,
     reason = "the kernel's half of step 6 exists before the adapter's"
 )]
 const FAULT_RESUME: u64 = 1;
+/// The method that says a domain slot has been reused, so whatever this
+/// program remembers about it belongs to somebody else.
+///
+/// **A domain id is reused and this program keeps state keyed by it.** A new
+/// domain 3 inheriting the old domain 3's signal handlers would let a program
+/// that never installed one survive a fault it should have died on — which is
+/// worse than a crash, because it is a crash that did not happen.
+const FORGET_METHOD: u64 = u64::MAX - 1;
+
 /// Where the fault exchange page sits in this program's own space.
 const FAULTS: u64 = 2;
 const FAULTS_AT: u64 = 0x0000_0000_1F00_0000;
 /// Bytes per fault slot, and how many faults were handed over.
 const FAULT_SLOT_BYTES: u64 = 512;
+
+/// `rt_sigaction(sig, act, oldact, sigsetsize)`.
+const RT_SIGACTION: u64 = 13;
+/// `sigaltstack(ss, old_ss)`.
+const SIGALTSTACK: u64 = 131;
+
+/// What each hosted domain has asked for, by domain id.
+///
+/// **This is the personality's own state, and its being here rather than in
+/// the nucleus is the whole of RFC 0005's "where it lives".** A bug in this
+/// table is a bug in one ring 3 program that holds one endpoint, two pages
+/// and a handle to each domain it hosts. It was a kernel table until
+/// 2026-08-20.
+static mut DISPOSITIONS: [Dispositions; 32] = [const { Dispositions::new() }; 32];
+
+/// The dispositions of one domain.
+///
+/// # Safety of the `static mut`
+///
+/// This program has **one thread** and answers one request at a time: the
+/// kernel's IPC gives a server exactly one outstanding reply, so there is no
+/// second caller inside this function and no interrupt that runs its code.
+/// A lock here would be a lock nothing can contend.
+fn dispositions_of(domain: u32) -> &'static mut Dispositions {
+    let index = (domain as usize) % 32;
+    // SAFETY: single-threaded by construction, as above; the index is masked
+    // into the array's own length.
+    unsafe { &mut *core::ptr::addr_of_mut!(DISPOSITIONS[index]) }
+}
+
+/// The bytes of the frame a signal handler is entered on.
+const FRAME_BYTES: usize = 8 + SIGINFO_BYTES + UCONTEXT_BYTES;
+/// A `siginfo_t` is 128 bytes on Linux; only `si_addr` is filled.
+const SIGINFO_BYTES: usize = 128;
+/// Where `si_addr` sits within it.
+const SIGINFO_ADDR: usize = 16;
+/// The part of a `ucontext_t` this builds, up to and including the
+/// `sigcontext` a handler reads and edits.
+const UCONTEXT_BYTES: usize = UCONTEXT_MCONTEXT + signal::sigcontext::SIZE;
+/// Where the `mcontext` starts inside the `ucontext`.
+const UCONTEXT_MCONTEXT: usize = 40;
 
 /// How many processors a hosted program is told it has.
 ///
@@ -558,9 +833,15 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
         // this only ever sees faults nothing wanted — which is exactly the
         // set that should end. When the dispositions move, this arm grows a
         // decision and the kernel's delivery goes away.
+        if received.method == FORGET_METHOD {
+            *dispositions_of(received.badge as u32) = Dispositions::new();
+            let _ = call(syscall::REPLY, 0, 0, [0; 4]);
+            continue;
+        }
         if received.method == FAULT_METHOD {
             faults_seen(args[0], args[1]);
-            let _ = call(syscall::REPLY, 0, 0, [FAULT_END, 0, 0, 0]);
+            let verdict = deliver(received.badge as u32, args[0], args[1]);
+            let _ = call(syscall::REPLY, 0, 0, [verdict, 0, 0, 0]);
             continue;
         }
 
