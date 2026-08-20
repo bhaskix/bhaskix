@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-20** — the other half of architecture question **A6**, opened the day its first half closed. Nothing here is built |
+| **Status** | ✅ **Accepted 2026-08-20** — all ten steps delivered and gated, each gate armed. A hosted process is a record in `bin/linuxd` bound one-to-one to a domain: a pid that survives an `execve`, descriptors that are capabilities the adapter holds, real files, pipes with blocking readers, `fork` by copying, `wait4` with the status the child chose, and a `/proc` that cannot leak what it has never seen. Drafted the same day, as the other half of architecture question **A6** |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`), kernel (`domain`, `vm` limits only), `abi` (one method, and only if a measurement asks for it) |
 | **Milestone** | Phase 2 → **L1** ([RFC 0031](0031-linux-compatibility-as-an-adapter.md)'s application milestones): static binaries, BusyBox, shell utilities |

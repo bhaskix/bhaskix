@@ -69,7 +69,7 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > claim whose limits are not written down is believed further than it should be.**
 
 > **T11 is in scope and is mitigated, as of 2026-08-20 — and this note stays because how it
-> got there is worth more than the tick.**
+> got there, and what it now costs, are worth more than the tick.**
 > [RFC 0005](rfc/0005-linux-abi-compatibility.md) §"Where it lives" requires the Linux personality
 > to run in a **service domain**, precisely so that a bug in the largest untrusted-input parser in
 > the project is a compromise of that domain and not of the kernel. On 2026-08-19 the
@@ -121,11 +121,18 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > which is one endpoint, three pages, a write-only console, sixteen notifications and a handle per
 > hosted domain. There is no ambient root, no device, no memory outside its own objects.
 >
-> **The other half has not happened**: the adapter holds no directory capability, so it cannot reach
-> a filesystem, and `execve` resolves exactly one path — `/bin/execed` — against a program compiled
-> into the adapter itself. When the file surface lands (RFC 0033 step 6), this note grows again,
-> and the sentence to write then is the one about a compromise reaching every hosted process's
-> files.
+> **And the other half happened too, later the same day.** RFC 0033 step 6 gave the adapter a
+> **directory capability** — one directory of the filesystem, `READ` and `DERIVE` and no `WRITE` —
+> so that a hosted process can open a file. So the sentence that note said would have to be written
+> is written here: **a compromised adapter can read every file inside that directory, and every file
+> any hosted process has open.** It cannot write one, cannot reach anything above that directory,
+> and cannot name a directory it was not given — a hosted process's `/` *is* that capability, which
+> is `chroot` by construction rather than by check.
+>
+> The list, in full, as of 2026-08-20: one endpoint, three pages, a write-only console, sixteen
+> notifications, `DomainControl` within a sixteen-domain envelope, one directory, and a supervisor
+> handle per hosted domain. **Every increase on that list is a decision, and each one is recorded in
+> the step that made it** — which is the only way a row like this stays true.
 >
 > Written here rather than only in the RFC because [RFC 0005](rfc/0005-linux-abi-compatibility.md)'s
 > own impact table asked for this row on the day it was drafted — *"The threat model gains an

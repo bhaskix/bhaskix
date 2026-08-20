@@ -269,7 +269,9 @@ derived from what their manifests ask. What remains is libc.
   [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md) records with its correction trigger
   and [security.md](security.md) §1's T11 priced; [RFC 0032](rfc/0032-a-supervisor-interface.md)
   moved it out in ten steps and the nucleus now interprets **no** Linux syscall number, gated on
-  every boot. RFC 0031 is also where this bullet's *destination* is written down — the L1–L4
+  every boot; [RFC 0033](rfc/0033-what-a-hosted-process-is.md), accepted the same day, then said what
+  a hosted process *is* — a record in that service bound one-to-one to a domain — which closes
+  architecture question **A6** and unblocks L1 below. RFC 0031 is also where this bullet's *destination* is written down — the L1–L4
   application milestones below, and the containment they must inherit, all four still unmet
 
 **Exit:** Bhaskix self-hosts its own userspace utilities, does useful network I/O, and boots on its
@@ -315,13 +317,16 @@ defined by tracing a binary. **L** rows are *applications*.
 **L1 is the first row whose prerequisite is a decision rather than code.** Every call it names —
 `execve`, `wait4`, `pipe2`, `openat`, `/proc/self/*` — means something different depending on
 whether a Linux process is a Bhaskix domain or a share of one, and on where its descriptor table
-lives. That is [RFC 0033](rfc/0033-what-a-hosted-process-is.md), which is a draft: the row below
-cannot start before it is settled, and says so rather than discovering it halfway.
+lives. That is [RFC 0033](rfc/0033-what-a-hosted-process-is.md), and it is **settled — accepted
+2026-08-20**, all ten steps built and gated: a Linux process is a record in `bin/linuxd` bound
+one-to-one to a domain, its pid invented in ring 3 and surviving an `execve`, its descriptors
+capabilities the adapter holds. The row below can start, and what it is still missing is now a list
+of named calls rather than an undecided shape.
 
 | | Target | What it demands beyond the row above | Status |
 |---|---|---|---|
-| **L1** | Static ELF binaries, BusyBox, shell utilities, `curl`, OpenSSH | Tier 1's file surface, `execve`, pipes, a `/proc` subset, terminal `ioctl`s — and, before any of them, **what a hosted process is** ([RFC 0033](rfc/0033-what-a-hosted-process-is.md), drafted 2026-08-20): a process record and a pid that survives an exec, a descriptor table held by the adapter, and three fixed tables raised — this machine holds **five** concurrent hosted processes today | ⬜ not started — today a static Go binary loads, runs and traces 212 calls, answered entirely from ring 3 |
-| **L2** | Python, GCC, Clang, Rust, Go toolchains | The dynamic linker and a real libc's expectations, `fork`, process groups, filesystem breadth | ⬜ not started |
+| **L1** | Static ELF binaries, BusyBox, shell utilities, `curl`, OpenSSH | Its prerequisite is **met**: [RFC 0033](rfc/0033-what-a-hosted-process-is.md), accepted 2026-08-20, gave it a process record, a pid that survives an `execve`, a descriptor table held by the adapter, real `openat`/`read`/`close`/`dup`, `pipe2` with a reader that parks, `fork`, `wait4` and `/proc/self/{status,maps}`. What is left is **breadth, not shape**: terminal `ioctl`s, `getdents`, `stat`, a writable path, argv and environment through `execve`, and the signal gaps a shell notices | 🔨 **started 2026-08-20** — a static Go binary loads, runs and traces 212 calls, and seven hosted probes exercise the process surface; **no BusyBox has run** |
+| **L2** | Python, GCC, Clang, Rust, Go toolchains | The dynamic linker and a real libc's expectations, process groups, filesystem breadth — and **a forked child's full register file**, which RFC 0033 left open on purpose: today a child gets `rax`, `rsp` and `rip`, and the rest needs the syscall entry stub widened on the hottest path in the system, measured before and after | ⬜ not started |
 | **L3** | nginx, Apache, PostgreSQL, MariaDB | Tier 2 sockets and `epoll`, `mmap`-heavy storage, `fsync` durability, users and permissions | ⬜ not started |
 | **L4** | Larger server software, container workloads | Resource control mapped onto `ResourceEnvelope`, image formats, orchestration | ⬜ not started |
 
