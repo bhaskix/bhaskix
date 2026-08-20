@@ -43,7 +43,7 @@ use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
 use bhaskix_personality::file::Kind;
 use bhaskix_personality::memory;
 use bhaskix_personality::pipe::Pipe;
-use bhaskix_personality::process::{Exit, Process, Processes};
+use bhaskix_personality::process::{Exit, Process, Processes, Region};
 use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
 
@@ -241,6 +241,25 @@ fn trace_file(opened: i64, read: i64, size: u64) {
     }
 }
 
+/// Where the fork record sits, three words past the file record.
+const FORK_RECORD_AT: u64 = FILE_RECORD_AT + 24;
+
+/// Records what a `fork` cost: the child's pid and the bytes copied.
+///
+/// **The number step 8 exists to produce.** RFC 0033 writes stage two — a
+/// copy-on-write `COPY_SPACE` in the nucleus — as something to build only if a
+/// measurement says so, and this is the measurement's own half of it: how much
+/// was moved, by a fork that moved all of it.
+fn trace_fork(pid: u32, copied: u64) {
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // past the mmap records, the scratch area, the exec record and the file
+    // record.
+    unsafe {
+        core::ptr::write_volatile(FORK_RECORD_AT as *mut u64, u64::from(pid));
+        core::ptr::write_volatile((FORK_RECORD_AT + 8) as *mut u64, copied);
+    }
+}
+
 /// Records an exec for the kernel's report.
 fn trace_exec(pid: u32, from: u32, to: u32) {
     // SAFETY: inside the page `ATTACH` mapped from this program's own object,
@@ -407,6 +426,19 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
             }
             (REPLY_RESTORE, Answer::ok(slot))
         }
+        FORK => (
+            REPLY_VALUE,
+            answer_fork(
+                &PersonalityCall::new(
+                    Dialect::Linux,
+                    number,
+                    [0; bhaskix_personality::call::ARGUMENTS],
+                    0,
+                    domain,
+                ),
+                &image,
+            ),
+        ),
         _ => (REPLY_VALUE, bhaskix_personality::call::ENOSYS),
     }
 }
@@ -593,7 +625,10 @@ fn invoke(capability: u64, what: u64, args: [u64; 4]) -> Answer {
 fn answer(request: &PersonalityCall) -> (u64, Answer) {
     // The two that cannot be answered from a message alone say so, and the
     // kernel asks again with the caller's register frame.
-    if matches!(request.number, CLONE | RT_SIGRETURN) {
+    // **`fork` needs the frame too**, and for the plainest reason: the child
+    // resumes where the parent's call returns, and only the staged register
+    // image says where that is.
+    if matches!(request.number, CLONE | RT_SIGRETURN | FORK) {
         return (REPLY_NEED_FRAME, Answer::ok(0));
     }
     // Acts on the caller that only the kernel can perform. **Which** of them,
@@ -758,6 +793,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
                 if let Some(wanted) = at.or(hint)
                     && map_at(domain, wanted, pages, protection, replace)
                 {
+                    remember_mapping(request.domain, wanted, pages, protection);
                     return Answer::ok(wanted);
                 }
                 if at.is_some() {
@@ -766,6 +802,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
                 let bytes = pages * memory::PAGE;
                 let address = NEXT_MAPPING.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
                 if map_at(domain, address, pages, protection, 0) {
+                    remember_mapping(request.domain, address, pages, protection);
                     Answer::ok(address)
                 } else {
                     Answer::error(memory::errno::ENOMEM)
@@ -775,21 +812,44 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         MUNMAP => match memory::plan_munmap(request.first(), request.second()) {
             Ok((address, pages)) => {
                 let _ = pages;
-                invoke(
+                let answer = invoke(
                     handle_of(request.domain),
                     method::UNMAP_AT,
                     [address, 0, 0, 0],
-                )
+                );
+                // The list follows the mapping, or a `fork` after an unmap
+                // would copy memory that is not there any more.
+                if answer.value == 0
+                    && let Some(process) = process_for(request.domain)
+                {
+                    process.unmapped(address);
+                }
+                answer
             }
             Err(errno) => Answer::error(errno),
         },
         MPROTECT => {
             match memory::plan_mprotect(request.first(), request.second(), request.third()) {
-                Ok((address, pages, read, write, execute)) => invoke(
-                    handle_of(request.domain),
-                    method::PROTECT_AT,
-                    [address, pages, protection_of(read, write, execute), 0],
-                ),
+                Ok((address, pages, read, write, execute)) => {
+                    let protection = protection_of(read, write, execute);
+                    let answer = invoke(
+                        handle_of(request.domain),
+                        method::PROTECT_AT,
+                        [address, pages, protection, 0],
+                    );
+                    // The list follows the mapping here too, and this one is
+                    // not bookkeeping for its own sake: a `fork` maps the
+                    // child's copy with the protection this list holds, so a
+                    // page made executable after it was mapped would be copied
+                    // as writable-and-not-executable and the child would fault
+                    // on its first instruction.
+                    if answer.value == 0
+                        && let Some(process) = process_for(request.domain)
+                    {
+                        process.protected(address, protection);
+                    }
+                    answer
+                }
                 Err(errno) => Answer::error(errno),
             }
         }
@@ -1041,6 +1101,18 @@ const REPLY_BLOCK_ON: u64 = 7;
 /// What a blocking `read` needs: it must come back with *bytes*, and the zero
 /// a woken `futex` is answered with would be end of file.
 const REPLY_BLOCK_ON_RETRY: u64 = 8;
+
+/// `fork()`.
+const FORK: u64 = 57;
+/// The name a forked child's domain is created under.
+const FORK_NAME_LOW: u64 = u64::from_le_bytes(*b"forked\0\0");
+/// Where the child's trampoline is written, in its own space.
+///
+/// Above everything a hosted program maps for itself: `mmap` hands out
+/// addresses from `0x7000_0000_0000` and a program's own image sits far below
+/// this. A collision would be a region copied over the trampoline, which is
+/// why the address is out of both ranges rather than merely unlikely.
+const FORK_TRAMPOLINE_AT: u64 = 0x0000_0000_3000_0000;
 
 /// `execve(path, argv, envp)`.
 const EXECVE: u64 = 59;
@@ -1478,6 +1550,26 @@ fn write_to_pipe(request: &PersonalityCall, index: usize, buffer: u64, count: u6
     Answer::ok(written as u64)
 }
 
+/// Records that a hosted process has a mapping — RFC 0033 step 8.
+///
+/// **Nothing needed this list until `fork`.** The kernel holds the mapping and
+/// answers the faults; this program answered `mmap` and forgot. A fork has to
+/// *copy* an address space, and the only thing that knows what is in one is
+/// whoever answered every `mmap` for it.
+///
+/// A table that is full is not an error here: the mapping was made, and the
+/// honest consequence is that a later `fork` cannot copy that region. Said in
+/// the record rather than by refusing a call that has already succeeded.
+fn remember_mapping(domain: u32, at: u64, pages: u64, protection: u64) {
+    if let Some(process) = process_for(domain) {
+        let _ = process.mapped(Region {
+            at,
+            pages,
+            protection,
+        });
+    }
+}
+
 /// Answers a hosted `openat` — RFC 0033 step 6.
 ///
 /// **One component, against the directory this program was given.** The
@@ -1856,6 +1948,154 @@ fn one_component(name: &[u8]) -> Option<&[u8]> {
 
 /// The longest path this personality reads out of a hosted program.
 const MAX_NAME: usize = 64;
+
+/// Answers a hosted `fork` — RFC 0033 step 8, stage one.
+///
+/// **By copying, and the copying is the point.** The RFC's stage two is a
+/// copy-on-write `COPY_SPACE` in the nucleus, and it is written down as
+/// something to build *only if a measurement says so* — so this is the
+/// measurement: every region the parent has is mapped in the child and its
+/// bytes moved through an object this program owns, a kilobyte at a time,
+/// with no new kernel mechanism at all.
+///
+/// The child's first instruction is a **trampoline**, three instructions this
+/// program writes into a page of the child's own memory: zero `rax`, and jump
+/// to where the parent's `fork` returns. That is what makes `fork` answer
+/// **0 in the child and the child's pid in the parent** without the kernel
+/// having to start a thread from a register image.
+///
+/// ## What this fork does not carry, said plainly
+///
+/// The child arrives with `rax` zero, the parent's stack pointer, and the
+/// parent's instruction pointer. **Every other register is empty**, because
+/// the only place the parent's registers exist is the CPU and the entry stub
+/// saves the caller-saved set alone (RFC 0032 step 8 recorded that narrowing
+/// and named its price: widening the stub means widening the hottest path in
+/// the system). A hand-written program that expects nothing else survives it;
+/// a compiled one does not, because a Linux `syscall` preserves the
+/// callee-saved registers and its caller relies on that.
+///
+/// So this is a fork that **copies an address space correctly** and hands the
+/// child a register file it should not have to accept. The measurement is
+/// real; the call is not yet one a real program can use, and L2 is where that
+/// has to be true.
+fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Answer {
+    // The parent's own `rip` and `rsp`, out of the frame the kernel staged --
+    // the same two words `rt_sigreturn` reads, at the same offsets, because
+    // there is one register order and both sides write it down.
+    let rip = image[15];
+    let rsp = image[17];
+
+    let made = call(
+        syscall::INVOKE,
+        CONTROL,
+        method::SPAWN,
+        [CHILD, FORK_NAME_LOW, 0, 0],
+    );
+    if made.status != status::OK {
+        return Answer::error(-11); // EAGAIN
+    }
+    let child_domain = made.args[0] as u32;
+    let outcome = build_fork_child(request, rip, rsp);
+    let _ = call(syscall::INVOKE, CHILD, method::DELETE, [0; 4]);
+    let Some(copied) = outcome else {
+        return Answer::error(-12); // ENOMEM
+    };
+
+    // The record last, so that a child which fails to build leaves none.
+    let generation = incarnation_of(child_domain);
+    let Some(parent) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let pid = {
+        // SAFETY: single-threaded by construction, as elsewhere here.
+        let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+        let Ok(pid) = processes.admit(parent.pid, child_domain, generation) else {
+            return Answer::error(-11);
+        };
+        let parent = *parent;
+        if let Some(child) = processes.by_pid_mut(pid) {
+            let identity = (child.pid, child.ppid, child.domain, child.generation);
+            *child = parent.fork_into(identity.0, identity.2, identity.3);
+            child.ppid = identity.1;
+        }
+        pid
+    };
+    trace_fork(pid, copied);
+    Answer::ok(u64::from(pid))
+}
+
+/// Builds the child of a `fork`: its space, its memory, its first thread.
+///
+/// Answers how many bytes were copied, which is the number step 8 exists to
+/// produce.
+fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64> {
+    if call(syscall::INVOKE, CHILD, method::PERSONALITY, [1, 0, 0, 0]).status != status::OK {
+        return None;
+    }
+    if call(syscall::INVOKE, CHILD, method::MAKE_SPACE, [0; 4]).status != status::OK {
+        return None;
+    }
+
+    let mut copied = 0u64;
+    let process = process_for(request.domain)?;
+    let regions = process.regions;
+    let parent = request.domain;
+    for region in regions.iter().flatten() {
+        if !map_at_eager(CHILD, region.at, region.pages, region.protection) {
+            return None;
+        }
+        // A kilobyte at a time, because that is what the scratch object holds
+        // and what one `COPY_IN` may move. Two invocations per kilobyte is the
+        // price stage two exists to argue with.
+        let bytes = region.pages * 4096;
+        let mut moved = 0;
+        while moved < bytes {
+            let take = (bytes - moved).min(SCRATCH_BYTES) as usize;
+            let mut chunk = [0u8; SCRATCH_BYTES as usize];
+            if !copy_in(parent, region.at + moved, &mut chunk[..take]) {
+                // A region with a hole in it -- a lazily mapped page nothing
+                // has touched -- is not an error: there is nothing there to
+                // copy, and the child's own page is already zero.
+                moved += take as u64;
+                continue;
+            }
+            if !copy_out_through(CHILD, region.at + moved, &chunk[..take]) {
+                return None;
+            }
+            moved += take as u64;
+            copied += take as u64;
+        }
+    }
+
+    // The trampoline: `xor eax, eax; movabs rcx, rip; jmp rcx`, in a page of
+    // the child's own memory. Three instructions rather than a kernel method
+    // to start a thread from a register image -- and `rcx` because a `syscall`
+    // destroys it anyway, so no program can be relying on what is in it here.
+    let mut code = [0u8; 16];
+    code[0] = 0x31;
+    code[1] = 0xc0; // xor eax, eax
+    code[2] = 0x48;
+    code[3] = 0xb9; // movabs rcx, imm64
+    code[4..12].copy_from_slice(&rip.to_le_bytes());
+    code[12] = 0xff;
+    code[13] = 0xe1; // jmp rcx
+    if !map_at_eager(CHILD, FORK_TRAMPOLINE_AT, 1, PROT_READ_EXECUTE)
+        || !copy_out_through(CHILD, FORK_TRAMPOLINE_AT, &code)
+    {
+        return None;
+    }
+    let started = call(
+        syscall::INVOKE,
+        CHILD,
+        method::SPAWN_THREAD,
+        [FORK_TRAMPOLINE_AT, rsp, 0, 0],
+    );
+    if started.status != status::OK {
+        return None;
+    }
+    Some(copied)
+}
 
 /// Answers a hosted `execve` — [RFC 0033](../../../docs/rfc/0033-what-a-hosted-process-is.md) step 5.
 ///

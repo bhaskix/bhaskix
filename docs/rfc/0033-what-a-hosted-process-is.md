@@ -704,6 +704,69 @@ boot: the offsets, the padding and the labels were counted by hand. This one is 
 it lays the parent, the child and the message out, then patches its own branch displacements. The
 array in the source is what that script printed.
 
+## Step 8's record (2026-08-20): a fork that copies, and a register file that does not
+
+**A hosted program forked, and its child ran in its own copy of its parent's memory.**
+
+```text
+linux fork     a Linux program forked: the child is pid 6, 8192 bytes of its parent's memory
+               were copied into it a kilobyte at a time, and the child printed what its parent
+               had written there
+copied!                                         <- printed by the child, from its own page
+```
+
+The parent maps two pages, writes eight bytes into one of them, forks, and yields; the **child**
+prints what is at that address in its own address space. A fork that made a domain and started a
+thread but copied nothing prints zeros — armed exactly that way, and the gate went red.
+
+**No new kernel mechanism.** `SPAWN`, `PERSONALITY`, `MAKE_SPACE`, `MAP_AT`, `COPY_IN`, `COPY_OUT`,
+`SPAWN_THREAD` — every one of them already existed, and the fork is a hundred lines of ring 3 code
+over them. The child's first instruction is a **trampoline** the adapter writes into a page of the
+child's own memory: `xor eax, eax; movabs rcx, rip; jmp rcx`. That is what makes `fork` answer zero
+in the child and the child's pid in the parent without the nucleus having to start a thread from a
+register image.
+
+### The measurement, and why it is not the argument this RFC expected
+
+**8,192 bytes, two invocations per kilobyte.** The number the plan wanted was a *ratio* — how much
+worse copying is than copy-on-write — and it is not the number that matters yet, because what step 8
+actually found is that **a fork can only copy the regions the personality knows about**.
+
+The adapter knows a region because it answered the `mmap` that made it. A program the *kernel*
+started by hand — every hosted probe in this tree — has code and a stack the adapter never saw, so a
+fork of it copies neither. The probe had to be rewritten twice to learn this: the first version wrote
+its marker into a kernel-mapped page and the record honestly said `0 bytes copied`; the second copied
+the page but left the child jumping into code its space did not contain, and the fault counter went
+up by one. The third maps a page, **writes its own forking routine into it eight bytes at a time**,
+makes it executable, and jumps in.
+
+So the trigger for stage 2 stands unfired, and the honest reason is that nothing here yet forks
+anything big enough to argue about. The number to beat is recorded — two invocations per kilobyte —
+and the workload that makes it matter is L2's.
+
+### What a forked child does not get, and why it is not a detail
+
+The child arrives with **`rax` zero, its parent's stack pointer, and its parent's instruction
+pointer**. Every other register is empty. The parent's registers exist only in the CPU, and the entry
+stub saves the caller-saved set alone — RFC 0032 step 8 recorded that narrowing and named its price:
+*widening it means widening the hottest path in the system*.
+
+A hand-written program survives that; a compiled one does not, because a Linux `syscall` preserves
+the callee-saved registers and every caller relies on it. **So this is a fork that copies an address
+space correctly and hands the child a register file it should not have to accept.** `fork` is an L2
+requirement, and L2 is where that has to stop being true — by widening the entry stub and paying for
+it on every system call, measured.
+
+### Two mistakes, both bookkeeping, both caught by the machine
+
+- **`mprotect` did not update the region list.** The child's copy was mapped with the protection the
+  region was *created* with, so a page the parent had made executable arrived writable-and-not —
+  and the child faulted on its first instruction, at `rip 0x5000001b`. The list follows the mapping
+  now, and a host test says so.
+- **The report line quoted the gate's marker.** Two arms that should have gone red stayed green,
+  because the kernel printed `copied!` in its own sentence and the gate found it there. The marker
+  is the *child's* to print, and the report no longer says it.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -830,6 +893,8 @@ later step consumes them.
    `getdents64` and a synthetic directory; see the record below.*
 7. **Pipes**, and a blocked reader woken by a writer — `BLOCK_ON`, unchanged from step 10.
    ✅ *Delivered 2026-08-20 — `BLOCK_ON` turned out to need a sibling; see the record below.*
-8. **`fork` by copying**, with the measurement that decides whether stage 2 exists.
+8. **`fork` by copying**, with the measurement that decides whether stage 2 exists. ✅ *Delivered
+   2026-08-20 — and the measurement is not the number this plan expected to argue about; see the
+   record below.*
 9. **`wait4` on domain death**, over `BIND` and the notification pool.
 10. **The `/proc` subset**, and the leak test: nothing in it names a Bhaskix object.

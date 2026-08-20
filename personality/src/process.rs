@@ -77,6 +77,29 @@ pub const MAX_PROCESSES: usize = 32;
 /// that special-cases them finds nothing to special-case.
 pub const FIRST_PID: u32 = 2;
 
+/// How many mapped regions one hosted process may have.
+///
+/// **Sixteen, and it is `fork` that made this table necessary.** Until step 8
+/// the adapter answered `mmap` and forgot: the kernel held the mapping and
+/// nothing needed a list. A fork has to *copy* an address space, and the only
+/// thing that knows what is in one is whoever answered every `mmap` for it.
+/// Sixteen is what a hand-written program and a small runtime both fit inside;
+/// a seventeenth is `ENOMEM`, which is what Linux answers a mapping it cannot
+/// make.
+pub const MAX_REGIONS: usize = 16;
+
+/// One mapped range of a hosted process's memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Region {
+    /// Where it starts.
+    pub at: u64,
+    /// How many pages.
+    pub pages: u64,
+    /// The protection, in the kernel's own encoding — this crate does not
+    /// interpret it, it carries it.
+    pub protection: u64,
+}
+
 /// A hosted process's identity, and what it is entitled to keep.
 #[derive(Clone, Copy, Debug)]
 pub struct Process {
@@ -111,6 +134,8 @@ pub struct Process {
     pub root: u64,
     /// Its open descriptors.
     pub descriptors: Table,
+    /// What is mapped in its address space, so that a `fork` can copy it.
+    pub regions: [Option<Region>; MAX_REGIONS],
     /// What it is doing.
     pub state: State,
 }
@@ -206,8 +231,79 @@ impl Process {
             cwd: 0,
             root: 0,
             descriptors: Table::new(),
+            regions: [None; MAX_REGIONS],
             state: State::Live,
         }
+    }
+
+    /// Records a mapping this process now has.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` when the table is full, which is what Linux answers a mapping
+    /// it cannot make.
+    pub fn mapped(&mut self, region: Region) -> Result<(), i64> {
+        let free = self
+            .regions
+            .iter()
+            .position(Option::is_none)
+            .ok_or(crate::memory::errno::ENOMEM)?;
+        self.regions[free] = Some(region);
+        Ok(())
+    }
+
+    /// Forgets a mapping, by its start address.
+    ///
+    /// **Whole regions only**, which is the same narrowing `mprotect` already
+    /// carries: a partial unmap would split a region, and a list that could
+    /// split is a list that needs merging too. A hosted program that unmaps
+    /// part of a mapping is answered as though it unmapped none of it, and the
+    /// address it named is what this looks for.
+    pub fn unmapped(&mut self, at: u64) -> bool {
+        let found = self
+            .regions
+            .iter()
+            .position(|region| region.is_some_and(|region| region.at == at));
+        match found {
+            Some(index) => {
+                self.regions[index] = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Records that a mapping's protection has changed.
+    ///
+    /// **Whole regions only**, as [`Self::unmapped`]. Answers whether a region
+    /// started there — a `mprotect` of something this list does not know about
+    /// is not an error to the hosted program, it is a mapping the personality
+    /// did not make.
+    ///
+    /// Without this a `fork` maps the child's copy with the protection the
+    /// region was *created* with: a program that mapped a page writable, wrote
+    /// code into it and made it executable would have a child whose copy is
+    /// writable and not executable, and the child would fault on its first
+    /// instruction. That is not hypothetical — it is what the fork probe did,
+    /// at `rip 0x5000001b`.
+    pub fn protected(&mut self, at: u64, protection: u64) -> bool {
+        for region in self.regions.iter_mut().flatten() {
+            if region.at == at {
+                region.protection = protection;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// How many pages this process has mapped, over every region.
+    #[must_use]
+    pub fn mapped_pages(&self) -> u64 {
+        self.regions
+            .iter()
+            .flatten()
+            .map(|region| region.pages)
+            .sum()
     }
 
     /// Rewrites this record for a successful `execve`.
@@ -241,6 +337,11 @@ impl Process {
     ) -> usize {
         self.domain = domain;
         self.generation = generation;
+        // **The old image's memory is not the new one's.** An exec replaces the
+        // address space, so a region list carried across it would describe
+        // mappings that no longer exist — and the first `fork` after an `exec`
+        // would copy them.
+        self.regions = [None; MAX_REGIONS];
         self.descriptors.close_on_exec(released)
     }
 
@@ -266,6 +367,11 @@ impl Process {
             cwd: self.cwd,
             root: self.root,
             descriptors: self.descriptors,
+            // **The child's map is the parent's**, which is what makes a fork
+            // a copy rather than a fresh start: the same addresses, the same
+            // protections, and — once the adapter has copied the bytes — the
+            // same contents.
+            regions: self.regions,
             state: State::Live,
         }
     }
@@ -641,6 +747,106 @@ mod tests {
         assert_eq!(released, 0);
         assert_eq!(process.descriptors.open_count(), 4);
         assert_eq!(process.descriptors.get(3).map(|e| e.handle), Some(42));
+    }
+
+    #[test]
+    fn a_forked_child_inherits_the_map_it_will_be_given_copies_of() {
+        let mut parent = Process::new(9, 2, 3, 1);
+        parent
+            .mapped(Region {
+                at: 0x1000,
+                pages: 2,
+                protection: 2,
+            })
+            .expect("room");
+        parent
+            .mapped(Region {
+                at: 0x8000,
+                pages: 1,
+                protection: 3,
+            })
+            .expect("room");
+        assert_eq!(parent.mapped_pages(), 3);
+
+        let child = parent.fork_into(10, 4, 1);
+        assert_eq!(child.regions, parent.regions, "the same map, page for page");
+        assert_eq!(child.mapped_pages(), 3);
+    }
+
+    #[test]
+    fn an_exec_forgets_the_map_because_the_memory_is_gone() {
+        let mut process = Process::new(9, 2, 3, 1);
+        process
+            .mapped(Region {
+                at: 0x1000,
+                pages: 4,
+                protection: 2,
+            })
+            .expect("room");
+        process.exec_into(11, 2, |_| {});
+        assert_eq!(
+            process.mapped_pages(),
+            0,
+            "a fork after an exec would copy mappings that no longer exist"
+        );
+    }
+
+    #[test]
+    fn a_protection_change_follows_the_region_a_fork_will_copy() {
+        let mut process = Process::new(9, 2, 3, 1);
+        process
+            .mapped(Region {
+                at: 0x5000,
+                pages: 1,
+                protection: 2,
+            })
+            .expect("room");
+        assert!(process.protected(0x5000, 3));
+        assert_eq!(process.regions[0].expect("there").protection, 3);
+        assert!(
+            !process.protected(0x6000, 3),
+            "a region this list does not know about is not one to change"
+        );
+    }
+
+    #[test]
+    fn unmapping_names_the_region_by_where_it_starts() {
+        let mut process = Process::new(9, 2, 3, 1);
+        for at in [0x1000, 0x2000] {
+            process
+                .mapped(Region {
+                    at,
+                    pages: 1,
+                    protection: 2,
+                })
+                .expect("room");
+        }
+        assert!(process.unmapped(0x1000));
+        assert!(!process.unmapped(0x1000), "twice is not a region");
+        assert!(!process.unmapped(0x1800), "the middle of one is not one");
+        assert_eq!(process.mapped_pages(), 1);
+    }
+
+    #[test]
+    fn a_full_region_table_is_enomem_and_not_a_panic() {
+        let mut process = Process::new(9, 2, 3, 1);
+        for index in 0..MAX_REGIONS {
+            process
+                .mapped(Region {
+                    at: 0x1000 * (index as u64 + 1),
+                    pages: 1,
+                    protection: 2,
+                })
+                .expect("room");
+        }
+        assert_eq!(
+            process.mapped(Region {
+                at: 0x9_0000,
+                pages: 1,
+                protection: 2
+            }),
+            Err(crate::memory::errno::ENOMEM)
+        );
     }
 
     #[test]

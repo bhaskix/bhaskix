@@ -1674,6 +1674,26 @@ else
     status=1
 fi
 
+# RFC 0033 step 8: `fork`, by copying. Two things, and the second is the one a
+# fork that "worked" could not fake.
+#
+# The adapter says how many bytes it moved -- the number the whole step exists
+# to produce, because RFC 0033 writes copy-on-write as something to build only
+# if a measurement asks for it. And the **child** prints what its parent wrote
+# before forking, out of its own address space: a fork that made a domain and
+# started a thread but copied nothing would print zeros, and one that shared the
+# page rather than copying it would be a different bug that this probe cannot
+# tell apart -- which is why the parent writes and only the child reads.
+if grep -qE "linux fork     a Linux program forked: the child is pid [1-9][0-9]*, [1-9][0-9]* bytes of its parent's memory were copied" "$LOG" \
+    && grep -qF "copied!" "$LOG"; then
+    pass "a hosted program forked: its child ran, in its own copy of its parent's memory"
+elif grep -qF "linux fork     skipped" "$LOG"; then
+    pass "no second cpu, so the fork test was skipped"
+else
+    fail "the fork test did not conclude: $(grep -aoE 'linux fork .*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0033 step 7: two hosted threads meet through a pipe, and the *blocking*
 # half is what this gate is for. The reader finds the pipe empty and parks --
 # which the kernel counts, because only a `BLOCK_ON` reply increments that

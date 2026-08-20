@@ -554,6 +554,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux pipe     FAILED\x1b[0m");
     }
+    if !fork_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux fork     FAILED\x1b[0m");
+    }
     if !signal_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -4603,6 +4609,124 @@ const EXEC_PROBE_CODE: [u8; 44] = [
     b'/', b'b', b'i', b'n', b'/', b'e', b'x', b'e', b'c', b'e', b'd',
 ];
 
+/// Where the fork probe's code lands in its own space.
+const FORK_PROBE_CODE_AT: u64 = 0x0000_0000_1500_0000;
+
+/// The fork probe, hand-assembled — RFC 0033 step 8.
+///
+/// **What it proves is that the *memory* was copied.** The parent `mmap`s a
+/// page, writes eight bytes into it, forks, and yields; the child prints what
+/// is at that address in **its own** address space.
+///
+/// The `mmap` is not decoration: a fork copies the regions the *personality*
+/// knows about, and the personality knows about a region because it answered
+/// the `mmap` that made it. This probe's code and stack were mapped by the
+/// kernel before it ran, so they are invisible to the adapter and are not
+/// copied — which is exactly right for a program the kernel starts by hand,
+/// and would be wrong for one an `execve` built. Stated here because the first
+/// version of this probe wrote its marker into a kernel-mapped page and the
+/// record honestly said `0 bytes copied`. A fork that made a domain and
+/// started a thread but copied nothing would print eight zeros; one that
+/// shared the page rather than copying it would be a different bug with the
+/// same output, which is why the child writes and the parent does not.
+///
+/// The child is entered through a trampoline `bin/linuxd` writes, so `rax` is
+/// zero there and the parent sees the child's pid — the one branch this blob
+/// takes.
+///
+/// **The probe forks from memory it mapped itself, and that is the whole
+/// shape of what a fork can copy.** A fork copies the regions the
+/// *personality* knows about, and the personality knows a region because it
+/// answered the `mmap` that made it. This probe's own code and stack were
+/// mapped by the kernel before it ran, so they are invisible to the adapter —
+/// and a child whose `rip` pointed into them would jump into memory its space
+/// does not have. So the probe maps a page, **writes the forking routine into
+/// it eight bytes at a time**, makes it executable, maps a second page for the
+/// data, and jumps in. Everything the child needs is then a region the adapter
+/// recorded.
+///
+/// Two earlier versions of this probe failed exactly there: the first wrote
+/// its marker into a kernel-mapped page and the record honestly said `0 bytes
+/// copied`; the second copied the page but left the child jumping into code
+/// its space did not contain, and the fault counter went up by one.
+///
+/// **Both addresses are constants**, because a child arrives with `rax`, its
+/// stack pointer and its instruction pointer and *nothing else* — the parent's
+/// other registers exist only in the CPU, and the entry stub saves the
+/// caller-saved set alone.
+///
+/// Assembled by the same script as the pipe probe: the branch displacement
+/// below is its output, not a count.
+#[rustfmt::skip]
+const FORK_PROBE_CODE: [u8; 447] = [
+    0xbf, 0x00, 0x00, 0x00, 0x50, 0xbe, 0x00, 0x10,
+    0x00, 0x00, 0xba, 0x03, 0x00, 0x00, 0x00, 0x41,
+    0xba, 0x32, 0x00, 0x00, 0x00, 0x49, 0xc7, 0xc0,
+    0xff, 0xff, 0xff, 0xff, 0x4d, 0x31, 0xc9, 0xb8,
+    0x09, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x3d,
+    0x00, 0x00, 0x00, 0x50, 0x0f, 0x85, 0x82, 0x01,
+    0x00, 0x00, 0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00,
+    0x50, 0x48, 0xb8, 0x48, 0xb8, 0x63, 0x6f, 0x70,
+    0x69, 0x65, 0x64, 0x48, 0x89, 0x81, 0x00, 0x00,
+    0x00, 0x00, 0x48, 0xb8, 0x21, 0x0a, 0x48, 0xc7,
+    0xc1, 0x00, 0x00, 0x01, 0x48, 0x89, 0x81, 0x08,
+    0x00, 0x00, 0x00, 0x48, 0xb8, 0x50, 0x48, 0x89,
+    0x01, 0xb8, 0x39, 0x00, 0x00, 0x48, 0x89, 0x81,
+    0x10, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x00, 0x0f,
+    0x05, 0x48, 0x85, 0xc0, 0x74, 0x43, 0x48, 0x89,
+    0x81, 0x18, 0x00, 0x00, 0x00, 0x48, 0xb8, 0xb8,
+    0x18, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xb8, 0x48,
+    0x89, 0x81, 0x20, 0x00, 0x00, 0x00, 0x48, 0xb8,
+    0x18, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xb8, 0x18,
+    0x48, 0x89, 0x81, 0x28, 0x00, 0x00, 0x00, 0x48,
+    0xb8, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xb8, 0x18,
+    0x00, 0x48, 0x89, 0x81, 0x30, 0x00, 0x00, 0x00,
+    0x48, 0xb8, 0x00, 0x00, 0x0f, 0x05, 0xb8, 0x18,
+    0x00, 0x00, 0x48, 0x89, 0x81, 0x38, 0x00, 0x00,
+    0x00, 0x48, 0xb8, 0x00, 0x0f, 0x05, 0xb8, 0x18,
+    0x00, 0x00, 0x00, 0x48, 0x89, 0x81, 0x40, 0x00,
+    0x00, 0x00, 0x48, 0xb8, 0x0f, 0x05, 0xb8, 0x18,
+    0x00, 0x00, 0x00, 0x0f, 0x48, 0x89, 0x81, 0x48,
+    0x00, 0x00, 0x00, 0x48, 0xb8, 0x05, 0xb8, 0x18,
+    0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x89, 0x81,
+    0x50, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x31, 0xff,
+    0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x48, 0x89,
+    0x81, 0x58, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x05,
+    0xeb, 0xfe, 0xbf, 0x01, 0x00, 0x00, 0x00, 0x48,
+    0x89, 0x81, 0x60, 0x00, 0x00, 0x00, 0x48, 0xb8,
+    0xbe, 0x00, 0x00, 0x01, 0x50, 0xba, 0x08, 0x00,
+    0x48, 0x89, 0x81, 0x68, 0x00, 0x00, 0x00, 0x48,
+    0xb8, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00,
+    0x0f, 0x48, 0x89, 0x81, 0x70, 0x00, 0x00, 0x00,
+    0x48, 0xb8, 0x05, 0x31, 0xff, 0xb8, 0x3c, 0x00,
+    0x00, 0x00, 0x48, 0x89, 0x81, 0x78, 0x00, 0x00,
+    0x00, 0x48, 0xb8, 0x0f, 0x05, 0xeb, 0xfe, 0x90,
+    0x90, 0x90, 0x90, 0x48, 0x89, 0x81, 0x80, 0x00,
+    0x00, 0x00, 0xbf, 0x00, 0x00, 0x00, 0x50, 0xbe,
+    0x00, 0x10, 0x00, 0x00, 0xba, 0x05, 0x00, 0x00,
+    0x00, 0xb8, 0x0a, 0x00, 0x00, 0x00, 0x0f, 0x05,
+    0x48, 0x85, 0xc0, 0x0f, 0x85, 0x3b, 0x00, 0x00,
+    0x00, 0xbf, 0x00, 0x00, 0x01, 0x50, 0xbe, 0x00,
+    0x10, 0x00, 0x00, 0xba, 0x03, 0x00, 0x00, 0x00,
+    0x41, 0xba, 0x32, 0x00, 0x00, 0x00, 0x49, 0xc7,
+    0xc0, 0xff, 0xff, 0xff, 0xff, 0x4d, 0x31, 0xc9,
+    0xb8, 0x09, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48,
+    0x3d, 0x00, 0x00, 0x01, 0x50, 0x0f, 0x85, 0x09,
+    0x00, 0x00, 0x00, 0x48, 0xc7, 0xc0, 0x00, 0x00,
+    0x00, 0x50, 0xff, 0xe0, 0x31, 0xff, 0xb8, 0xe7,
+    0x00, 0x00, 0x00, 0x0f, 0x05, 0xeb, 0xfe,
+];
+
+/// What the parent writes before forking, and the child must print.
+///
+/// **Deliberately not named in the report line.** The gate looks for these
+/// bytes in the log, and a report line that contained them would match it —
+/// so the boot would pass with the copy disabled, which is exactly what
+/// happened when this was tried: two arms that should have gone red stayed
+/// green because the kernel was quoting the marker at itself.
+#[expect(dead_code, reason = "the gate reads it from the log, not the kernel")]
+const FORK_PROBE_MARKER: &str = "copied!";
+
 /// Where the pipe probe's code lands in its own space.
 const PIPE_PROBE_CODE_AT: u64 = 0x0000_0000_1400_0000;
 
@@ -4705,6 +4829,50 @@ const FILE_PROBE_CODE: [u8; 71] = [
 /// `enter_ring3` already has and the one every supervisor-built program will
 /// use.
 const FILE_PROBE_NAME_AT: u64 = 128;
+
+/// The thread that becomes the fork probe — RFC 0033 step 8.
+extern "C" fn ring3_forker(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const PAGE_AT: u64 = FORK_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (FORK_PROBE_CODE_AT, Protection::ReadExecute),
+        (PAGE_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(FORK_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the direct
+    // map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            FORK_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            FORK_PROBE_CODE.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page and the
+    // stack is inside the writable one; `rdi` is that page.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(FORK_PROBE_CODE_AT, PAGE_AT + 0x0f00, [PAGE_AT, 0])
+    }
+}
 
 /// The thread that becomes the pipe probe — RFC 0033 step 7.
 extern "C" fn ring3_piper(hhdm_base: u64) -> ! {
@@ -5122,6 +5290,101 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         false
     }
+}
+
+/// RFC 0033 step 8's witness: a hosted program forks, and its memory comes too.
+///
+/// The parent writes eight bytes into a page of its own, forks, and yields; the
+/// child prints what is at that address in **its own** address space. A fork
+/// that made a domain and started a thread but copied nothing would print
+/// zeros, and the gate demands the bytes.
+///
+/// The adapter's own record says what the copy *cost*: the child's pid and how
+/// many bytes were moved. That number is the whole reason this step exists —
+/// RFC 0033 writes copy-on-write as something to build only if a measurement
+/// asks for it.
+fn fork_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux fork     skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let Ok(realm) = domain::create("forker", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux fork     FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    linux fork     FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "forker", ring3_forker, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux fork     FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+    let mut ended = false;
+    for _ in 0..400 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    let (pid, copied) = adapter_fork_record();
+    let right = ended && pid > 0 && copied > 0;
+    if right {
+        println!(
+            "    linux fork     a Linux program forked: the child is pid {pid}, {copied} bytes of \
+             its parent's memory were copied into it a kilobyte at a time, and the child printed \
+             what its parent had written there"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux fork     FAILED: ended {ended}, child pid {pid}, {copied} bytes \
+             copied\x1b[0m"
+        );
+    }
+    right
+}
+
+/// What the adapter's last `fork` did: the child's pid and the bytes copied.
+fn adapter_fork_record() -> (u64, u64) {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return (0, 0);
+    }
+    // Past the `mmap` records, the scratch area, the exec record and the file
+    // record: 256 + 1,024 + 24 + 24.
+    const FIRST_WORD: usize = (8 * 32 + 1024 + 24 + 24) / 8;
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 2];
+    let mut at = 0usize;
+    let taken = shared::drain_into(object, (FIRST_WORD + 2) * 8, &mut |chunk: &[u8]| {
+        for word in chunk.chunks_exact(8) {
+            if at >= FIRST_WORD + 2 {
+                break;
+            }
+            if at >= FIRST_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    if taken.is_none() {
+        return (0, 0);
+    }
+    (record[0], record[1])
 }
 
 /// RFC 0033 step 7's witness: two hosted threads meet through a pipe.
