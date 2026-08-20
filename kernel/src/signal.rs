@@ -75,6 +75,16 @@ pub fn forget(domain: u32) {
     }
 }
 
+/// Why the last undelivered fault was not turned into a signal.
+///
+/// 1 no domain, 2 not a Linux domain, 3 no dispositions at all, 4 no handler
+/// for `SIGSEGV`, 5 the frame would not reach the thread's stack.
+///
+/// A fault that a hosted program was *entitled* to survive and did not is the
+/// difference between a program with a bug and a personality with one, and
+/// the exception report could not tell them apart.
+pub static WHY_NOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// How many signals have been delivered, for the boot report.
 pub static DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// How many `rt_sigreturn`s have resumed a thread.
@@ -125,21 +135,25 @@ pub fn deliver_for_fault(frame: &mut bhaskix_arch::trap::TrapFrame, fault_addres
     use bhaskix_personality::signal::number::SIGSEGV;
 
     let Some(domain) = crate::sched::current_domain() else {
+        WHY_NOT.store(1, core::sync::atomic::Ordering::Relaxed);
         return false;
     };
     let slot = domain.as_u32();
     if crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed) & (1 << (slot % 32))
         == 0
     {
+        WHY_NOT.store(2, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
 
     let (handler, stack_top) = {
         let table = DISPOSITIONS.lock();
         let Some(Some(dispositions)) = table.get(slot as usize) else {
+            WHY_NOT.store(3, core::sync::atomic::Ordering::Relaxed);
             return false;
         };
         let Some(handler) = dispositions.handler(SIGSEGV) else {
+            WHY_NOT.store(4, core::sync::atomic::Ordering::Relaxed);
             return false;
         };
         (handler, dispositions.delivery_stack(SIGSEGV, frame.rsp))

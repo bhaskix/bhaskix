@@ -391,6 +391,84 @@ reproduction produced zeros in all three counters. **What is not known** is whic
 the original failure was, because it happened before they were separated. The next occurrence
 will say. That is the whole of the claim, and it is smaller than "fixed".
 
+## Step 5's record (2026-08-20): `mmap` moves, and moving it found two things nothing else could
+
+`mmap` is answered by `bin/linuxd`. The ratchet moved **14 → 13**, and the memory family is
+complete: every one of `mmap`, `munmap`, `mprotect` and `madvise` is now decided by a program
+in ring 3 and performed through a capability it holds.
+
+**It did not need the shared page this RFC predicted, and the reason is worth stating.** Linux
+passes `mmap` six arguments and an IPC message carries four. The two that do not fit — `fd`
+and `offset` — matter only for a *file* mapping, which this personality refuses whole. So the
+adapter passes `fd = -1` and refuses anything without `MAP_ANONYMOUS`, which reaches the same
+answer for every request either could have refused. **One behaviour changes and it moves
+toward Linux**: the nucleus also refused an anonymous mapping carrying a non-negative fd,
+which Linux ignores. File mappings will need all six and therefore the page; that cost is now
+a written expectation rather than a surprise.
+
+**`MAP_AT` gained two flags, and each is a Linux semantic made explicit rather than assumed.**
+*Lazy* — record the region, take no frame until a page is touched — because a runtime reserves
+address space by the gigabyte and touches a little of it, and an eager mapping would refuse a
+program on a machine with ample memory. *Replace* — Linux's `MAP_FIXED`, whose specification
+is precisely "the overlapping part will be discarded" — opt-in, so the default stays the
+refusal this RFC argued for, and whole-regions-only, so a partial overlap is refused where it
+can be seen rather than approximated.
+
+### What the move found
+
+**Moving `mmap` changed what the Go corpus does, and no amount of reading the diff said why.**
+212 calls became 401 and the complaint changed from "cannot allocate memory" to "out of
+memory". So the adapter was given a report page — it holds no console — and made to trace what
+it is asked. The trace answered in one boot what two rounds of reasoning had not:
+
+```text
+#2 addr 0xc000000000 len 0x4000000 pages 16384 prot 0 hinted
+#3 addr 0xc000000000 len 0x4000000 pages 16384 prot 2 fixed
+```
+
+**Reserve, then commit.** The runtime reserves a 64 MiB arena `PROT_NONE`, then maps *the same
+range* read-write over the top with `MAP_FIXED`. The second was refused, because `MAP_AT`
+would not overlap an existing region — and that refusal was the "out of memory". With the
+replace flag it succeeds, and the runtime goes on to map four more arenas.
+
+**Then it faults, and the fault is a kernel limitation this project has never been able to
+reach before.** Writing to the arena it has just mapped, the fault handler answers *"the fault
+was legal but could not be serviced: could not map the demanded page"* — `paging::map_page`
+could not get page-table frames from the per-CPU reserve, because `0xc000000000` is the first
+address anything on this machine has ever touched in a fresh PML4 slot and it needs three new
+table levels at once. The reserve exists precisely so the fault path never waits on the
+allocator's lock, and it is sized for a page rather than for a page plus its tables.
+
+**That defect is fixed, and the fix was written down before it was needed.** `frames.rs`'s own
+caveat said: *"It does not survive a burst. `RESERVE_FRAMES` faults on one CPU between refills
+is the budget… Sizing it against a real fault rate needs a workload."* The workload arrived.
+Sixteen became sixty-four, faults missed went from one to **zero**, and the arena is served.
+
+**And then the corpus reached something no version of it ever has.** It faults on an
+instruction fetch at `0xffffffffff600000` — the **Linux vsyscall page**. This RFC's parent
+states the opposite as a design assumption: *"No vDSO. Omitting `AT_SYSINFO_EHDR` makes Go
+fall back to real system calls for `clock_gettime`."* **For this Go it does not**: it falls
+back to the legacy vsyscall page, a fixed kernel-half address that must be mapped and
+executable. RFC 0005's assumption is corrected in place, and the requirement is now named
+rather than guessed at.
+
+The number that says how much this changed: the corpus reaches the clock in **10 system calls**
+where it previously thrashed through 212 and then 401. Memory is no longer what stops it.
+
+**One behaviour of the machine changed with it, and it is a principle rather than an
+expedient.** A hosted foreign program faulting with no handler installed used to print the
+full exception report — which claims the machine went wrong, trips every blanket "no
+EXCEPTION" check in the suite, and is untrue: the containment worked, and the kernel's own
+next line says the domain is gone and the machine is still running. RFC 0005 step 4 already
+makes half this argument three lines earlier — *a delivered signal is not an exception the
+machine needs to narrate* — and the other half follows from the same reasoning. It is now one
+line carrying the address, the instruction, **and why no signal was delivered**, because a
+hosted program *entitled* to survive a fault that did not is a personality bug rather than a
+program bug, and nothing else can tell the two apart.
+
+**The corpus is a witness, not a gate**, which is why none of this turned the suite red: what
+the boot demands is that the histogram be printed, and the histogram is the deliverable.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |
@@ -498,8 +576,10 @@ already in hand.
    unchanged. The ratchet moves **18 → 17**, the first time it has moved. ✅ *Delivered
    2026-08-19 — see the record below.*
 4. **The memory calls.** ✅ *Delivered 2026-08-19, three of the four — see the record below.*
-5. **Signals and the fault path** — the hard one: a fault cannot IPC out from
-   `trap.rs:255`, so the faulting thread must be parked and the adapter woken. New
-   mechanism, not an extension.
+5. **`mmap`, and the memory family completed.** ✅ *Delivered 2026-08-20 — see the record
+   below. Signals moved to step 6 when the fault path turned out to need more than an
+   extension.*
+6. **Signals and the fault path** — the hard one: the faulting thread must be parked and the
+   adapter woken.
 6. **Threads and futex** — `SPAWN_THREAD` and `BLOCK_ON`.
 7. **Delete `mod linux`.** The ratchet reads **0**, and T11's mitigation column becomes true.

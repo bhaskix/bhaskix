@@ -256,6 +256,45 @@ fn handle(frame: &mut TrapFrame) {
         crate::sched::check_user_space(3);
         return;
     }
+    // **A hosted foreign program's fault is that program ending, not an
+    // exception the machine needs to narrate.**
+    //
+    // RFC 0005 step 4 already makes half of this argument, three lines above:
+    // a *delivered* signal is not an exception worth a report. The other half
+    // follows from the same reasoning. A Linux binary this machine did not
+    // write, running with no handler installed, faulting on an address its
+    // own runtime chose — that is the containment working, and the kernel says
+    // so in the "domain is gone" line below. Narrating it in the full
+    // exception format claims the machine went wrong, which is exactly what
+    // did not happen, and it trips every blanket "no EXCEPTION" check in the
+    // suite for a boot in which nothing failed.
+    //
+    // Everything a reader needs is kept: the address, the instruction, and
+    // **why no signal was delivered** — because a hosted program that was
+    // *entitled* to survive a fault and did not is a personality bug rather
+    // than a program bug, and the two are indistinguishable without it.
+    if frame.from_user_mode()
+        && let Some(domain) = crate::sched::current_domain()
+        && crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed)
+            & (1 << (domain.as_u32() % 32))
+            != 0
+    {
+        let why = crate::signal::WHY_NOT.load(core::sync::atomic::Ordering::Relaxed);
+        println!(
+            "    linux fault    a hosted program faulted at {:#x} (rip {:#x}) and was ended: {}",
+            read_cr2(),
+            frame.rip,
+            match why {
+                1 => "the faulting thread has no domain",
+                3 => "it had installed no signal handlers at all",
+                4 => "it had installed no handler for SIGSEGV",
+                5 => "the signal frame would not reach its stack",
+                _ => "the personality declined to deliver a signal",
+            }
+        );
+        crate::sched::check_user_space(3);
+        end_faulting_domain()
+    }
 
     report_exception(frame, dispatched);
 

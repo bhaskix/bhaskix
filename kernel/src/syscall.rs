@@ -1717,8 +1717,6 @@ mod linux {
     pub const RT_SIGRETURN: u64 = 15;
     /// `sigaltstack(ss, old_ss)`.
     pub const SIGALTSTACK: u64 = 131;
-    /// `mmap(addr, length, prot, flags, fd, offset)`.
-    pub const MMAP: u64 = 9;
     /// `clone(flags, stack, parent_tid, child_tid, tls)`.
     pub const CLONE: u64 = 56;
     /// `futex(uaddr, op, val, timeout, uaddr2, val3)`.
@@ -1751,11 +1749,10 @@ mod linux {
     /// alternative, deriving it from the dispatch, needs the dispatch to be
     /// a table rather than a `match`, which is a change worth making when
     /// the personality moves rather than before.
-    pub const ANSWERED: [u64; 14] = [
+    pub const ANSWERED: [u64; 13] = [
         RT_SIGACTION,
         RT_SIGRETURN,
         SIGALTSTACK,
-        MMAP,
         CLONE,
         FUTEX,
         GETTID,
@@ -1815,96 +1812,6 @@ fn futex_word(address: u64) -> Option<u32> {
     let read = unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), address, 4) };
     read.ok()?;
     Some(u32::from_le_bytes(bytes))
-}
-
-/// Where the personality places a mapping when the caller says "anywhere".
-///
-/// A bump, downward from a fixed base well clear of anything an image or a
-/// stack occupies. Not an allocator: a hosted program that unmaps and remaps
-/// will drift upward in address space until it runs out, which is a stated
-/// narrowing rather than a bug hiding — the trigger for a real region
-/// allocator is the first program that churns mappings, and Go's heap grows
-/// monotonically enough not to be it.
-static MMAP_NEXT: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0x0000_7000_0000_0000);
-
-/// Answers the Linux memory calls over the region map — RFC 0005 step 5.
-///
-/// The decoding is `bhaskix_personality::memory`'s and host-tested there;
-/// what happens here is the mapping itself, in the *calling* domain's own
-/// address space, which is the whole of rule 2: the personality maps memory
-/// the caller already has a domain to hold, and can no more conjure a frame
-/// than any other program can.
-fn foreign_memory_call(call: &PersonalityCall) -> Option<u64> {
-    use bhaskix_personality::memory::{self, MapPlan};
-
-    let (first, second, third) = (call.first(), call.second(), call.third());
-    match call.number {
-        linux::MMAP => {
-            static TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-            let nth = TRACED.fetch_add(1, Ordering::Relaxed);
-            if nth < 12 {
-                crate::println!(
-                    "    go trace       mmap#{nth} addr={first:#x} len={second:#x} \
-                     prot={third:#x} flags={:#x}",
-                    call.fourth()
-                );
-            }
-            let plan = memory::plan_mmap(first, second, third, call.fourth(), call.fifth() as i64);
-            let MapPlan::Map {
-                at,
-                hint,
-                pages,
-                read,
-                write,
-                execute,
-            } = plan
-            else {
-                let MapPlan::Refuse(errno) = plan else {
-                    return None;
-                };
-                return Some(errno as u64);
-            };
-            let protection = match (read, write, execute) {
-                (_, true, _) => bhaskix_mm::Protection::ReadWrite,
-                (_, _, true) => bhaskix_mm::Protection::ReadExecute,
-                (true, _, _) => bhaskix_mm::Protection::ReadOnly,
-                _ => bhaskix_mm::Protection::None,
-            };
-            let bytes = pages.checked_mul(memory::PAGE)?;
-            // A demand is honoured or refused; a *hint* is tried and then
-            // given up on. Trying it matters: an allocator that asked for
-            // its heap near one address and got another hands the mapping
-            // back, and after enough of those gives up entirely -- which is
-            // exactly how the Go runtime spent step 7 saying "cannot
-            // allocate memory" while nothing here had refused a thing.
-            let attempt = |address: u64| -> Option<bool> {
-                let range =
-                    bhaskix_mm::VirtRange::from_pages(bhaskix_boot::VirtAddr(address), pages)?;
-                crate::vm::with_active(|space| space.map_anonymous_lazy(range, protection).is_ok())
-            };
-            if let Some(wanted) = at.or(hint)
-                && attempt(wanted) == Some(true)
-            {
-                return Some(wanted);
-            }
-            if at.is_some() {
-                return Some(memory::errno::ENOMEM as u64);
-            }
-            let address = MMAP_NEXT.fetch_add(bytes, Ordering::Relaxed);
-            let range = bhaskix_mm::VirtRange::from_pages(bhaskix_boot::VirtAddr(address), pages)?;
-            // Lazily: a hosted program that asks for a gigabyte and touches
-            // a page should pay for a page, which is what Go's allocator
-            // assumes and what the fault handler already provides.
-            let mapped =
-                crate::vm::with_active(|space| space.map_anonymous_lazy(range, protection).is_ok());
-            match mapped {
-                Some(true) => Some(address),
-                _ => Some(memory::errno::ENOMEM as u64),
-            }
-        }
-        _ => None,
-    }
 }
 
 /// Answers the thread and futex calls — RFC 0005 step 6.
@@ -2306,14 +2213,10 @@ fn foreign_call(frame: &mut SyscallFrame) {
         return;
     }
 
-    // The memory calls, RFC 0005 step 5, over this domain's own space.
-    if let Some(value) = foreign_memory_call(&call) {
-        frame.kind = value;
-        if priced {
-            price_foreign_call(started);
-        }
-        return;
-    }
+    // The memory calls used to be tried here. All four now live in
+    // `bin/linuxd` (RFC 0032 steps 4 and 5), so there is nothing between the
+    // signal calls and the thread calls -- which is what this refactor looks
+    // like from inside the nucleus: arms disappearing, one at a time.
 
     // The thread and futex calls, RFC 0005 step 6.
     if let Some(domain) = crate::sched::current_domain()
@@ -3008,7 +2911,39 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             let Some(protection) = protection_from(protection) else {
                 return Some(Outcome::err(Status::WrongObject));
             };
-            if pages == 0 || pages > MAX_SUPERVISED_PAGES {
+            // Bit 0 of the flags asks for a *lazy* mapping: the region is
+            // recorded and no frame is taken until the domain touches a page.
+            //
+            // **This is what a hosted `mmap` needs and an eager mapping cannot
+            // give it.** A Go runtime reserves address space by the gigabyte
+            // and touches a little of it; charging frames for the reservation
+            // would refuse a program on a machine with ample memory. A lazy
+            // mapping is therefore not bounded by `MAX_SUPERVISED_PAGES` --
+            // that bound exists because eager pages cost frames *now*, and
+            // these cost none until they are touched.
+            let lazy = frame.arg3 & 1 != 0;
+            // Bit 1 says the caller *demands* this address and accepts that
+            // whatever is there is discarded -- Linux's `MAP_FIXED`, whose
+            // specification is exactly that: "if the memory region specified
+            // overlaps pages of any existing mapping, then the overlapping
+            // part will be discarded".
+            //
+            // **Opt-in, and the default stays a refusal.** RFC 0032 says a
+            // `MAP_AT` over an existing region is refused rather than silently
+            // replaced, because an adapter that thought it was making a new
+            // mapping and actually replaced a live one is a bug that presents
+            // as memory corruption a long way from its cause. A caller that
+            // means to replace says so.
+            //
+            // Whole regions only, like `PROTECT_AT` and for its reason:
+            // splitting a live range in three because a caller re-mapped its
+            // middle is a different piece of work with its own failure modes.
+            // That is enough for the pattern that motivated it -- a Go runtime
+            // reserves an arena `PROT_NONE` and commits *the same range*
+            // read-write -- and a partial overlap is refused where it can be
+            // seen rather than approximated.
+            let replace = frame.arg3 & 2 != 0;
+            if pages == 0 || (!lazy && pages > MAX_SUPERVISED_PAGES) {
                 return Some(Outcome::err(Status::WrongObject));
             }
             let Some(range) =
@@ -3031,8 +2966,31 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             // laziness for a reservation it will never touch all of. Until
             // then a supervisor pays for what it maps, and the bound below is
             // what stops that being unreasonable.
-            let mapped =
-                crate::vm::with_space(root, |space| space.map_anonymous(range, protection).is_ok());
+            let mapped = crate::vm::with_space(root, |space| {
+                if replace {
+                    // Only an exact match is discarded. `unmap` frees the
+                    // frames of an eager region and has nothing to free for a
+                    // lazy one, which is the common case here: a reservation
+                    // nobody has touched yet.
+                    let exact = space
+                        .regions()
+                        .find(bhaskix_boot::VirtAddr(address))
+                        .is_some_and(|region| {
+                            region.range.start.as_u64() == address && region.range.pages() == pages
+                        });
+                    if exact {
+                        let _ = space.unmap(bhaskix_boot::VirtAddr(address));
+                    }
+                }
+                if lazy {
+                    space.map_anonymous_lazy(range, protection).is_ok()
+                } else {
+                    space.map_anonymous(range, protection).is_ok()
+                }
+            });
+            if replace {
+                crate::tlb::shootdown(address);
+            }
             match mapped {
                 Some(true) => Outcome::ok(address),
                 _ => Outcome::err(Status::QuotaExceeded),

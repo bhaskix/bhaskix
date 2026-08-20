@@ -94,10 +94,26 @@ impl<T> PerCpuCell<T> {
 
 /// Frames each CPU holds ready.
 ///
-/// Small deliberately: every frame here is memory the allocator cannot hand
-/// to anyone else, multiplied by the CPU count. Sixteen is enough for a burst
-/// of faults between two timer interrupts and costs 64 KiB per CPU.
-pub const RESERVE_FRAMES: usize = 16;
+/// Every frame here is memory the allocator cannot hand to anyone else,
+/// multiplied by the CPU count, so this is deliberately small — 64 costs
+/// 256 KiB per CPU.
+///
+/// **Sixteen until 2026-08-20, and the number moved because the workload this
+/// module's own caveat asked for finally arrived.** That caveat said: *"It
+/// does not survive a burst. `RESERVE_FRAMES` faults on one CPU between
+/// refills is the budget… Sizing it against a real fault rate needs a
+/// workload."* The workload is a Go runtime touching a freshly mapped 64 MiB
+/// arena: the first write needs a frame *and three new page-table levels* at
+/// once, because it is the first address anything on this machine has ever
+/// touched in that PML4 slot, and the pages after it come in a burst. Sixteen
+/// was not enough and the fault came back "could not map the demanded page" —
+/// which ends a hosted program that had done nothing wrong.
+///
+/// This is a rate, not a guarantee, and the caveat above still stands: a
+/// reserve that runs dry still falls back to the allocator, and a fault that
+/// finds it held is still unserviceable. Sixty-four converts a failure this
+/// machine can now reproduce into one it does not.
+pub const RESERVE_FRAMES: usize = 64;
 
 /// Refill when fewer than this remain.
 ///

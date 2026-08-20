@@ -228,9 +228,15 @@ pub mod method {
     /// `COPY_OUT(memory, offset, address, length)` on a `Domain` — write a
     /// `Memory` object the caller holds into the target domain's memory.
     pub const COPY_OUT: u64 = 60;
-    /// `MAP_AT(address, pages, protection)` on a `Domain` — anonymous pages in
-    /// the target domain. `protection` is the same encoding `ATTACH` uses, so
-    /// writable-and-executable is not expressible.
+    /// `MAP_AT(address, pages, protection, flags)` on a `Domain` — anonymous
+    /// pages in the target domain. `protection` is the same encoding `ATTACH`
+    /// uses, so writable-and-executable is not expressible.
+    ///
+    /// Bit 0 of `flags` asks for a **lazy** mapping: the region is recorded
+    /// and no frame is taken until the domain touches a page. That is what a
+    /// hosted `mmap` needs — a runtime reserving address space by the
+    /// gigabyte and touching a little of it — and an eager mapping is bounded
+    /// precisely because its pages cost frames at once.
     pub const MAP_AT: u64 = 61;
     /// `UNMAP_AT(address)` on a `Domain` — the region starting there.
     pub const UNMAP_AT: u64 = 62;

@@ -3039,6 +3039,53 @@ fn personality_boundary_report() {
     // program in ring 3 through an IPC round trip. The difference is what the
     // containment costs, and it is a number a reviewer can argue with instead
     // of an estimate.
+    // What the adapter saw, out of the page it writes into. Eight records of
+    // four words: the address and length a hosted program asked for, the pages
+    // and protection it resolved to, and whether it was a demand or a hint.
+    //
+    // **This is RFC 0005's own instruction, one layer out**: when moving
+    // `mmap` changed what the Go corpus does, no amount of reading the diff
+    // said why -- so the adapter traces what it is asked, and the kernel
+    // prints it.
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page != u64::MAX {
+        let object = shared::MemoryId::from_u64(page);
+        let mut records = [[0u64; 4]; 8];
+        let mut at = 0usize;
+        let taken = shared::drain_into(object, 8 * 32, &mut |chunk: &[u8]| {
+            for word in chunk.chunks_exact(8) {
+                if at >= 32 {
+                    break;
+                }
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                records[at / 4][at % 4] = u64::from_le_bytes(eight);
+                at += 1;
+            }
+            chunk.len()
+        });
+        if taken.is_some() {
+            for (index, record) in records.iter().enumerate() {
+                if record[1] == 0 {
+                    continue;
+                }
+                println!(
+                    "    linux mmap     #{index} addr {:#x} len {:#x} pages {} prot {} {}",
+                    record[0],
+                    record[1],
+                    record[2],
+                    record[3] & 0xff,
+                    if record[3] & (1 << 8) != 0 {
+                        "fixed"
+                    } else if record[3] & (1 << 9) != 0 {
+                        "hinted"
+                    } else {
+                        "anywhere"
+                    }
+                );
+            }
+        }
+    }
     let (adapter_priced, adapter_floor, adapter_mean) = syscall::adapter_cost();
     if adapter_priced > 0 {
         println!(
@@ -6879,6 +6926,9 @@ extern "C" fn tcp_domain_entry(hhdm_base: u64) -> ! {
     unsafe { enter_user("tcp domain", entry, rsp, [hertz, 0]) }
 }
 
+/// The page `bin/linuxd` leaves its trace in.
+static ADAPTER_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// Where `bin/linuxd`'s stack lives, and what it is called.
 const LINUXD_STACK: u64 = 0x0000_0000_1D00_0000;
 const LINUXD_STACK_PAGES: u64 = 8;
@@ -6933,9 +6983,22 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     })
     .ok_or("the adapter's endpoint capability would not be created")?;
 
-    if domain::with(realm, |owner| owner.cspace.install_at(0, serving).is_ok()) != Some(true) {
+    // Slot 1: one page to report through. **Not a console** — the adapter is
+    // started before the console service exists, and every other service on
+    // this machine that must say something before there is a console says it
+    // the same way: it writes into a page the kernel reads. `bin/tcpd` has
+    // done this since RFC 0020.
+    let report = shared::create(realm, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the adapter's report page would not be created")?;
+    let named = shared::name(report).map_err(|_| "the adapter's report would not be named")?;
+
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(0, serving).is_ok() && owner.cspace.install_at(1, named).is_ok()
+    }) != Some(true)
+    {
         return Err("the adapter's capabilities would not install");
     }
+    ADAPTER_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
 
     let options = sched::SpawnOptions::new()
         .pinned()

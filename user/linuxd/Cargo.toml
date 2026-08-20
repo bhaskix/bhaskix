@@ -41,9 +41,13 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-# The syscall stub's one block, and nothing else. This program dereferences no
-# pointer: it answers questions about numbers, and the memory of the process it
-# hosts is reached through capabilities rather than through addresses -- which
-# is RFC 0032's whole shape and the reason this budget can stay this small
-# while the personality grows.
-unsafe_budget = 16
+# The syscall stub's one block, and the four stores that write one trace
+# record into a page this program mapped from an object it holds.
+#
+# **The hosted process's memory is still reached through capabilities rather
+# than through addresses** -- which is RFC 0032's whole shape and the reason
+# this budget stays small while the personality grows. The nine lines added at
+# step 5 touch this program's *own* page, at an address it chose, whose frames
+# came from its own object; not one of them names anything belonging to a
+# process it hosts.
+unsafe_budget = 25

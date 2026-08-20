@@ -590,6 +590,20 @@ one, because the Go runtime reads that state directly:
   exchange for latency on a call nothing currently measures. Revisit when there
   is a benchmark that cares.
 
+  > **Correction, 2026-08-20: it does not fall back to a system call.** With
+  > the memory calls working well enough for the corpus to reach its first
+  > clock read, it faults on an *instruction fetch* at `0xffffffffff600000` —
+  > the legacy **vsyscall page**. This Go reaches for that address rather than
+  > issuing `clock_gettime`, so omitting the vDSO does not produce the fallback
+  > this bullet assumed; it produces a fault at a fixed kernel-half address
+  > that would have to be mapped and executable.
+  >
+  > Found by running it, which is this RFC's own instruction. The requirement
+  > is now named — a vsyscall page, or a vDSO after all — and it is not costed
+  > here: mapping a user-executable page in the kernel half touches the shared
+  > higher-half tables every address space copies, which is a decision with a
+  > security dimension and deserves its own RFC rather than a paragraph.
+
 ### The system-call surface, in tiers
 
 The surface is defined by **tracing the actual target binary**, not by reading

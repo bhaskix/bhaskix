@@ -42,8 +42,16 @@ use bhaskix_abi::{method, status, syscall};
 use bhaskix_personality::call::{Answer, Dialect, PersonalityCall};
 use bhaskix_personality::memory;
 
-/// The endpoint hosted domains' calls arrive on, and the **only** capability
-/// this program holds.
+/// One page to report through, written by this program and read by the
+/// kernel. Not a console: this program is started before the console service
+/// exists, and every other service that must say something that early says it
+/// the same way.
+const REPORT: u64 = 1;
+/// Where the report page is mapped in this program's own space.
+const REPORT_AT: u64 = 0x0000_0000_1E00_0000;
+
+/// The endpoint hosted domains' calls arrive on, and the first of the two
+/// capabilities
 ///
 /// Not even a console. It is started before the console service exists —
 /// its first callers are the Linux self-tests, which run long before
@@ -115,6 +123,52 @@ struct Reply {
     args: [u64; 4],
 }
 
+/// Reports the first few `mmap` requests, through the kernel's own report
+/// channel rather than a console this program does not hold.
+///
+/// **The RFC's instruction restated: trace the binary, do not reason about
+/// it.** Moving `mmap` here changed what the Go corpus does — 212 calls
+/// became 401, and its complaint changed from "cannot allocate memory" to
+/// "out of memory" — and no amount of reading the diff would have said why.
+fn trace(addr: u64, length: u64, pages: u64, protection: u64, fixed: bool, hinted: bool) {
+    let seen = TRACED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if seen >= 8 {
+        return;
+    }
+    let at = REPORT_AT + seen * 32;
+    // SAFETY: `REPORT_AT` is where `ATTACH` mapped a writable page of this
+    // program's own object at start-up, and `seen` is bounded to eight
+    // records of four words, which is 256 bytes inside a 4,096-byte page.
+    unsafe {
+        core::ptr::write_volatile(at as *mut u64, addr);
+        core::ptr::write_volatile((at + 8) as *mut u64, length);
+        core::ptr::write_volatile((at + 16) as *mut u64, pages);
+        core::ptr::write_volatile(
+            (at + 24) as *mut u64,
+            protection | (u64::from(fixed) << 8) | (u64::from(hinted) << 9),
+        );
+    }
+}
+
+/// How many `mmap` requests have been traced.
+static TRACED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Maps `pages` lazily at `address` in a hosted domain.
+///
+/// Lazily, because a hosted `mmap` is a *reservation*: a runtime that asks for
+/// a gigabyte and touches a page should pay for a page, which is what Go's
+/// allocator assumes and what an eager mapping would refuse on a machine with
+/// ample memory.
+fn map_at(domain: u64, address: u64, pages: u64, protection: u64, extra: u64) -> bool {
+    let reply = call(
+        syscall::INVOKE,
+        domain,
+        method::MAP_AT,
+        [address, pages, protection, MAP_LAZY | extra],
+    );
+    reply.status == status::OK
+}
+
 /// Invokes a method on a capability, and turns the answer into an `errno`.
 ///
 /// A hosted program is told `-EINVAL` when the invocation was refused: this
@@ -162,6 +216,80 @@ fn answer(request: &PersonalityCall) -> Answer {
         // page shared with the kernel rather than a message — which is also
         // what signal delivery will need, and is therefore one piece of work
         // rather than two.
+        // `mmap`, and the one place this personality's arguments do not all
+        // fit in a message.
+        //
+        // Linux passes six: address, length, protection, flags, **fd** and
+        // offset. An IPC message carries four, and the two that do not fit are
+        // the two that only matter for a *file* mapping — which this
+        // personality refuses whole (RFC 0005 step 5: a file mapping needs a
+        // filesystem capability and a translation from a Linux fd to it, which
+        // is Tier 1's work). So the adapter passes `fd = -1` and refuses
+        // anything without `MAP_ANONYMOUS`, which reaches the same answer for
+        // every request either could have refused.
+        //
+        // **One behaviour changes, and it moves toward Linux rather than
+        // away.** The nucleus also refused an anonymous mapping that carried a
+        // non-negative fd; Linux ignores fd when `MAP_ANONYMOUS` is set, and
+        // now so does this. When file mappings arrive they will need all six
+        // arguments and therefore a page shared with the kernel rather than a
+        // message — which is written down here so it is a known cost and not a
+        // surprise.
+        MMAP => match memory::plan_mmap(
+            request.first(),
+            request.second(),
+            request.third(),
+            request.fourth(),
+            -1,
+        ) {
+            memory::MapPlan::Refuse(errno) => Answer::error(errno),
+            memory::MapPlan::Map {
+                at,
+                hint,
+                pages,
+                read,
+                write,
+                execute,
+            } => {
+                let protection = protection_of(read, write, execute);
+                let domain = SLOT_BASE + u64::from(request.domain);
+                trace(
+                    request.first(),
+                    request.second(),
+                    pages,
+                    protection,
+                    at.is_some(),
+                    hint.is_some(),
+                );
+                // A demand is honoured or refused; a *hint* is tried and then
+                // given up on. Trying it matters: an allocator that asked for
+                // its heap near one address and got another hands the mapping
+                // back, and after enough of those gives up entirely.
+                // A *demand* discards whatever is at the address; a hint does
+                // not. That difference is `MAP_FIXED`, and it is the whole of
+                // the reserve-then-commit pattern a Go runtime uses: reserve
+                // an arena `PROT_NONE`, then map the same range read-write
+                // over the top of it. Refusing the second is what stopped the
+                // corpus at "out of memory", which the adapter's own trace is
+                // what showed.
+                let replace = if at.is_some() { MAP_REPLACE } else { 0 };
+                if let Some(wanted) = at.or(hint)
+                    && map_at(domain, wanted, pages, protection, replace)
+                {
+                    return Answer::ok(wanted);
+                }
+                if at.is_some() {
+                    return Answer::error(memory::errno::ENOMEM);
+                }
+                let bytes = pages * memory::PAGE;
+                let address = NEXT_MAPPING.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+                if map_at(domain, address, pages, protection, 0) {
+                    Answer::ok(address)
+                } else {
+                    Answer::error(memory::errno::ENOMEM)
+                }
+            }
+        },
         MUNMAP => match memory::plan_munmap(request.first(), request.second()) {
             Ok((address, pages)) => {
                 let _ = pages;
@@ -197,6 +325,10 @@ fn answer(request: &PersonalityCall) -> Answer {
 
 /// `getpid()`, from Linux's `x86_64` table.
 const GETPID: u64 = 39;
+/// `mmap(addr, length, prot, flags, fd, offset)` — six arguments, of which
+/// this personality needs four. See [`answer`] for why that is sound and
+/// what changes when file mappings arrive.
+const MMAP: u64 = 9;
 /// `munmap(addr, length)`.
 const MUNMAP: u64 = 11;
 /// `mprotect(addr, length, prot)`.
@@ -215,6 +347,24 @@ const MADVISE: u64 = 28;
 /// Without it this program can answer questions about numbers and nothing
 /// else, which is what it could do an hour ago.
 const SLOT_BASE: u64 = 32;
+
+/// `MAP_AT`'s lazy flag: record the region, take no frame until it is touched.
+const MAP_LAZY: u64 = 1;
+/// `MAP_AT`'s replace flag — Linux's `MAP_FIXED`: this address, and whatever
+/// is there is discarded.
+const MAP_REPLACE: u64 = 2;
+
+/// Where an `mmap` with no address of its own is put.
+///
+/// A bump, and it is **the personality's policy rather than the kernel's** —
+/// which is the whole point of the call having moved. Addresses are per
+/// address space, so one counter serves every hosted domain: the same number
+/// in two of them names two different pages.
+///
+/// The base is the same one the nucleus used, so a hosted program sees no
+/// change of layout across the move.
+static NEXT_MAPPING: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x0000_7000_0000_0000);
 
 /// `MAP_AT`/`PROTECT_AT`'s protection encoding.
 const PROT_NONE: u64 = 0;
@@ -241,6 +391,16 @@ fn protection_of(read: bool, write: bool, execute: bool) -> u64 {
 /// declares; this one has nothing to time and ignores it.
 #[unsafe(no_mangle)]
 extern "C" fn linuxd_main(_hertz: u64) -> ! {
+    // The report page, into this program's own space. If it will not map the
+    // adapter still serves — a trace is a convenience and refusing to work
+    // without one would be the wrong priority.
+    let _ = call(
+        syscall::INVOKE,
+        REPORT,
+        method::ATTACH,
+        [REPORT_AT, 1, 0, 0],
+    );
+
     loop {
         let received = call(syscall::RECV, ENDPOINT, 0, [0; 4]);
         if received.status == status::CONGESTED {

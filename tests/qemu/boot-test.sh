@@ -1284,10 +1284,10 @@ fi
 # and which this suite has made before.
 if grep -qE "personality +boundary: [0-9]+ linux numbers interpreted in the nucleus" "$LOG"; then
     interpreted=$(sed -n 's/.*boundary: \([0-9]*\) linux numbers.*/\1/p' "$LOG" | head -1)
-    if [[ "$interpreted" -le 14 ]]; then
+    if [[ "$interpreted" -le 13 ]]; then
         pass "the personality boundary is $interpreted linux numbers wide, and may only narrow"
     else
-        fail "the nucleus interprets $interpreted linux numbers, up from 14 -- RFC 0031 I1 wants 0"
+        fail "the nucleus interprets $interpreted linux numbers, up from 13 -- RFC 0031 I1 wants 0"
         status=1
     fi
     # And the instrument accounts for itself. Every foreign call is priced,
