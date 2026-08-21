@@ -228,10 +228,21 @@ The truth is that staging was never the term: split apart, staging a kilobyte co
 - **The first execution costs six to eight times the steady state.** That is a translation cache
   warming: a fact about TCG, not about this interface, and it should not appear in anybody's
   design arithmetic.
-- **The adapter makes four crossings per page where one would do.** `MAX_SUPERVISED_COPY` is a
-  whole page, but `bin/linuxd`'s scratch area is 1 KiB, so a page of image is four calls. That is a
-  **4× penalty this measurement found and that nothing else was looking for**, and it is a constant
-  in a manifest rather than a design problem.
+- **The adapter made four crossings per page where two now do** — and *"a 4× penalty in a
+  constant"*, which is what this section said when it found it, **was wrong too.** `SCRATCH_BYTES`
+  was 1 KiB against a `MAX_SUPERVISED_COPY` of a whole page; it is 3,584 now, the rest of the report
+  page after the records. Measured before and after, warm, seven boots each:
+
+  | scratch | crossings per page | median | mean |
+  |---|---|---|---|
+  | 1,024 | 4 | 214,222 | 243,125 |
+  | 3,584 | 2 | 181,352 | 182,312 |
+
+  **15% on the median, 25% on the mean, with the ranges overlapping** — real, worth keeping, and
+  nothing like the 2× halving the crossings implies. The reason is that staging four kilobytes into
+  the scratch is the same work either way and is the larger term; the crossing count is not what a
+  page costs. Reaching one crossing needs a page of its own, which is an object in the manifest and
+  an entry in `security.md` §1's T11 list — a decision, and on this evidence not an urgent one.
 - **Every figure is emulated.** M1-17 is unmet, so none of this is a statement about hardware.
 
 **What it means for question 1.** The interface is not free and it is not catastrophic. A
@@ -249,8 +260,9 @@ version of this section did not produce because it was measuring the emulator.
    ~200,000 cycles per kilobyte warm, against ~110 for the copy alone — about 1,800×, all of it
    emulated.** The first version of this answer said 10⁴× and a per-byte slope, and was measuring
    the emulator's translation cache; see §"What step 2 measured". The open part is now narrower and
-   concrete: the adapter crosses four times per page because its scratch is a quarter of what
-   `MAX_SUPERVISED_COPY` allows.
+   concrete, and smaller than it looked: widening the scratch from 1 KiB to 3,584 halved the
+   crossings per page and bought 15–25%, because staging dominates. A page of its own would reach
+   one crossing and is not obviously worth an object in the manifest.
 3. **How many bits?** The `mmap` base takes 28, matching Linux. A text slide has less room — the
    image must stay inside the user half and clear of the fixed addresses the adapter maps for
    `execve` and `fork` — and the number should be stated rather than inherited.

@@ -46,6 +46,7 @@ use bhaskix_personality::pipe::Pipe;
 use bhaskix_personality::proc::File as ProcFile;
 use bhaskix_personality::process::layout;
 use bhaskix_personality::process::{Exit, Process, Processes, Region};
+use bhaskix_personality::report;
 use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
 
@@ -220,10 +221,10 @@ static TRACED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 /// their bytes — so every copy after the exec overwrote it, and the kernel
 /// printed the tail of a path as a pid. The scratch area's own bound is what
 /// this is placed after, so moving one moves the other.
-const EXEC_RECORD_AT: u64 = REPORT_AT + SCRATCH_AT_OFFSET + SCRATCH_BYTES;
+const EXEC_RECORD_AT: u64 = REPORT_AT + report::EXEC_AT as u64;
 
 /// Where the file record sits, three words past the exec record.
-const FILE_RECORD_AT: u64 = EXEC_RECORD_AT + 24;
+const FILE_RECORD_AT: u64 = REPORT_AT + report::FILE_AT as u64;
 
 /// Records what the last `open` and `read` did, for the kernel's report.
 ///
@@ -244,7 +245,7 @@ fn trace_file(opened: i64, read: i64, size: u64) {
 }
 
 /// Where the fork record sits, three words past the file record.
-const FORK_RECORD_AT: u64 = FILE_RECORD_AT + 24;
+const FORK_RECORD_AT: u64 = REPORT_AT + report::FORK_AT as u64;
 
 /// Records what a `fork` cost: the child's pid and the bytes copied.
 ///
@@ -263,7 +264,7 @@ fn trace_fork(pid: u32, copied: u64) {
 }
 
 /// Where the wait record sits, two words past the fork record.
-const WAIT_RECORD_AT: u64 = FORK_RECORD_AT + 16;
+const WAIT_RECORD_AT: u64 = REPORT_AT + report::WAIT_AT as u64;
 
 /// Where the supervised-copy measurement lands: cycles, then bytes.
 ///
@@ -273,7 +274,7 @@ const WAIT_RECORD_AT: u64 = FORK_RECORD_AT + 16;
 /// page costs through `COPY_OUT` against the kernel's own `copy_nonoverlapping`
 /// through the direct map. **The RFC declined to choose a design before this
 /// number existed**, so here it is measured rather than guessed.
-const COPY_RECORD_AT: u64 = WAIT_RECORD_AT + 16;
+const COPY_RECORD_AT: u64 = REPORT_AT + report::COPY_AT as u64;
 
 /// Records what a `wait4` answered: the child collected and its status word.
 ///
@@ -565,6 +566,23 @@ fn copy_out(domain: u32, address: u64, bytes: &[u8]) -> bool {
 /// slot of its own rather than one the kernel has named yet — the handle
 /// arrives from `SPAWN`, and the kernel's own grant for that domain does not
 /// exist until the program in it makes its first call.
+/// Moves a whole page out, in as many crossings as the scratch area allows.
+///
+/// The count is the point: `MAX_SUPERVISED_COPY` permits a page in one
+/// `COPY_OUT`, and what stops this being one call is the size of the scratch
+/// area, not the interface. RFC 0036 step 2's measurement is what noticed.
+fn copy_page_out(handle: u64, address: u64, page: &[u8]) -> bool {
+    let mut moved = 0usize;
+    while moved < page.len() {
+        let take = (page.len() - moved).min(SCRATCH_BYTES as usize);
+        if !copy_out_through(handle, address + moved as u64, &page[moved..moved + take]) {
+            return false;
+        }
+        moved += take;
+    }
+    true
+}
+
 fn copy_out_through(handle: u64, address: u64, bytes: &[u8]) -> bool {
     if bytes.len() > SCRATCH_BYTES as usize {
         return false;
@@ -588,7 +606,7 @@ fn copy_out_through(handle: u64, address: u64, bytes: &[u8]) -> bool {
 }
 
 /// How much of the report page the copies may use.
-const SCRATCH_BYTES: u64 = 1024;
+const SCRATCH_BYTES: u64 = report::SCRATCH_BYTES as u64;
 
 /// Records that a fault was handed over, in the report page the kernel reads.
 ///
@@ -614,7 +632,7 @@ fn faults_seen(slot: u64, address: u64) {
 static FAULTS_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Where the fault log sits in the report page, after the trace and scratch.
-const FAULT_LOG_OFFSET: u64 = 8 * 32 + 64;
+const FAULT_LOG_OFFSET: u64 = report::FAULT_LOG_AT as u64;
 
 /// Where in the report page the scratch word lives.
 ///
@@ -622,7 +640,7 @@ const FAULT_LOG_OFFSET: u64 = 8 * 32 + 64;
 /// other. The same page serves both because it is the only memory this
 /// program owns, and a second object would be a second thing to explain in
 /// the manifest for no gain.
-const SCRATCH_AT_OFFSET: u64 = 8 * 32;
+const SCRATCH_AT_OFFSET: u64 = report::SCRATCH_AT as u64;
 
 /// Writes the scratch word this program copies out of.
 fn write_scratch(value: u64) {
@@ -2648,17 +2666,20 @@ fn build_exec_image() -> bool {
     // So both numbers are taken, and named for what they are. Neither is a
     // measurement of hardware: this machine has never booted on any
     // (M1-17).
-    let wide = [0x90u8; SCRATCH_BYTES as usize];
+    // **A page, not a kilobyte**, because a page is the unit a loader moves and
+    // the unit `MAX_SUPERVISED_COPY` allows in one crossing. How many crossings
+    // that takes is `SCRATCH_BYTES`' business: at 1,024 it was four, and at
+    // 3,584 it is two.
+    let page = [0x90u8; report::PAGE];
 
-    // First: the path has never run in this boot.
     let cold_started = bhaskix_sock::time::now();
-    let cold_ok = copy_out_through(CHILD, EXEC_CODE_AT, &wide);
+    let cold_ok = copy_page_out(CHILD, EXEC_CODE_AT, &page);
     let cold_cycles = bhaskix_sock::time::now().saturating_sub(cold_started);
 
-    // Then the same crossing again, warm, which is what a loader moving a
-    // second page would actually pay.
+    // Then the same page again, warm, which is what a loader moving its second
+    // page would actually pay.
     let warm_started = bhaskix_sock::time::now();
-    let warm_ok = copy_out_through(CHILD, EXEC_CODE_AT, &wide);
+    let warm_ok = copy_page_out(CHILD, EXEC_CODE_AT, &page);
     let warm_cycles = bhaskix_sock::time::now().saturating_sub(warm_started);
 
     // The real image last, so the page ends up holding the program.

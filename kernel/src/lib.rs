@@ -3028,7 +3028,7 @@ fn adapter_file_record() -> (i64, i64, u64) {
     }
     // Past the eight `mmap` records, the scratch area and the exec record:
     // 256 + 1,024 + 24. `bin/linuxd` places it there and says so.
-    const FIRST_WORD: usize = (8 * 32 + 1024 + 24) / 8;
+    const FIRST_WORD: usize = bhaskix_personality::report::FILE_AT / 8;
     let object = shared::MemoryId::from_u64(page);
     let mut record = [0u64; 3];
     let mut at = 0usize;
@@ -3227,7 +3227,7 @@ fn personality_boundary_report() {
         // overwrote it and the kernel printed the tail of a path as a pid.
         // 1,280 = 256 of `mmap` records + 1,024 of scratch, which is where
         // `bin/linuxd` puts it and says so.
-        const EXEC_RECORD_BYTE: usize = 8 * 32 + 1024;
+        const EXEC_RECORD_BYTE: usize = bhaskix_personality::report::EXEC_AT;
         const EXEC_RECORD_WORD: usize = EXEC_RECORD_BYTE / 8;
         let taken = shared::drain_into(object, EXEC_RECORD_BYTE + 24, &mut |chunk: &[u8]| {
             for word in chunk.chunks_exact(8) {
@@ -5749,7 +5749,7 @@ fn adapter_wait_record() -> (i64, u64) {
     if page == u64::MAX {
         return (0, 0);
     }
-    const FIRST_WORD: usize = (8 * 32 + 1024 + 24 + 24 + 16) / 8;
+    const FIRST_WORD: usize = bhaskix_personality::report::WAIT_AT / 8;
     let object = shared::MemoryId::from_u64(page);
     let mut record = [0u64; 2];
     let mut at = 0usize;
@@ -5803,7 +5803,7 @@ fn report_supervised_copy() {
     }
     // Past the mmap records, the scratch, and the exec, file, fork and wait
     // records: 256 + 1,024 + 24 + 24 + 16 + 16.
-    const FIRST_WORD: usize = (8 * 32 + 1024 + 24 + 24 + 16 + 16) / 8;
+    const FIRST_WORD: usize = bhaskix_personality::report::COPY_AT / 8;
     let object = shared::MemoryId::from_u64(page);
     let mut record = [0u64; 2];
     let mut at = 0usize;
@@ -5829,8 +5829,8 @@ fn report_supervised_copy() {
     // The floor: the same 1,024 bytes, moved by the kernel with no crossing.
     // Two static buffers rather than a frame allocation, because this runs on
     // the boot path and must not be able to fail.
-    static mut FROM: [u8; 1024] = [0x5a; 1024];
-    static mut INTO: [u8; 1024] = [0; 1024];
+    static mut FROM: [u8; 4096] = [0x5a; 4096];
+    static mut INTO: [u8; 4096] = [0; 4096];
     let started = bhaskix_arch::tsc::read();
     // SAFETY: two distinct static buffers of the same length, neither aliased
     // by anything else on the boot path, copied whole.
@@ -5838,14 +5838,18 @@ fn report_supervised_copy() {
         core::ptr::copy_nonoverlapping(
             core::ptr::addr_of!(FROM).cast::<u8>(),
             core::ptr::addr_of_mut!(INTO).cast::<u8>(),
-            1024,
+            4096,
         );
     }
     let direct = bhaskix_arch::tsc::read().saturating_sub(started);
+    // How many crossings a page takes, which is what the scratch width decides.
+    let crossings =
+        bhaskix_personality::report::PAGE.div_ceil(bhaskix_personality::report::SCRATCH_BYTES);
 
     println!(
-        "    linux copyout  one kilobyte through COPY_OUT costs {narrow} cycles the first time and \
-         {wide} warm; the kernel moves the same kilobyte through the direct map in {direct}"
+        "    linux copyout  a page through COPY_OUT costs {narrow} cycles the first time and \
+         {wide} warm, in {crossings} crossings; the kernel moves a page through the direct map in \
+         {direct}"
     );
 }
 
@@ -5856,7 +5860,7 @@ fn adapter_fork_record() -> (u64, u64) {
     }
     // Past the `mmap` records, the scratch area, the exec record and the file
     // record: 256 + 1,024 + 24 + 24.
-    const FIRST_WORD: usize = (8 * 32 + 1024 + 24 + 24) / 8;
+    const FIRST_WORD: usize = bhaskix_personality::report::FORK_AT / 8;
     let object = shared::MemoryId::from_u64(page);
     let mut record = [0u64; 2];
     let mut at = 0usize;

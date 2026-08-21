@@ -894,6 +894,85 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (a third intermittent: the user-fault arm hangs for 120 seconds, at rest, in both directions)
+
+`make test` failed on `test-faults`' **`user`** arm — the one that faults a ring 3 program and
+requires the domain to end, its siblings to stop, and a blocked caller to be released. It failed by
+**hanging until the 120-second timeout**, not by reporting anything wrong: the six kernel-fault arms
+before it all passed.
+
+**It was nearly blamed on the change in front of it, and the arithmetic that would have done so was
+wrong.** The first comparison was 4 of 6 passing with the change and **6 of 6 without** — which
+looks like causation and is not. Timing the same arm in both configurations then produced a
+**120-second hang with the change reverted**, and successful boots of 18.6 s against 18.8 s, so the
+change adds no measurable time. Counted over more runs on the tree as it stands: **6 of 8, at host
+load 0.41.**
+
+So: **roughly one run in four hangs, at rest, and it predates today's work.** The record already had
+*"one `test-faults` 120 s timeout — under a loaded host"*; the load excuse is now gone.
+
+**What is not yet known** is where it hangs. The arm's expectation is six ordered markers, and a
+timeout says only that the last of them never arrived. The next step is to keep the serial log on
+failure — `fault-test.sh` deletes it — and find which marker is last, because *"the domain went
+away"* failing and *"the caller was released"* failing are different bugs with different repairs.
+
+**Three unexplained intermittents in one day**, all recorded rather than re-run away: a 494 ms spawn
+against a 50 ms bound, an exec whose record was right and whose console line was missing, and this.
+They have no obvious common cause — timing, a lost byte, and a hang — but they share a shape worth
+naming: **each is a boot that did less than it should have, and each was found only because a suite
+that is usually green went red once.** A project that re-ran until green would have none of them
+written down.
+
+### 2026-08-21 (the scratch is widened, the fault log stops overlapping it, and the predicted 4× is 15%)
+
+Three things, and the smallest of them is the one that was asked for.
+
+#### The overlap, which is the real defect
+
+`FAULT_LOG_OFFSET` was `8 * 32 + 64` — four sixteen-byte entries at **320** — and its comment said
+*"past the trace records and the scratch word"*. That was true when the scratch **was one word**.
+The scratch later became 1,024 bytes starting at **256**, so the fault log came to sit **inside
+it**, and the comment kept describing the layout it was written for.
+
+Nothing has gone wrong yet, and the reason is worth stating because it is not a reason to relax:
+the kernel never reads the fault log, and `bin/linuxd` is **single-threaded**, so no fault is handed
+over between staging bytes and copying them out. **A latent corruption held off by an invariant
+nobody wrote down for this purpose.**
+
+#### The cause, which was two derivations of one layout
+
+The adapter computed the offsets as a chain — `const FILE_RECORD_AT = EXEC_RECORD_AT + 24` — and the
+kernel computed them again, five separate times, as expressions like `(8 * 32 + 1024 + 24 + 24) / 8`.
+**Two independent derivations of one layout, in two rings, with nothing checking they agreed.** They
+did not.
+
+It lives in `bhaskix-personality::report` now, which both rings already depend on, with the records
+first and the scratch **last** so widening it cannot walk into anything, and three `const` assertions
+that the pieces do not overlap and do end inside the page. Every hand-computed offset is gone.
+
+#### The widening, and the prediction it refuted
+
+`SCRATCH_BYTES` 1,024 → **3,584**, which takes a page from four crossings to two. The previous entry
+called the old value *"a 4× penalty in a constant"*. Measured, warm, seven boots each:
+
+| scratch | crossings per page | median | mean | range |
+|---|---|---|---|---|
+| 1,024 | 4 | 214,222 | 243,125 | 191,170 – 327,226 |
+| 3,584 | 2 | 181,352 | 182,312 | 134,834 – 238,942 |
+
+**15% on the median, 25% on the mean, ranges overlapping.** Real, worth keeping, and nothing like
+the 2× that halving the crossings implies — because **staging four kilobytes is the same work either
+way and is the larger term.** The crossing count is not what a page costs.
+
+**That is the third prediction about this code that measurement has corrected today**, after the
+per-byte slope that was a warm-up and the staging loop that was not the problem. The pattern is
+consistent enough to name: *this code's costs are not where its structure suggests, and every
+estimate made from reading it has been wrong.*
+
+The measurement now moves a **page** rather than a kilobyte, since a page is the unit a loader moves
+and the unit `MAX_SUPERVISED_COPY` allows, and the boot line reports the crossing count so the
+constant is visible in the output rather than only in the source.
+
 ### 2026-08-21 (the step 2 measurement was wrong, and the correction is the more useful entry)
 
 **The entry below reports "roughly 10⁴× the copy it performs" and "a marginal cost around 1,100
