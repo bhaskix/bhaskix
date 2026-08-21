@@ -894,6 +894,49 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (the step 2 measurement was wrong, and the correction is the more useful entry)
+
+**The entry below reports "roughly 10⁴× the copy it performs" and "a marginal cost around 1,100
+cycles per byte". There is no such slope, and the number was measuring the emulator.**
+
+The two sizes — 96 bytes and 1,024 — were always timed in the same order, to the same page. The
+first one paid for the **first execution of the path in that boot** and the second did not.
+Reversing the order moved the cost with it: **1,107,710 cycles for 96 bytes when 96 went first**,
+then **103,034 for 1,024 immediately after**. The difference was never about length.
+
+That also explains the result that had looked like a finding. Replacing the byte-at-a-time staging
+loop with a bulk copy changed nothing, and the entry below reads that as *"the cost is on the kernel
+side of `COPY_OUT`"*. It is not: split apart, staging a kilobyte costs **60,000–72,000** cycles and
+the crossing **103,000**. Neither is a million. Both halves were small all along, and the million
+was a translation cache filling.
+
+**What is true, measured cold and warm on purpose and printed that way:**
+
+| | cycles |
+|---|---|
+| One kilobyte through `COPY_OUT`, first execution in a boot | 1,152,540 – 1,421,690 |
+| The same kilobyte immediately afterwards | 175,336 – 229,066 |
+| The kernel moving it through the direct map | 102 – 126 |
+
+**~1,800× warm, not 10⁴×.** The first execution costs six to eight times the steady state, which is
+TCG's translation cache and belongs in nobody's design arithmetic.
+
+**And the measurement found something real once it stopped measuring the emulator**:
+`MAX_SUPERVISED_COPY` is a whole page, but `bin/linuxd`'s scratch area is **1 KiB**, so the adapter
+crosses **four times per page** where one would do. A 4× penalty, in a constant, that nothing else
+was looking for.
+
+**How the error happened, since that is the reusable part.** The two sizes were chosen to give a
+fixed cost and a slope — a reasonable design for a measurement — and then run in one fixed order,
+which silently made the first sample a different experiment from the second. **A two-point
+measurement that never varies the order is not two points; it is one point and a warm-up.** The
+diagnosis took three instrumented boots: timing `copy_across` itself (fixed, ~90K for 8 bytes),
+splitting staging from the crossing (60K and 963K), and finally swapping the order, which was the
+one that settled it.
+
+The gate now reads the cold and warm numbers by name, so the shape of the claim is in the line
+itself rather than in a reader's arithmetic.
+
 ### 2026-08-21 (RFC 0036 step 2: the supervised copy is measured, and the number does not answer the question it was taken for)
 
 **The step the RFC put before its own design decision**, and it paid off in the direction nobody

@@ -5783,13 +5783,19 @@ fn adapter_wait_record() -> (i64, u64) {
 /// what a page costs that way against `copy_nonoverlapping` through the direct
 /// map. **The RFC refused to choose a design before this number existed.**
 ///
-/// Three numbers, and the comparison only means something with all three:
-/// what the adapter paid for 96 bytes (one round trip, almost all fixed cost),
-/// what it paid for 1,024 (the scratch area's full width, so the slope), and
-/// what the kernel pays to move the same 1,024 bytes with a single `memcpy`
-/// through the direct map. The last is the floor — it is the copy itself with
-/// no crossing at all — and the distance between it and the first two is the
-/// price of doing the work from ring 3.
+/// Three numbers: what one kilobyte costs through `COPY_OUT` the **first** time
+/// the path runs in a boot, what the **same** kilobyte costs immediately
+/// afterwards, and what the kernel pays to move it with a single `memcpy`
+/// through the direct map. The last is the floor — the copy with no crossing at
+/// all.
+///
+/// **The first two used to be 96 bytes and 1,024 bytes, and the difference was
+/// read as a per-byte cost. That was wrong**: the sizes were measured in a fixed
+/// order to the same page, so the first one paid for the path's first execution
+/// and the second did not. Swapping the order moved the cost with it —
+/// 1,107,710 cycles for 96 bytes when 96 went first, 103,034 for 1,024
+/// immediately after. What the pair actually shows is a translation cache
+/// warming, which is a fact about TCG rather than about this interface.
 fn report_supervised_copy() {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
@@ -5838,8 +5844,8 @@ fn report_supervised_copy() {
     let direct = bhaskix_arch::tsc::read().saturating_sub(started);
 
     println!(
-        "    linux copyout  a supervised copy costs {narrow} cycles for 96 bytes and {wide} for \
-         1024; the kernel moves the same 1024 through the direct map in {direct}"
+        "    linux copyout  one kilobyte through COPY_OUT costs {narrow} cycles the first time and \
+         {wide} warm; the kernel moves the same kilobyte through the direct map in {direct}"
     );
 }
 

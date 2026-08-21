@@ -2634,24 +2634,39 @@ fn build_exec_image() -> bool {
     // scratch area **one volatile write at a time**, and the scratch is 1 KiB,
     // so a page is four calls and four thousand stores. Both halves are inside
     // the span below, which is what a loader would actually pay.
-    // **Two sizes, because one point is not a measurement.** A 96-byte image is
-    // almost all fixed cost — one `COPY_OUT` round trip — and a 1,024-byte one
-    // is the scratch area's full width, so the pair gives the fixed cost and
-    // the slope, which is what a real image's page count would be multiplied
-    // by. The wide copy goes in first and the real image overwrites its first
-    // 96 bytes; what is left behind sits past the image in a page the child
-    // enters at offset zero and never reaches.
+    // **First touch and steady state, because the first version of this
+    // measured neither and reported a slope that did not exist.**
+    //
+    // The first attempt timed a 96-byte copy and a 1,024-byte copy to the same
+    // page, wide one first, and read the difference as a per-byte cost: about
+    // 1,100 cycles a byte. It was an artefact of the order. Putting the *narrow*
+    // copy first made **it** the expensive one — 1,107,710 cycles for 96 bytes,
+    // against 103,034 for 1,024 immediately afterwards. The cost is the first
+    // execution of the path, not the bytes crossing it, which is what TCG's
+    // translation cache looks like from inside the guest.
+    //
+    // So both numbers are taken, and named for what they are. Neither is a
+    // measurement of hardware: this machine has never booted on any
+    // (M1-17).
     let wide = [0x90u8; SCRATCH_BYTES as usize];
-    let wide_started = bhaskix_sock::time::now();
-    let wide_ok = copy_out_through(CHILD, EXEC_CODE_AT, &wide);
-    let wide_cycles = bhaskix_sock::time::now().saturating_sub(wide_started);
 
-    let started = bhaskix_sock::time::now();
+    // First: the path has never run in this boot.
+    let cold_started = bhaskix_sock::time::now();
+    let cold_ok = copy_out_through(CHILD, EXEC_CODE_AT, &wide);
+    let cold_cycles = bhaskix_sock::time::now().saturating_sub(cold_started);
+
+    // Then the same crossing again, warm, which is what a loader moving a
+    // second page would actually pay.
+    let warm_started = bhaskix_sock::time::now();
+    let warm_ok = copy_out_through(CHILD, EXEC_CODE_AT, &wide);
+    let warm_cycles = bhaskix_sock::time::now().saturating_sub(warm_started);
+
+    // The real image last, so the page ends up holding the program.
     if !copy_out_through(CHILD, EXEC_CODE_AT, &EXEC_IMAGE) {
         return false;
     }
-    let cycles = bhaskix_sock::time::now().saturating_sub(started);
-    let wide_cycles = if wide_ok { wide_cycles } else { 0 };
+    let cycles = if cold_ok { cold_cycles } else { 0 };
+    let wide_cycles = if warm_ok { warm_cycles } else { 0 };
     // SAFETY: inside the page `ATTACH` mapped from this program's own object,
     // past every other record and well inside 4,096 bytes.
     unsafe {

@@ -200,50 +200,57 @@ not a device.
 ## What step 2 measured
 
 Printed on every boot that runs a hosted `execve`, and gated so it cannot quietly stop being taken.
-Five samples, medians:
+Three samples:
 
 | | cycles |
 |---|---|
-| A supervised copy of **96 bytes** (one `COPY_OUT` round trip) | ~158,000 |
-| A supervised copy of **1,024 bytes** | ~1,165,000 |
-| The kernel moving the same **1,024 bytes** through the direct map | ~112 |
+| One kilobyte through `COPY_OUT`, **first execution of the path in a boot** | 1,152,540 – 1,421,690 |
+| The **same** kilobyte immediately afterwards | 175,336 – 229,066 |
+| The kernel moving that kilobyte through the direct map | 102 – 126 |
 
-So the crossing costs on the order of **10⁴× the copy it performs**, and the marginal cost is around
-**1,100 cycles per byte** against roughly a tenth of a cycle per byte for `copy_nonoverlapping`. A
-one-megabyte image at that rate is over a billion cycles.
+**A correction, because the first version of this section was wrong and it is worth saying how.**
+It reported *"roughly 10⁴× the copy it performs, and a marginal cost around 1,100 cycles per byte"*,
+derived from timing a 96-byte copy and a 1,024-byte copy to the same page. **There is no such
+slope.** The two sizes were always measured in the same order, so the first one paid for the path's
+first execution and the second did not. Putting the 96-byte copy first moved the cost with it:
+**1,107,710 cycles for 96 bytes**, then **103,034 for 1,024** immediately after. The difference was
+never about length.
 
-**The obvious explanation was tested and is wrong.** `copy_out_through` stages bytes into the scratch
-area **one volatile write at a time**, which looked like the whole story. Replacing that loop with a
-single bulk copy and re-measuring changed nothing: 96 bytes went ~158,000 → ~164,000 and 1,024 went
-~1,165,000 → ~1,005,000, both inside the spread of the samples. **The cost is on the kernel side of
-`COPY_OUT`, not in how the adapter feeds it.**
+That also explains why the obvious fix did nothing. Replacing the byte-at-a-time staging loop with a
+bulk copy changed no number, and at the time that was read as *"the cost is on the kernel side"*.
+The truth is that staging was never the term: split apart, staging a kilobyte costs about
+**60,000–72,000** cycles and the crossing about **103,000**, and neither is a million.
 
-**Which is why this measurement does not decide question 1, and saying so is the honest outcome.**
-A per-byte cost of a thousand cycles inside a supervised copy is not a property anybody designed on
-purpose, and a design chosen against an unexplained number inherits the misunderstanding. Two things
-must happen before question 1 is answered:
+**What is actually true:**
 
-1. **Understand the per-byte term.** `copy_across` copies in bulk once it has a frame, so ~1,100
-   cycles per byte has no obvious source in the code. `shared::drain_into` re-walks its object from
-   the beginning on every call — documented, and named for its sink rather than for consumption —
-   which is the first place to look.
-2. **Repeat it somewhere that is not TCG.** Every figure above is emulated, and this project has
-   never booted on physical hardware (M1-17). The telemetry plane's own numbers carry the same
-   caveat and say so.
+- **The steady-state crossing is about 200,000 cycles per kilobyte** against about 110 for the raw
+  copy — roughly **1,800×**, not four orders of magnitude.
+- **The first execution costs six to eight times the steady state.** That is a translation cache
+  warming: a fact about TCG, not about this interface, and it should not appear in anybody's
+  design arithmetic.
+- **The adapter makes four crossings per page where one would do.** `MAX_SUPERVISED_COPY` is a
+  whole page, but `bin/linuxd`'s scratch area is 1 KiB, so a page of image is four calls. That is a
+  **4× penalty this measurement found and that nothing else was looking for**, and it is a constant
+  in a manifest rather than a design problem.
+- **Every figure is emulated.** M1-17 is unmet, so none of this is a statement about hardware.
 
-**What the measurement does establish**: the interface is not *near* free, so the "adapter loads the
-image" design cannot be adopted on the assumption that it is cheap — which is exactly the assumption
-step 2 existed to test.
+**What it means for question 1.** The interface is not free and it is not catastrophic. A
+one-megabyte image at the steady-state rate, with the scratch left at 1 KiB, is on the order of 200
+million emulated cycles; widening the scratch to a page would quarter the call count. That is a
+number a design can be argued against — which is what step 2 existed to produce, and which the first
+version of this section did not produce because it was measuring the emulator.
 
 ## Unresolved questions
 
 1. **Who chooses the slide?** The three shapes are in *Alternatives*. The leaning is the adapter,
    loading through the supervisor interface it already holds — but it is the largest of the three
    and the decision should follow the measurement in *Performance*, not precede it.
-2. ~~**What does loading through the supervisor interface cost?**~~ **Measured 2026-08-21 —
-   ~10⁴× the copy itself, ~1,100 cycles per byte — and the number raised a new question instead of
-   settling one.** Why the per-byte term is that large is not understood; the staging loop was
-   ruled out by experiment. Question 1 waits on that, not on more measuring.
+2. ~~**What does loading through the supervisor interface cost?**~~ **Measured 2026-08-21:
+   ~200,000 cycles per kilobyte warm, against ~110 for the copy alone — about 1,800×, all of it
+   emulated.** The first version of this answer said 10⁴× and a per-byte slope, and was measuring
+   the emulator's translation cache; see §"What step 2 measured". The open part is now narrower and
+   concrete: the adapter crosses four times per page because its scratch is a quarter of what
+   `MAX_SUPERVISED_COPY` allows.
 3. **How many bits?** The `mmap` base takes 28, matching Linux. A text slide has less room — the
    image must stay inside the user half and clear of the fixed addresses the adapter maps for
    `execve` and `fork` — and the number should be stated rather than inherited.

@@ -1474,7 +1474,7 @@ fi
 # carries three figures; it deliberately does **not** assert a threshold,
 # because the numbers are TCG and a bound on an emulator's arithmetic would be a
 # gate about QEMU. What must not happen is the measurement disappearing.
-if grep -qE "linux copyout +a supervised copy costs [0-9]+ cycles for 96 bytes and [0-9]+ for 1024; the kernel moves the same 1024 through the direct map in [0-9]+" "$LOG"; then
+if grep -qE "linux copyout +one kilobyte through COPY_OUT costs [0-9]+ cycles the first time and [0-9]+ warm; the kernel moves the same kilobyte through the direct map in [0-9]+" "$LOG"; then
     pass "the cost of a supervised copy is measured against the kernel's own"
 else
     fail "the supervised-copy measurement did not appear"
