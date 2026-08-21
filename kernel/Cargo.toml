@@ -321,7 +321,11 @@ asm_budget = 10
 # floating-point file saved and restored at both switch sites (which is what
 # makes enabling it safe), the per-thread FS base, and the Tier 0 loader
 # thread that puts a real Go binary into a domain.
-unsafe_budget = 1588
+# 1595 as of 2026-08-21: 1588 plus the seven lines of RFC 0036 step 2's
+# comparator -- two static buffers and one `copy_nonoverlapping` through the
+# direct map, which is the floor the supervised copy is measured against. A
+# measurement that cost nothing to take would be measuring nothing.
+unsafe_budget = 1595
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

@@ -40,6 +40,12 @@ bhaskix-personality = { path = "../../personality" }
 # and holds nothing extra to do it: RFC 0021's finding, and why there is no
 # capability here to ask for.
 bhaskix-rand = { path = "../../rand" }
+# The cycle counter, for RFC 0036 step 2's measurement. Taken from here rather
+# than written locally: `bhaskix-sock` owns that read already, written once so
+# it is not copied, and an `rdtsc` added here cost twelve `unsafe` lines in the
+# program `security.md` §1 calls the largest concentration of authority in the
+# system. The exact budget said so before the measurement was even taken.
+bhaskix-sock = { path = "../../sock" }
 
 [profile.release]
 panic = "abort"
@@ -153,7 +159,13 @@ asm_budget = 3
 # per table, each making the single-threaded promise once instead of restating
 # it wherever a table was wanted. Thirteen lines went with them and no behaviour
 # changed.
-unsafe_budget = 72
+# 76 as of 2026-08-21: 72 plus the four lines of the supervised-copy
+# measurement's record write (RFC 0036 step 2). **Raised deliberately, which is
+# the whole point of the line below.** A first attempt wrote `rdtsc` here too
+# and the number went to 84; taking the counter from `bhaskix-sock`, which owns
+# that read already, brought it back to 76. The gate reported both, before
+# either was committed.
+unsafe_budget = 76
 # **This crate's number is a cap, not a ceiling.** It must equal the count, so
 # the build fails if this program's `unsafe` shrinks *or* grows without somebody
 # editing this line. `bin/linuxd` is the largest concentration of authority in

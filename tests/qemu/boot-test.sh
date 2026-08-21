@@ -1467,6 +1467,20 @@ else
     status=1
 fi
 
+# RFC 0036 step 2's measurement, printed on every boot that runs a hosted exec.
+# The RFC's question 1 -- who chooses a hosted program's load address -- turns
+# on whether the adapter could load an image itself through the supervisor
+# interface, and that turns on this number. The gate asserts the line exists and
+# carries three figures; it deliberately does **not** assert a threshold,
+# because the numbers are TCG and a bound on an emulator's arithmetic would be a
+# gate about QEMU. What must not happen is the measurement disappearing.
+if grep -qE "linux copyout +a supervised copy costs [0-9]+ cycles for 96 bytes and [0-9]+ for 1024; the kernel moves the same 1024 through the direct map in [0-9]+" "$LOG"; then
+    pass "the cost of a supervised copy is measured against the kernel's own"
+else
+    fail "the supervised-copy measurement did not appear"
+    status=1
+fi
+
 # `security.md` §1 gap 3: a hosted process's `mmap` region is drawn per process
 # rather than bumped from one shared counter at a fixed base. The software
 # arriving under L1-L4 is C, and a hosted process at a wholly predictable layout

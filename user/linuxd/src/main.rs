@@ -265,6 +265,16 @@ fn trace_fork(pid: u32, copied: u64) {
 /// Where the wait record sits, two words past the fork record.
 const WAIT_RECORD_AT: u64 = FORK_RECORD_AT + 16;
 
+/// Where the supervised-copy measurement lands: cycles, then bytes.
+///
+/// [RFC 0036](../../docs/rfc/0036-a-relocatable-program-in-ring-3.md) step 2.
+/// The RFC's question 1 — who chooses a program's load address — turns on
+/// whether this adapter could load an image itself, and that turns on what a
+/// page costs through `COPY_OUT` against the kernel's own `copy_nonoverlapping`
+/// through the direct map. **The RFC declined to choose a design before this
+/// number existed**, so here it is measured rather than guessed.
+const COPY_RECORD_AT: u64 = WAIT_RECORD_AT + 16;
+
 /// Records what a `wait4` answered: the child collected and its status word.
 ///
 /// Written on every outcome, including the refusals, because a boot where
@@ -2613,8 +2623,40 @@ fn build_exec_image() -> bool {
     {
         return false;
     }
+    // RFC 0036 step 2, measured here because this is the one place this program
+    // already moves a program image into another domain. **The counter comes
+    // from `bhaskix-sock`, not from an `rdtsc` written here**: a first attempt
+    // added the instruction locally and cost twelve `unsafe` lines in the most
+    // authority-concentrated program in the system, which the exact budget
+    // reported immediately. `bhaskix-sock` already owns that read, written once
+    // so it is not copied — which is the reason that crate exists. The cost has two
+    // halves and only one of them is `COPY_OUT`: the bytes are staged into the
+    // scratch area **one volatile write at a time**, and the scratch is 1 KiB,
+    // so a page is four calls and four thousand stores. Both halves are inside
+    // the span below, which is what a loader would actually pay.
+    // **Two sizes, because one point is not a measurement.** A 96-byte image is
+    // almost all fixed cost — one `COPY_OUT` round trip — and a 1,024-byte one
+    // is the scratch area's full width, so the pair gives the fixed cost and
+    // the slope, which is what a real image's page count would be multiplied
+    // by. The wide copy goes in first and the real image overwrites its first
+    // 96 bytes; what is left behind sits past the image in a page the child
+    // enters at offset zero and never reaches.
+    let wide = [0x90u8; SCRATCH_BYTES as usize];
+    let wide_started = bhaskix_sock::time::now();
+    let wide_ok = copy_out_through(CHILD, EXEC_CODE_AT, &wide);
+    let wide_cycles = bhaskix_sock::time::now().saturating_sub(wide_started);
+
+    let started = bhaskix_sock::time::now();
     if !copy_out_through(CHILD, EXEC_CODE_AT, &EXEC_IMAGE) {
         return false;
+    }
+    let cycles = bhaskix_sock::time::now().saturating_sub(started);
+    let wide_cycles = if wide_ok { wide_cycles } else { 0 };
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // past every other record and well inside 4,096 bytes.
+    unsafe {
+        core::ptr::write_volatile(COPY_RECORD_AT as *mut u64, cycles);
+        core::ptr::write_volatile((COPY_RECORD_AT + 8) as *mut u64, wide_cycles);
     }
     let started = call(
         syscall::INVOKE,

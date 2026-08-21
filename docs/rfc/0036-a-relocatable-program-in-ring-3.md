@@ -197,13 +197,53 @@ gate, which accepts a no-entropy machine and refuses silence.
 **Real hardware.** Nothing specific, and that is worth stating: this is arithmetic and page tables,
 not a device.
 
+## What step 2 measured
+
+Printed on every boot that runs a hosted `execve`, and gated so it cannot quietly stop being taken.
+Five samples, medians:
+
+| | cycles |
+|---|---|
+| A supervised copy of **96 bytes** (one `COPY_OUT` round trip) | ~158,000 |
+| A supervised copy of **1,024 bytes** | ~1,165,000 |
+| The kernel moving the same **1,024 bytes** through the direct map | ~112 |
+
+So the crossing costs on the order of **10⁴× the copy it performs**, and the marginal cost is around
+**1,100 cycles per byte** against roughly a tenth of a cycle per byte for `copy_nonoverlapping`. A
+one-megabyte image at that rate is over a billion cycles.
+
+**The obvious explanation was tested and is wrong.** `copy_out_through` stages bytes into the scratch
+area **one volatile write at a time**, which looked like the whole story. Replacing that loop with a
+single bulk copy and re-measuring changed nothing: 96 bytes went ~158,000 → ~164,000 and 1,024 went
+~1,165,000 → ~1,005,000, both inside the spread of the samples. **The cost is on the kernel side of
+`COPY_OUT`, not in how the adapter feeds it.**
+
+**Which is why this measurement does not decide question 1, and saying so is the honest outcome.**
+A per-byte cost of a thousand cycles inside a supervised copy is not a property anybody designed on
+purpose, and a design chosen against an unexplained number inherits the misunderstanding. Two things
+must happen before question 1 is answered:
+
+1. **Understand the per-byte term.** `copy_across` copies in bulk once it has a frame, so ~1,100
+   cycles per byte has no obvious source in the code. `shared::drain_into` re-walks its object from
+   the beginning on every call — documented, and named for its sink rather than for consumption —
+   which is the first place to look.
+2. **Repeat it somewhere that is not TCG.** Every figure above is emulated, and this project has
+   never booted on physical hardware (M1-17). The telemetry plane's own numbers carry the same
+   caveat and say so.
+
+**What the measurement does establish**: the interface is not *near* free, so the "adapter loads the
+image" design cannot be adopted on the assumption that it is cheap — which is exactly the assumption
+step 2 existed to test.
+
 ## Unresolved questions
 
 1. **Who chooses the slide?** The three shapes are in *Alternatives*. The leaning is the adapter,
    loading through the supervisor interface it already holds — but it is the largest of the three
    and the decision should follow the measurement in *Performance*, not precede it.
-2. **What does loading through the supervisor interface cost?** Unmeasured, and it decides
-   question 1.
+2. ~~**What does loading through the supervisor interface cost?**~~ **Measured 2026-08-21 —
+   ~10⁴× the copy itself, ~1,100 cycles per byte — and the number raised a new question instead of
+   settling one.** Why the per-byte term is that large is not understood; the staging loop was
+   ruled out by experiment. Question 1 waits on that, not on more measuring.
 3. **How many bits?** The `mmap` base takes 28, matching Linux. A text slide has less room — the
    image must stay inside the user half and clear of the fixed addresses the adapter maps for
    `execve` and `fork` — and the number should be stated rather than inherited.
@@ -223,8 +263,9 @@ Not a schedule, and **the first step is not the feature**.
    reached in 2,499,337 runs after, both from an empty corpus. 24,472,731 executions clean. `elf`
    keeps `forbid(unsafe_code)` and a zero budget. **The prerequisite is discharged; the rest of
    this plan is not started.**
-2. Measure what loading an image through `COPY_OUT`/`MAP_AT` costs against the kernel's direct copy.
-   Answer question 2, then question 1.
+2. ~~Measure what loading an image through `COPY_OUT`/`MAP_AT` costs against the kernel's direct
+   copy.~~ **Done 2026-08-21 — and it does not answer question 1, which is itself the finding.**
+   See §"What step 2 measured" below.
 3. Host tests for the slide arithmetic in `elf`, with the crate's `forbid(unsafe_code)` and zero
    budget intact.
 4. `AddressHalf::User` accepts `TYPE_DYN`; the loader takes and applies a slide.

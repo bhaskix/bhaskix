@@ -894,6 +894,82 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (RFC 0036 step 2: the supervised copy is measured, and the number does not answer the question it was taken for)
+
+**The step the RFC put before its own design decision**, and it paid off in the direction nobody
+plans for: the measurement refuses to settle question 1, and *that* is the finding.
+
+Printed on every boot that runs a hosted `execve`, gated so it cannot quietly stop being taken.
+Five samples, medians:
+
+| | cycles |
+|---|---|
+| A supervised copy of **96 bytes** — one `COPY_OUT` round trip | ~158,000 |
+| A supervised copy of **1,024 bytes** | ~1,165,000 |
+| The kernel moving the same **1,024 bytes** through the direct map | ~112 |
+
+**Roughly 10⁴× the copy it performs**, and a marginal cost around **1,100 cycles per byte** against
+about a tenth of a cycle for `copy_nonoverlapping`. A one-megabyte image at that rate is over a
+billion cycles.
+
+**The obvious explanation was tested and is wrong**, which is the part worth keeping.
+`copy_out_through` stages bytes into the scratch **one volatile write at a time**, and that looked
+like the whole story. Replacing the loop with a single bulk copy and re-measuring changed nothing —
+96 bytes ~158,000 → ~164,000, and 1,024 ~1,165,000 → ~1,005,000, both inside the samples' own
+spread. **The cost is on the kernel side of `COPY_OUT`, not in how the adapter feeds it.** The
+experiment was reverted; a change that buys nothing measurable should not be carried as though it
+did.
+
+**So question 1 stays open, deliberately.** A thousand cycles per byte inside a supervised copy is
+not a property anybody designed on purpose, `copy_across` copies in bulk once it has a frame, and a
+design chosen against an unexplained number inherits the misunderstanding. `shared::drain_into`
+re-walks its object from the beginning on every call — documented, and named for its sink rather
+than for consumption — and is the first place to look. Every figure is also TCG, and M1-17 is
+unmet.
+
+**What it does establish is exactly what the step existed to test**: the interface is not near free,
+so "the adapter loads the image" cannot be adopted on the assumption that it is.
+
+#### The exact budgets earned their keep twice in one change
+
+A first attempt wrote `rdtsc` inside `bin/linuxd` and cost **twelve** `unsafe` lines in the program
+`security.md` §1 calls the largest concentration of authority in the system. The exact budget
+reported it before it was committed. Taking the counter from `bhaskix-sock` — which owns that read
+already, *written once so it is not copied*, which is the reason that crate exists — brought it to
+**four**, and left the instruction budget untouched at three. The kernel's comparator cost seven,
+and 1,588 → 1,595 was raised deliberately with the reason at the line. **A measurement that cost
+nothing to take would be measuring nothing.**
+
+#### And the stale-artifact trap, for the fourth time, two commits after it was written down
+
+`bin/linuxd is not an ELF this kernel will load`. A bare `cargo build` inside `user/linuxd` updated
+the artifact's mtime, `make` skipped its recipe, and the ISO shipped a binary built without its link
+script — the hazard recorded earlier the same day, walked into again by the person who recorded it.
+**The rule as written was not sharp enough.** `cargo check` is safe: it produces no artifact.
+`cargo build` in a crate directory is the trap. The record now says which.
+
+### 2026-08-21 (a second unexplained intermittent: an exec whose record is right and whose console line is missing)
+
+`make test` failed once on the **UEFI** lane:
+
+```
+FAIL  the exec did not keep its pid across the domain change: kept='3 2 3', console says ''
+```
+
+**The record is correct** — pid 3, domain 2 became domain 3 — so the `execve` happened, the pid
+survived, and the adapter wrote its record. What is missing is the *child's own console line*,
+`execed pid 3`, which the gate also requires and which is written by the exec'd program in the
+moment before its domain ends.
+
+**Not reproduced**: three consecutive UEFI lanes afterwards were clean, and six earlier boots
+captured for the copy measurement all carry `execed pid 3`. The shape suggests a race between the
+child's console write and its domain ending rather than anything about the exec, but that is a
+reading of one sample and is recorded as such.
+
+It is the **second** unexplained intermittent of the day, after the 494 ms spawn, and they are not
+obviously related — one is scheduler timing, this one is a lost console byte on a dying domain.
+Both are written down with their evidence rather than re-run until green and forgotten.
+
 ### 2026-08-21 (an unexplained 494 ms spawn, recorded rather than dismissed)
 
 **`make test` failed once, on a gate nothing in the change could reach**, and the number is the

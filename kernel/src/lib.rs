@@ -3251,6 +3251,8 @@ fn personality_boundary_report() {
         }
     }
 
+    report_supervised_copy();
+
     // What the fault path did. Printed whenever anything was handed over,
     // because a fault reaching the personality at all is the claim step 6
     // makes and the only evidence for it.
@@ -5772,6 +5774,75 @@ fn adapter_wait_record() -> (i64, u64) {
 }
 
 /// What the adapter's last `fork` did: the child's pid and the bytes copied.
+/// What a supervised copy costs, against the kernel's own.
+///
+/// [RFC 0036](../../docs/rfc/0036-a-relocatable-program-in-ring-3.md) step 2,
+/// and the reason it is step 2: the RFC's question 1 — who chooses a hosted
+/// program's load address — turns on whether `bin/linuxd` could load an image
+/// itself through the supervisor interface it already holds, and that turns on
+/// what a page costs that way against `copy_nonoverlapping` through the direct
+/// map. **The RFC refused to choose a design before this number existed.**
+///
+/// Three numbers, and the comparison only means something with all three:
+/// what the adapter paid for 96 bytes (one round trip, almost all fixed cost),
+/// what it paid for 1,024 (the scratch area's full width, so the slope), and
+/// what the kernel pays to move the same 1,024 bytes with a single `memcpy`
+/// through the direct map. The last is the floor — it is the copy itself with
+/// no crossing at all — and the distance between it and the first two is the
+/// price of doing the work from ring 3.
+fn report_supervised_copy() {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return;
+    }
+    // Past the mmap records, the scratch, and the exec, file, fork and wait
+    // records: 256 + 1,024 + 24 + 24 + 16 + 16.
+    const FIRST_WORD: usize = (8 * 32 + 1024 + 24 + 24 + 16 + 16) / 8;
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 2];
+    let mut at = 0usize;
+    let taken = shared::drain_into(object, (FIRST_WORD + 2) * 8, &mut |chunk: &[u8]| {
+        for word in chunk.chunks_exact(8) {
+            if at >= FIRST_WORD + 2 {
+                break;
+            }
+            if at >= FIRST_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    let (narrow, wide) = (record[0], record[1]);
+    if taken.is_none() || narrow == 0 {
+        return;
+    }
+
+    // The floor: the same 1,024 bytes, moved by the kernel with no crossing.
+    // Two static buffers rather than a frame allocation, because this runs on
+    // the boot path and must not be able to fail.
+    static mut FROM: [u8; 1024] = [0x5a; 1024];
+    static mut INTO: [u8; 1024] = [0; 1024];
+    let started = bhaskix_arch::tsc::read();
+    // SAFETY: two distinct static buffers of the same length, neither aliased
+    // by anything else on the boot path, copied whole.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(FROM).cast::<u8>(),
+            core::ptr::addr_of_mut!(INTO).cast::<u8>(),
+            1024,
+        );
+    }
+    let direct = bhaskix_arch::tsc::read().saturating_sub(started);
+
+    println!(
+        "    linux copyout  a supervised copy costs {narrow} cycles for 96 bytes and {wide} for \
+         1024; the kernel moves the same 1024 through the direct map in {direct}"
+    );
+}
+
 fn adapter_fork_record() -> (u64, u64) {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
