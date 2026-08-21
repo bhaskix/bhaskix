@@ -285,7 +285,3 @@ fn arm_sequence(data: &[u8], max: usize) {
         assert!(cache.live(now) <= 4, "the table's own bound");
     }
 }
-
-fn bad() -> u8 {
-    1
-}

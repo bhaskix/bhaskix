@@ -762,6 +762,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | Limine containment (only `boot/` may name it) | M1 | architecture.md §1 |
 | Dependency direction / no cycles | M1 | architecture.md §5 |
 | **Every fuzz target still compiles** — `tools/check-fuzz-targets.sh`, `cargo check` on all 15, one second warm, on stable. Added after `arp_parse` and `tcp_parse` were found not to have compiled since 2026-08-18 | 2026-08-21 | coding-style.md §8 — a target that does not build runs zero executions |
+| **A supervisor's write commits, and its read does not** — the invariant behind 2026-08-20's three `EFAULT` bugs, asserted at boot in both directions and both watched failing | 2026-08-21 | security.md §1 gap 4; `vm::frame_for_write` |
 | **Instruction containment** — every crate holding an architecture-specific instruction declares an `asm_budget` and a reason; undeclared is a hard failure, and the gate is watched refusing a fixture on every run | 2026-08-20 | architecture.md §7 |
 | No vendor strings in published files | M1 | Project policy |
 | No AI-vendor attribution — **refused at commit time** by `tools/git-hooks/{pre-commit,commit-msg}`, and the hooks' installation is itself checked | M1 (hooks 2026-08-20) | Project policy; CONTRIBUTING.md §"AI-assisted contributions" cond. 3 |
@@ -889,6 +890,71 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-21 (the user-pointer copy path gets its pass, and the invariant stops being a comment)
+
+**Gap 4 of the security reassessment.** Three bugs of one shape landed on 2026-08-20 — `wait4`'s
+status word, `pipe2`'s descriptor pair and every `read` into a fresh buffer, each answering `EFAULT`
+for memory a hosted program had legitimately mapped. Three occurrences of one shape is a missing
+invariant, not three bugs, and the remedy recorded was *a pass, not a fourth patch*.
+
+#### The invariant, stated exactly
+
+**A kernel write into a domain's memory must commit the page first — and only a write.** The reason
+is narrow and easy to forget: a write performed by the **CPU**, through the loaded page table,
+*faults* on a lazily mapped page and the handler services it, automatically and invisibly. A write
+performed by the kernel through the **direct map**, into a space that is not loaded, takes no fault
+at all. There is nothing to service, so a page the program mapped and never touched has no frame and
+the write fails.
+
+#### What the pass found, which is smaller than the bug count suggested
+
+Only **six** kernel operations touch a space that is not the current one — `MAP_AT`, `UNMAP_AT`,
+`PROTECT_AT`, `commit_page` itself, and the two halves of `copy_across`. **Exactly one of them
+writes bytes.** Everything else either writes through the CPU, or writes into a region mapped by
+`map_anonymous`, which is **eager** and has nothing to commit: the ELF loader is the significant
+example, and it is safe by construction rather than by care.
+
+**Lazy regions come from exactly one production call site** — `map_anonymous_lazy`, reached only
+through `MAP_AT`. So the whole exposure is: a supervisor writing into a domain whose memory it
+mapped, which is precisely the hosted-process path RFC 0033 built.
+
+#### The change
+
+The rule is no longer a comment at the site that learned it. `vm::frame_for_write` commits;
+`vm::frame_for_read` deliberately does not; **a caller picks by saying which it is doing**, and the
+next supervisor write gets the rule without being told. `copy_across` is three lines shorter and
+says only which kind of copy it is.
+
+The asymmetry is the point of having two functions rather than one with a flag. **A read that
+commits is not a harmless extra**: it turns an inspection into a change, lets a caller that only
+meant to look grow the target's memory, and would hide the original bug by accident rather than fix
+it on purpose.
+
+**Watched failing in both directions, which is the only reason to believe it**: putting the
+2026-08-20 bug back gives *"a write did not commit a page the region map allows"*; making the read
+commit gives *"a lazily mapped page had a frame before anything touched it"*. A boot gate holds it
+on every placement.
+
+#### Two mistakes of my own, recorded because they are the useful part
+
+- **I booted a stale ISO.** The first attempt to arm the read half reported success against an image
+  `cargo build` had not rebuilt — `make iso` is what assembles it. The same mistake as the shell
+  rename earlier today, made twice in one session by the same shortcut.
+- **A `sed` cleanup after a formatter silently did nothing, and the result was pushed.** Arming the
+  formatting gate meant appending a deliberately unformatted `fn bad()`; `cargo fmt` then rewrote it
+  into well-formed multi-line code, so the `sed` pattern written against the *unformatted* text
+  matched nothing. The stray function was formatted, compiled, passed every gate, and went out in
+  `83157d4`. **A formatting gate and a compile gate cannot see dead code**, and cleanup matched
+  against text a formatter has already rewritten is not cleanup. Both copies are removed here.
+
+#### And a message bug in this morning's gate, fixed
+
+`tools/check-fuzz-targets.sh` ran `cargo fmt --all` inside the fuzz workspace, which **follows path
+dependencies** and reports on `kernel/`, `net/` and everything else they reach — so it failed with
+*"a fuzz target is not formatted"* over a diff in `kernel/src/vm.rs`, blaming the wrong workspace for
+a real problem. It is `-p bhaskix-fuzz` now: the root `make fmt` owns those crates, this owns the
+targets.
 
 ### 2026-08-21 (IPv6 and NDP get the coverage-guided target RFC 0029 never promised, and it refutes an assertion of its own author's)
 

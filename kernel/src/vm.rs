@@ -1035,6 +1035,59 @@ pub fn commit_page(root: u64, address: u64) -> bool {
     .unwrap_or(false)
 }
 
+/// The frame behind `page` in `root`, for a kernel **write** into that space.
+///
+/// # The invariant this exists to hold, and why a comment was not enough
+///
+/// **A kernel write into a domain's memory must commit the page first.** The
+/// reason is narrow and easy to forget: a write performed by the CPU, through
+/// the loaded page table, *faults* on a lazily mapped page and the handler
+/// services it — the mechanism is automatic and invisible. A write performed by
+/// the kernel through the **direct map**, into a space that is not loaded, takes
+/// no fault at all. There is nothing to service, so a page the program mapped
+/// but never touched simply has no frame, and the write fails.
+///
+/// That distinction cost **three bugs of one shape in a single day**, on
+/// 2026-08-20: `wait4`'s status word, `pipe2`'s descriptor pair and every
+/// `read` into a fresh buffer each answered `EFAULT` for memory the hosted
+/// program had legitimately mapped. Three occurrences of one shape is a missing
+/// invariant, not three bugs.
+///
+/// So the invariant is not written in a comment at the one call site that
+/// learned it. **It is written here, as the only way to obtain a frame to write
+/// into**: this function commits, [`frame_for_read`] does not, and a caller
+/// picks by saying which it is doing. The next supervisor write gets the rule
+/// for free, which a comment could never have given it — the same argument
+/// [RFC 0014](../../docs/rfc/0014-driver-framework.md) makes for
+/// `register_block!`: a framework is the difference between a lesson recorded
+/// and a lesson enforced.
+///
+/// Answers `None` when the page is not in the space at all, when its region
+/// refuses a write, or when there is no frame to be had.
+pub fn frame_for_write(root: u64, page: u64) -> Option<u64> {
+    if let Some(frame) = with_space(root, |space| space.translate(VirtAddr(page)))? {
+        return Some(frame);
+    }
+    // Nothing there: commit it, exactly as the program's own first write would
+    // have. A region that refuses a write refuses here too, inside
+    // `service_fault`, so this is not a way around a read-only mapping.
+    if !commit_page(root, page) {
+        return None;
+    }
+    with_space(root, |space| space.translate(VirtAddr(page)))?
+}
+
+/// The frame behind `page` in `root`, for a kernel **read** of that space.
+///
+/// **Deliberately does not commit**, and that asymmetry is the whole point of
+/// having two functions rather than one with a flag. A read of a page nothing
+/// has ever written is a read of zeroes; allocating a frame to prove it would
+/// turn an inspection into a change, and would let a caller that only meant to
+/// look grow the target's memory footprint.
+pub fn frame_for_read(root: u64, page: u64) -> Option<u64> {
+    with_space(root, |space| space.translate(VirtAddr(page)))?
+}
+
 /// The body of [`handle_fault`], against a space the caller has found.
 fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOutcome {
     let page = VirtAddr(address & !(PAGE_SIZE - 1));
@@ -1156,6 +1209,108 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
             FaultOutcome::Handled
         }
     }
+}
+
+/// Proves that a supervisor's **write** commits a lazily mapped page and a
+/// **read** does not.
+///
+/// # Why this is a test and not a comment
+///
+/// The rule lives in [`frame_for_write`], and the reason it lives in a function
+/// rather than in prose is that three bugs of one shape landed on 2026-08-20
+/// when it lived in prose. A rule with no test is prose again: nothing would
+/// notice if `frame_for_write` stopped committing, and — the direction people
+/// forget — nothing would notice if `frame_for_read` **started**.
+///
+/// Both directions are asserted here. A read that commits is not a harmless
+/// extra: it turns an inspection into a change, lets a caller that only meant
+/// to look grow the target's memory, and would make the `EFAULT` bug invisible
+/// again by accident rather than on purpose.
+///
+/// This runs against a **registered** space, because that is the only kind the
+/// supervisor interface can reach — `with_space` finds a space by root in the
+/// table, and an unregistered one is not addressable by either accessor. That
+/// is also why it cannot simply be an arm of the demand-paging test above,
+/// which works on a space it holds directly and never registers.
+pub fn supervisor_write_self_test(hhdm_base: u64) -> bool {
+    // Far from anything bring-up maps, and page-aligned.
+    const LAZY: u64 = 0x0000_0000_5000_0000;
+    // A domain id nothing owns. `register_for` records it and no operation
+    // here resolves it, which is exactly what `DomainId::from_u32` documents.
+    const NOBODY: u32 = 0xffff_fffe;
+
+    let baseline = heap::available_frames();
+
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        crate::println!("    supervisor write  FAILED to create an address space");
+        return false;
+    };
+    let Some(range) = VirtRange::from_pages(VirtAddr(LAZY), 1) else {
+        space.destroy();
+        return false;
+    };
+    if space
+        .map_anonymous_lazy(range, Protection::ReadWrite)
+        .is_err()
+    {
+        crate::println!("    supervisor write  FAILED to register a lazy region");
+        space.destroy();
+        return false;
+    }
+
+    let root = space.root();
+    if register_for(crate::domain::DomainId::from_u32(NOBODY), space).is_none() {
+        crate::println!("    supervisor write  FAILED to register the space");
+        return false;
+    }
+
+    let mut wrong: Option<&str> = None;
+
+    // The premise: mapped in the region map, absent from the page table.
+    if frame_for_read(root, LAZY).is_some() {
+        wrong = Some("a lazily mapped page had a frame before anything touched it");
+    }
+
+    // A read must not create one. This is the assertion that would catch a
+    // future `frame_for_read` that "helpfully" committed.
+    if wrong.is_none() && frame_for_read(root, LAZY).is_some() {
+        wrong = Some("a read committed a page");
+    }
+
+    // A write must.
+    let written = frame_for_write(root, LAZY);
+    if wrong.is_none() && written.is_none() {
+        wrong = Some("a write did not commit a page the region map allows");
+    }
+
+    // And the commit stuck, so the read now sees what the write made.
+    if wrong.is_none() && frame_for_read(root, LAZY) != written {
+        wrong = Some("the frame a write committed is not the one a read finds");
+    }
+
+    // A page in no region is refused by both, which is what stops either
+    // accessor being a way to reach memory the domain was never given.
+    if wrong.is_none() && frame_for_write(root, LAZY + 0x1000_0000).is_some() {
+        wrong = Some("a write committed a page in no region at all");
+    }
+
+    forget(root);
+
+    if let Some(what) = wrong {
+        crate::println!("    supervisor write  FAILED: {what}");
+        return false;
+    }
+
+    // The frames the commit took are not returned — `forget` drops the
+    // bookkeeping and leaks the tables, exactly as it documents — so this
+    // reports the cost rather than asserting it went back to baseline, which
+    // would be a claim this kernel cannot yet make about any address space.
+    let after = heap::available_frames();
+    crate::println!(
+        "    supervisor write  a write commits, a read does not; {} frames spent",
+        baseline.saturating_sub(after)
+    );
+    true
 }
 
 /// Exercises demand paging and copy-on-write against a live address space.

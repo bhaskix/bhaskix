@@ -359,6 +359,13 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("\x1b[91m    demand paging  FAILED\x1b[0m");
     }
 
+    // And the other half of the same mechanism: a supervisor writing into a
+    // space it is not running in takes no fault, so it must commit the page
+    // itself. Three bugs of one shape on 2026-08-20 are why this is a gate.
+    if !vm::supervisor_write_self_test(handoff.hhdm_base.as_u64()) {
+        println!("\x1b[91m    supervisor write  FAILED\x1b[0m");
+    }
+
     let secondaries = smp::start_secondaries(handoff);
     smp::report(handoff);
     let _ = secondaries;

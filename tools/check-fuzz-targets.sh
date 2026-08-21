@@ -53,10 +53,15 @@ done
 # targets above. The check belongs here, with the other thing that knows this
 # workspace exists, rather than as a fourteenth line on a list somebody has to
 # remember to extend.
-if [ "$status" -eq 0 ] && ! (cd fuzz && cargo fmt --all --check >/dev/null 2>&1); then
+# `-p bhaskix-fuzz`, not `--all`: `cargo fmt --all` in this workspace follows
+# the path dependencies and reports on `kernel/`, `net/` and everything else
+# they reach -- so on 2026-08-21 this check failed with "a fuzz target is not
+# formatted" over a diff in `kernel/src/vm.rs`, blaming the wrong workspace for
+# a real problem. The root `make fmt` owns those crates; this owns the targets.
+if [ "$status" -eq 0 ] && ! (cd fuzz && cargo fmt --check -p bhaskix-fuzz >/dev/null 2>&1); then
     echo "  ${RED}FAIL${RESET}  a fuzz target is not formatted"
-    (cd fuzz && cargo fmt --all --check 2>&1) | head -20
-    echo "        Run: cd fuzz && cargo fmt --all"
+    (cd fuzz && cargo fmt --check -p bhaskix-fuzz 2>&1) | head -20
+    echo "        Run: cd fuzz && cargo fmt -p bhaskix-fuzz"
     status=1
 fi
 

@@ -408,6 +408,25 @@ else
     status=1
 fi
 
+# The other half of the same mechanism, and the half that has actually gone
+# wrong. A write performed by the CPU faults on a lazily mapped page and the
+# handler services it; a write performed by the kernel through the direct map,
+# into a space it is not running in, takes no fault at all and must commit the
+# page itself. Three bugs of one shape landed on 2026-08-20 because that rule
+# lived in a comment -- `wait4`'s status word, `pipe2`'s descriptor pair and
+# every `read` into a fresh buffer, each answering EFAULT for memory the
+# program had legitimately mapped.
+#
+# Both directions are asserted by the self-test behind this line, and both were
+# watched failing: a write that does not commit (the original bug, put back),
+# and -- the direction people forget -- a read that does.
+if grep -qF "a write commits, a read does not" "$LOG"; then
+    pass "a supervisor's write commits a lazily mapped page, and its read does not"
+else
+    fail "the supervisor-write invariant did not hold"
+    status=1
+fi
+
 # SMEP and SMAP turn whole classes of exploitation primitive into faults, and
 # uaccess depends on the exception table existing at all.
 # A single boot cannot prove the base is *random*, only that a slide was
