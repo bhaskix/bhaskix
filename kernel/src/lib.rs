@@ -2809,6 +2809,35 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
             ok = false;
         }
     }
+    if !answered || verdict != 2 {
+        // What the caller is actually doing, at the moment the wait gave up.
+        // `STRANDED` says how far it got -- 1 is "the call has not returned",
+        // 2 is the right answer, 3 a wrong refusal, 4 a reply it should never
+        // have received -- and the thread's own state says whether it is
+        // blocked, runnable, or gone. A wait that only reports "not 2" cannot
+        // tell a caller still asleep from one woken with the wrong answer.
+        println!("      stranded verdict {verdict}, and the caller is:");
+        let mut seen = false;
+        sched::for_each(|cpu, id, name, state, _, _, _| {
+            if name == "stranded" {
+                seen = true;
+                println!("      cpu {cpu} thread {id} ({name}) {state:?}");
+            }
+        });
+        if !seen {
+            println!("      no thread named 'stranded' is on any runqueue");
+        }
+        // Which rendezvous step failed, from the counters that already exist.
+        // `reply_tried` against `reply_no_caller` says whether the server ever
+        // tried to answer and was refused; `wake_missed` says whether somebody
+        // was woken who was not asleep; `dropped` says whether a message was
+        // handed over and lost.
+        let (dropped, wake_missed, recv_returned, reply_tried, reply_no_caller, recv_empty) =
+            ipc::diagnostics();
+        println!(
+            "      ipc: dropped {dropped}, wake missed {wake_missed}, recv returned              {recv_returned}, reply tried {reply_tried}, reply refused {reply_no_caller},              recv empty {recv_empty}"
+        );
+    }
     if !siblings_gone {
         // Which one survived is the diagnosis, not a detail: `spinner` never
         // makes a system call and `yielder` makes nothing but, so the name of

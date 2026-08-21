@@ -894,6 +894,64 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (the teardown race: one real defect fixed, the race itself narrowed to a window a `println!` closes)
+
+**Asked to fix the race. One genuine defect is fixed, the race is not, and the difference is stated
+rather than blurred.**
+
+#### What was fixed, and it is a real bug
+
+`ipc::reply` **took** the reply obligation with `take_reply_target` and then, if `sched::deliver`
+failed, returned an error **without putting it back**. The obligation is gone and the caller stays
+blocked: no later `exit` and no teardown will release it, because nothing owes it any more. The
+branch six lines above — a reply aimed at the wrong caller — already restores it, with the comment
+*"Put it back: this thread still owes an answer, to somebody else."* This path wanted the same
+sentence and did not have it.
+
+`deliver` fails two ways and restoring is right for both: a caller whose mailbox is already occupied
+is still owed an answer, and a caller that has gone leaves an obligation naming a dead thread, which
+`abandon_caller` reports `false` for harmlessly.
+
+**It is not what `test-faults` was hitting** — the rate is unchanged — and that is said here rather
+than left for somebody to discover. It was found while hunting the other thing.
+
+#### What the failure actually is, measured
+
+The `user` arm's failing boot, with diagnostics that print only on failure:
+
+```
+stranded verdict 1, and the caller is:
+cpu 0 thread 11 (stranded) Blocked
+ipc: dropped 0, wake missed 0, recv returned 1, reply tried 0, reply refused 0, recv empty 3
+```
+
+- The caller is **Blocked**, verdict 1 — its `call` never returned.
+- **`reply tried 0`.** The server never attempted an answer.
+- The server exited **owing nothing** — no `A SERVER EXITED OWING A REPLY`.
+- Yet `owes_reply_in_domain` had returned true before the fault, which is what the arm waits for.
+
+So the obligation existed, was never discharged, and was gone by the time the server exited.
+
+**Ruled out, each by reading the code rather than assuming:** a lost wakeup (`wake missed 0`), a
+dropped message (`dropped 0`), work stealing losing the field (the steal moves the whole `Thread`),
+and teardown marking threads finished behind `exit`'s back (`State::Finished` is assigned in exactly
+one place outside tests). The only two writers of `reply_to` are `reply` and `exit`, and neither ran
+with it held.
+
+#### And the window is narrow enough that watching it closes it
+
+A single `crate::println!` added to `exit`, reporting the exiting thread and its obligation, made
+the arm pass **18 times in a row**. Without it, 2 failures in 10. At a one-in-four rate, eighteen
+consecutive passes is about a 0.6% coincidence.
+
+**That is the most useful thing this session learned about the bug**: it is a genuine timing race,
+not a logic error on a path that always runs, and it is narrow enough that one serial write in the
+exit path hides it. Any instrument placed in `exit` will therefore lie. The next attempt should
+record into memory and print *after* the fact — a counter, or a small ring the failure dump reads —
+rather than printing inside the window.
+
+The diagnostics that survive here all print **only on failure**, for that reason.
+
 ### 2026-08-21 (the fault test keeps its log, and the "hang" turns out to be a revoked capability)
 
 **The change asked for was small: stop deleting the serial log.** It found the bug on the fifth run.

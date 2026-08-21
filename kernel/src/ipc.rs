@@ -755,6 +755,28 @@ pub fn reply(caller: u32, message: Message) -> Result<(), IpcError> {
     }
 
     if !sched::deliver(caller, message, me) {
+        // **Put the obligation back.** `take_reply_target` above has already
+        // removed it, and returning here without restoring it drops an answer
+        // that is still owed: the caller stays blocked, and the server no
+        // longer owes anything, so neither `exit`'s `abandon_caller` nor the
+        // domain's teardown will ever release it. That is a thread asleep for
+        // the life of the machine, and nothing reports it.
+        //
+        // The branch six lines above — a reply aimed at the wrong caller —
+        // already does this, with the comment *"Put it back: this thread still
+        // owes an answer, to somebody else."* This path wanted the same
+        // sentence and did not have it.
+        //
+        // Correct for both ways `deliver` fails. If the caller's mailbox is
+        // occupied, the answer is still owed and the server may retry. If the
+        // caller has gone, the obligation now names a thread that no longer
+        // exists, and `abandon_caller` answers `false` for it harmlessly.
+        //
+        // Found on 2026-08-21 by `test-faults`' `user` arm, which failed about
+        // one run in four with the caller never released — and was called a
+        // 120-second hang for a week, because the harness deleted the log that
+        // said otherwise.
+        sched::set_reply_target(me, caller);
         REPLY_NO_CALLER.fetch_add(1, Ordering::Relaxed);
         trace(Event::ReplyRefused, me, caller);
         return Err(IpcError::NoSuchCaller);
