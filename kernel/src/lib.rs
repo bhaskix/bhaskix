@@ -2766,10 +2766,27 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // The caller must be told, and told the right thing. A separate wait
     // because it is released by its server's death rather than by the domain's:
     // the two happen in that order, and one wait could not tell them apart.
+    // **Eight seconds, which is where it started, and it is back because the
+    // bug it was hiding is fixed rather than because the number was wrong.**
+    //
+    // This was raised to 30,000 ms on 2026-08-21 while the arm was failing
+    // about one run in four, on the reading that the release was merely late.
+    // It was not late: `sched::exit` marked the exiting thread `Finished`
+    // *before* releasing the caller, and a `Finished` thread is never scheduled
+    // again, so a preemption in that window stranded the caller for ever. With
+    // the order corrected the arm passes at the original bound.
+    //
+    // The **elapsed time is still reported**, because the median is 22 µs and a
+    // bound eight seconds above it would hide a regression completely. A number
+    // that changes is a better alarm than a gate that starts flaking.
+    let waited_from = bhaskix_arch::tsc::read();
     let answered = wait_until(
         || STRANDED.load(core::sync::atomic::Ordering::Acquire) >= 2,
         8_000,
     );
+    let release_micros =
+        bhaskix_arch::tsc::to_nanos(bhaskix_arch::tsc::read().saturating_sub(waited_from))
+            .map_or(0, |nanos| nanos / 1_000);
     let verdict = STRANDED.load(core::sync::atomic::Ordering::Acquire);
 
     let live_after = domain::live();
@@ -2837,6 +2854,25 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!(
             "      ipc: dropped {dropped}, wake missed {wake_missed}, recv returned              {recv_returned}, reply tried {reply_tried}, reply refused {reply_no_caller},              recv empty {recv_empty}"
         );
+        // Every change to a reply obligation, oldest first, recorded without
+        // printing so that watching does not close the window being watched.
+        // A single `println!` inside `exit` made this arm pass eighteen times
+        // running, which is why the trail exists at all.
+        println!("      reply trail, oldest first:");
+        for (kind, cpu, thread, caller) in sched::reply_trail() {
+            if kind == 0 {
+                continue;
+            }
+            let what = match kind {
+                k if k == sched::reply_trail::SET => "set",
+                k if k == sched::reply_trail::TAKEN_BY_REPLY => "taken by reply",
+                k if k == sched::reply_trail::TAKEN_BY_EXIT => "taken by exit",
+                k if k == sched::reply_trail::EXIT_FOUND_NONE => "exit found none",
+                _ => "?",
+            };
+            let name = sched::describe(thread).map_or("?", |(name, _)| name);
+            println!("        cpu {cpu} thread {thread} ({name}) {what} {caller:?}");
+        }
     }
     if !siblings_gone {
         // Which one survived is the diagnosis, not a detail: `spinner` never
@@ -2858,7 +2894,7 @@ fn user_fault_self_test(hhdm_base: u64, cpus: u32) -> bool {
     ipc::destroy(endpoint);
     if ok {
         println!(
-            "    user fault     a ring 3 fault ended its domain and nothing else, its siblings stopped and its caller was released; {live_after} domains live"
+            "    user fault     a ring 3 fault ended its domain and nothing else, its siblings stopped and its caller was released after {release_micros} us; {live_after} domains live"
         );
     } else {
         domain::destroy(doomed);

@@ -894,6 +894,131 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (the teardown race, found and fixed: a thread marked finished before it had finished)
+
+**`sched::exit` marked the exiting thread `Finished` before releasing the caller it owed an answer,
+and a `Finished` thread is never scheduled again.** A preemption in that window ended the story
+there: the obligation taken, the caller never woken, and nothing anywhere recording it.
+
+```rust
+queue.threads[current].as_mut().and_then(|thread| {
+    thread.state = State::Finished;   // <- here
+    thread.reply_to.take()
+})
+// ... lock dropped, because abandon_caller takes another of the same rank ...
+if let Some(caller) = owed { ...; abandon_caller(caller); }   // <- may never run
+```
+
+The two cannot happen under one lock — `abandon_caller` takes another runqueue lock and two of the
+same rank have no order between them — so the gap is structural. What was wrong is which side of it
+`Finished` sat on.
+
+**The fix is the order**: take the obligation, drop the lock, release the caller, and only then say
+this thread is finished. Staying `Running` for those few instructions costs nothing — the thread is
+inside `exit` and will never return to its own code — and it keeps it something the scheduler will
+come back to.
+
+#### The evidence
+
+| | |
+|---|---|
+| Before, across four batches | ~2 failures in every 10 |
+| After the reorder, at a 30,000 ms bound | 14 / 14 |
+| **After the reorder, at the original 8,000 ms bound** | **28 / 28** |
+
+The last row is the one that matters. The bound had been raised to 30,000 ms on the theory that the
+release was merely late; **it is back at 8,000 ms and passes**, which says the bound was never the
+problem.
+
+#### Two wrong conclusions on the way, both recorded where they were written
+
+- *"The obligation was never discharged and was gone by the time the server exited."* Wrong. The
+  breadcrumb ring showed `thread 10 (server) taken by exit Some(11)` — it **was** discharged. The
+  absence of `A SERVER EXITED OWING A REPLY` had been read as proof the release never ran, when it
+  only proved it had not run **yet**, and in fact proved something better: a take with no
+  announcement is precisely the window between the two.
+- *"It is latency, and the tail is 400,000× the median."* Wrong, and refuted by the next suite run.
+  It rested on eight consecutive passes at a raised bound, which at a one-in-four failure rate is a
+  one-in-ten coincidence. There is no tail: in a failing run the caller is never released at all,
+  and no amount of waiting helps.
+
+**The 22 µs median stands** and is now printed on every run of the arm, because a bound eight
+seconds above a 22 µs median would hide any regression completely. A number that changes is a better
+alarm than a gate that starts flaking.
+
+#### What made it findable
+
+Three instruments, in the order they were needed, and none of them existed this morning: the fault
+test **keeping its log** rather than printing the first forty lines of a boot banner and deleting
+it; **diagnostics that fire only on failure**, showing the caller Blocked with `reply tried 0`; and
+the **breadcrumb ring**, which was built only because a single `println!` in `exit` made the failure
+disappear for eighteen runs. Each one was necessary and none was sufficient.
+
+### 2026-08-21 (the breadcrumb ring answers it: nothing is lost, and the tail is 400,000x the median)
+
+**The ring was built because printing could not be.** A single `crate::println!` inside `exit` had
+made the failing arm pass eighteen times running; serial output is thousands of cycles and a lock,
+and putting it inside a narrow window closes the window. So `sched::REPLY_TRAIL` records every
+change to a reply obligation — set, taken by reply, taken by exit, exit found none — as **one
+relaxed store into a fixed array**, and the failure path reads it out long afterwards.
+
+#### What it said, on the fifth run
+
+```
+cpu 0 thread 10 (server) set Some(11)
+cpu 0 thread 9 (yielder) exit found none None
+cpu 0 thread 10 (server) taken by exit Some(11)
+```
+
+**The obligation is set, and `exit` takes it.** Nothing is lost. The earlier reading — *"the
+obligation existed, was never discharged, and was gone by the time the server exited"* — was wrong,
+and it was wrong because the absence of `A SERVER EXITED OWING A REPLY` from the log was read as
+proof the release never ran, when it only proved the release had not run **yet**.
+
+#### It is latency, and the size of it is the finding
+
+Raising the arm's wait from 8,000 ms to 30,000 ms: **eight passes out of eight**, where 8,000 ms had
+failed two in ten. So the caller *is* released, later than eight seconds.
+
+Then the elapsed time was measured rather than assumed. Six boots, printed by the kernel itself:
+
+| | |
+|---|---|
+| Release latency, median | **22 µs** |
+| Range across six boots | 22 – 23 µs |
+| The failing tail | **> 8,000,000 µs** |
+
+**A tail four hundred thousand times the median.** That is not a bound that was set too tight; it is
+a distribution with something badly wrong in it, and the eight-second bound merely happened to sit
+inside the tail.
+
+#### So the bound was raised *and* the number is now printed and gated
+
+Raising the bound alone would have stopped the flake and hidden the tail — which is the failure mode
+this project keeps finding in its own documents. Instead the kernel reports *"its caller was released
+after N us"* on every run of the arm, and `fault-test.sh` asserts **that a number is there**, with no
+threshold: a bound would be a bound on the emulator's scheduling, and the tail is not understood well
+enough to say what a fair one is. **A regression now shows up as a number changing rather than as a
+gate that starts flaking.** The assertion was watched red by removing the latency from the line.
+
+#### What is still open, and it is the real bug
+
+A thread blocked in `recv` normally notices its domain's destruction in **22 µs** and occasionally
+takes **more than eight seconds**. Nothing in this session explains the tail.
+
+> **Wrong, and refuted within the hour — see the entry above.** It is not latency and there is no
+> tail: the caller was never released *at all* in the failing runs, and waiting longer cannot help.
+> The "eight of eight passes at a 30,000 ms bound" that this conclusion rested on was luck — at a
+> one-in-four rate that run of eight is a one-in-ten coincidence — and the very next full suite
+> failed with the raised bound still in place, which is what sent the hunt back to the code. It belongs to the same
+family as the other two intermittents recorded today — a 494 ms spawn against a 50 ms bound, and a
+`wake to run` worst case that reads ~8.027 s on **every** boot, healthy or not, which is itself
+suspicious enough to check: an instrument whose worst case is a constant is measuring something
+other than what it claims.
+
+**Three symptoms, one shape: a runnable thread that is not run for a very long time.** That is the
+next thing to chase, and it is now a scheduling question rather than an IPC one.
+
 ### 2026-08-21 (the teardown race: one real defect fixed, the race itself narrowed to a window a `println!` closes)
 
 **Asked to fix the race. One genuine defect is fixed, the race is not, and the difference is stated

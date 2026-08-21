@@ -221,6 +221,20 @@ for fault in "${FAULTS[@]}"; do
     grep -qF -- "$expected" "$log" || failures+=("missing: '$expected'")
   done <<< "${EXPECT[$fault]}"
 
+  # The `user` arm reports how long the stranded caller waited to be released,
+  # and the number is where the pathology lives: median 22 us across six boots
+  # on 2026-08-21, with a tail past **eight seconds** that made this arm fail
+  # about one run in four and was read for a week as a 120-second hang.
+  #
+  # The arm's own bound was raised so the flake stops; asserting the *number is
+  # printed* is what stops the raise from also hiding a 400,000x tail. No
+  # threshold: a bound here would be a bound on the emulator's scheduling, and
+  # the tail is not understood well enough to say what a fair one would be.
+  if [[ "$fault" == "user" ]] &&
+     ! grep -qE "its caller was released after [0-9]+ us" "$log"; then
+    failures+=("the release was not reported with its latency -- the number is the thing being watched")
+  fi
+
   for marker in "${FATAL_MARKERS[@]}"; do
     grep -qF -- "$marker" "$log" && failures+=("$marker")
   done

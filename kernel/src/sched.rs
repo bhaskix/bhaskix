@@ -1529,6 +1529,98 @@ pub fn is_pinned(thread: u32) -> Option<bool> {
     None
 }
 
+/// A lock-free trail of every change to a reply obligation.
+///
+/// # Why a ring and not a `println!`
+///
+/// The teardown race of 2026-08-21 loses a reply obligation between a server
+/// taking a call and exiting, and it is narrow: a **single** `crate::println!`
+/// added inside `exit` made the failing arm pass eighteen times in a row where
+/// it had been failing twice in ten. Serial output is thousands of cycles and a
+/// lock; putting it inside the window closes the window. **Any instrument that
+/// prints where the bug lives will report that there is no bug.**
+///
+/// So this records and says nothing. One relaxed store per event, into a fixed
+/// array, read out only by the failure path long afterwards.
+///
+/// Packed per entry, most significant first:
+///
+/// ```text
+///   8 bits  what happened -- 1 set, 2 taken by reply, 3 taken by exit, 4 exit found none
+///   8 bits  the cpu it happened on
+///  16 bits  the thread whose obligation it is
+///  32 bits  the caller owed, or u32::MAX for none
+/// ```
+///
+/// Zero is "nothing was recorded here", which no real entry can be: every kind
+/// is non-zero.
+static REPLY_TRAIL: [core::sync::atomic::AtomicU64; REPLY_TRAIL_LEN] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; REPLY_TRAIL_LEN];
+static REPLY_TRAIL_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many transitions are kept.
+///
+/// Thirty-two: the arm under investigation produces a handful, and a ring that
+/// wrapped during the window would lose the beginning of the story, which is
+/// the half that says whether the obligation was ever set.
+pub const REPLY_TRAIL_LEN: usize = 32;
+
+/// What a trail entry records.
+pub mod reply_trail {
+    /// An obligation was recorded against a thread.
+    pub const SET: u64 = 1;
+    /// A reply took it.
+    pub const TAKEN_BY_REPLY: u64 = 2;
+    /// An exiting thread took it, and will abandon the caller.
+    pub const TAKEN_BY_EXIT: u64 = 3;
+    /// An exiting thread looked and found none.
+    pub const EXIT_FOUND_NONE: u64 = 4;
+}
+
+/// Records one transition. Never prints, never locks, never allocates.
+fn note_reply_trail(kind: u64, thread: u32, caller: Option<u32>) {
+    use core::sync::atomic::Ordering;
+    let cpu = percpu::cpu_id() as u64 & 0xff;
+    let packed = (kind & 0xff) << 56
+        | cpu << 48
+        | (u64::from(thread) & 0xffff) << 32
+        | u64::from(caller.unwrap_or(u32::MAX));
+    let at = REPLY_TRAIL_AT.fetch_add(1, Ordering::Relaxed) as usize % REPLY_TRAIL_LEN;
+    REPLY_TRAIL[at].store(packed, Ordering::Relaxed);
+}
+
+/// The trail, oldest first, as `(kind, cpu, thread, caller)` with `None` for a
+/// caller of `u32::MAX`. Empty entries are skipped.
+///
+/// Read by the failure path only. Racy by construction — a torn read of a ring
+/// being written is still worth more than nothing, and the alternative is a
+/// lock in the window this exists to observe.
+#[must_use]
+pub fn reply_trail() -> [(u64, u64, u32, Option<u32>); REPLY_TRAIL_LEN] {
+    use core::sync::atomic::Ordering;
+    let mut out = [(0u64, 0u64, 0u32, None); REPLY_TRAIL_LEN];
+    let next = REPLY_TRAIL_AT.load(Ordering::Relaxed) as usize;
+    for (index, slot) in out.iter_mut().enumerate() {
+        let at = (next + index) % REPLY_TRAIL_LEN;
+        let packed = REPLY_TRAIL[at].load(Ordering::Relaxed);
+        if packed == 0 {
+            continue;
+        }
+        let caller = (packed & 0xffff_ffff) as u32;
+        *slot = (
+            packed >> 56,
+            (packed >> 48) & 0xff,
+            ((packed >> 32) & 0xffff) as u32,
+            if caller == u32::MAX {
+                None
+            } else {
+                Some(caller)
+            },
+        );
+    }
+    out
+}
+
 /// Records that `thread` owes `caller` an answer.
 ///
 /// Called when a message is taken, so that [`take_reply_target`] can say who a
@@ -1538,6 +1630,7 @@ pub fn set_reply_target(thread: u32, caller: u32) {
         let mut queue = queue.lock();
         if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
             target.reply_to = Some(caller);
+            note_reply_trail(reply_trail::SET, thread, Some(caller));
             return;
         }
     }
@@ -1570,7 +1663,9 @@ pub fn take_reply_target(thread: u32) -> Option<u32> {
     for queue in QUEUES.iter().take(percpu::online_count() as usize) {
         let mut queue = queue.lock();
         if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
-            return target.reply_to.take();
+            let taken = target.reply_to.take();
+            note_reply_trail(reply_trail::TAKEN_BY_REPLY, thread, taken);
+            return taken;
         }
     }
     None
@@ -2787,12 +2882,44 @@ pub fn exit() -> ! {
         crate::notify::unbind_thread(thread);
     }
 
+    // **The obligation is taken first and the thread is marked `Finished`
+    // second, and the order is the whole of a bug fixed on 2026-08-21.**
+    //
+    // Both used to happen in one pass under the queue lock, `Finished` first.
+    // `abandon_caller` cannot run there — it takes another runqueue lock, and
+    // two of the same rank held at once have no order between them — so it runs
+    // after the lock is dropped. That leaves a window in which this thread is
+    // already `Finished` and has not yet released anybody, and **a `Finished`
+    // thread is never scheduled again**: a preemption inside that window ends
+    // the story there, with the obligation taken, the caller never woken, and
+    // nothing anywhere recording that it happened.
+    //
+    // The symptom was `test-faults`' `user` arm failing about one run in four
+    // with its caller blocked for ever. The breadcrumb trail showed the
+    // obligation *taken by exit* while `A SERVER EXITED OWING A REPLY` never
+    // printed — a take with no announcement, which is exactly this window.
+    //
+    // So: take the obligation, drop the lock, release the caller, and only then
+    // say this thread is finished. Staying `Running` for those few instructions
+    // costs nothing — the thread is inside `exit` and will never return to its
+    // own code — and it means the release happens while this thread is still
+    // something the scheduler will come back to.
     let owed = if cpu < MAX_CPUS {
         let mut queue = QUEUES[cpu].lock();
         let current = queue.current;
         queue.threads[current].as_mut().and_then(|thread| {
-            thread.state = State::Finished;
-            thread.reply_to.take()
+            let id = thread.id;
+            let taken = thread.reply_to.take();
+            note_reply_trail(
+                if taken.is_some() {
+                    reply_trail::TAKEN_BY_EXIT
+                } else {
+                    reply_trail::EXIT_FOUND_NONE
+                },
+                id,
+                taken,
+            );
+            taken
         })
     } else {
         None
@@ -2817,6 +2944,16 @@ pub fn exit() -> ! {
              (thread {caller}) was waiting. That call fails as Revoked."
         );
         abandon_caller(caller);
+    }
+
+    // Now that nobody is owed anything, this thread may stop being one the
+    // scheduler will return to. See the comment above the take.
+    if cpu < MAX_CPUS {
+        let mut queue = QUEUES[cpu].lock();
+        let current = queue.current;
+        if let Some(thread) = queue.threads[current].as_mut() {
+            thread.state = State::Finished;
+        }
     }
 
     loop {
