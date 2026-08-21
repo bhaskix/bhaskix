@@ -47,6 +47,7 @@ dependencies = [
  "bhaskix-personality",
  "bhaskix-pkg",
  "bhaskix-service-vfs",
+ "bhaskix-ustar",
  "libfuzzer-sys",
 ]
 

@@ -47,9 +47,22 @@ for target in $targets; do
     fi
 done
 
+# And formatted. `make fmt` walks a hand-written list of directories and `fuzz/`
+# is not on it, so a target could be committed unformatted and nothing would
+# say -- which happened on 2026-08-21, to the very commit that repaired the two
+# targets above. The check belongs here, with the other thing that knows this
+# workspace exists, rather than as a fourteenth line on a list somebody has to
+# remember to extend.
+if [ "$status" -eq 0 ] && ! (cd fuzz && cargo fmt --all --check >/dev/null 2>&1); then
+    echo "  ${RED}FAIL${RESET}  a fuzz target is not formatted"
+    (cd fuzz && cargo fmt --all --check 2>&1) | head -20
+    echo "        Run: cd fuzz && cargo fmt --all"
+    status=1
+fi
+
 count=$(echo "$targets" | wc -w)
 if [ "$status" -eq 0 ]; then
-    printf '  %sok%s    all %d fuzz targets still compile\n' "$GREEN" "$RESET" "$count"
+    printf '  %sok%s    all %d fuzz targets compile and are formatted\n' "$GREEN" "$RESET" "$count"
 else
     for target in $broken; do
         echo "  ${RED}FAIL${RESET}  fuzz target does not compile: $target"

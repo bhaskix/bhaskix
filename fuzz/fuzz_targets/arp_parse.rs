@@ -74,5 +74,9 @@ fuzz_target!(|data: &[u8]| {
 
     let _ = cache.forget(Address::V4(Ipv4Addr::new(10, 0, 0, 1)));
     let _ = cache.lookup(Address::V4(Ipv4Addr::BROADCAST), 0);
-    let _ = cache.learn(Address::V4(Ipv4Addr::new(10, 0, 0, 2)), MacAddr::BROADCAST, 0);
+    let _ = cache.learn(
+        Address::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        MacAddr::BROADCAST,
+        0,
+    );
 });

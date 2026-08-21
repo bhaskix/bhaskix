@@ -30,6 +30,13 @@ bhaskix-fs = { path = "../fs" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-net = { path = "../net" }
 bhaskix-pkg = { path = "../pkg" }
+# The one definition of a well-formed `ustar` header, behind the feature
+# gate that keeps a header *writer* out of anything that ships. The
+# `ustar_parse` and `pkg_package` targets need it for the same reason
+# `pkg`'s and the VFS's own tests do: a second builder here would be a
+# second opinion about what a well-formed header looks like, and the first
+# one to drift would be the copy nobody runs outside a fuzz campaign.
+bhaskix-ustar = { path = "../ustar", features = ["test-support"] }
 bhaskix-personality = { path = "../personality" }
 
 [[bin]]

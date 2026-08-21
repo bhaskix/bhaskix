@@ -101,7 +101,11 @@ fuzz_target!(|data: &[u8]| {
             0,
             0,
         ]);
-        for operation in [event::control::ADD, event::control::MOD, event::control::DEL] {
+        for operation in [
+            event::control::ADD,
+            event::control::MOD,
+            event::control::DEL,
+        ] {
             let _ = set.control(operation, -1, descriptor, interest, data_word);
         }
         let mut out = [0u8; event::EVENT_BYTES * 4];

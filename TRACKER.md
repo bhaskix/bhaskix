@@ -726,7 +726,7 @@ what is actually ahead.
 | Telemetry plane | ✅ **done** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) **accepted 2026-08-17**, drafted, implemented and accepted the same day | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
 | libc — resolved into the Linux personality | ⬜ **in progress** — [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) steps 2–8 of 10 | **This row did not exist until 2026-08-19**, while the roadmap carried the bullet and eight of the RFC's steps shipped — the same omission this table's own preamble describes. What runs: the personality tag and its `-ENOSYS` telemetry, the initial process image with a real auxiliary vector, the signal round trip (fault → handler → `rt_sigreturn`), the memory calls including `mprotect` and honoured `mmap` hints, `clone` and `futex` proven by two threads of one hosted program meeting, and a **real static Go binary** that loads, runs, prints through the adapter and stops in its own allocator after 212 traced calls. What does not: Tier 1 (files, `/proc`) has not started, and Tier 2 (sockets, `epoll`) has its arithmetic and neither its wiring nor a way to build one where the personality currently lives; the RFC's step 10 gate needs a workload from outside. **And one thing is in the wrong place:** the translation runs in the nucleus, where RFC 0005 §"Where it lives" requires a service domain — recorded 2026-08-19 in that RFC, in `security.md` §1 as **T11**, and in [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md) §5 with its correction trigger |
 | **A fuzz target for the filesystem** — a hostile disk image | ✅ **DONE 2026-08-21** — `fuzz/fuzz_targets/fs_image.rs`, four arms, 123,501 executions clean | **A debt against a binding rule, not new scope.** `coding-style.md` §8 and `security.md` §5 both say a parser touching untrusted input gets a fuzz target *before* it merges. `fuzz/fuzz_targets/` holds fourteen — ELF, `ustar`, `DMAR`, both package formats and every network parser — and **none for `fs`**. Journal replay is the code that runs before anything can refuse. `Superblock::parse` already sanity-checks every field it later uses as an index, which is why this should be cheap; the target is what proves it. Found by the security reassessment of 2026-08-20, ranked fifth there by attacker cost and kept out of the roadmap deliberately — promoting a merge-gate obligation to a phase item turns a rule into a plan |
-| **Three fuzz targets that reach nothing from an empty corpus** — `pkg_manifest`, `pkg_package`, `ustar_parse` | ⬜ **owed**, opened 2026-08-21 | Measured, not guessed: `pkg_manifest` 0 of 5 probe points in 1,523,042 executions, `pkg_package` 0 of 5 in 5,384,466, `ustar_parse` 1 of 5 in four million — and 5 of 5 in 34,227 **with its corpus**, which is gitignored, so the assurance does not survive a clone. Neither `pkg` target has ever produced a corpus at all. The fix is the one `fuzz_targets/fs_image.rs` demonstrates: build the valid structure inside the target and let the fuzzer mutate within it, instead of hoping it invents a `ustar` header checksum. Until then these three are targets in name |
+| ~~Three fuzz targets that reach nothing from an empty corpus~~ — `pkg_manifest`, `pkg_package`, `ustar_parse` | ✅ **DONE 2026-08-21**, seeded and re-measured from empty corpora | Measured, not guessed: `pkg_manifest` 0 of 5 probe points in 1,523,042 executions, `pkg_package` 0 of 5 in 5,384,466, `ustar_parse` 1 of 5 in four million — and 5 of 5 in 34,227 **with its corpus**, which is gitignored, so the assurance does not survive a clone. Neither `pkg` target has ever produced a corpus at all. The fix is the one `fuzz_targets/fs_image.rs` demonstrates: build the valid structure inside the target and let the fuzzer mutate within it, instead of hoping it invents a `ustar` header checksum. **Done the same day.** `ustar_parse` gained three seeded arms (a composed archive; the size field behind a re-derived checksum; a window of fuzzer bytes spliced over a header and resealed), `pkg_manifest` four (the grammar's shape with the fuzzer's values; raw values; keywords from a table; a valid manifest with exactly one deliberate defect), and `pkg_package` eight, each aimed at a named refusal in `pkg/src/package.rs`. Re-measured from empty corpora: `ustar` yields entries, payloads and second members; `pkg_manifest` parses; `pkg_package` verifies a package it built. 2,075,038 executions across the three, no crash, no artifact — and corpora that now grow from nothing (354 / 1,449 / 173 units), so the assurance no longer lives in an untracked directory |
 | **A coverage-guided fuzz target for IPv6 and NDP** | ⬜ **owed**, opened 2026-08-20 | The v6 parsers are covered by `net/src/fuzz.rs`'s seeded mutation harness, which runs on every commit and is **the weaker of the two mechanisms `coding-style.md` §8 names** — the v4 path has both. They are also the newest parsers in the tree ([RFC 0029](docs/rfc/0029-ipv6.md), 2026-08-18), so they have had the least time under anything. Ranked sixth in the 2026-08-20 reassessment |
 
 ---
@@ -889,6 +889,63 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-21 (the three targets that tested nothing are seeded, and the fuzz workspace turns out to be unformatted too)
+
+**Measured before, measured after, both from an empty corpus** — which is what a fresh clone has,
+since `fuzz/corpus/` is gitignored:
+
+| Target | Before | After |
+|---|---|---|
+| `pkg_manifest` | **0 of 5** points in 1,523,042 executions | parses, in 247,319 |
+| `pkg_package` | **0 of 5** in 5,384,466 | verifies a package it built, in 21,997 |
+| `ustar_parse` | **1 of 5** in four million (the magic alone) | entries, payloads and second members, in 67,803 |
+
+**The technique is `fs_image.rs`'s**: build the valid structure inside the target and let the fuzzer
+mutate within it, re-deriving whatever integrity value the structure requires. Recomputing a
+checksum is the threat model rather than a cheat — it defends against corruption, not against
+somebody who can write the file, and an attacker handing you an archive computes a valid one.
+
+- `ustar_parse` gained three arms: an archive composed from fuzzer-chosen names, sizes and payloads;
+  **the size field behind a re-derived checksum**, which is the field that decides how far the walk
+  jumps and the one the target's own comment worried about; and a window of fuzzer bytes spliced
+  over a header and resealed, which reaches the name, the octal fields, the type flag and the magic
+  test itself.
+- `pkg_manifest` gained four: the grammar's shape with the fuzzer's values, the same with raw values,
+  keywords drawn from a fixed table so malformed-but-plausible combinations get tried, and a valid
+  manifest carrying exactly one deliberate defect.
+- `pkg_package` gained eight, each aimed at a **named refusal** in `pkg/src/package.rs`: a digest
+  wrong by one nibble, a length that disagrees, a member never mentioned, a member mentioned and
+  absent, the manifest not first, a directory where a file was promised.
+
+**All archives are built through `ustar::test_support`**, which exists so there is one definition of
+a well-formed header — the crate's own comment warns that a second builder would be "a second
+opinion about what a well-formed `ustar` header looks like". `pkg` and the VFS already depend on it
+this way for their tests.
+
+**2,075,038 executions across the three, no crash and no artifact**, and corpora that grow from
+nothing — 354, 1,449 and 173 units. The assurance no longer lives in an untracked directory.
+
+**Two assertions were broken on purpose, because a target seen only green has not been seen.**
+Changing a payload after its digest was computed trips `pkg_package`'s
+`expect("a package built to the rules verifies")`. Corrupting the first header's magic trips
+`ustar_parse`'s listing check — *"a well-formed archive of 1 members listed 0"*. A third attempt
+did **not** fire and is recorded because it teaches more than the two that did: truncating the
+archive by 1,024 bytes removes only the two trailing zero blocks `archive_of` appends, not a member,
+so the listing is unchanged. **A negative test that fires for no reason proves nothing, and one that
+fails to fire can be the tester's mistake rather than the code's.**
+
+#### And the gate grew a second half, for the same reason it exists
+
+`cargo fmt --all --check` on the fuzz workspace **fails**. `make fmt` walks a hand-written list of
+thirteen directories and `fuzz/` is not among them, so nothing has ever checked it. Two files had
+drifted: `arp_parse.rs`, unformatted by **the commit earlier today that repaired it**, and
+`linux_sockaddr.rs`, which has been unformatted in the tree since it was written.
+
+`tools/check-fuzz-targets.sh` now checks formatting as well as compilation, and was watched red for
+both halves. It belongs there rather than as a fourteenth line on a list somebody has to remember to
+extend — which is the same argument that put the compile check there this morning, made twice in one
+day by two different failures of the same list.
 
 ### 2026-08-21 (four shell command names checked against the Linux-familiarity rule, and the check found a bug instead)
 
