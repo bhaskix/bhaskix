@@ -890,6 +890,63 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (four shell command names checked against the Linux-familiarity rule, and the check found a bug instead)
+
+The user's UX directive gained a clause: **command names must be understandable, memorable, relevant
+to the task, and *near Linux*** — a person who knows Linux should guess the name and be right — with
+the line that familiar *names* are a surface decision and never permission to import Linux
+*semantics*. The four names with no obvious Linux equivalent were checked: `caps`, `lend`, `open`,
+`release`.
+
+**Verified on the machine rather than recalled**: `open` and `close` are **not Linux shell
+commands** — they are syscalls with man-section-2 pages, and typing `open` at a Linux prompt gives
+"command not found". `lsof`, `namei`, `stat`, `capsh`, `getpcaps`, `id`, `free` and `prove` are all
+present; `lsfd` is not, on this image.
+
+| Name | Verdict |
+|---|---|
+| `caps` | **keep** — the names a Linux user would reach for are `id` and `whoami`, and both promise a **user identity Bhaskix does not have**. No `caps` command exists to collide with |
+| `lend` | **renamed to `ask`** — and not for a Linux reason. See below |
+| `open` | **keep, help line fixed** — no Linux shell has a word for name→handle, so there is nothing nearer to be near. The lie was **scope**, not the verb |
+| `release` | **keep** — `close` promises a lifetime this code does not keep (it probes the *lent page*, slot 11, not the handle, slot 9), and **Bhaskix already ships a `close`** for sockets meaning the opposite half: object dies, capability survives |
+
+**`lend` was wrong in the plainest possible way: the shell is the borrower.** It calls
+`block::LEND_CONFIG` and *receives*; the block service is the lender. The name put the program on the
+wrong side of its own transaction, and its own help line had said *"ask a service for a capability"*
+since it was written — the name was the only thing still claiming otherwise. `ask` is that word, is
+absent from Linux, and kills a second defect: `lend` and `release` read as an acquire/return pair and
+**never were one** — `release` gives back what `open` obtained from the *filesystem* service, while
+what `ask` obtains from the *block* service is never given back at all.
+
+#### The bug the naming check found
+
+**`SCRATCH` and `LENT_PAGE` were the same slot — 11.** `SCRATCH`'s own doc comment states the
+invariant its value broke: *"A slot this program keeps free, to find things out with. A probe that
+had to occupy a slot it cared about would be answering a different question afterwards."* `caps`
+derives into that slot twice and `DELETE`s it each time.
+
+So **running `caps` after an `open` silently emptied the lent-page slot while leaving the page
+mapped**, and `release` then "proved" the page could no longer be mapped by attaching a slot `caps`
+had already emptied. The boot gate escapes it only because `shell-test.sh` happens to type `caps`
+*before* `open`.
+
+**Tested, not reasoned about**: `caps` was typed between `ask` and `release` and **every gate still
+passed**, including *"a released page cannot be mapped again"* — and `held` passed too, which shows
+`DELETE` removes the capability and leaves the mapping, exactly the state that makes the proof
+vacuous. That is a gate that has stopped testing what it names. `SCRATCH` is now 18, with the
+history recorded at the constant.
+
+#### Three commands nobody could discover
+
+`held`, `irq` and `net` were dispatchable and **absent from `help`** — which fails the directive's
+first point, since a command you cannot discover is one you cannot remember. All three are listed
+now, and `open` and `release` gained the sentences their behaviour needed: `open` resolves **one
+name, no paths, no `..`**, and also maps the page the service lends; `release` says which page it
+gives back and what it then proves.
+
+The help table's 18-column gutter is asserted literally by `shell-test.sh` — `caps` plus fourteen
+spaces — so every new row was kept inside it.
+
 ### 2026-08-21 (every fuzz target probed for reachability, and two of them had not compiled for three days)
 
 The filesystem target's lesson — *an execution count says nothing about what a target reached* — was

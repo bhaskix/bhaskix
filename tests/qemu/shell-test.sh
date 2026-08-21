@@ -100,11 +100,15 @@ else
     commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'open greeting\r'
     commands+=$'open sub/inner\r'$'open ..\r'$'open inner\r'$'ls /\r'$'cat etc/hostname\r'
     if [[ "$MODE" == "iommu" ]]; then
+        # `ask` was called `lend` until 2026-08-21, when the name was found to
+        # put this shell on the wrong side of its own transaction -- the block
+        # service lends, this program borrows.
+        #
         # `held` before `release`, and nothing reading the page after it:
         # releasing unmaps the page, so a later read would fault -- and since
         # RFC 0017 step 1 a fault ends the domain, which would end the shell in
         # the middle of its own test.
-        commands+=$'lend\r'$'held\r'$'release\r'
+        commands+=$'ask\r'$'held\r'$'release\r'
         # RFC 0030 step 3: a package installed at the prompt, onto the
         # writable filesystem, out of an archive the boot image carries. The
         # same install twice, because the second answer -- already installed

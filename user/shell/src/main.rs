@@ -127,7 +127,19 @@ const LENT: u64 = 13;
 ///
 /// A probe that had to occupy a slot it cared about would be answering a
 /// different question afterwards.
-const SCRATCH: u64 = 11;
+///
+/// **It was 11 until 2026-08-21, which is [`LENT_PAGE`] — a slot this program
+/// cares about very much.** The sentence above states the invariant and the
+/// value broke it: `caps` derives into this slot twice and `DELETE`s it each
+/// time, so running `caps` after an `open` silently emptied the lent-page slot
+/// while leaving the page mapped. `release` then proves the page "can no
+/// longer be mapped" by attaching that slot and being refused — a refusal
+/// `caps` had already arranged. The boot gate escapes it only because
+/// `shell-test.sh` happens to type `caps` before `open`; typing it after was
+/// tried on 2026-08-21 and every gate still passed, which is the definition of
+/// a gate that has stopped testing what it names. 18 is free, and is not
+/// spoken about anywhere else.
+const SCRATCH: u64 = 18;
 /// The badge the kernel put on this program's filesystem capability.
 ///
 /// Known here only so that the probe can ask for the *same* one. A program
@@ -431,10 +443,16 @@ fn help() {
     write(b"    echo <words>      print the arguments\n");
     write(b"    ls [path]         list a directory\n");
     write(b"    cat <path>        print a file\n");
-    write(b"    open <name>       resolve a name inside the directory held\n");
-    write(b"    lend              ask a service for a capability, and use it\n");
+    write(b"    open <name>       resolve one name in the directory held -- no paths,\n");
+    write(b"                      no '..'; also maps the page the service lends\n");
+    write(b"    held              print what the page lent by 'open' begins with\n");
+    write(b"    release           give back the page 'open' was lent, and prove it\n");
+    write(b"                      cannot be mapped again\n");
+    write(b"    ask               ask the block service for a capability, and be\n");
+    write(b"                      refused it until a slot is declared for it\n");
     write(b"    caps              what this program is allowed to do\n");
-    write(b"    release           give back the page the filesystem service lent\n");
+    write(b"    irq               wait for a signal, and report the badge it carried\n");
+    write(b"    net <host>        speak to a host through the network service\n");
     write(
         b"    map               map memory this program holds, and be refused what it does not\n",
     );
@@ -1236,7 +1254,19 @@ fn open(name: &[u8]) {
 /// anything else would be putting a capability in a slot somebody else was
 /// keeping empty. So the refusal below is asked for twice — once having
 /// declared, and once not.
-fn lend() {
+/// Ask a service for a capability, and be refused it until a slot is declared.
+///
+/// **Named `ask`, not `lend`, since 2026-08-21.** `lend` put this program on
+/// the wrong side of its own transaction: the block service is the lender and
+/// this shell is the borrower — it calls `LEND_CONFIG` and *receives*. The help
+/// line had said "ask a service for a capability" since it was written, so the
+/// name was the only thing still claiming otherwise.
+///
+/// It also stopped `lend` and `release` reading as an acquire/return pair,
+/// which they never were: `release` gives back what `open` obtained from the
+/// **filesystem** service, and what this command obtains from the **block**
+/// service is never given back at all.
+fn ask() {
     const AT: u64 = 0x3300_0000;
 
     // Without declaring first. Nothing may arrive, because nothing said where
@@ -2032,7 +2062,7 @@ fn run(line: &[u8]) {
             write(b"\n");
         }
         b"ls" => list(rest),
-        b"lend" => lend(),
+        b"ask" => ask(),
         b"held" => held(),
         b"release" => release(),
         b"open" => {
