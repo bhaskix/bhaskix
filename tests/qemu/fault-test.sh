@@ -235,9 +235,42 @@ for fault in "${FAULTS[@]}"; do
     for failure in "${failures[@]}"; do
       echo "        $failure"
     done
-    echo "      ${DIM}--- serial ---${RESET}"
-    sed 's/^/      /' "$log" | head -40
+
+    # Which of the expected lines arrived, in order, and where it stopped.
+    #
+    # **The single most useful thing this test knows, and it did not used to
+    # say it.** The expectations are ordered -- for `user` they are the fault
+    # report, then the domain going away, then its siblings stopping, then the
+    # caller being released, then the boot finishing -- so the *last one that
+    # appeared* names the stage that hung. "The domain never went away" and
+    # "the caller was never released" are different bugs with different
+    # repairs, and a bare timeout cannot tell them apart.
+    echo "      ${DIM}--- expectations, in order ---${RESET}"
+    while IFS= read -r expected; do
+      [[ -z "$expected" ]] && continue
+      if grep -qF -- "$expected" "$log"; then
+        echo "      ${GREEN}  saw${RESET}  $expected"
+      else
+        echo "      ${RED}  not${RESET}  $expected"
+      fi
+    done <<< "${EXPECT[$fault]}"
+
+    # The **tail**, not the head. A timeout's evidence is where the machine
+    # stopped, and the first forty lines of any boot are the same banner --
+    # which is what a failing `user` arm printed on 2026-08-21 while the lines
+    # that would have explained it scrolled past unseen.
+    echo "      ${DIM}--- serial, last 40 lines of $(wc -l < "$log") ---${RESET}"
+    tail -40 "$log" | sed 's/^/      /'
     echo "      ${DIM}--- end ---${RESET}"
+
+    # And keep it. `mktemp` plus `rm` meant every failure was diagnosable only
+    # while it was on screen, so an intermittent -- the `user` arm hangs about
+    # one run in four at rest -- left nothing behind to compare across runs.
+    mkdir -p build
+    cp "$log" "build/fault-$fault.log" 2>/dev/null
+    cp "$qemu_log" "build/fault-$fault.qemu.log" 2>/dev/null
+    echo "      ${DIM}kept: build/fault-$fault.log and build/fault-$fault.qemu.log${RESET}"
+
     status=1
   fi
 

@@ -894,6 +894,67 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (the fault test keeps its log, and the "hang" turns out to be a revoked capability)
+
+**The change asked for was small: stop deleting the serial log.** It found the bug on the fifth run.
+
+`fault-test.sh` did print the serial on failure — **the first forty lines of it**, which on every
+boot are the same banner, and then deleted the file. So the only intermittent this suite has was
+undiagnosable by construction: the evidence was always past line 40 and never survived the run.
+
+Three changes, and the first is the one that mattered:
+
+- **The expectations are listed in order, with what arrived and what did not.** They are ordered by
+  construction — the fault report, the domain going away, the siblings stopping, the caller being
+  released, the boot finishing — so the last one seen names the stage that stopped.
+- **The tail, not the head.** A timeout's evidence is where the machine stopped.
+- **The log is kept**, at `build/fault-<arm>.log`, so an intermittent leaves something to compare
+  across runs instead of scrolling past once.
+
+#### What it said immediately
+
+```
+saw  EXCEPTION: page fault (#PF)
+saw  from USER mode
+saw  this is a null pointer dereference
+saw  Domain "faulter" is gone
+not  a ring 3 fault ended its domain and nothing else, its siblings stopped and its caller was released
+saw  Nothing left to do at this milestone
+```
+
+**The last marker arrived.** The machine ran to completion — 317 lines, the full boot report, a
+`boot cost` line — and only the fourth expectation is missing. **It never hung.** The harness waited
+its whole 120 seconds for a line that was never going to be printed, which is why this looked like a
+hang for a week.
+
+#### And the kept log names the mechanism
+
+```
+A SERVICE WAS REFUSED A RECEIVE: thread 10 (server), status 2.
+  It has exited, and every later caller will block for ever.
+    user fault     FAILED: a caller whose server died was released
+    user fault     FAILED: it was told the server had gone, not the endpoint
+```
+
+**Status 2 is `NoSuchCapability`** — *the capability index named nothing in this domain's CSpace*.
+So the doomed domain's **server thread** called `RECEIVE` and found its own endpoint capability
+already gone, exited on that refusal, and the caller waiting on it was therefore never released.
+`STRANDED` never reached 2, and both checks that read it failed together.
+
+The race is between a domain's teardown revoking capabilities and its server thread's next
+`RECEIVE`. Which side wins decides whether the server dies **holding an unanswered call**, which is
+what the arm asserts, or dies **between calls**, which is what happens about one run in four.
+
+**Two readings, and they want different repairs.** Either the kernel's release path only releases a
+caller whose reply is currently owed, and a server that exits between calls strands one — a real
+bug in teardown — or the arm's choreography does not guarantee the server is mid-call when the
+fault lands, and the test is racing itself. Distinguishing them means asking whether `taken` and the
+refusal describe the *same* call; the check for `taken` passes in the failing run, which is
+suggestive but not decisive because the server loops.
+
+**Not fixed here.** The task was to keep the log, and the log has turned a week-old *"it hangs
+sometimes"* into a named race with two candidate causes and a stated way to tell them apart.
+
 ### 2026-08-21 (a third intermittent: the user-fault arm hangs for 120 seconds, at rest, in both directions)
 
 `make test` failed on `test-faults`' **`user`** arm — the one that faults a ring 3 program and
@@ -915,6 +976,11 @@ So: **roughly one run in four hangs, at rest, and it predates today's work.** Th
 timeout says only that the last of them never arrived. The next step is to keep the serial log on
 failure — `fault-test.sh` deletes it — and find which marker is last, because *"the domain went
 away"* failing and *"the caller was released"* failing are different bugs with different repairs.
+
+> **Answered the same day, and "hangs" was the wrong word.** See the entry above: the machine does
+> not hang. It completes the whole boot, one assertion inside it fails, and the harness then waits
+> out its full 120 seconds because the success line it is watching for will never come. The timeout
+> is a consequence of the failure, not the failure.
 
 **Three unexplained intermittents in one day**, all recorded rather than re-run away: a 494 ms spawn
 against a 50 ms bound, an exec whose record was right and whose console line was missing, and this.
