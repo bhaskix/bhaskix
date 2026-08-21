@@ -19,6 +19,14 @@ license.workspace = true
 name = "bhaskix_elf"
 path = "src/lib.rs"
 
+[features]
+# The image builders, for tests in crates that consume this one -- and for the
+# fuzz target, which cannot reach the relocation walk without a real dynamic
+# segment to walk. Gated so that nothing shipping links an image *writer*: this
+# crate reads images, and the one well-formed-image definition it carries feeds
+# its own parser.
+test-support = []
+
 [dependencies]
 
 [lints]

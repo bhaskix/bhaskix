@@ -543,15 +543,40 @@ pub fn for_each_relative_relocation(
     Ok(count)
 }
 
-#[cfg(test)]
-mod tests {
+/// Image builders, shared with the tests of every consuming crate.
+///
+/// Public behind the `test-support` feature (and in this crate's own tests)
+/// rather than private, for the reason `ustar`'s equivalent states: **a second
+/// builder somewhere else would be a second opinion about what a well-formed
+/// image looks like**, and there is one definition of that. It belongs next to
+/// the parser it feeds.
+///
+/// It exists here for a second reason too. The reachability audit of
+/// 2026-08-21 measured `fuzz_targets/elf_parse.rs` and found that *"a relative
+/// relocation was applied"* was **never reached** from an empty corpus: the
+/// walk returned `Ok` with nothing to do, every time, because random bytes do
+/// not carry a dynamic segment naming a `RELA` table. A fuzzer cannot invent
+/// one, so the target has to build one — and building one twice, once here and
+/// once there, is exactly the thing this module exists to prevent.
+///
+/// Hidden from documentation: these are fixtures, not an image writer. Nothing
+/// that ships links them.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
     use super::*;
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// Where a built image says it loads.
+    pub const BASE: u64 = 0xffff_ffff_8000_0000;
 
     /// Builds a high-half `ET_DYN` image: one loadable RX segment whose
     /// contents hold a relocation table, and a `DYNAMIC` segment naming it.
     /// `reloc_type` lets a test hand in a kind the walker must refuse.
-    fn dynamic_elf(reloc_count: usize, reloc_type: u32, target: u64) -> Vec<u8> {
-        const BASE: u64 = 0xffff_ffff_8000_0000;
+    #[must_use]
+    pub fn dynamic_elf(reloc_count: usize, reloc_type: u32, target: u64) -> Vec<u8> {
         const PHOFF: usize = 64;
         const PHENTSIZE: usize = 56;
         let contents_at = PHOFF + 2 * PHENTSIZE;
@@ -612,6 +637,12 @@ mod tests {
         }
         bytes
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::dynamic_elf;
+    use super::*;
 
     #[test]
     fn a_dynamic_kernel_image_parses_and_its_relocations_are_walked() {

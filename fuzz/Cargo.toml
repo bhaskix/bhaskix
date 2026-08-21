@@ -24,7 +24,7 @@ unsafe_budget = 0
 [dependencies]
 libfuzzer-sys = "0.4"
 bhaskix-kernel = { path = "../kernel", features = ["host"] }
-bhaskix-elf = { path = "../elf" }
+bhaskix-elf = { path = "../elf", features = ["test-support"] }
 bhaskix-service-vfs = { path = "../services/vfs" }
 bhaskix-fs = { path = "../fs" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }

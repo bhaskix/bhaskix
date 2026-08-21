@@ -894,6 +894,89 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (an unexplained 494 ms spawn, recorded rather than dismissed)
+
+**`make test` failed once, on a gate nothing in the change could reach**, and the number is the
+reason this entry exists rather than a shrug:
+
+```
+FAIL  spawn to first dispatch took 493942 us -- the tickless spawn hole is back
+      0xfe  apic error
+```
+
+**493,942 µs sits inside the 446–500 ms range `boot-test.sh`'s own comment attributes to the hole**
+this gate was written to catch — *a priority-90 thread waiting behind a spinning fair thread on a
+CPU whose timer had gone tickless because it was busy but alone*. That comment also says **"the
+bound is 50 ms so no emulator slowness can trip it"**, which this run contradicts.
+
+**It is not the change.** Every line of the `elf` diff is inside `#[cfg(test)]` or the
+`test-support` feature; the kernel binary is unaffected, and the gate is a scheduler measurement.
+
+**Thirteen isolated runs of the lane, with host load recorded:**
+
+| | µs |
+|---|---|
+| Eleven runs | 631, 713, 720, 763, 787, 805, 875, 887, 903, 926, 3,635 |
+| One | **28,061** — over half the 50 ms bound |
+| The failure | **493,942** |
+
+Both outliers occurred while the **full suite** was running rather than the lane alone; the eleven
+tight samples were taken at host load 1.0–1.6. So the available explanation is load, and the
+available objection is that the gate's author expected 50 ms to be beyond load's reach and the
+failing value landed on the hole's own signature.
+
+**The suite was then re-run on the same binary and passed with no outlier at all** — its ten
+measurements were 673, 688, 691, 761, 767, 810, 830, 945, 3,119 and 3,915 µs. Twenty-three samples
+in total, two outliers, both in one run of the suite and none in another of the same code. That
+tilts the reading towards a transient host condition rather than a race in the scheduler, and it is
+a tilt rather than an answer.
+
+**Recorded as observed and unexplained, which is the honest state.** Not reproduced in thirteen
+attempts, not caused by the change that surfaced it, and not dismissed: a one-in-thirteen 28 ms and
+a one-off 494 ms on a gate whose margin was believed to be three orders of magnitude are worth the
+next person's attention. The `0xfe apic error` on the same boot is part of the observation. If it
+recurs, the thing to capture is whether the spawn reschedule request was issued and lost, or never
+issued — which the current instrumentation does not distinguish.
+
+### 2026-08-21 (RFC 0036 step 1: the relocation walk is fuzzed with something to do, for the first time)
+
+**The step the RFC put before its own feature**, and the reason it did: the reachability audit
+measured `fuzz_targets/elf_parse.rs` and found *"a relative relocation was applied"* **never reached
+from an empty corpus**. The walk returned `Ok(0)` every time. Random bytes do not carry a dynamic
+segment naming a `RELA` table, and a fuzzer cannot invent one — so the code the whole RFC depends on
+had never been exercised with anything to do.
+
+**Measured before and after, both from an empty corpus:**
+
+| Probe | Before | After |
+|---|---|---|
+| A relative relocation **applied** | **never**, in a full campaign | reached, in 2,499,337 runs |
+| The walk returning a **non-zero** count | never | reached |
+| A fuzzer-written **dynamic table** parsed | did not exist | reached |
+
+**The builder was hoisted rather than rewritten.** `elf`'s own tests already had `dynamic_elf`, and
+it now lives in `elf::test_support` behind a feature — the arrangement `ustar` uses and argues for in
+its own words: *a second builder would be a second opinion about what a well-formed image looks
+like*. `elf` keeps `#![forbid(unsafe_code)]` and its zero budget; all nineteen of its existing tests
+still pass, unchanged.
+
+**Three arms.** The raw one stays, because a corrupted image is what a corrupted boot medium looks
+like. Arm B builds a valid `ET_DYN` image and lets the fuzzer write the **relocation entries**, which
+is where the walk's decisions are — the `R_X86_64_RELATIVE` check, the inside-a-segment check, and
+the arithmetic that would let a loader write outside the image it placed. Arm C attacks the dynamic
+segment that *finds* the table, where `DT_RELA`, `DT_RELASZ` and `DT_RELAENT` are three
+attacker-chosen numbers and each has a refusal only reachable through there.
+
+**Two assertions, both watched failing.** The walk's own comment says a target must be inside a
+loaded segment *"or the loader would write outside the image it placed"* — so the target asserts it,
+and inverting the assertion trips it immediately. And everything the walk counts, it must apply: a
+count larger than the callbacks would mean entries skipped silently, which is how a loader ends up
+with a half-relocated image. Off-by-one in the comparison trips that one.
+
+**24,472,731 executions, no crash, no artifact.** Nothing was found — which is the outcome to expect
+from code that is careful and had simply never been driven, and is worth exactly as much as the
+measurement that says it was driven this time.
+
 ### 2026-08-21 (RFC 0036 drafted: the image half of a hosted layout, and the measurement that says what to build first)
 
 **Opened the same day the hosted half landed**, so that "partial ASLR" is a decision on the record

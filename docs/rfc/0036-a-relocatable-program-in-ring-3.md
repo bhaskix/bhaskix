@@ -217,9 +217,12 @@ not a device.
 
 Not a schedule, and **the first step is not the feature**.
 
-1. **Seed `elf_parse` for relocations**, and measure the fifth probe point reached. This is the
-   prerequisite, for the reason §"Security implications" gives: the code the rest of this plan
-   depends on has never been fuzzed with anything to do.
+1. ~~**Seed `elf_parse` for relocations**, and measure the fifth probe point reached.~~ **Done
+   2026-08-21, the day this RFC was drafted.** Three arms, the builder hoisted into
+   `elf::test_support` rather than rewritten, and the probe measured reached — *never* before,
+   reached in 2,499,337 runs after, both from an empty corpus. 24,472,731 executions clean. `elf`
+   keeps `forbid(unsafe_code)` and a zero budget. **The prerequisite is discharged; the rest of
+   this plan is not started.**
 2. Measure what loading an image through `COPY_OUT`/`MAP_AT` costs against the kernel's direct copy.
    Answer question 2, then question 1.
 3. Host tests for the slide arithmetic in `elf`, with the crate's `forbid(unsafe_code)` and zero
