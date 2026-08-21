@@ -762,6 +762,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | Limine containment (only `boot/` may name it) | M1 | architecture.md §1 |
 | Dependency direction / no cycles | M1 | architecture.md §5 |
 | **Every fuzz target still compiles** — `tools/check-fuzz-targets.sh`, `cargo check` on all 15, one second warm, on stable. Added after `arp_parse` and `tcp_parse` were found not to have compiled since 2026-08-18 | 2026-08-21 | coding-style.md §8 — a target that does not build runs zero executions |
+| **`bin/linuxd`'s `unsafe` is exact, not bounded** — `unsafe_budget_exact = true`; the build fails if the largest concentration of authority in the system grows *or* shrinks without somebody editing the number | 2026-08-21 | security.md §1 gap 2; coding-style.md §3 |
 | **A supervisor's write commits, and its read does not** — the invariant behind 2026-08-20's three `EFAULT` bugs, asserted at boot in both directions and both watched failing | 2026-08-21 | security.md §1 gap 4; `vm::frame_for_write` |
 | **Instruction containment** — every crate holding an architecture-specific instruction declares an `asm_budget` and a reason; undeclared is a hard failure, and the gate is watched refusing a fixture on every run | 2026-08-20 | architecture.md §7 |
 | No vendor strings in published files | M1 | Project policy |
@@ -890,6 +891,47 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-21 (`bin/linuxd`'s `unsafe` is capped, and thirteen lines of it turn out to be one line written twenty times)
+
+**Gap 2 of the reassessment, and the honest half of it.** "`bin/linuxd` is the concentration point
+and it is growing fastest" has no completion state — it is a property, not a task. What is
+actionable is the number, and the number went **42 → 85 in a single day** while RFC 0033 was being
+built.
+
+**Twenty of those lines were the same line.** `unsafe { &mut *core::ptr::addr_of_mut!(TABLE) }`,
+written out wherever a table was wanted — for `PROCESSES`, `PIPES_HELD`, `PIPE_WAITERS`, `WAITERS`,
+`FILE_HELD`, `INCARNATION`, `HANDLES` and `ARRIVALS`. Each restated an invariant that belongs to the
+whole program — *this server is single-threaded, so there is no second borrower* — and twenty
+restatements of one invariant is twenty places to get it wrong and one place nobody looks.
+
+The file already had the better idiom in three places (`sleepers`, `dispositions_of`,
+`process_for`); it simply was not applied. It is now: **one accessor per table, the promise made
+once, and the rest of the file asks by name.** 85 → **72**, no behaviour changed. This is M8-02's
+result in a different crate — *forty-two blocks making the same promise over and over became two*,
+and the count fell.
+
+#### The cap, which is the part that lasts
+
+`tools/check-unsafe-budget.py` gains an opt-in: `unsafe_budget_exact = true` makes a budget a **cap
+rather than a ceiling** — the count must *equal* it, so the build fails if the crate's `unsafe`
+shrinks as well as if it grows, until somebody edits the number.
+
+That sounds pedantic and is not. **Headroom is permission nobody is using**, and permission nobody
+is using is where the next twenty lines land without a reviewer being asked. A crate opts in when
+the number is the point, and `bin/linuxd` — which `security.md` §1's T11 note describes as holding
+`DomainControl`, a read-only directory capability and every hosted process's descriptors — is that
+crate.
+
+**Both directions watched red**, which is the only reason to believe either. Adding one `unsafe`
+line gives *"73 unsafe lines exceeds budget 72"*. Removing one and leaving the number alone gives
+*"71 unsafe lines is under its exact budget 72"* — the half nothing guarded before today.
+
+**What was not done, and why.** The remaining 72 are not repetition: the syscall stub, the `ud2` in
+the panic handler, the volatile reads and writes of the report and fault pages, and the byte-at-a-
+time copies across the boundary. They are promises about the machine, and a ring 3 program cannot
+make them any other way. Cutting further would mean moving work, not rewriting it — and the cap is
+what makes that a decision somebody takes rather than a number that drifts.
 
 ### 2026-08-21 (the user-pointer copy path gets its pass, and the invariant stops being a comment)
 

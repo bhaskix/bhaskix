@@ -1320,7 +1320,7 @@ static mut FILE_HELD: [bool; FILE_SLOTS] = [false; FILE_SLOTS];
 /// Takes a free slot for an open file, or `None` when there are none left.
 fn claim_file_slot() -> Option<u64> {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
-    let held = unsafe { &mut *core::ptr::addr_of_mut!(FILE_HELD) };
+    let held = file_held();
     let index = held.iter().position(|taken| !*taken)?;
     held[index] = true;
     Some(FILE_SLOT_TOP - index as u64)
@@ -1331,7 +1331,7 @@ fn release_file_slot(slot: u64) {
     let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
     let index = (FILE_SLOT_TOP - slot) as usize;
     // SAFETY: as `claim_file_slot`.
-    let held = unsafe { &mut *core::ptr::addr_of_mut!(FILE_HELD) };
+    let held = file_held();
     if let Some(taken) = held.get_mut(index) {
         *taken = false;
     }
@@ -1432,10 +1432,10 @@ static mut INCARNATION: [u32; limits::MAX_DOMAINS] = [0; limits::MAX_DOMAINS];
 /// into the refusal Linux has for it.
 fn process_for(domain: u32) -> Option<&'static mut Process> {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
-    let incarnations = unsafe { &*core::ptr::addr_of!(INCARNATION) };
+    let incarnations = incarnation();
     let generation = incarnations[domain as usize % limits::MAX_DOMAINS];
     // SAFETY: as above.
-    let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+    let processes = processes();
     if processes.by_domain(domain, generation).is_none() {
         // Parent zero: nothing hosted started it, so nothing will wait for it.
         // When `fork` and `execve` exist, the parent is the process that asked.
@@ -1460,6 +1460,82 @@ fn sleepers() -> &'static mut [Sleeper; WAKES] {
     unsafe { &mut *core::ptr::addr_of_mut!(SLEEPERS) }
 }
 
+// ---------------------------------------------------------------------------
+// One accessor per static, and every reader goes through it.
+//
+// **This is the `unsafe` cap made structural rather than promised.** This
+// program is the largest concentration of authority in the system --
+// `security.md` §1's T11 note lists what it holds -- and its `unsafe` budget
+// went 42 -> 85 in a single day while RFC 0033 was being built. The reassessment
+// of 2026-08-20 named it gap 2 and observed that "the concentration point" is a
+// property with no completion state, so the actionable thing is the number.
+//
+// Twenty of those lines were the *same* line: `&mut` to a `static mut`, written
+// out wherever a table was wanted. Each one restated an invariant that is a
+// property of the whole program -- **this server is single-threaded, so there is
+// no second borrower to race with** -- and twenty restatements of one invariant
+// is twenty places to get it wrong and one place nobody looks.
+//
+// So the promise is made once per table, here, and the rest of the file asks by
+// name. It is the argument [RFC 0014](../../docs/rfc/0014-driver-framework.md)
+// made for `register_block!` and M8-02 measured: forty-two blocks making the
+// same promise became two, and the kernel's `unsafe` count *fell*.
+//
+// The invariant, stated once for all of them: `bin/linuxd` runs one thread. It
+// answers one foreign call at a time, and every accessor below hands out a
+// borrow that ends before the next call begins. If this program ever grows a
+// second thread, every function here becomes wrong at the same moment -- which
+// is the point of them being together.
+// ---------------------------------------------------------------------------
+
+/// The process table.
+fn processes() -> &'static mut Processes {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) }
+}
+
+/// The pipes this adapter holds for hosted processes.
+fn pipes_held() -> &'static mut [Option<Pipe>; PIPES] {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) }
+}
+
+/// Which thread is parked on which pipe.
+fn pipe_waiters() -> &'static mut [u32; PIPES] {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(PIPE_WAITERS) }
+}
+
+/// Who is waiting in `wait4`, and for whom.
+fn waiters() -> &'static mut [(u32, u32); 4] {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(WAITERS) }
+}
+
+/// Which open-file slots are taken.
+fn file_held() -> &'static mut [bool; FILE_SLOTS] {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(FILE_HELD) }
+}
+
+/// How many times each domain slot has been reused.
+fn incarnation() -> &'static mut [u32; limits::MAX_DOMAINS] {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(INCARNATION) }
+}
+
+/// The supervisor handle held for each hosted domain.
+fn handles() -> &'static mut [u32; limits::MAX_DOMAINS] {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(HANDLES) }
+}
+
+/// How many notifications have arrived.
+fn arrivals() -> &'static mut u64 {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(ARRIVALS) }
+}
+
 /// Answers a hosted `pipe2` — RFC 0033 step 7.
 ///
 /// Two descriptors into one ring: the low one reads, the high one writes,
@@ -1471,7 +1547,7 @@ fn answer_pipe(request: &PersonalityCall, at: u64, flags: u64) -> Answer {
 
     let close_on_exec = flags & open::CLOEXEC != 0;
     // SAFETY: single-threaded by construction, as `dispositions_of`.
-    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) };
+    let pipes = pipes_held();
     let Some(index) = pipes.iter().position(Option::is_none) else {
         return Answer::error(-24); // EMFILE
     };
@@ -1528,13 +1604,13 @@ fn read_from_pipe(
     count: u64,
 ) -> (u64, Answer) {
     // SAFETY: single-threaded by construction, as elsewhere here.
-    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) };
+    let pipes = pipes_held();
     let Some(pipe) = pipes.get_mut(index).and_then(Option::as_mut) else {
         return (REPLY_VALUE, Answer::error(-9)); // EBADF
     };
     if pipe.would_block() {
         // SAFETY: as above.
-        let waiters = unsafe { &mut *core::ptr::addr_of_mut!(PIPE_WAITERS) };
+        let waiters = pipe_waiters();
         let Some(slot) = claim_wake() else {
             return (REPLY_VALUE, Answer::error(-11)); // EAGAIN
         };
@@ -1563,7 +1639,7 @@ fn read_from_pipe(
 /// guard for a case that cannot arise is a guard nobody can test.
 fn wake_pipe_reader(index: usize) {
     // SAFETY: single-threaded by construction, as elsewhere here.
-    let waiters = unsafe { &mut *core::ptr::addr_of_mut!(PIPE_WAITERS) };
+    let waiters = pipe_waiters();
     let Some(slot) = waiters.get_mut(index) else {
         return;
     };
@@ -1588,7 +1664,7 @@ fn write_to_pipe(request: &PersonalityCall, index: usize, buffer: u64, count: u6
         return Answer::error(-14); // EFAULT
     }
     // SAFETY: single-threaded by construction, as elsewhere here.
-    let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) };
+    let pipes = pipes_held();
     let Some(pipe) = pipes.get_mut(index).and_then(Option::as_mut) else {
         return Answer::error(-9);
     };
@@ -1990,7 +2066,7 @@ fn answer_close(request: &PersonalityCall) -> Answer {
             // hang for ever or stop at its first pause.
             if entry.kind == Kind::Pipe {
                 // SAFETY: single-threaded by construction, as elsewhere here.
-                let pipes = unsafe { &mut *core::ptr::addr_of_mut!(PIPES_HELD) };
+                let pipes = pipes_held();
                 if let Some(slot) = pipes.get_mut(entry.handle as usize)
                     && let Some(pipe) = slot.as_mut()
                 {
@@ -2123,7 +2199,7 @@ fn note_exit(domain: u32, exit: Exit) {
     };
     let (pid, parent) = (process.pid, process.ppid);
     // SAFETY: single-threaded by construction, as elsewhere here.
-    let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+    let processes = processes();
     let _ = processes.ended(pid, exit);
     wake_waiter(parent);
 }
@@ -2134,7 +2210,7 @@ fn wake_waiter(pid: u32) {
         return;
     }
     // SAFETY: as above.
-    let waiters = unsafe { &mut *core::ptr::addr_of_mut!(WAITERS) };
+    let waiters = waiters();
     let Some(entry) = waiters.iter_mut().find(|entry| entry.0 == pid) else {
         return;
     };
@@ -2174,7 +2250,7 @@ fn answer_wait(request: &PersonalityCall) -> (u64, Answer) {
     let (pid, group) = (process.pid, process.pgid);
     let wanted = WaitFor::from_argument(which as i64, group);
     // SAFETY: single-threaded by construction, as elsewhere here.
-    let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+    let processes = processes();
     match processes.collect(pid, wanted) {
         Ok(WaitOutcome::Collected { pid: child, status }) => {
             trace_wait(i64::from(child), u64::from(status));
@@ -2195,7 +2271,7 @@ fn answer_wait(request: &PersonalityCall) -> (u64, Answer) {
                 return (REPLY_VALUE, Answer::error(-11));
             };
             // SAFETY: as above.
-            let waiters = unsafe { &mut *core::ptr::addr_of_mut!(WAITERS) };
+            let waiters = waiters();
             let Some(entry) = waiters.iter_mut().find(|entry| entry.0 == 0) else {
                 release_wake(slot);
                 return (REPLY_VALUE, Answer::error(-11));
@@ -2271,7 +2347,7 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
     };
     let pid = {
         // SAFETY: single-threaded by construction, as elsewhere here.
-        let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+        let processes = processes();
         let Ok(pid) = processes.admit(parent.pid, child_domain, generation) else {
             return Answer::error(-11);
         };
@@ -2506,7 +2582,7 @@ fn map_at_eager(domain: u64, address: u64, pages: u64, protection: u64) -> bool 
 /// This program's own count of how often a domain slot has been handed to it.
 fn incarnation_of(domain: u32) -> u32 {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
-    let incarnations = unsafe { &*core::ptr::addr_of!(INCARNATION) };
+    let incarnations = incarnation();
     incarnations[domain as usize % limits::MAX_DOMAINS]
 }
 
@@ -2577,7 +2653,7 @@ fn answer_futex(request: &PersonalityCall) -> (u64, Answer) {
             }
             let arrived = {
                 // SAFETY: single-threaded, as above.
-                let counter = unsafe { &mut *core::ptr::addr_of_mut!(ARRIVALS) };
+                let counter = arrivals();
                 *counter += 1;
                 *counter
             };
@@ -2701,7 +2777,7 @@ static mut HANDLES: [u32; limits::MAX_DOMAINS] = [0; limits::MAX_DOMAINS];
 /// from every call site, and it costs no branch at any of them.
 fn handle_of(domain: u32) -> u64 {
     // SAFETY: one thread, one request at a time -- as `dispositions_of`.
-    let handles = unsafe { &*core::ptr::addr_of!(HANDLES) };
+    let handles = handles();
     match handles.get(domain as usize % limits::MAX_DOMAINS) {
         Some(0) | None => NO_HANDLE,
         Some(slot) => u64::from(slot - 1),
@@ -2814,7 +2890,7 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
         if received.method == HANDLE_METHOD {
             let domain = (received.badge as u32) as usize % limits::MAX_DOMAINS;
             // SAFETY: one thread, one request at a time -- as `sleepers`.
-            let handles = unsafe { &mut *core::ptr::addr_of_mut!(HANDLES) };
+            let handles = handles();
             handles[domain] = (args[0] as u32).saturating_add(1);
             let _ = call(syscall::REPLY, 0, 0, [0; 4]);
             continue;
@@ -2847,11 +2923,11 @@ extern "C" fn linuxd_main(_hertz: u64) -> ! {
             let domain = received.badge as u32;
             let slot = domain as usize % limits::MAX_DOMAINS;
             // SAFETY: single-threaded by construction, as elsewhere here.
-            let incarnations = unsafe { &mut *core::ptr::addr_of_mut!(INCARNATION) };
+            let incarnations = incarnation();
             let generation = incarnations[slot];
             incarnations[slot] = generation.wrapping_add(1);
             // SAFETY: as above.
-            let processes = unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) };
+            let processes = processes();
             // **A domain slot reused means whoever was in it is gone**, and
             // by now its status has either been recorded — `exit_group` and
             // the fault path both do it before the domain ends — or there is

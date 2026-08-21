@@ -15,6 +15,19 @@ The point is not to make `unsafe` impossible. It is to make its growth
 *visible*, because the failure mode is gradual and invisible: no single PR
 adds much, and a year later the auditable surface is the whole kernel.
 
+A crate may additionally declare:
+
+    unsafe_budget_exact = true
+
+which makes the budget a **cap rather than a ceiling**: the count must equal it,
+so shrinking is as much a build failure as growing until somebody edits the
+number. That sounds pedantic and is not. **Headroom is permission nobody is
+using**, and permission nobody is using is where the next twenty lines land
+without a single reviewer being asked. A crate that opts in is one where the
+number is the point -- `bin/linuxd`, whose budget went 42 to 85 in a day while
+RFC 0033 was built, and which `security.md` §1 names as the largest
+concentration of authority in the system.
+
 Usage:
     tools/check-unsafe-budget.py            # check, exit non-zero on failure
     tools/check-unsafe-budget.py --report   # print the table and exit 0
@@ -49,7 +62,10 @@ def crates() -> list[tuple[str, pathlib.Path, int | None]]:
         if not name:
             continue  # workspace root
         budget = re.search(r"^\s*unsafe_budget\s*=\s*(\d+)", text, re.M)
-        found.append((name.group(1), manifest.parent, int(budget.group(1)) if budget else None))
+        exact = re.search(r"^\s*unsafe_budget_exact\s*=\s*true", text, re.M) is not None
+        found.append(
+            (name.group(1), manifest.parent, int(budget.group(1)) if budget else None, exact)
+        )
     return sorted(found)
 
 
@@ -155,7 +171,7 @@ def main() -> int:
     status = 0
     rows = []
 
-    for name, directory, budget in crates():
+    for name, directory, budget, exact in crates():
         total = 0
         all_missing: list[tuple[pathlib.Path, int]] = []
 
@@ -182,6 +198,15 @@ def main() -> int:
             print(f"{RED}FAIL{RESET}  {name}: {total} unsafe lines exceeds budget {budget}")
             print("        Raising the budget is allowed, but the PR description must")
             print("        say why the new unsafe could not be avoided.")
+            status = 1
+        elif exact and total < budget and not args.report:
+            # The direction nobody guards, and the reason `unsafe_budget_exact`
+            # exists: a crate that shrank and kept its old number is carrying
+            # room for the next author to fill without asking anybody.
+            print(f"{RED}FAIL{RESET}  {name}: {total} unsafe lines is under its exact budget {budget}")
+            print("        This crate declares unsafe_budget_exact. Lower the number to")
+            print("        match, in the same change that removed the unsafe -- headroom")
+            print("        here is permission nobody is using.")
             status = 1
 
     print()
