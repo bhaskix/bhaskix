@@ -35,6 +35,11 @@ bhaskix-abi = { path = "../../abi" }
 # **unchanged by this move** -- which is the point of having kept it separate
 # while the rest of the personality was in the kernel.
 bhaskix-personality = { path = "../../personality" }
+# `RDRAND` and the `CPUID` that detects it, for a hosted process's `mmap` base
+# -- security.md §1 gap 3. Unprivileged, so a ring 3 program draws for itself
+# and holds nothing extra to do it: RFC 0021's finding, and why there is no
+# capability here to ask for.
+bhaskix-rand = { path = "../../rand" }
 
 [profile.release]
 panic = "abort"

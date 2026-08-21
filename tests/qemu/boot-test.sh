@@ -1467,6 +1467,33 @@ else
     status=1
 fi
 
+# `security.md` §1 gap 3: a hosted process's `mmap` region is drawn per process
+# rather than bumped from one shared counter at a fixed base. The software
+# arriving under L1-L4 is C, and a hosted process at a wholly predictable layout
+# turns any bug in it into a reliable exploit rather than a crash.
+#
+# **The condition matters and is stated rather than assumed.** The draw is
+# `RDRAND`, and a machine without it gets the floor -- `bin/linuxd` falls back
+# rather than refusing to run a program, because a layout is a hardening measure
+# and not a correctness one. Every machine this harness boots reports `rdrand`
+# present, so the drawn arm is the one asserted here; on a machine without it
+# the kernel prints the other line, in yellow, saying the layout is known. What
+# is refused is silence: a boot that says neither has stopped reporting.
+#
+# Negative-armed by construction rather than by editing: the address printed is
+# the one the hosted program received, and three consecutive boots on 2026-08-21
+# gave 0x707c9b39a000, 0x70b501870000 and 0x70718f4f2000 -- so a build that
+# stopped drawing would print the floor and fail this line without anything
+# being made wrong on purpose.
+if grep -qE "linux aslr +the hosted mmap base was drawn, not fixed: 0x[0-9a-f]+, 28 bits" "$LOG"; then
+    pass "a hosted process's memory layout is drawn, not fixed"
+elif grep -qE "linux aslr +the hosted mmap base is the floor" "$LOG"; then
+    pass "this machine drew no entropy, and the boot says the hosted layout is known"
+else
+    fail "the boot said nothing about the hosted memory layout"
+    status=1
+fi
+
 # RFC 0005 step 4: signals, the part the RFC says to build first because it
 # is where the design is most likely to be wrong. A Linux program installs a
 # SIGSEGV handler, faults on purpose, reads cr2 out of the ucontext it was

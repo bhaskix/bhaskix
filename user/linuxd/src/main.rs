@@ -44,6 +44,7 @@ use bhaskix_personality::file::Kind;
 use bhaskix_personality::memory;
 use bhaskix_personality::pipe::Pipe;
 use bhaskix_personality::proc::File as ProcFile;
+use bhaskix_personality::process::layout;
 use bhaskix_personality::process::{Exit, Process, Processes, Region};
 use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
@@ -852,7 +853,15 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
                     return Answer::error(memory::errno::ENOMEM);
                 }
                 let bytes = pages * memory::PAGE;
-                let address = NEXT_MAPPING.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+                // **From this process's own base, not a shared bump** --
+                // `security.md` §1 gap 3. One global allocator meant every
+                // hosted layout was fixed *and* that each process's addresses
+                // were predictable from any other's; a base per record ends
+                // both. A record with no base has not been drawn one, which is
+                // a refusal rather than a fixed address quietly used.
+                let Some(address) = advance_mapping(request.domain, bytes) else {
+                    return Answer::error(memory::errno::ENOMEM);
+                };
                 if map_at(domain, address, pages, protection, 0) {
                     remember_mapping(request.domain, address, pages, protection);
                     Answer::ok(address)
@@ -1440,6 +1449,10 @@ fn process_for(domain: u32) -> Option<&'static mut Process> {
         // Parent zero: nothing hosted started it, so nothing will wait for it.
         // When `fork` and `execve` exist, the parent is the process that asked.
         let pid = processes.admit(0, domain, generation).ok()?;
+        // Drawn here, at the one place a process first exists.
+        if let Some(fresh) = processes.by_pid_mut(pid) {
+            fresh.mmap_next = drawn_base();
+        }
         // **The three descriptors a Linux program is entitled to assume.** It
         // does not open standard output; it writes to descriptor 1 and is
         // entitled to find something there. Without them the first file a
@@ -1452,6 +1465,56 @@ fn process_for(domain: u32) -> Option<&'static mut Process> {
             .install_standard(CONSOLE);
     }
     processes.by_domain_mut(domain, generation)
+}
+
+/// A base for a hosted process's `mmap` region, drawn from the hardware.
+///
+/// [security.md](../../docs/security.md) §1 gap 3. `RDRAND` is unprivileged, so
+/// a ring 3 program can draw for itself without holding anything — which is
+/// [RFC 0021](../../docs/rfc/0021-unpredictability.md)'s finding, and why there
+/// is no capability to ask for.
+///
+/// **A machine with no entropy gets the floor, and the boot says so.** Refusing
+/// to start a hosted process would be a worse answer than starting one with a
+/// known layout: the layout is a hardening measure, not a correctness one, and
+/// a machine that cannot randomise can still run programs. What it must not do
+/// is *pretend* — so the kernel's `linux aslr` line reports which world the
+/// machine is in, read off the address the hosted program actually received
+/// rather than from a flag this program sets about itself. A boot gate accepts
+/// either line and refuses silence.
+fn drawn_base() -> u64 {
+    match bhaskix_rand::u64() {
+        Some(draw) => layout::base_from(draw),
+        None => layout::MMAP_FLOOR,
+    }
+}
+
+/// Takes `bytes` from a process's own `mmap` region.
+///
+/// Answers `None` when the record has no base — a record admitted without a
+/// draw, which cannot happen through `admit_hosted` and is refused here rather
+/// than silently allocating from the bottom of the address space — or when the
+/// region would run past its window.
+fn advance_mapping(domain: u32, bytes: u64) -> Option<u64> {
+    // Through `process_for`, which is the one door that creates a record and
+    // draws its base. Looking the record up directly was the first version and
+    // was wrong twice over: it indexed `incarnation` without the mask
+    // `process_for` applies, and it refused an `mmap` that arrived *before* any
+    // other call from that domain — which is exactly what a program that maps
+    // memory first does, and what the memory probe does.
+    let process = process_for(domain)?;
+    if process.mmap_next == 0 {
+        return None;
+    }
+    let address = process.mmap_next;
+    // The window is 1 TiB and a hosted process that walked out of it has asked
+    // for more address space than this adapter will hand one program.
+    let next = address.checked_add(bytes)?;
+    if next > layout::ceiling() + (1u64 << 40) {
+        return None;
+    }
+    process.mmap_next = next;
+    Some(address)
 }
 
 /// The sleeper table, borrowed for the length of one request.
@@ -2515,7 +2578,7 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
         if let Some(process) = process_for(request.domain) {
             let pid = process.pid;
             let from = process.domain;
-            process.exec_into(child, generation, |_| {});
+            process.exec_into(child, generation, drawn_base(), |_| {});
             trace_exec(pid, from, child);
         }
     }
@@ -2792,18 +2855,6 @@ const MAP_LAZY: u64 = 1;
 /// `MAP_AT`'s replace flag — Linux's `MAP_FIXED`: this address, and whatever
 /// is there is discarded.
 const MAP_REPLACE: u64 = 2;
-
-/// Where an `mmap` with no address of its own is put.
-///
-/// A bump, and it is **the personality's policy rather than the kernel's** —
-/// which is the whole point of the call having moved. Addresses are per
-/// address space, so one counter serves every hosted domain: the same number
-/// in two of them names two different pages.
-///
-/// The base is the same one the nucleus used, so a hosted program sees no
-/// change of layout across the move.
-static NEXT_MAPPING: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0x0000_7000_0000_0000);
 
 /// `MAP_AT`/`PROTECT_AT`'s protection encoding.
 const PROT_NONE: u64 = 0;

@@ -123,6 +123,18 @@ pub struct Process {
     pub generation: u32,
     /// Linux's credentials: numbers, for Linux's own arithmetic.
     pub credentials: Credentials,
+    /// Where this process's next `mmap` lands.
+    ///
+    /// **Per process, and drawn rather than shared** — `security.md` §1 gap 3.
+    /// It used to be one global bump allocator for every hosted process at
+    /// once, which meant two things: every layout was fixed, and each process's
+    /// addresses were predictable from any other's. A base per record fixes
+    /// both, and [`layout::base_from`] is the arithmetic.
+    ///
+    /// Zero means "not drawn yet" and the adapter fills it at admission; a
+    /// record that reached `mmap` with zero would allocate from the bottom of
+    /// the address space, so the adapter refuses rather than guessing.
+    pub mmap_next: u64,
     /// The adapter's handle for the directory this process resolves relative
     /// paths against.
     pub cwd: u64,
@@ -228,6 +240,10 @@ impl Process {
                 gid: 0,
                 egid: 0,
             },
+            // Filled by the adapter at admission, from a drawn number. Zero
+            // here rather than the floor, so a record that never got one is
+            // visible as a refusal instead of quietly using a fixed address.
+            mmap_next: 0,
             cwd: 0,
             root: 0,
             descriptors: Table::new(),
@@ -333,8 +349,17 @@ impl Process {
         &mut self,
         domain: u32,
         generation: u32,
+        base: u64,
         released: impl FnMut(crate::file::Entry),
     ) -> usize {
+        // **A new image gets a new layout**, which is where Linux randomises
+        // too: `fork` copies and must not move anything, `execve` replaces and
+        // is the moment a fresh draw costs nothing. Without this, a program
+        // that learned its parent's layout — by crashing it, by reading
+        // `/proc/self/maps`, by any of the ways a local attacker learns an
+        // address — would keep that knowledge across the exec that was supposed
+        // to be a new program.
+        self.mmap_next = base;
         self.domain = domain;
         self.generation = generation;
         // **The old image's memory is not the new one's.** An exec replaces the
@@ -361,6 +386,13 @@ impl Process {
             ppid: self.pid,
             pgid: self.pgid,
             sid: self.sid,
+            // **The child inherits the parent's layout, deliberately.** `fork`
+            // copies an address space, so a child whose `mmap` base differed
+            // from its parent's would be a copy that is not a copy: a pointer
+            // the parent computed before forking would name nothing in the
+            // child. Linux re-randomises at `execve`, not at `fork`, and so
+            // does this — see `exec_into`.
+            mmap_next: self.mmap_next,
             domain,
             generation,
             credentials: self.credentials,
@@ -717,7 +749,7 @@ mod tests {
         process.descriptors = table_with(true);
         assert_eq!(process.descriptors.open_count(), 4);
 
-        let closed = process.exec_into(11, 2, |_| {});
+        let closed = process.exec_into(11, 2, layout::base_from(99), |_| {});
         assert_eq!(closed, 1, "the exec must say what it closed");
 
         assert_eq!(
@@ -743,7 +775,7 @@ mod tests {
         let mut process = Process::new(9, 2, 3, 1);
         process.descriptors = table_with(false);
         let mut released = 0;
-        process.exec_into(11, 2, |_| released += 1);
+        process.exec_into(11, 2, layout::base_from(7), |_| released += 1);
         assert_eq!(released, 0);
         assert_eq!(process.descriptors.open_count(), 4);
         assert_eq!(process.descriptors.get(3).map(|e| e.handle), Some(42));
@@ -783,7 +815,7 @@ mod tests {
                 protection: 2,
             })
             .expect("room");
-        process.exec_into(11, 2, |_| {});
+        process.exec_into(11, 2, layout::base_from(1), |_| {});
         assert_eq!(
             process.mapped_pages(),
             0,
@@ -1014,5 +1046,162 @@ mod tests {
         let pid = table.admit(0, 1, 1).expect("room");
         table.ended(pid, Exit::Status(0)).expect("live");
         assert_eq!(table.ended(pid, Exit::Status(0)), Err(errno::ESRCH));
+    }
+}
+
+/// Where a hosted process's `mmap` allocations begin.
+///
+/// [security.md](../../docs/security.md) §1 gap 3, and the half of it that is
+/// this personality's to fix.
+///
+/// # Why a hosted process gets this and a Bhaskix program does not
+///
+/// Bhaskix's own services are Rust and their per-program bases are **fixed on
+/// purpose**: they were all at one address until 2026-08-13, which made a
+/// debugger useless because a fault `rip` meant eight different instructions.
+/// That decision stands. The software arriving under L1–L4 is C, and a hosted
+/// process at a wholly predictable layout turns any bug in BusyBox or `curl`
+/// into a reliable exploit rather than a crash. The domain still contains it —
+/// but containment is the claim this project sells, and cheap exploitation of
+/// the contained thing weakens the sale.
+///
+/// # What this randomises, and what it cannot
+///
+/// **The `mmap` region only.** The image itself is where its ELF says: the
+/// loader refuses `ET_DYN`, deliberately, to keep relocation processing out of
+/// the program loader, so a static non-PIE binary has one possible base and no
+/// amount of policy here changes that. Randomising the image needs `ET_DYN`
+/// accepted in ring 3, which is a separate decision with its own fuzz
+/// obligation and belongs in an RFC rather than in this function.
+///
+/// So this is **partial** ASLR, and saying which part is the point: the heap
+/// and every shared mapping move; the text does not.
+pub mod layout {
+    /// The lowest address `mmap` may return.
+    ///
+    /// The same base the nucleus used before RFC 0032 moved the personality
+    /// out, so a hosted program that reads `/proc/self/maps` sees the region it
+    /// always saw, one window further along.
+    pub const MMAP_FLOOR: u64 = 0x0000_7000_0000_0000;
+
+    /// How many bits of the base are drawn.
+    ///
+    /// **Twenty-eight, page-granular**, which is what Linux gives `mmap` on
+    /// `x86_64` and is a 1 TiB window — comfortably inside the 47-bit user half
+    /// this kernel's four-level paging provides
+    /// ([RFC 0025](../../docs/rfc/0025-four-level-paging-on-purpose.md)), and
+    /// comfortably above the fixed addresses the adapter maps into a hosted
+    /// domain for `execve` and `fork`.
+    ///
+    /// Stated as a number because "randomised" without a bit count is a claim
+    /// nobody can check. Twenty-eight bits is not a defence against an attacker
+    /// who can retry — nothing at this layer is — it is a defence against one
+    /// who gets a single attempt at a fixed address.
+    pub const BITS: u32 = 28;
+
+    /// Page size, in bytes.
+    const PAGE: u64 = 4096;
+
+    /// The base a hosted process should use, given one drawn number.
+    ///
+    /// Page-aligned, inside the window, and a pure function of the draw — which
+    /// is what lets the whole of this be tested on the host with no machine and
+    /// no entropy source anywhere near it.
+    #[must_use]
+    pub const fn base_from(draw: u64) -> u64 {
+        let slots = 1u64 << BITS;
+        MMAP_FLOOR + (draw % slots) * PAGE
+    }
+
+    /// The highest base [`base_from`] can return.
+    #[must_use]
+    pub const fn ceiling() -> u64 {
+        MMAP_FLOOR + ((1u64 << BITS) - 1) * PAGE
+    }
+}
+
+#[cfg(test)]
+mod aslr_tests {
+    use super::{Process, layout};
+
+    #[test]
+    fn a_forked_child_keeps_its_parent_layout_and_an_exec_replaces_it() {
+        let mut parent = Process::new(2, 1, 5, 1);
+        parent.mmap_next = layout::base_from(0x1111);
+
+        // `fork` copies an address space, so the child must land where the
+        // parent's pointers already point. A child that moved would be a copy
+        // that is not a copy.
+        let child = parent.fork_into(3, 6, 1);
+        assert_eq!(child.mmap_next, parent.mmap_next, "fork moved the layout");
+
+        // `execve` replaces the image, and that is the moment to redraw --
+        // otherwise an address learned from the old program survives into the
+        // new one, which is the whole thing this defends against.
+        let mut after = child;
+        let fresh = layout::base_from(0x2222);
+        after.exec_into(7, 2, fresh, |_| {});
+        assert_eq!(after.mmap_next, fresh, "exec kept the old layout");
+        assert_ne!(after.mmap_next, parent.mmap_next, "exec did not move it");
+    }
+
+    #[test]
+    fn a_record_that_was_never_given_a_base_is_visibly_unset() {
+        // Zero rather than the floor, so an adapter that forgot to draw one is
+        // a refusal the next `mmap` can see instead of a silent fixed address.
+        let fresh = Process::new(2, 1, 5, 1);
+        assert_eq!(fresh.mmap_next, 0);
+        assert!(layout::base_from(0) > 0, "the floor is never zero");
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::layout;
+
+    #[test]
+    fn every_base_is_page_aligned_and_inside_the_window() {
+        for draw in [0, 1, 4095, 4096, u64::MAX, u64::MAX / 3, 0x5eed_face] {
+            let base = layout::base_from(draw);
+            assert_eq!(base % 4096, 0, "draw {draw:#x} gave an unaligned base");
+            assert!(
+                base >= layout::MMAP_FLOOR,
+                "draw {draw:#x} fell below the floor"
+            );
+            assert!(
+                base <= layout::ceiling(),
+                "draw {draw:#x} rose above the ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_is_the_stated_size() {
+        // A bit count that does not match the window it produces is the kind
+        // of claim this comment exists to stop.
+        assert_eq!(
+            layout::ceiling() - layout::MMAP_FLOOR,
+            ((1u64 << 28) - 1) * 4096
+        );
+        assert_eq!(layout::BITS, 28);
+    }
+
+    #[test]
+    fn different_draws_give_different_bases() {
+        // Not a randomness test -- it cannot be one, since `base_from` is a
+        // pure function. It is the mapping being injective enough to carry the
+        // entropy it is given, which is the part that would break silently if
+        // somebody "simplified" the arithmetic.
+        let mut seen = alloc_free_set();
+        for draw in 0..1000u64 {
+            let base = layout::base_from(draw * 7 + 3);
+            assert!(seen.insert(base), "two draws collided at {base:#x}");
+        }
+    }
+
+    /// A tiny set, because this crate is `no_std` and its tests run on the host
+    /// without pulling `std` collections into the shipping build.
+    fn alloc_free_set() -> std::collections::BTreeSet<u64> {
+        std::collections::BTreeSet::new()
     }
 }

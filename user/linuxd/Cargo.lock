@@ -11,9 +11,14 @@ name = "bhaskix-personality"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-rand"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-user-linuxd"
 version = "0.1.0"
 dependencies = [
  "bhaskix-abi",
  "bhaskix-personality",
+ "bhaskix-rand",
 ]

@@ -762,6 +762,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | Limine containment (only `boot/` may name it) | M1 | architecture.md §1 |
 | Dependency direction / no cycles | M1 | architecture.md §5 |
 | **Every fuzz target still compiles** — `tools/check-fuzz-targets.sh`, `cargo check` on all 15, one second warm, on stable. Added after `arp_parse` and `tcp_parse` were found not to have compiled since 2026-08-18 | 2026-08-21 | coding-style.md §8 — a target that does not build runs zero executions |
+| **A hosted process's memory layout is drawn, not fixed** — 28 bits per process, `fork` inheriting and `execve` redrawing; the gate accepts the no-entropy line too and refuses silence | 2026-08-21 | security.md §1 gap 3 |
 | **`bin/linuxd`'s `unsafe` is exact, not bounded** — `unsafe_budget_exact = true`; the build fails if the largest concentration of authority in the system grows *or* shrinks without somebody editing the number | 2026-08-21 | security.md §1 gap 2; coding-style.md §3 |
 | **A supervisor's write commits, and its read does not** — the invariant behind 2026-08-20's three `EFAULT` bugs, asserted at boot in both directions and both watched failing | 2026-08-21 | security.md §1 gap 4; `vm::frame_for_write` |
 | **Instruction containment** — every crate holding an architecture-specific instruction declares an `asm_budget` and a reason; undeclared is a hard failure, and the gate is watched refusing a fixture on every run | 2026-08-20 | architecture.md §7 |
@@ -891,6 +892,58 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-21 (a hosted process's memory layout is drawn, and the thing it replaced was worse than fixed)
+
+**Gap 3 of the reassessment, hosted half.** Roadmap Phase 3 ordered it before the L1 row for a
+reason: the software arriving under L1–L4 is C, and a hosted process at a wholly predictable layout
+turns any bug in BusyBox or `curl` into a reliable exploit rather than a crash. The domain still
+contains it — containment is the claim this project sells, and cheap exploitation of the contained
+thing weakens the sale.
+
+**What it replaced was worse than fixed.** `NEXT_MAPPING` was *one* `AtomicU64` bump allocator
+shared by every hosted process at once, so not only was every layout known, **each process's
+addresses were predictable from any other's**. A base per process record ends both.
+
+- **28 bits, page-granular**, stated as a number because "randomised" without a bit count is a claim
+  nobody can check. That is what Linux gives `mmap` on `x86_64`, and it is a 1 TiB window inside the
+  47-bit user half four-level paging provides.
+- **`fork` inherits, `execve` redraws** — Linux's split, for a concrete reason. `fork` copies an
+  address space, so a child whose base moved would be a copy that is not a copy and a pointer the
+  parent computed would name nothing. `execve` replaces the image, which is exactly when an address
+  learned from the old program should stop being useful.
+- **The arithmetic lives in `personality`**, which holds no capability and is host-tested: base,
+  window, ceiling, the fork/exec split, and a record that was never drawn one being visibly unset
+  rather than quietly at the floor.
+- **A machine with no entropy gets the floor and the boot says which world it is in**, in yellow.
+  Refusing to start a program would be the worse answer — a layout is hardening, not correctness —
+  but *pretending* is not allowed. The gate accepts either line and **refuses silence**.
+
+**Partial, and the split is written down.** The image stays where its ELF says: the loader refuses
+`ET_DYN` deliberately, to keep relocation processing out of the program loader, so randomising the
+text needs `ET_DYN` accepted in ring 3 — a separate decision with its own fuzz obligation and an
+RFC's job. Bhaskix's *own* programs keep their fixed per-program bases, which is the 2026-08-13
+debuggability decision and is asserted by two boot gates.
+
+#### Three detours, all one mechanism, recorded because it cost the most time today
+
+**A bare `cargo build` inside a `user/` crate makes `make` skip its own recipe.** The Makefile's rule
+is `$(USER_LINUXD): $(LINUXD_DIR)/src/main.rs …`, so once a direct build has updated the artifact's
+mtime, make considers it current and never runs the recipe that supplies `RUSTFLAGS` — including
+`-C link-arg=-T…/link.ld`. The ISO then ships a binary built **without its link script**.
+
+It happened three times: the shell rename, where it produced *"the shell program is not an ELF this
+kernel will load"* and was obvious; and twice here, where it produced a binary that ran and answered
+`mmap 0x0`, which is not obvious at all. **The rule is: build through `make`, never through `cargo`
+in a crate directory** — and the reason the second failure took longer than the first is that a
+wrong-but-running artifact is harder to recognise than one that will not load.
+
+#### And the gate found dead code of mine, again
+
+`aslr_available` was written, never called — the kernel decides which world it is in by reading the
+address the hosted program actually received, which is a better source than a flag the adapter sets
+about itself. Removed. That is the second stray function I have written today, after the one that
+reached `83157d4`.
 
 ### 2026-08-21 (`bin/linuxd`'s `unsafe` is capped, and thirteen lines of it turn out to be one line written twenty times)
 

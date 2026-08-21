@@ -4270,6 +4270,12 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // A plausible address, the pattern read back out of the second page,
     // and both of the calls that answer zero having answered zero.
     let mapped_somewhere = answers[0] >= 0x0000_7000_0000_0000 && answers[0] % 4096 == 0;
+    // `security.md` §1 gap 3: a hosted process's `mmap` region is drawn per
+    // process rather than bumped from one shared counter at a fixed base. The
+    // floor is what a machine with no `RDRAND` gets — `bin/linuxd` falls back
+    // rather than refusing to run a program — so the line says which world this
+    // is, exactly as the IOMMU lines do, instead of implying the stronger one.
+    let drawn = answers[0] != 0x0000_7000_0000_0000;
     if report_pa != 0 && mapped_somewhere && answers[1] == 42 && answers[2] == 0 && answers[3] == 0
     {
         println!(
@@ -4278,6 +4284,18 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
              madvise taken as advice",
             answers[0]
         );
+        if drawn {
+            println!(
+                "    linux aslr     the hosted mmap base was drawn, not fixed: {:#x}, {} bits \
+                 page-granular above the floor",
+                answers[0], 28
+            );
+        } else {
+            println!(
+                "\x1b[93m    linux aslr     the hosted mmap base is the floor -- this machine \
+                 drew no entropy, so the layout is known\x1b[0m"
+            );
+        }
         true
     } else {
         println!(
