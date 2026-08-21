@@ -2182,8 +2182,16 @@ fi
 # The scheduler's wake-to-dispatch measurement must exist on every boot:
 # wakes happen on all of them, and an instrument that vanishes is a
 # regression even when nothing gates its values.
-if grep -qE "wake to run +[0-9]+ wakes; p50 [0-9]+ us, p99 [0-9]+ us" "$LOG"; then
-    pass "wake-to-dispatch is measured, not guessed"
+#
+# **And the worst case must name its thread**, which is asserted here because
+# the number alone misled for a day. Every boot reports a worst of about 8.027
+# seconds; it is thread `boot` waiting through bring-up while the self-tests run
+# on the same CPU, not a scheduling stall. A worst case that is the same
+# constant on every run is measuring something other than what it claims, and
+# the name is what lets a reader tell the two apart — so the name is gated, not
+# merely printed.
+if grep -qE "wake to run +[0-9]+ wakes; p50 [0-9]+ us, p99 [0-9]+ us, mean [0-9]+ us; worst [0-9]+ us was thread [0-9]+ \([a-z0-9_-]+\)" "$LOG"; then
+    pass "wake-to-dispatch is measured, and its worst case names the thread it happened to"
 else
     fail "the wake-to-dispatch measurement is missing"
     status=1

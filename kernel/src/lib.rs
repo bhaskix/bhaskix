@@ -13596,14 +13596,33 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     let wake_hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
     if wakes > 0 && wake_hertz != 0 {
         let micros = |ticks: u64| (u128::from(ticks) * 1_000_000 / u128::from(wake_hertz)) as u64;
+        // **The worst is printed with the thread it happened to, on the same
+        // line, and that is not decoration.** Every boot of 2026-08-21 reported
+        // a worst case of about 8.027 seconds — healthy boots and failing ones
+        // alike, varying by under two milliseconds between them — and a worst
+        // case that is the same constant on every run is measuring something
+        // other than what it claims. It was read for a day as evidence of a
+        // scheduling stall.
+        //
+        // It is thread 3, `boot`: this thread, waiting through bring-up while
+        // the self-tests run on the same CPU. A real delay, and an entirely
+        // expected one, and it swamps the statistic — the bucket comment beside
+        // `WAKE_TO_RUN_BUCKETS` already said the distribution "has bring-up in
+        // it" and gave the median as the number to trust.
+        //
+        // So the name travels with the number. A reader who sees `(boot)` knows
+        // immediately that the tail is the boot thread and not a service; a
+        // reader who one day sees a different name has found something.
+        let (worst_ticks, worst_thread) = sched::wake_to_run_worst();
+        let worst_name = sched::describe(worst_thread).map_or("?", |(name, _)| name);
         println!(
-            "    wake to run    {} wakes; p50 {} us, p99 {} us, mean {} us, worst {} us from \
-             marked ready to dispatched",
+            "    wake to run    {} wakes; p50 {} us, p99 {} us, mean {} us; worst {} us was \
+             thread {worst_thread} ({worst_name}), from marked ready to dispatched",
             wakes,
             micros(sched::wake_to_run_percentile(50)),
             micros(sched::wake_to_run_percentile(99)),
             micros(wake_cycles / wakes),
-            micros(wake_worst),
+            micros(worst_ticks.max(wake_worst)),
         );
     }
 

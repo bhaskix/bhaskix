@@ -894,6 +894,43 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-21 (the 8-second wake was the boot thread, and an instrument that would not say so)
+
+**Every boot reported `worst 8026749 us from marked ready to dispatched`** — healthy boots and
+failing ones alike, varying by under two milliseconds between runs. A worst case that is the same
+constant on every run is measuring something other than what it claims, and this one had been read
+for a day as evidence of a scheduling stall, alongside two real intermittents.
+
+**It is thread 3, `boot`.** This thread, waiting through bring-up while the self-tests run on the
+same CPU. A real delay and an entirely expected one: nothing else in the machine waits that long,
+so it is always the maximum, on every boot, for ever.
+
+**The instrument could not say so, which is the actual defect.** `WAKE_TO_RUN_MAX` kept a number
+and nothing else, so no reader could tell a service starved for eight seconds from the boot thread
+doing exactly what it is supposed to. The comment beside `WAKE_TO_RUN_BUCKETS` already knew the
+shape of the problem — *"a mean is the wrong statistic for a distribution with bring-up in it: one
+four-second outlier contributes hundreds of microseconds of mean"* — and named the median as the
+number to trust. What it did not do was stop the worst case being quoted on its own.
+
+**The fix is that the name travels with the number**, in the same line so the two cannot be
+separated: `worst 8025256 us was thread 3 (boot)`. The delay is packed into the high forty-eight
+bits and the thread into the low sixteen, so a single `fetch_max` orders by the delay and carries
+the thread with it — lock-free, one atomic, no cost on the dispatch path.
+
+The boot gate now requires the name rather than merely the numbers, and was watched red by removing
+it. **A reader who sees `(boot)` knows the tail is bring-up; a reader who one day sees a different
+name has found something.**
+
+#### Three intermittents, and this closes the third
+
+- The `test-faults` `user` arm: **fixed** — `exit` marked a thread finished before releasing the
+  caller it owed.
+- This 8-second worst case: **explained** — the boot thread, and the instrument now says so.
+- The 494 ms spawn against a 50 ms bound: **still open.** It is the only one left, and with the
+  other two accounted for it can no longer be waved at as part of a pattern. Its own gate's comment
+  claims three orders of magnitude of headroom and one run reached within a factor of ten of the
+  bound, which is the thing to check next.
+
 ### 2026-08-21 (the teardown race, found and fixed: a thread marked finished before it had finished)
 
 **`sched::exit` marked the exiting thread `Finished` before releasing the caller it owed an answer,

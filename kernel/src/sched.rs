@@ -786,6 +786,20 @@ static WAKE_TO_RUN_MAX: AtomicU64 = AtomicU64::new(0);
 /// Bucket `i` holds delays in `[2^i, 2^(i+1))` cycles.
 static WAKE_TO_RUN_BUCKETS: [AtomicU64; 48] = [const { AtomicU64::new(0) }; 48];
 
+/// The worst wake-to-dispatch, packed with the thread it happened to.
+///
+/// `waited << 16 | thread`, so `fetch_max` orders by the delay and carries the
+/// thread along with it. Forty-eight bits of ticks is about a day at 3 GHz, and
+/// sixteen of thread id is the whole table twice over.
+///
+/// **The packing exists because the number alone was useless.** Every boot on
+/// 2026-08-21 reported a worst case of ~8.027 seconds — healthy boots and
+/// failing ones alike, varying by less than two milliseconds between them — and
+/// a worst case that is the same constant on every run is measuring something
+/// other than what it claims. Nothing could say which thread it was, so nothing
+/// could say whether it mattered. Now it can.
+static WAKE_TO_RUN_WORST: AtomicU64 = AtomicU64::new(0);
+
 /// The wake-to-dispatch tallies: `(count, total cycles, worst cycles)`.
 #[must_use]
 pub fn wake_to_run() -> (u64, u64, u64) {
@@ -794,6 +808,13 @@ pub fn wake_to_run() -> (u64, u64, u64) {
         WAKE_TO_RUN_SUM.load(Ordering::Relaxed),
         WAKE_TO_RUN_MAX.load(Ordering::Relaxed),
     )
+}
+
+/// The worst wake-to-dispatch and the thread it happened to: `(cycles, thread)`.
+#[must_use]
+pub fn wake_to_run_worst() -> (u64, u32) {
+    let packed = WAKE_TO_RUN_WORST.load(Ordering::Relaxed);
+    (packed >> 16, (packed & 0xffff) as u32)
 }
 
 /// The delay, in cycles, below which `percent` of wakes dispatched.
@@ -2580,6 +2601,12 @@ pub fn preempt() {
                 WAKE_TO_RUN_SUM.fetch_add(waited, Ordering::Relaxed);
                 WAKE_TO_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
                 WAKE_TO_RUN_MAX.fetch_max(waited, Ordering::Relaxed);
+                // The delay in the high bits so `fetch_max` orders by it, the
+                // thread in the low bits so the winner says who it was.
+                WAKE_TO_RUN_WORST.fetch_max(
+                    (waited.min((1 << 48) - 1) << 16) | u64::from(thread.id & 0xffff),
+                    Ordering::Relaxed,
+                );
                 let bucket = (63 - waited.max(1).leading_zeros() as usize).min(47);
                 WAKE_TO_RUN_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
             }
