@@ -727,7 +727,7 @@ what is actually ahead.
 | libc — resolved into the Linux personality | ⬜ **in progress** — [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) steps 2–8 of 10 | **This row did not exist until 2026-08-19**, while the roadmap carried the bullet and eight of the RFC's steps shipped — the same omission this table's own preamble describes. What runs: the personality tag and its `-ENOSYS` telemetry, the initial process image with a real auxiliary vector, the signal round trip (fault → handler → `rt_sigreturn`), the memory calls including `mprotect` and honoured `mmap` hints, `clone` and `futex` proven by two threads of one hosted program meeting, and a **real static Go binary** that loads, runs, prints through the adapter and stops in its own allocator after 212 traced calls. What does not: Tier 1 (files, `/proc`) has not started, and Tier 2 (sockets, `epoll`) has its arithmetic and neither its wiring nor a way to build one where the personality currently lives; the RFC's step 10 gate needs a workload from outside. **And one thing is in the wrong place:** the translation runs in the nucleus, where RFC 0005 §"Where it lives" requires a service domain — recorded 2026-08-19 in that RFC, in `security.md` §1 as **T11**, and in [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md) §5 with its correction trigger |
 | **A fuzz target for the filesystem** — a hostile disk image | ✅ **DONE 2026-08-21** — `fuzz/fuzz_targets/fs_image.rs`, four arms, 123,501 executions clean | **A debt against a binding rule, not new scope.** `coding-style.md` §8 and `security.md` §5 both say a parser touching untrusted input gets a fuzz target *before* it merges. `fuzz/fuzz_targets/` holds fourteen — ELF, `ustar`, `DMAR`, both package formats and every network parser — and **none for `fs`**. Journal replay is the code that runs before anything can refuse. `Superblock::parse` already sanity-checks every field it later uses as an index, which is why this should be cheap; the target is what proves it. Found by the security reassessment of 2026-08-20, ranked fifth there by attacker cost and kept out of the roadmap deliberately — promoting a merge-gate obligation to a phase item turns a rule into a plan |
 | ~~Three fuzz targets that reach nothing from an empty corpus~~ — `pkg_manifest`, `pkg_package`, `ustar_parse` | ✅ **DONE 2026-08-21**, seeded and re-measured from empty corpora | Measured, not guessed: `pkg_manifest` 0 of 5 probe points in 1,523,042 executions, `pkg_package` 0 of 5 in 5,384,466, `ustar_parse` 1 of 5 in four million — and 5 of 5 in 34,227 **with its corpus**, which is gitignored, so the assurance does not survive a clone. Neither `pkg` target has ever produced a corpus at all. The fix is the one `fuzz_targets/fs_image.rs` demonstrates: build the valid structure inside the target and let the fuzzer mutate within it, instead of hoping it invents a `ustar` header checksum. **Done the same day.** `ustar_parse` gained three seeded arms (a composed archive; the size field behind a re-derived checksum; a window of fuzzer bytes spliced over a header and resealed), `pkg_manifest` four (the grammar's shape with the fuzzer's values; raw values; keywords from a table; a valid manifest with exactly one deliberate defect), and `pkg_package` eight, each aimed at a named refusal in `pkg/src/package.rs`. Re-measured from empty corpora: `ustar` yields entries, payloads and second members; `pkg_manifest` parses; `pkg_package` verifies a package it built. 2,075,038 executions across the three, no crash, no artifact — and corpora that now grow from nothing (354 / 1,449 / 173 units), so the assurance no longer lives in an untracked directory |
-| **A coverage-guided fuzz target for IPv6 and NDP** | ⬜ **owed**, opened 2026-08-20 | The v6 parsers are covered by `net/src/fuzz.rs`'s seeded mutation harness, which runs on every commit and is **the weaker of the two mechanisms `coding-style.md` §8 names** — the v4 path has both. They are also the newest parsers in the tree ([RFC 0029](docs/rfc/0029-ipv6.md), 2026-08-18), so they have had the least time under anything. Ranked sixth in the 2026-08-20 reassessment |
+| ~~A coverage-guided fuzz target for IPv6 and NDP~~ | ✅ **DONE 2026-08-21** — `fuzz_targets/ipv6_ndp.rs`, four arms, 12,906,117 executions clean, five of five probe points reached from empty | The v6 parsers are covered by `net/src/fuzz.rs`'s seeded mutation harness, which runs on every commit and is **the weaker of the two mechanisms `coding-style.md` §8 names** — the v4 path has both. They are also the newest parsers in the tree ([RFC 0029](docs/rfc/0029-ipv6.md), 2026-08-18), so they have had the least time under anything. Ranked sixth in the 2026-08-20 reassessment |
 
 ---
 
@@ -889,6 +889,45 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-21 (IPv6 and NDP get the coverage-guided target RFC 0029 never promised, and it refutes an assertion of its own author's)
+
+**Gap 6 is paid, and it was the last fuzz debt in Phase 2.** `fuzz/fuzz_targets/ipv6_ndp.rs`:
+four arms, **12,906,117 executions, no crash**, and **five of five probe points reached from an
+empty corpus**.
+
+RFC 0029 landed IPv6 on 2026-08-18 committing only to the **seeded mutation harness** in
+`net/src/fuzz.rs`. `coding-style.md` §8 names both mechanisms and says plainly that one does not
+replace the other — *coverage guidance finds what blind mutation cannot, and blind mutation runs on
+every commit without a nightly toolchain*. The v4 path has had both since RFC 0018. The v6 path had
+the weaker one, on the newest parsers in the tree.
+
+**The question this gap raised is now settled by measurement.** Every ICMPv6 message carries a
+**mandatory** 16-bit checksum over a forty-byte pseudo-header the message does not contain — no
+zero-means-absent escape, unlike UDP's. That looked like the wall. It is not: the as-given arm
+reaches a checksum-verified echo from an empty corpus, which is the third time this week a 16-bit
+checksum has failed to stop a coverage-guided fuzzer. **A 32-bit checksum and a 48-bit address are
+walls; a 16-bit one is a speed bump.** The repaired arm is kept anyway, because recomputing the sum
+is what an attacker does and the fields behind it are the ones worth attacking.
+
+**The target refuted an assertion its own author had just written, in seconds.** Arm A first claimed
+`payload.len() == data.len() - HEADER` — that a datagram fills its buffer. The fuzzer produced a
+header stating a zero-length payload followed by twenty trailing bytes, which is a **legal**
+datagram: `Ipv6Header::parse` returns `&bytes[HEADER..HEADER + payload_length]`, and IPv6 does not
+require the buffer to end there. **The assertion was wrong and the parser was right.** It is now the
+stronger claim it should always have been — the payload is exactly the length the header states,
+re-derived from the bytes rather than assumed — and the reasoning is recorded at the assertion.
+This is what the merge-gate rule is for: the target found a false belief about the format before
+that belief could be built on.
+
+**And the gate written this morning caught its own author twice.** The formatting half refused
+`ipv6_ndp.rs` an hour after it was added. It also printed *"a target that does not compile"*
+underneath a formatting diff, sending the reader after the wrong thing; the hint is now conditional
+on there being a compile failure, and both halves were re-armed after the fix.
+
+One crash artifact appeared and was triaged rather than reported: it was written two minutes before
+the corrected assertion and executes cleanly against the current target — it is the wrong assertion's
+own artifact, not a finding. **Sixteen targets now compile, are formatted, and are gated on both.**
 
 ### 2026-08-21 (the three targets that tested nothing are seeded, and the fuzz workspace turns out to be unformatted too)
 

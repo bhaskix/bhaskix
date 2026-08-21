@@ -170,3 +170,10 @@ path = "fuzz_targets/fs_image.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ipv6_ndp"
+path = "fuzz_targets/ipv6_ndp.rs"
+test = false
+doc = false
+bench = false

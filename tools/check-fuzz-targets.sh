@@ -63,7 +63,11 @@ fi
 count=$(echo "$targets" | wc -w)
 if [ "$status" -eq 0 ]; then
     printf '  %sok%s    all %d fuzz targets compile and are formatted\n' "$GREEN" "$RESET" "$count"
-else
+elif [ -n "$broken" ]; then
+    # Only for a compile failure. The unformatted case has already said its
+    # piece above, and printing "a target that does not compile" underneath a
+    # formatting diff sends the reader after the wrong thing -- which this
+    # script did on 2026-08-21, to its own author, an hour after it was written.
     for target in $broken; do
         echo "  ${RED}FAIL${RESET}  fuzz target does not compile: $target"
         (cd fuzz && cargo check --bin "$target" --target "$HOST" 2>&1) | grep -E '^error' | head -3
