@@ -17613,6 +17613,20 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
         .slice_us(200)
         .pinned();
 
+    // Before the spawn, because the spawn is what depends on it: a same-CPU
+    // spawn whose `resched` declines falls back to the reschedule IPI, and it
+    // can only do that if the decline is reported at all.
+    if sched::preempt_reports_its_decline() {
+        println!(
+            "    spawn retry    a declined preemption reports itself, so a same-cpu spawn can fall back to the ipi"
+        );
+    } else {
+        println!(
+            "\x1b[91m    spawn retry    FAILED: preempt declined while a lock was held and did not say so -- a same-cpu spawn that declines would be dropped, and its thread would wait for the one-second backstop\x1b[0m"
+        );
+        return false;
+    }
+
     let spawned_at = bhaskix_arch::tsc::read();
     if let Err(error) = sched::spawn_on_with(cpu, "rt-probe", rt_probe, 0, hhdm_base, options) {
         println!("\x1b[91m    rt latency     FAILED to spawn the probe: {error:?}\x1b[0m");
@@ -17675,12 +17689,14 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
              {gave_up} give-ups (first at round {first_give_up}), loop {} ms, \
              spawn to first run {spawn_to_first_run_us} us, pinned to cpu {cpu}, first ran on \
              cpu {}, waker now on cpu {}, {timer_ticks_in_loop} timer ticks on cpu {cpu} \
-             during the loop (target 50 us, docs/scheduler.md §4)",
+             during the loop, {} spawn resched declines \
+             (target 50 us, docs/scheduler.md §4)",
             nanos / 1000,
             nanos % 1000,
             bhaskix_arch::tsc::to_nanos(loop_ticks).unwrap_or(0) / 1_000_000,
             RT_FIRST_CPU.load(Ordering::Relaxed),
             bhaskix_arch::percpu::cpu_id(),
+            sched::spawn_resched_declines(),
         ),
         None => {
             println!("    rt latency     {rounds} wakeups, worst {worst} ticks (tsc uncalibrated)")

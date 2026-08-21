@@ -253,6 +253,25 @@ Deliberate design points:
 > that presented as three worker threads that never ran. The rule is now explicit: every operation
 > that makes a thread runnable on another processor must say so.
 >
+> **And on *this* processor too — the same rule, and it took a third fix** (2026-08-21). A thread
+> spawned onto the calling CPU asked for a reschedule directly rather than sending itself an IPI,
+> and those are not equivalent: the IPI handler re-arms this CPU's timer *before* it preempts, while
+> a direct `preempt` re-arms only along the path where it actually switches. `preempt` has two
+> silent declines — it will not deschedule a lock holder, and it will not spin for its own
+> runqueue lock against another processor working in it. Either one left a runnable thread in the
+> queue with the timer still armed for the one-second backstop, so the spawnee's first dispatch
+> waited a **uniform draw over that second**. Measured by deleting the request and booting:
+> **495,688 µs**, against 737 µs when the IPI is sent instead. A decline is no longer dropped; it
+> falls back to the IPI the spawn would have sent from any other CPU, and the fallback is counted so
+> it cannot go quiet.
+>
+> The failure is not a fixed 450 ms to bound against — half its draws land under 500 ms, so the
+> 50 ms boot gate necessarily passes about a twentieth of them. Tightening it to 20 ms was tried and
+> reverted the same day: a healthy boot under full-suite load measured 31,494 µs, so the broken
+> distribution and host weather overlap and no latency bound separates them. What guards the hole
+> instead is a deterministic check on every boot — hold a lock, ask for a preemption, and require to
+> be told it was declined — because the hole needs that report to go missing.
+>
 > **An idle CPU is still armed once a second.** Strictly it needs no interrupt at all, but that
 > assumes every present and future path that makes a thread runnable remembers the IPI. The backstop
 > costs nothing and turns the worst failure this design has — a silently lost thread — into "that

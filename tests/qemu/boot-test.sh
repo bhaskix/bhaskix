@@ -551,18 +551,49 @@ else
     status=1
 fi
 
+# The decline is reported. Deterministic, and it guards the gate below rather
+# than duplicating it: that one bounds the *latency*, which only moves when a
+# decline actually happens, and declines are rare. This one asserts the
+# mechanism the fallback rests on -- hold a lock, ask for a preemption, and be
+# told it was declined -- so a change that broke the reporting is caught on
+# every boot instead of on the rare boot that would have needed it.
+if grep -qa "a declined preemption reports itself" "$LOG"; then
+    pass "a declined preemption reports itself, so a same-cpu spawn can fall back to the IPI"
+else
+    fail "preempt did not report a declined preemption -- a same-cpu spawn that declines is dropped again"
+    status=1
+fi
+
 # Spawn-to-first-dispatch, bounded. Unlike the 50 us wakeup target above, this
-# one IS asserted, with three orders of magnitude of headroom on either side:
-# with spawn requesting a reschedule it measures under a millisecond, and
-# without one it measured 446-500 *milliseconds* -- a priority-90 thread
-# waiting behind a spinning fair thread on a CPU whose timer had gone tickless
-# because it was busy but alone. The bound is 50 ms so no emulator slowness
-# can trip it, and no return of the hole can pass it.
+# one IS asserted: with spawn requesting a reschedule it measures in the low
+# thousands of microseconds, and without one it measured 446-500
+# *milliseconds* -- a priority-90 thread waiting behind a spinning fair thread
+# on a CPU whose timer had gone tickless because it was busy but alone.
+#
+# **This bound cannot separate the two distributions, and pretending otherwise
+# cost a suite run** (2026-08-21). The failure it guards is a *uniform draw
+# over the one-second idle backstop*, so it starts at zero; and a loaded host
+# running several QEMU lanes at once pushes a perfectly healthy boot into the
+# tens of milliseconds. The two overlap. Tightening 50 ms -> 20 ms on the
+# reasoning that a 28,061 us sample "must have been" a backstop draw failed
+# the very next full-suite run at **31,494 us with the fix in place** -- which
+# is the evidence that the tens-of-ms tail is host weather, not the bug.
+#
+# So this is a loose sanity check and is documented as one. It catches about
+# 95% of backstop draws, which is enough to notice, and it does not fire on
+# host weather, which is what keeps it worth reading. **The real guard is the
+# deterministic check above**: the hole needs a declined preemption to go
+# unreported, and that is asserted on every boot without waiting for luck.
 spawn_us=$(grep -aoE "spawn to first run [0-9]+ us" "$LOG" | grep -oE "[0-9]+" || echo "")
 if [[ -n "$spawn_us" && "$spawn_us" -lt 50000 ]]; then
     pass "a spawned thread reaches its first dispatch promptly ($spawn_us us)"
 else
     fail "spawn to first dispatch took ${spawn_us:-unmeasured} us -- the tickless spawn hole is back"
+    # The measurement lives in the boot log, which is a temporary file this
+    # script throws away -- so a failure used to arrive as a number with no
+    # context, and the one thing worth knowing is on the same line: whether
+    # any spawn had to fall back to the IPI. Printed here, kept here.
+    grep -a "rt latency" "$LOG" | sed 's/^/      /'
     status=1
 fi
 

@@ -1172,13 +1172,37 @@ pub fn spawn_on_with(
     // had this hole; spawn did, and it measured as a priority-90 probe
     // waiting 446 ms for its first dispatch behind a spinning fair thread —
     // every wakeup after the first taking 54 µs, because those went through
-    // `wake`. If the spawner holds a lock, `resched` declines and the spawnee
-    // waits for the next natural reschedule — narrower than the hole this
-    // closes, and a spawner that holds a lock across spawn is already rare.
+    // `wake`.
+    //
+    // **The two branches were not equivalent, and that was the rest of the
+    // bug** (2026-08-21). `notify` sends an IPI, and the handler for it
+    // re-arms this CPU's timer *before* calling `preempt` — so the tickless
+    // hole is closed whether or not the preemption then happens. `resched` is
+    // `preempt` alone, and `preempt` re-arms only along the path where it
+    // actually switches. Its two silent declines — the holds veto, and losing
+    // the `try_lock` on this CPU's own queue to something another processor
+    // was doing in it — therefore left a runnable thread in the queue and the
+    // timer still armed for whatever it was armed for before. On a CPU
+    // running one spinning thread that is the one-second idle backstop, so
+    // the spawnee waited a *uniform draw over a second* for its first
+    // dispatch.
+    //
+    // That is the shape of the intermittent this closes: the gate allows
+    // 50 ms, and the failures came in at 28 ms (passing, and unexplained at
+    // the time) and 493,942 µs. Both are draws from the same second.
+    // Confirmed rather than inferred by deleting the call below and booting:
+    // **495,688 µs**, first try, where the fix measures in the low thousands.
+    //
+    // So the decline is no longer dropped. `preempt_reporting` distinguishes
+    // "did not look" from "looked and stayed", and only the first falls back
+    // to the IPI this CPU would have been sent had the spawn come from any
+    // other processor. The fast path is unchanged: a switch that happens
+    // directly costs no interrupt.
     if cpu != percpu::cpu_id() {
         notify(cpu);
-    } else {
-        resched();
+    } else if preempt_reporting() {
+        SPAWN_RESCHED_DECLINED.fetch_add(1, Ordering::Relaxed);
+        notify(cpu);
     }
 
     Ok(id)
@@ -2428,9 +2452,22 @@ pub fn stop_all() {
 ///
 /// Called from the timer interrupt and from [`yield_now`].
 pub fn preempt() {
+    let _ = preempt_reporting();
+}
+
+/// [`preempt`], answering `true` when it declined **without looking at the
+/// queue** — the holds veto or a busy queue lock, and nothing else.
+///
+/// The distinction is the whole value of the return. "Looked and kept the
+/// running thread" is a decision and needs no retry; "did not look" leaves a
+/// runnable thread undispatched and a timer armed for whatever it was armed
+/// for before, which on a tickless CPU is the one-second backstop. Only the
+/// second is reported, so a caller acting on it cannot start an interrupt
+/// storm out of threads that were simply not the best choice.
+fn preempt_reporting() -> bool {
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
-        return;
+        return true;
     }
 
     // Never take the CPU away from a thread holding a spinlock.
@@ -2498,7 +2535,7 @@ pub fn preempt() {
         if let Some(count) = PREEMPT_VETO_HOLDS.get(cpu) {
             count.fetch_add(1, Ordering::Relaxed);
         }
-        return;
+        return true;
     }
 
     // From here to the end of the switch, this must not be re-entered.
@@ -2536,11 +2573,15 @@ pub fn preempt() {
                 count.fetch_add(1, Ordering::Relaxed);
             }
             restore_interrupts(interrupts_were_enabled);
-            return;
+            return true;
         };
         if !queue.started {
+            // Not a decline to retry: the scheduler has not started here, or
+            // `stop_all` has frozen it for reporting. It will look when it
+            // starts, and an IPI sent into a freeze would only be answered by
+            // the same refusal.
             restore_interrupts(interrupts_were_enabled);
-            return;
+            return false;
         }
 
         let current = queue.current;
@@ -2581,7 +2622,7 @@ pub fn preempt() {
                 Some(stolen) => next = stolen,
                 None => {
                     restore_interrupts(interrupts_were_enabled);
-                    return;
+                    return false;
                 }
             }
         }
@@ -2740,14 +2781,14 @@ pub fn preempt() {
             .map(|thread| &raw mut thread.context)
         else {
             restore_interrupts(interrupts_were_enabled);
-            return;
+            return false;
         };
         let Some(to) = queue.threads[next]
             .as_ref()
             .map(|thread| &raw const thread.context)
         else {
             restore_interrupts(interrupts_were_enabled);
-            return;
+            return false;
         };
         Some((from, to))
     };
@@ -2772,6 +2813,7 @@ pub fn preempt() {
     // thread rather than with the processor -- which is what makes it the
     // right place to keep a value that must survive a switch.
     restore_interrupts(interrupts_were_enabled);
+    false
 }
 
 /// Points both kernel-entry paths at the incoming thread's stack.
@@ -2840,10 +2882,23 @@ pub fn exit() -> ! {
     // still good, and there may be another server on it later. The obligation
     // is what died, and it lived here.
     //
-    // Taken under the same lock that marks this thread finished, so there is no
-    // window in which the thread is gone and the debt is still recorded.
-    // Ending the domain happens **before** this thread is marked `Finished`,
-    // and that ordering is the whole of a bug that cost an evening.
+    // Taken **before** this thread is marked `Finished`, so there is no window
+    // in which the thread is gone and the debt is still recorded.
+    //
+    // This sentence used to say "under the same lock that marks this thread
+    // finished", and that stopped being true on 2026-08-21: the debt is now
+    // taken under the queue lock, the caller is released after the lock is
+    // dropped — `abandon_caller` takes another of the same rank — and only then
+    // is this thread marked `Finished`. The invariant is unchanged and the
+    // mechanism is not, which is exactly the kind of drift this file keeps
+    // finding in itself.
+    //
+    // The reason for the order is the paragraph below, one step further on: a
+    // `Finished` thread is never scheduled again, so anything still owed must
+    // be discharged while this thread is still something the scheduler will
+    // return to. Ending the domain happens before the marking too, and that
+    // ordering is the whole of a bug that cost an evening — **the same shape,
+    // found twice in this function, a fortnight apart.**
     //
     // `dispatch` handles `Exit` before it takes a single lock, and says why: a
     // thread holding one cannot be preempted (M4-08), so a thread that reaches
@@ -3813,6 +3868,41 @@ static PREEMPT_VETO_HOLDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) };
 
 /// Preemptions declined because this CPU's own queue lock was busy.
 static PREEMPT_QUEUE_BUSY: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Spawns onto the calling CPU whose `resched` declined and fell back to an IPI.
+///
+/// Zero on a quiet machine and small under load. It is here so the fallback is
+/// not itself silent: if this stays zero for ever the path is untested rather
+/// than unnecessary, and if it climbs while spawn latencies climb with it the
+/// IPI is being declined too and the fix is in the wrong place.
+static SPAWN_RESCHED_DECLINED: AtomicU64 = AtomicU64::new(0);
+
+/// How many same-CPU spawns had to fall back to an IPI. See the static.
+#[must_use]
+pub fn spawn_resched_declines() -> u64 {
+    SPAWN_RESCHED_DECLINED.load(Ordering::Relaxed)
+}
+
+/// Checks that a declined preemption still *reports* itself.
+///
+/// The 20 ms boot bound on spawn-to-first-dispatch only fires when a decline
+/// actually happens, and a decline is rare — so a change that stopped
+/// `preempt_reporting` answering `true` could sit unnoticed for a long time
+/// while the hole it guards quietly reopened. This asserts the reporting
+/// directly and deterministically: hold a lock, ask for a preemption, and it
+/// must say it declined.
+///
+/// Nothing else is taken. The holds veto is the first thing `preempt` checks,
+/// before it looks at any runqueue, so this can never contend with the
+/// scheduler or deschedule the caller.
+#[must_use]
+pub fn preempt_reports_its_decline() -> bool {
+    static PROBE: SpinLock<()> = SpinLock::new(Rank::Console, ());
+    let held = PROBE.lock();
+    let declined = preempt_reporting();
+    drop(held);
+    declined
+}
 
 /// How often `preempt` declined on `cpu`: `(holds veto, queue busy)`.
 ///
