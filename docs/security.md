@@ -421,6 +421,21 @@ metadata, network packets, IPC messages), and UBSan/ASan-equivalent debug featur
 **Parsers are where kernels get exploited.** Every parser that touches untrusted input gets a fuzz
 target before it gets merged, not after.
 
+> **And a target is not the same as coverage, which was measured on 2026-08-21 rather than assumed.**
+> Every one of the fourteen targets was instrumented with probe points and run from an **empty**
+> corpus — what a fresh clone has, since `fuzz/corpus/` is gitignored. Most are healthy. Three are
+> not: `pkg_manifest` reached **none** of its five points in 1,523,042 executions, `pkg_package`
+> none of five in 5,384,466, and `ustar_parse` one of five in four million — though **five of five
+> in 34,227 runs with its corpus**, which means its assurance lives in an untracked directory rather
+> than in the repository.
+>
+> Two further findings, both worse than a coverage hole. `arp_parse` and `tcp_parse` **had not
+> compiled since 2026-08-18**, when RFC 0029's renames landed: they ran zero executions for three
+> days while this section went on claiming a target on every parser. `tools/check-fuzz-targets.sh`
+> now runs in `make gates` so that cannot recur. And the analyses that predicted which walls would
+> hold were **wrong in the reassuring direction**: a 16-bit checksum is not a wall to a
+> coverage-guided fuzzer; a 32-bit one and a 48-bit address are.
+
 ---
 
 ## 6. Isolation between domains

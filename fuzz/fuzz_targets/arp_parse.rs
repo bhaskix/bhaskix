@@ -30,15 +30,21 @@
 use libfuzzer_sys::fuzz_target;
 
 use bhaskix_net::{
-    addr::{Ipv4Addr, MacAddr},
-    arp::{ArpCache, ArpPacket},
+    addr::{Address, Ipv4Addr, MacAddr},
+    arp::ArpPacket,
+    neighbour::NeighbourCache,
 };
 
 fuzz_target!(|data: &[u8]| {
     const SLOTS: usize = 4;
     const LIFETIME: u64 = 60_000_000_000;
 
-    let mut cache = ArpCache::<SLOTS>::new(LIFETIME);
+    // `NeighbourCache`, not `ArpCache`: RFC 0029 step 2 replaced ARP's table
+    // with one table for both families, and the protocol address became
+    // `Address` rather than `Ipv4Addr`. **This target did not compile from
+    // 2026-08-18 until 2026-08-21**, so it ran no executions at all in that
+    // window, and nothing said so — see the module comment.
+    let mut cache = NeighbourCache::<SLOTS>::new(LIFETIME);
 
     // Chunked, so one input drives a sequence of packets into one cache rather
     // than a single packet into a fresh one. Eviction, replacement and expiry
@@ -49,13 +55,14 @@ fuzz_target!(|data: &[u8]| {
             continue;
         };
         let now = step as u64 * 1_000_000_000;
-        let learned = cache.learn(packet.sender_protocol, packet.sender_hardware, now);
+        let sender = Address::V4(packet.sender_protocol);
+        let learned = cache.learn(sender, packet.sender_hardware, now);
 
         if learned {
             // What went in must come back, and must not be a group address --
             // believing one turns every unicast send into a broadcast, which is
             // a redirection primitive handed over for free.
-            let found = cache.lookup(packet.sender_protocol, now);
+            let found = cache.lookup(sender, now);
             assert_eq!(found, Some(packet.sender_hardware));
             assert!(!packet.sender_hardware.is_group());
             assert_ne!(packet.sender_protocol, Ipv4Addr::UNSPECIFIED);
@@ -65,7 +72,7 @@ fuzz_target!(|data: &[u8]| {
         assert!(cache.live(now) <= SLOTS);
     }
 
-    let _ = cache.forget(Ipv4Addr::new(10, 0, 0, 1));
-    let _ = cache.lookup(Ipv4Addr::BROADCAST, 0);
-    let _ = cache.learn(Ipv4Addr::new(10, 0, 0, 2), MacAddr::BROADCAST, 0);
+    let _ = cache.forget(Address::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    let _ = cache.lookup(Address::V4(Ipv4Addr::BROADCAST), 0);
+    let _ = cache.learn(Address::V4(Ipv4Addr::new(10, 0, 0, 2)), MacAddr::BROADCAST, 0);
 });

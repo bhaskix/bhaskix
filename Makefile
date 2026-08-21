@@ -704,6 +704,13 @@ gates:
 	    printf '  \033[1;32mok\033[0m    the instruction check rejects an undeclared instruction\n'; \
 	fi
 	tools/check-deps.py
+# Every fuzz target still compiles. `fuzz/` is its own workspace, so nothing
+# else in this file builds it -- and on 2026-08-18 RFC 0029's renames broke two
+# targets, which then ran zero executions for three days while the project went
+# on describing itself as having a fuzz target on every untrusted parser. This
+# is `cargo check`, not a campaign: proving a target builds is a second warm and
+# catches the whole class.
+	tools/check-fuzz-targets.sh
 	tools/check-one-machine.sh
 # And watched refusing one, against a fixture that is wrong on purpose. The
 # real harnesses are correct, so the only way to see this go red is to keep a

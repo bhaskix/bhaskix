@@ -726,6 +726,7 @@ what is actually ahead.
 | Telemetry plane | ✅ **done** — [RFC 0026](docs/rfc/0026-telemetry-plane.md) **accepted 2026-08-17**, drafted, implemented and accepted the same day | [ai-native.md](docs/ai-native.md) §2 made real: a 64-byte typed event, one lock-free drop-newest ring per CPU, a build-time-hashed schema registry, and `bin/traced` reading through two capabilities. Six steps; step 1 — `bhaskix-telemetry`, the whole protocol as pure host-tested arithmetic, zero `unsafe`, layer −2 — is done: 14 tests, the edge-seeded storm harness, and the tail clamp proven able to fail before being believed. Step 5 retires the hand-rolled TCP pipeline stamps and hands the serve-loop hunt its streaming instrument. The `Audit` class is reserved and refused — backpressure audit is its own later RFC, per `security.md` §8 |
 | libc — resolved into the Linux personality | ⬜ **in progress** — [RFC 0005](docs/rfc/0005-linux-abi-compatibility.md) steps 2–8 of 10 | **This row did not exist until 2026-08-19**, while the roadmap carried the bullet and eight of the RFC's steps shipped — the same omission this table's own preamble describes. What runs: the personality tag and its `-ENOSYS` telemetry, the initial process image with a real auxiliary vector, the signal round trip (fault → handler → `rt_sigreturn`), the memory calls including `mprotect` and honoured `mmap` hints, `clone` and `futex` proven by two threads of one hosted program meeting, and a **real static Go binary** that loads, runs, prints through the adapter and stops in its own allocator after 212 traced calls. What does not: Tier 1 (files, `/proc`) has not started, and Tier 2 (sockets, `epoll`) has its arithmetic and neither its wiring nor a way to build one where the personality currently lives; the RFC's step 10 gate needs a workload from outside. **And one thing is in the wrong place:** the translation runs in the nucleus, where RFC 0005 §"Where it lives" requires a service domain — recorded 2026-08-19 in that RFC, in `security.md` §1 as **T11**, and in [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md) §5 with its correction trigger |
 | **A fuzz target for the filesystem** — a hostile disk image | ✅ **DONE 2026-08-21** — `fuzz/fuzz_targets/fs_image.rs`, four arms, 123,501 executions clean | **A debt against a binding rule, not new scope.** `coding-style.md` §8 and `security.md` §5 both say a parser touching untrusted input gets a fuzz target *before* it merges. `fuzz/fuzz_targets/` holds fourteen — ELF, `ustar`, `DMAR`, both package formats and every network parser — and **none for `fs`**. Journal replay is the code that runs before anything can refuse. `Superblock::parse` already sanity-checks every field it later uses as an index, which is why this should be cheap; the target is what proves it. Found by the security reassessment of 2026-08-20, ranked fifth there by attacker cost and kept out of the roadmap deliberately — promoting a merge-gate obligation to a phase item turns a rule into a plan |
+| **Three fuzz targets that reach nothing from an empty corpus** — `pkg_manifest`, `pkg_package`, `ustar_parse` | ⬜ **owed**, opened 2026-08-21 | Measured, not guessed: `pkg_manifest` 0 of 5 probe points in 1,523,042 executions, `pkg_package` 0 of 5 in 5,384,466, `ustar_parse` 1 of 5 in four million — and 5 of 5 in 34,227 **with its corpus**, which is gitignored, so the assurance does not survive a clone. Neither `pkg` target has ever produced a corpus at all. The fix is the one `fuzz_targets/fs_image.rs` demonstrates: build the valid structure inside the target and let the fuzzer mutate within it, instead of hoping it invents a `ustar` header checksum. Until then these three are targets in name |
 | **A coverage-guided fuzz target for IPv6 and NDP** | ⬜ **owed**, opened 2026-08-20 | The v6 parsers are covered by `net/src/fuzz.rs`'s seeded mutation harness, which runs on every commit and is **the weaker of the two mechanisms `coding-style.md` §8 names** — the v4 path has both. They are also the newest parsers in the tree ([RFC 0029](docs/rfc/0029-ipv6.md), 2026-08-18), so they have had the least time under anything. Ranked sixth in the 2026-08-20 reassessment |
 
 ---
@@ -760,6 +761,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | `unsafe` budget | M1 | coding-style.md §3 |
 | Limine containment (only `boot/` may name it) | M1 | architecture.md §1 |
 | Dependency direction / no cycles | M1 | architecture.md §5 |
+| **Every fuzz target still compiles** — `tools/check-fuzz-targets.sh`, `cargo check` on all 15, one second warm, on stable. Added after `arp_parse` and `tcp_parse` were found not to have compiled since 2026-08-18 | 2026-08-21 | coding-style.md §8 — a target that does not build runs zero executions |
 | **Instruction containment** — every crate holding an architecture-specific instruction declares an `asm_budget` and a reason; undeclared is a hard failure, and the gate is watched refusing a fixture on every run | 2026-08-20 | architecture.md §7 |
 | No vendor strings in published files | M1 | Project policy |
 | No AI-vendor attribution — **refused at commit time** by `tools/git-hooks/{pre-commit,commit-msg}`, and the hooks' installation is itself checked | M1 (hooks 2026-08-20) | Project policy; CONTRIBUTING.md §"AI-assisted contributions" cond. 3 |
@@ -887,6 +889,73 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-21 (every fuzz target probed for reachability, and two of them had not compiled for three days)
+
+The filesystem target's lesson — *an execution count says nothing about what a target reached* — was
+applied to the thirteen targets that already existed. **The audit found something worse than a
+coverage hole before it found any coverage hole.**
+
+#### Two targets had not compiled since 2026-08-18, and nothing said so
+
+`arp_parse` and `tcp_parse` fail to build. The cause is **RFC 0029, the IPv6 work, accepted the same
+day it landed**: step 2 replaced `ArpCache` with `NeighbourCache<N>` keyed on `Address` — *"one table
+for both families"* — and step 5 changed TCP's checksum functions to take `Address` instead of
+`Ipv4Addr` — *"TCP crosses families"*. Both renames were correct. Both broke a fuzz target.
+
+**They ran zero executions for three days, and every document went on saying this project has a fuzz
+target on every untrusted parser.** They were not slow or weakly seeded. They did not run.
+
+The reason is structural and is the same one `fuzz/Cargo.toml` states in its first line: `fuzz/` is
+its own workspace on purpose, because a target links libFuzzer and needs a nightly sanitiser runtime.
+The cost of that separation is that **nothing built it** — not `make gates`, not `make test-host`,
+not `make clippy`, not CI. This is M7-15's shape exactly: *the tests that left the suite when the
+code left the kernel*, where `make test-host` named its packages and twenty-two assertions silently
+stopped running. Same mechanism, different directory, three days instead of one.
+
+Both are repaired against the RFC 0029 API, and **`tools/check-fuzz-targets.sh` now runs in
+`make gates`** — `cargo check` on every target, one second warm, on stable. It was watched red by
+re-introducing the exact historical breakage. Proving a target still builds is cheap and catches the
+whole class; running one is expensive and catches only what it reaches.
+
+#### The reachability audit itself: 14 targets, 64 probe points
+
+Each probe prints once the first time a named point is reached. Runs are **from an empty corpus**,
+which is what a fresh clone has, since `fuzz/corpus/` is gitignored.
+
+| Target | Reached | Note |
+|---|---|---|
+| `udp_parse`, `icmp_parse`, `tcp_parse`, `tcp_state`, `dmar_parse`, `arp_parse` | **5 / 5** | healthy; `tcp_parse` and `arp_parse` after repair |
+| `linux_sockaddr` | 4 / 4 | healthy |
+| `elf_parse` | 4 / 5 | a relative relocation is never *applied* |
+| `ipv4_parse` | 4 / 5 | assembly completes, but never from a header that is itself a fragment |
+| `dhcp_parse` | 4 / 5 | the unshaped arm never parses — the target already says so in its own comment |
+| `eth_parse` | 3 / 4 | the exact 48-bit station address is never guessed. Correct and unfixable |
+| **`ustar_parse`** | **1 / 5** | **from empty. With its corpus: 5 / 5** |
+| **`pkg_manifest`** | **0 / 5** | nothing at all, 1,523,042 executions |
+| **`pkg_package`** | **0 / 5** | nothing at all, 5,384,466 executions |
+
+**Predictions were often wrong in the reassuring direction, which is worth recording.** Four of the
+five analyses expected a checksum to be an impassable wall — `udp_parse` "walled off hard",
+`ipv4_parse`'s as-given arm "near-silent", `icmp_parse`'s unrepaired half "dead". All three reached.
+A 16-bit checksum is not a wall to a coverage-guided fuzzer with byte-compare feedback and ten
+million executions. **A 32-bit one, and a 48-bit address, are.**
+
+#### The three that matter
+
+- **`pkg_manifest` and `pkg_package` have never tested anything.** Neither has a corpus directory —
+  not a stale one, not an empty one — and from nothing, the manifest needs the literal word
+  `package` and the package needs `ustar` at offset 257 plus a header checksum. Seven million
+  executions between them, reaching the first byte comparison.
+- **`ustar_parse`'s assurance is not reproducible.** It reaches everything with its 715-unit corpus
+  in 34,227 runs, and only the magic without it in four million. **`fuzz/corpus/` is gitignored**, so
+  a contributor who clones this repository and runs the target walks zero archive members however
+  long they wait. The 24-hour campaign that closed M6's criterion was real; what makes it repeatable
+  lives in an untracked directory on one machine.
+
+The fix for all three is the one the filesystem target already demonstrates: **build the valid
+structure inside the target and let the fuzzer mutate within it**, rather than hoping it invents a
+checksum. That is tracked in §4 rather than done here.
 
 ### 2026-08-21 (the filesystem gets its fuzz target, and the target's first finding was about itself)
 

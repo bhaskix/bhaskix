@@ -37,7 +37,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use bhaskix_net::{
-    addr::Ipv4Addr,
+    addr::{Address, Ipv4Addr},
     checksum,
     ipv4::Protocol,
     tcp::{
@@ -47,6 +47,10 @@ use bhaskix_net::{
 };
 
 /// Recomputes the checksum over the pseudo-header and the segment.
+/// Still `Ipv4Addr`-shaped: the stack's own `pseudo_of` is private, and this
+/// helper builds the v4 pseudo-header by hand. RFC 0029 gave TCP a second
+/// family and a **mixed-family refusal** that nothing here exercises — a v6
+/// arm for this target is the coverage-guided IPv6 work TRACKER §4 tracks.
 fn repair(bytes: &mut [u8], source: Ipv4Addr, destination: Ipv4Addr) {
     if bytes.len() < segment::HEADER {
         return;
@@ -67,7 +71,7 @@ fn repair(bytes: &mut [u8], source: Ipv4Addr, destination: Ipv4Addr) {
 /// Written once and applied to both parses, so the repaired path and the
 /// as-supplied path are held to the same standard rather than the repaired one
 /// being the only one checked.
-fn check(parsed: &Segment<'_>, bytes: &[u8], source: Ipv4Addr, destination: Ipv4Addr) {
+fn check(parsed: &Segment<'_>, bytes: &[u8], source: Address, destination: Address) {
     // The data offset is the only field that decides where the payload starts,
     // so this is what a mis-checked offset breaks while still returning `Ok`.
     assert!(parsed.payload.len() + segment::HEADER <= bytes.len());
@@ -103,8 +107,14 @@ fuzz_target!(|data: &[u8]| {
     let (addresses, bytes) = data.split_at(data.len().min(8));
     let mut pair = [0u8; 8];
     pair[..addresses.len()].copy_from_slice(addresses);
-    let source = Ipv4Addr(u32::from_be_bytes([pair[0], pair[1], pair[2], pair[3]]));
-    let destination = Ipv4Addr(u32::from_be_bytes([pair[4], pair[5], pair[6], pair[7]]));
+    // `Address`, not `Ipv4Addr`: RFC 0029 step 5 took TCP across families, so
+    // the checksum functions take the family-agnostic address. **This target
+    // did not compile from 2026-08-18 until 2026-08-21** and ran no executions
+    // at all in that window — see the module comment.
+    let source_v4 = Ipv4Addr(u32::from_be_bytes([pair[0], pair[1], pair[2], pair[3]]));
+    let destination_v4 = Ipv4Addr(u32::from_be_bytes([pair[4], pair[5], pair[6], pair[7]]));
+    let source = Address::V4(source_v4);
+    let destination = Address::V4(destination_v4);
 
     // As supplied: mostly this exercises the checksum test, which is the one
     // check a repaired input can never fail.
@@ -115,7 +125,7 @@ fuzz_target!(|data: &[u8]| {
     // Repaired: this is the pass that reaches the data offset and the option
     // walk. Without it the campaign reports clean coverage of a closed door.
     let mut repaired = bytes.to_vec();
-    repair(&mut repaired, source, destination);
+    repair(&mut repaired, source_v4, destination_v4);
     if let Ok(parsed) = Segment::parse(&repaired, source, destination) {
         check(&parsed, &repaired, source, destination);
     }
