@@ -988,6 +988,53 @@ The server was returned to its normal state: media unmounted, boot override
 consumed, boot order never modified (that change was refused by a safety check,
 which turned out to be the right call), power on, health OK.
 
+### 2026-08-22 (RFC 0038 step 5: TRBs and rings — the cycle bit is the whole protocol)
+
+The last of the definitions. Commands, transfers and events are all Transfer
+Request Blocks — sixteen bytes, four dwords — and the rings they sit in have
+**no shared head or tail pointer**. Ownership is one bit per entry.
+
+**The cycle rule, which is the part worth getting exactly right.** Each side
+keeps a cycle state. An entry belongs to the consumer when its cycle bit
+*equals* the consumer's state. The producer fills an entry and writes that bit
+**last**, because the bit is what publishes it — set it first and the consumer
+may read a TRB whose other fields do not exist yet, which on a transfer ring is
+a pointer the controller follows. Both sides flip their state on wrapping, which
+is what stops last lap's entries being read as this lap's.
+
+Getting this wrong produces no error. It produces a ring that silently replays
+or silently stalls. So the rule is a named function, `owned_by_consumer`, with
+tests — rather than a comparison written out at each call site where one of them
+would eventually be inverted. Watched red by inverting it.
+
+**Three more traps written into the types:**
+
+- **A ring's last entry is reserved for its Link TRB**, so `usable_entries` is
+  one fewer than the ring holds. Fill all of them and the driver overwrites its
+  own link, after which the controller runs off the end of the segment into
+  whatever follows — by DMA. Watched red by removing the subtraction.
+- **`ShortPacket` is a success.** USB devices routinely return fewer bytes than
+  the buffer allows, so `is_success` covers both it and `Success`; a driver
+  comparing against `Success` alone rejects perfectly well-formed descriptors.
+  And completion code **0 is not a failure** — it is the reset value, and
+  reading it means the driver looked at an entry it does not own.
+- **The transfer length in an event is a residue, not a count.** It is what was
+  *not* transferred, so a complete transfer reports zero. Read the other way it
+  inverts every length a driver computes.
+
+Unknown TRB types are carried as `Kind::Other` rather than refused, because the
+controller may legitimately produce an event this crate has no name for and a
+driver must be able to skip it and advance. Refusing would wedge the event ring
+on an entry nobody can consume.
+
+**RFC 0038 is now complete as a set of definitions**: capability, operational,
+runtime, doorbell, context and TRB. 77 host tests, no `unsafe`, no dependencies,
+and **nothing in the kernel uses any of it**. The driver — enumeration, slot
+assignment, endpoint configuration, the HID boot protocol — is the next piece of
+work and is bound by the six rules in RFC 0038's security section, the first of
+which is that it refuses to initialise unless the controller is behind an IOMMU
+translation.
+
 ### 2026-08-22 (RFC 0038 step 4: contexts, and two asymmetries that are each one wrong pointer)
 
 The slot, endpoint and input control contexts — the structures the controller

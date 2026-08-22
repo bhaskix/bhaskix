@@ -43,6 +43,7 @@ pub mod context;
 pub mod doorbell;
 pub mod operational;
 pub mod runtime;
+pub mod trb;
 
 /// Extracts the bits `lo..=hi` of `value`, shifted down to bit zero.
 ///
