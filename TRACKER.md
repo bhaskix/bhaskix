@@ -35,9 +35,15 @@ What can be counted honestly, with how to recount it:
 
 1. **Phase 0's review criterion.** The design documents have one author and no independent
    reviewers. Nothing mechanical gates on it, which is exactly why a task count hides it.
-2. **Nothing has ever booted on physical hardware** — M1-17, blocked on a machine. Every number
-   above was measured on one emulator, and this project's own record says machines see different
-   bugs.
+2. **It has now booted on physical hardware once, and every number above still comes from an
+   emulator** — M1-17, no longer wholly unmet and not yet met. On 2026-08-22 the image booted on a
+   Lenovo ThinkSystem SR550 (8 cores, 192 GiB, UEFI, Secure Boot off) from media mounted over its
+   BMC, **observed on screen by the operator**. Nothing was captured: the kernel's output reached
+   the framebuffer and not serial-over-LAN, so no boot report was read and **no self-test result
+   from real hardware is known**. What that boot produced was one fix — the UART presence probe,
+   which called a BMC-shared port absent — and one open question, which is everything else the
+   report would have said. This project's own record says machines see different bugs; it has now
+   seen one.
 3. ~~**The ELF loader's 24 hours of fuzzing**, unmet since it was written down.~~ **Met on
    2026-08-13.** Three campaigns ran the full twenty-four hours: 10.97 billion executions over
    `elf::parse`, 11.34 billion over `DMAR`, 52 million over `ustar`. No crash, no hang, no artifact.
@@ -893,6 +899,114 @@ find it again.
 **No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
+
+### 2026-08-22 (it booted on metal, and the first thing real hardware said was that the serial probe is wrong)
+
+**Bhaskix ran on a physical machine for the first time.** A Lenovo ThinkSystem
+SR550 (serial J300Z7MT, Xeon Silver 4110, 8 cores, 192 GiB, UEFI mode, Secure
+Boot off, XCC firmware 9.95), booted from the ISO mounted as remote media over
+the BMC. **M1-17 has been open since Phase 0 and this is the first evidence
+against it.**
+
+**The evidence is the operator's, not this session's, and the record has to say
+so.** The kernel's output reached the framebuffer, which the user watched over
+the BMC's graphical console, and reported "i saw booted". Nothing reached
+serial-over-LAN: the console showed the firmware's POST, then `UEFI:POST END`,
+then a screen clear, then silence. So what is established is that the machine
+booted; **what was on the screen was not captured, no boot report was read, and
+no self-test result is known.** That is a weaker result than a green harness run
+and is written down as one.
+
+**What that silence pointed at, and what has been fixed.** `SerialPort::init`
+put the UART in loopback, wrote a byte, and returned `NotPresent` if it did not
+come back — after which the console dropped its serial sink entirely. That is
+right for a machine with no UART. This machine reports `SerialPortAccessMode =
+Shared`: its UART is shared with the BMC, and serial-over-LAN is the only way
+into a server with no screen. Concluding "no UART" from a loopback that the
+other user of the port disturbed turns off the one channel that matters.
+
+The probe now answers three states instead of two. Presence is decided by the
+**scratch register** — eight bits of storage with no side effects, which a
+floating bus (all ones) cannot hold — and the loopback is demoted from a gate to
+a confidence check. A device that holds a scratch value and fails loopback is
+`Unverified`: its sink is installed, and the boot report says
+`present, loopback unverified (shared with a service processor?)` rather than
+`ABSENT`. Being wrong this way costs a log with no reader; being wrong the other
+way costs every log on a headless machine.
+
+**A second defect found while reading it, unrelated to the first and worse.**
+Both early returns left `MCR` **in loopback** — so a port that failed the test
+was also left wired to itself, while the doc comment claimed "the port is left
+in a safe state". On a UART shared with a service processor that breaks the
+other user of it too. There is now no early return between entering loopback and
+leaving it, and the comment says why.
+
+**What is NOT claimed**: that the loopback test is why the SR550 was silent. It
+is a mechanism that produces exactly that symptom on exactly that machine's
+configuration, and it was a real bug regardless — but the boot report was never
+read, so the cause is *consistent with* the evidence rather than shown by it.
+The next hardware boot settles it, and the report line was written to be the
+thing that answers: it now distinguishes the three cases by name.
+
+Five host tests on the policy, split out from the register accesses so it can be
+tested at all; three of them fail if the old two-state behaviour returns. The
+whole QEMU suite is the regression test for the rest, since every harness here
+reads serial output — a probe that got this wrong would take the suite dark
+rather than fail quietly.
+
+The server was returned to its normal state: media unmounted, boot override
+consumed, boot order never modified (that change was refused by a safety check,
+which turned out to be the right call), power on, health OK.
+
+### 2026-08-22 (RFC 0038 step 3: runtime registers and doorbells, and a bound that was the wrong number)
+
+Steps 2 and 3 of RFC 0038 — the capability and operational banks landed with
+step 1's paperwork; this adds the **runtime** bank and the **doorbells**. Still
+pure data: offsets and decoders, `forbid(unsafe_code)`, unsafe budget 0, nothing
+in the kernel using any of it yet.
+
+**Two facts that recall would have got wrong, both found by reading the source
+rather than trusting memory.** In the same interrupter register set, `ERSTBA`
+is **64-byte** aligned and `ERDP` is **16-byte** aligned — a shared alignment
+helper would have had to pick one and been wrong about the other, so each
+enforces its own and a test asserts they differ. And there is a **reserved
+dword** between `ERSTSZ` at `0x08` and `ERSTBA` at `0x10`: a table packed
+without it puts every register from there on four bytes early.
+
+**The write-one-to-clear hazard is in this bank too**, in two places. `IMAN`
+bit 0 is pending-and-clear, so enabling an interrupter by read-modify-write
+acknowledges an event nobody has looked at — and the event is not redelivered.
+`ERDP` bit 3 is event-handler-busy, and clearing it tells the controller it may
+overwrite events the driver has not read. Both are built into the type rather
+than left to the caller, and both were watched red: *"the pending event would
+have been lost"*.
+
+**A test caught a wrong constant, which is the entry's real content.**
+`MAX_INTERRUPTERS` was written as `1 << 11` on the reasoning that `HCSPARAMS1`'s
+interrupter field is eleven bits wide. The test disagreed, and the test was
+right: **the field can encode 2047, and the specification permits 1024** (xHCI
+§5.3.3). The gap between those numbers is not academic — it is precisely the
+case where a controller reports something the architecture does not allow, which
+RFC 0038's sixth rule says must be refused rather than believed. A driver that
+sized its bound by the field width would have followed it there.
+
+Verified by looking it up rather than by asserting it, which is the same
+discipline that found the translation bit in RFC 0037 the day before.
+
+**Upstream does not bound the interrupter index at all** — `base + index * 0x20`,
+unchecked, taking a `usize`. Neither the doorbell index. Both are bounded here,
+because an unchecked index reaches straight into an MMIO offset and a doorbell
+is a *write*. That is a hardening improvement on the vendored source, recorded
+so the divergence is deliberate rather than accidental.
+
+One more trap written into the types: **Device Context Indices are not USB
+endpoint numbers.** Endpoint 1 IN is index 3, not 1, and a HID keyboard's
+interrupt endpoint is exactly that — ring index 1 instead and the control
+endpoint is poked while the keyboard never reports. A test enumerates every
+endpoint number and asserts no index exceeds the 31 a device context holds.
+
+Forty-five host tests, three watched red. Steps 4 and 5 — contexts and TRBs —
+remain, and the driver after them.
 
 ### 2026-08-22 (RFC 0038 step 1: the first vendored source, and a policy sentence that stopped being true)
 

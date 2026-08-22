@@ -36,6 +36,12 @@ const REG_FIFO_CTRL: u16 = 2;
 const REG_LINE_CTRL: u16 = 3;
 const REG_MODEM_CTRL: u16 = 4;
 const REG_LINE_STATUS: u16 = 5;
+/// Scratch register: eight bits of storage with **no side effects at all**.
+///
+/// It is the presence probe precisely because writing it does nothing to the
+/// line, the FIFOs or the modem control signals. The loopback test cannot say
+/// that: it seizes the port to say it.
+const REG_SCRATCH: u16 = 7;
 
 const LCR_8N1: u8 = 0b0000_0011; // 8 data bits, no parity, 1 stop bit
 const LCR_DLAB: u8 = 0b1000_0000; // divisor latch access
@@ -51,6 +57,13 @@ const IER_RECEIVED_DATA: u8 = 0b0000_0001;
 
 const LSR_TRANSMIT_EMPTY: u8 = 0b0010_0000;
 const LSR_DATA_READY: u8 = 0b0000_0001;
+
+/// Written to the scratch register to see whether anything holds it.
+///
+/// Any value with bits in both halves does; `0xff` would be
+/// indistinguishable from the floating bus a missing device reads as, and
+/// `0x00` from a device that answers everything with zero.
+const SCRATCH_PROBE: u8 = 0xa5;
 
 /// Bound on how long to wait for the transmit holding register to drain.
 ///
@@ -94,12 +107,50 @@ pub struct SerialPort {
     base: u16,
 }
 
-/// Why [`SerialPort::init`] failed.
+/// What [`SerialPort::init`] concluded about the port.
+///
+/// **Three states, not two, and the third one is the whole point of this
+/// type.** Until 2026-08-22 a failed loopback self-test meant `NotPresent` and
+/// the console dropped its serial sink entirely — which is right for a machine
+/// with no UART and catastrophic for the machine this was found on: a Lenovo
+/// SR550 whose UART is *shared with its BMC* (`SerialPortAccessMode = Shared`).
+/// On a server, serial-over-LAN is the only way in, so concluding "no UART"
+/// from a loopback that another agent disturbed turns the one usable channel
+/// off and leaves an operator staring at nothing.
+///
+/// Absence and unverified are now different answers, because one of them
+/// should silence the port and the other should not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SerialError {
-    /// The loopback self-test read back a different byte than it wrote, so
-    /// there is no working UART at this port.
-    NotPresent,
+pub enum Presence {
+    /// Nothing answered. The scratch register did not hold what was written
+    /// to it, which on a floating bus reads back as `0xff`.
+    Absent,
+    /// A device answered and the loopback round-tripped.
+    Working,
+    /// A device answered, and the loopback did **not** round-trip.
+    ///
+    /// Output is enabled anyway. A UART that holds a scratch value is a UART,
+    /// and the likeliest reason a loopback fails on a port that exists is that
+    /// something else — a BMC, a service processor — is driving the same
+    /// wires. Being wrong this way costs a log with no reader; being wrong the
+    /// other way costs every log on a headless machine.
+    Unverified,
+}
+
+/// What the probe concluded, from what the two round-trips answered.
+///
+/// Split out from the register accesses so the *policy* can be tested on the
+/// host, which is the only assurance available for a decision whose inputs are
+/// two I/O ports.
+#[must_use]
+pub const fn classify(scratch_round_tripped: bool, loopback_round_tripped: bool) -> Presence {
+    if !scratch_round_tripped {
+        Presence::Absent
+    } else if loopback_round_tripped {
+        Presence::Working
+    } else {
+        Presence::Unverified
+    }
 }
 
 impl SerialPort {
@@ -116,20 +167,21 @@ impl SerialPort {
     }
 
     /// Configures the UART for 115200 baud, 8N1, FIFOs enabled, no interrupts,
-    /// and verifies a device is actually present.
+    /// and answers what it found.
     ///
-    /// # Errors
-    ///
-    /// Returns [`SerialError::NotPresent`] if the loopback self-test fails.
-    /// The port is left in a safe state and further writes are harmless
-    /// no-ops rather than hangs.
+    /// See [`Presence`] for why the answer has three states rather than two.
+    /// **The port is left out of loopback on every path**, which the previous
+    /// version's documentation claimed and its code did not do: both of its
+    /// early returns left `MCR` in loopback, so a port that failed the test was
+    /// also left wired to itself. On a UART shared with a service processor
+    /// that breaks the other user of it too.
     ///
     /// # Safety
     ///
     /// The caller must ensure `base` really is a UART and that no other code
     /// is driving it concurrently. Writing this sequence to an unrelated
     /// device's ports could put it in an unexpected state.
-    pub unsafe fn init(&self) -> Result<(), SerialError> {
+    pub unsafe fn init(&self) -> Presence {
         // SAFETY: every access below targets a documented 16550 register at
         // `base + offset`, in the initialisation order given in the 16550
         // datasheet. The caller guarantees `base` is a UART.
@@ -146,29 +198,45 @@ impl SerialPort {
 
             self.reg::<u8>(REG_FIFO_CTRL).write(FCR_ENABLE_CLEAR);
 
-            // Self-test: put the UART in loopback and check that a byte we
-            // write comes back. Without this, a machine with no UART silently
-            // produces no output and the operator has no idea why.
+            // **Presence first, and without seizing the port.** The scratch
+            // register is eight bits of storage with no side effects: if it
+            // holds what was written, something is there. A missing device
+            // reads as a floating bus -- all ones -- and cannot hold `0xa5`.
+            //
+            // The previous value is put back, because on a shared port it may
+            // belong to somebody else.
+            let saved_scratch = self.reg::<u8>(REG_SCRATCH).read();
+            self.reg::<u8>(REG_SCRATCH).write(SCRATCH_PROBE);
+            let scratch_round_tripped = self.reg::<u8>(REG_SCRATCH).read() == SCRATCH_PROBE;
+            self.reg::<u8>(REG_SCRATCH).write(saved_scratch);
+
+            // Then the loopback, which is now a *confidence* check rather than
+            // a gate. It is still worth doing: on a port that is genuinely
+            // ours it proves the transmit and receive paths are wired, which
+            // the scratch register cannot.
             self.reg::<u8>(REG_MODEM_CTRL).write(MCR_LOOPBACK_TEST);
             self.reg::<u8>(REG_DATA).write(LOOPBACK_PROBE);
 
+            let mut loopback_round_tripped = false;
             let mut spins = 0;
-            while self.reg::<u8>(REG_LINE_STATUS).read() & LSR_DATA_READY == 0 {
-                spins += 1;
-                if spins >= TRANSMIT_SPIN_LIMIT {
-                    return Err(SerialError::NotPresent);
+            while spins < TRANSMIT_SPIN_LIMIT {
+                if self.reg::<u8>(REG_LINE_STATUS).read() & LSR_DATA_READY != 0 {
+                    loopback_round_tripped = self.reg::<u8>(REG_DATA).read() == LOOPBACK_PROBE;
+                    break;
                 }
+                spins += 1;
                 core::hint::spin_loop();
             }
 
-            if self.reg::<u8>(REG_DATA).read() != LOOPBACK_PROBE {
-                return Err(SerialError::NotPresent);
-            }
-
-            // Out of loopback and into normal operation.
+            // **Unconditionally out of loopback.** Not on the success path, not
+            // on most paths -- every path, including the one where nothing
+            // answered. Leaving a port wired to itself is worse than leaving it
+            // alone, and there is no early return between here and the write
+            // above for that reason.
             self.reg::<u8>(REG_MODEM_CTRL).write(MCR_DTR_RTS_OUT2);
+
+            classify(scratch_round_tripped, loopback_round_tripped)
         }
-        Ok(())
     }
 
     /// Writes one byte, waiting for space in the transmit register.
@@ -280,5 +348,63 @@ impl SerialPort {
             // SAFETY: same obligation as `write_byte`, delegated to the caller.
             unsafe { self.write_byte(byte) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_answering_the_scratch_register_is_absent() {
+        // A floating bus reads as all ones and cannot hold `0xa5`, so this is
+        // the one answer that should silence the sink.
+        assert_eq!(classify(false, false), Presence::Absent);
+        // Even if a loopback somehow appeared to pass, a port that cannot hold
+        // a byte is not a port.
+        assert_eq!(classify(false, true), Presence::Absent);
+    }
+
+    #[test]
+    fn a_device_that_round_trips_both_probes_is_working() {
+        assert_eq!(classify(true, true), Presence::Working);
+    }
+
+    /// **The case that cost a headless server its console.**
+    ///
+    /// A UART that holds a scratch value is a UART. If its loopback does not
+    /// round-trip, the likeliest reason on a machine that has one is that
+    /// something else is driving the same wires — a BMC, a service processor.
+    /// The old code called that `NotPresent` and dropped the serial sink, which
+    /// on a Lenovo SR550 (`SerialPortAccessMode = Shared`) removes the only
+    /// channel a machine with no screen has.
+    #[test]
+    fn a_present_device_with_a_failed_loopback_is_unverified_not_absent() {
+        assert_eq!(classify(true, false), Presence::Unverified);
+        assert_ne!(classify(true, false), Presence::Absent);
+    }
+
+    #[test]
+    fn only_absence_should_silence_the_sink() {
+        // The console installs its sink for anything that is not `Absent`, so
+        // this enumerates the contract that decision relies on.
+        for (scratch, loopback) in [(true, true), (true, false)] {
+            assert_ne!(
+                classify(scratch, loopback),
+                Presence::Absent,
+                "a device answered; the sink must survive"
+            );
+        }
+        assert_eq!(classify(false, true), Presence::Absent);
+        assert_eq!(classify(false, false), Presence::Absent);
+    }
+
+    #[test]
+    fn the_scratch_probe_cannot_be_confused_with_a_floating_bus() {
+        // `0xff` is what a missing device reads back, and `0x00` is what a
+        // device that answers everything with zero reads back. The probe must
+        // be neither, or presence and absence would look the same.
+        assert_ne!(SCRATCH_PROBE, 0xff);
+        assert_ne!(SCRATCH_PROBE, 0x00);
     }
 }

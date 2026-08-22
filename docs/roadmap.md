@@ -152,8 +152,11 @@ loader survives 24 hours of fuzzing without a crash.
 across four CPUs, runs programs in ring 3 that hold capabilities and nothing else, and answers a
 user-mode shell from services in their own domains.
 
-**One exit criterion is owed rather than met**, and is tracked as such: M1-17 has never booted on
-physical hardware.
+**One exit criterion is owed rather than met**, and is tracked as such: M1-17. The image booted on
+a Lenovo SR550 on 2026-08-22, observed on screen, which is the first evidence against this
+criterion — but nothing was captured, because the kernel's output reached the framebuffer and not
+serial-over-LAN, so no boot report was read. Booting is not the criterion; a boot whose report
+somebody read is.
 
 **Correction, 2026-08-20.** This paragraph and M6's heading both said the ELF loader's 24 hours of
 fuzzing was still owed. It was **met on 2026-08-13** — three campaigns ran the full twenty-four

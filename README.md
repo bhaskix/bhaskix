@@ -50,9 +50,13 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > own domain, carry a byte stream both directions through rings the connecting *program* owns and
 > hands over as capabilities, with the cost measured rather than argued about. No package
 > management, no libc, no self-hosting. The ELF
-> loader has had its 24 hours of fuzzing, as of 2026-08-13, with no crash and no artifact. **Nothing has ever booted on physical hardware** —
-> every claim above is QEMU, and M1-17 is blocked on a machine, not on code. Nothing here should run
-> anywhere that matters — see [SECURITY.md](SECURITY.md).
+> loader has had its 24 hours of fuzzing, as of 2026-08-13, with no crash and no artifact. **It has
+> booted on physical hardware exactly once, and every measurement above is still QEMU** — on
+> 2026-08-22 the image booted on a Lenovo ThinkSystem SR550 from media mounted over its BMC,
+> observed on screen. Nothing was captured: the output reached the framebuffer and not
+> serial-over-LAN, so no boot report was read and no self-test result from real hardware is known.
+> M1-17 stays open, because the criterion is a boot somebody read, not a boot somebody saw. Nothing
+> here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
 >
 > **The design documents still have one author and no independent reviewers.** Phase 0's exit
 > criterion asks for two people who did not write them, and that is genuinely unmet rather than

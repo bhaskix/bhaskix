@@ -50,5 +50,5 @@ pub mod uaccess;
 pub mod vtd;
 
 pub use context::Context;
-pub use serial::SerialPort;
+pub use serial::{Presence, SerialPort};
 pub use trap::TrapFrame;

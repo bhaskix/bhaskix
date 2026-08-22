@@ -22,7 +22,7 @@
 
 use core::fmt::{self, Write};
 
-use bhaskix_arch::SerialPort;
+use bhaskix_arch::{Presence, SerialPort};
 use bhaskix_boot::Framebuffer;
 
 use crate::framebuffer::FbConsole;
@@ -67,21 +67,28 @@ impl Write for Console {
 
 /// Brings up the serial sink.
 ///
-/// Returns whether a working UART was found. The caller reports the result
-/// rather than assuming: a machine with no serial port is normal, and the
-/// operator should know that serial capture will be empty.
-pub fn init_serial(base: u16) -> bool {
+/// Answers what the probe concluded. The caller reports it rather than
+/// assuming: a machine with no serial port is normal, and the operator should
+/// know that serial capture will be empty.
+///
+/// **A port whose loopback did not round-trip still gets its sink.** Only
+/// [`Presence::Absent`] means no device, and only absence silences this sink.
+/// The reason is a real machine: a Lenovo SR550 shares its UART with the BMC,
+/// and serial-over-LAN is the only way into a server with no screen. Refusing
+/// to print because a self-test was disturbed by the other user of the port is
+/// how a headless machine ends up saying nothing at all.
+pub fn init_serial(base: u16) -> Presence {
     let port = SerialPort::new(base);
 
     // SAFETY: `base` is a legacy UART port constant, and nothing else in the
     // kernel drives a UART -- this runs once, before any other CPU is started
     // and before interrupts are enabled.
-    let present = unsafe { port.init() }.is_ok();
+    let presence = unsafe { port.init() };
 
-    if present {
+    if presence != Presence::Absent {
         CONSOLE.lock().serial = Some(port);
     }
-    present
+    presence
 }
 
 /// Brings up the framebuffer sink.

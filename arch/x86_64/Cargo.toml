@@ -121,7 +121,15 @@ asm_budget = 37
 # enable it -- CR0.EM cleared, CR0.MP, CR4.OSFXSR and CR4.OSXMMEXCPT set --
 # and the FXSAVE/FXRSTOR pair the middle of those four is a promise to
 # perform. Every line is a register the type system cannot describe.
-unsafe_budget = 1152
+#
+# 1169 on 2026-08-22, after the first boot on physical hardware: seventeen
+# lines in the UART probe. The scratch-register round-trip that now decides
+# presence -- read, write, read, restore -- plus the restructured loopback,
+# which has no early return between entering loopback and leaving it because
+# the old code's two early returns left the port wired to itself. Every line is
+# an I/O port access; the *decision* those lines feed is a pure function tested
+# on the host, and holds no `unsafe` at all.
+unsafe_budget = 1169
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

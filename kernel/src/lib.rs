@@ -16738,7 +16738,7 @@ fn verify_timer() {
     }
 }
 
-fn report_boot_state(handoff: &Handoff, serial: bool, framebuffer: bool) {
+fn report_boot_state(handoff: &Handoff, serial: bhaskix_arch::Presence, framebuffer: bool) {
     println!("  boot");
     println!("    loader          {}", handoff.loader);
     println!("    handoff version {}", handoff.version);
@@ -16752,7 +16752,16 @@ fn report_boot_state(handoff: &Handoff, serial: bool, framebuffer: bool) {
     );
     println!(
         "    serial          {}",
-        if serial { "present" } else { "ABSENT" }
+        match serial {
+            bhaskix_arch::Presence::Working => "present",
+            // Named, not hidden. On a machine whose UART is shared with a
+            // service processor this is the normal answer, and an operator
+            // reading a log over that very port should be told why the
+            // self-test did not agree that it works.
+            bhaskix_arch::Presence::Unverified =>
+                "present, loopback unverified (shared with a service processor?)",
+            bhaskix_arch::Presence::Absent => "ABSENT",
+        }
     );
 
     if handoff.regions_truncated {
