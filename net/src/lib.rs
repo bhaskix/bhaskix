@@ -191,11 +191,14 @@ pub fn checksum(spans: &[&[u8]]) -> u16 {
                 continue;
             }
         }
-        let mut chunks = bytes.chunks_exact(2);
-        for pair in &mut chunks {
-            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        // `as_chunks` rather than `chunks_exact`, which clippy asks for as of
+        // Rust 1.98: the chunk is a `[u8; 2]` rather than a slice, so the pair
+        // goes straight into `from_be_bytes` without indexing it twice.
+        let (pairs, remainder) = bytes.as_chunks::<2>();
+        for pair in pairs {
+            sum += u32::from(u16::from_be_bytes(*pair));
         }
-        if let Some(&odd) = chunks.remainder().first() {
+        if let Some(&odd) = remainder.first() {
             pending = Some(odd);
         }
     }

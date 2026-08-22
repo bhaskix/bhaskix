@@ -288,7 +288,7 @@ fn hex_digest(bytes: &[u8]) -> Option<[u8; 32]> {
         return None;
     }
     let mut digest = [0u8; 32];
-    for (slot, pair) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (slot, pair) in digest.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let nibble = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),

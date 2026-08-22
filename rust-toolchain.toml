@@ -8,7 +8,7 @@
 # justification and a stabilisation-tracking issue.
 
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.0"
 components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]
 targets = ["x86_64-unknown-none", "x86_64-unknown-uefi"]
 profile = "minimal"

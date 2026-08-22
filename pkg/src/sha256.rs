@@ -204,8 +204,8 @@ impl Sha256 {
         self.compress(&block);
 
         let mut out = [0u8; DIGEST];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.state) {
-            chunk.copy_from_slice(&word.to_be_bytes());
+        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *chunk = word.to_be_bytes();
         }
         out
     }
@@ -213,8 +213,8 @@ impl Sha256 {
     /// One block through the compression function, FIPS 180-4 §6.2.2.
     fn compress(&mut self, block: &[u8; BLOCK]) {
         let mut w = [0u32; 64];
-        for (index, chunk) in block.chunks_exact(4).enumerate() {
-            w[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for (index, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[index] = u32::from_be_bytes(*chunk);
         }
         for index in 16..64 {
             let s0 = w[index - 15].rotate_right(7)

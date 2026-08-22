@@ -900,6 +900,36 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-22 (Rust 1.98.0, and a new lint that reached into the hash code)
+
+**The pin moves 1.97.1 → 1.98.0** (released 2026-08-20, two days old), verified
+against the channel manifest rather than assumed: `[pkg.rust] version = "1.98.0
+(88d9e12ae 2026-08-18)"`.
+
+One new clippy lint, `chunks_exact_to_as_chunks`, and it is not cosmetic: with a
+constant chunk size, `as_chunks::<N>()` yields `&[T; N]` rather than `&[T]`, so
+the length is in the type instead of being re-checked at every index. Twelve
+sites across four crates — `net` (the checksum's byte pairs, SipHash's blocks),
+`pkg` (SHA-256's compression and digest, the manifest's hex parse), `kernel`
+(six word loops over drained shared memory), and `traced`.
+
+Several of them got shorter as well as safer: `u16::from_be_bytes([pair[0],
+pair[1]])` becomes `u16::from_be_bytes(*pair)`, and two `copy_from_slice` calls
+become plain assignments, because the destination is now an array of known
+length rather than a slice that had to be checked.
+
+**Two of those sites are hash functions, which is the part worth stating.**
+Rewriting the inner loop of SHA-256's compression and SipHash's block absorb is
+exactly where a silent byte-order or off-by-one error goes unnoticed — so the
+assurance is the published vectors both already carry: FIPS 180-4's empty,
+`"abc"`, two-block and million-`a` messages, and SipHash's reference set. 218
+tests pass, and they were watched red by flipping `from_be_bytes` to
+`from_le_bytes` in the one line the lint touched: three vector tests failed
+immediately. A change to a hash function that its own vectors cannot see failing
+is a change nobody should believe.
+
+Full suite green on the new toolchain.
+
 ### 2026-08-22 (it booted on metal, and the first thing real hardware said was that the serial probe is wrong)
 
 **Bhaskix ran on a physical machine for the first time.** A Lenovo ThinkSystem

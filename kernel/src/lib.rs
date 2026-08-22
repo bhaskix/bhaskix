@@ -3099,7 +3099,7 @@ fn adapter_file_record() -> (i64, i64, u64) {
     let mut record = [0u64; 3];
     let mut at = 0usize;
     let taken = shared::drain_into(object, (FIRST_WORD + 3) * 8, &mut |chunk: &[u8]| {
-        for word in chunk.chunks_exact(8) {
+        for word in chunk.as_chunks::<8>().0 {
             if at >= FIRST_WORD + 3 {
                 break;
             }
@@ -3236,7 +3236,7 @@ fn personality_boundary_report() {
         let mut records = [[0u64; 4]; 8];
         let mut at = 0usize;
         let taken = shared::drain_into(object, 8 * 32, &mut |chunk: &[u8]| {
-            for word in chunk.chunks_exact(8) {
+            for word in chunk.as_chunks::<8>().0 {
                 if at >= 32 {
                     break;
                 }
@@ -3296,7 +3296,7 @@ fn personality_boundary_report() {
         const EXEC_RECORD_BYTE: usize = bhaskix_personality::report::EXEC_AT;
         const EXEC_RECORD_WORD: usize = EXEC_RECORD_BYTE / 8;
         let taken = shared::drain_into(object, EXEC_RECORD_BYTE + 24, &mut |chunk: &[u8]| {
-            for word in chunk.chunks_exact(8) {
+            for word in chunk.as_chunks::<8>().0 {
                 if at >= EXEC_RECORD_WORD + 3 {
                     break;
                 }
@@ -5820,7 +5820,7 @@ fn adapter_wait_record() -> (i64, u64) {
     let mut record = [0u64; 2];
     let mut at = 0usize;
     let taken = shared::drain_into(object, (FIRST_WORD + 2) * 8, &mut |chunk: &[u8]| {
-        for word in chunk.chunks_exact(8) {
+        for word in chunk.as_chunks::<8>().0 {
             if at >= FIRST_WORD + 2 {
                 break;
             }
@@ -5874,7 +5874,7 @@ fn report_supervised_copy() {
     let mut record = [0u64; 2];
     let mut at = 0usize;
     let taken = shared::drain_into(object, (FIRST_WORD + 2) * 8, &mut |chunk: &[u8]| {
-        for word in chunk.chunks_exact(8) {
+        for word in chunk.as_chunks::<8>().0 {
             if at >= FIRST_WORD + 2 {
                 break;
             }
@@ -5931,7 +5931,7 @@ fn adapter_fork_record() -> (u64, u64) {
     let mut record = [0u64; 2];
     let mut at = 0usize;
     let taken = shared::drain_into(object, (FIRST_WORD + 2) * 8, &mut |chunk: &[u8]| {
-        for word in chunk.chunks_exact(8) {
+        for word in chunk.as_chunks::<8>().0 {
             if at >= FIRST_WORD + 2 {
                 break;
             }

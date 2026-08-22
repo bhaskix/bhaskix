@@ -147,14 +147,14 @@ pub fn hash(key: &Key, message: &[u8]) -> u64 {
         key.k1 ^ INITIAL[3],
     ];
 
-    let mut blocks = message.chunks_exact(8);
-    for block in blocks.by_ref() {
+    let (blocks, remainder) = message.as_chunks::<8>();
+    for block in blocks {
         absorb(&mut state, le64(block));
     }
     // The tail, zero-padded, with the length modulo 256 in the top byte. The
     // tail is at most seven bytes, so the two never overlap.
     let length = (message.len() % 256) as u64;
-    absorb(&mut state, le64(blocks.remainder()) | (length << 56));
+    absorb(&mut state, le64(remainder) | (length << 56));
 
     state[2] ^= 0xff;
     for _ in 0..FINALIZATION_ROUNDS {

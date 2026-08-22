@@ -161,8 +161,8 @@ fn drain(cpu: u64, layout: ring::Layout, tally: &mut Tally) {
     for sequence in tail..tail + readable {
         let slot = base + layout.slot_offset(sequence) as u64;
         let mut bytes = [0u8; EVENT_BYTES];
-        for (word, chunk) in bytes.chunks_exact_mut(8).enumerate() {
-            chunk.copy_from_slice(&word_at(slot + word as u64 * 8).to_le_bytes());
+        for (word, chunk) in bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            *chunk = word_at(slot + word as u64 * 8).to_le_bytes();
         }
         match decode(&bytes) {
             Ok((event, found)) => {
