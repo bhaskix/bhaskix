@@ -70,4 +70,9 @@ asm_budget = 5
 # through the direct map instead of identity -- same reads, six more
 # lines, because the kernel keeps those references long past the loader's
 # identity view and follows them from address spaces with no low half.
-unsafe_budget = 103
+# 114 on 2026-08-22: eleven lines for `EFI_SERIAL_IO_PROTOCOL` -- locating it
+# and the one call this loader makes through it. Every line is a firmware
+# function pointer the type system cannot describe. They buy the removal of a
+# worse thing than `unsafe`: writing COM1's registers while the firmware still
+# owns the port, which UEFI §12 gives this protocol to avoid.
+unsafe_budget = 114

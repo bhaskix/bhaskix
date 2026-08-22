@@ -182,6 +182,16 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         serial::write("bhaskixboot: no valid system table; stopping at the banner\r\n");
         return efi::SUCCESS;
     };
+    // **Hand the port to the firmware for the rest of boot services.** Before
+    // this line there was no table to ask; after it, writing COM1's registers
+    // underneath the firmware's own driver is the thing UEFI §12 provides a
+    // protocol to avoid. Released again before `ExitBootServices`.
+    if let Some(port) = efi::serial_io(table) {
+        serial::adopt_firmware_port(port);
+        serial::write("bhaskixboot: speaking through the firmware's serial port\r\n");
+    } else {
+        serial::write("bhaskixboot: no firmware serial port; writing COM1 directly\r\n");
+    }
     serial::write("bhaskixboot: system table validated\r\n");
 
     // **The console banner is the last thing in this window that calls

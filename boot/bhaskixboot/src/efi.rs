@@ -72,6 +72,22 @@ const GRAPHICS_OUTPUT: Guid = Guid(
     [0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A],
 );
 
+/// `EFI_SERIAL_IO_PROTOCOL_GUID`.
+///
+/// **The firmware's serial port, asked for rather than seized.** Until
+/// `ExitBootServices` the port belongs to the firmware, which may have its own
+/// driver on it, may be redirecting a console through it, and on a server may
+/// be trapping the I/O ports into SMM for a service processor. Writing the
+/// registers underneath all of that is what this loader did until 2026-08-22,
+/// and it is not what the specification describes: §12 gives this protocol for
+/// exactly this purpose, and it is what other loaders use on EFI.
+const SERIAL_IO: Guid = Guid(
+    0xBB25_CF6F,
+    0xF1D4,
+    0x11D2,
+    [0x9A, 0x0C, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0xFD],
+);
+
 /// `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID`.
 const SIMPLE_FILE_SYSTEM: Guid = Guid(
     0x964E_5B22,
@@ -140,6 +156,27 @@ struct BootServices {
         registration: *mut core::ffi::c_void,
         interface: *mut *mut core::ffi::c_void,
     ) -> usize,
+}
+
+/// `EFI_SERIAL_IO_PROTOCOL`, down to the one call this loader makes.
+///
+/// The fields before `write` are named so the offset is right; nothing else
+/// is called, and giving them their real signatures would be describing an
+/// interface this loader does not use.
+#[repr(C)]
+struct SerialIo {
+    revision: u32,
+    reset: usize,
+    set_attributes: usize,
+    set_control: usize,
+    get_control: usize,
+    write: unsafe extern "efiapi" fn(
+        this: *mut SerialIo,
+        size: *mut usize,
+        buffer: *const core::ffi::c_void,
+    ) -> usize,
+    read: usize,
+    mode: usize,
 }
 
 /// The system table, down to the boot services.
@@ -640,6 +677,12 @@ pub fn take_map_and_exit(
         }
         map.bytes_used = size;
         map.stride = stride;
+        // The firmware's serial port goes back before its boot services end:
+        // the protocol's function pointers live in memory the firmware
+        // reclaims here, and calling one afterwards is a jump into whatever
+        // replaced it. A store to an atomic, so it neither allocates nor
+        // stales the key -- which is what the next comment forbids.
+        crate::serial::release_firmware_port();
         // Nothing between the take and the exit — a print here would
         // allocate and stale the key this exit presents.
         // SAFETY: the specification's signature; on success the firmware's
@@ -697,4 +740,48 @@ pub fn allocate_pages(
         return Err(usize::MAX);
     }
     Ok(memory)
+}
+
+/// Finds the firmware's serial port, if it has one.
+///
+/// `LocateProtocol` rather than a handle walk: any serial port the firmware
+/// exposes will do for diagnostics, and this loader has no basis for
+/// preferring one over another.
+#[must_use]
+pub fn serial_io(table: *mut SystemTable) -> Option<*mut core::ffi::c_void> {
+    // SAFETY: `table` passed `validate`.
+    let services = unsafe { (*table).boot_services };
+    if services.is_null() {
+        return None;
+    }
+    let mut interface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: the boot services table is the firmware's, and this is the
+    // documented shape of `LocateProtocol`.
+    let status = unsafe {
+        ((*services).locate_protocol)(&SERIAL_IO, core::ptr::null_mut(), &raw mut interface)
+    };
+    if status == SUCCESS && !interface.is_null() {
+        Some(interface)
+    } else {
+        None
+    }
+}
+
+/// Writes bytes through the firmware's serial port.
+///
+/// Best effort, and deliberately so: a diagnostic that refuses to be written
+/// is worth less than one that is dropped. The status is ignored for the same
+/// reason [`output_string`] ignores its own.
+pub fn serial_io_write(protocol: *mut core::ffi::c_void, bytes: &[u8]) {
+    let protocol = protocol.cast::<SerialIo>();
+    let mut size = bytes.len();
+    // SAFETY: `protocol` came from `serial_io`, non-null and of this type;
+    // the size in/out and buffer follow the protocol's signature.
+    unsafe {
+        let _ = ((*protocol).write)(
+            protocol,
+            &raw mut size,
+            bytes.as_ptr().cast::<core::ffi::c_void>(),
+        );
+    }
 }

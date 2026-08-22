@@ -990,6 +990,52 @@ The server was returned to its normal state: media unmounted, boot override
 consumed, boot order never modified (that change was refused by a safety check,
 which turned out to be the right call), power on, health OK.
 
+### 2026-08-22 (the loader speaks through the firmware's port now, and the SR550 symptom is one sentence)
+
+**Researched rather than invented, on the user's instruction, and the research
+was right about the practice even though it did not fix the machine.** UEFI §12
+provides `EFI_SERIAL_IO_PROTOCOL` for a loader that wants a serial port, and
+loaders on EFI use it; writing COM1's registers directly while the firmware
+still owns the port is the non-standard thing, and this loader did it. Until
+`ExitBootServices` that port may have a firmware driver on it, may be carrying a
+redirected console, and on a server may have its I/O trapped into SMM for a
+service processor.
+
+So the loader now **asks for the port instead of seizing it**: `LocateProtocol`
+after the system table validates, every write routed through the protocol while
+boot services live, and the protocol released immediately before
+`ExitBootServices` — its function pointers live in memory the firmware reclaims
+there, so calling one afterwards is a jump into whatever replaced it. Before the
+first and after the second the registers are written directly, because in
+neither window is there an alternative. Verified under OVMF: `speaking through
+the firmware's serial port` and then the whole trace.
+
+**It did not fix the SR550, and what it produced instead is a sharper symptom.**
+Across four more boots the behaviour reduces to one sentence: **only the first
+`serial::write` call ever reaches the console.** The banner arrives; nothing
+after it does, whatever the next call is.
+
+| what was tried | result |
+|---|---|
+| a marker with *nothing* between it and the banner | did not appear |
+| a loader that never reprograms the UART | identical |
+| writing through the firmware's own serial protocol | identical — neither the success line nor its `else` branch appeared |
+| reading `init` for a bad UART state | textbook: IER off, divisor 1, 8N1, FIFO on, DTR/RTS/OUT2, no loopback |
+
+That set rules out the configuration, the spin bound, the ownership conflict and
+the write path. It leaves two shapes: execution stops immediately after the
+first write, or the BMC relays only the first burst a raw writer produces. The
+firmware's own POST output arrives at length before ours, so SOL is not simply
+mute.
+
+**The next instrument must not be serial**, because every one so far has been.
+Port `0x80` POST codes survive a fault and are read from the BMC; the firmware's
+event log may hold an exception record from a hung boot; and a loader that does
+nothing after the banner would settle whether anything executes past it.
+
+**Not fixed.** Recorded at this length because the next attempt should start from
+four eliminated hypotheses rather than from the beginning.
+
 ### 2026-08-22 (the loader hang, localised to two lines and not yet explained)
 
 Four boots of the SR550 spent narrowing where `bhaskixboot` stops. **It is not
