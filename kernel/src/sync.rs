@@ -824,6 +824,23 @@ fn record(held: u64, rank: Rank, site: &core::panic::Location<'_>) {
         site.file(),
         site.line()
     );
+
+    // **And what is actually open, because the mask alone cannot say.**
+    //
+    // A mask with two bits in it has two readings: this CPU is holding two
+    // locks, which is an ordering bug in the code that took them; or the mask
+    // is stale and names locks already released, which is a bug in the
+    // bookkeeping and not in the caller at all. The 2026-08-22 specimen is
+    // exactly that ambiguity — `wake_all` takes ranks 9 and 10 and the very
+    // next statement blocks on rank 9, so a genuine hold and a lagging mask
+    // produce the identical line — and it cost a soak to find and could not be
+    // read afterwards.
+    //
+    // The open-guard table answers it: every entry is a lock that was acquired
+    // and not yet released, with the line that took it. Two entries means the
+    // holds are real; none means the mask is lying. Safe to call here, where
+    // the comment above forbids taking a lock, because it only loads atomics.
+    dump_open_guards(percpu::cpu_id() as usize);
 }
 
 /// A spinlock protecting a value.

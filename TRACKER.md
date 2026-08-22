@@ -990,6 +990,41 @@ The server was returned to its normal state: media unmounted, boot override
 consumed, boot order never modified (that change was refused by a safety check,
 which turned out to be the right call), power on, health OK.
 
+### 2026-08-22 (the lock-order report now names who is holding, not just that something is)
+
+**The `wait.rs:195` specimen could not be read, and this is why.** The report
+printed the *mask* — `holding mask 0b11000000000`, ranks 9 and 10 — and a mask
+with two bits in it has two readings that produce the identical line:
+
+- this CPU is holding two locks, which is an ordering bug in whoever took them;
+- the mask is stale and names locks already released, which is a bookkeeping bug
+  and not the caller's fault at all.
+
+**And the code makes both readings plausible.** The violating thread is
+`ring_station` in the wait-queue stress test, whose loop is `wait_until(...)`,
+then work, then `wake_all()` — and `wake_all` takes rank 9 and, through
+`sched::wake`, rank 10. The very next statement is the `wait_until` that
+reported. A genuine hold and a mask lagging one instant behind the release are
+indistinguishable from the outside.
+
+The open-guard table settles it and was already there, used by `COUNT
+UNDERFLOW`: every entry is a lock acquired and not yet released, with the line
+that took it. The violation report now dumps it. Two entries means the holds are
+real; none means the mask is lying.
+
+Safe where the surrounding comment forbids taking a lock — `for_each_open_guard`
+only loads atomics — and verified by injecting a real violation, two same-rank
+locks one line apart:
+
+```
+LOCK ORDER     blocking on wait::WaitQueue (rank 9) while holding mask 0b1000000000, at kernel/src/lib.rs:130
+  open guard   rank 9 acquired at kernel/src/lib.rs:129
+```
+
+It names the holder. **The defect is not fixed and is not yet understood** — this
+makes the next specimen readable, which the last one was not. One in three
+hundred boots, so a soak is what produces it.
+
 ### 2026-08-22 (the loader stops writing to one channel, so it now writes to two)
 
 Five boots of the SR550 learned nothing because **every instrument was on the
