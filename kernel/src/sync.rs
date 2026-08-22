@@ -448,6 +448,20 @@ static LOCK_EVENTS_PER_CPU: [LockEventRing; MAX_CPUS] = [const { LockEventRing::
 const OPEN_GUARDS: usize = 8;
 
 struct OpenGuards {
+    /// **The identity of the hold: the address of the lock itself.**
+    ///
+    /// This used to be the acquisition site, and a site is not an identity.
+    /// Every `WaitQueue` in this kernel is locked at one line —
+    /// `self.waiters.lock()` in `wait.rs` — so two threads holding two
+    /// different wait queues carried the same key, and [`close_guard`]'s
+    /// cross-CPU scan cleared whichever it found first. A live hold could lose
+    /// its record to somebody else's release, and the dump would then report
+    /// "no open guard" for a hold that was perfectly real — which is exactly
+    /// the inference the lock-order report was drawing conclusions from.
+    ///
+    /// A lock's address is unique while it exists, which is the whole of the
+    /// requirement, and `SpinLockGuard` already holds it.
+    held: [core::sync::atomic::AtomicUsize; OPEN_GUARDS],
     at: [core::sync::atomic::AtomicUsize; OPEN_GUARDS],
     rank: [AtomicU32; OPEN_GUARDS],
     /// Cycle count at acquisition, so the dump can print each hold's age —
@@ -459,6 +473,7 @@ struct OpenGuards {
 impl OpenGuards {
     const fn new() -> Self {
         Self {
+            held: [const { core::sync::atomic::AtomicUsize::new(0) }; OPEN_GUARDS],
             at: [const { core::sync::atomic::AtomicUsize::new(0) }; OPEN_GUARDS],
             rank: [const { AtomicU32::new(0) }; OPEN_GUARDS],
             since: [const { AtomicU64::new(0) }; OPEN_GUARDS],
@@ -471,19 +486,18 @@ static OPEN_GUARDS_PER_CPU: [OpenGuards; MAX_CPUS] = [const { OpenGuards::new() 
 /// Claims an open-guard slot; returns its index, or `OPEN_GUARDS` when the
 /// table is full (eight simultaneous holds on one CPU is already a story the
 /// rank mask tells without this table's help).
-fn open_guard(at: &'static core::panic::Location<'static>, rank: u8) -> usize {
+fn open_guard(held: usize, at: &'static core::panic::Location<'static>, rank: u8) -> usize {
     let cpu = percpu::cpu_id() as usize;
     let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
     for slot in 0..OPEN_GUARDS {
-        if table.at[slot]
-            .compare_exchange(
-                0,
-                at as *const _ as usize,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
+        if table.held[slot]
+            .compare_exchange(0, held, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
+            // The site is stored *after* the claim, so a reader that catches
+            // the window sees a claimed slot with no site and skips it rather
+            // than dereferencing a null.
+            table.at[slot].store(at as *const _ as usize, Ordering::Relaxed);
             table.rank[slot].store(u32::from(rank), Ordering::Relaxed);
             table.since[slot].store(bhaskix_arch::tsc::read(), Ordering::Relaxed);
             return slot;
@@ -541,31 +555,32 @@ fn note_hold_duration(table: &OpenGuards, slot: usize) {
 /// a different CPU than it was taken on — a thread that blocked holding,
 /// migrated, and resumed, which is exactly the case being hunted — falls
 /// back to scanning every CPU's table for the matching site.
-fn close_guard(slot: usize, at: &'static core::panic::Location<'static>) {
-    let key = at as *const _ as usize;
+fn close_guard(slot: usize, held: usize) {
     if slot < OPEN_GUARDS {
         let cpu = percpu::cpu_id() as usize;
         let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
-        if table.at[slot].load(Ordering::Relaxed) == key {
+        if table.held[slot].load(Ordering::Relaxed) == held {
             note_hold_duration(table, slot);
-        }
-        if table.at[slot]
-            .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
+            if table.held[slot]
+                .compare_exchange(held, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                table.at[slot].store(0, Ordering::Relaxed);
+                return;
+            }
         }
     }
     for table in &OPEN_GUARDS_PER_CPU {
         for slot in 0..OPEN_GUARDS {
-            if table.at[slot].load(Ordering::Relaxed) == key {
+            if table.held[slot].load(Ordering::Relaxed) == held {
                 note_hold_duration(table, slot);
-            }
-            if table.at[slot]
-                .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
+                if table.held[slot]
+                    .compare_exchange(held, 0, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    table.at[slot].store(0, Ordering::Relaxed);
+                    return;
+                }
             }
         }
     }
@@ -603,7 +618,8 @@ pub fn for_each_open_guard(
     let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
     for slot in 0..OPEN_GUARDS {
         let raw = table.at[slot].load(Ordering::Relaxed);
-        if raw != 0 {
+        // Both, because a slot is claimed before its site is stored.
+        if table.held[slot].load(Ordering::Relaxed) != 0 && raw != 0 {
             // SAFETY: only `&'static Location`s are ever stored.
             let at = unsafe { &*(raw as *const core::panic::Location<'static>) };
             f(
@@ -953,7 +969,7 @@ impl<T> SpinLock<T> {
         self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
         let at = core::panic::Location::caller();
         record_lock_event(at, 255, true);
-        let open_slot = open_guard(at, 255);
+        let open_slot = open_guard(core::ptr::from_ref(self) as usize, at, 255);
         Some(SpinLockGuard {
             lock: self,
             ranked: false,
@@ -1046,7 +1062,7 @@ impl<T> SpinLock<T> {
         self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
         let at = core::panic::Location::caller();
         record_lock_event(at, self.rank as u8, true);
-        let open_slot = open_guard(at, self.rank as u8);
+        let open_slot = open_guard(core::ptr::from_ref(self) as usize, at, self.rank as u8);
         SpinLockGuard {
             lock: self,
             ranked: true,
@@ -1126,7 +1142,7 @@ impl<T> Drop for SpinLockGuard<'_, T> {
                 },
                 false,
             );
-            close_guard(self.open_slot, self.at);
+            close_guard(self.open_slot, core::ptr::from_ref(self.lock) as usize);
         }
 
         // Release ordering pairs with the Acquire in `lock`, so everything
@@ -1208,6 +1224,70 @@ mod tests {
         let lock = SpinLock::new(Rank::Console, 41);
         *lock.lock() += 1;
         assert_eq!(*lock.lock(), 42);
+    }
+
+    /// **A guard's record is identified by its lock, not by the line that
+    /// took it**, and this is the test that did not exist while it was the
+    /// line.
+    ///
+    /// Every `WaitQueue` in this kernel is locked at one line —
+    /// `self.waiters.lock()` — so two threads holding two *different* wait
+    /// queues carried one key. `close_guard` clears the first entry that
+    /// matches, scanning every CPU's table when the remembered slot misses,
+    /// because a thread that blocked holding a lock may resume elsewhere. With
+    /// the site as the key, that scan could take away a live hold's record and
+    /// leave the lock-order dump reporting "no open guard" for a hold that was
+    /// perfectly real — which is what the report's conclusions were resting on.
+    ///
+    /// The check that first verified that dump used two locks *one line
+    /// apart*: the one arrangement where the keys differ and the table cannot
+    /// be confused. Verified where it works, deployed where it does not.
+    ///
+    /// Both records are claimed at the same `at`, and the release is issued
+    /// with the *wrong* remembered slot — which is what a guard released on a
+    /// different CPU than it was taken on looks like.
+    #[test]
+    fn a_guard_record_is_identified_by_its_lock_not_by_the_line_that_took_it() {
+        let cpu = effective_cpu();
+        // Stand-ins for two locks: all `open_guard` wants is two addresses
+        // that differ, which is precisely the identity the site was not.
+        let first = 0u32;
+        let second = 0u32;
+        let one = core::ptr::from_ref(&first) as usize;
+        let two = core::ptr::from_ref(&second) as usize;
+        let at = core::panic::Location::caller();
+
+        let slot_one = open_guard(one, at, 9);
+        let slot_two = open_guard(two, at, 10);
+        assert_ne!(slot_one, slot_two, "two holds must take two slots");
+
+        // Release the *second* lock quoting the *first* lock's slot.
+        close_guard(slot_one, two);
+
+        let mut ranks = [false; 16];
+        for_each_open_guard(cpu, |_, rank, _| {
+            if (rank as usize) < ranks.len() {
+                ranks[rank as usize] = true;
+            }
+        });
+        assert!(
+            ranks[9],
+            "the lock that was not released must still be recorded -- its \
+             record was taken away by another lock's release"
+        );
+        assert!(
+            !ranks[10],
+            "the lock that was released must be gone, found by identity rather \
+             than by the slot it was quoted with"
+        );
+
+        close_guard(slot_one, one);
+        let mut left = 0;
+        for_each_open_guard(cpu, |_, _, _| left += 1);
+        assert_eq!(
+            left, 0,
+            "the table must be empty again, or later tests inherit these"
+        );
     }
 
     #[test]
