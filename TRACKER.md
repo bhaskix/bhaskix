@@ -5,10 +5,10 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 
 | | |
 |---|---|
-| **Last updated** | 2026-08-19 |
+| **Last updated** | 2026-08-23 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. **TCP is complete and its RFC accepted 2026-08-16** ([RFC 0020](docs/rfc/0020-tcp.md), all six steps: `bin/tcpc` opens connections with rings its own domain owns, echoes through them both directions, and the boundary is measured — RFC 0022's capability-in-a-call is the mechanism underneath). **The sockets API exists** — `bhaskix-sock`, RFC 0027 accepted 2026-08-17 — and this cell said "no sockets API beyond UDP and TCP's own" until 2026-08-18, stale from the acceptance. **IPv6 is done** (RFC 0029, **accepted 2026-08-18**, all six steps): dual stack on every networked boot, both families measured on the same rings, and the networking bullet — the last open row of §4's table — is closed. **Packages are done** (RFC 0030, **accepted 2026-08-19**, all six steps): the image a deterministic function of the manifests, install/run/remove at the shell with manifest-derived grants, every operation priced. What remains on the roadmap's own Phase 2 list: libc — **RFC 0005 steps 2–8 of 10 are implemented**, a real static Go binary runs, and the translation sits in the nucleus where that RFC requires a service domain ([RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md), drafted 2026-08-19, carries the correction and its trigger) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed; the claim "no architecture question open" held from 2026-08-16 to 2026-08-19, when **A6** — where the Linux personality runs — was opened by RFC 0031) · **RFC 0026 ACCEPTED 2026-08-17** (the telemetry plane — six steps, drafted, built and accepted in one day) · **RFC 0027 ACCEPTED 2026-08-17** (a sockets API worth the name — `bhaskix-sock`, both ports paid) · **RFC 0028 ACCEPTED 2026-08-18** (`bhaskixboot.efi` — seven steps; the machine boots on its own loader at full gate parity, KASLR drawn and confirmed, four CPUs started by the kernel's own INIT-SIPI) · **RFC 0029 ACCEPTED 2026-08-18** (IPv6 — the second family, measured beside the first with no emulator in its numbers; drafted, built and accepted in one day, and the networking bullet — §4's last open row — closed with it) · **RFC 0030 ACCEPTED 2026-08-19** (packages — authority made reviewable: the image a function of the manifests, install/run/remove live at the shell with manifest-derived grants, every operation priced, and the kernel gained no method for any of it) · **RFC 0032 ACCEPTED 2026-08-20** (a supervisor interface — ten steps; the Linux personality left the nucleus entirely and the gated count of Linux syscall numbers the nucleus interprets went 18 → 0, while the kernel's `unsafe` budget *fell* across the move) · **RFC 0033 ACCEPTED 2026-08-20** (what a hosted process is — A6's second half, and the whole question closed with it: a Linux process is a record in `bin/linuxd` bound one-to-one to a domain, with a pid that survives an `execve`, descriptors that are capabilities the adapter holds, real files, pipes with blocking readers, `fork` by copying, `wait4` with the child's own status, and a `/proc` a host test proves cannot name a Bhaskix object; ten steps in one day, and the kernel gained exactly two generic methods — `MAKE_SPACE` and a reply shape — for all of it) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 72 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026's telemetry report line and then its round-trip check became gates; 48 until 2026-08-18, when RFC 0029's three joined — the SLAAC/NDP/echo gate, the v6 socket round trip, and the v6 TCP measurement instrument-check, each answered or its reduction stated per placement; the count sat at 48 through steps 3–5, stale from the moment the first v6 gate landed; 51 until 2026-08-19, when RFC 0005 step 2's personality gate joined, 53 when step 3's initial-image gate did, 54 when step 4's signal round trip did, 55 when step 5's memory calls did, 56 when step 6's futex edges did, and 57 when its clone half followed; 59 on 2026-08-19, when RFC 0031's two boundary gates joined -- the ratchet on how many Linux numbers the nucleus interprets, and the instrument's own accounting for every call it priced; 60 on 2026-08-19, when RFC 0032's supervisor-interface gate joined, and 61 when step 3's adapter gate did; 62 on 2026-08-20, when RFC 0032 step 6's fault crossing joined, 64 on 2026-08-20 when RFC 0033 step 3's two joined -- the free address-space count and the fixed tables' printed bill -- 65 when the exit check's own line became a gate, 66 when RFC 0033 step 4's pid claim did, 67 when step 5's exec did, 68 when step 6's file read did, 69 when step 7's pipe did, 70 when step 8's fork did, 71 when step 9's wait did, and 72 when step 10's /proc did), 74 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 710 host tests, counted 2026-08-20 (677 before RFC 0033 step 2's process record; 649 before RFC 0005 step 9, 674 before step 10's boundary type) |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed; the claim "no architecture question open" held from 2026-08-16 to 2026-08-19, when **A6** — where the Linux personality runs — was opened by RFC 0031) · **RFC 0026 ACCEPTED 2026-08-17** (the telemetry plane — six steps, drafted, built and accepted in one day) · **RFC 0027 ACCEPTED 2026-08-17** (a sockets API worth the name — `bhaskix-sock`, both ports paid) · **RFC 0028 ACCEPTED 2026-08-18** (`bhaskixboot.efi` — seven steps; the machine boots on its own loader at full gate parity, KASLR drawn and confirmed, four CPUs started by the kernel's own INIT-SIPI) · **RFC 0029 ACCEPTED 2026-08-18** (IPv6 — the second family, measured beside the first with no emulator in its numbers; drafted, built and accepted in one day, and the networking bullet — §4's last open row — closed with it) · **RFC 0030 ACCEPTED 2026-08-19** (packages — authority made reviewable: the image a function of the manifests, install/run/remove live at the shell with manifest-derived grants, every operation priced, and the kernel gained no method for any of it) · **RFC 0032 ACCEPTED 2026-08-20** (a supervisor interface — ten steps; the Linux personality left the nucleus entirely and the gated count of Linux syscall numbers the nucleus interprets went 18 → 0, while the kernel's `unsafe` budget *fell* across the move) · **RFC 0033 ACCEPTED 2026-08-20** (what a hosted process is — A6's second half, and the whole question closed with it: a Linux process is a record in `bin/linuxd` bound one-to-one to a domain, with a pid that survives an `execve`, descriptors that are capabilities the adapter holds, real files, pipes with blocking readers, `fork` by copying, `wait4` with the child's own status, and a `/proc` a host test proves cannot name a Bhaskix object; ten steps in one day, and the kernel gained exactly two generic methods — `MAKE_SPACE` and a reply shape — for all of it) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 72 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026's telemetry report line and then its round-trip check became gates; 48 until 2026-08-18, when RFC 0029's three joined — the SLAAC/NDP/echo gate, the v6 socket round trip, and the v6 TCP measurement instrument-check, each answered or its reduction stated per placement; the count sat at 48 through steps 3–5, stale from the moment the first v6 gate landed; 51 until 2026-08-19, when RFC 0005 step 2's personality gate joined, 53 when step 3's initial-image gate did, 54 when step 4's signal round trip did, 55 when step 5's memory calls did, 56 when step 6's futex edges did, and 57 when its clone half followed; 59 on 2026-08-19, when RFC 0031's two boundary gates joined -- the ratchet on how many Linux numbers the nucleus interprets, and the instrument's own accounting for every call it priced; 60 on 2026-08-19, when RFC 0032's supervisor-interface gate joined, and 61 when step 3's adapter gate did; 62 on 2026-08-20, when RFC 0032 step 6's fault crossing joined, 64 on 2026-08-20 when RFC 0033 step 3's two joined -- the free address-space count and the fixed tables' printed bill -- 65 when the exit check's own line became a gate, 66 when RFC 0033 step 4's pid claim did, 67 when step 5's exec did, 68 when step 6's file read did, 69 when step 7's pipe did, 70 when step 8's fork did, 71 when step 9's wait did, and 72 when step 10's /proc did), 74 with an IOMMU, plus an `iommu=off` mode that proves the escape hatch escapes · 855 host tests, counted 2026-08-23 — a `make test-host` run, summed across the workspace (710 on 2026-08-20; 677 before RFC 0033 step 2's process record; 649 before RFC 0005 step 9, 674 before step 10's boundary type). The rise since the 20th is RFC 0041's parsers — `usb` and `kernel::xhci` — plus `sched::waited`, the one that made a dying caller testable off a machine) |
 
 ### How far along is this, in numbers
 
@@ -902,6 +902,110 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-23 (a boot gate failed on a fact the scheduler had in its hand and threw away)
+
+**The `native` lane failed a full suite with `1 were refused by its endpoint`,
+and the refusal was not real.** The gate is RFC 0032 step 3's: `bin/linuxd`
+answers a hosted program from ring 3, and the count of deliveries its endpoint
+refused must be zero. It read:
+
+```
+FAIL  the adapter was asked and did not answer: the adapter in ring 3 answered 83
+      foreign calls, and 0 found none to ask, 1 were refused by its endpoint,
+      0 gave up retrying a full queue, and 0 were for a caller already being
+      killed (last refusal 1)
+```
+
+Refusal reason 1 is `NoSuchEndpoint`. A comment in `kernel/src/syscall.rs`
+already described this exact symptom being fixed once before: a thread whose
+domain has ended is woken with `Abandoned`, which arrives as `NoSuchEndpoint`,
+"and without this the suite reported *1 were refused by its endpoint* for a boot
+in which nothing was wrong". The mitigation asks `sched::should_die()`.
+
+**`should_die` answers `false` when it means "I do not know."** It reads the
+current thread's `dying` flag under `try_lock`, and a lost lock returns `false`
+— which every caller reads as *this thread is not being killed*. Its own doc
+called that "the safe direction … there is always another safe point", and for
+the trap and notify callers it is. `ask_adapter_counted` has no other safe
+point: the call it is deciding about has already failed.
+
+The window was measured before anything was built on it. A counter,
+`sched::DYING_UNKNOWN`, is incremented on the lost-lock path and printed on the
+`linux domain` line every boot: **0 to 1 per boot** on the `native` lane. Narrow,
+real, and invisible until counted.
+
+**The fix is not a better guess. It is to stop discarding the answer.**
+`take_message_or_block` decides three outcomes under the runqueue lock, and two
+of them returned `Delivery::Abandoned`:
+
+```rust
+if target.dying { return Delivery::Abandoned; }   // this thread is being killed
+...
+return Delivery::Abandoned;                       // the endpoint has gone
+```
+
+Those are unrelated facts. The first is teardown working; the second is a dead
+endpoint. `target.dying` is read *there*, under the lock, at no cost — and was
+then thrown away, leaving `ask_adapter_counted` to take the same lock a second
+time to recover what had just been in hand.
+
+So `Delivery::Dying` and `IpcError::CallerDying` now exist, and the adapter
+matches on the exact answer. `IpcError::CallerDying` maps to the same
+`Status::NoSuchCapability` a ring 3 program saw before, because a program being
+destroyed has no use for the distinction; the kernel does. The old
+`should_die()` arm is kept as a second net for the paths that reach
+`NoSuchEndpoint` without waiting, and `DYING_UNKNOWN` says how far it can be
+trusted.
+
+**Made host-testable on the way**, because this was only ever observable by
+booting a machine and reading a counter — which is how it stayed wrong. The
+three-way choice is now `sched::waited`, pure, and
+`a_dying_caller_is_told_so_and_is_never_confused_with_a_vanished_endpoint`
+pins all four rows. Watched red: collapsing `Dying` back into `Abandoned` fails
+it with `left: Abandoned, right: Dying`. Host tests 855, kernel lib 165.
+
+**A separate defect, found first and wrongly blamed for this one.**
+`time_the_burst` gave one 40,000-iteration budget to two different waits — for
+the burst to *begin*, and for its four phases to *finish*. On any lane with no
+DMA window `bin/netd` maps no window and exits by design, `bin/ipd` blocks on
+frames that never come, and the instrument spent the whole 40 seconds one
+millisecond at a time inside a bring-up allowed 45. Watched red: with the old
+bound restored the boot prints `BRING-UP STOPPED. 45 seconds have passed`. Split
+into `START_MS = 5_000` and `RUN_MS = 35_000`; the lane now prints
+`burst never started: nothing sent in 5 s, so there is no device behind it and
+nothing to time` and finishes.
+
+**The correction, recorded where the wrong claim was made.** The yellow burst
+line and the "BRING-UP STOPPED" banner sat together at the end of the failing
+log, and were reported as the cause of the lane failure. They were not: the red
+run proves bring-up carries on afterwards and the lane still passes. The gate
+that failed was fourteen hundred lines further up. **A log read from its end is
+a log read backwards**, and the second instrument found in two days to have
+obscured the thing it was measuring.
+
+**A third correction, in the lock-order instrument, made by reading rather than
+by a boot.** The violation report's open-guard dump carried the inference "two
+entries means the holds are real; none means the mask is lying". It does not.
+`close_guard` identifies a hold by its **acquisition site** and clears the first
+entry that matches, scanning every CPU when the fast path misses — and every
+`WaitQueue` in this kernel is locked at one line, `wait.rs:195`, so two threads
+holding two different wait queues carry the same key and either can clear the
+other's record. The check that verified the dump used "two same-rank locks one
+line apart", the one arrangement where the keys differ and the table is
+unambiguous: **verified where it works, deployed where it does not.** So the
+2026-08-22 specimen — mask bit 9, no open guard, at `wait.rs:195` — does not
+establish a phantom mask after all, and both readings are open again. The
+correction is written beside the original claim. The fix is an identity unique
+per hold rather than per line; `SpinLockGuard` already holds the lock's own
+address and recording it costs nothing.
+
+**Also corrected: `docs/architecture.md` §5 claimed `arch/x86_64/` contains
+"VMX stubs".** It has said so since the first boot commit (`f9e9089`) and there
+has never been any VMX or SVM code in the tree. The layout line now names what
+is actually there, and §4's Phase 3 paragraph says plainly that no such code
+exists, what the Phase 3 row will build on that does, and that a VM device model
+is separate work scoped by no accepted RFC.
+
 ### 2026-08-22 (Rust 1.98.0, and a new lint that reached into the hash code)
 
 **The pin moves 1.97.1 → 1.98.0** (released 2026-08-20, two days old), verified
@@ -990,6 +1094,224 @@ The server was returned to its normal state: media unmounted, boot override
 consumed, boot order never modified (that change was refused by a safety check,
 which turned out to be the right call), power on, health OK.
 
+### 2026-08-22 (the pushed tree did not build for three commits, and nothing here could have said so)
+
+**`third_party/xhci/src/lib.rs` was committed declaring `pub mod doorbell;` and
+`pub mod runtime;` while neither file was ever `git add`ed.** Commit `31d2f23`
+added three module declarations and one file. Every local build passed, because
+both files were sitting on disk untracked. `bca1231` inherited it, and both were
+pushed.
+
+Verified rather than assumed: `git archive HEAD` into an empty directory and
+`cargo check` gives `error[E0583]: file not found for module 'doorbell'`.
+
+**The cause is a habit that protects against one mistake and exposes another.**
+Every commit in this session staged explicit paths, adopted so that a second
+session's work in the same tree could never be swept in by `git add -A`. That
+habit prevents including too much. It does nothing about including too little,
+and two files went missing behind it.
+
+**Nothing in the suite could have caught it**, which is the part worth keeping.
+`make test` builds the working tree; what is pushed is the index. Those are the
+same thing right up until they are not. A test that builds what you have cannot
+tell you what you gave away.
+
+So `tools/check-tracked-modules.py` now runs in `make gates`: for every `mod x;`
+in a tracked Rust file, either `x.rs` or `x/mod.rs` must be tracked beside it,
+by Rust's own rule about where a child module lives. Inline `mod tests { ... }`
+declares a body rather than a file and is not the subject. It is the cheap half
+of the real check — a full build of the archived tree costs minutes — and it is
+the half that catches this class.
+
+Watched red on the actual defect: with `doorbell.rs` unstaged it prints
+`third_party/xhci/src/lib.rs:43 declares 'mod doorbell;' and no file for it is
+tracked`, and the resolution line says what to do — add the file, or delete the
+declaration.
+
+184 sources checked, and the two missing files are in this commit.
+
+### 2026-08-22 (300 more boots: the lock-order specimen did not return, and a different one arrived explaining itself)
+
+The soak that the improved lock-order report was built for ran 300 boots at
+`JOBS=1`. **No canary fired at all** — not the lock-order one, and none of the
+five counter-family markers. The `wait.rs:195` violation has now been seen once
+in 600 boots and not since, which is a rate rather than a diagnosis; the
+instrument that would read it stays armed.
+
+**One boot in 300 failed, with a different pair of failures**, and the boot
+report diagnosed itself:
+
+```
+cpu 3  thread 19  rt-probe  rt   Finished  52 runs
+cpu 3  thread 12  ring-0    fair Running  1807 runs (migrated)
+tickless FAILED: cpu 3 took 128 ticks over 400 ms with nothing to run, and at most 1 is expected
+  armed 1754 for a slice, 0 for a timer, 7 for the backstop
+  it wants a preemption tick because it has more than one schedulable thread (2 schedulable)
+```
+
+Read the last line and then the one marked `(migrated)`. **The kernel did the
+right thing and the test called it a failure.** `tickless_self_test` picks a CPU
+it believes is idle and then counts its ticks — and the load balancer stole
+`ring-0` onto that very CPU during the measurement. With two schedulable threads
+there, a preemption tick is exactly what the tickless rule requires. The test's
+assumption, not the scheduler's behaviour, is what broke.
+
+That reading is the instrument's own words rather than an inference, which is
+the point of having taught it to say *why* it wanted a tick. The same boot also
+failed `linux exec ... the execing domain is still alive`, which may be
+downstream of the same migration or may be the 2026-08-21 exec intermittent
+again; it is not established either way.
+
+**Not fixed.** The obvious repair — have the tickless measurement re-check that
+its chosen CPU is still idle, and skip rather than fail when a thread has landed
+on it — is a change to a gate, and a gate loosened without care stops catching
+the thing it was built for. Recorded with the specimen preserved at
+`/root/bhaskix-soak-artifacts/2026-08-22-soak-jobs1-tickless-exec-run-227.log`.
+
+**Also measured across the same 300 boots:** `spawn resched declines` remained 0,
+as it did in the previous 300. The fallback added on 2026-08-21 has still never
+fired outside a forced experiment.
+
+**And one observation kept rather than buried.** The suite run that landed the
+xHCI work failed the IOMMU lane once, on `the ring handover or the stream
+through it did not complete` — a TCP check, in the lane whose machine had just
+gained an inert USB controller. Three consecutive re-runs of that lane passed,
+and the BIOS lane passes the same device profile, so this reads as a flake rather
+than a consequence. It is written down because "reads as" is not "is": if that
+check starts failing, the controller added to `devices.sh` on this date is the
+first thing to try removing.
+
+### 2026-08-22 (a book is scoped, and its first sample chapter caught the author out twice)
+
+*Mastering Bhaskix*, by Tarun Kumar Kushwaha — scoped in
+[`docs/ebook-mastering-bhaskix.md`](docs/ebook-mastering-bhaskix.md), with one
+sample chapter written to test whether the scope survives contact with a hard
+topic.
+
+**The scoping decision that matters is what the book may claim.** Most operating
+system books teach a finished system, where the reader gets the answer without
+the question, or stop at a shell prompt — before the problems that start after
+one. This project is neither, and its own documents state its gaps in writing. So
+the gaps are the subject: the parts where the first answer was wrong, the
+measurement contradicted the reasoning, and the record had to be corrected in
+place. Almost nobody writes that book, because almost nobody keeps the evidence.
+This tracker is the evidence.
+
+The spine is one sentence — *a claim you have not measured is a claim you do not
+have* — and every chapter carries the gate, soak or number that decided it, plus
+**"what was wrong first"** where something was.
+
+**Voice, on the author's instruction:** Indian English, written plainly, with
+examples from ordinary life before any code — a railway ticket for a capability,
+a master key for `root`, the society gate's watchman for the IOMMU. Written as
+checkable rules rather than aspirations, and with two guards: an analogy that
+flatters the design is worse than none, and **easy language is not vague
+language** — the numbers keep their units and their dates.
+
+**The sample chapter caught its own author twice, which is the best argument for
+the method it describes.** It claimed a per-boot self-test for the stale-slot
+refusal; the test is real but is a *host* test, run by `make test` — corrected.
+It then claimed the test had been watched fail on purpose, which nobody had
+done — so it was done: the generation comparison in `cap.rs::resolve` was
+deleted, the test failed with *the stale reference must stay dead*, and the line
+was put back. A third slip, misdating that red run, was caught on re-reading.
+
+Both corrections took under a minute because the evidence was a `grep` away.
+That is the whole thesis of the book, demonstrated on its first page.
+
+Scoped and sampled. Not written.
+
+### 2026-08-22 (RFC 0041 step 2: the refusal built before the driver, and the cursors where cycle bugs live)
+
+**Rule 1 first, which is the point of the ordering.** `kernel/src/xhci.rs`
+finds xHCI controllers — PCI class `0x0c`, subclass `0x03`, and the programming
+interface byte `0x30` that separates xHCI from UHCI, OHCI and EHCI, because
+class and subclass alone only say "USB" and driving an EHCI controller with
+xHCI's offsets is writing arbitrary values into a bus master's registers — and
+then, before reading a single register, asks whether an IOMMU translates for
+each one.
+
+**The refusal is a property of the type rather than a rule to remember.**
+`Found::drivable()` only ever answers a translated controller; there is no path
+through the type to an untranslated one. Placement is a safety contract too: the
+scan runs *after* the IOMMU windows exist, because asking earlier reads
+"untranslated" for a device about to be caged and refuses a controller that
+should have been driven.
+
+**And the refusal is watched, not asserted.** `devices.sh`'s `full` profile now
+puts a real `qemu-xhci` controller in the machine — no devices attached, never
+driven, so it does no DMA — and the boot gate requires the kernel to find it and
+turn it down by name. A refusal nobody can observe is a refusal nobody can
+trust.
+
+**The ring cursors, where a cycle-bit bug would live.** The TRBs and the
+ownership rule are the vendored crate's; whose turn it is, where the next entry
+goes and when the cycle flips is this project's own, so it lives in the kernel
+and the vendored crate stays what `PROVENANCE.md` says it is. Three things
+encoded, each watched red:
+
+- The cycle flips **exactly once per lap**, and the producer never offers the
+  link entry as somewhere to write. Removing the flip has no symptom on
+  hardware — the controller reads the next lap as stale and the ring silently
+  stops.
+- **An event ring has no link TRB**, so it wraps one entry *later* than a
+  command ring of the same size. Using the producer's arithmetic on it skips
+  the last event of every lap, for ever. One test exists purely so that a
+  future refactor unifying the two cursors fails.
+- The producer **starts with the cycle set**, because fresh memory is zeroed and
+  starting at 0 makes the whole ring look already-published.
+
+**Setup packets, built where they can be tested.** Everything a driver asks a
+device before it can read reports is eight bytes with a bitmap on the front, and
+a wrong field there does not fail loudly — it asks a different question and gets
+a plausible answer. Two such questions now have tests, both watched red:
+`GET_DESCRIPTOR` puts the type in the **high** byte of `wValue` and the index in
+the low one, and **boot protocol is `0`** while the richer report mode is 1,
+which is the way round the intuition does not run.
+
+Twelve tests in the kernel module, thirty-three in `usb`, and the fuzz target at
+about 3.8 million executions with no artifact. Nothing drives a controller yet.
+
+### 2026-08-22 (RFC 0041 step 1: the parser for what a device says, where a fuzzer can reach it)
+
+`usb/` — a leaf crate beside `elf`, `net`, `fs` and `ustar`. Descriptors, the
+HID boot report, `no_std`, `forbid(unsafe_code)`, depending on nothing.
+
+**Kept out of the driver on purpose.** What it parses is written by whatever is
+plugged into the machine, which on a hostile stick means written by an attacker;
+a parser that needs a controller to run is a parser nobody fuzzes. Here it is a
+pure function from bytes to values, so RFC 0038's fifth rule is a thing that can
+be tested rather than promised. **2,481,983 executions in 91 seconds, no crash,
+no hang, no artifact** — and the target feeds reports as a *stream*, because a
+keyboard sends state and the interesting inputs are sequences.
+
+**The layouts were read rather than recalled**, on the standing instruction, and
+two of them repaid it:
+
+- **`0x32` is missing from the punctuation range** — it is the non-US hash key —
+  so the usage ids are not contiguous and a table indexed by `id - MINUS` puts
+  every key after backslash one place wrong. It is a `match`, and a test asserts
+  the gap.
+- **A HID report is state, not an event.** An i8042 sends make and break codes;
+  a keyboard sends *the set of keys currently held*, whenever that set changes.
+  Nothing says "pressed". A driver that treats each report as a keystroke
+  repeats every held key on every report — so `Keyboard` keeps the previous
+  report and emits only what is newly down. Watched red: removing that check
+  fails two tests immediately.
+
+**Three more refusals with tests behind them.** A zero-length descriptor ends
+the walk rather than repeating — it is the one value that turns the walk into an
+infinite loop and a device can send it, and the guard was watched red. A length
+longer than the buffer is refused rather than believed. And the rollover error,
+which fills all six slots with `0x01`, types nothing rather than six characters.
+
+An endpoint belongs to the interface *before* it, so `boot_keyboard` tracks the
+current interface while it walks — otherwise a driver polls a mouse for
+keystrokes, which is a test.
+
+Twenty-five host tests, three watched red. Nothing in the kernel uses it yet;
+step 2 is the controller discovery and the IOMMU refusal that precedes it.
+
 ### 2026-08-22 (RFC 0041 drafted: a USB keyboard, and the bring-up order was read rather than recalled)
 
 The definitions from RFC 0038 are complete, tested and **used by nothing**. RFC
@@ -1040,6 +1362,31 @@ The open-guard table settles it and was already there, used by `COUNT
 UNDERFLOW`: every entry is a lock acquired and not yet released, with the line
 that took it. The violation report now dumps it. Two entries means the holds are
 real; none means the mask is lying.
+
+> **Correction, 2026-08-23: the second half of that sentence is not sound, and
+> the verification below is why it read as though it were.** The open-guard
+> table keys an entry on the **acquisition site** — the `&Location` pointer —
+> and nothing else. `close_guard` clears the first entry whose key matches,
+> scanning every CPU's table when the fast path misses, because a thread that
+> blocked holding a lock may resume on another CPU. That fallback cannot tell
+> two holds apart when they were taken at the same line.
+>
+> Every `WaitQueue` in this kernel is locked at exactly one line —
+> `self.waiters.lock()`, `kernel/src/wait.rs:195` — so two threads holding two
+> *different* wait queues carry the same key, and either one's release clears
+> whichever record it finds first. "No open guard" is therefore consistent with
+> a perfectly real hold whose record another thread took away.
+>
+> **The injected violation below could not have caught this**: it uses "two
+> same-rank locks one line apart", so the two keys differ, which is the one
+> arrangement in which the table is unambiguous. The instrument was verified
+> where it works and deployed where it does not.
+>
+> What this means for run-161's specimen — mask bit 9, no open guard, at
+> `wait.rs:195` — is that it does **not** establish a phantom mask. Both
+> readings are open again. The fix is an identity that is unique per hold
+> rather than per source line; the lock's own address is already in the guard
+> (`SpinLockGuard::lock`) and costs nothing to record.
 
 Safe where the surrounding comment forbids taking a lock — `for_each_open_guard`
 only loads atomics — and verified by injecting a real violation, two same-rank

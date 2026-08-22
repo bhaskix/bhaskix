@@ -91,6 +91,12 @@ LAYERS = {
     # that owns device memory. If it ever grows a dependency, that is the sign
     # it has started doing something other than describing layouts.
     "bhaskix-xhci": -3,
+    # USB descriptors and the HID boot report, RFC 0041. A leaf for the reason
+    # that matters most in this list: what it parses is written by whatever is
+    # plugged into the machine, so it is kept where a fuzzer can drive it
+    # without a controller, and it depends on nothing so that nothing it
+    # depends on can be the thing that fails.
+    "bhaskix-usb": -3,
     # The Linux personality's arithmetic, RFC 0005: the kernel builds a real
     # initial stack with it and a host test checks the bytes, so it depends
     # on nothing -- the leaf-layer argument a seventh time.

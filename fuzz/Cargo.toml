@@ -37,6 +37,7 @@ bhaskix-pkg = { path = "../pkg" }
 # second opinion about what a well-formed header looks like, and the first
 # one to drift would be the copy nobody runs outside a fuzz campaign.
 bhaskix-ustar = { path = "../ustar", features = ["test-support"] }
+bhaskix-usb = { path = "../usb" }
 bhaskix-personality = { path = "../personality" }
 
 [[bin]]
@@ -177,3 +178,9 @@ path = "fuzz_targets/ipv6_ndp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "usb_descriptors"
+path = "fuzz_targets/usb_descriptors.rs"
+test = false
+doc = false

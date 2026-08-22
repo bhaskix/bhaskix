@@ -1928,19 +1928,65 @@ pub fn take_message_or_block(
             // and never reach a safe point -- so RFC 0017 step 2 stopped every
             // thread except the ones that were asleep in IPC, which is most of
             // the interesting ones.
-            if target.dying {
-                target.state = State::Running;
-                return Delivery::Abandoned;
+            //
+            // The three-way choice itself lives in [`waited`], which is pure
+            // and tested on the host. It used to live here, and the one
+            // distinction it draws -- a dying caller against a vanished
+            // endpoint -- was only observable by booting a machine and reading
+            // a counter, which is how it stayed wrong.
+            match waited(target.dying, still_waiting) {
+                Waited::Dying => {
+                    target.state = State::Running;
+                    return Delivery::Dying;
+                }
+                Waited::Blocked => {
+                    target.state = State::Blocked;
+                    return Delivery::Blocked;
+                }
+                Waited::Abandoned => {
+                    target.state = State::Running;
+                    return Delivery::Abandoned;
+                }
             }
-            if still_waiting() {
-                target.state = State::Blocked;
-                return Delivery::Blocked;
-            }
-            target.state = State::Running;
-            return Delivery::Abandoned;
         }
     }
     Delivery::Abandoned
+}
+
+/// What a waiting thread that found no message should be told.
+///
+/// Three outcomes, and the first two are the ones that get confused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Waited {
+    /// **This thread** is being killed. It must not sleep again, and nothing
+    /// has failed: its domain is ending, which is teardown working.
+    Dying,
+    /// Still waiting, and the thing waited on is still there.
+    Blocked,
+    /// What was waited on has gone.
+    Abandoned,
+}
+
+/// The rule [`take_message_or_block`] applies when no message arrived.
+///
+/// **Pure, and separate, because the distinction it draws was wrong for weeks
+/// and nothing on the host could see it.** `Dying` and `Abandoned` were one
+/// answer until 2026-08-23. `syscall::ask_adapter_counted` needs them apart --
+/// a domain ending under a hosted thread is not a dead adapter -- and with the
+/// two collapsed it recovered the difference by asking `sched::should_die`,
+/// which takes the runqueue lock again and answers "no" when it loses it. The
+/// `native` boot gate failed on the resulting phantom refusal.
+///
+/// `still_waiting` stays lazy: a dying thread's answer does not depend on it,
+/// and the closure is a lookup the caller should not pay for twice.
+fn waited(dying: bool, still_waiting: impl FnOnce() -> bool) -> Waited {
+    if dying {
+        Waited::Dying
+    } else if still_waiting() {
+        Waited::Blocked
+    } else {
+        Waited::Abandoned
+    }
 }
 
 /// What [`take_message_or_block`] concluded.
@@ -1953,6 +1999,12 @@ pub enum Delivery<T> {
     /// What was being waited on has gone. The thread is running and should give
     /// up rather than sleep for something that will never arrive.
     Abandoned,
+    /// **This thread** has been told to stop, so it must not sleep again —
+    /// which is a different fact from the endpoint having gone, and reaches a
+    /// different conclusion. A caller seeing this is watching its own domain
+    /// end underneath it: nothing is wrong, and nothing should be counted as a
+    /// failure. See the branch that returns it.
+    Dying,
     /// The thread that owed this answer has died. The thread is running and
     /// should report that, distinctly: "the endpoint you called does not exist"
     /// and "the program you called has gone" are different facts, and a caller
@@ -4054,12 +4106,30 @@ pub fn owes_reply_in_domain(domain: u32) -> bool {
     false
 }
 
+/// How many times [`should_die`] could not read the runqueue and answered
+/// "no" without knowing.
+///
+/// Not a failure on its own — most callers of `should_die` lose nothing by a
+/// missed tear-down and will ask again. It is here because one caller does
+/// lose something, and because a blind spot that is never counted is
+/// indistinguishable from one that does not exist.
+pub static DYING_UNKNOWN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Whether the running thread has been told to stop.
 ///
 /// Read at the points where a thread provably holds no kernel lock: on the way
 /// back to user mode, and when it is about to sleep. Answers `false` if this
-/// CPU's runqueue is contended, which is the safe direction — the thread stays
-/// alive until the next safe point, and there is always another one.
+/// CPU's runqueue is contended, which is the safe direction for those callers
+/// — the thread stays alive until the next safe point.
+///
+/// **"There is always another safe point" is what this comment used to say,
+/// and it is not true of every caller.** `syscall::ask_adapter_counted` asks
+/// this once, to tell a domain ending underneath a hosted thread apart from an
+/// adapter that has died; there is no later point at which it asks again,
+/// because the call it is deciding about has already failed. For that caller a
+/// contended lock is not "stay alive a little longer", it is a wrong answer
+/// recorded as a refusal. [`DYING_UNKNOWN`] counts how often the lock is lost
+/// so the width of that window is measured rather than assumed.
 #[must_use]
 pub fn should_die() -> bool {
     let cpu = percpu::cpu_id() as usize;
@@ -4067,6 +4137,24 @@ pub fn should_die() -> bool {
         return false;
     }
     let Some(queue) = QUEUES[cpu].try_lock() else {
+        // **This answers "no" when it means "I do not know", and the two are
+        // not the same answer.**
+        //
+        // Every caller reads `false` as *the current thread is not being
+        // killed*, and one of them — `syscall::ask_adapter_counted` — uses it
+        // to tell a teardown apart from a dead adapter. A lost `try_lock` there
+        // turns a domain ending normally into a counted refusal, which is
+        // exactly the line the `native` lane failed on for 2026-08-23's suite:
+        // `1 were refused by its endpoint, 0 were for a caller already being
+        // killed`. Contention is load-dependent, which is why it is rare and
+        // why it arrives in a full suite rather than in a lane run alone.
+        //
+        // Counted rather than fixed here, because the fix is not to block: two
+        // of the five callers are on trap and notify paths where taking this
+        // lock is what `try_lock` was chosen to avoid. What the count answers
+        // is whether the window is real and how wide, before anything is
+        // built on the guess that it is.
+        DYING_UNKNOWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return false;
     };
     let current = queue.current;
@@ -4292,6 +4380,43 @@ mod tests {
     /// live versions cannot be called here. What *can* be tested is the
     /// predicate they turn on, which is the part that was added and the part
     /// that can be wrong.
+    /// **A dying caller and a vanished endpoint are different answers**, and
+    /// this is the test that did not exist while they were the same one.
+    ///
+    /// `syscall::ask_adapter_counted` counts the first as teardown and the
+    /// second as a refused delivery, and a boot gate demands the refusal count
+    /// be zero. With both collapsed into `Abandoned`, the adapter recovered the
+    /// difference by asking `should_die` afterwards -- which loses this CPU's
+    /// runqueue lock sometimes and then answers "no" without knowing. On
+    /// 2026-08-23 that turned a domain ending normally into
+    /// `1 were refused by its endpoint` and failed the `native` lane.
+    ///
+    /// **Both `dying` rows matter.** A thread being killed is told so whether
+    /// or not the endpoint it waited on is still live: the answer is about the
+    /// caller, not about what it was waiting for. Collapsing the first row into
+    /// `Blocked` would put a dying thread back to sleep, which is the bug
+    /// RFC 0017 step 2 fixed; collapsing the second into `Abandoned` is the one
+    /// that cost the boot gate.
+    #[test]
+    fn a_dying_caller_is_told_so_and_is_never_confused_with_a_vanished_endpoint() {
+        assert_eq!(
+            waited(true, || true),
+            Waited::Dying,
+            "a dying thread must not be told to block, even with the endpoint still there"
+        );
+        assert_eq!(
+            waited(true, || false),
+            Waited::Dying,
+            "a dying thread and a vanished endpoint are the two facts that were one"
+        );
+        assert_eq!(waited(false, || true), Waited::Blocked);
+        assert_eq!(
+            waited(false, || false),
+            Waited::Abandoned,
+            "nothing to wait for, and this caller is fine -- the endpoint is not"
+        );
+    }
+
     #[test]
     fn a_dying_thread_is_not_marked_blocked() {
         let mut queue = with(&[State::Running]);

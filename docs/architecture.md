@@ -503,6 +503,14 @@ escape land in the same place: a domain with no capabilities.
 Hardware virtualization (VMX/SVM) is a Phase 3 milestone. The domain abstraction is defined now so
 that nothing built in Phase 1 or 2 has to be undone to accommodate it.
 
+**No VMX or SVM code exists in the tree**, and this paragraph says so because §5's crate layout
+claimed "VMX stubs" in `arch/x86_64/` from the first boot commit until 2026-08-23, which was never
+true. What exists today is the half that has to be right first: a domain that owns its address
+space, a `ResourceEnvelope` the scheduler already enforces, and per-device IOMMU translation
+([RFC 0012](rfc/0012-iommu.md)) — which is what a passed-through device needs and what makes the
+Phase 3 row additive rather than a second kernel. The VM's *device model* is separate work again,
+belongs in ring 3 as an ordinary domain, and is not scoped by any accepted RFC.
+
 > **Implemented, in part, as of M5-02.** A domain has a CSpace, a `ResourceEnvelope` and a thread
 > count, and is named by a capability — so `ObjectKind::Domain` is the first capability kind that
 > refers to something real. Destroying one revokes everything derived from its root capability
@@ -577,7 +585,7 @@ is argued:
 ```
 bhaskix/
 ├── boot/            bootloader shim → bhaskix_boot::Handoff  (the ONLY crate that knows Limine)
-├── arch/x86_64/     GDT, IDT, APIC, TSS, MSRs, context switch asm, VMX stubs
+├── arch/x86_64/     GDT, IDT, APIC, IOAPIC, TSS, MSRs, paging, PCI, VT-d, context switch asm
 ├── kernel/          the nucleus: caps, domains, IPC, syscall dispatch, init
 ├── mm/              physical + virtual memory, slab, address spaces
 ├── sched/           runqueues, scheduling classes, load balancing, policy trait

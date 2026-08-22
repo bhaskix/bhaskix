@@ -23,6 +23,9 @@ bhaskix-fs = { path = "../fs" }
 # the same fuzz-hardened checks. The loader half stays here, with the
 # address spaces it needs.
 bhaskix-elf = { path = "../elf" }
+# RFC 0038/0041: the vendored xHCI layouts. The ring cursors in
+# `kernel/src/xhci.rs` are this project's own logic built on them.
+bhaskix-xhci = { path = "../third_party/xhci" }
 # RFC 0021. The kernel does not need unpredictability itself yet -- randomising
 # the heap base is that RFC's open question 2 -- but it is the thing that boots,
 # so it is where "the instruction actually works on this machine" is checked.
@@ -332,7 +335,12 @@ asm_budget = 10
 # include is the part most likely to be wrong: the scancode tables and their
 # translation are a pure function with no hardware in it, tested on the host,
 # and hold no `unsafe` at all.
-unsafe_budget = 1621
+# 1622 at RFC 0041 step 2, 2026-08-22: one line, the configuration-space read
+# that tells an xHCI controller apart from a UHCI or EHCI one. The scan around
+# it is safe code, and the decision it feeds -- whether the IOMMU translates
+# for that device -- holds no `unsafe` at all. A controller that is not
+# translated is refused before any register of it is touched.
+unsafe_budget = 1622
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

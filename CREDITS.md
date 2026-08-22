@@ -14,6 +14,7 @@ architecture, and the design documents in [`docs/`](docs/).
 
 ## With thanks to
 
+- **Professor Pawan Kumar Mall**
 - **Prince Komal Boonlia**
 - **Mayur Agnihotri**
 - **Devesh Singh**

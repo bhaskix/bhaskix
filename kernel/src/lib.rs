@@ -62,6 +62,7 @@ pub mod trap;
 pub mod vectors;
 pub mod virtio;
 pub mod vm;
+pub mod xhci;
 
 // The archive parser and the namespace over it live in the filesystem service
 // crate as of RFC 0013 step 3, and are re-exported here because the kernel's
@@ -484,6 +485,17 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
 
     // What a device can reach, said once it is settled rather than before.
     iommu::report_dma(iommu_state.is_some());
+
+    // RFC 0041 step 2: xHCI controllers, and whether any of them may be
+    // driven. **After the IOMMU windows exist**, which is the whole of this
+    // call's safety contract: asking earlier would read "untranslated" for a
+    // device about to be caged and refuse a controller that should have been
+    // driven. Nothing is driven yet either way — this reports, and reporting a
+    // controller nobody may touch is the point.
+    // SAFETY: called once, here, with configuration access working and the
+    // IOMMU settled.
+    let xhci_found = unsafe { xhci::discover() };
+    xhci::report(&xhci_found);
     if let Some((found, _)) = iommu_state.as_ref() {
         // A fault here means a device reached for something nobody granted it,
         // during its own bring-up. RFC 0012 calls that the feature.
@@ -1203,6 +1215,11 @@ extern "C" fn ipc_service(_argument: u64) -> ! {
                     ipc::IpcError::NoSuchCaller => 4,
                     ipc::IpcError::ServerGone => 5,
                     ipc::IpcError::Refused(_) => 6,
+                    // Its own code rather than folded into 1: a service whose
+                    // own domain was ended stopped for a different reason than
+                    // one whose endpoint went, and this number is read to tell
+                    // exactly that apart.
+                    ipc::IpcError::CallerDying => 7,
                 };
                 RING3_RECV_ERROR.store(code, Ordering::Release);
                 sched::exit()
@@ -3209,12 +3226,23 @@ fn personality_boundary_report() {
     // What the adapter did, from the kernel's own counters rather than from
     // the adapter's word for it -- which is the only kind of evidence
     // available for a program that holds no console, and the better kind.
+    //
+    // **The last figure is the instrument's own blind spot**, and it is here
+    // because without it a refusal cannot be told from a misread teardown.
+    // Separating those two depends on `sched::should_die`, which answers "no"
+    // when this CPU's runqueue is contended — so a boot with a non-zero count
+    // here is a boot in which the refusal above may be an accounting artefact
+    // rather than a dead adapter. Printed on every boot, not only on the ones
+    // that fail, because a number that appears only beside a failure cannot
+    // establish what it looks like when nothing is wrong.
     println!(
         "    linux domain   the adapter in ring 3 answered {answered} foreign calls, and {absent} \
          found none to ask, {refused} were refused by its endpoint, {gave_up} gave up \
          retrying a full queue, and {caller_gone} were for a caller already being killed \
-         (last refusal {})",
-        syscall::ADAPTER_REFUSAL.load(order)
+         (last refusal {}); {} times the kernel could not read the runqueue to tell whether a \
+         caller was dying",
+        syscall::ADAPTER_REFUSAL.load(order),
+        crate::sched::DYING_UNKNOWN.load(order)
     );
     // **The cross-placement price, which is what RFC 0031 asked for before
     // the move rather than after.** Two figures, one instrument, one boot: a
@@ -10085,21 +10113,52 @@ fn time_the_burst(hhdm: u64) {
     //
     // So this waits for the first request of phase zero to go out, and stamps
     // then.
+    //
+    // # Two bounds, not one, and why that distinction cost a boot
+    //
+    // **Waiting for the burst to *begin* is a different question from waiting
+    // for four phases to *finish*, and giving them one shared budget made this
+    // instrument able to stop the machine it was measuring.**
+    //
+    // On a lane with no DMA window — `native`, and every lane where the IOMMU
+    // contains nothing for the NIC — `bin/netd` maps no window, reports zeroes
+    // and exits, exactly as designed. `bin/ipd` then blocks on frames that will
+    // never arrive. Whether this function noticed was a race: it returns at once
+    // if `bin/ipd` has not yet written its marker, and enters the wait if it
+    // has. On 2026-08-23 the marker won that race on the `native` lane, nothing
+    // was ever sent, and the loop below spent its whole 40-second budget one
+    // millisecond at a time — inside a bring-up allowed 45 seconds in total. The
+    // boot was stopped by its own measurement, and the four other lanes in the
+    // same suite passed only because the race went the other way.
+    //
+    // A burst that has sent nothing after a few seconds is not slow, it is
+    // absent: the trigger is an ARP exchange and one round trip, which is
+    // milliseconds under emulation. So the start gets seconds and says so when
+    // it expires; the phases keep the rest.
+    const START_MS: usize = 5_000;
+    const RUN_MS: usize = 35_000;
     let mut stamp = bhaskix_arch::tsc::read();
     let mut started = false;
+    for _ in 0..START_MS {
+        if word(base + 3) >= 1 || word(base) >= 1 {
+            started = true;
+            stamp = bhaskix_arch::tsc::read();
+            break;
+        }
+        wait_millis(1);
+    }
+    if !started {
+        println!(
+            "\x1b[93m    burst          never started: nothing sent in {} s, so there is no \
+             device behind it and nothing to time\x1b[0m",
+            START_MS / 1000
+        );
+        return;
+    }
     // Bounded: a burst that never finishes must not hold the boot. Whatever
     // completed is reported and the rest is said to be missing rather than
     // quietly left out.
-    for _ in 0..40_000 {
-        if !started {
-            if word(base + 3) >= 1 || word(base) >= 1 {
-                started = true;
-                stamp = bhaskix_arch::tsc::read();
-            } else {
-                wait_millis(1);
-                continue;
-            }
-        }
+    for _ in 0..RUN_MS {
         let phase = word(base) as usize;
         while done < phase.min(4) {
             let now = bhaskix_arch::tsc::read();
@@ -16630,7 +16689,10 @@ fn banner() {
     // is the screen in front of them rather than a file in the repository.
     // `CREDITS.md` says the same thing at length; this says it at boot.
     println!(
-        "{DIM}     With thanks to                  {OFF}{TEXT}Prince Komal Boonlia · Mayur Agnihotri{OFF}"
+        "{DIM}     With thanks to                  {OFF}{TEXT}Professor Pawan Kumar Mall{OFF}"
+    );
+    println!(
+        "{DIM}                                     {OFF}{TEXT}Prince Komal Boonlia · Mayur Agnihotri{OFF}"
     );
     println!(
         "{DIM}                                     {OFF}{TEXT}Devesh Singh · Neha Mourya{OFF}"

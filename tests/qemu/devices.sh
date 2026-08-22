@@ -83,6 +83,19 @@ qemu_device_list() {
                 # explicit; the default and the flag are different worlds.
                 -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:45557-:7"
                 -device "virtio-net-pci,netdev=net0$suffix"
+                # An xHCI controller, present and driven by nothing.
+                #
+                # RFC 0041 step 2 refuses any controller that is not behind an
+                # IOMMU translation, and a refusal nobody can observe is a
+                # refusal nobody can trust. This puts a real controller in the
+                # machine so the boot gate can watch it be found and turned
+                # down. It is deliberately given no devices and is never
+                # driven, so it does no DMA and changes nothing else.
+                #
+                # Not `$suffix`: the translation attributes belong to devices
+                # this kernel actually delegates, and this one is here to be
+                # refused.
+                -device qemu-xhci
             )
             ;;
         disks)

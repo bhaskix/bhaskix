@@ -245,6 +245,15 @@ pub enum IpcError {
     /// and the endpoint may be served again by something else. What was lost is
     /// the obligation, which lived in one thread.
     ServerGone,
+    /// The *caller* is being torn down, and that is why this call did not
+    /// complete.
+    ///
+    /// Not a failure of the endpoint, the server, or the message — the domain
+    /// this thread belongs to is ending, which is teardown working. It maps to
+    /// the same user-visible status as [`IpcError::NoSuchEndpoint`], because a
+    /// program being destroyed has no use for the distinction; the kernel does,
+    /// and used to guess it after the fact.
+    CallerDying,
     /// The rendezvous refused this call: a staged gift could not be
     /// completed, and the message was never delivered. RFC 0022 step 2.
     /// Carries the refusal's own status, raw, because "the service never
@@ -538,6 +547,9 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
             // thread. RFC 0013's unresolved question 1.
             sched::Delivery::Revoked => return Err(IpcError::ServerGone),
             sched::Delivery::Abandoned => return Err(IpcError::NoSuchEndpoint),
+            // This thread is being killed, which is not the endpoint's doing
+            // and must not be counted against it.
+            sched::Delivery::Dying => return Err(IpcError::CallerDying),
             // The server's receive path could not complete this thread's
             // staged gift; the message was never delivered. RFC 0022 step 2.
             sched::Delivery::Refused(status) => return Err(IpcError::Refused(status)),
@@ -660,7 +672,9 @@ pub fn recv_either(id: EndpointId) -> Result<Received, IpcError> {
                     // thread has been told to stop. Both leave the same duty:
                     // take the queue entry out, or a later rendezvous delivers
                     // to a thread that has gone.
-                    sched::Delivery::Abandoned | sched::Delivery::Revoked => {
+                    sched::Delivery::Abandoned
+                    | sched::Delivery::Dying
+                    | sched::Delivery::Revoked => {
                         cancel(id, me);
                         ABANDONED_RECVS.fetch_add(1, Ordering::Relaxed);
                         return Err(IpcError::NoSuchEndpoint);

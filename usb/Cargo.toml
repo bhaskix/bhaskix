@@ -1,0 +1,23 @@
+[package]
+name = "bhaskix-usb"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "USB descriptors and the HID boot keyboard report. Untrusted input, parsed where it can be fuzzed."
+authors = ["Tarun Kumar Kushwaha"]
+publish = false
+
+[lib]
+name = "bhaskix_usb"
+path = "src/lib.rs"
+
+# Nothing. Descriptors arrive from whatever is plugged in, so the crate that
+# parses them depends on nothing and can be driven by a fuzzer without a
+# controller. RFC 0041.
+[dependencies]
+
+[package.metadata.bhaskix]
+# Parsing attacker-controlled, length-prefixed, nested data. There is no
+# `unsafe` that could be justified here, and `forbid(unsafe_code)` says so in
+# the source as well.
+unsafe_budget = 0

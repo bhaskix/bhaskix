@@ -551,6 +551,19 @@ else
     status=1
 fi
 
+# RFC 0041 rule 1, watched rather than asserted: a real xHCI controller is in
+# this machine (devices.sh, `full` profile), it is behind no IOMMU translation,
+# and the kernel must refuse it by name. A bus master with unmediated access to
+# memory is the thing this rule exists to stop, and a refusal that never fires
+# in a test is a refusal nobody has seen work.
+if grep -qaE 'xhci +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]+ [0-9a-f]{4}:[0-9a-f]{4} REFUSED' "$LOG"; then
+    pass "an xHCI controller without IOMMU translation is found and refused"
+else
+    fail "the xHCI controller was not found, or was not refused"
+    grep -a "xhci" "$LOG" | sed 's/^/      /'
+    status=1
+fi
+
 # The decline is reported. Deterministic, and it guards the gate below rather
 # than duplicating it: that one bounds the *latency*, which only moves when a
 # decline actually happens, and declines are rare. This one asserts the

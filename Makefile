@@ -711,6 +711,11 @@ gates:
 	    printf '  \033[1;32mok\033[0m    the instruction check rejects an undeclared instruction\n'; \
 	fi
 	tools/check-deps.py
+# What is pushed is the index, not the working tree, and the suite builds the
+# working tree. On 2026-08-22 two files were declared in a committed lib.rs and
+# never added: every local build passed and the pushed tree did not compile, for
+# three commits. This is the cheap half of that check.
+	tools/check-tracked-modules.py
 # Every fuzz target still compiles. `fuzz/` is its own workspace, so nothing
 # else in this file builds it -- and on 2026-08-18 RFC 0029's renames broke two
 # targets, which then ran zero executions for three days while the project went

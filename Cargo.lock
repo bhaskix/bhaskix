@@ -55,6 +55,7 @@ dependencies = [
  "bhaskix-service-console",
  "bhaskix-service-vfs",
  "bhaskix-telemetry",
+ "bhaskix-xhci",
 ]
 
 [[package]]
@@ -124,6 +125,10 @@ dependencies = [
 
 [[package]]
 name = "bhaskix-telemetry"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-usb"
 version = "0.0.0"
 
 [[package]]

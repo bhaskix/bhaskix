@@ -889,9 +889,11 @@ pub fn last_recv_refusal() -> Option<(u32, u64)> {
 /// Maps an IPC failure onto a status code.
 const fn ipc_status(error: crate::ipc::IpcError) -> Status {
     match error {
-        crate::ipc::IpcError::NoSuchEndpoint | crate::ipc::IpcError::Exhausted => {
-            Status::NoSuchCapability
-        }
+        crate::ipc::IpcError::NoSuchEndpoint
+        | crate::ipc::IpcError::Exhausted
+        // A caller being torn down sees exactly what it saw before this
+        // variant existed. The distinction is the kernel's, not ring 3's.
+        | crate::ipc::IpcError::CallerDying => Status::NoSuchCapability,
         crate::ipc::IpcError::Congested => Status::Congested,
         crate::ipc::IpcError::NoSuchCaller => Status::NoSuchCaller,
         // The endpoint is fine; the program behind it is not. `Revoked` is the
@@ -2197,6 +2199,18 @@ fn ask_adapter_counted(
             // endpoint gives. The thread's own dying flag is what separates
             // them, and without this the suite reported "1 were refused by
             // its endpoint" for a boot in which nothing was wrong.
+            // **Exact, and taken before the guess below.** The scheduler knew
+            // this thread was dying at the moment it stopped waiting, and now
+            // says so instead of leaving it to be inferred.
+            Err(crate::ipc::IpcError::CallerDying) => {
+                ADAPTER_CALLER_GONE.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            // Kept as a second net rather than deleted: this covers the paths
+            // that reach `NoSuchEndpoint` without passing through the wait —
+            // a lookup that finds the endpoint already gone, say. It is the
+            // arm that could answer wrongly under a contended runqueue, and
+            // `sched::DYING_UNKNOWN` counts how often it could not tell.
             Err(crate::ipc::IpcError::NoSuchEndpoint) if crate::sched::should_die() => {
                 ADAPTER_CALLER_GONE.fetch_add(1, Ordering::Relaxed);
                 return None;
