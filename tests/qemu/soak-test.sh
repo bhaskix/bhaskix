@@ -135,8 +135,31 @@ done
 # A boot that never reached the end of the self-tests is a failure too, and a
 # different one from a self-test that ran and said no -- so they are counted
 # apart rather than both as "not ok".
+# The canaries, which this harness could not see until 2026-08-22.
+#
+# These markers are printed by a kernel that has found something deeply wrong
+# and chosen to *finish anyway*, because a boot that completes its report is
+# worth more than one that halts on the first sign of trouble. That choice is
+# right, and it made them invisible here: none of them contains the word
+# `FAILED` and every one of them appears in a boot that reaches the end
+# marker, so both greps above call such a run a pass, and the logs are then
+# deleted by the `EXIT` trap.
+#
+# Which matters because of what this harness is *for*. The 2026-08-18 fix to
+# the acquire's front edge (`claim_uninterrupted`) was claimed on a mechanism
+# fitting seven specimens rather than on a reproduction, and it set its own
+# proof standard in writing: "the negative space -- the wedge rate of every
+# suite and soak that follows, with all five markers still armed to convict a
+# survivor". A soak that cannot see the markers cannot supply that proof, and
+# would have quietly discarded the survivor it was run to find.
+#
+# The first five are that family, in the order one tear produces them. The
+# rest are other families with the same habit of reporting without failing.
+CANARIES='COUNT UNDERFLOW|COUNT MISMATCH|BLOCK HOLDING|SAVED HOLDING|SAVED COUNT|INVARIANT VIOLATED|LOCK ORDER|IT IS RUNNING IN SOMEBODY ELSE'
+
 failed=0
 truncated=0
+canaries=0
 for log in "$WORK"/run-*.log; do
     if grep -q "FAILED" "$log"; then
         failed=$((failed + 1))
@@ -147,6 +170,17 @@ for log in "$WORK"/run-*.log; do
         }
     elif ! grep -q "$MARKER" "$log"; then
         truncated=$((truncated + 1))
+    fi
+
+    # Checked on every log, not as an `elif`: a boot can trip a canary and
+    # still pass every self-test, and that combination is the specimen worth
+    # the most -- the disease present and the machine not yet wedged by it.
+    if grep -qE "$CANARIES" "$log"; then
+        canaries=$((canaries + 1))
+        [[ $canaries -eq 1 ]] && {
+            echo "  first canary, in $(basename "$log"):"
+            grep -m 8 -E "$CANARIES" "$log" | sed 's/^/    /'
+        }
     fi
 done
 
@@ -161,12 +195,15 @@ for stamp in "$WORK"/time-*; do
     [[ $seconds -gt $slowest ]] && slowest=$seconds
 done
 
-if [[ $failed -eq 0 && $truncated -eq 0 ]]; then
-    ok "$RUNS boots, no self-test failed (slowest ${slowest}s against a ${TIMEOUT}s cap)"
+if [[ $failed -eq 0 && $truncated -eq 0 && $canaries -eq 0 ]]; then
+    ok "$RUNS boots, no self-test failed and no canary tripped (slowest ${slowest}s against a ${TIMEOUT}s cap)"
     exit 0
 fi
 [[ $failed -gt 0 ]] && fail "$failed of $RUNS boots failed a self-test"
 [[ $truncated -gt 0 ]] && fail "$truncated of $RUNS boots did not finish bring-up"
+# A canary is a failure of this harness even when every boot passed, because
+# the whole point of keeping the logs is to have the specimen afterwards.
+[[ $canaries -gt 0 ]] && fail "$canaries of $RUNS boots tripped a canary -- a marker fired and the boot finished anyway"
 echo "  ($passed passed, which is why one run proves nothing)"
 
 # Before believing any of it, read the note at the top about oversubscription:

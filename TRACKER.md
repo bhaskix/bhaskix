@@ -894,6 +894,38 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-22 (the soak could not see the canaries it exists to catch)
+
+**The 2026-08-18 fix to the acquire's front edge set its own proof standard in writing** — *"the
+negative space — the wedge rate of every suite and soak that follows, with all five markers still
+armed to convict a survivor"* — and the harness that would supply that proof could not see the
+markers.
+
+`soak-test.sh` judged each boot two ways: does the log contain `FAILED`, and does it reach the end
+marker. The five markers of the counter family contain neither. They are printed by a kernel that
+has found something deeply wrong and chosen to **finish anyway**, because a report is worth more
+than a halt — the right choice, and the one that made them invisible here. So a boot could carry
+`COUNT UNDERFLOW`, pass every self-test, be counted as a pass, and have its log deleted by the
+`EXIT` trap, which only keeps logs when a boot *fails*.
+
+The specimen the soak exists to catch was the specimen it was guaranteed to throw away.
+
+It now scans every log for all five, plus three markers of other families with the same habit of
+reporting without failing (`INVARIANT VIOLATED`, `LOCK ORDER`, `IT IS RUNNING IN SOMEBODY ELSE`). A
+sighting prints the offending lines, keeps the logs, and fails the soak **even when every boot
+passed** — because a boot that trips a canary and still passes is the most valuable specimen there
+is: the disease present and the machine not yet wedged by it.
+
+Checked on every log rather than as an `elif`, so a canary is not hidden behind a failure on the
+same boot. Watched red by printing a real marker from a real boot rather than by matching bytes
+invented for the test: two boots, both passing every self-test, both convicted — `2 of 2 boots
+tripped a canary`, logs kept. Green again with the injection removed, and zero canaries across
+five boots and every healthy log on hand.
+
+**No specimen has been collected yet.** The instrument is now capable of collecting one; the
+negative-space proof needs a soak of some hundreds of boots on a machine that is not being used for
+anything else, which this one is.
+
 ### 2026-08-21 (the 494 ms spawn: two branches that were never equivalent, and a bound on luck)
 
 **The last of the three intermittents, and it was half a fix rather than none.** The row at §5
