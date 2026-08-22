@@ -39,7 +39,10 @@
 #![deny(missing_docs)]
 
 pub mod capability;
+pub mod context;
+pub mod doorbell;
 pub mod operational;
+pub mod runtime;
 
 /// Extracts the bits `lo..=hi` of `value`, shifted down to bit zero.
 ///

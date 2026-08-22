@@ -988,6 +988,51 @@ The server was returned to its normal state: media unmounted, boot override
 consumed, boot order never modified (that change was refused by a safety check,
 which turned out to be the right call), power on, health OK.
 
+### 2026-08-22 (RFC 0038 step 4: contexts, and two asymmetries that are each one wrong pointer)
+
+The slot, endpoint and input control contexts — the structures the controller
+**walks by DMA**, which is what makes a wrong offset here different in kind from
+a wrong offset anywhere else in this tree. It is not a wrong number in a report;
+it is a pointer the hardware follows.
+
+**Two things this module exists to keep straight**, both of which read the wrong
+way round on a first pass:
+
+- **Context size changes the stride, not the layout.** `HCCPARAMS1` bit 2
+  selects 32-byte or 64-byte contexts, and what the extra 32 bytes buy is
+  *padding*. Dword 3 is dword 3 either way. The plausible misreading — that
+  64-byte contexts put their fields somewhere else — would misplace every field
+  in every context, so the constant is named `DWORDS` (of fields, always 8) and
+  the size question is a separate function called `stride_bytes`.
+- **An endpoint sits one context later in an input context than in a device
+  context.** A device context is `[slot][ep1][ep2]…`; an input context is
+  `[input control][slot][ep1]…`. Use the device arithmetic to fill an input
+  context and the slot context lands on the input control context's add and drop
+  flags — which is a configure command that reconfigures whichever endpoints
+  those bits happen to name. The test asserts the difference is exactly one
+  stride at every index, and it was watched red by making the two functions
+  agree.
+
+**Three more bounds written into the types rather than left to a driver**: the
+device context base address array needs one entry *per slot plus one*, because
+entry zero is the scratchpad pointer and not a slot — sizing it by the slot
+count leaves the controller reading past the allocation. `context_entries` is an
+index rather than a count, and the controller reads exactly that many endpoint
+contexts, so setting it above what was initialised is the controller reading
+uninitialised memory as endpoint state. And the drop flags for indices 0 and 1
+are **reserved** — the slot context and the control endpoint cannot be dropped,
+only re-evaluated — so `dropping` refuses them rather than writing a reserved
+bit and finding out what the controller does with it. Watched red.
+
+Transfer ring pointers are 16-byte aligned and straddle dwords 2 and 3, so they
+get the same treatment as the other pointers in this crate: refused unless
+aligned, because the low bits are read as cycle state rather than address, and
+tested across the dword split where a 32-bit truncation would drop the top half.
+
+Sixty host tests now, two more watched red today. Still no `unsafe` and still
+nothing in the kernel using any of it. Step 5 — TRBs and the rings they sit in —
+is what remains before a driver can be written.
+
 ### 2026-08-22 (RFC 0038 step 3: runtime registers and doorbells, and a bound that was the wrong number)
 
 Steps 2 and 3 of RFC 0038 — the capability and operational banks landed with
