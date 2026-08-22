@@ -1204,8 +1204,13 @@ LOCK ORDER  blocking on wait::WaitQueue (rank 9) while holding mask 0b1100000000
 
 Ranks 9 and 10 — `WaitQueue` and `SchedRunqueue` — held while blocking on a wait
 queue. One boot in 300, during the wait-queue stress test (18,665 sleeps, four
-races caught in the window), on a boot where a thread had been stolen. The log
-is preserved.
+races caught in the window), on a boot where a thread had been stolen.
+
+**The log is kept at
+`/root/bhaskix-soak-artifacts/2026-08-22-soak-jobs1-lockorder-run-38.log`** on
+the build machine, beside the 2026-08-16 and 2026-08-17 specimens. Named,
+because a specimen whose location is described as "preserved" is a specimen
+nobody finds — and this one is the only instance of its marker in 300 boots.
 
 **One explanation is already ruled out by that boot's own report**: it says
 `saved holding  no thread was switched out holding a rank`, so the mask was not
