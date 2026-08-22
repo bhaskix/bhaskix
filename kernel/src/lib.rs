@@ -16626,6 +16626,16 @@ fn banner() {
     println!("{TEXT}     built from scratch, from India.{OFF}");
     println!();
     println!("{DIM}     Original author and developer   {OFF}{TEXT}Tarun Kumar Kushwaha{OFF}");
+    // The people the author wanted named where a person actually looks, which
+    // is the screen in front of them rather than a file in the repository.
+    // `CREDITS.md` says the same thing at length; this says it at boot.
+    println!(
+        "{DIM}     With thanks to                  {OFF}{TEXT}Prince Komal Boonlia · Mayur Agnihotri{OFF}"
+    );
+    println!(
+        "{DIM}                                     {OFF}{TEXT}Devesh Singh · Neha Mourya{OFF}"
+    );
+    println!("{DIM}                                     {OFF}{TEXT}the StraightArc Team{OFF}");
     println!("{DIM}     version {VERSION}  ·  x86_64  ·  Apache-2.0{OFF}");
     println!();
 }

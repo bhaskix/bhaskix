@@ -176,7 +176,8 @@ before reporting.
 
 Created and maintained by **Tarun Kumar Kushwaha** — original author and project lead.
 
-See [AUTHORS.md](AUTHORS.md) for all contributors.
+See [AUTHORS.md](AUTHORS.md) for all contributors, and [CREDITS.md](CREDITS.md) for the people
+whose support made the work possible.
 
 ## Prior art and acknowledgement
 

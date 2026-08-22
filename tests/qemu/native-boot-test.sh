@@ -344,6 +344,15 @@ fi
 # and the absence of any jump.
 echo "the negative arm: a corrupted kernel must be refused, up to ${TIMEOUT}s..."
 printf 'XXXX' | dd of="$ESP/bhaskix/kernel" bs=1 count=4 conv=notrunc 2>/dev/null
+# **Put it back on the way out, whatever happens.** The corruption above is
+# deliberate and the refusal it proves is worth having; leaving it behind is
+# not. This directory is a staged ESP, and it is the obvious thing to build
+# real boot media from -- which somebody did on 2026-08-22, imaged a kernel
+# with its ELF magic destroyed, and spent a while establishing that the loader
+# was right and the medium was wrong. A trap that only springs outside the
+# test that set it is the worst kind.
+restore_kernel() { cp "$KERNEL" "$ESP/bhaskix/kernel" 2>/dev/null; }
+trap restore_kernel EXIT
 cp "$OVMF_VARS" "$WRITABLE_VARS"
 NEGATIVE_LOG=$(mktemp)
 timeout "$TIMEOUT" qemu-system-x86_64 \
