@@ -68,11 +68,26 @@ impl Fnv {
     }
 }
 
+/// The most this loader asks the firmware for in one read.
+///
+/// **Not an optimisation — a diagnosis.** The first version asked for the whole
+/// remaining buffer, which is sixteen mebibytes for the kernel, in a single
+/// call. That is one firmware round trip with nothing to show for it until it
+/// returns, and on 2026-08-22 a Lenovo SR550 booting this loader from a virtual
+/// CD stopped after the banner and stayed silent: a firmware call that had not
+/// returned and a read that had not started are indistinguishable from outside.
+///
+/// A mebibyte at a time turns a long read into visible progress, and asks the
+/// firmware for something a CD-backed volume is more likely to answer promptly.
+const READ_CHUNK: usize = 1 << 20;
+
 /// Reads a whole file into `buffer`, returning how many bytes arrived.
 ///
 /// A file that fills the buffer with more to come is refused — the caller
 /// sized the buffer as a stated cap, and a payload past it is a different
 /// payload than the build produced.
+///
+/// Writes a dot per chunk, so slow media reads as slow rather than as stopped.
 fn read_fully(root: *mut File, path: &str, buffer: &mut [u8]) -> Result<usize, usize> {
     let file = efi::open_read_only(root, path)?;
     let mut total = 0usize;
@@ -87,7 +102,12 @@ fn read_fully(root: *mut File, path: &str, buffer: &mut [u8]) -> Result<usize, u
                 Err(usize::MAX)
             };
         }
-        let got = match efi::read(file, &mut buffer[total..]) {
+        let end = if buffer.len() - total > READ_CHUNK {
+            total + READ_CHUNK
+        } else {
+            buffer.len()
+        };
+        let got = match efi::read(file, &mut buffer[total..end]) {
             Ok(got) => got,
             Err(status) => {
                 efi::close(file);
@@ -98,7 +118,9 @@ fn read_fully(root: *mut File, path: &str, buffer: &mut [u8]) -> Result<usize, u
             break;
         }
         total += got;
+        serial::write(".");
     }
+    serial::write("\r\n");
     efi::close(file);
     Ok(total)
 }
@@ -160,24 +182,44 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         serial::write("bhaskixboot: no valid system table; stopping at the banner\r\n");
         return efi::SUCCESS;
     };
-    if let Some(con_out) = efi::con_out(table) {
-        console_write(con_out, BANNER);
+    serial::write("bhaskixboot: system table validated\r\n");
+
+    // **The console banner is the last thing in this window that calls
+    // firmware**, and on 2026-08-22 an SR550 stopped somewhere in here with
+    // only the serial banner out. These three markers exist to say which of
+    // the three steps it was, because a boot on somebody's server is too
+    // expensive to spend on a guess.
+    match efi::con_out(table) {
+        Some(con_out) => {
+            serial::write("bhaskixboot: console located, writing the banner to it\r\n");
+            console_write(con_out, BANNER);
+            serial::write("bhaskixboot: console banner written\r\n");
+        }
+        None => serial::write("bhaskixboot: no console output protocol; serial only\r\n"),
     }
 
     // The payload, read whole into pages the loader owns. The kernel and
     // the initrd are allocated as `LoaderCode` — the label the region
     // translation turns into `KernelAndModules` — and their checksums are
     // printed for the gate exactly as when they were streamed.
+    // **A marker before every firmware call in this window**, because the
+    // window used to be silent: from the banner to the first payload line the
+    // loader said nothing, so a call that never returned looked exactly like a
+    // loader that had not started. On the SR550 that cost a boot to learn
+    // nothing from. Each of these is one line and buys the next failure a name.
+    serial::write("bhaskixboot: opening the boot volume\r\n");
     let root = match efi::open_boot_volume(table, image_handle) {
         Ok(root) => root,
         Err(status) => refuse("the boot volume would not open", status as u64),
     };
+    serial::write("bhaskixboot: allocating the kernel buffer\r\n");
     let kernel_base = match efi::allocate_pages(table, efi::LOADER_CODE, KERNEL_BUFFER_PAGES) {
         Ok(base) => base,
         Err(status) => refuse("the kernel buffer would not allocate", status as u64),
     };
     // SAFETY: just allocated, sized as passed.
     let kernel_buffer = unsafe { pages_as_slice(kernel_base, KERNEL_BUFFER_PAGES) };
+    serial::write("bhaskixboot: reading bhaskix\\kernel ");
     let kernel_len = match read_fully(root, KERNEL_PATH, kernel_buffer) {
         Ok(len) => len,
         Err(status) => refuse("payload kernel REFUSED", status as u64),
@@ -190,6 +232,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     };
     // SAFETY: just allocated, sized as passed.
     let initrd_buffer = unsafe { pages_as_slice(initrd_base, INITRD_BUFFER_PAGES) };
+    serial::write("bhaskixboot: reading bhaskix\\initrd.tar ");
     let initrd_len = match read_fully(root, INITRD_PATH, initrd_buffer) {
         Ok(len) => len,
         Err(status) => refuse("payload initrd REFUSED", status as u64),
