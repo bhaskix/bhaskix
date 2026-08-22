@@ -61,7 +61,7 @@ until 2026-08-18, two days stale, found while closing RFC 0029. No architecture 
 
 ## Phase 1 — Foundation ✅ complete
 
-### M1 — Boot and output ✅ *(17/18 — M1-17, booting real hardware, is blocked on a machine)*
+### M1 — Boot and output ✅ *(17/18 — M1-17, booting real hardware: booted on an SR550 2026-08-22 and observed on screen, but no report was captured, so it is owed rather than met)*
 
 *Vision milestone 1: "Boot with UEFI, print Hello from Bhaskix".*
 
@@ -477,7 +477,7 @@ production readiness. The word for what this is, and the word the release notes 
 | R2 | The ISO boots to a user-mode shell on BIOS, UEFI, and our own loader | met |
 | R3 | A package installs, runs with manifest-derived grants, and removes | met (RFC 0030) |
 | R4 | Networking answers on both address families, measured | met (RFC 0018–0029) |
-| R5 | **Boots on one piece of real hardware** | **not met** — M1-17, blocked on a machine |
+| R5 | **Boots on one piece of real hardware** | **not met** — M1-17. Not blocked on a machine since 2026-08-22: the image booted on a Lenovo SR550, observed on screen. Nothing was captured, so what is owed is a boot report somebody read |
 | R6 | The design documents reviewed by two people who did not write them | **not met** — Phase 0's own criterion |
 | R7 | A release note that states the gaps above as plainly as the features | to write |
 

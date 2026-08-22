@@ -22,7 +22,7 @@ What can be counted honestly, with how to recount it:
 
 | | | how it is derived |
 |---|---|---|
-| **First release** | **29 November 2026** — set by the project lead 2026-08-19; a developer preview, scope in `docs/roadmap.md` | Seven criteria, five met today. The two that are not are the ones that decide what the release may claim: **R5** boots on real hardware (M1-17, blocked on a machine) and **R6** two independent document reviewers (Phase 0's own unmet criterion). If either is still open on the day, the release ships saying so |
+| **First release** | **29 November 2026** — set by the project lead 2026-08-19; a developer preview, scope in `docs/roadmap.md` | Seven criteria, five met today. The two that are not are the ones that decide what the release may claim: **R5** boots on real hardware (M1-17 — not blocked on a machine since 2026-08-22, when one booted on an SR550; what is owed is a *captured* boot report from it) and **R6** two independent document reviewers (Phase 0's own unmet criterion). If either is still open on the day, the release ships saying so |
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **9 of 10 done** | §4 below; the tenth row — libc, resolved into the Linux personality — **was missing from that table until 2026-08-19** while the roadmap carried the bullet, so this count read 9 of 9 and meant 9 of 10. The ninth — package management and image building — closed 2026-08-19 with RFC 0030 (accepted the same day), the eighth — networking — on 2026-08-18 with RFC 0029. The table has grown as bullets became rows: 7 until telemetry joined 2026-08-17, 8 until packages joined 2026-08-19, 9 until the missing libc row was added the same day |
 | Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
@@ -711,7 +711,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Task | Blocked on | Owner |
 |---|---|---|
-| M1-17 | Physical UEFI machine with serial. QEMU cannot substitute. | Tarun Kumar Kushwaha |
+| M1-17 | ~~Physical UEFI machine with serial. QEMU cannot substitute.~~ **The machine is no longer the blocker, corrected 2026-08-23.** A Lenovo ThinkSystem SR550 is available over its BMC and the image booted on it 2026-08-22, observed on screen. What is owed is a boot that was **captured**: the output reached the framebuffer and not serial-over-LAN, so no boot report was read and no self-test result from real hardware is known. This row read as though no machine existed for a day after one did. | Tarun Kumar Kushwaha |
 | Repo metadata | GitHub description and topics are unset, and `main` has no branch protection — `GOVERNANCE.md` §2 requires review for non-trivial changes and nothing enforces it. Deploy keys have no API scope, so these need the web UI. | Tarun Kumar Kushwaha |
 | CI log access | Reading Actions logs needs authentication; unauthenticated API gives 60 requests/hour and only pass/fail. A fine-grained token with `Actions: read` would remove both limits. | Tarun Kumar Kushwaha |
 
@@ -776,7 +776,7 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 | **A supervisor's write commits, and its read does not** — the invariant behind 2026-08-20's three `EFAULT` bugs, asserted at boot in both directions and both watched failing | 2026-08-21 | security.md §1 gap 4; `vm::frame_for_write` |
 | **Instruction containment** — every crate holding an architecture-specific instruction declares an `asm_budget` and a reason; undeclared is a hard failure, and the gate is watched refusing a fixture on every run | 2026-08-20 | architecture.md §7 |
 | No vendor strings in published files | M1 | Project policy |
-| No AI-vendor attribution — **refused at commit time** by `tools/git-hooks/{pre-commit,commit-msg}`, and the hooks' installation is itself checked | M1 (hooks 2026-08-20) | Project policy; CONTRIBUTING.md §"AI-assisted contributions" cond. 3 |
+| No AI-vendor attribution — **refused at commit time** by `tools/git-hooks/{pre-commit,commit-msg}`, and the hooks' installation is itself checked | M1 (hooks written 2026-08-20, committed 2026-08-23) | Project policy; CONTRIBUTING.md §"AI-assisted contributions" cond. 3 |
 | Frame-leak test (1000 address spaces, zero drift) | M3 | memory.md §7 |
 | RT latency p99.9 < 50 µs | M4 | scheduler.md §4 |
 | Fuzz targets on every untrusted parser | M6 | coding-style.md §8 |
@@ -791,116 +791,75 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
-### 2026-08-20 (the attribution rule stops being a policy and becomes a hook: refused before the commit object exists)
+### 2026-08-23 (four rows still said no machine existed, a day after one had booted the image)
 
-**The rule was already checked; it was never *enforced*.** `tools/check-containment.sh` scans the
-working tree, every commit message, author, tag and ref, and every blob in history — thoroughly, and
-**after the commit exists**. Its own comment says the part that matters: history is permanent,
-mirrored and indexed, and a string that reaches a public push cannot be taken back without rewriting
-the repository. A scan that runs at `make gates` can therefore only ever report damage that is
-already done. Two hooks now refuse it at the only moment it is still cheap.
+**M1-17's blocker was a machine, and the machine arrived on 2026-08-22.** This file's §"How far
+along is this, in numbers" and `docs/roadmap.md`'s Phase 1 paragraph were both updated that day with
+the careful version: the image booted on a Lenovo ThinkSystem SR550, observed on screen by the
+operator, and **nothing was captured** — output reached the framebuffer and not serial-over-LAN, so
+no boot report was read and no self-test result from real hardware is known. **Four other rows were
+not updated**, and every one of them still read `blocked on a machine`: this file's Blockers table
+and its first-release cell, and `docs/roadmap.md`'s M1 heading and its R5 release criterion.
 
-**`tools/git-hooks/pre-commit`** reads the **index**, not the working tree — `git show :path`, so a
-file edited after `git add` is judged on the bytes that would actually be committed. **`commit-msg`**
-is separate and has to be: pre-commit never sees the message, because the message does not exist when
-it runs, and a trailer added automatically by tooling is precisely the leak being guarded against.
+**The correction is not to mark M1-17 met.** It is not met, and the criterion is unchanged — a boot
+whose report somebody read. What changed is *what it waits on*: no longer a machine, which is
+available over its BMC, but a captured report from one. A row that names the wrong blocker sends the
+next person looking for hardware that is already sitting there, which is the whole cost of a stale
+blocker and the reason this is worth a commit.
 
-**The trailer ban catches a shape rather than guessing a vocabulary**, which is why bare model words
-are deliberately *not* in the pattern. "opus", "sonnet", "haiku", "fable", "llama" are ordinary
-English and a kernel tree may one day use them innocently; an attribution carrying one would appear
-in a commit trailer, and `Co-Authored-By:`/`Generated with`/`Assisted-by:`/`On-behalf-of:` are refused
-whoever they name. Bare `gpt` is excluded for a concrete reason: this is a UEFI project and GPT is the
-GUID Partition Table, so a partition parser in `boot/bhaskixboot` would trip it. Every exclusion has
-its trigger written beside it in `tools/vendor-pattern.sh`.
+**The historical entries in this section are left alone**, as always: two of them say M1-17 is
+blocked on a machine and were true on the day they were written. Corrections go where the live claim
+is.
 
-**The pattern moved to one file so three copies could not become three patterns.** `vendor-pattern.sh`
-is sourced by the script and both hooks; the day they disagree would be the day the weakest one is the
-rule. It broadened while it moved — five more vendor spellings joined, each with zero hits anywhere in
-the tree, so nothing existing had to change. Every enforcement file is written with its strings
-assembled from fragments and **contains none of them literally**, verified: a literal grep over all six
-returns 0, which is what keeps the un-exemptable blob-history scan green once they are committed.
+### 2026-08-23 (a change this file said had shipped had never been committed, and the changelog stopped being newest-first underneath it)
 
-**A hook nobody installed prevents nothing, so the installation is itself a gate.** `check-containment.sh`
-now fails when `core.hooksPath` is not `tools/git-hooks`, checked as configuration rather than by
-looking for files — hooks present but not pointed at are decoration. `make hooks` installs them and
-`tools/setup-dev.sh` does it during setup, so a fresh clone that skips it gets a red build rather than
-a silent hole.
+**The record claimed a gate no clone had.** On 2026-08-20 `ae9da6f` added three entries to this
+section and a row to §6's gate table, describing the AI-vendor attribution rule becoming a pair of
+git hooks. The entries are accurate about what was *built*. **None of the files were committed.**
+`tools/git-hooks/pre-commit`, `tools/git-hooks/commit-msg`, `tools/vendor-pattern.sh`, the
+`make hooks` target, `check-containment.sh`'s section 4, the installation in `tools/setup-dev.sh`,
+`CONTRIBUTING.md`'s third condition, `docs/coding-style.md` §9 and RFC 0034 sat in the working tree
+for three days while **51 commits** landed on top of them.
 
-**All five checks were watched failing before being believed**, per the standing rule. Armed in a
-throwaway repository so no history here was touched: a staged file carrying a vendor name (refused); a
-staged file carrying one of the *newly* covered names (refused, so the broadening is real); the same
-name in a commit message with clean files (refused); a `Co-Authored-By:` naming an ordinary person and
-no vendor at all (refused — the shape, not the vocabulary); and `core.hooksPath` unset, which turned
-the gate red and green again on restore. **The control matters as much**: a conventional
-`Signed-off-by:` commit with clean content still passes, so this is a gate and not a wall.
+**What it cost, stated precisely rather than dramatically.** Nothing was ever at risk of passing
+wrongly: the three history scans in `check-containment.sh` ran on every `make gates` and on every CI
+run, from the *committed* script, and those are the checks that would catch a leak. What was wrong
+was the **claim**. On a fresh clone there were no hooks, no `make hooks` to install them with, and no
+check that they were installed — so a rule §6 calls *refused at commit time* was enforced on exactly
+one machine, and `CONTRIBUTING.md`'s "enforced mechanically, not by review" was false for everybody
+who was not sitting at it.
 
-**The installation check would have turned CI permanently red, and was caught before it did.** CI
-checks out a fresh tree and never creates a commit, so `core.hooksPath` is unset there by
-construction — a gate demanding it would have failed every run forever. It is skipped when `CI` is
-set, and says so on the line rather than staying quiet. The skip does not weaken anything: hooks
-protect the *creation* of a commit, which happens on developer machines, and CI's backstop is the
-three history scans that do run there. Verified in both directions — with `core.hooksPath` unset,
-`CI=true` exits 0 and a developer shell exits 1.
+**This is the class `tools/check-tracked-modules.py` was written for on 2026-08-22** — *what is
+pushed is the index, not the working tree* — and that check could not see it. Its subject is `mod x;`
+against a tracked `x.rs`; a tool, a hook or a document that the record describes and the index does
+not hold is the same failure one layer out, and nothing looks for it. **Named here and not built**: a
+gate invented inside the entry that found the hole is a gate nobody has thought about, and this one
+needs a definition of "the record describes it" that is not a grep for backticks.
 
-**One pre-existing mislabel corrected on the way.** `check-containment.sh`'s section 3 header read
-"SPDX headers" while the block beneath it was the git-history scan — a copy-paste that had been there
-since the history check was added. Corrected rather than deleted.
+**Re-verified before committing, rather than trusted from the entry below.** That entry says all five
+of its checks were watched red; that was three days and 51 commits ago, so they were run again
+against the files actually being staged. Six behaviours, in a throwaway repository so that no history
+here was touched: a staged file carrying a vendor name — refused; a vendor name in the message with
+clean content — refused; `Co-Authored-By:` naming an ordinary person and no vendor at all — refused,
+which is the shape rather than the vocabulary; a `Generated with` line — refused; and two controls, a
+conventional `Signed-off-by:` commit with clean content and a commit staging `vendor-pattern.sh`
+itself, **both accepted**, so this is a gate and not a wall. Then the installation check, on this
+repository with the configuration saved and restored: `core.hooksPath` pointed elsewhere and
+`core.hooksPath` unset both turn it red and name `make hooks`, `CI=1` skips it and says so on the
+line, and the restore was verified green.
 
-**Documented where a contributor actually looks**: `CONTRIBUTING.md`'s "AI-assisted contributions"
-gains a third condition and the enforcement list; `docs/coding-style.md` §9 gains the trailer rule
-beside the commit format it already specifies. **Both state the rule without naming a single vendor**,
-which is not squeamishness — a document that spelled the words would be a document that trips its own
-gate.
+**And the changelog stopped being newest-first, by the same commit's hand.** `ae9da6f` inserted its
+three entries at the top of §7, correctly ordered at 15:52 on 2026-08-20. Every entry written
+afterwards went in *below the first two*, which turned them into a fixed header: this file opened
+with two 2026-08-20 entries standing above 2026-08-23's and all of 2026-08-22's. They are moved back
+beside the third entry of the same commit, where they belong. Verified as a **pure move** — the
+sorted lines of the file before and after are identical, so nothing was edited while being carried.
 
-### 2026-08-20 (RFC 0034 drafted: the adoption case audited against the tree, and three claims found with nothing under them)
-
-**A strategy was relayed for consideration and is recorded as a ledger rather than adopted as a
-direction.** *Keep Linux software compatibility, replace the underlying architecture* — five
-properties, five audiences, a set of rules about how the project describes itself. Roughly two
-thirds of it describes what this tree genuinely does, which is exactly the dangerous ratio: a
-document where most rows are true is one where the false rows travel unchallenged. So the RFC's
-deliverable is not the argument, which is largely RFC 0031's restated, but the **audit** — every
-claim carrying a status and the line in this tree that decides it. **Two ✅, five 🔨, eight ⬜,
-one ❌.**
-
-**The honest reading is unflattering to the pitch and flattering to the tree.** The security
-architecture it sells is largely real, gated, and better-evidenced than the pitch knew. The
-compatibility half is entirely future, and every audience story but one rests on it.
-
-**Three things nobody had written down.** *"Performant" is not a tracked property of this project
-at all* — §6 lists one performance gate, `architecture.md`'s "Native software never pays" has none,
-and `vision.md` refuses the benchmark-first premise on purpose, so the claim has nothing behind it
-and the recommendation is to withdraw it rather than manufacture a suite to back a pitch. *The
-proposed demonstration is stronger than the one specified* — RFC 0031 §6 Test 1 is a synthetic probe
-that proves the boundary is **shaped** right and never explodes anything, against a real application
-really exploited with its neighbour still serving; recommended as L3's demonstration criterion,
-which costs nothing now and cannot be faked early. And *`SecSphere` appears nowhere in this
-repository*, so the name stays out of these documents until something introduces it.
-
-**One row is stronger than the pitch claimed it.** `Cargo.lock` holds 20 packages and all 20 are
-`bhaskix-*` — this workspace has zero external dependencies, which is a supply-chain position the
-material undersold and `security.md` §1 lists as an out-of-scope threat with "Phase 2" beside it.
-
-**A governance item, G1, is raised and deliberately not resolved.** `vision.md` line 82 lists
-binary compatibility as an anti-goal — "**Not** binary compatibility with Linux" — and has
-contradicted RFC 0031, RFC 0005 and the L1–L4 roadmap rows **since 2026-08-19**, unnoticed on the
-day RFC 0031 was drafted. `vision.md` is an *adopted* document whose header requires a governance
-decision, and `GOVERNANCE.md` §2 puts architecture direction with the project lead after an RFC. The
-RFC quotes it, states that its second clause ("never a nucleus concern") is not merely satisfied but
-gated at 0, recommends amendment, and **edits nothing**.
-
-**A stale number was caught on the way and is named rather than used.** The RFC's first claim was
-drafted citing **five** concurrent hosted processes — which RFC 0033's Summary, `roadmap.md`'s L1
-row and this file's **HP1** row all still say. Step 3, the entry directly below this one, raised the
-four limits behind that figure the same day; `abi/src/lib.rs` reads `MAX_DOMAINS` 64 and the true
-figure is **twenty-five**. Step 3 recorded itself here and in RFC 0033's own step-3 section and did
-not update the three places carrying the old one — working rule 1's exact failure. Not fixed in this
-change, because it belongs to step 3's; named so the next person to quote "five" does not have to
-find it again.
-
-**No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
-unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
-in plain text.
+**A second, older violation is recorded rather than guessed at.** Four 2026-08-05 entries sit inside
+a run of 2026-08-07 ones — the last of them *RFC 0011 step 6, the last blocked step* — and six
+2026-08-06 entries follow that run. That is an interleaved region from early August rather than one
+stranded entry, and putting it right needs the intended order, not an assumption about it. Found,
+located, and left alone.
 
 ### 2026-08-23 (a boot gate failed on a fact the scheduler had in its hand and threw away)
 
@@ -3756,6 +3715,127 @@ majority of them idle threads, which is what the number is supposed to look like
 **What this does not do is find the fault.** It makes the next occurrence say something instead of
 nothing. The fault has been seen once in fourteen runs of one placement; the instrument is now able
 to name the site and the thread when it happens again.
+
+### 2026-08-20 (the attribution rule stops being a policy and becomes a hook: refused before the commit object exists)
+
+**The rule was already checked; it was never *enforced*.** `tools/check-containment.sh` scans the
+working tree, every commit message, author, tag and ref, and every blob in history — thoroughly, and
+**after the commit exists**. Its own comment says the part that matters: history is permanent,
+mirrored and indexed, and a string that reaches a public push cannot be taken back without rewriting
+the repository. A scan that runs at `make gates` can therefore only ever report damage that is
+already done. Two hooks now refuse it at the only moment it is still cheap.
+
+**`tools/git-hooks/pre-commit`** reads the **index**, not the working tree — `git show :path`, so a
+file edited after `git add` is judged on the bytes that would actually be committed. **`commit-msg`**
+is separate and has to be: pre-commit never sees the message, because the message does not exist when
+it runs, and a trailer added automatically by tooling is precisely the leak being guarded against.
+
+**The trailer ban catches a shape rather than guessing a vocabulary**, which is why bare model words
+are deliberately *not* in the pattern. "opus", "sonnet", "haiku", "fable", "llama" are ordinary
+English and a kernel tree may one day use them innocently; an attribution carrying one would appear
+in a commit trailer, and `Co-Authored-By:`/`Generated with`/`Assisted-by:`/`On-behalf-of:` are refused
+whoever they name. Bare `gpt` is excluded for a concrete reason: this is a UEFI project and GPT is the
+GUID Partition Table, so a partition parser in `boot/bhaskixboot` would trip it. Every exclusion has
+its trigger written beside it in `tools/vendor-pattern.sh`.
+
+**The pattern moved to one file so three copies could not become three patterns.** `vendor-pattern.sh`
+is sourced by the script and both hooks; the day they disagree would be the day the weakest one is the
+rule. It broadened while it moved — five more vendor spellings joined, each with zero hits anywhere in
+the tree, so nothing existing had to change. Every enforcement file is written with its strings
+assembled from fragments and **contains none of them literally**, verified: a literal grep over all six
+returns 0, which is what keeps the un-exemptable blob-history scan green once they are committed.
+
+**A hook nobody installed prevents nothing, so the installation is itself a gate.** `check-containment.sh`
+now fails when `core.hooksPath` is not `tools/git-hooks`, checked as configuration rather than by
+looking for files — hooks present but not pointed at are decoration. `make hooks` installs them and
+`tools/setup-dev.sh` does it during setup, so a fresh clone that skips it gets a red build rather than
+a silent hole.
+
+**All five checks were watched failing before being believed**, per the standing rule. Armed in a
+throwaway repository so no history here was touched: a staged file carrying a vendor name (refused); a
+staged file carrying one of the *newly* covered names (refused, so the broadening is real); the same
+name in a commit message with clean files (refused); a `Co-Authored-By:` naming an ordinary person and
+no vendor at all (refused — the shape, not the vocabulary); and `core.hooksPath` unset, which turned
+the gate red and green again on restore. **The control matters as much**: a conventional
+`Signed-off-by:` commit with clean content still passes, so this is a gate and not a wall.
+
+**The installation check would have turned CI permanently red, and was caught before it did.** CI
+checks out a fresh tree and never creates a commit, so `core.hooksPath` is unset there by
+construction — a gate demanding it would have failed every run forever. It is skipped when `CI` is
+set, and says so on the line rather than staying quiet. The skip does not weaken anything: hooks
+protect the *creation* of a commit, which happens on developer machines, and CI's backstop is the
+three history scans that do run there. Verified in both directions — with `core.hooksPath` unset,
+`CI=true` exits 0 and a developer shell exits 1.
+
+**One pre-existing mislabel corrected on the way.** `check-containment.sh`'s section 3 header read
+"SPDX headers" while the block beneath it was the git-history scan — a copy-paste that had been there
+since the history check was added. Corrected rather than deleted.
+
+**Documented where a contributor actually looks**: `CONTRIBUTING.md`'s "AI-assisted contributions"
+gains a third condition and the enforcement list; `docs/coding-style.md` §9 gains the trailer rule
+beside the commit format it already specifies. **Both state the rule without naming a single vendor**,
+which is not squeamishness — a document that spelled the words would be a document that trips its own
+gate.
+
+> **Corrected 2026-08-23.** Everything above describes what was *built* on 2026-08-20 and is accurate
+> about it. **None of it was committed until 2026-08-23**, 51 commits later, and §6's gate row read
+> `hooks 2026-08-20` throughout — so this entry, and that row, described an enforcement that no clone
+> of this repository had. The scans that do run on CI were unaffected. See the 2026-08-23 entry at
+> the top of this section.
+
+### 2026-08-20 (RFC 0034 drafted: the adoption case audited against the tree, and three claims found with nothing under them)
+
+**A strategy was relayed for consideration and is recorded as a ledger rather than adopted as a
+direction.** *Keep Linux software compatibility, replace the underlying architecture* — five
+properties, five audiences, a set of rules about how the project describes itself. Roughly two
+thirds of it describes what this tree genuinely does, which is exactly the dangerous ratio: a
+document where most rows are true is one where the false rows travel unchallenged. So the RFC's
+deliverable is not the argument, which is largely RFC 0031's restated, but the **audit** — every
+claim carrying a status and the line in this tree that decides it. **Two ✅, five 🔨, eight ⬜,
+one ❌.**
+
+**The honest reading is unflattering to the pitch and flattering to the tree.** The security
+architecture it sells is largely real, gated, and better-evidenced than the pitch knew. The
+compatibility half is entirely future, and every audience story but one rests on it.
+
+**Three things nobody had written down.** *"Performant" is not a tracked property of this project
+at all* — §6 lists one performance gate, `architecture.md`'s "Native software never pays" has none,
+and `vision.md` refuses the benchmark-first premise on purpose, so the claim has nothing behind it
+and the recommendation is to withdraw it rather than manufacture a suite to back a pitch. *The
+proposed demonstration is stronger than the one specified* — RFC 0031 §6 Test 1 is a synthetic probe
+that proves the boundary is **shaped** right and never explodes anything, against a real application
+really exploited with its neighbour still serving; recommended as L3's demonstration criterion,
+which costs nothing now and cannot be faked early. And *`SecSphere` appears nowhere in this
+repository*, so the name stays out of these documents until something introduces it.
+
+**One row is stronger than the pitch claimed it.** `Cargo.lock` holds 20 packages and all 20 are
+`bhaskix-*` — this workspace has zero external dependencies, which is a supply-chain position the
+material undersold and `security.md` §1 lists as an out-of-scope threat with "Phase 2" beside it.
+
+**A governance item, G1, is raised and deliberately not resolved.** `vision.md` line 82 lists
+binary compatibility as an anti-goal — "**Not** binary compatibility with Linux" — and has
+contradicted RFC 0031, RFC 0005 and the L1–L4 roadmap rows **since 2026-08-19**, unnoticed on the
+day RFC 0031 was drafted. `vision.md` is an *adopted* document whose header requires a governance
+decision, and `GOVERNANCE.md` §2 puts architecture direction with the project lead after an RFC. The
+RFC quotes it, states that its second clause ("never a nucleus concern") is not merely satisfied but
+gated at 0, recommends amendment, and **edits nothing**.
+
+**A stale number was caught on the way and is named rather than used.** The RFC's first claim was
+drafted citing **five** concurrent hosted processes — which RFC 0033's Summary, `roadmap.md`'s L1
+row and this file's **HP1** row all still say. Step 3, the entry directly below this one, raised the
+four limits behind that figure the same day; `abi/src/lib.rs` reads `MAX_DOMAINS` 64 and the true
+figure is **twenty-five**. Step 3 recorded itself here and in RFC 0033's own step-3 section and did
+not update the three places carrying the old one — working rule 1's exact failure. Not fixed in this
+change, because it belongs to step 3's; named so the next person to quote "five" does not have to
+find it again.
+
+**No code, no gate, no authority.** The RFC adds none of the three, and proposes no gate: a ledger of
+unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
+in plain text.
+
+> **Corrected 2026-08-23.** `docs/rfc/0034-the-adoption-case.md` was written on 2026-08-20 and
+> **committed on 2026-08-23**; it was an untracked file for three days while this entry described it
+> as drafted. See the 2026-08-23 entry at the top of this section.
 
 ### 2026-08-20 (RFC 0033 step 3: four limits raised, a latent aliasing bug found, and the bill printed)
 
