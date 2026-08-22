@@ -177,7 +177,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
-        test-placements mkfs test-shell test-faults fmt clippy gates clean distclean help
+        test-placements mkfs test-shell test-faults fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -677,6 +677,18 @@ clippy:
 	cd $(BOOTEFI_DIR) && $(CARGO) clippy --release --target x86_64-unknown-uefi -- -D warnings
 	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+
+# Installs the git hooks that refuse an AI-vendor attribution before the commit
+# object exists. `gates` checks that this has been run, so a fresh clone that
+# skips it gets a red build rather than a silent hole.
+#
+# core.hooksPath rather than copies into .git/hooks: a copy is a snapshot that
+# stops tracking the file it came from, and the hook that matters is the one in
+# the tree everyone pulls.
+hooks:
+	@git config core.hooksPath tools/git-hooks
+	@chmod +x tools/git-hooks/pre-commit tools/git-hooks/commit-msg
+	@printf '  \033[1;32mok\033[0m    git hooks installed (pre-commit, commit-msg)\n'
 
 # The project-specific invariants from docs/. Each one is cheap and catches a
 # class of mistake that review reliably misses.

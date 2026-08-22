@@ -95,11 +95,30 @@ is stable and reachable.
 
 ## AI-assisted contributions
 
-Permitted, with two conditions, and no stigma attached:
+Permitted, with three conditions, and no stigma attached:
 
 1. **You understand and can defend every line you submit.** "The tool wrote it" is not an answer to a
    review question, and it is not a defence when it turns out to be wrong.
 2. **You have the right to submit it** — the DCO sign-off applies unchanged.
+3. **No tool attribution enters the repository.** Bhaskix carries no model-vendor name and no
+   assistant attribution in any file, commit message, tag, branch or release artifact. Commits carry
+   `Signed-off-by:` (and `Fixes:` where one applies) and no other trailer — no co-authorship line, no
+   generated-by line. See [docs/coding-style.md](docs/coding-style.md) §9.
+
+**Condition 3 is enforced mechanically, not by review**, because it is the one that cannot be fixed
+afterwards: a file can be edited, but a commit message, an author field, a tag or a branch name that
+has reached a public push is permanent, mirrored and indexed.
+
+- `tools/git-hooks/pre-commit` refuses staged content that carries an attribution.
+- `tools/git-hooks/commit-msg` refuses the message and any co-authorship or generated-by trailer,
+  whoever it names.
+- `tools/check-containment.sh` — run by `make gates` and by CI — rescans the working tree, every
+  commit message, every ref, and **every blob in history**, and additionally fails if the hooks are
+  not installed.
+
+Install the hooks once, with `make hooks`; `tools/setup-dev.sh` does it for you. The forbidden list
+lives in one place, `tools/vendor-pattern.sh`, which also records what is deliberately *not* on it
+and why.
 
 In a kernel, the cost of a subtly wrong line is measured in weeks of someone else's debugging. That
 standard is the same whoever or whatever typed it.

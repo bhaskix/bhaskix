@@ -44,11 +44,18 @@ fi
 
 # Local tooling context is excluded via .git/info/exclude and is never
 # published, so it is not scanned here.
-# The pattern is assembled from fragments and this script excludes itself,
-# because it is necessarily the one tracked file that contains the strings it
-# is looking for.
-PATTERN="cla""ude|anthro""pic"
-vendor=$(git ls-files 2>/dev/null | grep -v '^tools/check-containment.sh$' | while read -r f; do
+#
+# **The pattern moved out of this file on 2026-08-20** and now lives in
+# tools/vendor-pattern.sh, which explains what it covers and what it
+# deliberately does not. It moved because this script stopped being the only
+# thing enforcing it: the hooks in tools/git-hooks/ refuse the commit before
+# the object exists, and three copies of a pattern are three patterns. The
+# fragment-assembly trick and the self-exclusion come with it -- see that file.
+# shellcheck source=vendor-pattern.sh
+. "$REPO_ROOT/tools/vendor-pattern.sh"
+PATTERN="$VENDOR_PATTERN"
+
+vendor=$(git ls-files 2>/dev/null | grep -vE "$VENDOR_EXEMPT" | while read -r f; do
     [[ -f "$f" ]] && grep -lniE "$PATTERN" "$f" 2>/dev/null
 done)
 
@@ -59,7 +66,11 @@ else
     pass "no vendor strings in tracked files"
 fi
 
-# --- 3. SPDX headers ------------------------------------------------------
+# --- 3. git history -------------------------------------------------------
+#
+# This header read "SPDX headers" until 2026-08-20 -- a copy-paste that
+# labelled the history scan after the section that actually follows it.
+# Corrected rather than deleted, per this project's rule about wrong claims.
 
 # Git history is the part that cannot be fixed later. A file can be edited; a
 # commit message, an author field, a tag or a branch name that has been pushed
@@ -114,13 +125,47 @@ blobs=$(git rev-list --all --objects 2>/dev/null | awk '{print $1}' \
 if [[ "$blobs" -gt 0 ]]; then
     fail "vendor strings found in a file somewhere in history"
     git grep -liE "$PATTERN" $(git rev-list --all) -- . 2>/dev/null \
-        | grep -v 'tools/check-containment.sh$' | head -20 | sed 's/^/        /' >&2
+        | grep -vE "$VENDOR_EXEMPT_SUFFIX" | head -20 | sed 's/^/        /' >&2
     echo "        A file that carried this was committed and may since have been" >&2
     echo "        deleted -- the working tree being clean does not clear it." >&2
     status=1
 else
     pass "no vendor strings in any file in history"
 fi
+
+# --- 4. the hooks are installed -------------------------------------------
+#
+# The scans above report; the hooks in tools/git-hooks/ are what actually
+# prevent. A hook nobody installed prevents nothing, and its absence is
+# invisible -- commits simply succeed. So the installation is itself a gate.
+#
+# Checked as configuration rather than by looking for files, because
+# core.hooksPath is what git obeys: hooks present in the directory but not
+# pointed at are decoration.
+# **Skipped on CI, deliberately, and it took a red build to notice.** CI checks
+# out a fresh tree and never creates a commit, so core.hooksPath is unset there
+# by construction and demanding it would fail every run forever. The property
+# hooks protect -- that a commit is never *created* carrying an attribution --
+# belongs to developer machines. CI's backstop is the three scans above, which
+# read the history a developer's hooks were supposed to keep clean, and those
+# do run here.
+hooks_path=$(git config --get core.hooksPath || true)
+if [[ -n "${CI:-}" ]]; then
+    pass "hook installation not checked on CI (no commits are created here)"
+elif [[ "$hooks_path" != "tools/git-hooks" ]]; then
+    fail "the vendor-attribution hooks are not installed (core.hooksPath is '${hooks_path:-unset}')"
+    echo "        Run: make hooks" >&2
+    echo "        Without them, the checks above can only report a string that" >&2
+    echo "        is already committed -- and history cannot be edited after a" >&2
+    echo "        public push." >&2
+elif [[ ! -x tools/git-hooks/pre-commit || ! -x tools/git-hooks/commit-msg ]]; then
+    fail "core.hooksPath is set but a hook is missing or not executable"
+    echo "        Run: make hooks" >&2
+else
+    pass "vendor-attribution hooks installed (pre-commit, commit-msg)"
+fi
+
+# --- 5. SPDX headers ------------------------------------------------------
 
 missing=$(git ls-files '*.rs' '*.sh' '*.py' 2>/dev/null | while read -r f; do
     [[ -f "$f" ]] || continue

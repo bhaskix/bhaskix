@@ -143,6 +143,17 @@ if (( CHECK_ONLY == 1 )); then
         exit 1
     fi
 else
+    # The hooks that refuse an AI-vendor attribution before a commit exists.
+    # Installed here rather than left to the contributor, because a rule that
+    # depends on somebody remembering to install it is not a rule -- and
+    # `make gates` fails when this has not been run, so skipping it here would
+    # only move the failure.
+    if git rev-parse --show-toplevel >/dev/null 2>&1; then
+        git config core.hooksPath tools/git-hooks
+        chmod +x tools/git-hooks/pre-commit tools/git-hooks/commit-msg 2>/dev/null || true
+        say "Git hooks installed (pre-commit, commit-msg)."
+    fi
+
     say "Setup complete."
     echo
     echo "  make        build the kernel and a bootable ISO"

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# Refuses to create a commit whose staged content carries an AI-vendor
+# attribution.
+#
+# **Why a hook and not only a CI gate.** tools/check-containment.sh already
+# scans the working tree, every commit message, every ref and every blob in
+# history -- and it runs after the commit exists. Its own comment says the part
+# that matters: history is permanent, mirrored and indexed, and a string that
+# reaches a public push cannot be taken back without rewriting the repository.
+# So the gate can only ever report the damage. This hook is where the rule is
+# actually enforced: before the object is written.
+#
+# Installed by `make hooks` or tools/setup-dev.sh, both of which set
+# core.hooksPath to tools/git-hooks. check-containment.sh verifies the
+# installation, so an uninstalled hook is a red build rather than a silent gap.
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 1
+# shellcheck source=../vendor-pattern.sh
+. "$REPO_ROOT/tools/vendor-pattern.sh"
+
+hits=""
+
+# The staged content, not the working tree: `git show :path` reads the index,
+# so a file edited after `git add` is judged on what would actually be
+# committed. Scanning the working tree here would check the wrong bytes.
+while IFS= read -r -d '' path; do
+    [[ "$path" =~ $VENDOR_EXEMPT ]] && continue
+    if git show ":$path" 2>/dev/null | grep -qiE "$VENDOR_PATTERN"; then
+        hits+="        $path"$'\n'
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [[ -n "$hits" ]]; then
+    printf '\033[1;31mFAIL\033[0m  AI-vendor attribution in staged content -- commit refused\n' >&2
+    printf '%s' "$hits" >&2
+    cat >&2 <<'EOF'
+
+        Bhaskix carries no AI-vendor attribution in any tracked file. This is
+        refused here, before the commit object exists, because a string that
+        reaches a public push cannot be removed without rewriting history.
+
+        Fix the file and stage it again. If you believe this is a false
+        positive, do not bypass the hook -- widen or narrow the pattern in
+        tools/vendor-pattern.sh, where every enforcement point reads it.
+EOF
+    exit 1
+fi
+
+exit 0

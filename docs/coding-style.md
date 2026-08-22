@@ -301,6 +301,9 @@ Signed-off-by: Name <email>
   `tools`, `tests`, `docs`, `ci`.
 - **Body:** what was wrong, why this fixes it, what the trade-off was. Not what the diff shows.
 - **DCO sign-off required** (`git commit -s`). See [../CONTRIBUTING.md](../CONTRIBUTING.md).
+- **`Signed-off-by:` and `Fixes:` are the only trailers.** No co-authorship line, no generated-by
+  line, and no model-vendor name anywhere in the message. Refused by `tools/git-hooks/commit-msg`
+  before the commit object exists, because a pushed message cannot be edited.
 - **One logical change per commit.** Rebase, do not merge, before submitting.
 - **PRs describe the design decision**, and where an alternative was rejected, say why. A rejected
   alternative recorded is worth more than the chosen one explained.
