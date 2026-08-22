@@ -188,11 +188,11 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     // protocol to avoid. Released again before `ExitBootServices`.
     if let Some(port) = efi::serial_io(table) {
         serial::adopt_firmware_port(port);
-        serial::write("bhaskixboot: speaking through the firmware's serial port\r\n");
+        diag("bhaskixboot: speaking through the firmware's serial port\r\n");
     } else {
-        serial::write("bhaskixboot: no firmware serial port; writing COM1 directly\r\n");
+        diag("bhaskixboot: no firmware serial port; writing COM1 directly\r\n");
     }
-    serial::write("bhaskixboot: system table validated\r\n");
+    diag("bhaskixboot: system table validated\r\n");
 
     // **The console banner is the last thing in this window that calls
     // firmware**, and on 2026-08-22 an SR550 stopped somewhere in here with
@@ -201,11 +201,13 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     // expensive to spend on a guess.
     match efi::con_out(table) {
         Some(con_out) => {
-            serial::write("bhaskixboot: console located, writing the banner to it\r\n");
+            // Adopted *before* the banner goes to it, so that everything from
+            // here on appears on the screen as well as the wire.
+            CONSOLE.store(con_out as usize, core::sync::atomic::Ordering::Relaxed);
             console_write(con_out, BANNER);
-            serial::write("bhaskixboot: console banner written\r\n");
+            diag("bhaskixboot: console adopted; diagnostics go to both\r\n");
         }
-        None => serial::write("bhaskixboot: no console output protocol; serial only\r\n"),
+        None => diag("bhaskixboot: no console output protocol; serial only\r\n"),
     }
 
     // The payload, read whole into pages the loader owns. The kernel and
@@ -217,12 +219,12 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     // loader said nothing, so a call that never returned looked exactly like a
     // loader that had not started. On the SR550 that cost a boot to learn
     // nothing from. Each of these is one line and buys the next failure a name.
-    serial::write("bhaskixboot: opening the boot volume\r\n");
+    diag("bhaskixboot: opening the boot volume\r\n");
     let root = match efi::open_boot_volume(table, image_handle) {
         Ok(root) => root,
         Err(status) => refuse("the boot volume would not open", status as u64),
     };
-    serial::write("bhaskixboot: allocating the kernel buffer\r\n");
+    diag("bhaskixboot: allocating the kernel buffer\r\n");
     let kernel_base = match efi::allocate_pages(table, efi::LOADER_CODE, KERNEL_BUFFER_PAGES) {
         Ok(base) => base,
         Err(status) => refuse("the kernel buffer would not allocate", status as u64),
@@ -529,6 +531,37 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
 }
 
 /// Prints `text` on the firmware console, UCS-2 encoded in bounded chunks.
+/// The firmware console this loader also speaks to, once it has one.
+///
+/// **Every diagnostic goes to both the wire and the screen**, and that is a
+/// lesson from a machine rather than a preference. On the SR550 the loader's
+/// serial output stopped after its first line, so five boots learned nothing —
+/// while the screen, which the operator was looking at, carried the banner and
+/// then nothing else, because the banner was the only thing this loader ever
+/// wrote there. A diagnostic that exists on one channel is a diagnostic that
+/// one broken channel erases.
+static CONSOLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Writes to the serial line and, once it is known, the firmware console.
+///
+/// The name is short because it is used everywhere the loader has something to
+/// say.
+///
+/// **On a machine whose firmware redirects its console to the same serial port,
+/// every line appears twice** — QEMU under OVMF is such a machine, and its logs
+/// show the doubling. That is the cost, and it is worth paying: on a real
+/// server the console is a screen and the serial line is a service processor,
+/// two channels that fail independently, and the whole reason this function
+/// exists is that on the SR550 one of them failed silently after a single
+/// line.
+fn diag(text: &str) {
+    serial::write(text);
+    let con_out = CONSOLE.load(core::sync::atomic::Ordering::Relaxed);
+    if con_out != 0 {
+        console_write(con_out as *mut SimpleTextOutput, text);
+    }
+}
+
 fn console_write(con_out: *mut SimpleTextOutput, text: &str) {
     let mut buffer = [0u16; 64];
     let mut at = 0;

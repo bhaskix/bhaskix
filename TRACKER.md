@@ -990,6 +990,28 @@ The server was returned to its normal state: media unmounted, boot override
 consumed, boot order never modified (that change was refused by a safety check,
 which turned out to be the right call), power on, health OK.
 
+### 2026-08-22 (the loader stops writing to one channel, so it now writes to two)
+
+Five boots of the SR550 learned nothing because **every instrument was on the
+same wire that was failing.** The loader wrote its banner to the firmware
+console and everything else to serial — so when serial went quiet after one
+line, the screen the operator was actually looking at went quiet too, having
+never been told anything else.
+
+Every diagnostic now goes to **both**: the serial line, and the firmware console
+once the loader has one. The console is adopted before the banner is written to
+it, so the whole trace appears on the screen from that point.
+
+**The cost is visible in QEMU and is worth paying.** OVMF redirects its console
+to the same serial port, so under QEMU every line appears twice and the logs
+show the doubling. On a server the console is a screen and the serial line is a
+service processor — two channels that fail independently, which is the entire
+reason this exists.
+
+This does not fix the SR550 either. It means the **next** boot of it can be read
+off the screen when the wire is mute, which is the difference between another
+boot that learns nothing and one that names the step.
+
 ### 2026-08-22 (the loader speaks through the firmware's port now, and the SR550 symptom is one sentence)
 
 **Researched rather than invented, on the user's instruction, and the research
