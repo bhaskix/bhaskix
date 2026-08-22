@@ -308,6 +308,15 @@ green again. A gate that has never failed is a gate nobody has tested.
 *What is still missing:* the memory and device arms (they need a second domain to read at, and a
 device the probe was not given), and the grant-set-unchanged assertion after the attempts.
 
+> **And what this test does not do, named 2026-08-20 because a stronger one was proposed.** Test 1
+> is a *synthetic probe*: it asks for things it should not get and is refused, which proves the
+> boundary is **shaped** right. Nothing is ever exploded, so it demonstrates no blast radius. The
+> demonstration the adoption case actually rests on is a **real application, really exploited, with
+> its neighbour still serving and the kernel untouched** — a different and much harder claim, whose
+> prerequisite is L3 and which therefore cannot be faked early.
+> → [RFC 0034](0034-the-adoption-case.md) §4, **D2**, which proposes it as L3's demonstration
+> criterion.
+
 **Test 2 — a compromised driver.** Already largely built, and this RFC's contribution is to name it
 as one test rather than five gates. Today's tree asserts: a driver in ring 3 cannot make its device
 read without a window capability; a revoked object is taken from the *device*, not just the page
@@ -411,17 +420,25 @@ measurement attached rather than quietly not done.
 1. **What is a Linux process, in Bhaskix terms?** One domain per process, or one domain per
    *workload* with several hosted processes inside it? The second is cheaper and weaker; the first
    makes `fork` and `execve` expensive. Decided by whoever implements L1's `execve`, with a
-   measurement. → **[RFC 0033](0033-what-a-hosted-process-is.md), drafted 2026-08-20**: one domain
-   per process, and the constants that make five of them the machine's limit named as the price.
+   measurement. → **[RFC 0033](0033-what-a-hosted-process-is.md), accepted 2026-08-20**: one domain
+   per process, built and gated; the constants that made five of them the machine's limit were
+   raised, and the machine now holds twenty-five spare address spaces.
 2. **Where does the file-descriptor table live** — in the adapter, or as capabilities in a hosted
    domain's CSpace it cannot name? The second is more faithful to the model and needs the nucleus
-   to hold state for a dialect it does not interpret. → **[RFC 0033](0033-what-a-hosted-process-is.md)**:
+   to hold state for a dialect it does not interpret. → **[RFC 0033](0033-what-a-hosted-process-is.md), accepted**:
    in the adapter, for exactly that reason — a CSpace-held table is Linux-shaped state in the
-   nucleus, which is what the ratchet was built to drive out.
+   nucleus, which is what the ratchet was built to drive out. Built at its step 6: a descriptor is
+   a slot in the adapter's own CSpace, and the hosted program sees an integer.
 3. **Does a hosted process ever get a `Notification`?** `epoll` wants one. Answering yes makes the
    adapter's event loop cheap and puts one Bhaskix concept inside the Linux boundary.
 4. **How is a Linux domain's manifest expressed** (I4)? Reuse RFC 0030's grammar, or a Linux-shaped
    one that names mounts and ports? Reuse is the default until something cannot be said.
+   → **Something cannot be said, 2026-08-20.** `packages/linuxd.manifest.in` cannot express two of
+   its own three grants: the grammar has no way to say *write-only* about a console, and no way to
+   say *sixteen* notifications. It describes them in prose and deliberately over-claims — the safe
+   direction for a reviewer to be wrong in — and names the trigger for `cap console write` and
+   `cap notification count=N`. Reuse still holds; the grammar owes two words.
+   → [RFC 0034](0034-the-adoption-case.md) §3, **P3**.
 5. **Cgroup-shaped resource control** onto `ResourceEnvelope` — an L4 question, recorded now so it
    is not discovered then.
 
