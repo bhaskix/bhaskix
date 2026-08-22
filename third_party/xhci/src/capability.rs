@@ -73,14 +73,36 @@ impl StructuralParameters1 {
 pub struct StructuralParameters2(pub u32);
 
 impl StructuralParameters2 {
-    /// Scratchpad buffers the controller wants. Bits 31:27 are the high five,
-    /// bits 25:21 the low five.
+    /// Scratchpad buffers the controller wants. Bits 25:21 are the high five,
+    /// bits 31:27 the low five.
     ///
-    /// **Split across two ranges, high part first**, which is the single most
-    /// error-prone field in this bank: read it as one contiguous range and a
-    /// controller asking for 32 buffers is given 0, which fails later and
-    /// somewhere else. The controller will not work without the buffers it
-    /// asked for.
+    /// **Split across two ranges**, which is the single most error-prone field
+    /// in this bank: read it as one contiguous range and a controller asking
+    /// for 32 buffers is given 0, which fails later and somewhere else. The
+    /// controller will not work without the buffers it asked for.
+    ///
+    /// # Corrected 2026-08-23
+    ///
+    /// This paragraph read "Bits 31:27 are the high five, bits 25:21 the low
+    /// five" — the two labels the wrong way round, and so a direct
+    /// contradiction of the two lines of code beneath it and of
+    /// `the_scratchpad_count_is_assembled_from_two_ranges`, whose own comment
+    /// says "High five bits at 21..=25, low five at 27..=31". The code and the
+    /// test agreed with each other and the prose disagreed with both; the prose
+    /// is what moved.
+    ///
+    /// **What has not been done here is the tiebreak that PROVENANCE.md names.**
+    /// That file says the specification wins where this source and xHCI
+    /// disagree, and no copy of the specification was read to settle which of
+    /// the two readings it supports — so what is fixed is an internal
+    /// contradiction, not a confirmed transcription. Two of the three artifacts
+    /// agreeing is why the doc moved rather than the code, and it is not
+    /// evidence about the register.
+    ///
+    /// *Trigger:* the first controller that asks for a non-zero count. QEMU's
+    /// `qemu-xhci` asks for none, so nothing in this tree exercises either
+    /// reading — read Table 5-11 of the specification against these two ranges
+    /// before trusting a driver that provides buffers on real hardware.
     #[must_use]
     pub const fn max_scratchpad_buffers(self) -> u32 {
         let high = bits32(self.0, 21, 25);
