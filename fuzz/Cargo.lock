@@ -47,6 +47,7 @@ dependencies = [
  "bhaskix-personality",
  "bhaskix-pkg",
  "bhaskix-service-vfs",
+ "bhaskix-usb",
  "bhaskix-ustar",
  "libfuzzer-sys",
 ]
@@ -68,6 +69,7 @@ dependencies = [
  "bhaskix-service-console",
  "bhaskix-service-vfs",
  "bhaskix-telemetry",
+ "bhaskix-xhci",
 ]
 
 [[package]]
@@ -125,7 +127,15 @@ name = "bhaskix-telemetry"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-usb"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-ustar"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-xhci"
 version = "0.0.0"
 
 [[package]]

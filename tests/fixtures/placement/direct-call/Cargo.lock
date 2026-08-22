@@ -46,6 +46,7 @@ dependencies = [
  "bhaskix-service-console",
  "bhaskix-service-vfs",
  "bhaskix-telemetry",
+ "bhaskix-xhci",
 ]
 
 [[package]]
@@ -102,4 +103,8 @@ version = "0.0.0"
 
 [[package]]
 name = "bhaskix-ustar"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-xhci"
 version = "0.0.0"
