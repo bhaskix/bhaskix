@@ -990,6 +990,35 @@ The server was returned to its normal state: media unmounted, boot override
 consumed, boot order never modified (that change was refused by a safety check,
 which turned out to be the right call), power on, health OK.
 
+### 2026-08-22 (RFC 0041 drafted: a USB keyboard, and the bring-up order was read rather than recalled)
+
+The definitions from RFC 0038 are complete, tested and **used by nothing**. RFC
+0041 is what uses them: an xHCI controller driven far enough to read a HID
+boot-protocol keyboard on a root port. One device class on purpose — not
+storage, not USB 3 streams — because that is the smallest thing that turns a
+machine with no i8042 into a machine somebody can type at, which is most laptops
+made recently.
+
+**The bring-up sequence in it is FreeBSD's, read rather than remembered**, and
+one ordering constraint in it is not obvious: `ERDP` is written **before**
+`ERSTBA`, because writing `ERSTBA` is what arms the event ring — a dequeue
+pointer written afterwards is written to a ring the controller has already begun
+using. Also: waiting on the reset bit alone is not enough, since the controller
+clears it before it is willing to be programmed and `USBSTS.CNR` is the bit that
+says otherwise.
+
+**Rule 1 is step 2 of the plan**, before any register is touched: no IOMMU
+translation for the controller's own BDF, no driver. The descriptor parser is
+its own leaf crate, `forbid(unsafe_code)` and fuzzed before the driver ships,
+because descriptors are length-prefixed nested data written by whatever is
+plugged in.
+
+The testing plan was checked rather than assumed: this QEMU has `qemu-xhci` and
+`usb-kbd`, so the whole path is gateable with the `sendkey` harness RFC 0037
+already built, pointed at a USB keyboard instead of the i8042.
+
+Drafted, not built.
+
 ### 2026-08-22 (the lock-order report now names who is holding, not just that something is)
 
 **The `wait.rs:195` specimen could not be read, and this is why.** The report
