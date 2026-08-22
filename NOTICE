@@ -10,8 +10,24 @@ Licensed under the Apache License, Version 2.0. See LICENSE for the full text.
 Third-party components
 --------------------------------------------------------------------------------
 
-Bhaskix does not vendor third-party source code into this repository. The
-following components are fetched at build time by tools/setup-dev.sh and are
+Bhaskix vendors third-party source into third_party/ only, and lists every such
+component here. Each carries its own license text and a PROVENANCE.md naming the
+upstream, the version taken, the copyright holder, the license it was taken
+under, and what was changed. This paragraph said "does not vendor third-party
+source code" until 2026-08-22; it stopped being true with RFC 0038, and a NOTICE
+that overstates a project's independence is worse than one that names what it
+took.
+
+  xHCI layouts  (third_party/xhci/)
+    Adapted from https://github.com/rust-osdev/xhci, version 0.9.2.
+    Copyright (c) 2021 Hiroki Tokunaga.
+    Upstream is licensed MIT OR Apache-2.0; taken under Apache-2.0, which is
+    the license Bhaskix already uses, so no second license enters this tree.
+    Adapted rather than copied: all five upstream dependencies were removed and
+    their work written out. See third_party/xhci/PROVENANCE.md.
+    Linked into the Bhaskix kernel.
+
+The following components are fetched at build time by tools/setup-dev.sh and are
 distributed under their own licenses. They are build and boot dependencies; no
 part of them is linked into the Bhaskix kernel.
 

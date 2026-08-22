@@ -894,6 +894,71 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-22 (RFC 0038 step 1: the first vendored source, and a policy sentence that stopped being true)
+
+**"Vendor the xHCI crate" turned out not to be possible, and the reason is the
+finding.** `xhci` 0.9.2 is `MIT OR Apache-2.0` — the ideal case, since it can be
+taken purely under Apache-2.0 and no second license enters the tree — and 5,759
+lines. But it has five dependencies, and `num-derive` pulls `syn`, `quote` and
+`proc-macro2`. **`syn` 1.0.109 alone is 44,682 lines.** Taking the crate whole
+means roughly sixty thousand lines, most of them a Rust parser that runs at
+build time, to obtain 5,759 lines of xHCI knowledge — into a project whose
+dependency gate exists precisely so that this is a decision rather than an
+accident. They are not shallow uses either: `accessor` appears 49 times and
+`bit_field` 35.
+
+So the layouts were taken and the dependencies were not, each replaced by
+something local: `accessor` by this kernel's own device-memory access,
+`bit_field` by shifts written out, the two proc-macros by the code they would
+have generated. The result is a derivative work — same knowledge, different
+expression — and `PROVENANCE.md` says exactly that.
+
+**One deliberate improvement on upstream: this crate does no I/O at all.**
+Upstream makes a register a thing you can read; here a register is an offset and
+a decoder, and the kernel does the volatile access. That is why the crate holds
+`forbid(unsafe_code)` and an unsafe budget of **0** — reaching device memory is
+the kernel's job, and a driver reaching it through a second abstraction with its
+own opinions is the drift this project keeps finding elsewhere.
+
+**`NOTICE` said "Bhaskix does not vendor third-party source code into this
+repository."** That stopped being true and was changed in the same commit, not
+after it. A NOTICE that overstates a project's independence is worse than one
+that names what it took. `docs/security.md` §1's "zero external dependencies" is
+qualified the same way: still true, no longer the whole story, and the number to
+watch is now what is in `third_party/` and whether anyone has read it.
+
+**The security requirements were written before the driver, because a mitigation
+added afterwards is one somebody has to remember.** An xHCI controller is a bus
+master: it reads and writes physical memory itself, at addresses it was handed,
+by a path that goes through neither page tables nor capabilities. Six rules bind
+any driver built on these layouts, the first being **no translation, no driver**
+— it refuses to initialise unless `iommu::present_for` answers true for its own
+BDF, with no degraded mode. A machine with no IOMMU gets no USB, which is the
+right trade against a device with unmediated access to all of memory. The others
+cover the empty-by-default window, copying rather than mapping caller buffers,
+interrupt remapping, descriptor parsing as untrusted input that must be fuzzed
+before shipping, and bounding the controller's own reported numbers before
+believing them.
+
+What is **not** claimed: a USB device that says it is a keyboard is a keyboard,
+here as everywhere. What bounds it is that keystrokes enter a ring the shell
+reads, and the shell holds the capabilities it was given and no others — a real
+bound, not prevention, and stated rather than implied.
+
+**A test caught a weak test, which is the part worth keeping.** The `PORTSC`
+write-one-to-clear guard was watched red and **did not fail**: the assertion
+masked with the very constant the red edit changed, so the constant was being
+compared against itself and the suite stayed green while the port would have
+been disabled. Rewritten against literal bit positions, it now fails with "the
+port would have been disabled". Clippy then found two more constants asserted
+against constants in the capability tests, and they were deleted. Twenty-four
+tests, all host-side; the dependency gate learned the crate and answers
+`bhaskix-xhci -> (nothing)`.
+
+Steps 2 onward — runtime registers, doorbells, contexts, TRBs — and the driver
+itself are not in this. It ends with the definitions in the tree, tested, and
+nothing using them yet.
+
 ### 2026-08-22 (a keyboard, because the first real machine would have ignored every key)
 
 **RFC 0037, built and gated.** Console input was a UART and nothing else —

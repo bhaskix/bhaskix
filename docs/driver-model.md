@@ -260,7 +260,14 @@ Ordered by "what makes the system useful soonest", not by interest.
 5. PCIe enumeration (ECAM)
 6. virtio-blk, virtio-net, virtio-rng — the whole VM story in three small drivers
 7. NVMe — the whole bare-metal storage story in one
-8. xHCI (USB) — keyboard, storage, and the largest attack surface here. Note
+8. xHCI (USB) — keyboard, storage, and the largest attack surface here, and
+   the phrase is meant literally: an xHCI controller is a **bus master**, so it
+   reads and writes physical memory on its own initiative, at addresses it was
+   handed, by a path that goes through neither page tables nor capabilities.
+   [RFC 0038](rfc/0038-vendoring-the-xhci-definitions.md) vendors the register
+   layouts and states the six rules any driver built on them must obey — the
+   first being that it refuses to initialise at all unless the controller is
+   behind an IOMMU translation. Note
    what item 4 does **not** cover: a USB keyboard needs all of this — PCIe
    enumeration, the register file, command/event/transfer rings, device slots
    and endpoint contexts, `ADDRESS_DEVICE`, descriptor parsing — before the HID

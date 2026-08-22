@@ -84,6 +84,13 @@ LAYERS = {
     # the VFS reads the initrd with it, the pkg crate reads packages with
     # it, and the fuzz target drives it -- one copy, depending on nothing.
     "bhaskix-ustar": -3,
+    # xHCI register and structure layouts, RFC 0038 -- **adapted third-party
+    # source**, frozen at a known version, living in third_party/ with its own
+    # PROVENANCE.md and license. A leaf for the same reason as the others and
+    # one more: it deliberately does no I/O, so it cannot depend on the kernel
+    # that owns device memory. If it ever grows a dependency, that is the sign
+    # it has started doing something other than describing layouts.
+    "bhaskix-xhci": -3,
     # The Linux personality's arithmetic, RFC 0005: the kernel builds a real
     # initial stack with it and a host test checks the bytes, so it depends
     # on nothing -- the leaf-layer argument a seventh time.

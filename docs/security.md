@@ -193,6 +193,24 @@ found by reading the tree rather than the documents, and each names what is true
 | 6 | ~~IPv6 and NDP have the mutation harness but no coverage-guided target~~ **— paid 2026-08-21** | `fuzz/fuzz_targets/ipv6_ndp.rs`, four arms, **12,906,117 executions clean**. All five probe points reach from an **empty** corpus, including the checksum-verified echo — which settles the question this gap raised: ICMPv6's mandatory 16-bit checksum over a pseudo-header is **not** a wall to a coverage-guided fuzzer, exactly as `udp_parse` and `icmp_parse` had already shown. A repaired arm is kept anyway, because recomputing the sum is what an attacker does and the fields behind it are the ones worth attacking |
 | 7 | **One entropy source, no pool** | `RDRAND` only — no `RDSEED`, no mixing, no pool. Every unpredictable number in the system, including the KASLR slide and the TCP ISN key, traces to one instruction from one vendor. The design **fails closed** where most systems fail silently, which is why this is seventh and not first |
 
+> **Qualified 2026-08-22, and the qualification matters more than the fact.** "Zero external
+> dependencies" is still true and is no longer the whole story: RFC 0038 brings **adapted
+> third-party source** into `third_party/`, beginning with the xHCI register layouts taken from the
+> `xhci` crate under Apache-2.0. That is supply chain by another route, and pretending otherwise
+> because it does not appear in `Cargo.lock` would be exactly the under-claiming this paragraph was
+> written to correct, inverted.
+>
+> The two fail differently, which is why the choice was made this way. A dependency is **live** —
+> it updates, its own dependencies update, and the reviewable unit is a version requirement rather
+> than a body of code. Vendored source is **frozen**: reviewed once, in full, at a known version,
+> changing only when somebody changes it here. Worse for maintenance, better for a kernel.
+>
+> What does not change is responsibility. A license grant covers the right to use code; it does not
+> make it correct and it does not transfer the consequences. Vendored code is budgeted, gated,
+> tested and reviewed as this project's own — `third_party/README.md` says so, `NOTICE` lists every
+> component, and each carries a `PROVENANCE.md`. **The number to watch is no longer "zero
+> dependencies" but "what is in `third_party/`, and has anyone read it".**
+
 **And the strongest fact in this document, which it had been under-claiming**: twenty packages in
 `Cargo.lock`, all of them `bhaskix-*`. **The shipped workspace has zero external dependencies**, and
 `tools/check-deps.py` fails the build if one appears — a **manifest**-level check, not a lockfile one, which is equivalent here only because there is no external *direct* dependency for a transitive to arrive under. The out-of-scope table above is corrected

@@ -27,6 +27,10 @@ members = [
     # M4
     # "sched",
 
+    # RFC 0038 -- adapted third-party source, frozen. See third_party/README.md
+    # and third_party/xhci/PROVENANCE.md.
+    "third_party/xhci",
+
     # M6
     "fs",
     # "drivers",

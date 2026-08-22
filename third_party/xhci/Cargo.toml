@@ -1,0 +1,24 @@
+[package]
+name = "bhaskix-xhci"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "xHCI register, context and TRB layouts. Adapted from the `xhci` crate; see PROVENANCE.md."
+authors = ["Tarun Kumar Kushwaha", "Hiroki Tokunaga (upstream `xhci`)"]
+publish = false
+
+[lib]
+name = "bhaskix_xhci"
+path = "src/lib.rs"
+
+# Nothing. That is the point of the adaptation -- see PROVENANCE.md, which
+# records the five dependencies that were removed and what replaced each.
+[dependencies]
+
+[package.metadata.bhaskix]
+# Adapted third-party source, frozen at a known version. RFC 0038.
+vendored_from = "xhci 0.9.2 (rust-osdev/xhci), MIT OR Apache-2.0, taken under Apache-2.0"
+# Layouts are pure data: offsets and bit ranges. Any `unsafe` here would be a
+# design mistake, because reaching device memory is the kernel's job and not
+# this crate's.
+unsafe_budget = 0
