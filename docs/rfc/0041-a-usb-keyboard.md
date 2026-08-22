@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | ⬜ **Draft — steps 1, 2 and 3 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. Steps 4–8 are open |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | drivers |
 | **Milestone** | Phase 2 (see docs/roadmap.md) |
@@ -157,6 +157,17 @@ an interrupt per event and a fast device can then livelock a CPU.
 ships. Real descriptors, truncated descriptors, descriptors whose lengths lie,
 and nesting that does not terminate.
 
+> **Corrected 2026-08-23, by step 3 doing it.** The paragraph below says the
+> controller is tested in QEMU, and the bring-up turned out to be **host-testable
+> in full**: `bring_up` writes registers over memory prepared before it is
+> called, so a device model on the host pins every ordering constraint — `ERDP`
+> before `ERSTBA`, Run/Stop after every pointer, the `CNR` wait — and each was
+> watched red by breaking exactly one thing. The QEMU gate confirms on a real
+> emulated controller; it is no longer the only place the sequence is checked.
+> That distinction earned itself immediately: the emulator's dword-only
+> capability bank is now a host test rather than a thing a boot has to be run to
+> catch.
+
 **The controller, in QEMU**, which emulates xHCI and a USB HID keyboard:
 `-device qemu-xhci -device usb-kbd`. That makes the whole path gateable —
 controller found behind an IOMMU, ports enumerated, slot addressed, endpoint
@@ -179,11 +190,29 @@ arithmetic — each seen to fail on purpose.
 
 ## Implementation plan
 
-1. The `usb` leaf crate: descriptor types, parsing, host tests, a fuzz target.
-2. Controller discovery — PCI class `0x0C` subclass `0x03` — and **rule 1**: the
-   IOMMU check, refusing before anything else happens.
-3. Bring-up through the sequence above, with the ring and context allocations
-   the crate's sizing functions describe.
+1. ✅ **Done 2026-08-22.** The `usb` leaf crate: descriptor types, parsing, host
+   tests, a fuzz target.
+2. ✅ **Done 2026-08-22.** Controller discovery — PCI class `0x0C` subclass
+   `0x03`, and the programming-interface byte, because class and subclass alone
+   only say "USB" — and **rule 1**: the IOMMU check, refusing before anything
+   else happens.
+3. ✅ **Done 2026-08-23.** Bring-up through the sequence above, with the ring and
+   context allocations the crate's sizing functions describe.
+
+   *What it cost, and one thing it changed.* The kernel now gives the **first**
+   controller a translation of its own — its own page table and the fourth domain
+   id — and `tests/qemu/devices.sh` carries a **second** controller so that one
+   boot holds both halves of rule 1 with a live subject: the first is driven, the
+   second is still refused by name. `MAX_WINDOWS` went 4 → 8, because the `full`
+   profile filled all four and a full table degrades by leaving a device
+   untranslated.
+
+   *And one correction to this document's own testing plan*, made by doing it:
+   the plan called for the controller to be tested "in QEMU", and the whole
+   bring-up is host-testable instead. `bring_up` writes registers and reads
+   nothing else — every byte the controller will read is prepared before it is
+   called — so the ordering constraints are pinned by a device model on the host
+   and the QEMU gate confirms rather than carries them.
 4. The event ring: consume, dispatch, advance the dequeue pointer.
 5. Port enumeration, Enable Slot, Address Device.
 6. Descriptors over control transfers; Configure Endpoint for interrupt IN.

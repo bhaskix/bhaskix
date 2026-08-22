@@ -496,6 +496,42 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // IOMMU settled.
     let xhci_found = unsafe { xhci::discover() };
     xhci::report(&xhci_found);
+    // RFC 0041 step 3: and the one that may be driven, is.
+    //
+    // Only reached for a controller `discover` answered as drivable, which is
+    // the type refusing rather than this line remembering to. `init` asks the
+    // same question again on its own account -- two checks of one rule, because
+    // the cost of the second is a comparison and the cost of neither is a bus
+    // master reading all of memory.
+    if xhci_found.drivable().is_some() {
+        // SAFETY: called once, here, after the IOMMU windows exist.
+        match unsafe { xhci::init(handoff.hhdm_base.as_u64()) } {
+            Ok(started) => println!(
+                "    xhci           running, {} slots, {} ports, {}-byte contexts, {} \
+                 scratchpad{}, {} frames mapped into its window, usb {:x}.{:x}",
+                started.running.slots,
+                started.running.ports,
+                if started.running.context_size_64 {
+                    64
+                } else {
+                    32
+                },
+                started.running.scratchpads,
+                if started.running.scratchpads == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                started.frames,
+                started.running.version >> 8,
+                (started.running.version >> 4) & 0xf,
+            ),
+            Err(error) => println!(
+                "\x1b[91m    xhci           FAILED to bring up: {}\x1b[0m",
+                error.describe()
+            ),
+        }
+    }
     if let Some((found, _)) = iommu_state.as_ref() {
         // A fault here means a device reached for something nobody granted it,
         // during its own bring-up. RFC 0012 calls that the feature.
@@ -15851,6 +15887,53 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
             }
             None => println!(
                 "\x1b[91m    iommu window   FAILED: no page table for the network device\x1b[0m"
+            ),
+        }
+    }
+
+    // The **first** xHCI controller, on the same terms and for the fourth
+    // domain id. RFC 0041 step 3: a controller is a bus master with unmediated
+    // access to all of memory, so it gets a translation or it is not driven.
+    //
+    // Deliberately the first and only the first. A machine with two of them
+    // leaves the second with no window, which is what keeps `xhci::report`'s
+    // refusal a thing that can be watched happening rather than a claim -- and
+    // `tests/qemu/devices.sh` puts a second one there for exactly that.
+    //
+    // SAFETY: configuration access works by here, and this reads config space
+    // only.
+    if let Some(controller) = unsafe { xhci::probe() } {
+        match iommu::attach_device(&window, controller, 3, hhdm) {
+            Some(controller_window) => {
+                if iommu::verify_window(&controller_window, 4, hhdm)
+                    && iommu::install(controller, found, controller_window)
+                {
+                    // SAFETY: the unit these windows are programmed into. The
+                    // unit caches context entries, so without this it goes on
+                    // believing this device has none and drops every request it
+                    // makes with the entry sitting correct in memory.
+                    let invalidated = unsafe { iommu::invalidate_contexts() };
+                    if !invalidated {
+                        println!(
+                            "\x1b[91m    iommu window   FAILED: the context cache did not invalidate\x1b[0m"
+                        );
+                    }
+                    println!(
+                        "    iommu window   {:02x}:{:02x}.{} translating too, the xhci \
+                         controller's own page table and domain, {} in use",
+                        controller.0,
+                        controller.1,
+                        controller.2,
+                        iommu::windows()
+                    );
+                } else {
+                    println!(
+                        "\x1b[91m    iommu window   FAILED: the xhci controller's tables did not read back\x1b[0m"
+                    );
+                }
+            }
+            None => println!(
+                "\x1b[91m    iommu window   FAILED: no page table for the xhci controller\x1b[0m"
             ),
         }
     }

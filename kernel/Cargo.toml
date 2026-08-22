@@ -340,7 +340,24 @@ asm_budget = 10
 # it is safe code, and the decision it feeds -- whether the IOMMU translates
 # for that device -- holds no `unsafe` at all. A controller that is not
 # translated is refused before any register of it is touched.
-unsafe_budget = 1622
+# 1715 at RFC 0041 step 3, 2026-08-23: +93, for driving a controller rather
+# than only finding one. Where it went, and why none of it could be avoided:
+#   * the register banks -- three `register_block!` blocks, so one
+#     `Mmio::new` per bank carries the promise and every read and write
+#     afterwards is *safe*. This is `coding-style.md` §3's own preference
+#     applied: fifty individually-correct volatile accesses would have been
+#     fifty unsafe lines and fifty chances to be wrong about a width.
+#   * the DMA memory -- allocating a frame, zeroing it, and writing the
+#     scratchpad array, the device context array's entry zero and the event
+#     ring segment table. Every one is a store the *controller* will read by
+#     DMA, so none of them can be a safe abstraction over something else.
+#   * the PCI configuration writes that enable memory space and, separately
+#     and later, bus mastering.
+# What is not in it: the bring-up sequence itself, the bounds on every number
+# the controller reports, and all thirty-one host tests -- test code is
+# excluded from the budget by the checker, which is why the model that drives
+# this driver costs nothing.
+unsafe_budget = 1715
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

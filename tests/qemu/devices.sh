@@ -83,19 +83,27 @@ qemu_device_list() {
                 # explicit; the default and the flag are different worlds.
                 -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:45557-:7"
                 -device "virtio-net-pci,netdev=net0$suffix"
-                # An xHCI controller, present and driven by nothing.
+                # Two xHCI controllers, and the pair is the point.
                 #
-                # RFC 0041 step 2 refuses any controller that is not behind an
-                # IOMMU translation, and a refusal nobody can observe is a
-                # refusal nobody can trust. This puts a real controller in the
-                # machine so the boot gate can watch it be found and turned
-                # down. It is deliberately given no devices and is never
-                # driven, so it does no DMA and changes nothing else.
+                # RFC 0041 step 3 brings the **first** one up: the kernel gives
+                # it a window of its own and drives it. Step 2 refuses any
+                # controller that is not behind an IOMMU translation, and the
+                # kernel builds a window for the first controller only -- so the
+                # second is still found, still turned down by name, and the
+                # refusal stays a thing the boot gate watches happen rather than
+                # a claim about code that no longer runs.
                 #
-                # Not `$suffix`: the translation attributes belong to devices
-                # this kernel actually delegates, and this one is here to be
-                # refused.
-                -device qemu-xhci
+                # One machine, both gates with a live subject. A single
+                # controller could serve only one of them, and demoting the
+                # refusal to a host test would leave the rule this driver exists
+                # to enforce unexercised on the machine it matters on.
+                #
+                # Neither takes `$suffix`: those are virtio's
+                # `iommu_platform=on` attributes, and an xHCI controller is
+                # translated by the unit without asking. The second has no
+                # devices attached and is never driven, so it does no DMA.
+                -device qemu-xhci,id=xhci0
+                -device qemu-xhci,id=xhci1
             )
             ;;
         disks)

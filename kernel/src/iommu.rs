@@ -42,15 +42,21 @@ use crate::sync::{Rank, SpinLock};
 /// having been handed it.
 /// How many devices can have a translation of their own at once.
 ///
-/// Two: the device the kernel drives, and one delegated to a domain. It was
-/// one until the block driver moved out, and one was not a decision either --
-/// there had only ever been one device doing DMA.
+/// **Eight since 2026-08-23, and the paragraph above this line said "Two"
+/// while the constant read four.** It had been raised twice without the
+/// reasoning being brought along, which is how a bound stops recording the
+/// decision that set it. What is true: every device doing DMA needs one, the
+/// machine's `full` profile now fills four of them -- the kernel's disk, the
+/// delegated disk, the network device and an xHCI controller (RFC 0041 step 3)
+/// -- and a table with no free slot degrades by printing "no free slot" and
+/// leaving a device untranslated. Eight is headroom for a second controller
+/// and whatever the next driver is, at 32 bytes of static table per slot.
 ///
-/// Sharing a window between them was the tempting shortcut and would have
+/// Sharing a window between devices was the tempting shortcut and would have
 /// undone the thing RFC 0012 is for: two devices translating through one page
 /// table can reach each other's buffers, so a driver in a domain would have
 /// been contained from the kernel's memory and not from the kernel's *device*.
-pub const MAX_WINDOWS: usize = 4;
+pub const MAX_WINDOWS: usize = 8;
 
 /// Every device with a translation of its own, found by where it is on the bus.
 ///
@@ -59,7 +65,7 @@ pub const MAX_WINDOWS: usize = 4;
 /// memory, and a capability that named "the window" would name whichever one
 /// happened to be first.
 static WINDOWS: SpinLock<[Option<(u64, Report, Window)>; MAX_WINDOWS]> =
-    SpinLock::new(Rank::DmaWindow, [None, None, None, None]);
+    SpinLock::new(Rank::DmaWindow, [const { None }; MAX_WINDOWS]);
 
 /// Packs a device's bus address into the word a `DmaWindow` capability names.
 #[must_use]

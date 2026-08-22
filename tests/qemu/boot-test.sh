@@ -564,6 +564,40 @@ else
     status=1
 fi
 
+# RFC 0041 step 3, on the lanes that have a unit. The machine has *two*
+# controllers and the kernel builds a window for the first only, so both halves
+# of the rule have a live subject on one boot: the gate above watches the second
+# be refused, and this one watches the first be driven.
+#
+# Guarded by mode for the same reason every other unit-dependent gate here is:
+# on a lane with no IOMMU **both** controllers are correctly refused, and rule 1
+# says that is the right answer rather than a failure. Asserting a bring-up
+# there would be asserting that the rule is broken.
+if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
+    # The counts are required to be non-zero rather than exact. Slots and ports
+    # are the controller's own numbers and an emulator is entitled to change
+    # them between versions -- but zero of either means the capability bank was
+    # not read, which is the failure this is for.
+    if grep -qaE 'xhci +running, [1-9][0-9]* slots, [1-9][0-9]* ports' "$LOG"; then
+        pass "the translated xHCI controller is brought up and reports its slots and ports"
+    else
+        fail "the xHCI controller behind a window was not brought up"
+        grep -a "xhci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
+    # And it got a window of its own. Named separately from the bring-up
+    # because they fail apart: the bring-up could be made to work by dropping
+    # rule 1, and this is what says the containment is real.
+    if grep -qa "the xhci controller's own page table and domain" "$LOG"; then
+        pass "the xHCI controller translates through a page table and domain of its own"
+    else
+        fail "no separate IOMMU window for the xHCI controller"
+        grep -a "iommu window" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+fi
+
 # The decline is reported. Deterministic, and it guards the gate below rather
 # than duplicating it: that one bounds the *latency*, which only moves when a
 # decline actually happens, and declines are rare. This one asserts the
