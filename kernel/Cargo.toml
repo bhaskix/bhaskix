@@ -325,7 +325,14 @@ asm_budget = 10
 # comparator -- two static buffers and one `copy_nonoverlapping` through the
 # direct map, which is the floor the supervised copy is measured against. A
 # measurement that cost nothing to take would be measuring nothing.
-unsafe_budget = 1595
+# 1621 at RFC 0037, 2026-08-22: twenty-six lines for the i8042 keyboard, and
+# every one of them is a port read or write. There is no way to talk to this
+# device that is not `in`/`out` on two fixed ports, so the cost is the driver
+# existing at all rather than any choice inside it. What the count does *not*
+# include is the part most likely to be wrong: the scancode tables and their
+# translation are a pure function with no hardware in it, tested on the host,
+# and hold no `unsafe` at all.
+unsafe_budget = 1621
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

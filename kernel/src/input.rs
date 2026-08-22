@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Console input: the path from a UART with a byte to a thread that wants one.
+//! Console input: the path from a UART or a keyboard with a byte to a thread
+//! that wants one.
 //!
 //! Until M6-04 the console could only write. Nothing was wired to notice an
 //! inbound byte — the local APIC delivers the timer and messages between CPUs,
 //! and a device interrupt needs an I/O APIC, which the kernel had never
 //! programmed. `bhaskix_arch::ioapic` is the other half of this module.
 //!
-//! # The ring is lock-free on purpose
+//! # The rings are lock-free on purpose, and there is one per source
 //!
 //! One producer (the interrupt handler) and one consumer (whichever thread is
 //! reading). A lock would be the obvious choice and the wrong one: the handler
 //! can interrupt the consumer *between* its acquire and release, and would
 //! then wait for a lock held by a thread that cannot run until the handler
 //! returns. Disjoint indices make that impossible rather than unlikely.
+//!
+//! That argument holds for *one* producer and collapses for two, which is why
+//! the keyboard did not simply call this module's `push` when it arrived. See
+//! [`Ring`]: each source has its own, and the consumer merges them.
 //!
 //! # The first client of RFC 0011, and it drains before it acknowledges
 //!
@@ -31,7 +36,9 @@
 //! # One reader
 //!
 //! A notification takes one waiter and refuses a second, so this inherits that
-//! bound rather than restating it. There is one console and one shell.
+//! bound rather than restating it. There is one console and one shell — which
+//! is what lets two sources share a consumer without any arbitration beyond
+//! the fixed order in [`try_read`].
 
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -53,17 +60,83 @@ pub const SERIAL_IRQ: u8 = 4;
 /// so an overrun means the reader has stopped, not that it was slow.
 const CAPACITY: usize = 256;
 
-/// The bytes themselves.
-static RING: [AtomicU8; CAPACITY] = [const { AtomicU8::new(0) }; CAPACITY];
-/// Written by the producer only.
-static HEAD: AtomicUsize = AtomicUsize::new(0);
-/// Written by the consumer only.
-static TAIL: AtomicUsize = AtomicUsize::new(0);
+/// One source's ring: exactly one producer, exactly one consumer, no lock.
+///
+/// **There is a ring per source, and that is a correctness requirement rather
+/// than tidiness.** The lock-free argument above holds only while there is one
+/// producer: `push` reads `head` relaxed, stores a byte, then publishes
+/// `head + 1`. Two interrupt handlers doing that at once — and two claimed
+/// lines may well be handled on different CPUs — both read the same head, both
+/// write the same slot, and both publish the same index. One byte is lost and
+/// the other is published twice.
+///
+/// So the keyboard did not join the serial line's ring when it arrived
+/// ([RFC 0037](../../docs/rfc/0037-a-keyboard-on-real-hardware.md)); it
+/// brought its own, and the *consumer* merges. Each ring keeps precisely the
+/// invariant its correctness depends on, and no lock is introduced anywhere.
+struct Ring {
+    /// The bytes themselves.
+    bytes: [AtomicU8; CAPACITY],
+    /// Written by the producer only.
+    head: AtomicUsize,
+    /// Written by the consumer only.
+    tail: AtomicUsize,
+    /// Bytes that arrived.
+    received: AtomicU64,
+    /// Bytes dropped because the ring was full.
+    dropped: AtomicU64,
+}
 
-/// Bytes that arrived.
-static RECEIVED: AtomicU64 = AtomicU64::new(0);
-/// Bytes dropped because the ring was full.
-static DROPPED: AtomicU64 = AtomicU64::new(0);
+impl Ring {
+    const fn new() -> Self {
+        Self {
+            bytes: [const { AtomicU8::new(0) }; CAPACITY],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            received: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Adds a byte, dropping it if there is no room.
+    ///
+    /// Dropping the newest rather than overwriting the oldest: a full ring
+    /// means nobody is reading, and in that case the first thing typed is more
+    /// likely to be what someone wants than the last.
+    fn push(&self, byte: u8) {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= CAPACITY {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.bytes[head % CAPACITY].store(byte, Ordering::Relaxed);
+        // Release, so the byte is visible before the index that publishes it.
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        self.received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Takes a byte if one is waiting.
+    fn take(&self) -> Option<u8> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        if self.head.load(Ordering::Acquire) == tail {
+            return None;
+        }
+        let byte = self.bytes[tail % CAPACITY].load(Ordering::Relaxed);
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        Some(byte)
+    }
+
+    fn pending(&self) -> bool {
+        self.head.load(Ordering::Acquire) != self.tail.load(Ordering::Relaxed)
+    }
+}
+
+/// What the UART puts in.
+static SERIAL: Ring = Ring::new();
+/// What the keyboard puts in.
+static KEYBOARD: Ring = Ring::new();
+
 /// Times the handler ran.
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 
@@ -148,6 +221,23 @@ fn handler_to_raw(handler: crate::irq::HandlerId) -> u64 {
     crate::irq::handler_raw(handler)
 }
 
+/// The notification the console waits on, once the line has been claimed.
+///
+/// Exposed so a *second* source can bind to the same one with its own badge,
+/// which is what keeps one reader for two devices — see
+/// [RFC 0037](../../docs/rfc/0037-a-keyboard-on-real-hardware.md).
+#[must_use]
+pub fn notification() -> Option<crate::notify::NotificationId> {
+    let index = NOTIFICATION.load(Ordering::Acquire);
+    if index == 0 {
+        return None;
+    }
+    Some(crate::notify::NotificationId::from_parts(
+        index - 1,
+        NOTIFICATION_GENERATION.load(Ordering::Relaxed),
+    ))
+}
+
 /// Drains the UART into the ring. Returns how many bytes it took.
 ///
 /// Called by the reader after a wake, never from the interrupt handler — the
@@ -162,7 +252,7 @@ fn drain() -> usize {
     // SAFETY: `install` stored a port whose `init` succeeded, and reading is
     // the documented way to clear the condition that raised the interrupt.
     while let Some(byte) = unsafe { port.read_byte() } {
-        push(byte);
+        SERIAL.push(byte);
         taken += 1;
     }
     taken
@@ -181,43 +271,40 @@ pub fn service() -> usize {
     if raw != u64::MAX {
         let _ = crate::irq::acknowledge(crate::irq::handler_from_raw(raw));
     }
-    taken
+    // Both sources share this notification, so a wake says only that *some*
+    // source has something. Servicing both is how it stays that way: asking
+    // the badge which one it was and draining only that would leave the other
+    // holding a byte until it happened to raise its own line again.
+    taken + crate::keyboard::service()
 }
 
-/// Adds a byte, dropping it if there is no room.
+/// Publishes what a keyboard produced.
 ///
-/// Dropping the newest rather than overwriting the oldest: a full ring means
-/// nobody is reading, and in that case the first thing typed is more likely to
-/// be what someone wants than the last.
-fn push(byte: u8) {
-    let head = HEAD.load(Ordering::Relaxed);
-    let tail = TAIL.load(Ordering::Acquire);
-    if head.wrapping_sub(tail) >= CAPACITY {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
+/// The keyboard's whole producer side, and the only way into its ring. Takes a
+/// slice because one keypress can be several bytes: an arrow key is an escape
+/// sequence, and the three bytes of one must not be interleaved with anything.
+/// Nothing else can interleave with them here — this is the ring's single
+/// producer, and it is called from one place.
+pub fn keyboard_produced(bytes: &[u8]) {
+    for byte in bytes {
+        KEYBOARD.push(*byte);
     }
-    RING[head % CAPACITY].store(byte, Ordering::Relaxed);
-    // Release, so the byte is visible before the index that publishes it.
-    HEAD.store(head.wrapping_add(1), Ordering::Release);
-    RECEIVED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Takes a byte if one is waiting.
+/// Takes a byte if one is waiting, from whichever source has one.
+///
+/// Serial first, and the order is fixed rather than fair. The two are never
+/// both busy on a real machine — a person is typing at one of them — and a
+/// fixed order is one fewer thing that can starve.
 #[must_use]
 pub fn try_read() -> Option<u8> {
-    let tail = TAIL.load(Ordering::Relaxed);
-    if HEAD.load(Ordering::Acquire) == tail {
-        return None;
-    }
-    let byte = RING[tail % CAPACITY].load(Ordering::Relaxed);
-    TAIL.store(tail.wrapping_add(1), Ordering::Release);
-    Some(byte)
+    SERIAL.take().or_else(|| KEYBOARD.take())
 }
 
 /// Whether anything is waiting to be read.
 #[must_use]
 pub fn pending() -> bool {
-    HEAD.load(Ordering::Acquire) != TAIL.load(Ordering::Relaxed)
+    SERIAL.pending() || KEYBOARD.pending()
 }
 
 /// Waits for a byte.
@@ -255,8 +342,8 @@ pub fn read() -> u8 {
 #[must_use]
 pub fn statistics() -> (u64, u64, u64) {
     (
-        RECEIVED.load(Ordering::Relaxed),
-        DROPPED.load(Ordering::Relaxed),
+        SERIAL.received.load(Ordering::Relaxed) + KEYBOARD.received.load(Ordering::Relaxed),
+        SERIAL.dropped.load(Ordering::Relaxed) + KEYBOARD.dropped.load(Ordering::Relaxed),
         INTERRUPTS.load(Ordering::Relaxed),
     )
 }

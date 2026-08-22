@@ -175,7 +175,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu \
+.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
         test-placements mkfs test-shell test-faults fmt clippy gates clean distclean help
 
@@ -487,7 +487,8 @@ run-uefi: $(ISO)
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
-      test-boot-qemu64 test-boot-native test-boot-native-full test-placements test-shell test-faults
+      test-boot-qemu64 test-boot-native test-boot-native-full test-placements test-shell \
+      test-keyboard test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -526,6 +527,12 @@ test-placements:
 	        tests/qemu/boot-test.sh bios || exit 1; \
 	  done; \
 	done
+
+# Typed at with a keyboard rather than a serial line (RFC 0037). Every other
+# harness here reaches the shell through the UART, which is exactly why console
+# input could be UART-only for so long without a single test noticing.
+test-keyboard: $(ISO)
+	tests/qemu/keyboard-test.sh
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios

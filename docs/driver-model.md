@@ -247,13 +247,25 @@ Ordered by "what makes the system useful soonest", not by interest.
 1. Serial (16550 UART) — the debugging lifeline, first driver written
 2. Framebuffer (from `Handoff`) — no hardware acceleration, just pixels
 3. Local APIC / IO-APIC timer and IPI
-4. PS/2 keyboard — simple, enough for a kernel shell
+4. PS/2 keyboard — simple, enough for a kernel shell. **Built 2026-08-22**
+   ([RFC 0037](rfc/0037-a-keyboard-on-real-hardware.md)): an i8042 probed under
+   a bounded wait so a machine without one is delayed rather than hung, its line
+   claimed through §2's own rules, and set-1 scancodes translated by a pure
+   function tested on the host. It is the first driver here written for a
+   machine nobody has booted yet — every other one on this list earns its keep
+   in QEMU, and this one exists because a laptop with no serial port has no
+   other way in.
 
 **Phase 2 (a real machine):**
 5. PCIe enumeration (ECAM)
 6. virtio-blk, virtio-net, virtio-rng — the whole VM story in three small drivers
 7. NVMe — the whole bare-metal storage story in one
-8. xHCI (USB) — keyboard, storage, and the largest attack surface here
+8. xHCI (USB) — keyboard, storage, and the largest attack surface here. Note
+   what item 4 does **not** cover: a USB keyboard needs all of this — PCIe
+   enumeration, the register file, command/event/transfer rings, device slots
+   and endpoint contexts, `ADDRESS_DEVICE`, descriptor parsing — before the HID
+   boot protocol can even begin. It is a milestone, not a step, and the honest
+   consequence today is that a machine with no i8042 has no keyboard.
 9. Intel e1000e / generic RTL — bare-metal networking
 
 **Phase 3 (enterprise):**

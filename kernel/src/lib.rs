@@ -42,6 +42,7 @@ pub mod input;
 pub mod iommu;
 pub mod ipc;
 pub mod irq;
+pub mod keyboard;
 pub mod memory;
 pub mod mmio;
 pub mod notify;
@@ -16025,6 +16026,27 @@ fn console_input(handoff: &Handoff) -> bool {
     );
     println!("    vectors        {taken} of {total} allocatable in use:");
     vectors::for_each(|vector, owner| println!("      {vector:#04x}  {owner}"));
+
+    // The keyboard, if this machine has one. RFC 0037.
+    //
+    // Absence is a state, not a failure: every machine this has ever booted on
+    // is reachable over serial, and the laptops this exists for are the ones
+    // where it is the only way in. Reported either way, because "no keyboard"
+    // is the single most useful line in the log for whoever is standing at
+    // that laptop.
+    if let Some(notification) = input::notification() {
+        // SAFETY: called once, here, with the interrupt controller up and the
+        // console's notification already created.
+        match unsafe { keyboard::install(handoff.bsp_lapic_id, handoff.rsdp, hhdm, notification) } {
+            Ok(keyboard_vector) => println!(
+                "    keyboard       i8042 present, irq {} -> vector {keyboard_vector:#04x}",
+                keyboard::KEYBOARD_IRQ
+            ),
+            Err(reason) => println!(
+                "\x1b[93m    keyboard       none ({reason}); this machine can only be typed at over serial\x1b[0m"
+            ),
+        }
+    }
     true
 }
 

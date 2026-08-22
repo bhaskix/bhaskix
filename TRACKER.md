@@ -894,6 +894,131 @@ find it again.
 unmet claims enforced by CI would only prove the claims are still unmet, which the table already says
 in plain text.
 
+### 2026-08-22 (a keyboard, because the first real machine would have ignored every key)
+
+**RFC 0037, built and gated.** Console input was a UART and nothing else —
+`input.rs` said so in its first line — and no test could tell, because every
+harness in this tree types over a serial line. On the laptop this project is
+about to be booted on, that is a machine which prints its whole boot report
+beautifully and then ignores the keyboard. M1-17 was going to be closed by a
+machine nobody could type at.
+
+**The design decision is one ring per source, and it is a correctness
+requirement rather than tidiness.** The obvious implementation — have the
+keyboard interrupt call `input::push` — is wrong, and the module's own header
+said why before this RFC existed: the ring is lock-free *because* it has one
+producer. Two handlers, possibly on two CPUs, both read the same head, both
+write the same slot, and both publish the same index. So the keyboard brought
+its own ring and the **consumer** merges. Each ring keeps exactly the invariant
+its correctness argument depends on, and no lock was introduced anywhere.
+
+One reader still, for two devices: the keyboard binds to the console's existing
+notification with its own badge, because `irq::bind` stores delivery per vector.
+
+**Every constant was verified against documentation rather than written from
+memory** — data `0x60`, status/command `0x64`, status bit 0 output-full and bit
+1 input-full, self-test `0xAA` → `0x55`, config read `0x20` / write `0x60`,
+`0xAE` enable-keyboard-interface. That check earned its keep on the last of
+them: **config bit 6 is the controller's set-2-to-set-1 translation**, firmware
+is free to leave it either way, and UEFI on a machine that never touched the
+legacy port has no reason to have set it. Left to chance the failure is not a
+dead keyboard, which would be obvious, but a keyboard where every key types the
+wrong character. It is now set explicitly.
+
+Absence is a state, not a failure. The probe is bounded — a controller that is
+not there never clears the bit being waited on, and an unbounded wait for it is
+a boot that stops with no message — and a machine without one reports
+`keyboard none (no i8042 controller answered); this machine can only be typed
+at over serial` and carries on. Proven, not asserted: with the probe forced to
+refuse, the machine still reached a shell prompt.
+
+**What is proven, and by what.** The translation is a pure function with no
+hardware in it: twelve host tests, one watched red by a single-character typo in
+the shift table, which the tables-agree test located as `tables disagree at
+0x03`. The driver is gated end to end in QEMU by `tests/qemu/keyboard-test.sh`,
+which drives the emulated i8042 through the monitor's `sendkey` and never types
+over serial at any point — a test that could fall back to the UART would pass on
+a machine whose keyboard does nothing. Watched red twice, as the RFC undertook:
+with shift broken, only the shift assertion failed and the other four still
+passed; with the probe refused, the presence assertion failed and the machine
+still booted.
+
+**The harness's own first run was wrong, and that is worth more than the pass.**
+Two assertions went green while the monitor socket had never been opened,
+because the boot report is thousands of lines and a self-test runs the kernel
+shell's `help` during it — so `help` and its output were already in the log
+before a single key was sent. A marker that was already there proves nothing.
+Every assertion about typing is now scoped to text produced *after* the keys go
+out. The same run also showed `await A || await B` serialising: waiting for a
+prompt that never comes burns the whole timeout and kills the machine before the
+second is tried.
+
+**What this does not do**, stated so nobody is surprised by a keyboard that does
+nothing: **a USB keyboard still will not work.** Many laptops present their
+built-in keyboard through the embedded controller's i8042 emulation and will;
+some recent thin machines have no i8042 at all and will not. xHCI is
+`docs/driver-model.md` item 8 and a milestone rather than a step.
+
+Twenty-six unsafe lines, every one a port read or write, because there is no way
+to talk to this device that is not `in`/`out` on two fixed ports. The part most
+likely to be wrong — the tables — holds no `unsafe` at all.
+
+### 2026-08-22 (300 boots with every marker armed: the negative space, and one thing in it)
+
+**The proof the 2026-08-18 fix asked for, delivered.** That fix — the acquire's
+front edge made uninterruptible — was claimed on a mechanism fitting seven
+specimens rather than on a reproduction, and set its own standard: *"the
+negative space — the wedge rate of every suite and soak that follows, with all
+five markers still armed to convict a survivor."*
+
+300 boots at `JOBS=1`, every marker armed, and the count for each:
+
+| marker | boots |
+|---|---|
+| `COUNT UNDERFLOW` | 0 |
+| `COUNT MISMATCH` | 0 |
+| `BLOCK HOLDING` | 0 |
+| `SAVED HOLDING` | 0 |
+| `SAVED COUNT` | 0 |
+
+Against a family that produced seven specimens in the soaks before it, that is
+the negative space the fix was claimed on. **It is not a proof of absence** and
+should not be written up as one — it is 300 boots of a defect that used to
+appear, not appearing.
+
+**One canary did fire, from a different family**, and it is a real defect rather
+than an instrument artefact:
+
+```
+LOCK ORDER  blocking on wait::WaitQueue (rank 9) while holding mask 0b11000000000, at kernel/src/wait.rs:195
+```
+
+Ranks 9 and 10 — `WaitQueue` and `SchedRunqueue` — held while blocking on a wait
+queue. One boot in 300, during the wait-queue stress test (18,665 sleeps, four
+races caught in the window), on a boot where a thread had been stolen. The log
+is preserved.
+
+**One explanation is already ruled out by that boot's own report**: it says
+`saved holding  no thread was switched out holding a rank`, so the mask was not
+inherited through a context switch and the phantom-mask-via-migration story does
+not fit. `wake_all` legitimately holds rank 9 and takes rank 10 inside it, in
+the declared order, so the remaining candidates are a stale rank record or a
+genuine re-entrant acquisition. **Undiagnosed, and recorded rather than
+re-run away.**
+
+**A correction to the entry above this one.** That entry argued the canary scan
+was worth having because a boot can trip a marker and still pass. This specimen
+is *not* that case — the same boot also printed `lock order FAILED`, so the
+existing `FAILED` grep would have caught and kept it. The scan changed nothing
+here. Its value — catching a marker in a boot that passes — remains real and
+remains **unproven**, and the first thing written about it overstated what this
+soak showed.
+
+Also measured across all 300: `spawn resched declines` was **0**. The fallback
+added yesterday has still never fired outside a forced experiment, which is what
+its own comment predicted and why the deterministic check beside it, rather than
+the latency bound, is what guards that hole.
+
 ### 2026-08-22 (the soak could not see the canaries it exists to catch)
 
 **The 2026-08-18 fix to the acquire's front edge set its own proof standard in writing** — *"the
