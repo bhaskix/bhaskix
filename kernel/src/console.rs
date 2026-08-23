@@ -120,6 +120,16 @@ impl Default for Recorder {
 /// A multiplexed output sink.
 pub struct Console {
     serial: Option<SerialPort>,
+    /// A **second** UART, if the machine has one.
+    ///
+    /// Not a fallback: output goes to both. A headless server's only channel
+    /// may be a port this kernel does not think of as first, and on the SR550
+    /// the boot report says `serial present` -- COM1 is real and its loopback
+    /// round-trips -- while nothing the kernel writes reaches serial-over-LAN.
+    /// Writing to both is what a machine with two ports and no screen needs,
+    /// and it costs a second UART's worth of characters on a machine that has
+    /// one to spare. RFC 0042 step 6.
+    serial_second: Option<SerialPort>,
     framebuffer: Option<FbConsole>,
     /// What has been printed, for reading back. RFC 0042.
     recorder: Recorder,
@@ -129,6 +139,7 @@ impl Console {
     const fn empty() -> Self {
         Self {
             serial: None,
+            serial_second: None,
             framebuffer: None,
             recorder: Recorder::new(),
         }
@@ -147,6 +158,11 @@ impl Write for Console {
             // SAFETY: `serial` is only ever set by `init_serial`, which stores
             // it after `SerialPort::init` returned `Ok` -- exactly the
             // precondition `write_str` requires.
+            unsafe { serial.write_str(s) };
+        }
+        if let Some(serial) = self.serial_second.as_ref() {
+            // SAFETY: as above -- set only by `init_second_serial`, and only
+            // for a port whose own probe answered something other than absent.
             unsafe { serial.write_str(s) };
         }
         if let Some(framebuffer) = self.framebuffer.as_mut() {
@@ -206,6 +222,29 @@ pub fn init_serial(base: u16) -> Presence {
 
     if presence != Presence::Absent {
         CONSOLE.lock().serial = Some(port);
+    }
+    presence
+}
+
+/// Brings up a second serial sink, if the machine has a second UART.
+///
+/// **Additional, not alternative.** The first port keeps its place; this one is
+/// written to as well. A machine with one UART is unaffected, because an absent
+/// port installs nothing.
+///
+/// Why this exists: on the SR550 the boot report says `serial present` — the
+/// probe found COM1 and its loopback round-tripped — and yet nothing the kernel
+/// writes arrives at serial-over-LAN, across seven boots. A port that is real
+/// and whose output nobody carries is a port that is not the one the service
+/// processor is listening to. That was read off the machine on 2026-08-23 by
+/// somebody typing `dmesg`, which is the first time this project has been able
+/// to ask.
+pub fn init_second_serial(base: u16) -> Presence {
+    let port = SerialPort::new(base);
+    // SAFETY: as `init_serial`. Still before any other CPU is started.
+    let presence = unsafe { port.init() };
+    if presence != Presence::Absent {
+        CONSOLE.lock().serial_second = Some(port);
     }
     presence
 }

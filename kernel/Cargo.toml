@@ -415,7 +415,14 @@ asm_budget = 10
 # which is forbid(unsafe_code), and the translation from "the set of keys held"
 # to "what was newly pressed" -- the whole difference between a boot report and
 # a scancode stream -- happens there.
-unsafe_budget = 2095
+# 2097 at RFC 0042 step 6, 2026-08-23: +2, for a second UART.
+#
+# The whole of the increase is `SerialPort::init` on COM2 and the write to it,
+# and it is the cheapest two lines in this file's history: the SR550 has two
+# serial ports, this kernel probed one, and it spent two hardware boots writing
+# a boot report nobody could carry. Writing to both put 19,550 bytes of it on
+# serial-over-LAN and closed M1-17, open since Phase 0.
+unsafe_budget = 2097
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

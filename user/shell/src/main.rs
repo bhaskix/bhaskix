@@ -316,6 +316,7 @@ fn dmesg() {
     }
 
     let mut offset = 0usize;
+    let mut lines = 0usize;
     while offset < size {
         let reply = call(CONSOLE, console::RECORD, [offset as u64, 0, 0, 0]);
         if !reply.delivered() {
@@ -330,9 +331,48 @@ fn dmesg() {
             // only one of them would also do.
             break;
         }
-        write(bytes);
+
+        // **Paged, and on a real machine that is the whole point.** Without it
+        // this prints twenty-one kilobytes onto a twenty-five line framebuffer
+        // and scrolls past exactly like the report it exists to recover -- so
+        // it would be a command that reproduces the problem it was built for.
+        // A byte at a time rather than a chunk at a time, because a page break
+        // lands mid-chunk far more often than not.
+        for byte in bytes {
+            write(core::slice::from_ref(byte));
+            if *byte == b'\n' {
+                lines += 1;
+                if lines >= PAGE_LINES {
+                    lines = 0;
+                    if !more() {
+                        return;
+                    }
+                }
+            }
+        }
         offset += bytes.len();
     }
+}
+
+/// How many lines `dmesg` prints before it waits.
+///
+/// Twenty-two of a twenty-five line framebuffer, leaving room for the prompt
+/// and the line the reader is still looking at.
+const PAGE_LINES: usize = 22;
+
+/// Waits at a page break. Answers whether to carry on.
+///
+/// **`q` quits and anything else continues**, which is the way round somebody
+/// who has used `more` expects. A reader who wanted one line near the start
+/// should not have to page through the rest to get their prompt back.
+fn more() -> bool {
+    write(b"-- more -- (q quits) ");
+    let mut buffer = [0u8; CHUNK_BYTES];
+    let taken = read(&mut buffer);
+    // Erase the prompt, so the record reads as a record rather than as a
+    // transcript with page furniture in it.
+    write(b"\r                      \r");
+    taken == 0 || (buffer[0] != b'q' && buffer[0] != b'Q')
 }
 
 /// Writes bytes to the console, one chunk per round trip.
@@ -506,7 +546,8 @@ fn help() {
     write(b"    pkg list          what is installed\n");
     write(b"    pkg run <n>       start an installed program, grants from its manifest\n");
     write(b"    pkg remove <n>    remove an installed package\n");
-    write(b"    dmesg             print what the kernel printed while booting --\n");
+    write(b"    dmesg             print what the kernel printed while booting, a\n");
+    write(b"                      page at a time (q quits) --\n");
     write(b"                      the bytes themselves, in order, not a log with\n");
     write(b"                      priorities or timestamps\n");
     write(b"    exit              end this shell\n");

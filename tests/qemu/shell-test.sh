@@ -97,7 +97,16 @@ else
     # handle lives in one slot, so each `open` takes it from the one before --
     # and `inner` is the one whose page gets lent, so its handle has to still be
     # there when the lending is given back at the end.
-    commands=$'help\r'$'dmesg\r'$'caps\r'$'map\r'$'irq\r'$'open greeting\r'
+    # `dmesg` pages, and the `q` on its own line is what gets out of it.
+    #
+    # It is a line of its own rather than glued to the next command, because the
+    # pager consumes a whole chunk of type-ahead when it takes its key -- which
+    # is what a pager is supposed to do, and which ate `caps` when the two were
+    # sent together. The `q` line's echo never appears (the shell is in the
+    # pager, not at a prompt), so the send loop waits out its ten seconds before
+    # carrying on. That is the cost of testing a pager with a harness that paces
+    # itself on echoes, and it is cheaper than not testing it.
+    commands=$'help\r'$'dmesg\r'$'q\r'$'caps\r'$'map\r'$'irq\r'$'open greeting\r'
     commands+=$'open sub/inner\r'$'open ..\r'$'open inner\r'$'ls /\r'$'cat etc/hostname\r'
     if [[ "$MODE" == "iommu" ]]; then
         # `ask` was called `lend` until 2026-08-21, when the name was found to

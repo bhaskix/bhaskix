@@ -355,7 +355,7 @@ load-bearing:
 | SMAP | Kernel cannot read/write user pages except via `copy_*_user` (which brackets with `STAC`/`CLAC`) | Warn loudly; degraded mode noted in attestation |
 | UMIP | User mode cannot read descriptor-table registers | Warn |
 | CET (shadow stack, IBT) | Control-flow integrity | Enable when present; not required |
-| IOMMU (VT-d / AMD-Vi) | DMA containment | **Boot in degraded mode, printed at boot and recorded in attestation.** T3 and T4 are not mitigated without it. |
+| IOMMU (VT-d / AMD-Vi) | DMA containment | **Boot in degraded mode, printed at boot and recorded in attestation.** T3 and T4 are not mitigated without it. **And on real hardware it has never been enabled** — found 2026-08-23 on the first machine whose boot report anybody could read: four units discovered and none programmed, because `iommu_bringup` sequences itself after `virtio::probe()` and no real server has a virtio block device. So T3 and T4 are mitigated **under emulation only** until that is fixed, and this row says so rather than letting the table imply otherwise. |
 | KASLR | Randomise the kernel image | Always on; `nokaslr` is a debug-build-only option. **The slide is not printed in the boot report** since 2026-08-23 — see the note below |
 | `RDRAND` | The machine's only source of unpredictability ([RFC 0021](rfc/0021-unpredictability.md)) | **Boot, warn loudly, and let the caller refuse.** A machine with no `RDRAND` still has a filesystem, a shell and a supervisor, none of which need to be unpredictable — but `bin/tcpd` does not start, because a guessable TCP sequence number is an off-path injection nobody can see. Reported in the `features` line every boot. |
 

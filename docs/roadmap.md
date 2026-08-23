@@ -61,7 +61,7 @@ until 2026-08-18, two days stale, found while closing RFC 0029. No architecture 
 
 ## Phase 1 — Foundation ✅ complete
 
-### M1 — Boot and output ✅ *(17/18 — M1-17, booting real hardware: booted on an SR550 2026-08-22 and observed on screen, but no report was captured, so it is owed rather than met)*
+### M1 — Boot and output ✅ *(18/18 — M1-17 **met 2026-08-23**: the boot report was read off a Lenovo SR550, 19,550 bytes over serial-over-LAN)*
 
 *Vision milestone 1: "Boot with UEFI, print Hello from Bhaskix".*
 
@@ -152,11 +152,16 @@ loader survives 24 hours of fuzzing without a crash.
 across four CPUs, runs programs in ring 3 that hold capabilities and nothing else, and answers a
 user-mode shell from services in their own domains.
 
-**One exit criterion is owed rather than met**, and is tracked as such: M1-17. The image booted on
-a Lenovo SR550 on 2026-08-22, observed on screen, which is the first evidence against this
-criterion — but nothing was captured, because the kernel's output reached the framebuffer and not
-serial-over-LAN, so no boot report was read. Booting is not the criterion; a boot whose report
-somebody read is.
+**Every exit criterion is met**, M1-17 last, on 2026-08-23. It took three boots of a Lenovo SR550.
+The first (2026-08-22) was observed on screen and captured nothing. The second captured the
+firmware's output and then silence. The third read the `serial` line back with `dmesg`
+([RFC 0042](rfc/0042-reading-the-boot-report-back.md)) — and that line said `present`, which meant
+the kernel had found a UART, believed it worked, and was writing to a port nobody carried. **The
+machine has two serial ports and this kernel only ever probed one.** Writing to both put 19,550
+bytes of boot report on serial-over-LAN.
+
+The criterion was never "a machine" — it was a boot whose report somebody read, and it stayed open
+for exactly as long as that was impossible.
 
 **Correction, 2026-08-20.** This paragraph and M6's heading both said the ELF loader's 24 hours of
 fuzzing was still owed. It was **met on 2026-08-13** — three campaigns ran the full twenty-four
@@ -477,7 +482,7 @@ production readiness. The word for what this is, and the word the release notes 
 | R2 | The ISO boots to a user-mode shell on BIOS, UEFI, and our own loader | met |
 | R3 | A package installs, runs with manifest-derived grants, and removes | met (RFC 0030) |
 | R4 | Networking answers on both address families, measured | met (RFC 0018–0029) |
-| R5 | **Boots on one piece of real hardware** | **not met** — M1-17. Not blocked on a machine since 2026-08-22: the image booted on a Lenovo SR550, observed on screen. Nothing was captured, so what is owed is a boot report somebody read |
+| R5 | **Boots on one piece of real hardware** | ✅ **met 2026-08-23** — the report was read off a Lenovo SR550, and its RT wake latency (worst 1.532 µs against a 50 µs target) is the first hardware measurement this project has. One machine of one model, and nothing has run on it longer than a boot |
 | R6 | The design documents reviewed by two people who did not write them | **not met** — Phase 0's own criterion |
 | R7 | A release note that states the gaps above as plainly as the features | to write |
 

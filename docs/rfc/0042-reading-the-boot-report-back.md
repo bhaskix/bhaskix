@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-23, steps 1–5 implemented.** Written the same day as the second hardware boot, which failed for the same reason as the first. `dmesg` at the shell replays the boot report from its first line, and the report no longer names its own address space. Step 6 — reading it back on the SR550 — is the one that closes M1-17, and is not done |
+| **Status** | ✅ **ACCEPTED 2026-08-23 — all six steps.** Written the same day as the second hardware boot, which failed for the same reason as the first. `dmesg` at the shell replays the boot report from its first line, the report no longer names its own address space, and step 6 read it back on the SR550 — **which closed M1-17, open since Phase 0**, and found that the machine has two UARTs and this kernel probed one |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/console`, `services/console`, `user/shell` |
 | **Milestone** | Phase 2. It gates nothing and unblocks **M1-17**, which has been open since Phase 0 |
@@ -246,6 +246,27 @@ say which of its three states this machine is in — a question open since
    it is not. Gated: it must replay the **first** thing the kernel printed, and
    the check runs against the typed session only — where that text can have come
    from nowhere but the replay.
-6. ⬜ A hardware boot on the SR550 that reads back the `serial` line — and, if it
-   says what commit `0087b87` intended, closes a question open since the first
-   physical boot this project ever did.
+6. ✅ **Done 2026-08-23, and it did close that question — by disproving the
+   thing it was supposed to confirm.** Somebody at the SR550 typed `dmesg` and
+   read the `serial` line. It said **`present`**: the probe found COM1 *and its
+   loopback round-tripped*, so `0087b87`'s theory — a shared port disturbing the
+   loopback — does not apply to this machine. The kernel was writing to a real
+   port that nobody was carrying.
+
+   The machine has **two** UARTs and the service processor listens to the other
+   one. Writing to both put **19,550 bytes** of boot report on serial-over-LAN,
+   which is **M1-17**, open since Phase 0, met.
+
+   *What the report then said, none of it seen before:* RT wake latency worst
+   **1.532 µs** against a 50 µs target; 16 CPUs of 16; 185,089 lock acquisitions
+   with no ordering violation; no frame lost; nothing red in 607 lines. And two
+   things QEMU cannot show — **2 firmware-reserved IOMMU regions** where the
+   emulator declares none, and a **real Intel xHCI controller** that RFC 0041's
+   rule 1 refused for want of translation on first meeting.
+
+   *And one defect it exposed*, recorded here because this step found it: the
+   IOMMU **never enables on real hardware**. `iommu_bringup` calls
+   `virtio::probe()?` after finding its units, and no real server has a virtio
+   block device — so four units were found and none programmed. Every
+   containment claim resting on RFC 0012 is a claim about an emulator until that
+   is fixed.

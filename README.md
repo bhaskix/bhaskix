@@ -61,13 +61,20 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > that has not been adopted. **USB is a keyboard and nothing else** — no storage, no hubs, no USB 3
 > — and a machine with no i8042 *and no IOMMU* still has no keyboard, because a bus master nothing
 > translates for is refused rather than driven. The ELF
-> loader has had its 24 hours of fuzzing, as of 2026-08-13, with no crash and no artifact. **It has
-> booted on physical hardware exactly once, and every measurement above is still QEMU** — on
-> 2026-08-22 the image booted on a Lenovo ThinkSystem SR550 from media mounted over its BMC,
-> observed on screen. Nothing was captured: the output reached the framebuffer and not
-> serial-over-LAN, so no boot report was read and no self-test result from real hardware is known.
-> M1-17 stays open, because the criterion is a boot somebody read, not a boot somebody saw. Nothing
-> here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
+> loader has had its 24 hours of fuzzing, as of 2026-08-13, with no crash and no artifact.
+>
+> **It runs on physical hardware, and as of 2026-08-23 somebody has read what it printed there.** A
+> Lenovo ThinkSystem SR550, booted from media mounted over its BMC: sixteen CPUs online of sixteen,
+> 185,089 lock acquisitions checked with no ordering violation, no frame lost, and an RT wake
+> latency whose **worst case was 1.532 µs against a 50 µs target** — a figure this project had only
+> ever been able to record as unmet-under-emulation. The full 19,550-byte report is kept.
+>
+> It took three boots to get there, and the reason is worth the sentence: the machine has **two**
+> serial ports and this kernel only ever probed one, so it spent two boots writing a report nobody
+> could carry. **What is still QEMU:** the IOMMU. Its bring-up is gated on finding a virtio block
+> device, which no real server has, so on that machine four units were found and none enabled — and
+> every containment claim that rests on RFC 0012 is a claim about an emulator until that is fixed.
+> Nothing here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
 >
 > **The design documents still have one author and no independent reviewers.** Phase 0's exit
 > criterion asks for two people who did not write them, and that is genuinely unmet rather than

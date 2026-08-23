@@ -117,6 +117,11 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
     // Serial first, before anything else can go wrong. It is the only sink
     // that works with no framebuffer, no memory manager, and a corrupt heap.
     let serial_present = console::init_serial(COM1);
+    // And a second UART if this machine has one, written to as well. RFC 0042
+    // step 6: the SR550 reports `serial present` for COM1 -- found, loopback
+    // round-tripping -- while nothing reaches its serial-over-LAN, which is a
+    // port that is real and that nobody carries.
+    let serial_second = console::init_second_serial(bhaskix_arch::serial::COM2);
 
     let framebuffer_present = match handoff.framebuffer {
         Some(fb) => console::init_framebuffer(fb),
@@ -220,7 +225,7 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
         cpu::halt_forever();
     }
 
-    report_boot_state(handoff, serial_present, framebuffer_present);
+    report_boot_state(handoff, serial_present, serial_second, framebuffer_present);
     report_memory(handoff);
 
     // Physical memory. The bump allocator is retired here: it carves out the
@@ -17105,7 +17110,12 @@ fn verify_timer() {
     }
 }
 
-fn report_boot_state(handoff: &Handoff, serial: bhaskix_arch::Presence, framebuffer: bool) {
+fn report_boot_state(
+    handoff: &Handoff,
+    serial: bhaskix_arch::Presence,
+    serial_second: bhaskix_arch::Presence,
+    framebuffer: bool,
+) {
     println!("  boot");
     println!("    loader          {}", handoff.loader);
     println!("    handoff version {}", handoff.version);
@@ -17115,6 +17125,19 @@ fn report_boot_state(handoff: &Handoff, serial: bhaskix_arch::Presence, framebuf
             "(none)"
         } else {
             handoff.cmdline
+        }
+    );
+    // Both ports, named, because the question this answers is *which one the
+    // machine's service processor is listening to* -- and one line saying
+    // "present" about a port nobody carries is what left that open for two
+    // days.
+    println!(
+        "    serial (com2)   {}",
+        match serial_second {
+            bhaskix_arch::Presence::Working => "present -- output goes here too",
+            bhaskix_arch::Presence::Unverified =>
+                "present, loopback unverified -- output goes here too",
+            bhaskix_arch::Presence::Absent => "absent (this machine has one UART)",
         }
     );
     println!(

@@ -22,7 +22,7 @@ What can be counted honestly, with how to recount it:
 
 | | | how it is derived |
 |---|---|---|
-| **First release** | **29 November 2026** — set by the project lead 2026-08-19; a developer preview, scope in `docs/roadmap.md` | Seven criteria, five met today. The two that are not are the ones that decide what the release may claim: **R5** boots on real hardware (M1-17 — not blocked on a machine since 2026-08-22, when one booted on an SR550; what is owed is a *captured* boot report from it) and **R6** two independent document reviewers (Phase 0's own unmet criterion). If either is still open on the day, the release ships saying so |
+| **First release** | **29 November 2026** — set by the project lead 2026-08-19; a developer preview, scope in `docs/roadmap.md` | Seven criteria, **six** met as of 2026-08-23. The one that is not is the one that decides what the release may claim: ~~**R5** boots on real hardware~~ **MET 2026-08-23** (M1-17: the report was captured and read on the SR550, and its RT wake latency — 1.532 µs worst against a 50 µs target — is the first hardware measurement this project has) and **R6** two independent document reviewers (Phase 0's own unmet criterion). If either is still open on the day, the release ships saying so |
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **9 of 10 done** | §4 below; the tenth row — libc, resolved into the Linux personality — **was missing from that table until 2026-08-19** while the roadmap carried the bullet, so this count read 9 of 9 and meant 9 of 10. The ninth — package management and image building — closed 2026-08-19 with RFC 0030 (accepted the same day), the eighth — networking — on 2026-08-18 with RFC 0029. The table has grown as bullets became rows: 7 until telemetry joined 2026-08-17, 8 until packages joined 2026-08-19, 9 until the missing libc row was added the same day |
 | Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
@@ -711,7 +711,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Task | Blocked on | Owner |
 |---|---|---|
-| M1-17 | ~~Physical UEFI machine with serial. QEMU cannot substitute.~~ **And not a *captured* boot report either, corrected again 2026-08-23 after a second boot: what is missing is that nobody can **read** what the machine printed. The report scrolls off a framebuffer, serial carries only the firmware on this machine, and no shell command brings it back — see [RFC 0042](docs/rfc/0042-reading-the-boot-report-back.md).** **The machine is no longer the blocker, corrected 2026-08-23.** A Lenovo ThinkSystem SR550 is available over its BMC and the image booted on it 2026-08-22, observed on screen. What is owed is a boot that was **captured**: the output reached the framebuffer and not serial-over-LAN, so no boot report was read and no self-test result from real hardware is known. This row read as though no machine existed for a day after one did. | Tarun Kumar Kushwaha |
+| ~~M1-17~~ | ✅ **MET 2026-08-23.** The boot report was read off the SR550 — 19,550 bytes over serial-over-LAN once the kernel wrote to **both** UARTs, and the `serial` line read by a person typing `dmesg` before that. The blocker was reshaped three times — a machine, then a capture, then somebody able to read it — and none of those was the answer: the machine has two serial ports and this kernel only ever probed one. | Tarun Kumar Kushwaha |
 | Repo metadata | GitHub description and topics are unset, and `main` has no branch protection — `GOVERNANCE.md` §2 requires review for non-trivial changes and nothing enforces it. Deploy keys have no API scope, so these need the web UI. | Tarun Kumar Kushwaha |
 | CI log access | Reading Actions logs needs authentication; unauthenticated API gives 60 requests/hour and only pass/fail. A fine-grained token with `Actions: read` would remove both limits. | Tarun Kumar Kushwaha |
 
@@ -790,6 +790,137 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-23 (the IOMMU has never been enabled on a real machine, because its bring-up asks for a virtio device first)
+
+**Found by the boot that closed M1-17**, in its own report:
+
+```
+    iommu          4 units found, not enabled; 46-bit addresses, 2 reserved regions, interrupt remapping supported
+```
+
+Four units, found and described, and **none programmed**. The reason is one line
+of `iommu_bringup`:
+
+```rust
+let found = found.filter(|report| report.units > 0)?;
+let device = virtio::probe()?;          // <- returns None on a real server
+```
+
+The IOMMU's whole bring-up — windows, per-device page tables, the identity map,
+interrupt remapping — is sequenced after finding **a virtio block device**,
+because that was the device it was built to contain and every machine it has ever
+run on had one. A Lenovo SR550 has SATA and NVMe and no virtio anything, so the
+`?` returns and the unit is left alone.
+
+**Nothing could have caught this.** Every gate this project has runs on QEMU, and
+QEMU always has the virtio device the probe is looking for. The check that would
+have failed is "does the IOMMU come up on a machine with no virtio device", and
+until today there was no such machine to run it on.
+
+**What it costs, stated plainly.** [RFC 0012](docs/rfc/0012-iommu.md) is the
+argument that a DMA-capable device reaches only what it was given, and
+`security.md` §1's **T3** and **T4** are marked mitigated by it. On the one piece
+of real hardware this system has ever run on, that mitigation **is not in
+effect** — four units sat idle while the machine ran. Every containment claim
+resting on RFC 0012 is a claim about an emulator until this is fixed.
+
+**And it is why the xHCI controller was refused.** The report also carries
+`xhci 00:14.0 8086:a1af REFUSED: no iommu translation`. RFC 0041's rule 1 did
+exactly the right thing to a real Intel controller on first meeting — a bus
+master with nothing translating for it is not driven. But the reason there was
+nothing translating is this bug, one layer down. **The rule fired correctly for
+the wrong reason**, and a reader of that line alone would conclude the machine
+has no IOMMU. It has four.
+
+**Not fixed here.** The fix is not "drop the probe": the device is *used* — it is
+the first window's subject, and `block_self_test` maps its frames through
+`iommu::map_frame`. Bringing the unit up with no device to give it a window is a
+different sequence, and the honest version of it says which devices got windows
+and which did not. That is its own change, and it is the first thing this
+project's hardware access has made both necessary and testable.
+
+Recorded against `security.md` §1 as well, because a threat table that says T3
+and T4 are mitigated while the mitigation does not run on real hardware is the
+kind of claim this file exists to refuse.
+
+### 2026-08-23 (M1-17 IS MET: the boot report was read off real hardware, and the two-day serial mystery was a second UART)
+
+**Somebody read what the machine printed.** M1-17 has been open since Phase 0,
+and its criterion was never "a machine" or "a captured log" — it was *a boot
+somebody read*. On the third hardware boot, a person at the SR550's console typed
+`dmesg` and read the `serial` line off the boot report.
+
+It said **`present`**, and that one word overturned the standing hypothesis.
+
+**What `present` meant.** The probe found COM1 *and its loopback round-tripped*.
+So commit `0087b87`'s theory — that a BMC sharing the port disturbs the loopback
+and the kernel wrongly concludes there is no UART — **does not apply to this
+machine**. The kernel was not declining to write. It was writing to a real port
+that nobody was carrying.
+
+**The SR550 has two UARTs, and the service processor listens to the other one.**
+That was the lead recorded earlier in the day as a hypothesis: the kernel probes
+`COM1` and only `COM1`, while the BIOS reports both ports enabled with
+`SerialPortSharing`. It is now a finding. The kernel writes to both ports, and:
+
+```
+    serial (com2)   present -- output goes here too
+    serial          present
+```
+
+**And the boot report came out over serial-over-LAN, 19,550 bytes of it**, saved
+at `/root/bhaskix-hardware-logs/sol-20260823-145324.txt`. Every measurement in
+this project's history until today came from an emulator.
+
+## What the machine said, none of it seen before
+
+| | |
+|---|---|
+| **RT wake latency** | **worst 1.532 µs** over 50 wakeups, against `scheduler.md` §4's 50 µs target. The target has been recorded as unmet-under-emulation since M4; on metal it is met with a **thirty-fold** margin. Spawn to first run 86 µs |
+| CPUs | 16 online of 16, bsp lapic 0 |
+| Lock order | 119,389 acquisitions checked with the detector verified, and 185,089 through bring-up — **0 violations** |
+| Deadline | armed for 20 ms, woke after 20.005 ms, never early |
+| Memory | 3 objects created and destroyed, 11 mappings revoked, **no frame lost** across 49,763,004 |
+| Nothing red | no `FAILED`, no `PANIC`, no `EXCEPTION` anywhere in 607 lines |
+
+**Two things a real machine has that QEMU does not.**
+
+- **4 IOMMU units, 46-bit addresses, and 2 reserved regions.** QEMU's
+  `intel-iommu` declares *no* reserved regions at all — `iommu.rs` says so, and
+  says the refusal path therefore has no natural test in the emulator. This
+  machine has two.
+- **A real Intel xHCI controller**, `00:14.0 8086:a1af`, and **RFC 0041's rule 1
+  fired on it**: `REFUSED: no iommu translation, and a bus master without one can
+  read and write all of memory`. The rule written yesterday against an emulated
+  controller did the right thing to a real one, on its first meeting.
+
+**And a defect this boot exposed.** The IOMMU was **not enabled** despite four
+units being found, and the reason is in `iommu_bringup`: after checking the units
+exist it calls `virtio::probe()?` and returns on `None`. **No real server has a
+virtio block device**, so the whole of RFC 0012 — windows, per-device page
+tables, interrupt remapping — is gated on a device that only appears under
+emulation. It has been that way since the IOMMU was built and no test could see
+it, because every test machine is QEMU.
+
+That is also why the xHCI controller was refused: there was no unit translating
+for it to be behind. Rule 1 was right, and the reason it had to fire is a bug one
+layer down.
+
+**`DYING_UNKNOWN` reads 4 on this machine**, against 0–1 per boot in QEMU. The
+counter added this morning — a `try_lock` on the runqueue that could not tell
+whether a caller was dying — is four times more likely to lose its race on
+sixteen real cores than on four emulated ones. Nothing was wrong; the boot's
+`0 were refused by its endpoint` says the second net held. But the window is
+wider here, which is what the counter was added to find out.
+
+## What this changes, and what it does not
+
+M1-17 is **met**. The first-release criterion R5 is **met**. What is not
+established: this is one machine of one model, and nothing has run on it for
+longer than a boot. The IOMMU gap above means the containment RFC 0012 argues for
+is, on real hardware, **not on** — and every claim that rests on it is a claim
+about QEMU until that is fixed.
 
 ### 2026-08-23 (RFC 0042 steps 4–5: `dmesg`, and the RFC's own "the kernel gains no method" was wrong)
 
