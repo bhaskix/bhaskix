@@ -2043,8 +2043,24 @@ $(grep -aoE 'inner(inner)*' "$LOG" | head -1) where innerinnerinnerinner was due
         fail "only $(grep -acF "only reachable through the subdirectory" "$LOG") hosted read(s) \
 reached the console; two hosted programs read a file and both must"
         status=1
+    elif ! grep -qF "Linuxx86_64x86_64" "$LOG"; then
+        # The rest of Tier 1's file surface, in one string, and the *count*
+        # is the check:
+        #
+        #   `Linux`   -- `uname`'s sysname. It says which ABI this is, which
+        #                is the question the field asks; `release` and
+        #                `version` say what the system actually is, and a
+        #                host test holds them to naming Bhaskix.
+        #   `x86_64`  -- printed once because `ioctl(1, TCGETS)` succeeded on
+        #                the console, which is what `isatty` reads...
+        #   `x86_64`  -- ...and once more because the same request on the
+        #                *file* was refused. One marker rather than two is an
+        #                adapter that calls every descriptor a terminal, and
+        #                every program that redirects its output asks this.
+        fail "uname or the ioctl allow-list did not answer: $(grep -aoE 'Linux[a-z0-9_]*' "$LOG" | head -1)"
+        status=1
     else
-        pass "a hosted program listed a directory, stat'ed a file in it, and read it -- the second hosted read on this machine"
+        pass "a hosted program read a second file, asked uname, and found only its console is a terminal"
     fi
 elif grep -qF "linux dir      skipped" "$LOG"; then
     pass "no filesystem service on this machine, so hosted programs have no directory to list"

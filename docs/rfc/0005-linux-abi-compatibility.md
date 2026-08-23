@@ -468,13 +468,19 @@ always said it belongs.
 
 ## Step 8's record, the real one (2026-08-23): directories are readable, and reading a file twice is not
 
-> **Step 8 is *begun*, not finished, and the tracker says so.** What is in:
-> directories, `lseek`, `fstat`/`newfstatat`, and the fuzz target the step
-> makes mandatory. What is named in Tier 1 and is not in: `readlinkat`,
-> `unlinkat`, `mkdirat`, `fcntl`, `ioctl`, `uname`, and `/proc/self/exe` —
-> which needs `readlinkat` first. Directories were taken first because they
-> were the part of the tier with *nothing* behind them; the rest have
-> arithmetic or an obvious shape and no discoveries left in them.
+> **Step 8's remaining surface landed the same day**, in a second pass:
+> `uname`, `fcntl`, `ioctl` on an allow-list, and `mkdirat`/`unlinkat` as the
+> refusals they have to be. See "The rest of Tier 1's surface" below.
+>
+> **What is still not in: `readlinkat`, and the `/proc/self/exe` that needs
+> it** — and that is a question rather than a gap. `/proc/self/exe` is a path
+> to the program's own image, and a hosted process here need not have one:
+> RFC 0033 makes a process a *record in `bin/linuxd`*, and every probe in this
+> tree is injected by the kernel with no file behind it at all. Answering with
+> an invented path would be the first thing this adapter made up. **The
+> decision belongs with the question "what is a hosted process's image", and
+> the trigger is the first program that needs its own path** — a runtime
+> re-executing itself, most likely.
 
 **Read the correction at the head of "Step 8's record (2026-08-19)" first.**
 That section is numbered wrong and says so: its content is step 5's. This is
@@ -653,6 +659,63 @@ and the probe faulted in ring 3 at an address that read exactly like a
 clobbered register. **Two boots went into diagnosing a kernel that was
 working.** The lesson is this RFC's own, in a new place: the transcription is
 untrusted input too.
+
+### The rest of Tier 1's surface, and the three decisions in it
+
+Directories were the part of the tier with nothing behind them. The rest is
+wiring — except in three places, where it is a judgement, and those are what
+this section is for.
+
+**`uname`'s `sysname` is `Linux`, and that is not a lie about what this is.**
+The field tells a program which *system-call ABI* it is on, and that answer is
+Linux: it is the entire purpose of this personality, and a program reading
+anything else would choose a different syscall convention and fail at once.
+What it does not claim is that the kernel is Linux — `version` says *"Bhaskix,
+a capability system; Linux is the ABI and not the kernel"*, which is what a
+reader of `uname -a` sees, and a host test holds both fields to naming the
+system. The UX rule this sits under is the project's own: a familiar name is
+allowed only where it does not imply a guarantee this system will not keep, and
+what is being guaranteed here is the ABI.
+
+**`release` is `0.0.0-bhaskix`, and is deliberately not a plausible Linux
+version.** Programs gate on it — glibc refuses below a minimum, runtimes pick
+syscalls by it — so reporting `6.x` would promise a syscall surface this
+adapter does not have and convert a clean refusal into an `ENOSYS` somewhere
+later and stranger. **A program that declines to run against `0.0.0` has
+refused loudly**, which is the better failure. The trigger for revisiting is
+the first program observed to refuse for this reason, and the number it asks
+for.
+
+**`ioctl` is an allow-list of two, as this RFC required.** `TCGETS` and
+`TIOCGWINSZ`, and only on a console. `ioctl` is not an interface; it is a
+namespace of driver interfaces, and answering an unknown request means writing
+to a caller's buffer at a length only the request number implies. The refusal
+is `ENOTTY` and not `EINVAL` because `ENOTTY` is what `isatty` turns into
+"no" — every program that redirects its output asks this on every run, and a
+different errno makes each of them believe its pipe is a terminal.
+
+Two more, smaller but worth stating. **`F_SETFL` is accepted and does
+nothing**: the flags it can change are `O_APPEND`, `O_NONBLOCK` and `O_ASYNC`,
+none of which this adapter has, and refusing would stop the many programs that
+set `O_NONBLOCK` defensively on descriptors they then use blockingly. The lie
+would be *reporting the flag back*, so `F_GETFL` derives its answer from what
+the descriptor actually is. And **`mkdirat` and `unlinkat` answer `EROFS`, not
+`ENOSYS`**: the directory this adapter holds carries `READ` and `DERIVE` and no
+`WRITE`, by RFC 0033 step 6's deliberate grant, so the honest answer is "this
+filesystem is read-only to you" — `ENOSYS` would send a program looking for
+another way to do it.
+
+**Gated as three more printings on the probe's own line**: `Linux` from
+`uname`, then `x86_64` twice — once because `ioctl(1, TCGETS)` succeeded on the
+console and once because the same request on the *file* was refused. One marker
+rather than two is an adapter calling every descriptor a terminal, which is
+what the gate watches for and what it caught when the check was removed on
+purpose.
+
+Eight host tests over the arithmetic, six of them watched red — including a
+plausible Linux version in `release`, a `uname` field allowed to fill its slot
+and lose its terminator, `F_SETFD` comparing the whole word instead of the low
+bit, and the allow-list opened to everything.
 
 ### What this does not do
 

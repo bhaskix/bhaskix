@@ -769,6 +769,8 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         // caller's memory, so each belongs in this block rather than among
         // the calls a message alone can answer.
         GETDENTS64 => return (REPLY_VALUE, answer_getdents64(request)),
+        UNAME => return (REPLY_VALUE, answer_uname(request)),
+        IOCTL => return (REPLY_VALUE, answer_ioctl(request)),
         FSTAT => return (REPLY_VALUE, answer_fstat(request)),
         NEWFSTATAT => return (REPLY_VALUE, answer_newfstatat(request)),
         CLOSE => return (REPLY_VALUE, answer_close(request)),
@@ -978,6 +980,14 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // arithmetic on a row this program already holds, which is why it is
         // here and `fstat` is not.
         LSEEK => answer_lseek(request),
+        FCNTL => answer_fcntl(request),
+        // **Refused, and with the errno that says why.** The directory this
+        // adapter holds carries `READ` and `DERIVE` and no `WRITE` -- RFC 0033
+        // step 6 granted it that way on purpose -- so a hosted program cannot
+        // create or remove anything, and `EROFS` is the answer that tells it
+        // the truth. `ENOSYS` would say the call is unimplemented, which would
+        // send a program looking for another way to do it.
+        MKDIRAT | UNLINKAT => Answer::error(-30), // EROFS
         MADVISE => Answer::ok(memory::plan_madvise() as u64),
         // Signal masking is recorded nowhere and honoured nowhere yet. Zero
         // rather than `-ENOSYS`, because a runtime told it cannot mask signals
@@ -1322,6 +1332,16 @@ const FSTAT: u64 = 5;
 const NEWFSTATAT: u64 = 262;
 /// `getdents64(fd, buffer, count)`.
 const GETDENTS64: u64 = 217;
+/// `uname(buf)`.
+const UNAME: u64 = 63;
+/// `fcntl(fd, command, argument)`.
+const FCNTL: u64 = 72;
+/// `ioctl(fd, request, argument)`.
+const IOCTL: u64 = 16;
+/// `mkdirat(dirfd, path, mode)`.
+const MKDIRAT: u64 = 258;
+/// `unlinkat(dirfd, path, flags)`.
+const UNLINKAT: u64 = 263;
 /// `newfstatat`'s flag meaning "the path is empty; stat the descriptor" —
 /// which is how a libc turns `fstat` into this call.
 ///
@@ -2551,6 +2571,125 @@ fn record_release(cycles: u64) {
             unsafe { core::ptr::write_volatile(at as *mut u64, cycles.max(1)) };
             return;
         }
+    }
+}
+
+/// Answers a hosted `uname`.
+fn answer_uname(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::{UTSNAME_BYTES, write_utsname};
+
+    let mut bytes = [0u8; UTSNAME_BYTES];
+    if write_utsname(&mut bytes).is_err() {
+        return Answer::error(-22); // EINVAL
+    }
+    if !copy_out(request.domain, request.first(), &bytes) {
+        return Answer::error(-14); // EFAULT
+    }
+    Answer::ok(0)
+}
+
+/// Answers a hosted `ioctl`, against an allow-list of two.
+fn answer_ioctl(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::{Ioctl, plan_ioctl};
+
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9); // EBADF
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    match plan_ioctl(request.second(), entry.kind) {
+        // **Nothing is written back for `TCGETS`**, and that is deliberate:
+        // `isatty` reads the *return value*, not the `termios` it passed, and
+        // this adapter has no terminal settings it could honestly report.
+        // Filling the caller's buffer with plausible ones would be inventing
+        // a baud rate and a line discipline.
+        Ok(Ioctl::AskIfTerminal) => Answer::ok(0),
+        Ok(Ioctl::WindowSize) => {
+            // Four `u16`s: rows, columns, and two pixel counts. Zeroes,
+            // because this console's size is not something the adapter knows
+            // -- and zero is what Linux reports for a terminal that cannot
+            // say, which programs already handle by falling back to 80x24.
+            let zeroes = [0u8; 8];
+            if !copy_out(request.domain, request.third(), &zeroes) {
+                return Answer::error(-14);
+            }
+            Answer::ok(0)
+        }
+        Err(errno) => Answer::error(errno),
+    }
+}
+
+/// Answers a hosted `fcntl`.
+fn answer_fcntl(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::{Entry, Fcntl, Kind, fcntl, open, plan_fcntl};
+
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9);
+    };
+    let plan = match plan_fcntl(request.second(), request.third()) {
+        Ok(plan) => plan,
+        Err(errno) => return Answer::error(errno),
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    match plan {
+        Fcntl::Duplicate {
+            floor,
+            close_on_exec,
+        } => {
+            let Ok(floor) = usize::try_from(floor) else {
+                return Answer::error(-22);
+            };
+            match process.descriptors.insert(
+                Entry {
+                    close_on_exec,
+                    ..entry
+                },
+                floor,
+            ) {
+                Ok(made) => Answer::ok(made as u64),
+                Err(errno) => Answer::error(errno),
+            }
+        }
+        Fcntl::ReadDescriptorFlags => Answer::ok(u64::from(entry.close_on_exec)),
+        Fcntl::WriteDescriptorFlags { close_on_exec } => {
+            if let Some(process) = process_for(request.domain)
+                && let Some(entry) = process.descriptors.get_mut(descriptor)
+            {
+                entry.close_on_exec = close_on_exec;
+            }
+            Answer::ok(0)
+        }
+        // **Derived from what the descriptor is, not from what was asked
+        // for.** A program that set `O_NONBLOCK` with `F_SETFL` and read it
+        // back here would find it absent, which is the honest answer: this
+        // adapter has no non-blocking descriptors, and reporting the flag
+        // would be agreeing to something it does not do.
+        Fcntl::ReadStatusFlags => {
+            let access = if entry.writable && entry.readable {
+                open::RDWR
+            } else if entry.writable {
+                open::WRONLY
+            } else {
+                open::RDONLY
+            };
+            let directory = if entry.kind == Kind::Directory {
+                open::DIRECTORY
+            } else {
+                0
+            };
+            let _ = fcntl::FD_CLOEXEC;
+            Answer::ok(access | directory)
+        }
+        Fcntl::WriteStatusFlags => Answer::ok(0),
     }
 }
 

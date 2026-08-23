@@ -300,11 +300,15 @@ scheduled here — promoting a merge-gate obligation to a phase item would turn 
   moved it out in ten steps and the nucleus now interprets **no** Linux syscall number, gated on
   every boot; [RFC 0033](rfc/0033-what-a-hosted-process-is.md), accepted the same day, then said what
   a hosted process *is* — a record in that service bound one-to-one to a domain — which closes
-  architecture question **A6** and unblocks L1 below. **Tier 1 began 2026-08-23** with step 8's
-  directories: a hosted program opens the directory it was given, lists it, rewinds the listing
-  with `lseek`, `fstat`s it and reopens through it, with the mandatory fuzz target at 22.4M
-  executions — and the step found two nucleus bugs on the way, one fixed and one recorded in
-  [security.md](security.md) §2 as a hole in immediate transitive revocation. RFC 0031 is also where this bullet's
+  architecture question **A6** and unblocks L1 below. **Tier 1 landed 2026-08-23** (step 8): a hosted
+  program opens the directory it was given, lists it, rewinds the listing with `lseek`, `fstat`s
+  it, reopens through it and reads a second file; asks `uname`; and finds through a two-request
+  `ioctl` allow-list that its console is a terminal and its file is not — with the mandatory fuzz
+  target at 22.4M executions. `readlinkat` and `/proc/self/exe` are left open on purpose: a hosted
+  process need not have an image path, and inventing one would be the first thing this adapter made
+  up. The step found three nucleus bugs on the way, all fixed, one of which meant a hosted program
+  could `read` exactly once per boot ([RFC 0044](rfc/0044-revocation-that-reaches-the-mapping.md),
+  and [security.md](security.md) §2's note on immediate transitive revocation). RFC 0031 is also where this bullet's
   *destination* is written down — the L1–L4
   application milestones below, and the containment they must inherit, all four still unmet
 

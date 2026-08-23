@@ -130,6 +130,11 @@ pub mod errno {
     pub const ENOSYS: i64 = -38;
     /// The buffer given is too small for one record.
     pub const EINVAL_SHORT: i64 = -22;
+    /// Not a terminal — read from this machine's
+    /// `/usr/include/asm-generic/errno-base.h`, not recalled. It is what
+    /// `isatty` turns into "no", so a program redirecting its output tests
+    /// for exactly this on every run.
+    pub const ENOTTY: i64 = -25;
 }
 
 /// How many descriptors one hosted process may hold.
@@ -571,6 +576,183 @@ pub fn write_dirent(
     Ok(bytes)
 }
 
+/// A `struct new_utsname`: six fields of sixty-five bytes.
+///
+/// **Read from this machine's `/usr/include/linux/utsname.h`, not recalled.**
+/// `__NEW_UTS_LEN` is 64 and each field is one longer for the terminator, and
+/// it is the *kernel's* struct rather than glibc's `struct utsname` — those
+/// agree here and need not, and what a syscall writes is the kernel's.
+pub const UTSNAME_FIELD: usize = 65;
+/// The whole of it.
+pub const UTSNAME_BYTES: usize = UTSNAME_FIELD * 6;
+
+/// What `uname` answers, and the one field that is a judgement rather than a
+/// fact.
+///
+/// **`sysname` is `Linux`, and that is not a lie about what this is.** The
+/// field tells a program which *system-call ABI* it is running on, and that
+/// answer is Linux — it is the whole purpose of this personality, and a
+/// program that read anything else would pick a different syscall convention
+/// and fail immediately. What the field does not claim is that the kernel is
+/// Linux, and the two fields below say so in the place a reader of `uname -a`
+/// will actually look.
+///
+/// **`release` is deliberately not a plausible Linux version.** Programs gate
+/// features on it — glibc refuses to start below a minimum, and runtimes pick
+/// syscalls by it — so reporting `6.x` would promise a syscall surface this
+/// adapter does not have and turn a clean refusal into an `ENOSYS` in a
+/// corner. A program that declines to run against `0.0.0` has refused
+/// *loudly*, which is the better failure. **The trigger for revisiting is the
+/// first program observed to refuse for this reason**, and the number it
+/// needs; until then this is a claim this system can defend.
+pub fn write_utsname(out: &mut [u8]) -> Result<(), i64> {
+    if out.len() < UTSNAME_BYTES {
+        return Err(errno::EINVAL);
+    }
+    out[..UTSNAME_BYTES].fill(0);
+    let fields = [
+        // The ABI, which is the question being asked.
+        "Linux",
+        "bhaskix",
+        // Not a Linux version, on purpose. See above.
+        "0.0.0-bhaskix",
+        "Bhaskix, a capability system; Linux is the ABI and not the kernel",
+        "x86_64",
+        // No NIS domain, which Linux itself reports as this exact string
+        // rather than as empty.
+        "(none)",
+    ];
+    for (index, field) in fields.iter().enumerate() {
+        let at = index * UTSNAME_FIELD;
+        let bytes = field.as_bytes();
+        // Every field is truncated to leave a terminator, because a caller
+        // reads these with `strlen` and an unterminated one runs into the next.
+        let take = bytes.len().min(UTSNAME_FIELD - 1);
+        out[at..at + take].copy_from_slice(&bytes[..take]);
+    }
+    Ok(())
+}
+
+/// `fcntl` commands this adapter answers.
+pub mod fcntl {
+    /// Duplicate to the lowest descriptor at or above the argument.
+    pub const DUPFD: u64 = 0;
+    /// Read the close-on-exec flag.
+    pub const GETFD: u64 = 1;
+    /// Write it.
+    pub const SETFD: u64 = 2;
+    /// Read the access mode and status flags.
+    pub const GETFL: u64 = 3;
+    /// Write the status flags.
+    pub const SETFL: u64 = 4;
+    /// As [`DUPFD`], with close-on-exec set on the new one.
+    pub const DUPFD_CLOEXEC: u64 = 1030;
+    /// The only descriptor flag there is.
+    pub const FD_CLOEXEC: u64 = 1;
+}
+
+/// What an `fcntl` asks this adapter to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fcntl {
+    /// Duplicate into the lowest free descriptor at or above `floor`.
+    Duplicate {
+        /// The lowest number the new descriptor may take.
+        floor: i32,
+        /// Whether `execve` should close the new one.
+        close_on_exec: bool,
+    },
+    /// Answer the close-on-exec flag.
+    ReadDescriptorFlags,
+    /// Set it from the argument.
+    WriteDescriptorFlags {
+        /// What the caller asked for.
+        close_on_exec: bool,
+    },
+    /// Answer the access mode and status flags.
+    ReadStatusFlags,
+    /// Accept a change to the status flags that changes nothing.
+    WriteStatusFlags,
+}
+
+/// Reads an `fcntl` command.
+///
+/// **`F_SETFL` is accepted and does nothing, which is a decision.** The flags
+/// it can change are `O_APPEND`, `O_NONBLOCK` and `O_ASYNC`; this adapter has
+/// no non-blocking descriptors and no signal-driven I/O, and a file opened
+/// read-only cannot append. Refusing would stop programs that set `O_NONBLOCK`
+/// defensively on descriptors they then use blockingly — which is most of
+/// them. Accepting it *and reporting the flag back* would be the lie; the
+/// status flags this answers come from what the descriptor actually is.
+///
+/// # Errors
+///
+/// [`errno::EINVAL`] for a command this adapter does not implement, which is
+/// every locking command among others. Not [`errno::ENOSYS`]: the call exists.
+pub fn plan_fcntl(command: u64, argument: u64) -> Result<Fcntl, i64> {
+    match command {
+        fcntl::DUPFD | fcntl::DUPFD_CLOEXEC => {
+            let floor = i32::try_from(argument).map_err(|_| errno::EINVAL)?;
+            if floor < 0 {
+                return Err(errno::EINVAL);
+            }
+            Ok(Fcntl::Duplicate {
+                floor,
+                close_on_exec: command == fcntl::DUPFD_CLOEXEC,
+            })
+        }
+        fcntl::GETFD => Ok(Fcntl::ReadDescriptorFlags),
+        fcntl::SETFD => Ok(Fcntl::WriteDescriptorFlags {
+            close_on_exec: argument & fcntl::FD_CLOEXEC != 0,
+        }),
+        fcntl::GETFL => Ok(Fcntl::ReadStatusFlags),
+        fcntl::SETFL => Ok(Fcntl::WriteStatusFlags),
+        _ => Err(errno::EINVAL),
+    }
+}
+
+/// The `ioctl` requests this adapter answers, and it is an allow-list.
+///
+/// [RFC 0005](../../docs/rfc/0005-linux-abi-compatibility.md) Tier 1 says
+/// exactly that — "a small allow-list, not the general mechanism" — and the
+/// reason is that `ioctl` is not an interface, it is a namespace of driver
+/// interfaces. Answering an unknown request would mean writing to a caller's
+/// buffer at a length only the request number implies.
+pub mod ioctl {
+    /// Read terminal attributes. What `isatty` actually calls.
+    pub const TCGETS: u64 = 0x5401;
+    /// Read the window size.
+    pub const TIOCGWINSZ: u64 = 0x5413;
+}
+
+/// What an `ioctl` asks for, if this adapter answers it at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ioctl {
+    /// `isatty`: succeed for a console and refuse for everything else.
+    AskIfTerminal,
+    /// The window size, which this adapter answers as zeroes.
+    WindowSize,
+}
+
+/// Reads an `ioctl` request against what the descriptor is.
+///
+/// **`ENOTTY` and not `EINVAL` for a non-console**, because that is the errno
+/// `isatty` turns into "no", and a program redirecting its output tests it on
+/// every run. A different refusal would make every such program think its
+/// pipe was a terminal or its terminal broken.
+///
+/// # Errors
+///
+/// [`errno::ENOTTY`] for a request this adapter does not answer, or a terminal
+/// request on something that is not one.
+pub fn plan_ioctl(request: u64, kind: Kind) -> Result<Ioctl, i64> {
+    let terminal = kind == Kind::Console;
+    match request {
+        ioctl::TCGETS if terminal => Ok(Ioctl::AskIfTerminal),
+        ioctl::TIOCGWINSZ if terminal => Ok(Ioctl::WindowSize),
+        _ => Err(errno::ENOTTY),
+    }
+}
+
 /// `lseek`'s `whence`.
 pub mod whence {
     /// From the beginning.
@@ -669,6 +851,140 @@ pub fn stat_of(entry: &Entry) -> StatFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uname_answers_the_abi_in_sysname_and_says_what_it_is_elsewhere() {
+        let mut out = [0xffu8; UTSNAME_BYTES];
+        write_utsname(&mut out).expect("room");
+        let field = |index: usize| {
+            let at = index * UTSNAME_FIELD;
+            let bytes = &out[at..at + UTSNAME_FIELD];
+            let end = bytes.iter().position(|byte| *byte == 0).expect("terminated");
+            core::str::from_utf8(&bytes[..end]).expect("ascii").to_string()
+        };
+        // The ABI, which is the question `sysname` asks and the one field a
+        // program branches on.
+        assert_eq!(field(0), "Linux");
+        assert_eq!(field(4), "x86_64");
+        // And the fields where a reader of `uname -a` finds out what this
+        // really is. If the system's own name stops appearing here, the
+        // `sysname` above has become a plain lie.
+        assert!(field(3).contains("Bhaskix"), "version: {}", field(3));
+        assert!(field(2).contains("bhaskix"), "release: {}", field(2));
+        // **Not a plausible Linux version**, deliberately: a program that
+        // gates on it should refuse loudly rather than proceed into ENOSYS.
+        assert!(field(2).starts_with("0."), "release: {}", field(2));
+    }
+
+    #[test]
+    fn every_uname_field_is_terminated_even_when_it_is_too_long_to_fit() {
+        let mut out = [0xffu8; UTSNAME_BYTES];
+        write_utsname(&mut out).expect("room");
+        for index in 0..6 {
+            let at = index * UTSNAME_FIELD;
+            assert_eq!(
+                out[at + UTSNAME_FIELD - 1],
+                0,
+                "field {index} runs into the next, and a caller reads these with strlen"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_uname_buffer_is_refused_rather_than_partly_filled() {
+        let mut out = [0u8; UTSNAME_BYTES - 1];
+        assert_eq!(write_utsname(&mut out), Err(errno::EINVAL));
+    }
+
+    #[test]
+    fn fcntl_reads_the_two_duplicating_commands_and_their_difference() {
+        assert_eq!(
+            plan_fcntl(fcntl::DUPFD, 7),
+            Ok(Fcntl::Duplicate {
+                floor: 7,
+                close_on_exec: false
+            })
+        );
+        assert_eq!(
+            plan_fcntl(fcntl::DUPFD_CLOEXEC, 7),
+            Ok(Fcntl::Duplicate {
+                floor: 7,
+                close_on_exec: true
+            })
+        );
+    }
+
+    #[test]
+    fn fcntl_sets_close_on_exec_from_the_flag_and_not_from_the_word() {
+        // `FD_CLOEXEC` is bit zero and the ABI header says "anything with the
+        // low bit set goes". A version that compared the whole word would
+        // leave the flag clear for every caller that passed a wider one.
+        assert_eq!(
+            plan_fcntl(fcntl::SETFD, 1),
+            Ok(Fcntl::WriteDescriptorFlags {
+                close_on_exec: true
+            })
+        );
+        assert_eq!(
+            plan_fcntl(fcntl::SETFD, 0),
+            Ok(Fcntl::WriteDescriptorFlags {
+                close_on_exec: false
+            })
+        );
+        assert_eq!(
+            plan_fcntl(fcntl::SETFD, 3),
+            Ok(Fcntl::WriteDescriptorFlags {
+                close_on_exec: true
+            }),
+            "the low bit is what counts"
+        );
+        assert_eq!(
+            plan_fcntl(fcntl::SETFD, 2),
+            Ok(Fcntl::WriteDescriptorFlags {
+                close_on_exec: false
+            }),
+            "and a word without it is not close-on-exec"
+        );
+    }
+
+    #[test]
+    fn an_fcntl_this_adapter_does_not_implement_is_refused_and_not_ignored() {
+        // The locking commands, among others. Answering `Ok` would tell a
+        // program its lock was taken.
+        for command in [5u64, 6, 7, 8, 1024, u64::MAX] {
+            assert_eq!(plan_fcntl(command, 0), Err(errno::EINVAL), "{command}");
+        }
+    }
+
+    #[test]
+    fn ioctl_answers_a_terminal_only_for_a_console() {
+        assert_eq!(
+            plan_ioctl(ioctl::TCGETS, Kind::Console),
+            Ok(Ioctl::AskIfTerminal)
+        );
+        // **ENOTTY and nothing else**: it is what `isatty` turns into "no",
+        // and every program that redirects its output asks this.
+        for kind in [Kind::File, Kind::Pipe, Kind::Socket, Kind::Directory] {
+            assert_eq!(
+                plan_ioctl(ioctl::TCGETS, kind),
+                Err(errno::ENOTTY),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ioctl_outside_the_allow_list_is_refused_even_on_a_console() {
+        // The point of an allow-list: an unknown request would mean writing
+        // to a caller's buffer at a length only the number implies.
+        for request in [0u64, 0x5402, 0x5414, 0x8912, u64::MAX] {
+            assert_eq!(
+                plan_ioctl(request, Kind::Console),
+                Err(errno::ENOTTY),
+                "{request:#x}"
+            );
+        }
+    }
 
     #[test]
     fn a_seek_past_the_end_is_where_the_descriptor_goes_rather_than_an_error() {

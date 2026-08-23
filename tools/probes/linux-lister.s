@@ -90,11 +90,57 @@ _start:
         mov     $1, %eax                # write
         syscall
 
+        # 6. uname, into a part of the page nothing else has touched, and
+        #    print its `sysname` -- five bytes that say which ABI this is.
+        lea     1024(%r12), %rdi
+        mov     $63, %eax               # uname
+        syscall
+        test    %rax, %rax
+        js      done
+        lea     1024(%r12), %rsi
+        mov     $5, %edx
+        mov     $1, %edi
+        mov     $1, %eax
+        syscall
+
+        # 7. ioctl(1, TCGETS) -- the console *is* a terminal, so this answers
+        #    zero, and `isatty` reads exactly this.
+        mov     $1, %edi
+        mov     $0x5401, %esi
+        xor     %edx, %edx
+        mov     $16, %eax               # ioctl
+        syscall
+        test    %rax, %rax
+        js      done
+        call    machine
+
+        # 8. ioctl(fd, TCGETS) on the *file* -- which is not a terminal, so
+        #    this must be refused. A run that printed the marker once rather
+        #    than twice is an adapter calling every descriptor a terminal.
+        mov     %r13, %rdi
+        mov     $0x5401, %esi
+        xor     %edx, %edx
+        mov     $16, %eax
+        syscall
+        test    %rax, %rax
+        jns     done                    # succeeded, which is the bug
+        call    machine
+
 done:
         xor     %edi, %edi
         mov     $231, %eax              # exit_group
         syscall
         jmp     .
+
+        # write(1, uname's machine field, 6) -- "x86_64", used as a marker
+        # after the read has overwritten the dirent the `say` below prints.
+machine:
+        lea     1284(%r12), %rsi
+        mov     $6, %edx
+        mov     $1, %edi
+        mov     $1, %eax
+        syscall
+        ret
 
         # write(1, buffer + 19, 5) -- the name in the first dirent record
 say:
