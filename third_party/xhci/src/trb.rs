@@ -34,7 +34,7 @@
 //! stalls, which is why [`owned_by_consumer`] is a named function with tests
 //! rather than a comparison written out at each call site.
 
-use crate::{bits32, bits64};
+use crate::{bit32, bits32, bits64};
 
 /// Bytes in one TRB.
 pub const BYTES: usize = 16;
@@ -240,6 +240,64 @@ impl CompletionCode {
     }
 }
 
+/// Whether a control transfer has a data stage, and which way it goes.
+///
+/// **The numbers are the wire encoding and one of them is missing on purpose**:
+/// dword 3 bits 17:16 encode 0, 2 and 3, and the value 1 is reserved. A
+/// contiguous enum would put `Out` at 1 and every control write would be a
+/// reserved transfer type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransferType {
+    /// No data stage: the request is the whole transfer.
+    NoData,
+    /// The host sends data.
+    Out,
+    /// The device sends data.
+    In,
+}
+
+impl TransferType {
+    /// The wire encoding.
+    #[must_use]
+    pub const fn as_raw(self) -> u32 {
+        match self {
+            Self::NoData => 0,
+            Self::Out => 2,
+            Self::In => 3,
+        }
+    }
+}
+
+/// Which way data moves on a stage that has a direction bit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    /// Host to device.
+    Out,
+    /// Device to host.
+    In,
+}
+
+impl Direction {
+    /// Whether this is the device-to-host direction, which is the bit's value.
+    #[must_use]
+    pub const fn is_in(self) -> bool {
+        matches!(self, Self::In)
+    }
+
+    /// The direction that acknowledges a transfer moving `self`.
+    ///
+    /// A control read is acknowledged by writing nothing and a control write by
+    /// reading nothing, so a status stage always points the other way. Written
+    /// here so that no caller has to remember to invert it.
+    #[must_use]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Out => Self::In,
+            Self::In => Self::Out,
+        }
+    }
+}
+
 /// One Transfer Request Block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Trb(pub [u32; DWORDS]);
@@ -404,6 +462,97 @@ impl Trb {
         Some(trb.with_cycle_bit(cycle))
     }
 
+    /// With Interrupt On Completion set. Dword 3, bit 5.
+    ///
+    /// **The last TRB of a transfer descriptor needs this or nothing is ever
+    /// reported.** The controller executes the whole descriptor and posts a
+    /// Transfer Event only where it is asked to — so a control transfer whose
+    /// Status Stage does not carry it completes, correctly and silently, and
+    /// the driver waits for ever.
+    #[must_use]
+    pub const fn with_interrupt_on_completion(mut self, interrupt: bool) -> Self {
+        if interrupt {
+            self.0[3] |= 1 << 5;
+        } else {
+            self.0[3] &= !(1 << 5);
+        }
+        self
+    }
+
+    /// Whether Interrupt On Completion is set.
+    #[must_use]
+    pub const fn interrupt_on_completion(self) -> bool {
+        bit32(self.0[3], 5)
+    }
+
+    /// A Setup Stage TRB carrying the eight bytes of a control request.
+    ///
+    /// **The setup packet is immediate data, not a pointer.** Dwords 0 and 1
+    /// *are* the eight bytes, and dword 3's Immediate Data bit says so — which
+    /// this sets, because a Setup Stage without it points the controller at
+    /// whatever address those eight bytes happen to spell.
+    ///
+    /// The transfer length is fixed at eight for the same reason: it is the
+    /// size of the packet, not of the data the request will move.
+    #[must_use]
+    pub const fn setup_stage(setup: [u8; 8], transfer: TransferType, cycle: bool) -> Self {
+        let low = u32::from_le_bytes([setup[0], setup[1], setup[2], setup[3]]);
+        let high = u32::from_le_bytes([setup[4], setup[5], setup[6], setup[7]]);
+        let mut trb = Self::new().with_kind(Kind::SetupStage);
+        trb.0[0] = low;
+        trb.0[1] = high;
+        // Bits 16:0. The packet is always eight bytes.
+        trb.0[2] = 8;
+        // Bit 6, Immediate Data.
+        trb.0[3] |= 1 << 6;
+        // Bits 17:16, Transfer Type.
+        trb.0[3] |= transfer.as_raw() << 16;
+        trb.with_cycle_bit(cycle)
+    }
+
+    /// A Data Stage TRB: `length` bytes at `buffer`, in `direction`.
+    ///
+    /// # Errors
+    ///
+    /// `None` if `length` does not fit the 17-bit transfer-length field, as
+    /// [`Trb::normal`].
+    #[must_use]
+    pub const fn data_stage(
+        buffer: u64,
+        length: u32,
+        direction: Direction,
+        cycle: bool,
+    ) -> Option<Self> {
+        if length > 0x1_ffff {
+            return None;
+        }
+        let mut trb = Self::new()
+            .with_parameter(buffer)
+            .with_kind(Kind::DataStage);
+        trb.0[2] = length;
+        if direction.is_in() {
+            // Bit 16, Direction.
+            trb.0[3] |= 1 << 16;
+        }
+        Some(trb.with_cycle_bit(cycle))
+    }
+
+    /// A Status Stage TRB, which ends a control transfer.
+    ///
+    /// **Its direction is the opposite of the data stage's**, and that is not a
+    /// convention this function can enforce — a control read is acknowledged by
+    /// writing nothing, and a control write by reading nothing. A status stage
+    /// pointing the same way as its data stage is a transfer the device never
+    /// completes.
+    #[must_use]
+    pub const fn status_stage(direction: Direction, cycle: bool) -> Self {
+        let mut trb = Self::new().with_kind(Kind::StatusStage);
+        if direction.is_in() {
+            trb.0[3] |= 1 << 16;
+        }
+        trb.with_cycle_bit(cycle)
+    }
+
     /// Event: dword 3, bits 31:24 — which slot this concerns.
     #[must_use]
     pub const fn slot_id(self) -> u8 {
@@ -518,6 +667,139 @@ impl SegmentTableEntry {
     #[must_use]
     pub const fn entries(self) -> u16 {
         bits32(self.0[2], 0, 15) as u16
+    }
+}
+
+#[cfg(test)]
+mod control_transfer_tests {
+    use super::*;
+
+    /// **Raw encodings against literals, not round trips.** On 2026-08-23 a
+    /// getter and setter pair in `context` were both wrong about a bit range,
+    /// agreed with each other, and were pinned by a test that read the value
+    /// back through the accessor that wrote it — which passed the whole time.
+    /// These assert the dwords.
+    #[test]
+    fn a_setup_stage_carries_its_packet_as_immediate_data() {
+        // A GET_DESCRIPTOR(DEVICE, 0, 18): 0x80 0x06 0x00 0x01 0x00 0x00 0x12 0x00.
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
+        let trb = Trb::setup_stage(setup, TransferType::In, true);
+
+        assert_eq!(
+            trb.0[0], 0x0100_0680,
+            "dwords 0 and 1 *are* the eight bytes"
+        );
+        // Dword 1 is wIndex[15:0] then wLength[31:16]. This assertion was
+        // first written as 0x0000_0012 -- the two halves the wrong way round --
+        // and the test caught its own author.
+        assert_eq!(trb.0[1], 0x0012_0000);
+        assert_eq!(trb.0[1] & 0xffff, 0, "wIndex is the low half");
+        assert_eq!(
+            trb.0[1] >> 16,
+            18,
+            "wLength is the high half: 18 bytes asked for"
+        );
+        assert_eq!(
+            trb.0[2], 8,
+            "the transfer length is the size of the packet, not of the data \
+             the request will move"
+        );
+        assert_eq!(trb.kind(), Kind::SetupStage);
+        assert!(trb.cycle_bit());
+        assert!(
+            trb.0[3] & (1 << 6) != 0,
+            "Immediate Data: without it the controller reads those eight bytes \
+             as an address"
+        );
+        assert_eq!((trb.0[3] >> 16) & 0b11, 3, "Transfer Type In is 3");
+    }
+
+    #[test]
+    fn the_reserved_transfer_type_is_not_reachable() {
+        // Bits 17:16 encode 0, 2 and 3. One is reserved, so a contiguous enum
+        // would make every control write a reserved transfer type.
+        assert_eq!(TransferType::NoData.as_raw(), 0);
+        assert_eq!(TransferType::Out.as_raw(), 2);
+        assert_eq!(TransferType::In.as_raw(), 3);
+        for kind in [TransferType::NoData, TransferType::Out, TransferType::In] {
+            assert_ne!(kind.as_raw(), 1, "1 is reserved");
+        }
+    }
+
+    #[test]
+    fn a_data_stage_points_at_its_buffer_and_names_its_direction() {
+        let trb =
+            Trb::data_stage(0x1_0000_4000, 18, Direction::In, true).expect("a length that fits");
+        assert_eq!(trb.parameter(), 0x1_0000_4000);
+        assert_eq!(trb.0[2] & 0x1_ffff, 18);
+        assert_eq!(trb.kind(), Kind::DataStage);
+        assert!(trb.0[3] & (1 << 16) != 0, "Direction In is bit 16 set");
+
+        let out = Trb::data_stage(0x1_0000_4000, 18, Direction::Out, true).expect("fits");
+        assert_eq!(out.0[3] & (1 << 16), 0, "Direction Out is bit 16 clear");
+    }
+
+    #[test]
+    fn a_transfer_length_that_does_not_fit_is_refused_rather_than_truncated() {
+        assert!(Trb::data_stage(0x1000, 0x1_ffff, Direction::In, true).is_some());
+        assert!(
+            Trb::data_stage(0x1000, 0x2_0000, Direction::In, true).is_none(),
+            "truncating would tell the controller to move a different amount \
+             of data than the caller allocated for"
+        );
+    }
+
+    #[test]
+    fn a_status_stage_carries_no_data_at_all() {
+        let trb = Trb::status_stage(Direction::Out, true);
+        assert_eq!(trb.0[0], 0, "dwords 0 and 1 are reserved on a status stage");
+        assert_eq!(trb.0[1], 0);
+        assert_eq!(trb.0[2], 0);
+        assert_eq!(trb.kind(), Kind::StatusStage);
+    }
+
+    #[test]
+    fn a_status_stage_points_the_opposite_way_to_its_data_stage() {
+        // A control read is acknowledged by writing nothing and a control write
+        // by reading nothing. A status stage pointing the same way as its data
+        // stage is a transfer the device never completes.
+        assert_eq!(Direction::In.opposite(), Direction::Out);
+        assert_eq!(Direction::Out.opposite(), Direction::In);
+        let status = Trb::status_stage(Direction::In.opposite(), true);
+        assert_eq!(status.0[3] & (1 << 16), 0);
+    }
+
+    #[test]
+    fn interrupt_on_completion_is_bit_five_and_nothing_reports_without_it() {
+        let quiet = Trb::status_stage(Direction::Out, true);
+        assert!(!quiet.interrupt_on_completion());
+        let loud = quiet.with_interrupt_on_completion(true);
+        assert!(loud.interrupt_on_completion());
+        assert_eq!(loud.0[3] & (1 << 5), 1 << 5);
+        assert_eq!(
+            loud.with_interrupt_on_completion(false).0[3],
+            quiet.0[3],
+            "clearing it must put the dword back exactly"
+        );
+    }
+
+    #[test]
+    fn every_stage_publishes_on_the_cycle_it_was_given() {
+        // The cycle bit is the whole protocol: a stage published with the wrong
+        // one is a stage the controller reads as not yet written.
+        for cycle in [false, true] {
+            assert_eq!(
+                Trb::setup_stage([0; 8], TransferType::NoData, cycle).cycle_bit(),
+                cycle
+            );
+            assert_eq!(
+                Trb::data_stage(0x1000, 1, Direction::In, cycle)
+                    .expect("fits")
+                    .cycle_bit(),
+                cycle
+            );
+            assert_eq!(Trb::status_stage(Direction::Out, cycle).cycle_bit(), cycle);
+        }
     }
 }
 

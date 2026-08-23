@@ -54,6 +54,17 @@ this source was wrong and this tree is not.
 | `Slot::root_hub_port_number` and its setter used dword 1 bits **31:24**, which is Number of Ports. Moved to bits **23:16**. | 2026-08-23 | A controller. RFC 0041 step 5's Address Device was refused with `CC_TRB_ERROR` while every other field of the input context probed correct; written at 23:16 the same command addressed the device, slot state `Addressed`, USB address 1. |
 | `StructuralParameters2::max_scratchpad_buffers` documented its two halves the wrong way round — the prose contradicted the code and the test beneath it. Prose corrected; **the code was not**, and the tiebreak against the specification is recorded as owed. | 2026-08-23 | Reading, while building RFC 0041 step 3. |
 
+### Additions made here, after the take
+
+| what | when | where it came from |
+|---|---|---|
+| `Trb::setup_stage`, `Trb::data_stage`, `Trb::status_stage`, `TransferType`, `Direction`, `with_interrupt_on_completion` — the three stages of a control transfer, which the take did not include | 2026-08-23 | **Read from the same upstream tree this crate was taken from**, `src/ring/trb/transfer.rs` at 0.9.2, still on the build machine. Not recalled, and not derived: same source, same version, same provenance as everything above. |
+
+They are here rather than in the kernel because they are layouts, which is what
+this crate is for. What stays in the kernel is the *policy* built on them: which
+stages a given transfer has, which way each points, and which one carries
+Interrupt On Completion.
+
 **The lesson from the first of those is about the shape of a test, not about a
 bit range.** The accessor pair was pinned by:
 
