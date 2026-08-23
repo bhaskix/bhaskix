@@ -271,8 +271,29 @@ Ordered by "what makes the system useful soonest", not by interest.
    what item 4 does **not** cover: a USB keyboard needs all of this — PCIe
    enumeration, the register file, command/event/transfer rings, device slots
    and endpoint contexts, `ADDRESS_DEVICE`, descriptor parsing — before the HID
-   boot protocol can even begin. It is a milestone, not a step, and the honest
-   consequence today is that a machine with no i8042 has no keyboard.
+   boot protocol can even begin. It is a milestone, not a step.
+
+   **Built 2026-08-23** ([RFC 0041](rfc/0041-a-usb-keyboard.md), seven steps in
+   one day): a controller found and refused unless caged, brought up, its rings
+   answering a No-Op matched by address, a port enumerated, a slot taken, the
+   device addressed, its descriptors read over control transfers and parsed as a
+   boot keyboard, the interrupt IN endpoint configured and Running, an MSI-X
+   entry claimed, and reports translated from *held* to *newly pressed* into the
+   console ring the shell reads. `make test-usb-keyboard` types at it and asserts
+   the whole chain, including that a held key produces one character rather than
+   one per report. Rule 1 is watched refusing a real untranslated controller on
+   every boot of the `full` profile.
+
+   **The sentence this item carried until 2026-08-23** — "the honest consequence
+   today is that a machine with no i8042 has no keyboard" — is retired. What
+   replaces it is narrower and still true: a machine with no i8042 **and no
+   IOMMU** has no keyboard, because rule 1 refuses the controller rather than
+   driving a bus master nothing translates for. That is a trade this document
+   chose deliberately, and it is now a trade with a consequence somebody can hit.
+
+   **Not done:** storage, hubs, USB 3 streams, and teardown on failure — a driver
+   that gives up half-initialised still leaves a bus master with a live ring
+   (RFC 0041's unresolved question 1).
 9. Intel e1000e / generic RTL — bare-metal networking
 
 **Phase 3 (enterprise):**

@@ -45,11 +45,22 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > capabilities it holds and nothing else — the block driver, the console, and the filesystem each
 > run as services in their own domains, outside the kernel.
 >
-> **What is not here.** No IPv6, and no sockets API beyond UDP and TCP's own — networking itself
-> is real as of 2026-08-15: a virtio-net driver, a protocol service and a TCP service, each in its
-> own domain, carry a byte stream both directions through rings the connecting *program* owns and
-> hands over as capabilities, with the cost measured rather than argued about. No package
-> management, no libc, no self-hosting. The ELF
+> **What is not here.** **This paragraph was stale on three counts until 2026-08-23**, and said so
+> about things that had shipped four to six days earlier — IPv6, a sockets API and package
+> management. All three are done: [RFC 0029](docs/rfc/0029-ipv6.md) landed IPv6 as a second address
+> family on 2026-08-18 with both families measured on one boot, `bhaskix-sock` has been the sockets
+> API since 2026-08-17, and packages install, run and remove at the shell with manifest-derived
+> grants since 2026-08-19. Networking itself has been real since 2026-08-15: a virtio-net driver, a
+> protocol service and a TCP service, each in its own domain, carry a byte stream both directions
+> through rings the connecting *program* owns and hands over as capabilities, with the cost measured
+> rather than argued about.
+>
+> What is genuinely not here: **no libc and no self-hosting** — the Linux personality runs Go
+> binaries in ring 3 but its file and socket tiers are not started. **No cryptography at all**; a
+> grep for eleven primitive names returns nothing, and where it will come from is a decision RFC
+> that has not been adopted. **USB is a keyboard and nothing else** — no storage, no hubs, no USB 3
+> — and a machine with no i8042 *and no IOMMU* still has no keyboard, because a bus master nothing
+> translates for is refused rather than driven. The ELF
 > loader has had its 24 hours of fuzzing, as of 2026-08-13, with no crash and no artifact. **It has
 > booted on physical hardware exactly once, and every measurement above is still QEMU** — on
 > 2026-08-22 the image booted on a Lenovo ThinkSystem SR550 from media mounted over its BMC,

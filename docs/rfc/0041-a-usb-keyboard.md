@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft — steps 1 to 7 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. **Step 5 (2026-08-23): a USB keyboard is enumerated, given a slot and addressed** — and a real controller caught a bug in RFC 0038's vendored layouts that the crate's own round-trip test could not see: the root hub port number was being written into the Number of Ports field. **Step 6 (2026-08-23): the keyboard answers a control transfer and its interrupt IN endpoint is configured and Running** — descriptors read and parsed by the fuzzed `usb` crate, and the Device Context Index trap (endpoint 1 IN is index 3) demonstrated on a real device. **Step 7 (2026-08-23): a key typed at a USB keyboard reaches the shell**, interrupt-driven, with a held key producing one character rather than one per report. Only step 8 — the documents — is open |
+| **Status** | ✅ **ACCEPTED 2026-08-23 — all eight steps.** A key pressed on a USB keyboard reaches the shell, and the QEMU gate is watched red the three ways this document asked for: refusing the IOMMU check, corrupting a descriptor length, and breaking the Device Context Index arithmetic. Both unresolved questions are answered or restated; the documents were changed in the same change that made them true. Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. **Step 5 (2026-08-23): a USB keyboard is enumerated, given a slot and addressed** — and a real controller caught a bug in RFC 0038's vendored layouts that the crate's own round-trip test could not see: the root hub port number was being written into the Number of Ports field. **Step 6 (2026-08-23): the keyboard answers a control transfer and its interrupt IN endpoint is configured and Running** — descriptors read and parsed by the fuzzed `usb` crate, and the Device Context Index trap (endpoint 1 IN is index 3) demonstrated on a real device. **Step 7 (2026-08-23): a key typed at a USB keyboard reaches the shell**, interrupt-driven, with a held key producing one character rather than one per report. Only step 8 — the documents — is open |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | drivers |
 | **Milestone** | Phase 2 (see docs/roadmap.md) |
@@ -302,5 +302,19 @@ arithmetic — each seen to fail on purpose.
    not stream — the controller polls the device only while there is somewhere to
    put the answer — so a driver that forgets to re-queue gets exactly one
    keystroke.
-8. The QEMU gate, watched red three ways, and the documents updated in the same
-   change that makes them true.
+8. ✅ **Done 2026-08-23.** The QEMU gate, watched red three ways, and the
+   documents updated in the same change that makes them true.
+
+   The three, each rebuilt and re-run against the real emulated controller and
+   each seen to fail:
+
+   | Broken on purpose | What went red |
+   |---|---|
+   | The controller gets no IOMMU window | `no USB keyboard was reported` — rule 1 refuses it, so the gate depends on the translation actually being there |
+   | Eighteen bytes of device descriptor asked for as seventeen | `no USB keyboard was reported` — `Device::parse` refuses a short descriptor rather than reading past it |
+   | The endpoint *number* used as its Device Context Index | `xhci endpoint  not configured: the configure input context could not be built` — index 1 is the control endpoint, and the builder refuses it |
+
+   Documents changed: `driver-model.md` item 8 (built, and its "a machine with
+   no i8042 has no keyboard" sentence retired for a narrower one that is still
+   true), `README.md` (whose "what is not here" paragraph was stale on three
+   counts unrelated to USB), `TRACKER.md`, and this document.
