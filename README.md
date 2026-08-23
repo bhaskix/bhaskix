@@ -89,6 +89,31 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 
 ---
 
+## Try it
+
+```sh
+tools/setup-dev.sh   # rust, qemu, limine, xorriso -- once
+make demo            # builds it, boots it, hands you the shell
+```
+
+Two commands. You will watch the machine check itself — **every line of that
+report is a claim it just tested** — and then land at a prompt:
+
+```
+bhaskix$ ls /
+bhaskix$ cat etc/hostname
+bhaskix$ ps
+bhaskix$ pkg list
+bhaskix$ dmesg
+```
+
+`Ctrl-A` then `x` to leave. It is an emulator with two disk images under
+`build/`; nothing touches your machine, and closing it discards everything.
+
+`make demo` boots the machine the gates run against — two disks, a network, an
+IOMMU containing them, a USB keyboard. `make run` boots a bare one instead: a
+single read-only disk and no network, which starts faster and can do much less.
+
 ## Why another operating system
 
 Every general-purpose operating system in production today was architected before containers,
@@ -162,7 +187,8 @@ describes it land together.
 ```sh
 tools/setup-dev.sh      # rust toolchain, qemu, limine, xorriso, ovmf
 make                    # build the kernel and a bootable ISO
-make run                # boot it in QEMU (BIOS)
+make demo               # boot the full machine and use its shell
+make run                # boot a bare machine in QEMU (BIOS)
 make run-uefi           # boot it in QEMU (UEFI, via OVMF)
 make test               # everything CI runs -- about six minutes
 ```
@@ -173,7 +199,10 @@ Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 
 `make test` runs, cheapest first, so a trivial mistake fails in seconds rather
 than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host
-targets; **346 host assertions**; the project-invariant gates (bootloader
+targets; **949 host tests** (counted 2026-08-23 from a `make test-host` run —
+this line said "346 host assertions" for months, carried forward uncounted,
+which [TRACKER.md](TRACKER.md) §3 had already recorded as not comparable with
+what a run prints); the project-invariant gates (bootloader
 containment, `unsafe` budgets with mandatory `// SAFETY:` justifications,
 dependency direction, service placements, no vendor strings, SPDX headers);
 BIOS, UEFI and IOMMU boot tests asserting on captured serial output across four

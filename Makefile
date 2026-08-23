@@ -175,7 +175,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu test-keyboard \
+.PHONY: FORCE all kernel iso demo run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
         test-placements mkfs test-shell test-faults test-usb-keyboard fmt clippy gates hooks clean distclean help
 
@@ -467,6 +467,13 @@ $(LIMINE_DIR):
 	@echo "Limine is missing. Run tools/setup-dev.sh" >&2; exit 1
 
 # --- run -----------------------------------------------------------------
+
+# The front door: boots the machine the gates run against and hands you its
+# shell. `run` below is a *bare* machine -- one read-only disk, no network, no
+# IOMMU -- which boots faster and can do almost nothing, so it is not what a
+# newcomer should meet first.
+demo: $(ISO)
+	@tools/demo.sh
 
 run: $(ISO)
 	$(QEMU) $(QEMU_COMMON) -cdrom $(ISO) -boot d -serial stdio
