@@ -494,7 +494,16 @@ static OPEN_GUARDS_PER_CPU: [OpenGuards; MAX_CPUS] = [const { OpenGuards::new() 
 /// table is full (eight simultaneous holds on one CPU is already a story the
 /// rank mask tells without this table's help).
 fn open_guard(held: usize, at: &'static core::panic::Location<'static>, rank: u8) -> usize {
-    let cpu = percpu::cpu_id() as usize;
+    // **`effective_cpu`, not `percpu::cpu_id`.** They are the same function
+    // outside tests. Under `cfg(test)` they are not: `effective_cpu` answers a
+    // per-test-thread lease, which is what `for_each_open_guard`'s callers pass
+    // and therefore which table a reader looks at. Writing through `cpu_id`
+    // here put the record in table 0 while the reader looked in the lease's --
+    // so a guard opened by a test on any lease but 0 was invisible to the test
+    // that opened it. It presented as a record "taken away by another lock's
+    // release", which named the wrong suspect, and it was intermittent because
+    // it depended on which lease the thread got.
+    let cpu = effective_cpu();
     let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
     for slot in 0..OPEN_GUARDS {
         if table.held[slot]
@@ -564,7 +573,8 @@ fn note_hold_duration(table: &OpenGuards, slot: usize) {
 /// back to scanning every CPU's table for the matching site.
 fn close_guard(slot: usize, held: usize) {
     if slot < OPEN_GUARDS {
-        let cpu = percpu::cpu_id() as usize;
+        // As `open_guard`: the same table the record was written to.
+        let cpu = effective_cpu();
         let table = &OPEN_GUARDS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
         if table.held[slot].load(Ordering::Relaxed) == held {
             note_hold_duration(table, slot);
@@ -1258,22 +1268,81 @@ mod tests {
         let cpu = effective_cpu();
         // Stand-ins for two locks: all `open_guard` wants is two addresses
         // that differ, which is precisely the identity the site was not.
-        let first = 0u32;
-        let second = 0u32;
-        let one = core::ptr::from_ref(&first) as usize;
-        let two = core::ptr::from_ref(&second) as usize;
+        //
+        // **Statics, and with different values, for two separate reasons.**
+        // They were stack locals, and a stack is the one place an address is
+        // *not* a durable identity: thread stacks are recycled between tests, so
+        // another test's lock could land on the address this one had registered
+        // and its release would clear this test's record -- which is what failed
+        // here about one run in twenty, and it presents as "the lock that was
+        // not released must still be recorded". A static's address is unique for
+        // the life of the process and nothing can reuse it.
+        //
+        // Different values because two `static u32 = 0` may be merged into one
+        // symbol, and this test needs two addresses that differ.
+        static FIRST: u32 = 0xA11CE;
+        static SECOND: u32 = 0xB0B;
+        let one = core::ptr::from_ref(&FIRST) as usize;
+        let two = core::ptr::from_ref(&SECOND) as usize;
+        assert_ne!(one, two, "two stand-ins must be two addresses");
         let at = core::panic::Location::caller();
 
-        let slot_one = open_guard(one, at, 9);
-        let slot_two = open_guard(two, at, 10);
+        // **The table is eight slots per CPU and every test in this binary
+        // shares CPU 0's**, so a claim can simply fail under parallelism --
+        // `open_guard` answers `OPEN_GUARDS` and records nothing. Until
+        // 2026-08-23 this test did not check, and a dropped registration
+        // presented as the assertion below: "its record was taken away by
+        // another lock's release", blaming `close_guard` for a record that was
+        // never made. That is the worst kind of red -- it names the wrong
+        // suspect.
+        //
+        // Retried rather than skipped, because a test that quietly does nothing
+        // is a test that has stopped testing. If the table never has two free
+        // slots across all attempts, that is said out loud.
+        let mut attempt = 0;
+        let (slot_one, slot_two) = loop {
+            let slot_one = open_guard(one, at, 9);
+            let slot_two = open_guard(two, at, 10);
+            if slot_one < OPEN_GUARDS && slot_two < OPEN_GUARDS {
+                break (slot_one, slot_two);
+            }
+            // Give back whichever was claimed, or the next attempt starts with
+            // fewer slots than this one did.
+            if slot_one < OPEN_GUARDS {
+                close_guard(slot_one, one);
+            }
+            if slot_two < OPEN_GUARDS {
+                close_guard(slot_two, two);
+            }
+            attempt += 1;
+            assert!(
+                attempt < 1000,
+                "the open-guard table never had two free slots of {OPEN_GUARDS} \
+                 across {attempt} attempts -- this test proved nothing, and \
+                 saying so is better than passing"
+            );
+            core::hint::spin_loop();
+        };
         assert_ne!(slot_one, slot_two, "two holds must take two slots");
 
         // Release the *second* lock quoting the *first* lock's slot.
         close_guard(slot_one, two);
 
+        // **Only this test's own records, found by the site they were opened
+        // at.** The guard table is per-CPU and shared with every other test in
+        // this binary, which run in parallel -- and ranks 9 and 10 are not
+        // arbitrary tags, they are `WaitQueue` and `SchedRunqueue`. Any
+        // concurrent test that took a runqueue lock registered a real rank-10
+        // guard on this CPU and failed the assertion below, about 1 run in 5
+        // and rising with the number of tests. The property this test is about
+        // is local; asserting it globally made it a test of what everything
+        // else happened to be doing.
+        let mine = |site: &'static core::panic::Location<'static>| {
+            site.file() == at.file() && site.line() == at.line()
+        };
         let mut ranks = [false; 16];
-        for_each_open_guard(cpu, |_, rank, _| {
-            if (rank as usize) < ranks.len() {
+        for_each_open_guard(cpu, |site, rank, _| {
+            if mine(site) && (rank as usize) < ranks.len() {
                 ranks[rank as usize] = true;
             }
         });
@@ -1290,7 +1359,11 @@ mod tests {
 
         close_guard(slot_one, one);
         let mut left = 0;
-        for_each_open_guard(cpu, |_, _, _| left += 1);
+        for_each_open_guard(cpu, |site, _, _| {
+            if mine(site) {
+                left += 1;
+            }
+        });
         assert_eq!(
             left, 0,
             "the table must be empty again, or later tests inherit these"

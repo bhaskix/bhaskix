@@ -791,6 +791,67 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (the guard-table test's writers and its reader disagreed about which CPU they were on)
+
+**`a_guard_record_is_identified_by_its_lock_not_by_the_line_that_took_it` failed
+about one run in five, and by today three in five.** Green alone, green
+single-threaded, red under the parallelism `cargo test` uses by default. It was
+reported at the start of the day as pre-existing and left alone; it became
+blocking when it stopped being possible to get a clean `make test`.
+
+**It got worse for an honest reason.** The rate rose because the day added
+tests — RFC 0041's forty-one and RFC 0042's seven — and more tests mean more
+threads racing the same table. The bug did not change; the exposure did.
+
+**The cause: `open_guard` and `close_guard` wrote to one table and the test read
+another.** Both took `percpu::cpu_id()` directly. `effective_cpu()` — which is
+what a *reader* uses, and what `for_each_open_guard`'s callers pass — answers
+something different under `cfg(test)`: a per-test-thread lease. Outside tests the
+two are the same function, which is why this never mattered on a machine.
+
+So a guard opened by a test running on any lease but zero was recorded in table
+zero and looked for in the lease's. It presented as:
+
+```
+the lock that was not released must still be recorded -- its record was
+taken away by another lock's release
+```
+
+**which names the wrong suspect entirely.** `close_guard` was innocent; the
+record had never been where the reader looked. A failure message that accuses a
+specific mechanism is worth more than a bare assertion — and worth less than
+nothing when it accuses the wrong one.
+
+**Fixed by making the writers use `effective_cpu()` too**, which changes nothing
+outside tests and makes the table a test writes the table it reads. Watched red
+by reverting exactly that one change: **3 failures in 15 runs without it, 0 in 40
+with it.**
+
+**Three other things were wrong with the test and are also fixed**, each found on
+the way and none of them the cause:
+
+- **It asserted a global property when it meant a local one.** The table is
+  shared, and the ranks it used as tags — 9 and 10 — are `WaitQueue` and
+  `SchedRunqueue`. Any concurrent test that took a runqueue lock registered a
+  real rank-10 guard and failed the assertion. It now looks only at records
+  opened at its own site.
+- **Its stand-in locks were stack addresses.** A stack is the one place an
+  address is not a durable identity: thread stacks are recycled between tests, so
+  another test's lock could land on an address this one had registered. They are
+  function-local statics now, with different values so the linker cannot merge
+  them into one symbol.
+- **It did not check that its slots were claimed.** The table is eight slots per
+  CPU and `open_guard` answers `OPEN_GUARDS` when it cannot claim one, recording
+  nothing — which produced the same misleading message. It retries a bounded
+  number of times and says plainly if it never gets two slots, because a test
+  that quietly does nothing is a test that has stopped testing.
+
+**What this does not establish.** The production path is unchanged: outside tests
+`effective_cpu()` *is* `percpu::cpu_id()`, so nothing about how the kernel records
+guards on a real machine is different today. This was a bug in what the test
+could see, not in what the kernel does — and the lock-order instrument's
+2026-08-22 specimens are neither confirmed nor cleared by it.
+
 ### 2026-08-23 (the second hardware boot, and it failed at the same wall as the first: nobody can read what the machine printed)
 
 **Bhaskix booted on the SR550 for the second time, reached a shell, and answered
