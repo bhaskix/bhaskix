@@ -789,6 +789,35 @@ impl CSpace {
         self.slots.get(index).copied().flatten()
     }
 
+    /// Whether this CSpace still holds a live capability naming `object`.
+    ///
+    /// [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)
+    /// design §2. Asked after a revocation, to decide whether that domain's
+    /// *mapping* of the object survives it: a holder that lost one name for an
+    /// object and kept another has not lost the authority the mapping rests
+    /// on.
+    ///
+    /// **Held, not owned, and the difference is what makes this a CSpace
+    /// method rather than an `Arena` one.** A node's `owner` records which
+    /// domain is *charged* for a capability, and its own comment says that
+    /// cannot be read off the CSpaces it sits in. `shared::name` mints the
+    /// cache frames' capabilities with `insert_root`, so they are charged to
+    /// the kernel and held by `bin/fsd` — and a version of this that asked
+    /// the arena "does this domain own a node naming it" answered *no* for
+    /// the service that had the page mapped, unmapped its cache, and faulted
+    /// the filesystem on the first `pkg install`.
+    ///
+    /// A slot holding a **dead** reference does not count: `lookup` fails on
+    /// it, which is exactly the borrower's state after its loan is revoked.
+    #[must_use]
+    pub fn names(&self, object: ObjectRef, arena: &Arena) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|slot| arena.lookup(*slot))
+            .any(|(named, _)| named == object)
+    }
+
     /// Removes whatever is at `index`. Does not revoke it — other domains may
     /// legitimately still hold the same capability.
     pub fn remove(&mut self, index: usize) -> Option<SlotRef> {
@@ -820,6 +849,76 @@ pub fn live() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape `bin/fsd` is in on every `dir::RELEASE`, and the reason
+    /// RFC 0044 asks the **CSpace** rather than the arena's `owner` field.
+    #[test]
+    fn a_lender_that_kept_its_own_name_for_an_object_still_holds_it_after_revoking_the_loan() {
+        let mut arena = Arena::new();
+        let object = ObjectRef::new(ObjectKind::Memory, 40);
+        let (mut lender, mut borrower) = (CSpace::new(), CSpace::new());
+
+        // **Charged to the kernel and held by the service**, which is what
+        // `shared::name` does for every cache frame -- and the detail that
+        // makes an owner-based check answer "no" for the domain that has the
+        // page mapped. The first version of this fix asked the arena's `owner`
+        // field and faulted the filesystem on the first `pkg install`.
+        let own = arena
+            .insert_root(object, Rights::ALL, 0)
+            .expect("a fresh arena has room");
+        lender.install_at(3, own).expect("slot 3 is free");
+
+        let lending = arena
+            .derive(
+                own,
+                Rights::READ
+                    .union(Rights::GRANT)
+                    .union(Rights::DERIVE)
+                    .union(Rights::REVOKE),
+                0,
+            )
+            .expect("room");
+        lender.install_at(40, lending).expect("free");
+        let borrowed = arena.derive(lending, Rights::READ, 0).expect("room");
+        borrower.install_at(23, borrowed).expect("free");
+
+        assert!(lender.names(object, &arena));
+        assert!(borrower.names(object, &arena));
+
+        // dir::RELEASE: the lending goes, and the borrower's copy with it.
+        let mut tally = [0u32; MAX_OWNERS];
+        arena
+            .revoke_tallied(lending, &mut tally)
+            .expect("the lending carries REVOKE");
+
+        assert!(
+            lender.names(object, &arena),
+            "the lender kept its own capability and must keep its mapping"
+        );
+        assert!(
+            !borrower.names(object, &arena),
+            "the borrower's slot holds a dead reference and must lose its mapping"
+        );
+    }
+
+    #[test]
+    fn naming_is_per_object_and_per_cspace_rather_than_either_alone() {
+        let mut arena = Arena::new();
+        let one = ObjectRef::new(ObjectKind::Memory, 7);
+        let two = ObjectRef::new(ObjectKind::Memory, 8);
+        let (mut holder, empty) = (CSpace::new(), CSpace::new());
+        let a = arena.insert_root(one, Rights::ALL, 0).expect("room");
+        holder.install_at(5, a).expect("free");
+
+        assert!(holder.names(one, &arena));
+        assert!(!holder.names(two, &arena), "a different object");
+        assert!(!empty.names(one, &arena), "a different holder");
+
+        // And a slot whose capability has been revoked names nothing, which
+        // is the borrower's state and the whole point of asking.
+        arena.revoke_unchecked(a);
+        assert!(!holder.names(one, &arena), "a dead reference is not a name");
+    }
 
     const FRAME: ObjectRef = ObjectRef::new(ObjectKind::Frame, 7);
 

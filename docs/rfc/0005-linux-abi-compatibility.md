@@ -573,11 +573,28 @@ Two tests, watched red three ways, including one that asserts the slot takes
 a capability again afterwards rather than merely that `DELETE` answered `Ok`.
 
 **The second is not fixed, and it is the reason this step's probe does not
-`read`.** `method::REVOKE` destroys arena nodes and **never unmaps**. The
-function that does it correctly already exists — `shared::revoke_capability`,
-"mappings first, then its subtree", whose own documentation says *"the order
-is the design"* and cites `security.md` §2 rule 3 — and it is called from
-exactly one place: a kernel self-test. The syscall does not use it.
+`read`.** `method::REVOKE` destroys arena nodes and **never unmaps**.
+
+> **Correction, 2026-08-23, the same day and after this section was pushed.**
+> The paragraph here first said the function that does it correctly already
+> exists — `shared::revoke_capability` — and is simply not called, which reads
+> as though the fix were a one-line redirect. **It is not, and the difference
+> is a worse bug than the one it would fix.** That function ends in
+> `shared::revoke`, which unmaps *and then destroys the object and frees its
+> frames*; and it tears the capability tree down with `revoke_unchecked`,
+> which skips both the `REVOKE`-rights check and the per-owner quota tally
+> that `method::REVOKE` owes. `bin/fsd` derives its lending capability from
+> the one naming its **own pinned cache frame** and revokes the lending, not
+> the frame — so a `method::REVOKE` routed through that function would give
+> the cache's frame back to the buddy allocator while the cache was still
+> reading out of it.
+>
+> What is reusable is the *order* — mappings out before the tree — and the
+> unmap-and-shoot-down loop. What does not exist is the operation actually
+> needed: unmap this object from the address spaces of the holders being
+> revoked, and leave the object alive. Written down here because the wrong
+> version was published, and because a reader who took it at face value would
+> have written the destructive fix.
 
 Two consequences, and the second is worse than the first:
 
@@ -585,7 +602,10 @@ Two consequences, and the second is worse than the first:
    borrower's address stays occupied, so the second `ATTACH` at it is refused
    `SlotUnavailable`. Reproduced in both directions: with the two probes in
    one order the second one fails, and with the order swapped the *other* one
-   fails, same stage, same status.
+   fails, same stage, same status. **Fixed the same day by
+   [RFC 0044](0044-revocation-that-reaches-the-mapping.md)**, and this step's
+   probe now reads: the gate counts *two* hosted reads on one boot, because
+   one was the bug.
 2. **`dir::RELEASE` does not do what it says.** Its documentation promises
    *"the page is gone from its address space when this returns, and reading
    where it used to be is a fault"*, and the page is still there. A borrower
@@ -636,8 +656,12 @@ untrusted input too.
 
 ### What this does not do
 
-- **No `read` in this probe**, for the reason above. The `linux file` gate
-  still does the one read the machine can do.
+- ~~**No `read` in this probe**, for the reason above. The `linux file` gate
+  still does the one read the machine can do.~~ **Corrected 2026-08-23**:
+  [RFC 0044](0044-revocation-that-reaches-the-mapping.md) closed the hole the
+  same day, and the probe reads the file it stats. The gate no longer looks
+  for the file's line, it *counts* it — twice, once per hosted program —
+  because a single match is what the bug produced.
 - **`readlinkat`, `unlinkat`, `mkdirat`, `fcntl`, `ioctl`, `uname`** are named
   in Tier 1 and are not here. `getdents64` and `fstat` were chosen because
   directories were the part of Tier 1 with *nothing* behind them; the rest

@@ -164,6 +164,18 @@ pub struct DeviceMapping {
     /// somebody else's would leave the device that holds it still reaching the
     /// page, which is the exact failure revocation exists to prevent.
     pub device: u64,
+    /// Which domain asked for it.
+    ///
+    /// [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)
+    /// design §5. A revocation that takes an object away from *some* of its
+    /// holders has to know whether this device mapping was one of theirs: a
+    /// borrower holding a `DmaWindow` capability can put a page it was lent
+    /// into a device's translation, and revoking the loan while the device
+    /// still reaches the frame is the same failure as leaving a TLB entry
+    /// behind. Without this field the only safe answer would be to remove the
+    /// mapping on *any* revocation of the object, which would take an
+    /// unrelated driver's DMA down with a lending it never knew about.
+    pub mapper: u32,
 }
 
 /// One object.
@@ -573,6 +585,156 @@ pub fn revoke(id: MemoryId) -> usize {
     removed
 }
 
+/// Which of an object's mapping slots belong to one of `roots`.
+///
+/// [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)
+/// design §1–2, kept pure and separate so it can be tested off a machine: the
+/// decision a revocation makes is *which* mappings go, and the rest of the
+/// work is page tables that only exist in QEMU.
+///
+/// **Matched on the address-space root and on nothing else.** A `Mapping`
+/// records where an object is mapped, not who mapped it, so "this holder's
+/// mapping" is only answerable through the space it lives in. Matching on the
+/// *address* instead would be wrong in a way that is easy to write and hard to
+/// see: two domains routinely map the same object at the same address, which
+/// is what `MINE`/`THEIRS` in the sharing self-test exists to demonstrate.
+///
+/// A `None` in `roots` is a domain with no address space — one that has died,
+/// whose mappings went with it — and matches nothing.
+fn selected_by_root(
+    mappings: &[Option<Mapping>; MAX_MAPPINGS],
+    roots: &[Option<u64>],
+) -> [bool; MAX_MAPPINGS] {
+    let mut chosen = [false; MAX_MAPPINGS];
+    for (slot, mapping) in mappings.iter().enumerate() {
+        let Some(mapping) = mapping else { continue };
+        chosen[slot] = roots
+            .iter()
+            .flatten()
+            .any(|root| *root == mapping.root);
+    }
+    chosen
+}
+
+/// Unmaps `id` from the address spaces of `holders`, **leaving the object
+/// alive**.
+///
+/// [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md).
+/// This is [`revoke`]'s loop without its ending, and the difference is the
+/// whole point: `revoke` finishes with `destroy`, which frees the frames and
+/// releases the owner's quota, because it is what an object's *death* does.
+/// A revocation of a lending is not a death. `bin/fsd` derives what it lends
+/// from the capability naming its own pinned cache frame and revokes the
+/// lending; a version of this that destroyed the object would hand that frame
+/// back to the allocator while the cache was still reading out of it.
+///
+/// Each holder is a domain and the root of its address space, together
+/// because the two answer different halves: a `Mapping` is found by root, and
+/// a `DeviceMapping` records the domain that asked for it. A holder whose
+/// root is `None` has no address space — it died — and matches nothing.
+///
+/// Returns how many mappings were removed, device mappings included.
+pub fn unmap_roots(id: MemoryId, holders: &[(u32, Option<u64>)]) -> usize {
+    // Taken out under the arena; the page-table work happens outside it, for
+    // the reason `revoke` gives: unmapping walks tables through the direct map
+    // and a shootdown sends an interrupt to every other CPU.
+    let (taken, device, hhdm) = {
+        let mut arena = ARENA.lock();
+        let Some(object) = resolve(&arena, id) else {
+            return 0;
+        };
+        let mut roots = [None; crate::cap::MAX_OWNERS];
+        for (slot, (_, root)) in holders.iter().enumerate().take(roots.len()) {
+            roots[slot] = *root;
+        }
+        let chosen = selected_by_root(&object.mappings, &roots);
+
+        let index = id.index as usize;
+        let mut taken = [None; MAX_MAPPINGS];
+        for (slot, wanted) in chosen.iter().enumerate() {
+            if *wanted {
+                taken[slot] = object.mappings[slot];
+                // **Cleared, not merely skipped.** An entry left behind is a
+                // root and an address that a *later* revocation would unmap,
+                // and by then that address may belong to something else in
+                // that space.
+                arena.objects[index].mappings[slot] = None;
+            }
+        }
+
+        // The device half — RFC 0044 design §5. It goes only when the domain
+        // that asked for it is one of the holders being revoked: a borrower
+        // holding a `DmaWindow` can put a page it was lent into a device's
+        // translation, and taking the loan back while the device still reaches
+        // the frame is the same failure as leaving a TLB entry behind. Taking
+        // it out on *any* revocation would be safe against the device and
+        // would drop an unrelated driver's DMA with a lending it never knew
+        // about.
+        let device = object
+            .device
+            .filter(|mapping| holders.iter().any(|(domain, _)| *domain == mapping.mapper));
+        if device.is_some() {
+            arena.objects[index].device = None;
+        }
+        (
+            taken,
+            device,
+            HHDM.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    };
+
+    let mut removed = 0;
+    for mapping in taken.iter().flatten() {
+        // **The region record first, and it is not bookkeeping.**
+        // `AddressSpace::unmap` takes the region out and, for a shared
+        // backing, deliberately leaves the pages alone -- teardown must not
+        // free frames the object owns. So the two halves are separate calls,
+        // and a revocation that did only the pages would leave the *address*
+        // occupied: the holder could never map anything there again, and the
+        // symptom is an `ATTACH` refused `SlotUnavailable` at an address
+        // nothing appears to be using. That is precisely how RFC 0005 step 8
+        // met this bug -- a hosted program could read one file and not two.
+        //
+        // Before the pages, because `Rank::AddressSpace` is 0 and the
+        // shootdown's `Rank::TlbSender` is 4: the outer lock has to be taken
+        // first, and taking it after a shootdown would be an inversion. The
+        // window it opens is "the region map says free, the hardware still
+        // maps it", and a thread of that domain racing into it gets a region
+        // it may then fault on -- which is safe. The reverse window would be
+        // "the region map says occupied, the pages are gone", which is the
+        // same fault by a longer route, so neither is unsound and this order
+        // is the one the ranks allow.
+        crate::vm::with_space(mapping.root, |space| {
+            let _ = space.unmap(bhaskix_boot::VirtAddr(mapping.address));
+        });
+        for page in 0..mapping.pages {
+            let address = mapping.address + page * FRAME_SIZE;
+            // SAFETY: `root` is a page table this object recorded a mapping
+            // into, and the frame it returns belongs to the object -- so it is
+            // deliberately *not* freed. The object outlives this, which is the
+            // difference from `revoke`.
+            let _ = unsafe { bhaskix_arch::paging::unmap_page(mapping.root, address, hhdm) };
+            // Before returning, on every CPU that might have loaded this
+            // address space. An entry that survives in one CPU's TLB is a
+            // mapping gone from the tables and still working -- a revocation
+            // with a delay fuse, which is what `security.md` rule 3 forbids.
+            crate::tlb::shootdown(address);
+        }
+        removed += 1;
+    }
+
+    if let Some(device) = device {
+        removed += usize::from(crate::iommu::unmap_device(
+            crate::iommu::device_of(device.device),
+            device.address,
+            device.pages,
+        ));
+    }
+
+    REVOKED.fetch_add(removed as u64, core::sync::atomic::Ordering::Relaxed);
+    removed
+}
+
 /// The direct map base this module was given at bring-up.
 ///
 /// Kept because unmapping happens from paths that were not handed one — a
@@ -588,7 +750,13 @@ pub fn hhdm() -> u64 {
 /// Returns false if the object is gone, or already reachable by a device —
 /// mapping one twice would leave the first address unrevoked, which is a page
 /// a device keeps after the object naming it has been destroyed.
-pub fn record_device_mapping(id: MemoryId, device: u64, address: u64, pages: u64) -> bool {
+pub fn record_device_mapping(
+    id: MemoryId,
+    device: u64,
+    address: u64,
+    pages: u64,
+    mapper: u32,
+) -> bool {
     let mut arena = ARENA.lock();
     if resolve(&arena, id).is_none() {
         return false;
@@ -601,6 +769,7 @@ pub fn record_device_mapping(id: MemoryId, device: u64, address: u64, pages: u64
         address,
         pages,
         device,
+        mapper,
     });
     true
 }
@@ -872,6 +1041,73 @@ fn free_frame(frame: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mapping(root: u64, address: u64) -> Option<Mapping> {
+        Some(Mapping {
+            root,
+            address,
+            pages: 1,
+        })
+    }
+
+    #[test]
+    fn a_revocation_selects_the_revoked_holders_spaces_and_leaves_the_others() {
+        let mut mappings = [None; MAX_MAPPINGS];
+        mappings[0] = mapping(0x1000, 0xaaaa_0000); // the owner
+        mappings[1] = mapping(0x2000, 0xbbbb_0000); // a borrower being revoked
+        mappings[3] = mapping(0x3000, 0xcccc_0000); // a borrower that is not
+
+        let chosen = selected_by_root(&mappings, &[Some(0x2000)]);
+        assert_eq!(chosen, [false, true, false, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn two_spaces_mapping_one_object_at_one_address_are_told_apart() {
+        // **The mistake this function is shaped to prevent.** Sharing means
+        // the same object in two spaces, and nothing stops both from choosing
+        // the same address -- the sharing self-test deliberately uses two, but
+        // a program may use one. Matching on the address would revoke the
+        // owner's mapping along with the borrower's.
+        let mut mappings = [None; MAX_MAPPINGS];
+        mappings[0] = mapping(0x1000, 0x5000_0000);
+        mappings[1] = mapping(0x2000, 0x5000_0000);
+
+        let chosen = selected_by_root(&mappings, &[Some(0x2000)]);
+        assert!(!chosen[0], "the owner's mapping at the same address survived");
+        assert!(chosen[1]);
+    }
+
+    #[test]
+    fn a_domain_with_no_address_space_selects_nothing() {
+        // A holder that died before the revocation reached it. Its mappings
+        // went with its address space, and `None` must not match an empty
+        // slot or a live root.
+        let mut mappings = [None; MAX_MAPPINGS];
+        mappings[0] = mapping(0x1000, 0xaaaa_0000);
+        assert_eq!(selected_by_root(&mappings, &[None]), [false; MAX_MAPPINGS]);
+        assert_eq!(selected_by_root(&mappings, &[]), [false; MAX_MAPPINGS]);
+    }
+
+    #[test]
+    fn several_revoked_holders_are_all_selected_and_empty_slots_are_not() {
+        let mut mappings = [None; MAX_MAPPINGS];
+        mappings[1] = mapping(0x2000, 0);
+        mappings[5] = mapping(0x4000, 0);
+        let chosen = selected_by_root(&mappings, &[Some(0x2000), None, Some(0x4000)]);
+        assert!(chosen[1] && chosen[5]);
+        assert_eq!(chosen.iter().filter(|taken| **taken).count(), 2);
+
+        // **An empty slot is not a mapping with a root of zero**, and this is
+        // the only value that can tell the two apart: a version that filled
+        // the gaps in with a default `Mapping` would select six here rather
+        // than two, and every other root in this file would hide it.
+        let chosen = selected_by_root(&mappings, &[Some(0), Some(0x2000)]);
+        assert_eq!(
+            chosen.iter().filter(|taken| **taken).count(),
+            1,
+            "an unoccupied mapping slot was selected"
+        );
+    }
 
     /// The arena is a global and the frame allocator is not available on the
     /// host, so what is tested here is the bookkeeping that does not touch

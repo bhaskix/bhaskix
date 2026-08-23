@@ -43,7 +43,7 @@ nothing in the tree implements it yet.
 | # | Threat | Primary mitigation | Status |
 |---|---|---|---|
 | T1 | A compromised userspace process attempts to gain kernel privilege | Capability system; no ambient authority; no setuid; W^X; SMEP/SMAP | ✅ **built** — capability system, no ambient authority, SMEP/SMAP and the exception table gated on every boot. **One weakness named**: there is no ASLR for user programs; only the kernel image is slid |
-| T2 | A compromised process attempts to access another domain's data | Address-space isolation; capabilities; no shared namespace by default | 🔨 **built, with one hole found 2026-08-23** — address-space isolation and immediate transitive revocation, both gated; but revocation does not reach **memory mappings** (§2 rule 3's note), so a domain that borrowed a page keeps reading the frame after the lender revoked and reused it. The only borrower today is `bin/linuxd`; the hole does not depend on its manners |
+| T2 | A compromised process attempts to access another domain's data | Address-space isolation; capabilities; no shared namespace by default | ✅ **built** — address-space isolation and immediate transitive revocation, both gated. A hole was found and closed on 2026-08-23, within the day: revocation reached capabilities and not the **memory mappings** they named, so a borrower went on reading a frame its lender had taken back and reused ([RFC 0044](rfc/0044-revocation-that-reaches-the-mapping.md), §2 rule 3's note). This cell read ✅ throughout the period the hole existed, which is the ordinary way of such things and the reason the note under rule 3 is kept rather than deleted |
 | T3 | A compromised or malicious **device driver** | IOMMU-enforced DMA windows; per-device capabilities; relocatable-service isolation | ✅ **built**, under the three conditions the note below states — and on a machine with no IOMMU a domain-hosted driver is refused outright rather than run unprotected |
 | T4 | A malicious peripheral performing DMA (evil maid, malicious PCIe/Thunderbolt device) | IOMMU on by default; devices default-denied until enumerated and granted | ✅ **built**, same three conditions; interrupt remapping is on by default and gated |
 | T5 | A guest VM escaping to the host | Domain isolation is the same mechanism as containers; EPT/NPT; no shared hypervisor codebase to diverge | ⬜ **planned** — domains exist and are the mechanism; **VMX/SVM and EPT/NPT do not**. There are no guests yet, so nothing has escaped and nothing has been prevented. Phase 3 |
@@ -287,45 +287,38 @@ statements about named functions with named tests rather than aspirations:
 |---|---|---|
 | 1 — unforgeable | `cap::CSpace`; a domain holds a slot index, never a pointer | A ring 3 program is refused a slot it was not given, before any service is reached (M6-05) |
 | 2 — monotone derivation | `cap::Arena::derive`, one function | Exhaustive over all 64×64 rights pairs, on the host |
-| 3 — immediate transitive revocation | `cap::Arena::destroy_subtree`, a fixed-point sweep | A derivation tree is revoked at an interior node and every descendant is dead *before the call returns* — and ring 3 revokes its own derived capability and finds the next call refused (M5-07). **For capabilities only — see the note below: `method::REVOKE` does not unmap, so a revoked `Memory` object stays mapped in the holder that borrowed it** |
+| 3 — immediate transitive revocation | `cap::Arena::destroy_subtree`, a fixed-point sweep | A derivation tree is revoked at an interior node and every descendant is dead *before the call returns* — and ring 3 revokes its own derived capability and finds the next call refused (M5-07). **And for the memory they name, since 2026-08-23** — revoking a lending takes the page out of the borrower's address space and gives the address back, while leaving the lender's own mapping and the object alive ([RFC 0044](rfc/0044-revocation-that-reaches-the-mapping.md)) |
 | 4 — granter-set badges | The badge is copied from the capability by the kernel and is never read from the caller's frame | Taking the badge from the frame instead makes a service unable to tell its callers apart, which fails the gate (M5-05) |
 
 **Each of those checks has been shown to fail** when the rule it guards is deliberately broken. A
 gate that has never failed is a gate nobody has tested.
 
-> **Rule 3 has a hole, found 2026-08-23 and not yet fixed.** It holds for
+> **Rule 3 had a hole, found and closed 2026-08-23.** It held for
 > *capabilities* and not for the **memory mappings** a revoked capability
-> named. `method::REVOKE` calls `cap::Arena::revoke_tallied`, which destroys
-> arena nodes and never unmaps: a domain that mapped a `Memory` object it was
-> lent keeps the mapping — and therefore the frames — after the lender has
-> revoked it and given them back to its allocator. The kernel's own words for
-> why this is wrong are already in the tree, on `shared::revoke`: *"a revoked
+> named: `method::REVOKE` destroyed arena nodes and never unmapped, so a
+> domain that borrowed a page kept reading the frame after the lender had
+> revoked the loan, unpinned it and refilled it. The kernel's own words for
+> why that is wrong were already in the tree, on `shared::revoke`: *"a revoked
 > capability whose pages are still mapped is not revoked, it is renamed."*
 >
-> **The function that does it correctly exists and is not called.**
-> `shared::revoke_capability` — mappings out of every address space first, then
-> the derivation tree, with a comment saying *"the order is the design"* and
-> citing this very rule — has exactly one caller, a kernel self-test. The
-> syscall path does not use it. So the rule is enforced where it is measured
-> and unenforced where it is used, which is the worst arrangement of the two.
+> Closed by [RFC 0044](rfc/0044-revocation-that-reaches-the-mapping.md), and
+> the shape of the fix is worth keeping because the obvious one was worse than
+> the bug. Revocation now takes the mapping out of the address spaces of the
+> holders that lost their **last** capability naming the object — not every
+> holder in the revocation tally, because `bin/fsd` derives what it lends from
+> the capability naming its own cache frame and is in that tally on every file
+> read; and not by way of `shared::revoke_capability`, which destroys the
+> object and would have handed that cache frame back to the allocator
+> mid-read. The address is given back too, region record and page-table
+> entries both: clearing only the entries left the borrower unable to map
+> there again, which is how the hole was found — a hosted program could read
+> one file per machine and not two.
 >
-> **What it costs today.** `bin/fsd` lends a page of its cache to a reader and
-> takes it back by revoking (`dir::RELEASE`), whose documentation promises
-> *"the page is gone from its address space when this returns, and reading
-> where it used to be is a fault."* It is not gone. The reader keeps a
-> read-only mapping of a frame the service has unpinned and will refill with
-> another file's block — which is the disclosure `MAP` was designed to avoid,
-> arriving a moment later. Today the only borrower is `bin/linuxd`, on behalf
-> of hosted Linux programs, and it does not go looking; the exposure is real
-> regardless and does not depend on the borrower's good manners.
->
-> It surfaced as a *functional* failure first, which is how it was noticed at
-> all: with the address still occupied the second `ATTACH` is refused, so a
-> hosted program can `read` once per machine rather than once per file
-> ([RFC 0005](rfc/0005-linux-abi-compatibility.md) step 8's record). The fix
-> has to move the unmapping outside the arena lock and so needs an RFC rather
-> than a patch; it is written down here first because a hole that is only in
-> somebody's head is not recorded.
+> Gated two ways, each watched red. A kernel self-test asserts all four halves
+> at once — the borrower's page gone, the lender's kept, the object alive, the
+> address free — and no plausible wrong fix passes all four. And end to end,
+> **two hosted programs read a file on the same boot**, which is a count
+> rather than a match: one is the old behaviour.
 
 ### RBAC is policy, built on this mechanism
 

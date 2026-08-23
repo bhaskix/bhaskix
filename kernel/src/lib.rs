@@ -5328,8 +5328,8 @@ const LIST_PROBE_CODE_AT: u64 = 0x0000_0000_1800_0000;
 /// continuation lines, shifted this probe by one byte, and produced a fault
 /// in ring 3 that read exactly like a clobbered register.
 ///
-/// It prints one five-letter name **four times**, and each printing is a
-/// different call's evidence:
+/// It prints one five-letter name **four times** and then a line of the file,
+/// and each printing is a different call's evidence:
 ///
 /// 1. `open("/")` then `getdents64` — the directory this process was given,
 ///    which until this step could not be opened at all: every path had to
@@ -5348,14 +5348,17 @@ const LIST_PROBE_CODE_AT: u64 = 0x0000_0000_1800_0000;
 ///    take the filesystem away from every hosted process on the machine, so
 ///    this `open` would find nothing.
 ///
-/// **It deliberately does not `read` the file it stats**, and that is a
-/// limitation rather than a choice: a hosted `read` maps a page the
-/// filesystem lends, and the second such mapping on the machine is refused
-/// because `method::REVOKE` never takes the first one out of the borrower's
-/// address space. The `linux file` gate above already does the one read this
-/// machine can do. See the step's record.
+/// 5. `read` of that file, and printing what it read. **This is the second
+///    file read on the machine**, and until
+///    [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)
+///    it could not happen at all: the `linux file` probe reads one first, and
+///    its lent page stayed mapped in the adapter because `method::REVOKE`
+///    never unmapped anything — so this one's `ATTACH` was refused at an
+///    address nothing appeared to be using. This step's own record says the
+///    probe *deliberately did not read* for exactly that reason; it does now,
+///    and that sentence is corrected there.
 #[rustfmt::skip]
-const LIST_PROBE_CODE: [u8; 228] = [
+const LIST_PROBE_CODE: [u8; 277] = [
     0x49, 0x89, 0xfc,                         // mov %rdi,%r12
     0x49, 0x89, 0xf6,                         // mov %rsi,%r14
     0x48, 0x89, 0xf7,                         // mov %rsi,%rdi
@@ -5364,7 +5367,7 @@ const LIST_PROBE_CODE: [u8; 228] = [
     0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x0f, 0x88, 0xa5, 0x00, 0x00, 0x00,       // js c2 <done>
+    0x0f, 0x88, 0xd6, 0x00, 0x00, 0x00,       // js f3 <done>
     0x49, 0x89, 0xc5,                         // mov %rax,%r13
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
@@ -5372,34 +5375,34 @@ const LIST_PROBE_CODE: [u8; 228] = [
     0xb8, 0xd9, 0x00, 0x00, 0x00,             // mov $0xd9,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x0f, 0x8e, 0x87, 0x00, 0x00, 0x00,       // jle c2 <done>
-    0xe8, 0x8d, 0x00, 0x00, 0x00,             // callq cd <say>
+    0x0f, 0x8e, 0xb8, 0x00, 0x00, 0x00,       // jle f3 <done>
+    0xe8, 0xbe, 0x00, 0x00, 0x00,             // callq fe <say>
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x31, 0xf6,                               // xor %esi,%esi
     0x31, 0xd2,                               // xor %edx,%edx
     0xb8, 0x08, 0x00, 0x00, 0x00,             // mov $0x8,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x78, 0x6f,                               // js c2 <done>
+    0x0f, 0x88, 0x9c, 0x00, 0x00, 0x00,       // js f3 <done>
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
     0xba, 0x00, 0x01, 0x00, 0x00,             // mov $0x100,%edx
     0xb8, 0xd9, 0x00, 0x00, 0x00,             // mov $0xd9,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x7e, 0x58,                               // jle c2 <done>
-    0xe8, 0x5e, 0x00, 0x00, 0x00,             // callq cd <say>
+    0x0f, 0x8e, 0x81, 0x00, 0x00, 0x00,       // jle f3 <done>
+    0xe8, 0x87, 0x00, 0x00, 0x00,             // callq fe <say>
     0x49, 0x8d, 0xb4, 0x24, 0x00, 0x02, 0x00, 0x00, // lea 0x200(%r12),%rsi
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0xb8, 0x05, 0x00, 0x00, 0x00,             // mov $0x5,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x78, 0x3c,                               // js c2 <done>
+    0x78, 0x65,                               // js f3 <done>
     0x41, 0x8b, 0x84, 0x24, 0x18, 0x02, 0x00, 0x00, // mov 0x218(%r12),%eax
     0x25, 0x00, 0xf0, 0x00, 0x00,             // and $0xf000,%eax
     0x3d, 0x00, 0x40, 0x00, 0x00,             // cmp $0x4000,%eax
-    0x75, 0x28,                               // jne c2 <done>
-    0xe8, 0x2e, 0x00, 0x00, 0x00,             // callq cd <say>
+    0x75, 0x51,                               // jne f3 <done>
+    0xe8, 0x57, 0x00, 0x00, 0x00,             // callq fe <say>
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
     0x0f, 0x05,                               // syscall
@@ -5409,12 +5412,25 @@ const LIST_PROBE_CODE: [u8; 228] = [
     0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x78, 0x05,                               // js c2 <done>
-    0xe8, 0x0b, 0x00, 0x00, 0x00,             // callq cd <say>
+    0x78, 0x2e,                               // js f3 <done>
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0xe8, 0x31, 0x00, 0x00, 0x00,             // callq fe <say>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x28, 0x00, 0x00, 0x00,             // mov $0x28,%edx
+    0x31, 0xc0,                               // xor %eax,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x7e, 0x12,                               // jle f3 <done>
+    0x48, 0x89, 0xc2,                         // mov %rax,%rdx
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
     0x31, 0xff,                               // xor %edi,%edi
     0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
     0x0f, 0x05,                               // syscall
-    0xeb, 0xfe,                               // jmp cb <done+0x9>
+    0xeb, 0xfe,                               // jmp fc <done+0x9>
     0x49, 0x8d, 0x74, 0x24, 0x13,             // lea 0x13(%r12),%rsi
     0xba, 0x05, 0x00, 0x00, 0x00,             // mov $0x5,%edx
     0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
@@ -5425,7 +5441,18 @@ const LIST_PROBE_CODE: [u8; 228] = [
 
 /// Where the names this probe opens are put: `"/"` then `"inner"`, two
 /// strings in one place, and the probe reaches the second at `+2`.
-const LIST_PROBE_NAMES_AT: u64 = 256;
+///
+/// **Asserted to be past the code, because it once was not.** The probe grew
+/// from 228 bytes to 277 when it gained a `read`, walked straight through the
+/// names at 256, and the symptom was the *first* `getdents64` printing
+/// nothing — a failure with no visible relationship to the change that caused
+/// it. A constant that has to stay ahead of a length is a constant the
+/// compiler should be checking.
+const LIST_PROBE_NAMES_AT: u64 = 512;
+const _: () = assert!(
+    LIST_PROBE_CODE.len() < LIST_PROBE_NAMES_AT as usize,
+    "the directory probe's code has grown into the names beside it"
+);
 
 /// The thread that becomes the directory probe — RFC 0005 step 8.
 extern "C" fn ring3_lister(hhdm_base: u64) -> ! {
@@ -6557,6 +6584,133 @@ fn file_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
     }
     right
+}
+
+/// RFC 0044's witness: a lending taken back from the borrower **alone**.
+///
+/// **The existing sharing self-test revokes an object's *root* capability and
+/// checks that both holders lost the memory. That is a different operation,
+/// and it is the one that was already right.** What was wrong is the one every
+/// file read performs: `bin/fsd` derives what it lends from the capability
+/// naming its own cache frame and revokes *the lending*, and until 2026-08-23
+/// that took the capability away and left the page mapped.
+///
+/// So three things have to be true at once here, and no two of them would be
+/// true of a plausible wrong fix:
+///
+/// 1. The borrower's page is **gone** — `security.md` §2 rule 3 holding for
+///    memory rather than only for capabilities.
+/// 2. The lender's page is **still there**, and the object still alive. A
+///    revocation that unmapped every domain in the tally would take the cache
+///    page `bin/fsd` is serving from, on the path every file read goes down;
+///    one that routed through `shared::revoke_capability` would free the frame
+///    outright.
+/// 3. The borrower can **map there again**, which is the half that has nothing
+///    to do with page tables: `AddressSpace::unmap` removes the region record
+///    and a revocation that only cleared the hardware entries would leave the
+///    address permanently occupied. That is the exact symptom RFC 0005 step 8
+///    met — an `ATTACH` refused `SlotUnavailable` at an address nothing
+///    appears to be using, so a hosted program could read one file and not two.
+///
+/// The address spaces are **registered**, unlike the sharing self-test's,
+/// because `shared::unmap_roots` reaches a holder through `vm::with_space` and
+/// a space nobody installed is a space no revocation can find. A version of
+/// this test that skipped that passed assertion 1 and silently lost 3.
+fn lending_self_test(hhdm: u64) -> bool {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::Protection;
+
+    const LENDER_AT: u64 = 0x0000_0000_6000_0000;
+    const BORROWER_AT: u64 = 0x0000_0000_6100_0000;
+
+    let (Ok(lender), Ok(borrower)) = (
+        domain::create("lender", domain::ResourceEnvelope::new()),
+        domain::create("borrower", domain::ResourceEnvelope::new()),
+    ) else {
+        println!("\x1b[91m    lending        FAILED: no domains\x1b[0m");
+        return false;
+    };
+
+    let outcome = (|| {
+        let id = shared::create(lender, bhaskix_mm::FRAME_SIZE).ok()?;
+        let (mine, theirs) = (
+            vm::AddressSpace::new(hhdm).ok()?,
+            vm::AddressSpace::new(hhdm).ok()?,
+        );
+        let mine_root = vm::register_for(lender, mine)?;
+        let theirs_root = vm::register_for(borrower, theirs)?;
+
+        // Both hold it, and both have it mapped -- which is the shape a
+        // lending is in when it is taken back.
+        for (root, at) in [(mine_root, LENDER_AT), (theirs_root, BORROWER_AT)] {
+            vm::with_space(root, |space| {
+                shared::map_into(id, space, VirtAddr(at), Protection::ReadOnly)
+            })?
+            .ok()?;
+        }
+        let mapped_first = vm::with_space(theirs_root, |space| {
+            space.translate(VirtAddr(BORROWER_AT)).is_some()
+        })? && vm::with_space(mine_root, |space| {
+            space.translate(VirtAddr(LENDER_AT)).is_some()
+        })?;
+
+        // The loan comes back from the borrower and from nobody else.
+        let removed = shared::unmap_roots(id, &[(borrower.as_u32(), Some(theirs_root))]);
+
+        let borrower_lost_it = vm::with_space(theirs_root, |space| {
+            space.translate(VirtAddr(BORROWER_AT)).is_none()
+        })?;
+        let lender_kept_it = vm::with_space(mine_root, |space| {
+            space.translate(VirtAddr(LENDER_AT)).is_some()
+        })?;
+        let object_alive = shared::live(id);
+
+        // And the address is free again, which is assertion 3.
+        let can_map_again = vm::with_space(theirs_root, |space| {
+            shared::map_into(id, space, VirtAddr(BORROWER_AT), Protection::ReadOnly)
+        })?
+        .is_ok();
+
+        Some((
+            mapped_first,
+            removed == 1,
+            borrower_lost_it,
+            lender_kept_it,
+            object_alive,
+            can_map_again,
+        ))
+    })();
+
+    domain::destroy(borrower);
+    domain::destroy(lender);
+
+    let Some((mapped, one, lost, kept, alive, again)) = outcome else {
+        println!("\x1b[91m    lending        FAILED: the arrangement could not be built\x1b[0m");
+        return false;
+    };
+
+    let checks = [
+        ("both holders had it mapped to begin with", mapped),
+        ("exactly one mapping was taken back", one),
+        ("the borrower's page is gone", lost),
+        ("the lender's page is not", kept),
+        ("and the object it lends from is still alive", alive),
+        ("the borrower's address is free to map again", again),
+    ];
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!("\x1b[91m    lending        FAILED: {name}\x1b[0m");
+            ok = false;
+        }
+    }
+    if ok {
+        println!(
+            "    lending        a loan was taken back from the borrower alone: its page is gone \
+             and its address is free again, the lender kept both, and the object outlived the loan"
+        );
+    }
+    ok
 }
 
 /// RFC 0005 step 8's witness: a hosted program lists a directory, stats a
@@ -14218,6 +14372,12 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // run after that, so it runs here — before the shell, which is what every
     // other check placed late does, so that nothing is still printing when the
     // shell begins.
+    // RFC 0044, before the file probes: it is the mechanism they now depend on,
+    // and a failure here explains a failure there rather than the other way
+    // round.
+    if !lending_self_test(hhdm) {
+        println!("\x1b[91m    lending        FAILED\x1b[0m");
+    }
     if !file_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux file     FAILED\x1b[0m");
     }
@@ -15925,6 +16085,8 @@ fn iommu_reuse_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) ->
         bhaskix_arch::vtd::Rights::READ_WRITE,
         false,
         hhdm,
+        // A self-test maps on nobody's behalf; the owner domain names it.
+        owner.as_u32(),
     ) else {
         println!("\x1b[91m    iommu reuse    FAILED to map the first object\x1b[0m");
         domain::destroy(owner);
@@ -15945,6 +16107,8 @@ fn iommu_reuse_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) ->
         bhaskix_arch::vtd::Rights::READ_WRITE,
         false,
         hhdm,
+        // A self-test maps on nobody's behalf; the owner domain names it.
+        owner.as_u32(),
     ) else {
         println!("\x1b[91m    iommu reuse    FAILED to map the second object\x1b[0m");
         domain::destroy(owner);
@@ -16011,6 +16175,8 @@ fn iommu_memory_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -
         bhaskix_arch::vtd::Rights::READ_WRITE,
         false,
         hhdm,
+        // A self-test maps on nobody's behalf; the owner domain names it.
+        owner.as_u32(),
     ) else {
         println!(
             "\x1b[91m    iommu memory   FAILED to map the object into the device window\x1b[0m"

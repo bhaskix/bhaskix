@@ -68,7 +68,27 @@ _start:
         syscall
         test    %rax, %rax
         js      done
+        mov     %rax, %r13              # the file's descriptor, kept
         call    say
+
+        # 5. read the file it just opened, and print what it read.
+        #
+        # **This is the second file read on the machine**, and until RFC 0044
+        # it could not happen: the `linux file` probe read one first, and its
+        # lent page stayed mapped in the adapter, so the ATTACH for this one
+        # was refused at an address nothing appeared to be using.
+        mov     %r13, %rdi
+        mov     %r12, %rsi
+        mov     $40, %edx
+        xor     %eax, %eax              # read
+        syscall
+        test    %rax, %rax
+        jle     done
+        mov     %rax, %rdx
+        mov     %r12, %rsi
+        mov     $1, %edi
+        mov     $1, %eax                # write
+        syscall
 
 done:
         xor     %edi, %edi

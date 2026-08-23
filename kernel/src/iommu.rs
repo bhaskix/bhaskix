@@ -929,6 +929,7 @@ pub fn map_memory(
     rights: vtd::Rights,
     below_4gib: bool,
     hhdm: u64,
+    mapper: u32,
 ) -> Option<DevAddr> {
     let (frames, count) = crate::shared::frames_of(id)?;
     if count == 0 {
@@ -967,7 +968,7 @@ pub fn map_memory(
 
     MAPPED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
 
-    if !crate::shared::record_device_mapping(id, key, address.as_u64(), count as u64) {
+    if !crate::shared::record_device_mapping(id, key, address.as_u64(), count as u64, mapper) {
         // Recorded or not mapped. An object whose device mapping is not
         // written down is one revocation cannot find, which is a page a device
         // keeps after the object naming it is destroyed.

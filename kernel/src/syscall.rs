@@ -552,6 +552,7 @@ fn invoke_capability(
     cspace: &mut CSpace,
     arena: &mut Arena,
     revoked: &mut [u32; crate::cap::MAX_OWNERS],
+    unmapping: &mut Option<Unmapping>,
 ) -> Outcome {
     let index = match usize::try_from(frame.capability) {
         Ok(index) => index,
@@ -644,6 +645,10 @@ fn invoke_capability(
             // ever got its quota back from a revocation, so a service
             // accepting a capability per client was spent to death by
             // clients that granted and revoked.
+            // Read before the revocation, because after it the node is gone
+            // and with it the only record of which object it named.
+            let named = object;
+            let before = *revoked;
             match arena.revoke_tallied(slot, revoked) {
                 Ok(destroyed) => {
                     // The revoked capability's own slot is now a dead
@@ -651,6 +656,31 @@ fn invoke_capability(
                     // resolving it fails -- but leaving it occupies a slot the
                     // domain can never use again.
                     cspace.remove(index);
+
+                    // **And the memory goes with the capability** -- RFC 0044.
+                    // Decided here, where the arena is held and the question
+                    // is answerable, and performed by the caller, where the
+                    // locks unmapping needs are not already inverted.
+                    //
+                    // Who lost a capability here; **whether they lost their
+                    // last one is decided by the caller**, because that needs
+                    // the other domains' CSpaces and this holds only the
+                    // invoker's.
+                    if named.kind == crate::cap::ObjectKind::Memory
+                        && let Some(memory) = crate::shared::from_identity(named.id)
+                    {
+                        let mut tallied = [false; crate::cap::MAX_OWNERS];
+                        for (domain, lost) in tallied.iter_mut().enumerate() {
+                            *lost = revoked[domain].saturating_sub(before[domain]) > 0;
+                        }
+                        if tallied.iter().any(|lost| *lost) {
+                            *unmapping = Some(Unmapping {
+                                object: memory,
+                                named,
+                                tallied,
+                            });
+                        }
+                    }
                     Outcome {
                         status: Status::Ok,
                         value: destroyed as u64,
@@ -676,6 +706,34 @@ fn invoke_capability(
 
         _ => Outcome::err(Status::NoSuchMethod),
     }
+}
+
+/// What a revocation still owes once the arena and domain locks are gone.
+///
+/// [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)
+/// design §3, and the same shape as [`ResolvedWindow`] for the same kind of
+/// reason. Revoking a `Memory` capability has to take the memory out of the
+/// holders' address spaces, and unmapping needs `Rank::TlbSender` (4),
+/// `Rank::Heap` (3) and `Rank::AddressSpace` (0) — all **outer** to the
+/// `Rank::Domains` (6) and `Rank::Capabilities` (7) held where the decision is
+/// made. So the decision is made there and carried out here.
+///
+/// `tallied` is which domains lost *a* capability, which is **not** which
+/// domains lost their last one: a lender that derived what it lent from its
+/// own capability appears in the tally of every lending it revokes and still
+/// holds the object. Narrowing the one to the other is `CSpace::names`, and it
+/// happens in the caller because it needs the other domains' CSpaces — the
+/// invoker's is the only one taken out here. Getting it wrong unmaps
+/// `bin/fsd`'s cache page on every file read, which is not a thought
+/// experiment: it faulted the filesystem on the first `pkg install`.
+#[derive(Clone, Copy)]
+struct Unmapping {
+    /// The object whose mappings are owed a removal.
+    object: crate::shared::MemoryId,
+    /// The same object as the arena names it, for the CSpace check.
+    named: crate::cap::ObjectRef,
+    /// Which domains lost a capability naming it.
+    tallied: [bool; crate::cap::MAX_OWNERS],
 }
 
 /// What a `DmaWindow` invocation resolved to, with every lock released.
@@ -1586,12 +1644,22 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         return match frame.method {
             method::MAP => match resolved.memory {
                 Some(memory) => {
+                    // **Who is asking, recorded with the mapping** — RFC 0044
+                    // design §5. A revocation that takes this object away from
+                    // some of its holders has to know whether the device
+                    // mapping was one of theirs; without a name on it the only
+                    // safe answer is to remove it on any revocation, which
+                    // would take an unrelated driver's DMA down with a lending.
+                    let Some(mapper) = crate::sched::current_domain() else {
+                        return Outcome::err(Status::NoDomain);
+                    };
                     match crate::iommu::map_memory(
                         resolved.device,
                         memory,
                         resolved.rights,
                         false,
                         hhdm,
+                        mapper.as_u32(),
                     ) {
                         Some(address) => Outcome::ok(address.as_u64()),
                         // No window, no room, or the object has gone. All
@@ -3760,11 +3828,15 @@ fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
 
     let owner = id.as_u32();
     let mut revoked = [0u32; cap::MAX_OWNERS];
+    // RFC 0044: a revocation of mapped memory decides *inside* the locks and
+    // acts outside them. Empty for every method but `REVOKE`, and for a
+    // `REVOKE` whose object nobody mapped.
+    let mut unmapping: Option<Unmapping> = None;
     let outcome = domain::with(id, |domain| {
         let mut cspace = core::mem::take(&mut domain.cspace);
         let before = cspace.occupied();
         let outcome = cap::with_arena(|arena| {
-            invoke_capability(frame, owner, &mut cspace, arena, &mut revoked)
+            invoke_capability(frame, owner, &mut cspace, arena, &mut revoked, &mut unmapping)
         });
         let after = cspace.occupied();
 
@@ -3812,6 +3884,44 @@ fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
                     other.release_capability();
                 }
             });
+        }
+    }
+
+    // **And the memory, last, with every lock this needed gone** -- RFC 0044.
+    // `security.md` §2 rule 3 says a revocation is immediate and transitive;
+    // it was true of capabilities and false of the pages they named, which is
+    // how a borrower went on reading a frame its lender had taken back,
+    // unpinned and refilled.
+    //
+    // The address-space roots are resolved here rather than inside `shared`,
+    // because `space_root_of` takes `Rank::Domains` (6) and `shared::ARENA` is
+    // `Rank::SharedMemory` (12): looking a domain up under the shared arena
+    // would be an inversion of its own. Roots cross the boundary, not domains.
+    if let Some(plan) = unmapping {
+        let mut holders = [(0u32, None); cap::MAX_OWNERS];
+        let mut count = 0;
+        for (domain, lost) in plan.tallied.iter().enumerate() {
+            if !*lost {
+                continue;
+            }
+            let id = domain::DomainId::from_u32(domain as u32);
+            // **Still holding a name for it? Then the mapping stays.** Asked
+            // of the domain's CSpace and not of the arena's `owner` field: a
+            // capability minted by `shared::name` is charged to the kernel and
+            // *held* by the service, so "does this domain own a node naming
+            // the object" is false for `bin/fsd` and its cache page. That
+            // version of this check faulted the filesystem.
+            let still_holds = domain::with(id, |holder| {
+                cap::with_arena(|arena| holder.cspace.names(plan.named, arena))
+            });
+            if still_holds == Some(true) {
+                continue;
+            }
+            holders[count] = (domain as u32, domain::space_root_of(id));
+            count += 1;
+        }
+        if count > 0 {
+            crate::shared::unmap_roots(plan.object, &holders[..count]);
         }
     }
     outcome
@@ -4235,6 +4345,7 @@ mod tests {
             &mut cspace,
             &mut arena,
             &mut revoked,
+            &mut None,
         );
         assert_eq!(outcome.status, Status::Ok, "delete refused a dead slot");
         assert!(cspace.get(5).is_none(), "the slot was not emptied");
@@ -4271,6 +4382,7 @@ mod tests {
             &mut cspace,
             &mut arena,
             &mut revoked,
+            &mut None,
         );
         assert_eq!(outcome.status, Status::Ok);
         assert!(cspace.get(9).is_none());
@@ -4350,7 +4462,7 @@ mod tests {
                 ..SyscallFrame::default()
             };
             let mut revoked = [0u32; crate::cap::MAX_OWNERS];
-            let _ = invoke_capability(&f, 0, &mut cspace, &mut arena, &mut revoked);
+            let _ = invoke_capability(&f, 0, &mut cspace, &mut arena, &mut revoked, &mut None);
 
             // The invariant that matters. A frame may legitimately *derive* a
             // capability -- that is what `Invoke` is for -- but every one it

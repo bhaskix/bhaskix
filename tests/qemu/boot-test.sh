@@ -2033,8 +2033,18 @@ if grep -qE "linux dir      a Linux program listed the directory it was given" "
         fail "the listing worked but the seek or the stat did not -- printed \
 $(grep -aoE 'inner(inner)*' "$LOG" | head -1) where innerinnerinnerinner was due"
         status=1
+    elif [ "$(grep -acF "only reachable through the subdirectory" "$LOG")" -lt 2 ]; then
+        # **The end-to-end half of RFC 0044, and it is a count rather than a
+        # match.** The `linux file` probe reads that line, and so does this
+        # one -- so the text appearing *once* is the old behaviour, where a
+        # hosted program could read one file per machine and the second
+        # `ATTACH` was refused at an address nothing appeared to be using.
+        # Twice is the property: revocation gave the address back.
+        fail "only $(grep -acF "only reachable through the subdirectory" "$LOG") hosted read(s) \
+reached the console; two hosted programs read a file and both must"
+        status=1
     else
-        pass "a hosted program listed a directory, rewound it with lseek, stat'ed it and reopened through it"
+        pass "a hosted program listed a directory, stat'ed a file in it, and read it -- the second hosted read on this machine"
     fi
 elif grep -qF "linux dir      skipped" "$LOG"; then
     pass "no filesystem service on this machine, so hosted programs have no directory to list"
@@ -2185,6 +2195,28 @@ fi
 # regression says by how much rather than only that there was one. This is the
 # frame-leak gate pointed at the newest thing that can leak, which is the whole
 # reason the object's frames are charged to an envelope at all.
+# RFC 0044: a lending taken back from the borrower *alone*.
+#
+# The gate above revokes an object's **root** capability and checks both
+# holders lost it. That operation was always right. This one is the operation
+# every file read performs -- `bin/fsd` revokes the *lending* it derived from
+# the capability naming its own cache frame -- and until 2026-08-23 it took the
+# capability away and left the page mapped.
+#
+# Four properties in one line, and the point is that no plausible wrong fix
+# gets all four. Unmapping every domain in the revocation tally passes "the
+# borrower's page is gone" and fails "the lender kept both", because the lender
+# is in that tally on every release. Routing through `shared::revoke_capability`
+# passes the first and destroys the object. Clearing only the hardware entries
+# passes both and fails "its address is free again", which is the half that put
+# a hosted program's second file read out of reach.
+if grep -qF "lending        a loan was taken back from the borrower alone: its page is gone and its address is free again, the lender kept both, and the object outlived the loan" "$LOG"; then
+    pass "revoking a lending unmaps the borrower, leaves the lender, and frees the address"
+else
+    fail "the lending self test did not pass: $(grep -aoE 'lending .*' "$LOG" | head -1)"
+    status=1
+fi
+
 if grep -qE "memory objects +[1-9][0-9]* created, [1-9][0-9]* destroyed, none live; two domains shared one object; [1-9][0-9]* mappings revoked out of their page tables; no frame lost" "$LOG"; then
     pass "two domains share an object, revocation takes it from both, nothing leaks"
 else
