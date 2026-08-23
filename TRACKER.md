@@ -791,6 +791,35 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (RFC 0045 drafted: three failures in one day all traced to one shared adapter, and the decision is the lead's)
+
+**No code, deliberately.** RFC 0031's interface **I5** says the Linux adapter
+is not a system service every hosted process shares -- one adapter domain per
+workload -- and the implementation has been a single `bin/linuxd` since RFC
+0032 moved it out of the nucleus. On 2026-08-23 that difference stopped being
+theoretical three times, in three different ways, none of them sought:
+
+- **Authority.** Tier 2's network grant went to *every* hosted program at
+  once, because there is one translator between them. Nothing in the system
+  can now give one Linux workload a network and another none.
+- **Blast radius.** A socket leaked by a hosted probe took the *shell's*
+  network away -- an unrelated native program losing a capability it had held
+  since boot, through a service table shared by way of one adapter.
+- **Availability.** A hosted `bind` against a service that cannot answer blocks
+  for ever, and one thread serves everybody, so that single call stops every
+  hosted process. Recorded and not fixed.
+
+The RFC writes all three down together, states what each way out would cost --
+per-workload adapters, a shared adapter holding *nothing* (which trades I5's
+problem for I3's invariant), or amending I5 to match the implementation -- and
+stops there. **It carries no implementation plan on purpose**: a plan written
+before the choice is a plan for one option, which is how a decision gets taken
+by whoever writes the code rather than by whoever should.
+
+Three arguments arriving in one day, none of them looked for, is stronger
+evidence than the original reasoning for I5 -- that was an argument, these are
+incidents.
+
 ### 2026-08-23 (RFC 0005 step 9's wiring: a hosted program uses a socket, and a test that could not fail said it already did)
 
 Tier 2's arithmetic landed 2026-08-19 and its wiring was proved impossible in
