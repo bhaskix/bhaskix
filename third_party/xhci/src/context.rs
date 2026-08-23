@@ -228,18 +228,41 @@ impl Slot {
         self
     }
 
-    /// Dword 1, bits 31:24 — the root hub port this device is on.
+    /// Dword 1, bits 23:16 — the root hub port this device is on.
     ///
     /// **Ports are numbered from one**, as everywhere else in xHCI.
+    ///
+    /// # Corrected 2026-08-23 — this was bits 31:24, and that is Number of Ports
+    ///
+    /// Both this accessor and [`Slot::with_root_hub_port_number`] used bits
+    /// 31:24, agreed with each other, and were pinned by a round-trip test that
+    /// read the value back through the very accessor that had written it. A
+    /// test shaped like that verifies the *pair*; it cannot see the layout, and
+    /// it passed for as long as the two were wrong together.
+    ///
+    /// **Caught by a controller, not by a reading.** RFC 0041 step 5's Address
+    /// Device command was refused with `CC_TRB_ERROR` while every other field
+    /// of the input context probed correct. Written at bits 31:24 the slot
+    /// context read `0x05000000`; moved to 23:16 it read `0x00050000` and the
+    /// same command succeeded, the device reaching slot state `Addressed` with
+    /// USB address 1. That is evidence from this machine rather than from
+    /// recall, which is the only kind available here — see PROVENANCE.md, which
+    /// says the specification wins and which nobody can consult from this tree.
+    ///
+    /// Dword 1 is `[max exit latency 15:0][root hub port 23:16][number of
+    /// ports 31:24]`, and the field this used to occupy belongs to a hub's port
+    /// count. The test below now asserts the raw dword as well as the round
+    /// trip, which is the only form that can fail when both accessors move
+    /// together.
     #[must_use]
     pub const fn root_hub_port_number(self) -> u8 {
-        bits32(self.0[1], 24, 31) as u8
+        bits32(self.0[1], 16, 23) as u8
     }
 
     /// With the root hub port number set.
     #[must_use]
     pub const fn with_root_hub_port_number(mut self, port: u8) -> Self {
-        self.0[1] = (self.0[1] & !(0xff << 24)) | ((port as u32) << 24);
+        self.0[1] = (self.0[1] & !(0xff << 16)) | ((port as u32) << 16);
         self
     }
 
@@ -556,6 +579,43 @@ mod tests {
         assert_eq!(slot.speed(), 3);
         assert_eq!(slot.context_entries(), 31);
         assert_eq!(slot.root_hub_port_number(), 7);
+    }
+
+    /// **The raw encoding, written a second time — and this is why.**
+    ///
+    /// The test above round-trips every field through the accessor that wrote
+    /// it, which pins the getter and setter *to each other* and says nothing
+    /// about where the field actually is. `root_hub_port_number` and
+    /// `with_root_hub_port_number` both used bits 31:24 until 2026-08-23, both
+    /// agreed, and that test passed the whole time. A controller found it:
+    /// Address Device was refused until the field moved to 23:16.
+    ///
+    /// So the layout is asserted against literals here, the same second
+    /// transcription the offset tests use. This is the only form of this test
+    /// that can fail when both accessors are wrong together.
+    #[test]
+    fn slot_fields_are_where_the_dword_layout_puts_them() {
+        // Dword 0: route string 19:0, speed 23:20, context entries 31:27.
+        let dword0 = Slot::new().with_route_and_speed(0xabcde, 3).0[0];
+        assert_eq!(dword0 & 0xf_ffff, 0xabcde, "route string is bits 19:0");
+        assert_eq!((dword0 >> 20) & 0xf, 3, "speed is bits 23:20");
+        assert_eq!(
+            Slot::new().with_context_entries(31).0[0] >> 27,
+            31,
+            "context entries is bits 31:27"
+        );
+
+        // Dword 1: max exit latency 15:0, root hub port 23:16, number of
+        // ports 31:24. Bits 31:24 are *not* the port -- that is a hub's port
+        // count, and writing a port number there is what produced
+        // CC_TRB_ERROR from a real controller.
+        let dword1 = Slot::new().with_root_hub_port_number(7).0[1];
+        assert_eq!(dword1, 7 << 16, "root hub port is bits 23:16, and alone");
+        assert_eq!(
+            dword1 >> 24,
+            0,
+            "nothing may land in the number-of-ports field"
+        );
     }
 
     #[test]

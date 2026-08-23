@@ -44,6 +44,31 @@ Replacing `accessor` is the one change that is an improvement rather than a
 trade: device memory is something this kernel already owns rules about, and a
 driver reaching it through a second abstraction with its own opinions is drift.
 
+### Corrections made here, after the take
+
+Behaviour changes, as opposed to the dependency removals above. Each is a place
+this source was wrong and this tree is not.
+
+| what | when | how it was found |
+|---|---|---|
+| `Slot::root_hub_port_number` and its setter used dword 1 bits **31:24**, which is Number of Ports. Moved to bits **23:16**. | 2026-08-23 | A controller. RFC 0041 step 5's Address Device was refused with `CC_TRB_ERROR` while every other field of the input context probed correct; written at 23:16 the same command addressed the device, slot state `Addressed`, USB address 1. |
+| `StructuralParameters2::max_scratchpad_buffers` documented its two halves the wrong way round — the prose contradicted the code and the test beneath it. Prose corrected; **the code was not**, and the tiebreak against the specification is recorded as owed. | 2026-08-23 | Reading, while building RFC 0041 step 3. |
+
+**The lesson from the first of those is about the shape of a test, not about a
+bit range.** The accessor pair was pinned by:
+
+```rust
+let slot = Slot::new().with_root_hub_port_number(7);
+assert_eq!(slot.root_hub_port_number(), 7);
+```
+
+which reads the value back through the accessor that wrote it. That verifies the
+getter and setter **against each other** and cannot see the layout — it passed
+for as long as the two were wrong together. A layout test must assert the raw
+encoding against a literal, which is the second transcription the offset tests in
+this crate already use. Where an accessor pair here is pinned only by a round
+trip, it is pinned by nothing.
+
 ## What this means for review
 
 Vendored code is code this project ships. The Apache-2.0 grant covers the right
