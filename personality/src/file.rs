@@ -89,7 +89,22 @@ pub mod mode {
     pub const IFCHR: u32 = 0o20_000;
     /// A socket.
     pub const IFSOCK: u32 = 0o140_000;
+    /// A pipe. Spelled `S_IFIFO` in a libc, and the one of these a hosted
+    /// program is most likely to test for: a shell decides whether it is on
+    /// a terminal or in a pipeline by this field.
+    pub const IFIFO: u32 = 0o10_000;
 }
+
+// Every value above was read from this machine's
+// `/usr/include/x86_64-linux-gnu/bits/stat.h` rather than recalled — the same
+// standard `STAT_BYTES` is held to, and for the same reason: a type bit at
+// the wrong value makes `stat` answer confidently and wrongly, and nothing
+// in this tree could tell.
+const _: () = {
+    assert!(mode::IFDIR == 0o040_000 && mode::IFCHR == 0o020_000);
+    assert!(mode::IFREG == 0o100_000 && mode::IFSOCK == 0o140_000);
+    assert!(mode::IFIFO == 0o010_000 && mode::IFMT == 0o170_000);
+};
 
 /// `dirent64.d_type` values.
 pub mod dirent_type {
@@ -157,6 +172,17 @@ pub enum Kind {
 pub struct Entry {
     /// The adapter's own name for whatever this refers to.
     pub handle: u64,
+    /// What the filesystem calls this file — `fstat`'s `st_ino`.
+    ///
+    /// **Kept beside the handle rather than derived from it.** The handle is
+    /// a capability slot, taken from a small pool and *reused*: two files
+    /// opened one after the other routinely land in the same slot, so a
+    /// `st_ino` derived from it would report them as the same file. `find`
+    /// and `du` act on exactly that equality, and would prune the second.
+    /// Zero for the kinds that have no filesystem identity — a pipe, a
+    /// socket, the console — which is [`StatFields::inode`]'s own caveat and
+    /// is why the kinds that *do* have one must carry it.
+    pub inode: u64,
     /// What it is.
     pub kind: Kind,
     /// Whether `execve` should close it.
@@ -217,6 +243,7 @@ impl Table {
         {
             self.entries[number] = Some(Entry {
                 handle,
+                inode: 0,
                 kind: Kind::Console,
                 close_on_exec: false,
                 offset: 0,
@@ -544,15 +571,243 @@ pub fn write_dirent(
     Ok(bytes)
 }
 
+/// `lseek`'s `whence`.
+pub mod whence {
+    /// From the beginning.
+    pub const SET: u64 = 0;
+    /// From where the descriptor is now.
+    pub const CUR: u64 = 1;
+    /// From the end of the file.
+    pub const END: u64 = 2;
+    /// The next hole at or after the offset.
+    pub const DATA: u64 = 3;
+    /// The next hole — sparse files, which this system does not have.
+    pub const HOLE: u64 = 4;
+}
+
+/// Where an `lseek` lands.
+///
+/// **A seek past the end is legal and is not an error**, which is the rule
+/// that surprises people: Linux lets a descriptor sit beyond the last byte,
+/// and a `read` there returns zero rather than failing. A version that
+/// clamped to the size would silently turn a sparse-write pattern into an
+/// overwrite of the tail, so the offset is *not* bounded by the size here —
+/// only by arithmetic.
+///
+/// `SEEK_DATA` and `SEEK_HOLE` are refused rather than answered as `SET`.
+/// They are questions about which parts of a file are allocated; a
+/// filesystem with no holes could answer them truthfully, but this one
+/// cannot yet say so with anything it has measured, and a wrong answer to
+/// `SEEK_HOLE` is a program that copies a file and drops its tail.
+///
+/// # Errors
+///
+/// [`errno::EINVAL`] for an unknown or unsupported `whence`, for a result
+/// before the start of the file, or for one that does not fit an `i64` —
+/// which is what Linux answers, and is `EOVERFLOW` only for `lseek64` on a
+/// 32-bit offset this system does not have.
+pub fn plan_lseek(current: u64, size: u64, offset: i64, from: u64) -> Result<u64, i64> {
+    let base = match from {
+        whence::SET => 0,
+        whence::CUR => current,
+        whence::END => size,
+        _ => return Err(errno::EINVAL),
+    };
+    // Signed arithmetic throughout, and checked: `base` can be any offset a
+    // descriptor has reached and `offset` is the program's own number, so
+    // both directions overflow and a wrapped result would be a seek to
+    // somewhere nobody asked for.
+    let base = i64::try_from(base).map_err(|_| errno::EINVAL)?;
+    let landed = base.checked_add(offset).ok_or(errno::EINVAL)?;
+    // **This also catches every overflow, and that is not a coincidence.**
+    // `base` is non-negative and `offset` is at most `i64::MAX`, so a sum
+    // that does not fit can only land negative — there is no input that
+    // wraps to a plausible positive offset. So `checked_add` above is
+    // belt-and-braces rather than the guard, and no test can tell it from
+    // `wrapping_add`; it is kept because a plain `+` here would panic a
+    // debug build. Deleting *this* check because it looks like it is only
+    // about negative arguments would be the real hole.
+    if landed < 0 {
+        return Err(errno::EINVAL);
+    }
+    Ok(landed as u64)
+}
+
+/// What `fstat` should answer about `entry`.
+///
+/// The mode's type bits come from the kind, and the permission bits are
+/// **`0o444` or `0o644` and nothing finer**, because this system has no
+/// per-file permissions to report and inventing three octal digits per file
+/// would be a claim it cannot keep. A caller that tests for writability gets
+/// the answer the descriptor actually has.
+#[must_use]
+pub fn stat_of(entry: &Entry) -> StatFields {
+    let kind_bits = match entry.kind {
+        Kind::File | Kind::Proc => mode::IFREG,
+        Kind::Directory => mode::IFDIR,
+        Kind::Console => mode::IFCHR,
+        Kind::Socket => mode::IFSOCK,
+        // A pipe is `S_IFIFO`, and an `epoll` set is a file in every libc
+        // that has looked: neither is a kind this table names elsewhere, so
+        // both are written here rather than left to fall through to a
+        // regular file, which is what a program calls `fstat` to find out.
+        Kind::Pipe => mode::IFIFO,
+        Kind::Epoll => mode::IFREG,
+    };
+    let permissions = if entry.writable { 0o644 } else { 0o444 };
+    StatFields {
+        inode: entry.inode,
+        mode: kind_bits | permissions,
+        links: 1,
+        size: entry.size,
+        // The filesystem's block, which is also what `MAP` lends a page of.
+        block_size: 4096,
+        time: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seek_past_the_end_is_where_the_descriptor_goes_rather_than_an_error() {
+        // Linux allows it and programs rely on it: this is how a file is
+        // extended by seeking and writing. Clamping to the size here would
+        // turn that into an overwrite of the last byte.
+        assert_eq!(plan_lseek(0, 10, 4096, whence::SET), Ok(4096));
+        assert_eq!(plan_lseek(10, 10, 90, whence::END), Ok(100));
+    }
+
+    #[test]
+    fn a_seek_before_the_start_is_refused_from_every_whence() {
+        assert_eq!(plan_lseek(0, 10, -1, whence::SET), Err(errno::EINVAL));
+        assert_eq!(plan_lseek(4, 10, -5, whence::CUR), Err(errno::EINVAL));
+        assert_eq!(plan_lseek(0, 10, -11, whence::END), Err(errno::EINVAL));
+        // And landing exactly on zero is not before the start.
+        assert_eq!(plan_lseek(4, 10, -4, whence::CUR), Ok(0));
+        assert_eq!(plan_lseek(0, 10, -10, whence::END), Ok(0));
+    }
+
+    #[test]
+    fn seek_from_the_end_measures_from_the_size_and_from_current_the_offset() {
+        // The two are only the same when the descriptor is at the end, which
+        // is the case a test that used one number for both would pass on.
+        assert_eq!(plan_lseek(3, 10, 0, whence::END), Ok(10));
+        assert_eq!(plan_lseek(3, 10, 0, whence::CUR), Ok(3));
+    }
+
+    #[test]
+    fn seek_data_and_seek_hole_are_refused_rather_than_answered_as_set() {
+        // A file system with no holes could answer these, and this one has
+        // not measured that it has none. Answering `SET` would put the
+        // descriptor at the caller's offset and report it as the start of
+        // data, which is a copy that silently drops a tail.
+        assert_eq!(plan_lseek(0, 10, 0, whence::DATA), Err(errno::EINVAL));
+        assert_eq!(plan_lseek(0, 10, 0, whence::HOLE), Err(errno::EINVAL));
+        assert_eq!(plan_lseek(0, 10, 0, 5), Err(errno::EINVAL));
+        assert_eq!(plan_lseek(0, 10, 0, u64::MAX), Err(errno::EINVAL));
+    }
+
+    #[test]
+    fn a_seek_that_would_overflow_is_refused_rather_than_wrapping_to_a_small_offset() {
+        // **What carries this is the sign check and the `i64` conversion, not
+        // `checked_add`** -- swapping that for `wrapping_add` leaves every
+        // case here still refused, because an overflow from a non-negative
+        // base can only land negative. Said here because a reader who saw
+        // `checked_add` and this test would reasonably assume the one tests
+        // the other, and would delete the sign check first.
+        assert_eq!(plan_lseek(u64::MAX, 0, 1, whence::CUR), Err(errno::EINVAL));
+        assert_eq!(
+            plan_lseek(i64::MAX as u64, 0, 1, whence::CUR),
+            Err(errno::EINVAL)
+        );
+        assert_eq!(plan_lseek(0, u64::MAX, 0, whence::END), Err(errno::EINVAL));
+        assert_eq!(
+            plan_lseek(i64::MAX as u64, 0, i64::MAX, whence::CUR),
+            Err(errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn stat_tells_a_directory_from_a_file_and_neither_from_a_console() {
+        let of = |kind| {
+            stat_of(&Entry {
+                handle: 1,
+                inode: 9,
+                kind,
+                close_on_exec: false,
+                offset: 0,
+                size: 40,
+                readable: true,
+                writable: false,
+            })
+            .mode
+                & mode::IFMT
+        };
+        assert_eq!(of(Kind::File), mode::IFREG);
+        assert_eq!(of(Kind::Directory), mode::IFDIR);
+        assert_eq!(of(Kind::Console), mode::IFCHR);
+        assert_eq!(of(Kind::Socket), mode::IFSOCK);
+        // A pipe is not a regular file, and a program that stats one to
+        // decide whether it may seek reads exactly this field.
+        assert_eq!(of(Kind::Pipe), mode::IFIFO);
+    }
+
+    #[test]
+    fn stat_answers_the_inode_the_entry_carries_and_never_its_handle() {
+        // The trap this field exists for: the handle is a slot number, taken
+        // from a pool of thirty-two and reused, so two files opened one after
+        // another share one. `find` prunes what it thinks it has visited.
+        let entry = Entry {
+            handle: 127,
+            inode: 3,
+            kind: Kind::File,
+            close_on_exec: false,
+            offset: 0,
+            size: 40,
+            readable: true,
+            writable: false,
+        };
+        assert_eq!(stat_of(&entry).inode, 3);
+        assert_ne!(stat_of(&entry).inode, entry.handle);
+    }
+
+    #[test]
+    fn a_written_stat_carries_the_size_and_mode_at_the_offsets_the_struct_puts_them() {
+        // Raw offsets, not a round trip through this module's own reader --
+        // there is no reader, and the caller is a libc that knows only the
+        // layout. A field written to the wrong offset round-trips perfectly
+        // and is still wrong.
+        let mut out = [0u8; STAT_BYTES];
+        write_stat(
+            &mut out,
+            &stat_of(&Entry {
+                handle: 1,
+                inode: 0x1122,
+                kind: Kind::Directory,
+                close_on_exec: false,
+                offset: 0,
+                size: 0x3344,
+                readable: true,
+                writable: false,
+            }),
+        )
+        .expect("room");
+        assert_eq!(u64::from_le_bytes(out[8..16].try_into().unwrap()), 0x1122);
+        assert_eq!(
+            u32::from_le_bytes(out[24..28].try_into().unwrap()),
+            mode::IFDIR | 0o444
+        );
+        assert_eq!(u64::from_le_bytes(out[48..56].try_into().unwrap()), 0x3344);
+    }
 
     #[test]
     fn a_duplicated_descriptor_is_counted_so_its_capability_is_not_dropped_early() {
         let mut table = Table::new();
         let entry = Entry {
             handle: 99,
+            inode: 0,
             kind: Kind::File,
             close_on_exec: false,
             offset: 0,
@@ -581,6 +836,7 @@ mod tests {
         table.install_standard(7);
         let entry = Entry {
             handle: 1,
+            inode: 0,
             kind: Kind::File,
             close_on_exec: false,
             offset: 0,
@@ -601,6 +857,7 @@ mod tests {
         let mut table = Table::new();
         let entry = Entry {
             handle: 1,
+            inode: 0,
             kind: Kind::File,
             close_on_exec: false,
             offset: 0,
@@ -631,6 +888,7 @@ mod tests {
         table.install_standard(7);
         let file = Entry {
             handle: 99,
+            inode: 0,
             kind: Kind::File,
             close_on_exec: false,
             offset: 0,

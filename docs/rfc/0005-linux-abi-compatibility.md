@@ -466,6 +466,191 @@ a file, made a socket or waited on an `epoll` set. Nothing above is reachable
 from ring 3 yet, and it will not be until the personality is where this RFC has
 always said it belongs.
 
+## Step 8's record, the real one (2026-08-23): directories are readable, and reading a file twice is not
+
+> **Step 8 is *begun*, not finished, and the tracker says so.** What is in:
+> directories, `lseek`, `fstat`/`newfstatat`, and the fuzz target the step
+> makes mandatory. What is named in Tier 1 and is not in: `readlinkat`,
+> `unlinkat`, `mkdirat`, `fcntl`, `ioctl`, `uname`, and `/proc/self/exe` —
+> which needs `readlinkat` first. Directories were taken first because they
+> were the part of the tier with *nothing* behind them; the rest have
+> arithmetic or an obvious shape and no discoveries left in them.
+
+**Read the correction at the head of "Step 8's record (2026-08-19)" first.**
+That section is numbered wrong and says so: its content is step 5's. This is
+step 8 — *"Tier 1. Files, directories, synthetic `/proc`. Fuzz target
+mandatory before merge."*
+
+### What was already there, and what was actually missing
+
+`personality::file` has had `write_stat`, `write_dirent`, `plan_openat`,
+`STAT_BYTES` and `dirent_bytes` since step 9's Tier 2 groundwork, each with
+host tests. **Nothing called any of them.** The formats were written, tested,
+and unreachable: `open` recognised a directory and set `Kind::Directory`, and
+no syscall could then do anything with one. So the gap was not arithmetic. It
+was four calls and their wiring:
+
+| | |
+|---|---|
+| `lseek` (8) | `personality::file::plan_lseek`, pure, eight host tests |
+| `fstat` (5) | `stat_of` + `write_stat`, out through `COPY_OUT` |
+| `newfstatat` (262) | `AT_EMPTY_PATH` is `fstat`; a path opens, stats and closes |
+| `getdents64` (217) | `dir::LIST_AT` in a loop, encoded by `write_dirent` |
+
+Plus two things without which none of it is reachable from a hosted program:
+
+- **`open("/")` and `open(".")`.** `getdents64` needs a directory descriptor,
+  and until now the only way to get one was to name a directory *inside* the
+  root — so the one directory every hosted process has was the one it could
+  not list. The handle is the adapter's own root capability at a fixed slot,
+  not a slot from its pool.
+- **The `close` guard that follows from that.** `release_file_slot` `DELETE`s
+  whatever is in the slot, and the slot here holds the directory the kernel
+  granted `bin/linuxd` at boot. One hosted `close(dirfd)` would have taken the
+  filesystem away from every hosted process for the life of the machine. The
+  probe closes and then reopens through it, so the guard is gated rather than
+  asserted.
+
+### The listing needed an inode, and the word that carries it set a trap
+
+`dirent64.d_ino` is not decoration: `find` and `du` use it to detect hard
+links and loops, and every file sharing inode zero looks like one enormous
+link farm. `dir::LIST_AT` did not carry one — `bin/fsd` computed the child
+inode to answer "is this a directory" and threw it away — and `dir::OPEN_AT`
+did not either, so `fstat` had nothing to answer `st_ino` with. Both now do:
+`OPEN_AT` in its spare fourth word, `LIST_AT` above bit 32 of its packed one.
+
+**And the packed word had a reader that the change would have broken.** The
+shell's `pkg_clear_directory` read the kind as `args[3] >> 8`, which was
+correct while nothing sat above it and would have called *every file a
+directory* with an inode there — sending `pkg remove` recursing into files.
+Found by reading the callers before writing the field, which is the only
+reason it is a paragraph here rather than a bug. The fix is not the mask: it
+is `dir::listing`, `dir::listing_length`, `dir::listing_is_directory` and
+`dir::listing_inode`, so the word has one definition and hand-masking is not
+how anybody reads it again. Three tests, all watched red, and one of them is
+the exact regression: *a file with a large inode is still a file*.
+
+### The mandatory fuzz target
+
+`fuzz/fuzz_targets/linux_dirent.rs`. **The untrusted input is the
+filesystem's, not the program's** — a `getdents64` fills the caller's buffer
+from names a disk supplied, and a disk is bytes somebody else wrote. It walks
+its own output the way a libc does, reading *only* `d_reclen` and the NUL and
+never `dirent_bytes`, so a padding rule the writer and the reader disagree
+about surfaces as a wrong name rather than as nothing at all. Three
+properties: a record never claims more room than it was given, the names come
+back exactly and in order, and `d_off` strictly increases — an equal or
+decreasing offset is a `readdir` that never ends.
+
+**22,414,011 executions, no crash**, at 148,437/s.
+
+**And it has been watched red twice**, because a fuzz target that has never
+failed proves nothing either. Dropping the eight-byte rounding from
+`dirent_bytes` — the padding rule whose whole purpose is that a caller can
+walk the buffer — is found in seconds: *"a record a caller cannot walk in
+eight-byte steps."* Writing the name one byte early, over `d_type`, is found
+in seconds as well: *"a name changed on the way through."* The second is the
+one that matters, because it is invisible to any test that reads the record
+back with the same offsets that wrote it.
+
+### Two kernel bugs, and only one of them is fixed
+
+**The first: a slot whose capability the issuer revoked could never be
+emptied.** `invoke_capability` resolves before it dispatches, so a dead
+reference refused every method — including `DELETE`, whose entire purpose is
+that the slot end up empty. `bin/fsd` lends a page of its cache and takes it
+back by revoking (`dir::RELEASE`), so every borrower's slot dies this way;
+`bin/linuxd` borrows into one fixed slot. **The second file read on the
+machine was refused**, by whichever hosted program happened to be second.
+Nothing had ever read two files, so nothing had ever seen it.
+
+Fixed: `DELETE` is answered before the slot is resolved. The ABI already said
+so — *"not an error on a slot that is already empty: a program tidying up
+should not have to remember whether it has anything to tidy"* — and the
+kernel answered `NoSuchCapability`, which made it two bugs rather than one.
+Two tests, watched red three ways, including one that asserts the slot takes
+a capability again afterwards rather than merely that `DELETE` answered `Ok`.
+
+**The second is not fixed, and it is the reason this step's probe does not
+`read`.** `method::REVOKE` destroys arena nodes and **never unmaps**. The
+function that does it correctly already exists — `shared::revoke_capability`,
+"mappings first, then its subtree", whose own documentation says *"the order
+is the design"* and cites `security.md` §2 rule 3 — and it is called from
+exactly one place: a kernel self-test. The syscall does not use it.
+
+Two consequences, and the second is worse than the first:
+
+1. **A hosted program can `read` once per machine, not once per file.** The
+   borrower's address stays occupied, so the second `ATTACH` at it is refused
+   `SlotUnavailable`. Reproduced in both directions: with the two probes in
+   one order the second one fails, and with the order swapped the *other* one
+   fails, same stage, same status.
+2. **`dir::RELEASE` does not do what it says.** Its documentation promises
+   *"the page is gone from its address space when this returns, and reading
+   where it used to be is a fault"*, and the page is still there. A borrower
+   that keeps the mapping reads a frame the service has unpinned and is free
+   to fill with another file's block — which is the disclosure `MAP` exists
+   to avoid, arriving a moment later.
+
+That is a change to revocation semantics in the nucleus, and the fix has to
+move the unmapping outside the arena lock, so it is **an RFC and not an
+improvisation**. Recorded here, and in `security.md`, rather than worked
+around: `bin/linuxd` could attach each lend at a rotating address and the
+gates would go green with the disclosure still open.
+
+### What the gate demands
+
+`tests/qemu/boot-test.sh`, the lanes with a filesystem. One five-letter name —
+`inner`, an entry off a filesystem image that no part of the personality could
+invent — printed **four times**, each printing a different call's evidence:
+
+1. `open("/")` and `getdents64`.
+2. `lseek(dirfd, 0, SEEK_SET)` and `getdents64` again. Only the seek makes the
+   second one answer; a spent listing returns nothing and the probe stops with
+   one name printed.
+3. `fstat(dirfd)`, printed **only if** `st_mode` says directory — so a mode at
+   the wrong offset of the `struct stat` stops the probe rather than passing.
+4. `close(dirfd)` then `open("inner")` — the close guard.
+
+Counting is the check: three would be a stat that worked and a close that took
+the filesystem away with it.
+
+**Watched red by deleting the `lseek`** and reassembling the probe: the gate
+reports *"printed inner where innerinnerinnerinner was due"*, and the adapter's
+record says `stage -120, detail 32` — the first `getdents64` wrote thirty-two
+bytes and the second answered nothing, because a listing nobody rewound is
+spent. The whole failure is legible from the boot line without re-running
+anything, which is what the stages are for.
+
+**The probe is assembled, not hand-written**, by
+`tools/probe-bytes.sh` from `tools/probes/linux-lister.s`, and that script
+verifies its transcription against the assembled binary before printing
+anything. It does that because the first version did not: `objdump` wraps an
+instruction longer than seven bytes onto a second line with no mnemonic, one
+`mov 0x230(%r12),%rdx` lost its trailing zero, every byte after it shifted,
+and the probe faulted in ring 3 at an address that read exactly like a
+clobbered register. **Two boots went into diagnosing a kernel that was
+working.** The lesson is this RFC's own, in a new place: the transcription is
+untrusted input too.
+
+### What this does not do
+
+- **No `read` in this probe**, for the reason above. The `linux file` gate
+  still does the one read the machine can do.
+- **`readlinkat`, `unlinkat`, `mkdirat`, `fcntl`, `ioctl`, `uname`** are named
+  in Tier 1 and are not here. `getdents64` and `fstat` were chosen because
+  directories were the part of Tier 1 with *nothing* behind them; the rest
+  have arithmetic or an obvious shape and no discoveries left in them.
+- **`st_ino` on the root is zero**, and it is a gap rather than a value: the
+  filesystem's name for that directory is inside the badge of a capability,
+  which is the service's to read and not the holder's. Every entry *inside* it
+  carries a real inode. The trigger is the first program that compares the
+  root's.
+- **The timestamps are one number, three times**, as `StatFields` has always
+  said: this system has no wall clock it can defend, and three separately
+  wrong times would imply a precision that does not exist.
+
 ## Step 10's record (2026-08-19): the gate is unmet, and it is reported unmet rather than redefined
 
 **Step 10 cannot be run, and the reason is not a shortfall in this

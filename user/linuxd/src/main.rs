@@ -743,6 +743,12 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
                 _ => (REPLY_VALUE, answer_read(request)),
             };
         }
+        // Reading a directory, and stat in both its shapes. Each writes the
+        // caller's memory, so each belongs in this block rather than among
+        // the calls a message alone can answer.
+        GETDENTS64 => return (REPLY_VALUE, answer_getdents64(request)),
+        FSTAT => return (REPLY_VALUE, answer_fstat(request)),
+        NEWFSTATAT => return (REPLY_VALUE, answer_newfstatat(request)),
         CLOSE => return (REPLY_VALUE, answer_close(request)),
         DUP | DUP2 | DUP3 => return (REPLY_VALUE, answer_dup(request)),
         SCHED_YIELD => return (REPLY_YIELD, Answer::ok(0)),
@@ -946,6 +952,10 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // page-reclaim policy that does not exist here. Answered rather than
         // refused, because a runtime told its advice was rejected may take a
         // slower path for no reason.
+        // **No memory, so no `Domain` capability** — the whole of `lseek` is
+        // arithmetic on a row this program already holds, which is why it is
+        // here and `fstat` is not.
+        LSEEK => answer_lseek(request),
         MADVISE => Answer::ok(memory::plan_madvise() as u64),
         // Signal masking is recorded nowhere and honoured nowhere yet. Zero
         // rather than `-ENOSYS`, because a runtime told it cannot mask signals
@@ -1281,6 +1291,21 @@ const EXEC_IMAGE: [u8; 96] = [
 
 /// `openat(dirfd, path, flags, mode)`, and `open(path, flags, mode)`.
 const OPENAT: u64 = 257;
+/// `lseek(fd, offset, whence)`.
+const LSEEK: u64 = 8;
+/// `fstat(fd, statbuf)`.
+const FSTAT: u64 = 5;
+/// `newfstatat(dirfd, path, statbuf, flags)` — `stat` and `lstat` as every
+/// current libc issues them.
+const NEWFSTATAT: u64 = 262;
+/// `getdents64(fd, buffer, count)`.
+const GETDENTS64: u64 = 217;
+/// `newfstatat`'s flag meaning "the path is empty; stat the descriptor" —
+/// which is how a libc turns `fstat` into this call.
+///
+/// Read from this machine's `/usr/include/linux/fcntl.h`, not recalled, as
+/// was [`AT_FDCWD`](answer_newfstatat)'s `-100` beside it.
+const AT_EMPTY_PATH: u64 = 0x1000;
 const OPEN: u64 = 2;
 /// `read(fd, buffer, count)`.
 const READ: u64 = 0;
@@ -1646,6 +1671,9 @@ fn answer_pipe(request: &PersonalityCall, at: u64, flags: u64) -> Answer {
 
     let row = |readable: bool| Entry {
         handle: index as u64,
+        // A pipe is not on any filesystem, so it has no inode to report and
+        // says so rather than borrowing its ring's index for one.
+        inode: 0,
         kind: Kind::Pipe,
         close_on_exec,
         offset: 0,
@@ -1816,6 +1844,12 @@ const STAGE_SERVICE_SILENT: i64 = -103;
 const STAGE_SERVICE_REFUSED: i64 = -104;
 /// And where a `read` stopped.
 const STAGE_NO_EXPECT: i64 = -105;
+/// And which of the directory calls last answered, so a probe that stops
+/// halfway says *which* call it stopped in rather than only that it did.
+const STAGE_LISTED: i64 = -120;
+const STAGE_STATTED: i64 = -121;
+const STAGE_SEEKED: i64 = -122;
+const STAGE_NOT_A_DIRECTORY: i64 = -123;
 const STAGE_MAP_SILENT: i64 = -106;
 const STAGE_MAP_REFUSED: i64 = -107;
 const STAGE_NOT_ATTACHED: i64 = -109;
@@ -1850,6 +1884,15 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
         return open_proc(request, file, flags);
     }
     let Some(component) = one_component(&name) else {
+        // **`/` and `.` are this process's own root**, and answering them is
+        // what makes a directory readable at all: `getdents64` needs a
+        // descriptor, and until now the only way to get one was to name a
+        // directory *inside* the root -- so the root itself, which is the
+        // one directory every hosted process has, was the one it could not
+        // list.
+        if names_own_root(&name) {
+            return open_own_root(request, flags);
+        }
         // **Three different refusals answered `-2` and the record could not
         // tell them apart** -- the mistake this project has now made five
         // times, and the reason the second word of the record is a *stage*
@@ -1901,6 +1944,10 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
     let directory = reply.args[2] != 0;
     let entry = Entry {
         handle: slot,
+        // The filesystem's own name for what was opened, which `fstat`
+        // answers with and this program cannot derive from anything else it
+        // holds -- the slot is reused between files.
+        inode: reply.args[3],
         kind: if directory {
             Kind::Directory
         } else {
@@ -1928,6 +1975,61 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
     }
 }
 
+/// Whether this name is the root of what this process can see.
+///
+/// `/`, `//`, and `.` — the three spellings a program reaches for when it
+/// means "here". **Not the empty string**, which Linux answers `ENOENT` and
+/// which is what a program passes when it has lost track of its own path;
+/// treating that as the root would turn a bug into a successful listing.
+fn names_own_root(name: &[u8]) -> bool {
+    let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+    let name = &name[..end];
+    !name.is_empty() && (name == b"." || name.iter().all(|byte| *byte == b'/'))
+}
+
+/// Opens the directory capability this process was given, as a descriptor.
+///
+/// **The handle is [`ROOT_DIR`] itself and no slot is claimed**, because
+/// there is nothing to claim: the capability is already held, at a fixed
+/// slot, for the life of this program. That makes `close` a special case,
+/// and [`answer_close`] carries the guard — releasing this handle would
+/// `DELETE` the adapter's only directory and every hosted process on the
+/// machine would stop finding files.
+fn open_own_root(request: &PersonalityCall, flags: u64) -> Answer {
+    use bhaskix_personality::file::{Entry, Kind, open};
+
+    // No access-mode check here: [`open_the_file`] refuses anything but
+    // `O_RDONLY` with `EROFS` before it reaches this, and a second check that
+    // cannot fire is a check nobody can watch fail.
+    let entry = Entry {
+        handle: ROOT_DIR,
+        // **Zero, and it is a gap rather than a value.** The filesystem's
+        // name for this directory is in the badge of the capability above,
+        // which is the *service's* to read: a holder cannot see inside a
+        // capability, and no method asks a directory about itself. Every
+        // entry *inside* it carries a real inode, which is what a listing
+        // needs; what is missing is `st_ino` on the root alone. The trigger
+        // for a `dir::STAT_AT` is the first program that compares it.
+        inode: 0,
+        kind: Kind::Directory,
+        close_on_exec: flags & open::CLOEXEC != 0,
+        offset: 0,
+        size: 0,
+        readable: true,
+        writable: false,
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11); // EAGAIN
+    };
+    match process.descriptors.insert(entry, 0) {
+        Ok(descriptor) => {
+            trace_file(i64::from(descriptor), 0, 0);
+            Answer::ok(descriptor as u64)
+        }
+        Err(errno) => Answer::error(errno),
+    }
+}
+
 /// Opens one of the `/proc` files this personality generates.
 ///
 /// The descriptor names *which* file, and nothing else: the text is generated
@@ -1945,6 +2047,10 @@ fn open_proc(request: &PersonalityCall, file: ProcFile, flags: u64) -> Answer {
         return Answer::error(-11); // EAGAIN
     };
     let entry = Entry {
+        // Generated here and on no filesystem: a synthetic `/proc` file has
+        // no inode, and inventing one would make two of them compare equal
+        // to each other rather than to nothing.
+        inode: 0,
         handle: match file {
             ProcFile::Status => 0,
             ProcFile::Maps => 1,
@@ -2076,7 +2182,20 @@ fn answer_read(request: &PersonalityCall) -> Answer {
         return Answer::error(-5);
     }
     if lent.args[0] != bhaskix_abi::dir::OK {
-        trace_file(-5, STAGE_MAP_REFUSED, lent.args[0]);
+        // **Four numbers in one word, because one was not enough twice.** The
+        // service answers `NOWHERE` from three different places -- no frame
+        // left to pin, no slot to derive into, nothing to hand to -- and the
+        // outcome alone cannot tell them apart, so a refusal on this path read
+        // the same whether the fault was here or there. `args[2]` is the site,
+        // `args[1]` the status it stopped with, and the handle says which open
+        // file was asking. That is what turned "the second read fails" from a
+        // symptom into `SlotUnavailable` at the hand, in one boot instead of
+        // three.
+        trace_file(
+            -5,
+            STAGE_MAP_REFUSED,
+            lent.args[0] | (lent.args[1] << 8) | (lent.args[2] << 16) | (entry.handle << 32),
+        );
         return Answer::error(-5);
     }
     // **Attached read-only, and the second argument is why.** A non-zero word
@@ -2130,6 +2249,256 @@ fn answer_read(request: &PersonalityCall) -> Answer {
     Answer::ok(take)
 }
 
+/// Answers a hosted `lseek`.
+///
+/// **A directory's offset is an entry index, not a byte count**, and that is
+/// deliberate: `LIST_AT` is addressed by index, so `lseek(dirfd, 0, SEEK_SET)`
+/// — which is how `rewinddir` is written — lands back at the first entry
+/// without this program having to keep a second kind of cursor. A byte offset
+/// on a directory would mean nothing to either side.
+fn answer_lseek(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::{Kind, plan_lseek};
+
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9); // EBADF
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    // **`ESPIPE` and not `EINVAL`**, and the difference is load-bearing: a
+    // program that seeks a pipe to find out whether it can is reading exactly
+    // this errno, and `EINVAL` would tell it the *arguments* were wrong.
+    if !matches!(entry.kind, Kind::File | Kind::Directory | Kind::Proc) {
+        return Answer::error(-29); // ESPIPE
+    }
+    match plan_lseek(
+        entry.offset,
+        entry.size,
+        request.second() as i64,
+        request.third(),
+    ) {
+        Ok(landed) => {
+            if let Some(process) = process_for(request.domain)
+                && let Some(entry) = process.descriptors.get_mut(descriptor)
+            {
+                entry.offset = landed;
+            }
+            trace_file(i64::from(descriptor), STAGE_SEEKED, landed);
+            Answer::ok(landed)
+        }
+        Err(errno) => Answer::error(errno),
+    }
+}
+
+/// Writes one `struct stat` describing `entry` into the caller's memory.
+fn stat_out(request: &PersonalityCall, entry: &bhaskix_personality::file::Entry, at: u64) -> Answer {
+    use bhaskix_personality::file::{STAT_BYTES, stat_of, write_stat};
+
+    let mut bytes = [0u8; STAT_BYTES];
+    if write_stat(&mut bytes, &stat_of(entry)).is_err() {
+        trace_file(-22, STAGE_STATTED, 1);
+        return Answer::error(-22); // EINVAL
+    }
+    if !copy_out(request.domain, at, &bytes) {
+        trace_file(-14, STAGE_NOT_COPIED, at);
+        return Answer::error(-14); // EFAULT
+    }
+    trace_file(entry.inode as i64, STAGE_STATTED, entry.size);
+    Answer::ok(0)
+}
+
+/// Answers a hosted `fstat`.
+fn answer_fstat(request: &PersonalityCall) -> Answer {
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9);
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    stat_out(request, &entry, request.second())
+}
+
+/// Answers a hosted `newfstatat` — which is how a current libc issues `stat`,
+/// `lstat` and often `fstat` as well.
+///
+/// **The path form opens, stats and closes**, because this system has no way
+/// to ask about a name without resolving it, and resolving it *is* opening it
+/// here. That costs a descriptor for the length of the call and can therefore
+/// fail with `EMFILE` where Linux would not — said rather than hidden, and the
+/// trigger for a `dir::STAT_AT` method is the first program that stats in a
+/// loop while holding its table full.
+fn answer_newfstatat(request: &PersonalityCall) -> Answer {
+    let (dirfd, path_at, out_at, flags) = (
+        request.first(),
+        request.second(),
+        request.third(),
+        request.fourth(),
+    );
+    let mut name = [0u8; MAX_NAME];
+    if !copy_in(request.domain, path_at, &mut name) {
+        return Answer::error(-14); // EFAULT
+    }
+    let empty = name.first() == Some(&0);
+    // `AT_EMPTY_PATH` with an empty path is `fstat` written the modern way,
+    // and it is what a libc emits for `fstat` itself.
+    if empty && flags & AT_EMPTY_PATH != 0 {
+        let Ok(descriptor) = i32::try_from(dirfd) else {
+            return Answer::error(-9);
+        };
+        let Some(process) = process_for(request.domain) else {
+            return Answer::error(-11);
+        };
+        let Some(entry) = process.descriptors.get(descriptor).copied() else {
+            return Answer::error(-9);
+        };
+        return stat_out(request, &entry, out_at);
+    }
+    if empty {
+        // An empty path without the flag is `ENOENT` in Linux, and a version
+        // that treated it as "this directory" would make every mistaken
+        // `stat("")` succeed.
+        return Answer::error(-2);
+    }
+    // Every path here is resolved from the one directory this process was
+    // given, so `dirfd` names nothing this program can act on differently.
+    // **Refused rather than ignored** when it is not `AT_FDCWD`: silently
+    // resolving a relative path against the wrong directory is how a program
+    // reads a file it did not ask for, and this system has no second
+    // directory to resolve against yet.
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    if dirfd != AT_FDCWD && !name.starts_with(b"/") {
+        return Answer::error(-38); // ENOSYS
+    }
+    let opened = open_the_file(request, path_at, 0);
+    if opened.is_error() {
+        return opened;
+    }
+    let Ok(descriptor) = i32::try_from(opened.value) else {
+        return Answer::error(-9);
+    };
+    let entry = process_for(request.domain)
+        .and_then(|process| process.descriptors.get(descriptor).copied());
+    let answer = match entry {
+        Some(entry) => stat_out(request, &entry, out_at),
+        None => Answer::error(-9),
+    };
+    // Closed whatever the stat did, or the descriptor leaks on every failed
+    // one -- which is the shape of bug that turns a working program into one
+    // that stops after thirty-two files.
+    let mut closing = *request;
+    closing.args[0] = descriptor as u64;
+    let _ = answer_close(&closing);
+    answer
+}
+
+/// Answers a hosted `getdents64` — RFC 0005 step 8's directory read.
+///
+/// **The listing is index-addressed and holds no session**, so the descriptor's
+/// offset is the index of the next entry and nothing in this program or in the
+/// filesystem service remembers a partly-read directory. A caller that seeks
+/// back to zero starts again; two callers reading the same directory cannot
+/// disturb each other; and a process that dies mid-listing leaves nothing
+/// behind.
+fn answer_getdents64(request: &PersonalityCall) -> Answer {
+    use bhaskix_abi::dir;
+    use bhaskix_personality::file::{Kind, dirent_bytes, dirent_type, write_dirent};
+
+    let (fd, buffer, count) = (request.first(), request.second(), request.third());
+    let Ok(descriptor) = i32::try_from(fd) else {
+        return Answer::error(-9);
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    if entry.kind != Kind::Directory {
+        trace_file(-20, STAGE_NOT_A_DIRECTORY, entry.kind as u64);
+        return Answer::error(-20); // ENOTDIR
+    }
+
+    let room = (count as usize).min(SCRATCH_BYTES as usize);
+    let mut out = [0u8; SCRATCH_BYTES as usize];
+    let mut written = 0usize;
+    let mut index = entry.offset;
+    loop {
+        let reply = call(syscall::CALL, entry.handle, dir::LIST_AT, [index, 0, 0, 0]);
+        if reply.status != status::OK {
+            return Answer::error(-5); // EIO
+        }
+        match reply.args[0] {
+            dir::OK => {}
+            dir::END => break,
+            // A name the listing cannot carry stops the read where it is
+            // rather than skipping it: a directory silently missing one entry
+            // is a worse answer than a directory that says it cannot be read.
+            _ => return Answer::error(-5),
+        }
+        let length = dir::listing_length(reply.args[3]).min(16);
+        let mut name = [0u8; 16];
+        name[..8].copy_from_slice(&reply.args[1].to_le_bytes());
+        name[8..].copy_from_slice(&reply.args[2].to_le_bytes());
+
+        // **The room is checked here rather than read off a failed write**,
+        // because `write_dirent` answers a full buffer and an illegal name
+        // with the same number -- `EINVAL_SHORT` *is* `EINVAL` -- and a
+        // caller that could not tell them apart would report a corrupt name
+        // as a short buffer and truncate the listing without saying so.
+        if written + dirent_bytes(length) > room {
+            if written == 0 {
+                // Linux's answer for a buffer too small for even one record.
+                return Answer::error(-22); // EINVAL
+            }
+            break;
+        }
+        let kind = if dir::listing_is_directory(reply.args[3]) {
+            dirent_type::DIR
+        } else {
+            dirent_type::REG
+        };
+        let Ok(bytes) = write_dirent(
+            &mut out[written..],
+            u64::from(dir::listing_inode(reply.args[3])),
+            // `d_off` is where the *next* entry is, which for an
+            // index-addressed listing is this index plus one. A caller that
+            // seeks to it and reads on must not see this entry twice.
+            index + 1,
+            kind,
+            &name[..length],
+        ) else {
+            // The room was checked, so this can only be a name the filesystem
+            // should never have produced: empty, or holding a separator or a
+            // NUL. Not skipped -- see above.
+            return Answer::error(-5);
+        };
+        written += bytes;
+        index += 1;
+    }
+
+    if written == 0 {
+        // The end of the directory, which `getdents64` reports as zero bytes
+        // and not as an error.
+        return Answer::ok(0);
+    }
+    if !copy_out(request.domain, buffer, &out[..written]) {
+        return Answer::error(-14); // EFAULT
+    }
+    if let Some(process) = process_for(request.domain)
+        && let Some(entry) = process.descriptors.get_mut(descriptor)
+    {
+        entry.offset = index;
+    }
+    trace_file(i64::from(descriptor), STAGE_LISTED, written as u64);
+    Answer::ok(written as u64)
+}
+
 /// Answers a hosted `close`, giving the capability back with the descriptor.
 fn answer_close(request: &PersonalityCall) -> Answer {
     let Ok(descriptor) = i32::try_from(request.first()) else {
@@ -2145,7 +2514,14 @@ fn answer_close(request: &PersonalityCall) -> Answer {
             // without dropping what it named would leak one of this program's
             // hundred and twenty-eight slots per open file, for the life of
             // the machine.
-            if process.descriptors.holders(entry.handle) == 0
+            // **Except the root**, which was never claimed from the pool
+            // and must never be given back to it: `release_file_slot`
+            // `DELETE`s the capability in the slot, and the capability in
+            // this one is the directory the kernel granted this program at
+            // boot. One hosted `close(dirfd)` would take every hosted
+            // process's filesystem away for the life of the machine.
+            if entry.handle != ROOT_DIR
+                && process.descriptors.holders(entry.handle) == 0
                 && matches!(entry.kind, Kind::File | Kind::Directory)
             {
                 release_file_slot(entry.handle);

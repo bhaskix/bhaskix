@@ -165,6 +165,17 @@ test = false
 doc = false
 bench = false
 
+# RFC 0005 Tier 1's mandatory target: the directory encoder, whose untrusted
+# input is the *filesystem's* names rather than the hosted program's bytes.
+# Walks its own output the way a libc does, so a padding rule the writer and
+# the reader disagree about is a wrong name rather than nothing at all.
+[[bin]]
+name = "linux_dirent"
+path = "fuzz_targets/linux_dirent.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "fs_image"
 path = "fuzz_targets/fs_image.rs"

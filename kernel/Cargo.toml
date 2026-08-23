@@ -422,7 +422,17 @@ asm_budget = 10
 # serial ports, this kernel probed one, and it spent two hardware boots writing
 # a boot report nobody could carry. Writing to both put 19,550 bytes of it on
 # serial-over-LAN and closed M1-17, open since Phase 0.
-unsafe_budget = 2097
+unsafe_budget = 2110
+# Up thirteen for RFC 0005 step 8's directory probe -- `ring3_lister`, which is
+# `ring3_filer` with a second name copied into its page. Two blocks and no new
+# kind of authority: one `copy_nonoverlapping` filling a freshly mapped frame
+# this space owns through the direct map, and the `vm::install` /
+# `enter_ring3` pair every hosted probe ends with. The step's own content --
+# `lseek`, `fstat`, `getdents64`, the dirent and stat layouts -- is in
+# `bhaskix-personality`, which is `#![forbid(unsafe_code)]`, and in `bin/linuxd`,
+# whose count did not move. So the thirteen lines are the cost of *running* the
+# test, not of the feature: every decision it exercises is decided in safe code
+# a host test holds.
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

@@ -2001,6 +2001,48 @@ else
     status=1
 fi
 
+# RFC 0005 step 8: a hosted program lists a directory, stats a file and seeks
+# inside it.
+#
+# **Three strings, none of which the personality can produce on its own**, and
+# each is a different call's evidence:
+#
+# **One name printed three times, and each printing is a different call.** The
+# probe writes `inner` -- an entry read out of the filesystem image, which no
+# part of the personality could invent -- once per proof:
+#
+#   1. `getdents64` on the directory the process was given. Until this step
+#      that directory could not be opened at all.
+#   2. `lseek(dirfd, 0, SEEK_SET)` and `getdents64` again. Only the seek makes
+#      the second one answer: a spent listing returns nothing, and the probe
+#      stops with the name printed once.
+#   3. `fstat(dirfd)`, printed only when `st_mode` says directory -- so a
+#      mode at the wrong offset of the `struct stat` stops the probe here.
+#   4. `close(dirfd)` then `open("inner")` -- the close guard: the directory's
+#      handle is the adapter's own root capability, and a `close` that
+#      released it leaves this open with nothing to find.
+#
+# So the gate is the name four times running, and counting is the check --
+# three would be a stat that worked and a close that took the filesystem
+# away with it.
+if grep -qE "linux dir      a Linux program listed the directory it was given" "$LOG"; then
+    if ! grep -qF "inner" "$LOG"; then
+        fail "the directory was listed and no entry name reached the console"
+        status=1
+    elif ! grep -qF "innerinnerinnerinner" "$LOG"; then
+        fail "the listing worked but the seek or the stat did not -- printed \
+$(grep -aoE 'inner(inner)*' "$LOG" | head -1) where innerinnerinnerinner was due"
+        status=1
+    else
+        pass "a hosted program listed a directory, rewound it with lseek, stat'ed it and reopened through it"
+    fi
+elif grep -qF "linux dir      skipped" "$LOG"; then
+    pass "no filesystem service on this machine, so hosted programs have no directory to list"
+else
+    fail "the hosted directory test did not conclude: $(grep -aoE 'linux dir .*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0033 step 5: `execve`. Three things have to be true at once, and no two
 # of them come from the same place.
 #

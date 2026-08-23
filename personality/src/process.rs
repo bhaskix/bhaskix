@@ -695,6 +695,7 @@ mod tests {
             .insert(
                 Entry {
                     handle: 42,
+                    inode: 7,
                     kind: Kind::File,
                     close_on_exec,
                     offset: 0,

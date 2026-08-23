@@ -5311,6 +5311,179 @@ const FILE_PROBE_CODE: [u8; 71] = [
     0xeb, 0xfe,                          // jmp $
 ];
 
+/// Where the directory probe's code lands in its own space.
+const LIST_PROBE_CODE_AT: u64 = 0x0000_0000_1800_0000;
+
+/// The directory probe, RFC 0005 step 8's witness: it lists the directory it
+/// was given, then reads a file out of it by seeking to a length `fstat` told
+/// it.
+///
+/// **Assembled by `as` and transcribed from `objdump`, not written by hand.**
+/// The source is [`tools/probes/linux-lister.s`](../../tools/probes/linux-lister.s)
+/// and the array below is what
+/// [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh) prints from it, so the
+/// comments on the right are the disassembler's and a byte cannot drift from
+/// its meaning. That script *verifies* rather than transcribes, and the
+/// reason is written on it: the first version of it dropped `objdump`'s
+/// continuation lines, shifted this probe by one byte, and produced a fault
+/// in ring 3 that read exactly like a clobbered register.
+///
+/// It prints one five-letter name **four times**, and each printing is a
+/// different call's evidence:
+///
+/// 1. `open("/")` then `getdents64` — the directory this process was given,
+///    which until this step could not be opened at all: every path had to
+///    name something *inside* it. The name printed is off a filesystem image
+///    and is one no part of the personality could invent.
+/// 2. `lseek(dirfd, 0, SEEK_SET)` then `getdents64` again — the second
+///    printing is the seek's, and only the seek's: a directory descriptor
+///    left where the first listing finished answers the second call with
+///    nothing, and the probe stops with one name on the console.
+/// 3. `fstat(dirfd)`, printed only if `st_mode` says directory — so a mode
+///    written to the wrong offset of the `struct stat`, or a kind taken from
+///    the wrong field, stops the probe here rather than passing.
+/// 4. `close(dirfd)` then `open("inner")` — the fourth printing is the close
+///    guard's: the directory's handle is the adapter's own root capability
+///    rather than a slot from its pool, and a `close` that gave it back would
+///    take the filesystem away from every hosted process on the machine, so
+///    this `open` would find nothing.
+///
+/// **It deliberately does not `read` the file it stats**, and that is a
+/// limitation rather than a choice: a hosted `read` maps a page the
+/// filesystem lends, and the second such mapping on the machine is refused
+/// because `method::REVOKE` never takes the first one out of the borrower's
+/// address space. The `linux file` gate above already does the one read this
+/// machine can do. See the step's record.
+#[rustfmt::skip]
+const LIST_PROBE_CODE: [u8; 228] = [
+    0x49, 0x89, 0xfc,                         // mov %rdi,%r12
+    0x49, 0x89, 0xf6,                         // mov %rsi,%r14
+    0x48, 0x89, 0xf7,                         // mov %rsi,%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0xa5, 0x00, 0x00, 0x00,       // js c2 <done>
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x00, 0x01, 0x00, 0x00,             // mov $0x100,%edx
+    0xb8, 0xd9, 0x00, 0x00, 0x00,             // mov $0xd9,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x8e, 0x87, 0x00, 0x00, 0x00,       // jle c2 <done>
+    0xe8, 0x8d, 0x00, 0x00, 0x00,             // callq cd <say>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x08, 0x00, 0x00, 0x00,             // mov $0x8,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x6f,                               // js c2 <done>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x00, 0x01, 0x00, 0x00,             // mov $0x100,%edx
+    0xb8, 0xd9, 0x00, 0x00, 0x00,             // mov $0xd9,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x7e, 0x58,                               // jle c2 <done>
+    0xe8, 0x5e, 0x00, 0x00, 0x00,             // callq cd <say>
+    0x49, 0x8d, 0xb4, 0x24, 0x00, 0x02, 0x00, 0x00, // lea 0x200(%r12),%rsi
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xb8, 0x05, 0x00, 0x00, 0x00,             // mov $0x5,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x3c,                               // js c2 <done>
+    0x41, 0x8b, 0x84, 0x24, 0x18, 0x02, 0x00, 0x00, // mov 0x218(%r12),%eax
+    0x25, 0x00, 0xf0, 0x00, 0x00,             // and $0xf000,%eax
+    0x3d, 0x00, 0x40, 0x00, 0x00,             // cmp $0x4000,%eax
+    0x75, 0x28,                               // jne c2 <done>
+    0xe8, 0x2e, 0x00, 0x00, 0x00,             // callq cd <say>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x8d, 0x7e, 0x02,                   // lea 0x2(%r14),%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x05,                               // js c2 <done>
+    0xe8, 0x0b, 0x00, 0x00, 0x00,             // callq cd <say>
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp cb <done+0x9>
+    0x49, 0x8d, 0x74, 0x24, 0x13,             // lea 0x13(%r12),%rsi
+    0xba, 0x05, 0x00, 0x00, 0x00,             // mov $0x5,%edx
+    0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0xc3,                                     // retq
+];
+
+/// Where the names this probe opens are put: `"/"` then `"inner"`, two
+/// strings in one place, and the probe reaches the second at `+2`.
+const LIST_PROBE_NAMES_AT: u64 = 256;
+
+/// The thread that becomes the directory probe — RFC 0005 step 8.
+extern "C" fn ring3_lister(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const BUFFER_AT: u64 = LIST_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (LIST_PROBE_CODE_AT, Protection::ReadExecute),
+        (BUFFER_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(LIST_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the direct
+    // map; the executable mapping is never writable. The two names go at a
+    // fixed offset inside the same page, past the code, as the file probe's
+    // one does -- handed over rather than computed, for the reason written on
+    // `FILE_PROBE_NAME_AT`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            LIST_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            LIST_PROBE_CODE.len(),
+        );
+        let names = b"/\0inner\0";
+        core::ptr::copy_nonoverlapping(
+            names.as_ptr(),
+            (hhdm_base + code_pa + LIST_PROBE_NAMES_AT) as *mut u8,
+            names.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page; `rdi` is
+    // the writable page it works in and `rsi` the names beside its code.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            LIST_PROBE_CODE_AT,
+            BUFFER_AT + 0x0f00,
+            [BUFFER_AT, LIST_PROBE_CODE_AT + LIST_PROBE_NAMES_AT],
+        )
+    }
+}
+
 /// Where the name this probe opens is put, and the address it is handed.
 ///
 /// **Handed over rather than computed**, and the first version was not: it
@@ -6384,6 +6557,95 @@ fn file_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
     }
     right
+}
+
+/// RFC 0005 step 8's witness: a hosted program lists a directory, stats a
+/// file and seeks inside it.
+///
+/// **What makes this a test rather than a demonstration is that the console
+/// output cannot be produced any other way.** The first five bytes are a name
+/// read out of a filesystem image, and the last five are the tail of a file
+/// found by an offset `fstat` supplied — so a `getdents64` that invented an
+/// entry, an `fstat` reading `st_size` from the wrong offset, and an `lseek`
+/// that quietly returned to the start each produce a *different line* rather
+/// than a missing one.
+fn list_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux dir      skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    // The same two absences the file probe distinguishes, and for the same
+    // reason: a machine with no filesystem has nothing to list, and one that
+    // has a filesystem and granted no directory is a bug that a skip would
+    // turn green.
+    let machine_has_files = FS_ENDPOINT.load(core::sync::atomic::Ordering::Acquire) != u64::MAX;
+    let adapter = syscall::ADAPTER_DOMAIN.load(core::sync::atomic::Ordering::Relaxed);
+    let holds_directory = adapter != u32::MAX
+        && domain::with(domain::DomainId::from_u32(adapter), |owner| {
+            owner.cspace.get(22).is_some()
+        }) == Some(true);
+    if !machine_has_files {
+        println!(
+            "    linux dir      skipped: this machine has no filesystem service, so there is no \
+             directory to list"
+        );
+        return true;
+    }
+    if !holds_directory {
+        println!(
+            "\x1b[91m    linux dir      FAILED: this machine has a filesystem and the adapter was \
+             given no directory\x1b[0m"
+        );
+        return false;
+    }
+
+    let Ok(realm) = domain::create("lister", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux dir      FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    linux dir      FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "lister", ring3_lister, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux dir      FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+    let mut ended = false;
+    for _ in 0..400 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    // The adapter's own record of the last file call, beside what the program
+    // printed -- so a boot where the two lines above did not appear says which
+    // call stopped rather than leaving the next reader to guess.
+    let (last, stage, detail) = adapter_file_record();
+    if ended {
+        println!(
+            "    linux dir      a Linux program listed the directory it was given, closed it, \
+             then stat'ed and seeked inside a file it found there (last {last}, stage {stage}, \
+             detail {detail})"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux dir      FAILED: the probe never ended (last {last}, stage \
+             {stage}, detail {detail})\x1b[0m"
+        );
+    }
+    ended
 }
 
 /// RFC 0033 step 5's witness: a hosted program `execve`s, and keeps its pid.
@@ -13958,6 +14220,17 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // shell begins.
     if !file_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux file     FAILED\x1b[0m");
+    }
+    // And RFC 0005 step 8's, immediately after, for the same reason: it needs
+    // the same directory and the same second CPU.
+    //
+    // **The order is load-bearing and stays this way.** This probe's `read` is
+    // the *second* on the machine, and the second one is what found the slot
+    // leak in `DELETE`: `bin/fsd` revokes the page it lent, and until
+    // 2026-08-23 the borrower could never clear the slot it landed in. Run
+    // this probe first and both still pass -- and the bug comes back unseen.
+    if !list_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    linux dir      FAILED\x1b[0m");
     }
 
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
