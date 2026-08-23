@@ -791,6 +791,49 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (RFC 0043's remaining answers are both blocked on things that are not decisions)
+
+**Steps 3–5 wait on unresolved question 1, so the useful work was to find out
+whether either answer can be built at all.** Neither can, today, and the reasons
+are different in kind from the policy argument.
+
+**Identity-map needs large pages, and this kernel's IOMMU tables have none.**
+`map_page` walks down to level 1 and maps 4 KiB; `vtd::PageEntry` carries an
+address and rights with no size bit. The SR550 has 192 GiB, so an identity map of
+it is 50,331,648 leaf entries — roughly **402 MB of page tables per device**,
+before the levels above them. That is a missing feature, not a tuning problem.
+
+**Pass-through needs a register field this machine cannot tell me.** Linux's
+`intel-iommu.h` *is* here, and gives two of the three things needed, read rather
+than recalled:
+
+```c
+#define CONTEXT_TT_PASS_THROUGH 2
+#define ecap_pass_through(e)    (((e) >> 6) & 0x1)
+```
+
+The value, and the capability bit. And the same header's `ecap_ir_support` at
+bit 3 agrees with what `vtd.rs` already does for interrupt remapping, which is
+worth having as a cross-check on the header itself.
+
+What it does not give is **where those two bits go inside the context entry's low
+word.** The setter lives in `drivers/iommu/intel/iommu.c`, and headers do not
+ship drivers. So the layout is unverified, and this project does not write a
+register field from recall — the day it did, `Slot::root_hub_port_number` was
+wrong for two days and a controller had to find it.
+
+**Recommendation, offered rather than taken: pass-through**, once that field can
+be read. It costs no page tables, and *"this device is not translated"* is a more
+honest thing for a table dump to say than a mapping that looks like containment
+and is not. The prerequisite is a copy of the VT-d specification or the driver
+source, and neither is on this machine.
+
+**What this leaves.** RFC 0043 steps 1 and 2 are done and were worth doing on
+their own — the root table no longer belongs to a device, and the bus is surveyed
+on every boot, which is what revealed that the emulator has the same hole. Steps
+3–5 are blocked, and blocked on a document rather than on a decision, which is a
+better place to be stuck than where this started.
+
 ### 2026-08-23 (RFC 0043 step 2: the bus is surveyed, and the emulator turns out to have the same hole)
 
 **Every function on the bus is now counted and the undescribable ones are

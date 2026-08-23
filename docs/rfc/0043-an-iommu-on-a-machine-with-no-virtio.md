@@ -247,6 +247,34 @@ should be one somebody is watching.
    remaining answers give an undriven endpoint everything it already had; they
    differ in cost and in what the boot report must then say. A security
    decision, and the one this RFC exists to put in front of somebody.
+
+   > **And neither is currently buildable, established 2026-08-23 rather than
+   > assumed.** The question is not only which policy is right; it is which one
+   > can be built from what can be verified here.
+   >
+   > **Identity-map** needs large pages, and this kernel's IOMMU tables have
+   > none: `map_page` walks to level 1 and maps 4 KiB, and `vtd::PageEntry`
+   > carries an address and rights with no size bit. The SR550 has 192 GiB, so
+   > an identity map of it is 50,331,648 leaf entries — about **402 MB of page
+   > tables per device**, before the levels above them. Not a tuning problem; a
+   > missing feature.
+   >
+   > **Pass-through** needs the context entry's translation-type field, and
+   > **the field's position could not be established on this machine.** Linux's
+   > `intel-iommu.h` is here and gives `CONTEXT_TT_PASS_THROUGH = 2` and
+   > `ecap_pass_through(e) = (e >> 6) & 1` — the *value* and the *capability
+   > bit*, both read rather than recalled, and the same header's
+   > `ecap_ir_support` at bit 3 agrees with what this kernel already does, which
+   > is worth something as a cross-check. But the setter that places those two
+   > bits inside the low word lives in `drivers/iommu/intel/iommu.c`, which
+   > headers do not ship. The layout is therefore **unverified**, and this
+   > project does not write a register field from recall.
+   >
+   > *Recommendation, offered rather than taken:* **pass-through**, once that
+   > field can be read. It costs no page tables, and "this device is not
+   > translated" is a more honest thing for a table dump to say than a mapping
+   > that looks like containment and is not. The prerequisite is a copy of the
+   > VT-d specification, or the driver source, and neither is on this machine.
 2. **What about functions behind a bridge?** Requester ids are rewritten by
    PCIe-to-PCI bridges, and a context entry keyed on the wrong id contains
    nothing. No machine here has one yet.
