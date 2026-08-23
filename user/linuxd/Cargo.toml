@@ -165,7 +165,16 @@ asm_budget = 3
 # and the number went to 84; taking the counter from `bhaskix-sock`, which owns
 # that read already, brought it back to 76. The gate reported both, before
 # either was committed.
-unsafe_budget = 76
+unsafe_budget = 78
+# Up two for RFC 0044's measurement, and both are the same statement this
+# program already makes a dozen times: a volatile read and a volatile write
+# into the report page it mapped from its own object, at an offset the
+# `personality` crate asserts is before the scratch area. No new authority, no
+# new page, and no `rdtsc` written here -- the counter comes from
+# `bhaskix-sock`, for the reason the supervised-copy measurement gives: adding
+# the instruction locally cost twelve unsafe lines in the most
+# authority-concentrated program in the system, and the exact budget said so
+# immediately.
 # **This crate's number is a cap, not a ceiling.** It must equal the count, so
 # the build fails if this program's `unsafe` shrinks *or* grows without somebody
 # editing this line. `bin/linuxd` is the largest concentration of authority in

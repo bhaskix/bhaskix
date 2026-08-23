@@ -354,14 +354,49 @@ under the capability arena, per file read.
 > tree rather than from the tree, which is the failure this project's own
 > rules name first.
 >
-> So the honest position: **this change ships un-measured on the path it makes
-> slower**, and the number to add is a lend/release pair timed the way
-> `bulk cost` already times a transfer — `time::cycles()` either side of the
-> `MAP`/`RELEASE` the filesystem self-test already performs, printed with the
-> other costs. That is a small addition and it is deliberately *not* smuggled
-> into this RFC: it is a measurement of an existing path, useful whether or not
-> this lands, and it should not appear for the first time in the change whose
-> cost it is being used to justify.
+> So the honest position at the time: **this change shipped un-measured on the
+> path it makes slower.**
+
+### The measurement, supplied afterwards — and the first attempt at it was the wrong one
+
+Two lines now, because the obvious measurement turned out not to answer the
+question.
+
+**What was tried first: the caller-visible `dir::RELEASE`.** `bin/linuxd` times
+the whole call, which is what a borrower actually pays. Two boots:
+
+| | first sample | second sample |
+|---|---|---|
+| boot A | 7,877,036 | 10,049,460 |
+| boot B | 6,480,746 | 4,351,920 |
+
+**The second sample is larger in one boot and smaller in the other**, and the
+spread between boots is bigger than anything a page-table walk could
+contribute. So it cannot price the revocation, and calling the pair "cold and
+warm" — which the first version of the boot line did — asserts a warming the
+numbers deny. What dominates is `bin/fsd`'s own work inside the call: mounting
+the volume and searching its cache for the frame. The line is kept, because the
+caller's cost is worth knowing, and it now says what dominates it instead of
+implying a trend.
+
+**What answers the question: the unmapping alone, where a repeat is possible.**
+Measured in the kernel's own lending self-test, re-mapping each time round —
+unmapping is not idempotent, and a second call would time an empty loop — and
+taking the **minimum of eight**, the way `bulk cost` measures a transfer:
+
+> **46,084 and 49,440 cycles** on two boots. About 5% apart, which is what a
+> number worth quoting looks like next to the one above.
+
+For scale, from the same boot report: a page through `COPY_OUT` costs 168,330
+cycles warm, and the kernel moves a page through the direct map in 122. So the
+work this RFC adds to a revocation is roughly a quarter of a page-copy across
+the supervised boundary, and it is dominated by the TLB shootdown — an IPI to
+every other CPU, which under TCG is expensive and on hardware would not be
+free either. That is the cost the rule requires; a revocation that skipped it
+would be `security.md` §2 rule 3's delay fuse.
+
+**Neither figure is a measurement of hardware.** This machine has never booted
+on any (M1-17).
 
 ## Testing plan
 

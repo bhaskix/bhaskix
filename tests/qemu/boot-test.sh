@@ -2195,6 +2195,38 @@ fi
 # regression says by how much rather than only that there was one. This is the
 # frame-leak gate pointed at the newest thing that can leak, which is the whole
 # reason the object's frames are charged to an envelope at all.
+# RFC 0044's missing number, supplied.
+#
+# That RFC shipped un-measured -- and, worse, first claimed the boot report
+# already priced this path when it did not. This gate is the correction: a lent
+# page given back, timed by `bin/linuxd` where the cost is paid.
+#
+# **Two samples, and deliberately not called cold and warm.** The first reading
+# was 7,877,036 cycles and then 10,049,460 -- the *second* larger -- so unlike
+# `COPY_OUT` this path is not dominated by its first execution, and naming the
+# second "warm" would assert a warming the numbers deny. What dominates is
+# `bin/fsd`'s own mount and cache search inside the call.
+#
+# The number that actually prices what RFC 0044 added is on the `lending` line:
+# the unmapping alone, best of eight, where a repeat is possible.
+#
+# And a warm figure exists at all only because of the change being measured:
+# before it, a second hosted read on the machine was refused, so this path ran
+# once per boot and had no steady state to report. The dark arm below says so
+# when only one read happened, rather than passing quietly.
+if grep -qE "lending cost   a lent page given back: [1-9][0-9]* cycles, then [1-9][0-9]*;" "$LOG"; then
+    pass "giving a lent page back is priced, and says what dominates it"
+elif grep -qF "lending cost" "$LOG"; then
+    fail "only one hosted read on this boot, so the lending cost has no steady state: \
+$(grep -aoE 'lending cost.*' "$LOG" | head -1)"
+    status=1
+elif grep -qF "linux file     skipped" "$LOG"; then
+    pass "no filesystem service on this machine, so nothing is lent to price"
+else
+    fail "the lending cost was not reported at all"
+    status=1
+fi
+
 # RFC 0044: a lending taken back from the borrower *alone*.
 #
 # The gate above revokes an object's **root** capability and checks both
@@ -2210,8 +2242,8 @@ fi
 # passes the first and destroys the object. Clearing only the hardware entries
 # passes both and fails "its address is free again", which is the half that put
 # a hosted program's second file read out of reach.
-if grep -qF "lending        a loan was taken back from the borrower alone: its page is gone and its address is free again, the lender kept both, and the object outlived the loan" "$LOG"; then
-    pass "revoking a lending unmaps the borrower, leaves the lender, and frees the address"
+if grep -qE "lending        a loan was taken back from the borrower alone: its page is gone and its address is free again, the lender kept both, and the object outlived the loan; the unmapping itself is [1-9][0-9]* cycles, best of 8" "$LOG"; then
+    pass "revoking a lending unmaps the borrower, leaves the lender, frees the address -- and says what that cost"
 else
     fail "the lending self test did not pass: $(grep -aoE 'lending .*' "$LOG" | head -1)"
     status=1

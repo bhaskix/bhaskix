@@ -6307,6 +6307,79 @@ fn adapter_wait_record() -> (i64, u64) {
 /// 1,107,710 cycles for 96 bytes when 96 went first, 103,034 for 1,024
 /// immediately after. What the pair actually shows is a translation cache
 /// warming, which is a fact about TCG rather than about this interface.
+/// Prices giving a lent page back — [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)'s
+/// missing number.
+///
+/// **That RFC shipped un-measured and said so, after first claiming the boot
+/// report already priced this path.** It did not: `bulk cost` prices a shared
+/// transfer against messages and `linux copyout` prices a page through
+/// `COPY_OUT`, and neither is a lending coming back. This is the number, taken
+/// by `bin/linuxd` where the cost is actually paid and read back here.
+///
+/// **What is in the span is more than the revocation**, and saying so is the
+/// difference between a measurement and a misleading one: it is a whole `CALL`
+/// to `bin/fsd`, which mounts, finds the frame, revokes the lending — the part
+/// RFC 0044 changed — unpins, and replies. The revocation's own share is not
+/// separable from out here, and pretending otherwise would be inventing a
+/// number rather than reading one.
+///
+/// Cold and warm for the reason [`report_supervised_copy`] learned the hard
+/// way. **And the warm one exists only because of what is being measured**:
+/// before RFC 0044 a second hosted read was refused, so this path ran once per
+/// machine and a steady-state figure for it could not be taken at all.
+fn report_lending_cost() {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return;
+    }
+    const FIRST_WORD: usize = bhaskix_personality::report::LEND_AT / 8;
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 2];
+    let mut at = 0usize;
+    let taken = shared::drain_into(object, (FIRST_WORD + 2) * 8, &mut |chunk: &[u8]| {
+        for word in chunk.as_chunks::<8>().0 {
+            if at >= FIRST_WORD + 2 {
+                break;
+            }
+            if at >= FIRST_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    let (first, second) = (record[0], record[1]);
+    if taken.is_none() || first == 0 {
+        return;
+    }
+    if second == 0 {
+        // One read happened and no second one. Said rather than skipped: a
+        // machine where this line is missing is a machine where the thing
+        // RFC 0044 fixed did not happen, and that is worth seeing.
+        println!(
+            "\x1b[93m    lending cost   {first} cycles, and no second lending to compare it \
+             with -- only one hosted read on this boot\x1b[0m"
+        );
+        return;
+    }
+    // **Not "cold and warm", whatever the two slots are called.** The first
+    // reading of this pair was 7,877,036 cycles and then 10,049,460 -- the
+    // *second* larger -- so this path is not dominated by its first execution
+    // the way `COPY_OUT` is, and calling the second figure "warm" would assert
+    // a warming that the numbers deny. What dominates is `bin/fsd`'s own work
+    // inside the call: mounting, and searching its cache for the frame.
+    //
+    // So both are printed as what they are, two samples, and the number that
+    // answers RFC 0044's question is on the `lending` line instead -- the
+    // unmapping alone, best of eight, where a repeat is possible.
+    println!(
+        "    lending cost   a lent page given back: {first} cycles, then {second}; \
+         bin/fsd's mount and search dominate both, so neither is a revocation's price"
+    );
+}
+
 fn report_supervised_copy() {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
@@ -6671,6 +6744,38 @@ fn lending_self_test(hhdm: u64) -> bool {
         })?
         .is_ok();
 
+        // **What RFC 0044 added, priced where it can be repeated.**
+        //
+        // The caller-visible number -- `lending cost`, taken by `bin/linuxd`
+        // around a whole `dir::RELEASE` -- turned out to be useless for this
+        // question: it is dominated by `bin/fsd` mounting and searching, and
+        // its two samples came out 7.9M and 10.0M cycles, the *second* larger.
+        // A spread like that at one sample each cannot attribute anything to a
+        // page-table walk. So the added work is measured here instead, on its
+        // own, the way `bulk cost` measures a transfer: several goes, and the
+        // **minimum**, because the minimum is the one the scheduler and the
+        // emulator have interfered with least.
+        //
+        // Re-mapped each time round, because unmapping is not idempotent --
+        // the second call would find nothing to do and time an empty loop.
+        let mut least = u64::MAX;
+        for _ in 0..8 {
+            if vm::with_space(theirs_root, |space| {
+                shared::map_into(id, space, VirtAddr(BORROWER_AT), Protection::ReadOnly)
+            })
+            .is_none()
+            {
+                break;
+            }
+            let started = bhaskix_arch::tsc::read();
+            let removed = shared::unmap_roots(id, &[(borrower.as_u32(), Some(theirs_root))]);
+            let elapsed = bhaskix_arch::tsc::read().saturating_sub(started);
+            if removed == 1 {
+                least = least.min(elapsed);
+            }
+        }
+        let unmap_cycles = if least == u64::MAX { 0 } else { least };
+
         Some((
             mapped_first,
             removed == 1,
@@ -6678,13 +6783,14 @@ fn lending_self_test(hhdm: u64) -> bool {
             lender_kept_it,
             object_alive,
             can_map_again,
+            unmap_cycles,
         ))
     })();
 
     domain::destroy(borrower);
     domain::destroy(lender);
 
-    let Some((mapped, one, lost, kept, alive, again)) = outcome else {
+    let Some((mapped, one, lost, kept, alive, again, unmap_cycles)) = outcome else {
         println!("\x1b[91m    lending        FAILED: the arrangement could not be built\x1b[0m");
         return false;
     };
@@ -6707,7 +6813,8 @@ fn lending_self_test(hhdm: u64) -> bool {
     if ok {
         println!(
             "    lending        a loan was taken back from the borrower alone: its page is gone \
-             and its address is free again, the lender kept both, and the object outlived the loan"
+             and its address is free again, the lender kept both, and the object outlived the \
+             loan; the unmapping itself is {unmap_cycles} cycles, best of 8"
         );
     }
     ok
@@ -14392,6 +14499,12 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     if !list_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux dir      FAILED\x1b[0m");
     }
+    // **After both probes, and that is the whole reason it is here** rather
+    // than with the other personality reports in `kernel_main`: those run
+    // before this bring-up thread has started a hosted program, so the record
+    // they would read is empty. The first version of this line was up there
+    // and printed nothing, which the gate caught immediately.
+    report_lending_cost();
 
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
     println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");

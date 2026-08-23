@@ -65,6 +65,16 @@ pub mod report {
     pub const WAIT_AT: usize = FORK_AT + 16;
     /// The supervised-copy measurement: cold cycles, warm cycles.
     pub const COPY_AT: usize = WAIT_AT + 16;
+    /// Giving a lent page back: cold cycles, warm cycles.
+    ///
+    /// [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)
+    /// made `dir::RELEASE` do more — a revocation now takes the page out of
+    /// the borrower's address space — and shipped without a number for it,
+    /// because the boot report priced every other path and not this one. Two
+    /// halves for the reason [`COPY_AT`]'s comment gives at length: a single
+    /// figure here would be the first execution of the path rather than the
+    /// cost of using it.
+    pub const LEND_AT: usize = COPY_AT + 16;
 
     /// Where bulk staging begins.
     ///
@@ -87,7 +97,7 @@ pub mod report {
     pub const PAGE: usize = 4096;
 
     /// Every record ends before the scratch begins.
-    const _: () = assert!(COPY_AT + 16 <= SCRATCH_AT);
+    const _: () = assert!(LEND_AT + 16 <= SCRATCH_AT);
     /// And the scratch ends inside the page.
     const _: () = assert!(SCRATCH_AT + SCRATCH_BYTES == PAGE);
     /// The fault log is past the traces, which is what it used to claim and

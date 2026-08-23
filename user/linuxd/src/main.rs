@@ -276,6 +276,28 @@ const WAIT_RECORD_AT: u64 = REPORT_AT + report::WAIT_AT as u64;
 /// number existed**, so here it is measured rather than guessed.
 const COPY_RECORD_AT: u64 = REPORT_AT + report::COPY_AT as u64;
 
+/// Where the cost of giving a lent page back lands: cold cycles, then warm.
+///
+/// [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)
+/// made `dir::RELEASE` do more work — the revocation inside it now takes the
+/// page out of this program's address space and gives the address back — and
+/// shipped **without a number**, having claimed in its own performance section
+/// that the boot report already priced this pair. It did not. This is that
+/// number, taken where the cost is actually paid.
+///
+/// **What is inside the span, said plainly, because it is more than the
+/// revocation:** one `CALL` to `bin/fsd`, which mounts, finds the frame the
+/// block is in, invokes `REVOKE` on its lending — which is the part RFC 0044
+/// changed — unpins the frame, and replies. A reader comparing this against
+/// the revocation alone would be comparing against something this program
+/// cannot measure from here.
+///
+/// Cold and warm, for the reason [`COPY_RECORD_AT`] gives at length: a single
+/// figure would be the first execution of the path and not the cost of using
+/// it. **And taking a warm one is only possible because of the change being
+/// measured** — before it, a second read on the machine was refused.
+const LEND_RECORD_AT: u64 = REPORT_AT + report::LEND_AT as u64;
+
 /// Records what a `wait4` answered: the child collected and its status word.
 ///
 /// Written on every outcome, including the refusals, because a boot where
@@ -2226,12 +2248,19 @@ fn answer_read(request: &PersonalityCall) -> Answer {
     // Given back either way: the service unpins the frame and revokes what it
     // lent, which unmaps it from here. A page kept is a page its cache cannot
     // evict.
+    // Timed, because RFC 0044 made this call do more and shipped without a
+    // number for it. The counter is `bhaskix-sock`'s for the reason the
+    // supervised-copy measurement gives: an `rdtsc` written here would cost
+    // `unsafe` lines in the most authority-concentrated program in the system,
+    // and that crate already owns the read.
+    let released_at = bhaskix_sock::time::now();
     let _ = call(
         syscall::CALL,
         entry.handle,
         bhaskix_abi::dir::RELEASE,
         [0; 4],
     );
+    record_release(bhaskix_sock::time::now().saturating_sub(released_at));
     let _ = call(syscall::INVOKE, LENT, method::DELETE, [0; 4]);
     if !moved {
         // **Not traced here.** The two branches above each recorded *where*
@@ -2497,6 +2526,32 @@ fn answer_getdents64(request: &PersonalityCall) -> Answer {
     }
     trace_file(i64::from(descriptor), STAGE_LISTED, written as u64);
     Answer::ok(written as u64)
+}
+
+/// Records what giving a lent page back cost — the first one on the machine,
+/// then the first one after that.
+///
+/// **Two slots and no averaging.** The first execution of this path is
+/// dominated by whatever the emulator has not translated yet, which the
+/// supervised-copy measurement learned the expensive way: a first attempt
+/// there read an ordering artefact as a per-byte cost. Keeping the two
+/// separate lets a reader see the difference rather than have it averaged
+/// away.
+///
+/// A zero slot means "not taken yet", which is safe because a call that took
+/// no cycles did not happen.
+fn record_release(cycles: u64) {
+    for slot in 0..2u64 {
+        let at = LEND_RECORD_AT + slot * 8;
+        // SAFETY: inside the page `ATTACH` mapped from this program's own
+        // object, at an offset the crate asserts is before the scratch area.
+        let taken = unsafe { core::ptr::read_volatile(at as *const u64) };
+        if taken == 0 {
+            // SAFETY: as above.
+            unsafe { core::ptr::write_volatile(at as *mut u64, cycles.max(1)) };
+            return;
+        }
+    }
 }
 
 /// Answers a hosted `close`, giving the capability back with the descriptor.

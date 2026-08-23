@@ -856,10 +856,24 @@ performance section said the boot report prints the cost of a
 `dir::MAP`/`dir::RELEASE` pair, so the change could be measured before and
 after. **It prints no such number** — `bulk cost` and `linux copyout` are
 different paths — and the sentence was written from an impression rather than
-from the tree. Corrected in place: this ships **un-measured** on the path it
-makes slower, the added cost is stated instead (a 4,096-entry scan per tallied
-owner, about two of them per release), and the measurement to add is named
-without being smuggled into the change whose cost it would justify.
+from the tree.
+
+**The number was supplied straight afterwards, and the obvious way to take it
+was the wrong way.** Timing the whole `dir::RELEASE` from `bin/linuxd` gives
+7,877,036 then 10,049,460 cycles on one boot and 6,480,746 then 4,351,920 on
+the next — the second sample larger in one and smaller in the other, with more
+spread between boots than a page-table walk could account for. It is dominated
+by `bin/fsd`'s own mount and cache search, so it cannot price a revocation, and
+the first version of that boot line called the pair "cold and warm", asserting
+a warming the numbers deny. Kept, and reworded to say what dominates it.
+
+What answers the question is the unmapping alone, measured in the kernel's
+lending self-test, re-mapped each time round — unmapping is not idempotent —
+and taking the minimum of eight the way `bulk cost` does: **46,084 and 49,440
+cycles** on two boots, about 5% apart. Beside a page through `COPY_OUT` at
+168,330 warm and the kernel's own direct-map copy at 122, that is roughly a
+quarter of a supervised page copy, dominated by the TLB shootdown the rule
+requires. Neither figure is a measurement of hardware (M1-17).
 
 ### 2026-08-23 (RFC 0005 step 8: directories are readable, and reading a file twice turns out not to be)
 
