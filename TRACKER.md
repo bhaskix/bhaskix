@@ -791,6 +791,54 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (RFC 0043 step 1: the root table stops belonging to a device, and the windows are byte-for-byte the same)
+
+**`build_window` did two things and only one of them was about the unit.** It
+allocated the root, context and page tables — the unit's half — and wrote a
+context entry for one device. The first is why turning translation on could only
+happen if a particular device existed, and why a machine with no virtio device
+got four IOMMU units and no translation at all.
+
+Split into the two things it is:
+
+- `build_tables(report, hhdm)` — root and context tables, no device named. Every
+  context entry absent, which means every device is **refused** if translation
+  is enabled over these alone. That is exactly why building is not enabling, and
+  why RFC 0043 spends most of its length on when it is safe to.
+- `attach_to(tables, device, domain, hhdm)` — the one place a context entry is
+  written.
+
+`build_window` is now `build_tables` then `attach_to`; `attach_device` is
+`attach_to` over the tables the installed window already uses. **The duplicated
+entry-writing code is gone** — there were two copies of it, and RFC 0012's own
+comment about writing the root entry again with the same context table being
+harmless now lives in one place instead of two.
+
+**Byte-for-byte, measured rather than asserted.** RFC 0043's step 1 asked for the
+QEMU lane to prove the windows unchanged, and the boot report does not print table
+addresses — so a temporary probe did, on the `iommu` lane, before and after:
+
+```
+BEFORE:  iommu probe    root 0xec36000 ctx 0xec37000 pt 0xec38000 width 39 domain 0
+AFTER :  iommu probe    root 0xec36000 ctx 0xec37000 pt 0xec38000 width 39 domain 0
+```
+
+Identical, because the allocation order is unchanged — root, context, then page —
+which was the property that had to hold and is now checked rather than reasoned
+about. The probe was removed afterwards and `kernel/src/lib.rs` is untouched by
+this change; the whole of it is one file.
+
+The four reported windows on that lane are also unchanged, and each still passes
+`verify_window`, which reads its entries back and counts the present context
+entries.
+
+**No behaviour change, and that is the point.** This is the step that makes the
+next one possible: with the unit's tables separable from any device's window,
+"may translation be enabled here" becomes a question that can be asked about a
+machine rather than about whichever device happened to be found first. What that
+question's answer should be is RFC 0043's unresolved question 1, and it is still
+unanswered.
+
 ### 2026-08-23 (RFC 0043 drafted: the IOMMU cannot simply be turned on, and the reason is the machine it would stop)
 
 **The obvious fix is fifteen lines and it is the wrong shape.** `iommu_bringup`

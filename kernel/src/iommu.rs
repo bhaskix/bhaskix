@@ -417,6 +417,99 @@ fn zeroed_frame(hhdm: u64) -> Option<(u64, u64)> {
     }
     Some((physical, hhdm + physical))
 }
+/// A unit's own tables: the root table, and the context table for bus zero.
+///
+/// **The root table belongs to the machine, not to a device.** It was allocated
+/// inside [`build_window`] until 2026-08-23, which made turning translation on
+/// something that could only happen if a particular device existed — and on a
+/// machine with no virtio device, nothing happened at all. RFC 0043 separates
+/// the two: this is the unit's half, and [`attach_device`] is the device's.
+///
+/// Every context entry is absent until something is attached, which means every
+/// device is **refused** if translation is enabled over these tables alone. That
+/// is why building them is not the same as enabling, and why RFC 0043 spends
+/// most of its length on when it is safe to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Tables {
+    /// Physical address of the root table.
+    pub root_table: u64,
+    /// Physical address of the context table.
+    pub context_table: u64,
+    /// How many address bits the unit translates.
+    pub width: bhaskix_arch::vtd::AddressWidth,
+}
+
+/// Allocates a unit's root and context tables, both empty.
+///
+/// `None` if there are no frames, or if the hardware reported an address width
+/// this kernel cannot describe. Both are refusals rather than defaults: tables
+/// built to the wrong width are tables the hardware walks to the wrong depth.
+#[must_use]
+pub fn build_tables(report: &Report, hhdm: u64) -> Option<Tables> {
+    use bhaskix_arch::vtd;
+
+    let width = vtd::AddressWidth::fitting(report.address_width)?;
+    let (root_table, _) = zeroed_frame(hhdm)?;
+    let (context_table, _) = zeroed_frame(hhdm)?;
+    Some(Tables {
+        root_table,
+        context_table,
+        width,
+    })
+}
+
+/// Gives `device` a page table of its own, reached through `tables`.
+///
+/// The one place a context entry is written. Both [`build_window`] and
+/// [`attach_device`] are this function with their tables found differently,
+/// which is what makes "the first device" no longer a special case.
+///
+/// `domain` must differ from every other device's, or the hardware is entitled
+/// to share IOTLB entries between them.
+#[must_use]
+pub fn attach_to(tables: &Tables, device: (u8, u8, u8), domain: u16, hhdm: u64) -> Option<Window> {
+    use bhaskix_arch::vtd;
+
+    let (page_table, _) = zeroed_frame(hhdm)?;
+    let (bus, slot, function) = device;
+
+    let root = vtd::RootEntry {
+        context_table: tables.context_table,
+    };
+    let (root_low, root_high) = root.to_bits();
+    let context = vtd::ContextEntry {
+        page_table,
+        width: tables.width,
+        domain,
+    };
+    let (context_low, context_high) = context.to_bits();
+
+    // SAFETY: tables this module allocated and never frees, reached through the
+    // direct map; the indices are bounded by construction -- a root index is a
+    // byte and a context index is masked to eight bits, so neither can leave
+    // its page. Written as two 64-bit words each, which is the layout the
+    // hardware reads.
+    unsafe {
+        let root_entry = ((hhdm + tables.root_table) as *mut u64).add(vtd::root_index(bus) * 2);
+        core::ptr::write_volatile(root_entry, root_low);
+        core::ptr::write_volatile(root_entry.add(1), root_high);
+
+        let context_entry =
+            ((hhdm + tables.context_table) as *mut u64).add(vtd::context_index(slot, function) * 2);
+        core::ptr::write_volatile(context_entry, context_low);
+        core::ptr::write_volatile(context_entry.add(1), context_high);
+    }
+
+    Some(Window {
+        root_table: tables.root_table,
+        context_table: tables.context_table,
+        page_table,
+        width: tables.width,
+        domain,
+        device,
+        addresses: DevAddrSpace::new(tables.width),
+    })
+}
 
 /// Builds the translation structures for one device, and enables nothing.
 ///
@@ -437,50 +530,12 @@ pub fn build_window(
     domain: u16,
     hhdm: u64,
 ) -> Option<Window> {
-    use bhaskix_arch::vtd;
-
-    let width = vtd::AddressWidth::fitting(report.address_width)?;
-
-    let (root_table, root_virtual) = zeroed_frame(hhdm)?;
-    let (context_table, context_virtual) = zeroed_frame(hhdm)?;
-    let (page_table, _) = zeroed_frame(hhdm)?;
-
-    let (bus, slot, function) = device;
-
-    let root = vtd::RootEntry { context_table };
-    let (root_low, root_high) = root.to_bits();
-    let context = vtd::ContextEntry {
-        page_table,
-        width,
-        domain,
-    };
-    let (context_low, context_high) = context.to_bits();
-
-    // SAFETY: both frames were just allocated and zeroed by this function, and
-    // the indices are bounded by construction -- a root index is a byte and a
-    // context index is masked to eight bits, so neither can leave its page.
-    // Written as two 64-bit words each, which is the layout the hardware
-    // reads.
-    unsafe {
-        let root_entry = (root_virtual as *mut u64).add(vtd::root_index(bus) * 2);
-        core::ptr::write_volatile(root_entry, root_low);
-        core::ptr::write_volatile(root_entry.add(1), root_high);
-
-        let context_entry =
-            (context_virtual as *mut u64).add(vtd::context_index(slot, function) * 2);
-        core::ptr::write_volatile(context_entry, context_low);
-        core::ptr::write_volatile(context_entry.add(1), context_high);
-    }
-
-    Some(Window {
-        root_table,
-        context_table,
-        page_table,
-        width,
-        domain,
-        device,
-        addresses: DevAddrSpace::new(width),
-    })
+    // **The unit's tables, then one device in them** -- which is all this ever
+    // did, written as the two things it is since RFC 0043. The allocation order
+    // is unchanged (root, context, page), so a machine that built a window
+    // before this split builds the identical one after it.
+    let tables = build_tables(report, hhdm)?;
+    attach_to(&tables, device, domain, hhdm)
 }
 
 /// Gives a second device a translation of its own, under the same unit.
@@ -504,50 +559,27 @@ pub fn attach_device(
     domain: u16,
     hhdm: u64,
 ) -> Option<Window> {
-    use bhaskix_arch::vtd;
+    // The same tables the installed window is reached through. Writing the root
+    // entry again with the same context table is harmless; writing it with a
+    // *different* one would not be, which is why the tables come from the window
+    // that is already installed rather than from a fresh allocation.
+    attach_to(&existing.tables(), device, domain, hhdm)
+}
 
-    let (page_table, _) = zeroed_frame(hhdm)?;
-    let (bus, slot, function) = device;
-
-    // The root entry for this bus may already exist -- devices on one bus
-    // share it -- and writing it again with the same context table is
-    // harmless. Writing it with a *different* one would not be, which is why
-    // the context table comes from the window that is already installed rather
-    // than from a fresh allocation.
-    let root = vtd::RootEntry {
-        context_table: existing.context_table,
-    };
-    let (root_low, root_high) = root.to_bits();
-    let context = vtd::ContextEntry {
-        page_table,
-        width: existing.width,
-        domain,
-    };
-    let (context_low, context_high) = context.to_bits();
-
-    // SAFETY: the root and context tables belong to the installed window and
-    // are never freed; the indices are bounded by construction, a root index
-    // being a byte and a context index masked to eight bits.
-    unsafe {
-        let root_entry = ((hhdm + existing.root_table) as *mut u64).add(vtd::root_index(bus) * 2);
-        core::ptr::write_volatile(root_entry, root_low);
-        core::ptr::write_volatile(root_entry.add(1), root_high);
-
-        let context_entry = ((hhdm + existing.context_table) as *mut u64)
-            .add(vtd::context_index(slot, function) * 2);
-        core::ptr::write_volatile(context_entry, context_low);
-        core::ptr::write_volatile(context_entry.add(1), context_high);
+impl Window {
+    /// The unit's tables this window is reached through.
+    ///
+    /// A window is one device's page table plus the machine's root and context
+    /// tables; this is the second half, which every other device on the same
+    /// unit shares.
+    #[must_use]
+    pub const fn tables(&self) -> Tables {
+        Tables {
+            root_table: self.root_table,
+            context_table: self.context_table,
+            width: self.width,
+        }
     }
-
-    Some(Window {
-        root_table: existing.root_table,
-        context_table: existing.context_table,
-        page_table,
-        width: existing.width,
-        domain,
-        device,
-        addresses: DevAddrSpace::new(existing.width),
-    })
 }
 
 /// Reads a window's own entries back and checks they say what was written.

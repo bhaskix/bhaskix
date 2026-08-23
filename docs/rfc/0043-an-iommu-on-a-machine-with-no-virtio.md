@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-23.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware |
+| **Status** | ⬜ **Draft 2026-08-23, step 1 implemented.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 — refuse, or identity-map — is still unanswered, and steps 2–5 wait on it** |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/iommu`, `kernel/lib.rs` bring-up |
 | **Milestone** | Phase 2. It does not add a feature; it makes an existing one true off the emulator |
@@ -79,11 +79,18 @@ are separated:
 - `iommu::build_tables(report, hhdm) -> Option<Tables>` — root and context
   tables, allocated and zeroed, no device named. Every context entry absent,
   which means *every device is refused* until one is given a window.
-- `iommu::attach_device(&tables, device, domain, hhdm)` — already exists, and
-  becomes the only way a device gets a window.
+- `iommu::attach_to(&tables, device, domain, hhdm)` — the one place a context
+  entry is written, and the only way a device gets a window.
 
-`build_window` then becomes `build_tables` followed by one `attach_device`, and
+`build_window` then becomes `build_tables` followed by one `attach_to`, and
 nothing else changes about what a window is.
+
+> **Corrected 2026-08-23 by building it.** This paragraph named the new function
+> `attach_device`, which already existed with a different signature — it takes an
+> installed `&Window` and reuses its tables. Rather than change what every
+> existing caller passes, `attach_to` is the new one and `attach_device` became a
+> single call to it. The duplicated entry-writing code the two of them used to
+> share went with the change.
 
 ### But enabling with nothing attached would stop the machine
 
@@ -207,8 +214,17 @@ should be one somebody is watching.
 
 ## Implementation plan
 
-1. Split `build_window` into `build_tables` and one `attach_device`, with the
-   QEMU lane proving byte-for-byte identical windows.
+1. ✅ **Done 2026-08-23.** Split into `build_tables` (the unit's half, no device
+   named) and `attach_to` (the one place a context entry is written).
+   `build_window` is now the two in sequence and `attach_device` is `attach_to`
+   over an installed window's tables — so the duplicated entry-writing code is
+   gone with them.
+
+   *Byte-for-byte, measured.* The boot report does not print table addresses, so
+   a temporary probe did, on the `iommu` lane, before and after:
+   `root 0xec36000 ctx 0xec37000 pt 0xec38000 width 39 domain 0` — identical,
+   because the allocation order is unchanged. The probe was removed; the change
+   is one file.
 2. Enumerate every DMA-capable function the kernel can see, and report them.
 3. The predicate: may translation be enabled? Pure, host-tested, watched red.
 4. Wire the decision, with the report naming every device and its window.
