@@ -596,6 +596,27 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         grep -a "iommu window" "$LOG" | sed 's/^/      /'
         status=1
     fi
+
+    # RFC 0041 step 4: both rings, in both directions, and a gate a coincidence
+    # cannot pass.
+    #
+    # A running controller is only a controller that is not halted. This asserts
+    # a *conversation*: a No-Op command written to the command ring, the
+    # doorbell rung, and a Command Completion Event that names the address the
+    # command was written to. The address is what carries it -- an event that
+    # merely arrived would prove the event ring works and say nothing about
+    # whether the controller ever read the ring this driver writes.
+    #
+    # `success` and `dequeue advanced` are in the same pattern deliberately.
+    # Without the dequeue write the interrupter is never re-armed, which is a
+    # ring that works exactly once and would pass a weaker gate every time.
+    if grep -qaE 'xhci rings +answered the no-op at 0x[0-9a-f]+: [1-9][0-9]* event.*success, dequeue advanced' "$LOG"; then
+        pass "the xHCI command and event rings carry a no-op round trip, matched by address"
+    else
+        fail "the xHCI rings did not carry a matched no-op round trip"
+        grep -a "xhci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
 fi
 
 # The decline is reported. Deterministic, and it guards the gate below rather

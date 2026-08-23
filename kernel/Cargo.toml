@@ -357,7 +357,22 @@ asm_budget = 10
 # the controller reports, and all thirty-one host tests -- test code is
 # excluded from the budget by the checker, which is why the model that drives
 # this driver costs nothing.
-unsafe_budget = 1715
+# 1804 at RFC 0041 step 4, 2026-08-23: +89, for asking the controller a
+# question and reading its answer. Almost all of it is one thing -- reaching
+# DMA memory the *controller* also writes -- and none of it can be a safe
+# abstraction over something else:
+#   * the command ring: the Link TRB that closes it (step 3 wrote none, which
+#     cost nothing while nothing read the ring and would have stopped the
+#     controller after fifteen commands once something did), and the No-Op
+#     command itself.
+#   * the event ring: a volatile read per entry, through a closure, because the
+#     controller writes these while the drain runs -- a `&[Trb]` over that
+#     memory would be a shared reference to something else's writes.
+#   * the doorbell and the dequeue pointer: one `Mmio::new` each.
+# What is not in it: `drain` itself, which is pure and takes the reader as a
+# closure precisely so it can be host-tested, and `command_ring_link`, which is
+# the link *decision* separated from the store so a test can hold it.
+unsafe_budget = 1804
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

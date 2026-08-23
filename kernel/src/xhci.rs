@@ -279,6 +279,18 @@ bhaskix_device::register_block! {
     }
 }
 
+bhaskix_device::register_block! {
+    /// One doorbell, inside the doorbell bank.
+    ///
+    /// **Write-only in practice**, which is why the block holds one register
+    /// and is named at the doorbell being rung rather than being an array
+    /// indexed at each use: an out-of-range index here is a write outside the
+    /// window, and a stray write to a device is worse than a stray read.
+    struct DoorbellRegister(0x04) {
+        0x00 => value: u32,
+    }
+}
+
 /// The moderation interval, in 250 ns units — about one interrupt per 16 µs.
 ///
 /// **Not left at the reset value**, which is zero and means an interrupt per
@@ -703,6 +715,114 @@ pub const fn ring_bytes() -> usize {
     trb::ring_bytes(RING_ENTRIES)
 }
 
+/// The Link TRB a command ring needs, and which entry it belongs in.
+///
+/// **A command ring's last entry must be a Link back to its own start**, or the
+/// controller runs off the end of the segment into whatever follows it in
+/// memory -- by DMA. It toggles the cycle, because a one-segment ring has
+/// nowhere else for the lap to flip.
+///
+/// An event ring gets none: the controller wraps that one by the segment table.
+/// That asymmetry is why this function names the *command* ring and why
+/// `ring::Consumer` wraps one entry later than `ring::Producer`.
+///
+/// Pure, and separate from the write, so that the decision is host-testable
+/// even though the store into DMA memory is not.
+///
+/// `None` for a ring too small to hold a link and any work, or an address the
+/// register cannot hold -- a misaligned link pointer is silently truncated by
+/// the controller rather than refused.
+#[must_use]
+pub fn command_ring_link(device_address: u64, entries: usize) -> Option<(usize, trb::Trb)> {
+    let producer = ring::Producer::new(entries)?;
+    let link = trb::Trb::link(device_address, true, producer.cycle())?;
+    Some((producer.link_index(), link))
+}
+
+/// What one drain of the event ring found.
+///
+/// Counts rather than a queue: nothing in this step *acts* on an event, and a
+/// structure that could hold one would be a structure the next step has to be
+/// talked out of. What it keeps is the last of each thing, which is what the
+/// boot report needs and what proves a round trip happened.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Drained {
+    /// Events consumed.
+    pub events: usize,
+    /// Of them, command completions.
+    pub command_completions: usize,
+    /// Of them, root hub port changes.
+    pub port_changes: usize,
+    /// Of them, transfer events.
+    pub transfers: usize,
+    /// Of them, the controller reporting a problem with itself.
+    pub host_controller: usize,
+    /// Of them, kinds this driver does not name.
+    ///
+    /// **Counted rather than ignored.** A controller posting events a driver
+    /// has no case for is a driver that has misunderstood something, and a
+    /// silent `_ =>` arm is how that stays invisible for a release.
+    pub unrecognised: usize,
+    /// How the last command or transfer turned out.
+    pub last_completion: Option<trb::CompletionCode>,
+    /// Which command the last completion was answering.
+    pub last_command: u64,
+    /// Which port the last change concerned.
+    pub last_port: u8,
+}
+
+/// Consumes every event the controller has published, and dispatches by kind.
+///
+/// **Pure, and reads through a closure rather than a slice.** The event ring is
+/// written by the controller by DMA while this runs, so a `&[Trb]` over it would
+/// be a shared reference to memory something else is writing. The closure lets
+/// the kernel read each entry volatilely and lets a host test answer from an
+/// array — which is what makes the whole of RFC 0041 step 4's logic testable
+/// without a controller.
+///
+/// Bounded at one lap. A controller that publishes faster than this drains is
+/// not a reason to stay in here for ever; the caller comes back.
+pub fn drain(
+    entries: usize,
+    consumer: &mut ring::Consumer,
+    read: &mut dyn FnMut(usize) -> trb::Trb,
+) -> Drained {
+    let mut found = Drained::default();
+    for _ in 0..entries {
+        let event = read(consumer.index());
+        // **The cycle bit is the whole protocol.** An entry whose bit does not
+        // match this consumer's lap has not been written by the controller yet,
+        // whatever else it contains -- and what it contains is the previous
+        // lap's event, which is why reading one is not a harmless mistake.
+        if !consumer.owns(event.cycle_bit()) {
+            break;
+        }
+        found.events += 1;
+        match event.kind() {
+            trb::Kind::CommandCompletion => {
+                found.command_completions += 1;
+                found.last_completion = Some(event.completion_code());
+                found.last_command = event.command_trb_pointer();
+            }
+            trb::Kind::PortStatusChange => {
+                found.port_changes += 1;
+                found.last_port = event.port_id();
+            }
+            trb::Kind::TransferEvent => {
+                found.transfers += 1;
+                found.last_completion = Some(event.completion_code());
+            }
+            trb::Kind::HostController => {
+                found.host_controller += 1;
+                found.last_completion = Some(event.completion_code());
+            }
+            _ => found.unrecognised += 1,
+        }
+        consumer.advance();
+    }
+    found
+}
+
 /// How much of a controller's BAR this driver maps.
 ///
 /// The banks are at offsets the controller reports, and this is the bound they
@@ -766,6 +886,8 @@ pub struct Started {
     pub running: Running,
     /// Frames handed to it, all of them mapped into its own window.
     pub frames: usize,
+    /// What asking it a question produced. RFC 0041 step 4.
+    pub answered: Answered,
 }
 
 /// Why a controller could not be brought up, from the kernel's side.
@@ -930,6 +1052,27 @@ pub unsafe fn init(hhdm: u64) -> Result<Started, InitError> {
         }
     }
 
+    // **The command ring's Link TRB, and step 3 did not write one.** Nothing
+    // read the ring then -- the doorbell was never rung -- so a missing link
+    // cost nothing and was invisible. Step 4 rings it, and the last entry of a
+    // command ring must be a Link back to the start or the controller reads a
+    // zeroed TRB, finds a type of 0, and stops. It toggles the cycle, because
+    // this is a one-segment ring and the lap has to flip somewhere.
+    //
+    // An event ring gets none: the controller wraps that one by the segment
+    // table, which is the asymmetry `ring::Consumer` exists to hold on to.
+    let (link_index, link) = command_ring_link(command_ring.device, RING_ENTRIES)
+        .ok_or(InitError::BringUp(BringUpError::RingTooSmall))?;
+    // SAFETY: a frame this function allocated and zeroed, written at an index
+    // `command_ring_link` bounds to inside the ring, which is far inside one
+    // frame.
+    unsafe {
+        core::ptr::write_volatile(
+            (command_ring.virtual_address as *mut [u32; 4]).add(link_index),
+            link.0,
+        );
+    }
+
     // The event ring segment table, describing the one segment there is.
     let entry = trb::SegmentTableEntry::new(event_ring.device, RING_ENTRIES as u16)
         .ok_or(InitError::NotMappable)?;
@@ -960,7 +1103,157 @@ pub unsafe fn init(hhdm: u64) -> Result<Started, InitError> {
     }
     .map_err(InitError::BringUp)?;
 
-    Ok(Started { running, frames })
+    // RFC 0041 step 4: ask the controller a question and read its answer.
+    //
+    // A running controller is only a controller that is *not halted*. This is
+    // the first thing that proves the rings are real in both directions -- the
+    // command ring the driver writes and the event ring the controller does.
+    // SAFETY: the controller is running, and this is its memory and its window.
+    let answered = unsafe {
+        exercise_the_rings(
+            base,
+            &parameters,
+            &memory,
+            command_ring.virtual_address,
+            event_ring.virtual_address,
+            &mut Settle,
+        )
+    };
+
+    Ok(Started {
+        running,
+        frames,
+        answered,
+    })
+}
+
+/// Sends a No-Op command and consumes the event it produces.
+///
+/// **A No-Op is how a driver proves its command ring works**, which is what the
+/// vendored crate's own constructor says it is for. Nothing is plugged in and no
+/// slot exists, so this is the only question that can be asked at this step --
+/// and the answer is not merely "an event arrived": a Command Completion Event
+/// names *the address of the command TRB it is answering*, so a matching pointer
+/// is a round trip a coincidence cannot fake.
+///
+/// # Safety
+///
+/// The controller must be running, `base` its mapped window, and the two
+/// virtual addresses the kernel's view of the rings named in `memory`.
+unsafe fn exercise_the_rings<W: Wait>(
+    base: usize,
+    parameters: &Parameters,
+    memory: &Memory,
+    command_ring: u64,
+    event_ring: u64,
+    wait: &mut W,
+) -> Answered {
+    let mut answered = Answered::default();
+
+    let Some(producer) = ring::Producer::new(memory.command_ring_entries) else {
+        return answered;
+    };
+    let Some(mut consumer) = ring::Consumer::new(memory.event_ring_entries) else {
+        return answered;
+    };
+    let Some(doorbell_offset) =
+        bhaskix_xhci::doorbell::doorbell_at(bhaskix_xhci::doorbell::COMMAND_RING)
+    else {
+        return answered;
+    };
+
+    // Where the controller will say it found this command. The *device*
+    // address, because that is the number the controller deals in -- naming the
+    // physical one here would compare an answer against a question nobody asked.
+    let asked_at = memory.command_ring + (producer.index() * trb::BYTES) as u64;
+    answered.asked_at = asked_at;
+
+    // SAFETY: a frame `init` allocated and zeroed, at an index `Producer`
+    // bounds to inside the ring.
+    unsafe {
+        core::ptr::write_volatile(
+            (command_ring as *mut [u32; 4]).add(producer.index()),
+            trb::Trb::no_op_command(producer.cycle()).0,
+        );
+    }
+
+    // SAFETY: the doorbell bank is inside the window, which `parameters`
+    // checked, and the offset is bounded by `doorbell_at`.
+    let doorbell = unsafe {
+        DoorbellRegister::<bhaskix_device::Volatile>::new(
+            base + parameters.doorbells + doorbell_offset,
+        )
+    };
+    doorbell
+        .value
+        .write(bhaskix_xhci::doorbell::Doorbell::command().0);
+
+    // The controller has to run the command and post the event. Bounded, and a
+    // controller that never answers is a report rather than a hang.
+    // Wait for the controller to publish something at the entry this consumer
+    // is looking at. Ownership is the cycle bit and nothing else: a zeroed
+    // entry has bit 0, a fresh consumer expects 1, so "not written yet" and
+    // "written" are distinguishable without reading anything else.
+    answered.arrived = wait.until(&mut || {
+        // SAFETY: the event ring is a frame `init` allocated; this reads one
+        // TRB at an index `Consumer` bounds to inside it. Volatile because the
+        // controller writes here by DMA.
+        let event = unsafe {
+            core::ptr::read_volatile((event_ring as *const [u32; 4]).add(consumer.index()))
+        };
+        consumer.owns(trb::Trb(event).cycle_bit())
+    });
+
+    let drained = drain(memory.event_ring_entries, &mut consumer, &mut |index| {
+        // SAFETY: as above.
+        trb::Trb(unsafe { core::ptr::read_volatile((event_ring as *const [u32; 4]).add(index)) })
+    });
+    answered.drained = drained;
+
+    // Tell the controller how far this driver has consumed, and clear the
+    // Event Handler Busy bit while doing it -- the one write that says "I am
+    // done looking". Without it the controller will not raise the interrupter
+    // again, which is a ring that works exactly once.
+    if let Some(interrupter_zero) = runtime::interrupter_at(0)
+        && let Some(dequeue) = runtime::EventRingDequeuePointer::advancing(
+            memory.event_ring + (consumer.index() * trb::BYTES) as u64,
+            0,
+            true,
+        )
+    {
+        // SAFETY: the runtime bank is inside the window, which `parameters`
+        // checked.
+        let interrupter = unsafe {
+            Interrupter::<bhaskix_device::Volatile>::new(
+                base + parameters.runtime + interrupter_zero,
+            )
+        };
+        interrupter.erdp.write(dequeue.0);
+        answered.dequeue_advanced = true;
+    }
+
+    answered.matched = drained.command_completions > 0 && drained.last_command == asked_at;
+    answered
+}
+
+/// What asking the controller a question produced.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Answered {
+    /// What the drain found.
+    pub drained: Drained,
+    /// Where the command was written, in the controller's own addresses.
+    pub asked_at: u64,
+    /// Whether an event arrived before the deadline.
+    pub arrived: bool,
+    /// Whether the completion named the command that was sent.
+    ///
+    /// **The claim worth making.** An event arriving proves the event ring
+    /// works; an event naming the address the command was written to proves the
+    /// controller read the command ring as well, and that the two are the same
+    /// conversation.
+    pub matched: bool,
+    /// Whether the dequeue pointer was written back.
+    pub dequeue_advanced: bool,
 }
 
 /// A controller to bring up without a machine.
@@ -1640,6 +1933,225 @@ mod bringup_tests {
         // follows the allocation, which the controller writes to by DMA.
         assert_eq!(super::device_context_array_bytes(4), 5 * 8);
         assert_eq!(super::device_context_array_bytes(1), 2 * 8);
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use bhaskix_xhci::trb::{CompletionCode, Kind, Trb};
+
+    use super::{RING_ENTRIES, drain, ring::Consumer};
+
+    /// An event ring a controller has written `published` entries into.
+    ///
+    /// Every entry carries the cycle bit a fresh consumer expects; everything
+    /// past `published` is left zeroed, which is what unwritten memory looks
+    /// like and is exactly how a consumer is meant to tell the difference.
+    fn ring_of(published: &[Trb]) -> [Trb; RING_ENTRIES] {
+        let mut ring = [Trb::new(); RING_ENTRIES];
+        for (slot, event) in ring.iter_mut().zip(published) {
+            *slot = event.with_cycle_bit(true);
+        }
+        ring
+    }
+
+    fn completion(code: CompletionCode, command: u64) -> Trb {
+        let raw = match code {
+            CompletionCode::Success => 1,
+            CompletionCode::ShortPacket => 13,
+            CompletionCode::TrbError => 5,
+            _ => 0,
+        };
+        let mut event = Trb::new()
+            .with_kind(Kind::CommandCompletion)
+            .with_parameter(command);
+        event.0[2] = raw << 24;
+        event
+    }
+
+    fn port_change(port: u8) -> Trb {
+        let mut event = Trb::new().with_kind(Kind::PortStatusChange);
+        event.0[0] = u32::from(port) << 24;
+        event
+    }
+
+    fn drained_from(ring: &[Trb; RING_ENTRIES], consumer: &mut Consumer) -> super::Drained {
+        drain(RING_ENTRIES, consumer, &mut |index| ring[index])
+    }
+
+    #[test]
+    fn an_empty_ring_yields_nothing_rather_than_reading_a_zeroed_entry_as_an_event() {
+        // The one that matters most: a zeroed ring is what the controller was
+        // handed, and every field of a zeroed TRB reads as a legal value. Only
+        // the cycle bit says it was never written.
+        let ring = ring_of(&[]);
+        let mut consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        let found = drained_from(&ring, &mut consumer);
+        assert_eq!(found.events, 0);
+        assert_eq!(found.unrecognised, 0);
+        assert_eq!(
+            consumer.index(),
+            0,
+            "an empty drain must not move the cursor"
+        );
+    }
+
+    #[test]
+    fn a_command_completion_is_matched_to_the_command_it_answers() {
+        let ring = ring_of(&[completion(CompletionCode::Success, 0x1_0000_1000)]);
+        let mut consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        let found = drained_from(&ring, &mut consumer);
+        assert_eq!(found.events, 1);
+        assert_eq!(found.command_completions, 1);
+        assert_eq!(found.last_completion, Some(CompletionCode::Success));
+        assert_eq!(
+            found.last_command, 0x1_0000_1000,
+            "the address is the whole claim: an event that does not name the \
+             command proves only that the event ring works"
+        );
+        assert_eq!(consumer.index(), 1);
+    }
+
+    #[test]
+    fn the_drain_stops_at_the_first_entry_the_controller_has_not_written() {
+        // Two published, the rest zeroed. A drain that read past the boundary
+        // would report the whole ring as events -- which is what a driver that
+        // trusts a length instead of the cycle bit does.
+        let ring = ring_of(&[completion(CompletionCode::Success, 0x2000), port_change(3)]);
+        let mut consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        let found = drained_from(&ring, &mut consumer);
+        assert_eq!(found.events, 2);
+        assert_eq!(found.command_completions, 1);
+        assert_eq!(found.port_changes, 1);
+        assert_eq!(found.last_port, 3);
+        assert_eq!(consumer.index(), 2);
+    }
+
+    #[test]
+    fn a_second_drain_finds_nothing_until_the_controller_writes_again() {
+        let ring = ring_of(&[completion(CompletionCode::Success, 0x3000)]);
+        let mut consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        assert_eq!(drained_from(&ring, &mut consumer).events, 1);
+        assert_eq!(
+            drained_from(&ring, &mut consumer).events,
+            0,
+            "an event consumed twice is an event acted on twice"
+        );
+    }
+
+    #[test]
+    fn a_full_lap_leaves_the_consumer_expecting_the_other_cycle_state() {
+        // Every entry published, so a whole lap is consumed. The event ring has
+        // no link TRB, so the wrap happens at `entries` -- and the consumer must
+        // come back expecting cycle 0, because the controller will write the
+        // next lap with the bit flipped over the entries it just used.
+        let published: [Trb; RING_ENTRIES] =
+            core::array::from_fn(|index| completion(CompletionCode::Success, index as u64 * 16));
+        let ring = ring_of(&published);
+        let mut consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        let found = drained_from(&ring, &mut consumer);
+        assert_eq!(found.events, RING_ENTRIES);
+        assert_eq!(consumer.index(), 0, "a full lap returns to the start");
+        assert!(
+            !consumer.owns(true),
+            "after one lap the consumer expects cycle 0; still expecting 1 would \
+             make it replay the lap it has just consumed"
+        );
+    }
+
+    #[test]
+    fn a_kind_this_driver_does_not_name_is_counted_rather_than_ignored() {
+        let ring = ring_of(&[Trb::new().with_kind(Kind::Other(42))]);
+        let mut consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        let found = drained_from(&ring, &mut consumer);
+        assert_eq!(found.events, 1);
+        assert_eq!(
+            found.unrecognised, 1,
+            "a controller posting events a driver has no case for is a driver \
+             that has misunderstood something; a silent match arm hides it"
+        );
+    }
+
+    #[test]
+    fn a_short_packet_is_not_read_as_a_failure() {
+        // `ShortPacket` is how a device answers with less than the buffer
+        // allowed, which is routine. A driver comparing against `Success` alone
+        // rejects perfectly good descriptors.
+        let ring = ring_of(&[completion(CompletionCode::ShortPacket, 0x4000)]);
+        let mut consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        let found = drained_from(&ring, &mut consumer);
+        assert_eq!(found.last_completion, Some(CompletionCode::ShortPacket));
+        assert!(
+            found
+                .last_completion
+                .expect("a completion was recorded")
+                .is_success()
+        );
+    }
+
+    #[test]
+    fn a_failure_code_is_carried_out_rather_than_swallowed() {
+        let ring = ring_of(&[completion(CompletionCode::TrbError, 0x5000)]);
+        let mut consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        let found = drained_from(&ring, &mut consumer);
+        assert_eq!(found.command_completions, 1);
+        assert!(
+            !found
+                .last_completion
+                .expect("a completion was recorded")
+                .is_success()
+        );
+    }
+
+    #[test]
+    fn the_command_ring_gets_a_link_trb_that_toggles_and_the_event_ring_gets_none() {
+        // A command ring's last entry must be a Link back to the start, or the
+        // controller runs off the end of the segment into whatever follows it
+        // -- by DMA. It must toggle, because this is a one-segment ring and the
+        // lap has to flip somewhere.
+        //
+        // Step 3 wrote no link at all. Nothing read the ring then, so it cost
+        // nothing; step 4 rings the doorbell, and after fifteen commands the
+        // controller would have read a zeroed TRB and stopped.
+        let (index, link) =
+            super::command_ring_link(0x1_0000_0000, RING_ENTRIES).expect("a ring and an address");
+        assert_eq!(
+            index,
+            RING_ENTRIES - 1,
+            "the link is the last entry, and a ring that puts work there              overwrites its own wrap"
+        );
+        assert_eq!(link.kind(), Kind::Link);
+        assert!(
+            link.toggle_cycle(),
+            "a one-segment ring has nowhere else for the lap to flip: without              the toggle the controller reads the next lap as stale and stops"
+        );
+        assert_eq!(link.parameter(), 0x1_0000_0000);
+        assert!(
+            link.cycle_bit(),
+            "the link is published like any other entry, so it carries the              producer's starting cycle or the controller never follows it"
+        );
+
+        // And the asymmetry, asserted rather than described: the consumer wraps
+        // one entry later than the producer, because no entry of an event ring
+        // is spent on a link.
+        let producer = super::ring::Producer::new(RING_ENTRIES).expect("a ring");
+        let consumer = Consumer::new(RING_ENTRIES).expect("a ring");
+        assert_eq!(consumer.index(), producer.index());
+        assert_eq!(
+            producer.remaining_this_lap(),
+            RING_ENTRIES - 1,
+            "a command ring spends one entry on its link; an event ring spends none"
+        );
+    }
+
+    #[test]
+    fn a_misaligned_link_address_is_refused_rather_than_truncated() {
+        assert!(super::command_ring_link(0x1000, RING_ENTRIES).is_some());
+        assert!(
+            super::command_ring_link(0x1008, RING_ENTRIES).is_none(),
+            "the low bits of a link pointer are not address, so a misaligned \
+             one is silently truncated by the controller rather than refused"
+        );
     }
 }
 

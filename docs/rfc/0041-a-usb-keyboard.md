@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft — steps 1, 2 and 3 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. Steps 4–8 are open |
+| **Status** | ⬜ **Draft — steps 1 to 4 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. Steps 5–8 are open |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | drivers |
 | **Milestone** | Phase 2 (see docs/roadmap.md) |
@@ -120,6 +120,16 @@ reading; not worth taking.
 **Poll the event ring instead of taking an interrupt.** Simpler, and it spins a
 CPU that `docs/scheduler.md` §7 has been taught to leave alone.
 
+> **What step 4 actually does, said here because this is where the reader will
+> look for it, 2026-08-23.** The boot-time probe **polls**, once, on a bounded
+> deadline: it writes one No-Op, rings the doorbell and waits for the answer.
+> That is not the arrangement this paragraph rejects. What is rejected is
+> polling in the *steady state*, when reports are arriving at the endpoint's
+> interval — a CPU spun for a keyboard. `IMAN` is enabled and nothing listens
+> yet; the interrupt arrives with the reports, at step 7, where rule 4 is spent.
+> If the steady state ever ships polling, this paragraph is the thing it
+> contradicts.
+
 **Support hubs, storage and USB 3 streams in the same change.** Each is a
 milestone; a keyboard is a step, and it is the step that makes the machine
 usable.
@@ -213,7 +223,20 @@ arithmetic — each seen to fail on purpose.
    nothing else — every byte the controller will read is prepared before it is
    called — so the ordering constraints are pinned by a device model on the host
    and the QEMU gate confirms rather than carries them.
-4. The event ring: consume, dispatch, advance the dequeue pointer.
+4. ✅ **Done 2026-08-23.** The event ring: consume, dispatch, advance the
+   dequeue pointer.
+
+   *Proved by a No-Op command*, which is what this crate's own constructor says
+   a No-Op is for: the completion event names the address of the command TRB it
+   answers, so a matching pointer establishes that the controller read the ring
+   the driver writes as well as wrote the ring the driver reads. "An event
+   arrived" would have proved only the second.
+
+   *And it found that step 3's command ring had no Link TRB.* Nothing read the
+   ring then, so a missing wrap cost nothing and was invisible; ringing the
+   doorbell makes it live, and the controller would have stopped after fifteen
+   commands. Written now, toggling. The event ring still gets none — that one
+   wraps by the segment table.
 5. Port enumeration, Enable Slot, Address Device.
 6. Descriptors over control transfers; Configure Endpoint for interrupt IN.
 7. Reports into `input::keyboard_produced`, which already exists and already

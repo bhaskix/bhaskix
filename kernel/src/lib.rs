@@ -506,26 +506,79 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if xhci_found.drivable().is_some() {
         // SAFETY: called once, here, after the IOMMU windows exist.
         match unsafe { xhci::init(handoff.hhdm_base.as_u64()) } {
-            Ok(started) => println!(
-                "    xhci           running, {} slots, {} ports, {}-byte contexts, {} \
-                 scratchpad{}, {} frames mapped into its window, usb {:x}.{:x}",
-                started.running.slots,
-                started.running.ports,
-                if started.running.context_size_64 {
-                    64
+            Ok(started) => {
+                println!(
+                    "    xhci           running, {} slots, {} ports, {}-byte contexts, {} \
+                     scratchpad{}, {} frames mapped into its window, usb {:x}.{:x}",
+                    started.running.slots,
+                    started.running.ports,
+                    if started.running.context_size_64 {
+                        64
+                    } else {
+                        32
+                    },
+                    started.running.scratchpads,
+                    if started.running.scratchpads == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    started.frames,
+                    started.running.version >> 8,
+                    (started.running.version >> 4) & 0xf,
+                );
+                // RFC 0041 step 4. **Both rings, in one sentence**, and the
+                // part that carries the claim is the address: a Command
+                // Completion Event names the command TRB it is answering, so
+                // "answered the no-op at X" says the controller read the ring
+                // this driver wrote as well as wrote the ring it reads.
+                //
+                // Printed as a failure when the answer does not match, because
+                // an event that arrived and named something else is a worse
+                // state than no event at all -- it means the two sides disagree
+                // about where the conversation is happening.
+                let answered = &started.answered;
+                if answered.matched {
+                    println!(
+                        "    xhci rings     answered the no-op at {:#x}: {} event{} \
+                         ({} completion, {} port, {} transfer, {} unknown), {}, dequeue {}",
+                        answered.asked_at,
+                        answered.drained.events,
+                        if answered.drained.events == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        answered.drained.command_completions,
+                        answered.drained.port_changes,
+                        answered.drained.transfers,
+                        answered.drained.unrecognised,
+                        match answered.drained.last_completion {
+                            Some(code) if code.is_success() => "success",
+                            Some(_) => "a failure code",
+                            None => "no completion code",
+                        },
+                        if answered.dequeue_advanced {
+                            "advanced"
+                        } else {
+                            "NOT advanced"
+                        },
+                    );
                 } else {
-                    32
-                },
-                started.running.scratchpads,
-                if started.running.scratchpads == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-                started.frames,
-                started.running.version >> 8,
-                (started.running.version >> 4) & 0xf,
-            ),
+                    println!(
+                        "\x1b[91m    xhci rings     the no-op at {:#x} was not answered: \
+                         {} event(s) arrived{}, last command {:#x}\x1b[0m",
+                        answered.asked_at,
+                        answered.drained.events,
+                        if answered.arrived {
+                            ""
+                        } else {
+                            " (nothing before the deadline)"
+                        },
+                        answered.drained.last_command,
+                    );
+                }
+            }
             Err(error) => println!(
                 "\x1b[91m    xhci           FAILED to bring up: {}\x1b[0m",
                 error.describe()
