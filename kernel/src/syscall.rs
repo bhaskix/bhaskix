@@ -558,9 +558,40 @@ fn invoke_capability(
         Err(_) => return Outcome::err(Status::NoSuchCapability),
     };
     let Some(slot) = cspace.get(index) else {
+        // **`DELETE` is answered before the slot is resolved, because it is
+        // the one method whose whole purpose is that the slot end up empty.**
+        // The ABI says so -- "not an error on a slot that is already empty: a
+        // program tidying up should not have to remember whether it has
+        // anything to tidy" -- and until 2026-08-23 the kernel said
+        // `NoSuchCapability` instead, which is the disagreement between a doc
+        // and its code that this project treats as two bugs.
+        if frame.method == method::DELETE {
+            return Outcome::ok(0);
+        }
         return Outcome::err(Status::NoSuchCapability);
     };
     let Some((object, _)) = arena.lookup(slot) else {
+        // **And this half was a slot leak with no way out of it.** A
+        // capability *the issuer revoked* leaves its holder a dead reference:
+        // resolving it fails, so every method refuses -- including the one
+        // that would clear it. The holder cannot empty the slot, cannot reuse
+        // it, and nothing can ever be handed there again.
+        //
+        // It is not hypothetical. `bin/fsd` lends a page of its cache and
+        // takes it back by revoking (`dir::RELEASE`), so *every* borrower's
+        // slot dies this way; `bin/linuxd` borrows into one fixed slot, and
+        // the second file read on the machine was refused with
+        // `SlotUnavailable` -- by whichever hosted program happened to be
+        // second. It went unseen because until RFC 0005 step 8 nothing had
+        // ever read two files.
+        //
+        // `remove` does not revoke -- other domains may still hold the same
+        // capability, and this one holds nothing but a name for something
+        // already gone.
+        if frame.method == method::DELETE {
+            cspace.remove(index);
+            return Outcome::ok(0);
+        }
         return Outcome::err(Status::Revoked);
     };
 
@@ -4159,6 +4190,90 @@ mod tests {
                 self.next()
             }
         }
+    }
+
+    /// A slot whose capability the *issuer* revoked can still be emptied.
+    ///
+    /// **The bug this fixes had no workaround from ring 3.** A service that
+    /// lends and takes back — `bin/fsd` lending a page of its cache and
+    /// revoking it in `dir::RELEASE` — leaves its borrower a slot naming
+    /// something gone. Every method refuses a dead reference, `DELETE`
+    /// included, so the borrower could not clear it and nothing could ever be
+    /// handed there again. `bin/linuxd` borrows into one fixed slot, so the
+    /// *second* file read on the machine failed, whoever made it.
+    ///
+    /// Written as three assertions rather than one, because the interesting
+    /// part is not that `DELETE` answers `Ok` — it is that the slot is empty
+    /// afterwards and can take a capability again.
+    #[test]
+    fn a_slot_whose_capability_the_issuer_revoked_can_still_be_emptied() {
+        let mut arena = Arena::new();
+        let mut cspace = CSpace::new();
+        let root = arena
+            .insert_root(ObjectRef::new(ObjectKind::Endpoint, 7), Rights::ALL, 0)
+            .expect("a fresh arena has room");
+        cspace.install_at(5, root).expect("slot 5 is free");
+
+        // The issuer takes it back. The holder is not consulted and does not
+        // find out; its slot still names the dead capability.
+        arena.revoke_unchecked(root);
+        assert!(cspace.get(5).is_some(), "the slot still holds a name");
+        assert!(
+            arena.lookup(root).is_none(),
+            "and the name no longer resolves"
+        );
+
+        let mut revoked = [0u32; crate::cap::MAX_OWNERS];
+        let outcome = invoke_capability(
+            &SyscallFrame {
+                kind: Kind::Invoke as u64,
+                capability: 5,
+                method: method::DELETE,
+                ..SyscallFrame::default()
+            },
+            0,
+            &mut cspace,
+            &mut arena,
+            &mut revoked,
+        );
+        assert_eq!(outcome.status, Status::Ok, "delete refused a dead slot");
+        assert!(cspace.get(5).is_none(), "the slot was not emptied");
+
+        // And it is usable again, which is the property the borrower needs:
+        // the next lend has somewhere to land.
+        let second = arena
+            .insert_root(ObjectRef::new(ObjectKind::Endpoint, 8), Rights::ALL, 0)
+            .expect("room");
+        cspace
+            .install_at(5, second)
+            .expect("a slot emptied by DELETE takes a capability again");
+    }
+
+    /// `DELETE` on a slot that was never occupied is not an error.
+    ///
+    /// The ABI has said so since it was written — "a program tidying up
+    /// should not have to remember whether it has anything to tidy" — and the
+    /// kernel answered `NoSuchCapability` until 2026-08-23. A doc and its
+    /// code disagreeing is two bugs, and this is the second.
+    #[test]
+    fn deleting_an_empty_slot_is_not_an_error() {
+        let mut arena = Arena::new();
+        let mut cspace = CSpace::new();
+        let mut revoked = [0u32; crate::cap::MAX_OWNERS];
+        let outcome = invoke_capability(
+            &SyscallFrame {
+                kind: Kind::Invoke as u64,
+                capability: 9,
+                method: method::DELETE,
+                ..SyscallFrame::default()
+            },
+            0,
+            &mut cspace,
+            &mut arena,
+            &mut revoked,
+        );
+        assert_eq!(outcome.status, Status::Ok);
+        assert!(cspace.get(9).is_none());
     }
 
     /// The fuzz target [RFC 0008](../../docs/rfc/0008-syscall-and-ipc-shape.md)'s
