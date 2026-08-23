@@ -791,6 +791,69 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (RFC 0042 steps 1–3: what the kernel printed is kept, and the boot report stops naming its own address space)
+
+**The record exists.** Everything the kernel prints now also goes into a
+fixed 64 KiB buffer, appended in `Console::write_str` — the one place all output
+already passes through, so *if it was printed it is in the record, and if it was
+not it is not*. A second formatting path would be a log that can disagree with
+the console, which is two sources of truth.
+
+```
+    boot record    21570 bytes kept of 64 KiB, all of it -- readable back
+```
+
+Twenty-one and a half kilobytes is a whole boot report with three times the room
+spare, and the line says both numbers on every boot: a truncated record that did
+not say it was truncated would have a reader take the last line they can see for
+the last line there was.
+
+**It fills once and stops, which is the opposite of the telemetry rings.** RFC
+0026's event rings are drop-newest, because a running system's newest events are
+the ones nobody has seen. A boot log wants the other end. What scrolls off a
+framebuffer is the *beginning* — the handoff, the memory map, paging, KASLR, the
+IOMMU — and what is still on screen is by definition already visible. So the
+earliest bytes are the ones kept, and the refused count is carried out.
+
+Seven host tests, four watched red: made drop-newest so it keeps the end and
+loses the beginning; a write crossing the boundary refused whole instead of kept
+up to it; the refused count reset per write instead of accumulated; and exactly
+full treated as overfull.
+
+**The boot report stops printing the KASLR slide, and that is the decision this
+step exists to make.** The record is about to be readable from ring 3, and
+`LINK_BASE + slide` is where the kernel is — the whole of what KASLR hides.
+Handing that to a program is an oracle against the one property the architecture
+argues for.
+
+Everything else the report prints was checked rather than assumed, and none of it
+is a secret: `hhdm base` is a **compile-time constant** stated in
+`architecture.md`, and the ACPI and SMBIOS pointers are firmware *physical*
+addresses any program that can read ACPI can find. The slide really was the only
+one.
+
+So the line now reads `applied and confirmed`, and `kaslr=show` on the command
+line prints the number — an escape hatch for whoever is debugging a fault, in the
+same shape as `iommu=off`, and available only to somebody who already controls
+the machine enough to hand it a command line.
+
+**And that broke a gate, which is the useful part.** Two gates read the slide.
+`boot-test.sh` only ever asserted that KASLR *happened*, and now accepts either
+wording. But `native-boot-test.sh` compares the number the kernel reports against
+the number the **loader drew** — RFC 0028's proof that the two halves agree — and
+that check genuinely needs the value. It cannot be checked against a number
+nobody prints.
+
+That lane now boots with `kaslr=show`. The result is a better arrangement than
+before: the weaker claim (KASLR happened) is asserted everywhere, and the
+stronger one (the loader and the kernel name the same slide) is asserted on the
+lane that can ask for the evidence. Both green.
+
+**Not done: steps 4 to 6.** The console service has no method to read the record
+back, the shell has no `dmesg`, and nothing has been read on hardware. The record
+is kept and nothing can yet get at it — which is progress in the sense that the
+bytes now exist, and no help at all to anybody standing at an SR550.
+
 ### 2026-08-23 (the guard-table test's writers and its reader disagreed about which CPU they were on)
 
 **`a_guard_record_is_identified_by_its_lock_not_by_the_line_that_took_it` failed

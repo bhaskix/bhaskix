@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-23.** Written the same day as the second hardware boot, which failed for the same reason as the first |
+| **Status** | ⬜ **Draft 2026-08-23, steps 1–3 implemented.** Written the same day as the second hardware boot, which failed for the same reason as the first. The record exists and the boot report no longer names its own address space; nothing can yet read it back, which is steps 4–6 |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/console`, `services/console`, `user/shell` |
 | **Milestone** | Phase 2. It gates nothing and unblocks **M1-17**, which has been open since Phase 0 |
@@ -206,12 +206,26 @@ say which of its three states this machine is in — a question open since
 
 ## Implementation plan
 
-1. The ring: a fixed byte buffer, fill-once, with a refused count. Pure, host
-   tested, watched red against drop-newest.
-2. The console's print path appends to it. The boot report gains its kept and
-   refused counts, and a gate.
-3. The KASLR line stops printing the slide and says applied-and-confirmed. The
-   value moves behind a capability, and `security.md` gains the row.
+1. ✅ **Done 2026-08-23.** The ring: a fixed byte buffer, fill-once, with a
+   refused count. Pure, host tested, watched red four ways including against
+   drop-newest.
+2. ✅ **Done 2026-08-23.** The console's print path appends to it, in
+   `Console::write_str` — the one place all output already passes through. The
+   boot report gains its kept and refused counts: `21570 bytes kept of 64 KiB,
+   all of it`.
+3. ✅ **Done 2026-08-23**, with one correction to this plan. The KASLR line says
+   `applied and confirmed`. The value did **not** move behind a capability —
+   there is no such capability yet — it moved behind `kaslr=show` on the command
+   line, which is the same shape as `iommu=off` and available only to somebody
+   who already controls the machine enough to pass it one.
+
+   *And it broke a gate, which is the useful part.* `native-boot-test.sh`
+   compares the slide the kernel reports against the one the **loader drew** —
+   RFC 0028's proof that the two halves agree — and that check needs the value.
+   That lane now asks for it. The weaker claim is asserted everywhere; the
+   stronger one on the lane that can ask for the evidence.
+
+   *Still owed from this step:* `security.md` has not gained its row.
 4. The console service's third method, and the capability that permits it.
 5. `dmesg` in the shell, with paging, and a help line that says what it is not.
 6. A hardware boot on the SR550 that reads back the `serial` line — and, if it

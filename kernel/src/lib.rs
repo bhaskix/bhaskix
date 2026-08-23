@@ -13733,6 +13733,25 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             + cap::MAX_CAPABILITIES * cap::size_of_node())
             / 1024
     );
+    // What the boot report itself cost, and whether all of it survived. RFC
+    // 0042: this record is what makes a machine whose report scrolls off a
+    // framebuffer diagnosable at all, and a record that quietly stopped would
+    // take the diagnosis with it.
+    {
+        let (kept, refused) = console::recorded();
+        if refused == 0 {
+            println!(
+                "    boot record    {kept} bytes kept of {} KiB, all of it -- readable back",
+                console::RECORDED_BYTES / 1024
+            );
+        } else {
+            println!(
+                "\x1b[93m    boot record    {kept} bytes kept of {} KiB and {refused} REFUSED: \
+                 the record is truncated and the earliest lines are the ones it kept\x1b[0m",
+                console::RECORDED_BYTES / 1024
+            );
+        }
+    }
     // Whether anything read after this point is complete. The transmitter drops
     // a byte rather than hang, which is right, and it did so silently until a
     // shell test failed on a string that had lost one character.
@@ -17152,8 +17171,27 @@ fn report_boot_state(handoff: &Handoff, serial: bhaskix_arch::Presence, framebuf
     let slide = handoff.kernel_virt_base.as_u64().wrapping_sub(LINK_BASE);
     if slide == 0 {
         println!("    kaslr           NOT APPLIED (image sits at its link-time base)");
+    } else if handoff
+        .cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == "kaslr=show")
+    {
+        // Asked for, at the console, by somebody who already controls the
+        // machine enough to pass it a command line.
+        println!("    kaslr           slid {slide:#x} bytes from {LINK_BASE:#018x} (kaslr=show)");
     } else {
-        println!("    kaslr           slid {slide:#x} bytes from {LINK_BASE:#018x}");
+        // **The slide is not printed, and RFC 0042 is why.** The boot report is
+        // about to become readable from ring 3, and the slide is the one thing
+        // in it that is a secret: `LINK_BASE + slide` is where the kernel is,
+        // which is the whole of what KASLR hides. Everything else the report
+        // prints is public -- `hhdm base` is a compile-time constant stated in
+        // `architecture.md`, and the ACPI and SMBIOS pointers are firmware
+        // physical addresses any program that can read ACPI can find.
+        //
+        // What the report is *for* is answering whether KASLR happened and
+        // whether the two halves agree about it, and that is a yes or no.
+        // `kaslr=show` prints the number for whoever is debugging a fault.
+        println!("    kaslr           applied and confirmed (kaslr=show prints the slide)");
     }
 
     println!("    hhdm base       {:#018x}", handoff.hhdm_base.as_u64());

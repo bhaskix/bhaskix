@@ -35,10 +35,94 @@ use crate::sync::{Rank, SpinLock};
 /// exists is exactly the code most likely to want to say something.
 static CONSOLE: SpinLock<Console> = SpinLock::new(Rank::Console, Console::empty());
 
+/// How much of what the kernel prints is kept for reading back.
+///
+/// A whole boot report today with room to grow. Sixty-four kilobytes of static
+/// kernel memory, priced on the boot line beside the other fixed tables — this
+/// project does not spend memory silently.
+pub const RECORDED_BYTES: usize = 64 * 1024;
+
+/// What the kernel has printed, kept so somebody can read it back.
+///
+/// **It fills once and then stops, which is the opposite of the telemetry
+/// rings.** [RFC 0026](../../docs/rfc/0026-telemetry-plane.md)'s event rings are
+/// drop-newest, because a running system's newest events are the ones a reader
+/// has not seen. A boot log wants the other end: what scrolls off a framebuffer
+/// is the *beginning* — the handoff, the memory map, paging, KASLR, the IOMMU —
+/// and what is still on screen is by definition already visible.
+///
+/// So this keeps the earliest bytes and counts what it refused. The count is
+/// reported, because a truncated log that does not say it is truncated is worse
+/// than no log: a reader would take the last line they can see for the last line
+/// there was.
+///
+/// RFC 0042.
+pub struct Recorder {
+    bytes: [u8; RECORDED_BYTES],
+    used: usize,
+    refused: usize,
+}
+
+impl Recorder {
+    /// An empty recorder.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            bytes: [0; RECORDED_BYTES],
+            used: 0,
+            refused: 0,
+        }
+    }
+
+    /// Records what was printed, keeping as much as still fits.
+    ///
+    /// **A partial write is kept rather than refused whole.** The byte that
+    /// crosses the boundary is the one a reader most wants — it is where the
+    /// record stops — and dropping its whole line to keep the ring tidy would
+    /// throw away the last thing the machine managed to say.
+    pub fn record(&mut self, bytes: &[u8]) {
+        let room = RECORDED_BYTES - self.used;
+        let taken = if bytes.len() < room {
+            bytes.len()
+        } else {
+            room
+        };
+        self.bytes[self.used..self.used + taken].copy_from_slice(&bytes[..taken]);
+        self.used += taken;
+        self.refused += bytes.len() - taken;
+    }
+
+    /// What was kept, in the order it was printed.
+    #[must_use]
+    pub fn kept(&self) -> &[u8] {
+        &self.bytes[..self.used]
+    }
+
+    /// How many bytes were printed and not kept.
+    #[must_use]
+    pub const fn refused(&self) -> usize {
+        self.refused
+    }
+
+    /// Whether everything printed so far was kept.
+    #[must_use]
+    pub const fn complete(&self) -> bool {
+        self.refused == 0
+    }
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A multiplexed output sink.
 pub struct Console {
     serial: Option<SerialPort>,
     framebuffer: Option<FbConsole>,
+    /// What has been printed, for reading back. RFC 0042.
+    recorder: Recorder,
 }
 
 impl Console {
@@ -46,12 +130,19 @@ impl Console {
         Self {
             serial: None,
             framebuffer: None,
+            recorder: Recorder::new(),
         }
     }
 }
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        // **Recorded first, and here rather than anywhere else.** This is the
+        // one place everything printed passes through, so "if it was printed it
+        // is in the record, and if it was not it is not" holds by construction.
+        // A second formatting path would be a log that can disagree with the
+        // console, which is two sources of truth.
+        self.recorder.record(s.as_bytes());
         if let Some(serial) = self.serial.as_ref() {
             // SAFETY: `serial` is only ever set by `init_serial`, which stores
             // it after `SerialPort::init` returned `Ok` -- exactly the
@@ -63,6 +154,17 @@ impl Write for Console {
         }
         Ok(())
     }
+}
+
+/// How much of what has been printed was kept, and how much was refused.
+///
+/// RFC 0042. Reported on every boot, because a truncated record that does not
+/// say it is truncated would have a reader take the last line they can see for
+/// the last line there was.
+#[must_use]
+pub fn recorded() -> (usize, usize) {
+    let guard = CONSOLE.lock();
+    (guard.recorder.kept().len(), guard.recorder.refused())
 }
 
 /// Brings up the serial sink.
@@ -172,4 +274,94 @@ macro_rules! println {
     ($($arg:tt)*) => {
         $crate::console::_print(::core::format_args!("{}\n", ::core::format_args!($($arg)*)))
     };
+}
+
+#[cfg(test)]
+mod recorder_tests {
+    use super::{RECORDED_BYTES, Recorder};
+
+    #[test]
+    fn what_is_printed_is_what_is_kept() {
+        let mut recorder = Recorder::new();
+        recorder.record(b"boot report\n");
+        recorder.record(b"second line\n");
+        assert_eq!(recorder.kept(), b"boot report\nsecond line\n");
+        assert_eq!(recorder.refused(), 0);
+        assert!(recorder.complete());
+    }
+
+    #[test]
+    fn an_empty_recorder_has_kept_nothing_and_refused_nothing() {
+        let recorder = Recorder::new();
+        assert!(recorder.kept().is_empty());
+        assert_eq!(recorder.refused(), 0);
+        assert!(
+            recorder.complete(),
+            "a machine that has printed nothing has lost nothing"
+        );
+    }
+
+    #[test]
+    fn filling_it_exactly_refuses_nothing() {
+        // The boundary that a fill-once ring gets wrong: exactly full is full,
+        // not overfull.
+        let mut recorder = Recorder::new();
+        recorder.record(&[b'x'; RECORDED_BYTES]);
+        assert_eq!(recorder.kept().len(), RECORDED_BYTES);
+        assert_eq!(recorder.refused(), 0);
+        assert!(recorder.complete());
+    }
+
+    #[test]
+    fn one_byte_over_is_one_byte_refused() {
+        let mut recorder = Recorder::new();
+        recorder.record(&[b'x'; RECORDED_BYTES]);
+        recorder.record(b"y");
+        assert_eq!(recorder.kept().len(), RECORDED_BYTES);
+        assert_eq!(recorder.refused(), 1);
+        assert!(!recorder.complete());
+    }
+
+    #[test]
+    fn a_write_that_crosses_the_end_is_kept_up_to_it() {
+        // **The byte that crosses the boundary is the one a reader most wants**
+        // -- it is where the record stops. Refusing the whole write to keep the
+        // ring tidy throws away the last thing the machine managed to say.
+        let mut recorder = Recorder::new();
+        recorder.record(&[b'x'; RECORDED_BYTES - 4]);
+        recorder.record(b"abcdefgh");
+        assert_eq!(recorder.kept().len(), RECORDED_BYTES);
+        assert_eq!(&recorder.kept()[RECORDED_BYTES - 4..], b"abcd");
+        assert_eq!(recorder.refused(), 4);
+    }
+
+    #[test]
+    fn the_beginning_is_what_survives_and_not_the_end() {
+        // The whole reason this is fill-once rather than drop-oldest. What
+        // scrolls off a framebuffer is the *start* of the boot report; the end
+        // is still on screen. A ring that kept the newest bytes would keep
+        // exactly what the operator can already see.
+        let mut recorder = Recorder::new();
+        recorder.record(b"FIRST");
+        recorder.record(&[b'x'; RECORDED_BYTES]);
+        assert_eq!(
+            &recorder.kept()[..5],
+            b"FIRST",
+            "the first line printed must still be readable after the ring fills"
+        );
+        assert_eq!(recorder.refused(), 5);
+    }
+
+    #[test]
+    fn refusals_accumulate_rather_than_reporting_only_the_last() {
+        let mut recorder = Recorder::new();
+        recorder.record(&[b'x'; RECORDED_BYTES]);
+        recorder.record(b"aaa");
+        recorder.record(b"bb");
+        assert_eq!(
+            recorder.refused(),
+            5,
+            "a count that reset would understate what was lost"
+        );
+    }
 }

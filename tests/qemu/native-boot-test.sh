@@ -82,7 +82,16 @@ cp "$LOADER" "$ESP/EFI/BOOT/BOOTX64.EFI"
 # entry step.
 cp "$KERNEL" "$ESP/bhaskix/kernel"
 cp "$INITRD" "$ESP/bhaskix/initrd.tar"
-printf 'cmdline=\n' > "$ESP/bhaskix/boot.conf"
+# **`kaslr=show`, and it is load-bearing for the gate below.** RFC 0042 stopped
+# the boot report printing the slide, because the report is about to be readable
+# from ring 3 and the slide is the one secret in it. But the check that makes
+# KASLR *real* on this lane is that the kernel names the same number the loader
+# drew -- and it cannot be checked against a number nobody prints.
+#
+# So this lane asks for it. That is not a hole: a machine somebody can hand a
+# command line to is a machine they already control, which is the same reasoning
+# `iommu=off` rests on.
+printf 'cmdline=kaslr=show\n' > "$ESP/bhaskix/boot.conf"
 
 # The build's own checksums, computed independently of the loader by the
 # same stated arithmetic (FNV-1a 64), so the gate is two implementations

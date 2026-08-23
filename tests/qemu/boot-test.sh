@@ -2417,7 +2417,13 @@ else
     status=1
 fi
 
-if grep -qE "kaslr +slid 0x[0-9a-f]+ bytes" "$LOG" \
+# **The report stopped printing the slide on 2026-08-23** (RFC 0042: it is the
+# one secret in a report that is about to be readable from ring 3), so this
+# accepts either wording. What it asserts is unchanged and is all it ever
+# asserted: that KASLR *happened*. The number itself is checked on the native
+# lane, which asks for it with `kaslr=show` and compares it against the slide the
+# loader drew -- a stronger check, and the one that needs the value.
+if grep -qE "kaslr +(applied and confirmed|slid 0x[0-9a-f]+ bytes)" "$LOG" \
    && ! grep -qF "kaslr           NOT APPLIED" "$LOG"; then
     pass "KASLR applied (kernel image slid from its link-time base)"
 else
