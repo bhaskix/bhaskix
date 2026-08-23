@@ -535,7 +535,10 @@ fn list_at(cache: &mut Cache<'static, BlockService>, badge: u64, args: &[u64; 4]
         dir::OK,
         u64::from_le_bytes(low),
         u64::from_le_bytes(high),
-        length as u64 | (is_directory << 8),
+        // Packed by the ABI rather than here, so that the three fields in
+        // this word have one definition and the readers of it cannot drift
+        // from the writer.
+        dir::listing(length, is_directory != 0, child),
     ]);
 }
 
@@ -771,7 +774,11 @@ fn lend(cache: &mut Cache<'static, BlockService>, badge: u64) {
     let Ok(frame) = cache.pin(block) else {
         // Every frame is lent already. A refusal, and the honest one: the
         // alternative is taking back a page somebody is reading.
-        answer(dir::NOWHERE, 0, 0);
+        // **The third word says which of this method's three refusals it
+        // was.** They all answer `NOWHERE`, and a caller that could not tell
+        // them apart cannot tell "no frame left here" from "no slot left
+        // there" -- which are faults on opposite sides of the call.
+        answer(dir::NOWHERE, 0, 1);
         return;
     };
     // Churn the cache before handing anything over. This is not housekeeping;
@@ -834,7 +841,7 @@ fn lend(cache: &mut Cache<'static, BlockService>, badge: u64) {
     );
     if derived != status::OK {
         cache.unpin(frame);
-        answer(dir::NOWHERE, derived, 0);
+        answer(dir::NOWHERE, derived, 2);
         return;
     }
 
@@ -848,7 +855,7 @@ fn lend(cache: &mut Cache<'static, BlockService>, badge: u64) {
         answer(dir::OK, size, 0);
     } else {
         cache.unpin(frame);
-        answer(dir::NOWHERE, handed, 0);
+        answer(dir::NOWHERE, handed, 3);
     }
 }
 
@@ -1046,7 +1053,12 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
             [ENDPOINT, rights::READ | rights::DERIVE, child_badge, 0],
         );
         if handed == status::OK {
-            answer(dir::OK, size, is_directory);
+            // **The inode goes with the answer**, in the word that was
+            // spare. A caller answering a Linux `fstat` needs the
+            // filesystem's own name for the file and has no other way to
+            // learn it: the badge carrying it is the *service's* to read,
+            // and a caller holding the capability cannot see inside it.
+            answer_words([dir::OK, size, is_directory, u64::from(found)]);
         } else {
             // The commonest reason is that the caller never said where. That
             // is the caller's mistake and not a missing name, so it is a

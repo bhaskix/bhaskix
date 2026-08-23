@@ -590,7 +590,11 @@ pub mod dir {
     /// with [`method::EXPECT`], before calling.
     ///
     /// Replies with `args[0]` an outcome below, `args[1]` the size in bytes,
-    /// and `args[2]` non-zero if what was opened is itself a directory. On
+    /// `args[2]` non-zero if what was opened is itself a directory, and
+    /// `args[3]` its **inode number** — the filesystem's own name for it,
+    /// which a caller answering a Linux `fstat` needs and cannot invent: a
+    /// descriptor's identity cannot come from the capability slot holding it,
+    /// because slots are reused and two files would report as one. On
     /// [`OK`] a capability to it has been handed to the caller.
     pub const OPEN_AT: u64 = 1;
     /// Lend the caller the page holding this file's first block.
@@ -697,8 +701,15 @@ pub mod dir {
     pub const REMOVE_AT: u64 = 7;
     /// List this directory: `arg0` = an entry index, and each call is its
     /// own question — no session, no cursor, nothing for a caller to leak.
-    /// Replies with the entry's name as a chunk in `args[1..3]`, its kind
-    /// in the reply's fourth word, [`END`] past the last entry.
+    /// Replies with the entry's name as a chunk in `args[1..3]`, [`END`]
+    /// past the last entry, and the name's length, the entry's kind and its
+    /// inode packed into the fourth word.
+    ///
+    /// **Read that word with [`listing_length`], [`listing_is_directory`]
+    /// and [`listing_inode`] rather than by hand.** It carried two fields
+    /// and now carries three, and the obvious hand-written test for the
+    /// second one — `word >> 8 != 0` — was correct while the inode was
+    /// absent and reports every entry as a directory now that it is there.
     pub const LIST_AT: u64 = 8;
     /// Read bytes of the file this handle names into memory the caller
     /// named — [`WRITE_FROM`]'s mirror, and what running an installed
@@ -712,6 +723,38 @@ pub mod dir {
     /// the file in place. Replies with the count in `args[1]`; zero is end
     /// of file. Any handle may read: reading is what every handle has.
     pub const READ_INTO: u64 = 9;
+
+    /// Packs [`LIST_AT`]'s fourth reply word: the name's length in the low
+    /// byte, whether the entry is a directory in bit 8, and the inode above
+    /// bit 32.
+    ///
+    /// **Bit 8 and not "anything above the low byte".** The inode sits well
+    /// clear of it so that the two can never be confused, and the reason is
+    /// written here rather than left to a reader: the field grew, and every
+    /// caller that had read the kind as "the rest of the word" would have
+    /// started calling every file a directory.
+    #[must_use]
+    pub const fn listing(length: usize, is_directory: bool, inode: u32) -> u64 {
+        ((length as u64) & 0xff) | ((is_directory as u64) << 8) | ((inode as u64) << 32)
+    }
+
+    /// The name's length out of [`listing`]'s word.
+    #[must_use]
+    pub const fn listing_length(word: u64) -> usize {
+        (word & 0xff) as usize
+    }
+
+    /// Whether the entry is a directory, out of [`listing`]'s word.
+    #[must_use]
+    pub const fn listing_is_directory(word: u64) -> bool {
+        word & (1 << 8) != 0
+    }
+
+    /// The entry's inode, out of [`listing`]'s word.
+    #[must_use]
+    pub const fn listing_inode(word: u64) -> u32 {
+        (word >> 32) as u32
+    }
 
     /// Packs an inode and a generation into the badge that names them.
     #[must_use]
@@ -1395,6 +1438,57 @@ impl LineEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listing_word_carries_three_fields_that_cannot_be_read_as_each_other() {
+        let word = dir::listing(5, false, 0x1234_5678);
+        assert_eq!(dir::listing_length(word), 5);
+        assert_eq!(dir::listing_inode(word), 0x1234_5678);
+        // **The regression this accessor exists for.** A plain `word >> 8`
+        // was the directory test while the word held two fields; with an
+        // inode above it, every entry in the tree would list as a directory
+        // and `pkg remove` would try to recurse into files.
+        assert!(
+            !dir::listing_is_directory(word),
+            "a file with a large inode is still a file"
+        );
+        assert!(dir::listing_is_directory(dir::listing(
+            5,
+            true,
+            0x1234_5678
+        )));
+    }
+
+    #[test]
+    fn a_listing_word_at_the_edges_of_each_field_still_reads_back() {
+        for (length, directory, inode) in [
+            (0usize, false, 0u32),
+            (255, true, u32::MAX),
+            (16, true, 1),
+            (1, false, u32::MAX),
+        ] {
+            let word = dir::listing(length, directory, inode);
+            assert_eq!(dir::listing_length(word), length, "{word:#x}");
+            assert_eq!(dir::listing_is_directory(word), directory, "{word:#x}");
+            assert_eq!(dir::listing_inode(word), inode, "{word:#x}");
+        }
+    }
+
+    #[test]
+    fn an_over_long_name_cannot_reach_out_of_its_field_and_flip_the_kind() {
+        // The length is a `usize` and the field is eight bits, so a caller
+        // that passed a longer one would otherwise write straight through
+        // the directory bit -- turning a file into a directory by the length
+        // of its name. Masked at packing, and this is what says so.
+        // A first version of this test used 255 and passed with the mask
+        // removed, which made it a test of nothing.
+        let word = dir::listing(0x1ff, false, 1);
+        assert!(!dir::listing_is_directory(word), "{word:#x}");
+        assert_eq!(dir::listing_inode(word), 1);
+        // Bits 9..32 are unclaimed and must stay that way, so the next field
+        // to arrive has somewhere to go that no caller is already reading.
+        assert_eq!(dir::listing(255, true, u32::MAX) & 0x0000_0000_ffff_fe00, 0);
+    }
 
     #[test]
     fn a_chunk_survives_a_round_trip_at_every_length() {

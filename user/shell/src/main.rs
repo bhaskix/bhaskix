@@ -1797,7 +1797,7 @@ fn pkg_list() {
         }
         match reply.args[0] {
             dir::OK => {
-                let length = (reply.args[3] & 0xff) as usize;
+                let length = dir::listing_length(reply.args[3]);
                 let mut name = [0u8; 16];
                 name[..8].copy_from_slice(&reply.args[1].to_le_bytes());
                 name[8..].copy_from_slice(&reply.args[2].to_le_bytes());
@@ -1839,8 +1839,13 @@ fn pkg_clear_directory(held: u64, spare: u64) -> bool {
             dir::OK => {}
             _ => return false,
         }
-        let length = (reply.args[3] & 0xff) as usize;
-        let is_directory = reply.args[3] >> 8 != 0;
+        // **Through the accessors, and this is the site that made them
+        // necessary.** The kind used to be read here as `args[3] >> 8`,
+        // which was right while the word held nothing above it; the listing
+        // now carries an inode there, and the hand-written test would call
+        // every file a directory and send this loop recursing into them.
+        let length = dir::listing_length(reply.args[3]);
+        let is_directory = dir::listing_is_directory(reply.args[3]);
         let mut name = [0u8; 16];
         name[..8].copy_from_slice(&reply.args[1].to_le_bytes());
         name[8..].copy_from_slice(&reply.args[2].to_le_bytes());
