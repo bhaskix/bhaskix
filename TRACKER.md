@@ -711,7 +711,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Task | Blocked on | Owner |
 |---|---|---|
-| M1-17 | ~~Physical UEFI machine with serial. QEMU cannot substitute.~~ **The machine is no longer the blocker, corrected 2026-08-23.** A Lenovo ThinkSystem SR550 is available over its BMC and the image booted on it 2026-08-22, observed on screen. What is owed is a boot that was **captured**: the output reached the framebuffer and not serial-over-LAN, so no boot report was read and no self-test result from real hardware is known. This row read as though no machine existed for a day after one did. | Tarun Kumar Kushwaha |
+| M1-17 | ~~Physical UEFI machine with serial. QEMU cannot substitute.~~ **And not a *captured* boot report either, corrected again 2026-08-23 after a second boot: what is missing is that nobody can **read** what the machine printed. The report scrolls off a framebuffer, serial carries only the firmware on this machine, and no shell command brings it back — see [RFC 0042](docs/rfc/0042-reading-the-boot-report-back.md).** **The machine is no longer the blocker, corrected 2026-08-23.** A Lenovo ThinkSystem SR550 is available over its BMC and the image booted on it 2026-08-22, observed on screen. What is owed is a boot that was **captured**: the output reached the framebuffer and not serial-over-LAN, so no boot report was read and no self-test result from real hardware is known. This row read as though no machine existed for a day after one did. | Tarun Kumar Kushwaha |
 | Repo metadata | GitHub description and topics are unset, and `main` has no branch protection — `GOVERNANCE.md` §2 requires review for non-trivial changes and nothing enforces it. Deploy keys have no API scope, so these need the web UI. | Tarun Kumar Kushwaha |
 | CI log access | Reading Actions logs needs authentication; unauthenticated API gives 60 requests/hour and only pass/fail. A fine-grained token with `Actions: read` would remove both limits. | Tarun Kumar Kushwaha |
 
@@ -790,6 +790,72 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-23 (the second hardware boot, and it failed at the same wall as the first: nobody can read what the machine printed)
+
+**Bhaskix booted on the SR550 for the second time, reached a shell, and answered
+the keyboard.** The operator watched it on the BMC's graphical console and typed
+commands at it. That is the same result as 2026-08-22 and it is **still not
+M1-17**, because the criterion is a boot somebody *read*, not one somebody saw.
+
+**What was captured this time, which is more than last time.** A
+serial-over-LAN session was attached *before* the reset and held throughout.
+Saved at `/root/bhaskix-hardware-logs/sol-20260823-130114.txt`. It carries the
+firmware and stops:
+
+```
+ UEFI:DXE INIT
+192 GB memory detected
+1 processor(s) detected, 8 cores enabled
+Intel(R) Xeon(R) Silver 4110 CPU @ 2.10GHz
+<F1> System Setup     <F10> PXE Boot
+ UEFI:POST END
+```
+
+Then nothing. The firmware's own console redirection works; whatever the kernel
+writes does not arrive.
+
+**The machine did boot the image, and that is established rather than inferred.**
+The one-time override was consumed — `Boot: Disabled None` after the reset, having
+been `Once / Cd` before it — and the BMC fetched the ISO once (`HEAD` then `GET`
+from `10.5.5.103` in the server log). The system reported
+`BootingOSOrInUndetectedOS`, and the operator confirmed a prompt on screen.
+
+**What is still not known, and the reason is worth stating plainly.** The boot
+report scrolled off before anyone looked, and **there is no way to get it back**:
+the shell has fourteen commands and none of them is `dmesg`. So the `serial`
+line — which names which of three states the UART probe found, and would say
+whether commit `0087b87`'s fix works on this machine — remains unread. **The
+diagnosis for a broken channel is printed to the broken channel.**
+
+That circularity is the finding. Both hardware boots this project has ever done
+died at the same wall, for the same reason, and it is not a hardware problem: the
+instrument every claim in this repository rests on is unreadable on the machine
+the claims most need testing on.
+
+**One concrete lead recorded while the machine was up.** The kernel probes
+**COM1 and only COM1** — `console::init_serial(COM1)`, and nothing anywhere uses
+`COM2`, though `arch/x86_64/src/serial.rs` defines it. This machine's BIOS has
+**both** ports enabled, `ConsoleRedirection Enable`, `SPRedirection Enable`,
+`SerialPortAccessMode Shared`, `SerialPortSharing Enable`. Baud is not the
+mismatch: the BIOS says `Com1BaudRate_115200` and the kernel programs divisor 1
+of the 115200 base clock. Whether the port is wrong is a hypothesis, not a
+finding, and it stays one until somebody reads the `serial` line.
+
+**→ [RFC 0042](docs/rfc/0042-reading-the-boot-report-back.md), drafted the same
+day.** A bounded ring filled by the same call that prints, read back through the
+console *service* rather than a new syscall, and a `dmesg` at the shell. Its hard
+part is not the ring: **the boot report prints the KASLR slide**, so handing the
+log to a ring 3 program hands it an oracle against the one property the whole
+architecture argues for. The RFC recommends the report stop printing the slide
+and say `applied and confirmed` instead, keeping the number behind a capability —
+which is a change to what the report *says*, and the reason it is an RFC rather
+than a patch.
+
+**The machine was restored**: image unmounted (`MountImages` count 0), the
+one-time override already self-cleared, and a restart back to its own boot order.
+It is a live node of the operator's cluster and each of these tests costs it a
+reboot.
 
 ### 2026-08-23 (RFC 0041 ACCEPTED: the gate watched red three ways, and a README paragraph stale on three counts of its own)
 
