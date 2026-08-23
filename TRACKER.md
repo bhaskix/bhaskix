@@ -791,6 +791,53 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (RFC 0043 drafted: the IOMMU cannot simply be turned on, and the reason is the machine it would stop)
+
+**The obvious fix is fifteen lines and it is the wrong shape.** `iommu_bringup`
+returns on `virtio::probe()?`, so trying virtio block, then virtio net, then xHCI
+would have made the SR550 work. It would also have left the same bug wearing a
+different hat on the next machine whose first device is something else — because
+the root table is not any device's. It is the machine's.
+
+**What stopped this being a patch.** With translation on and a context entry
+absent, that device's DMA is **refused**. On a real server the boot device is on
+the PCIe bus — and on the machine this was found on, the boot device is a **CD
+emulated by the BMC over that same bus**. Enable translation with no window for
+it and the machine stops reading the medium it is running from.
+
+QEMU has never shown this, because there the one device that mattered was the one
+the sequence happened to be anchored on.
+
+So the rule the RFC proposes is not "enable whenever there is a unit":
+
+> Translation is enabled only when **every DMA-capable device this kernel can
+> see has a window**. A machine holding a bus master this kernel cannot describe
+> boots with the IOMMU off, loudly.
+
+That is a **weaker** guarantee than "the IOMMU is always on", and it is the
+honest one. Most real machines have hardware this kernel has no driver for.
+
+**And it puts a question in front of somebody rather than answering it.** For a
+device the kernel cannot drive: refuse to enable at all, or give it an
+identity-mapped window so the units come up and the devices that *do* have
+drivers are contained? The second is what real systems do at bring-up, and it is
+**not containment** for those devices — calling it so would be exactly the kind
+of claim this project refuses. That is unresolved question 1, and it is a
+security decision rather than an engineering one.
+
+**Three more it records rather than solves:** requester ids rewritten by
+PCIe-to-PCI bridges, whether an `iommu=permissive` is wanted beside `iommu=off`,
+and whether the BMC's emulated CD survives translation at all — which nothing
+here knows, and which the first attempt will find out the hard way.
+
+**The circularity is worth keeping in view.** On the SR550 the only DMA-capable
+device this kernel recognises is the xHCI controller; RFC 0041's rule 1 refuses a
+controller with no translation; and bring-up wanted a device to anchor the
+translation on. The USB keyboard built yesterday cannot run on the machine it was
+built for until this lands. Neither half is wrong on its own — the sequence is.
+
+No code. `make gates` green.
+
 ### 2026-08-23 (the IOMMU has never been enabled on a real machine, because its bring-up asks for a virtio device first)
 
 **Found by the boot that closed M1-17**, in its own report:
