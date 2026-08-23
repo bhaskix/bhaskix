@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-23, steps 1–3 implemented.** Written the same day as the second hardware boot, which failed for the same reason as the first. The record exists and the boot report no longer names its own address space; nothing can yet read it back, which is steps 4–6 |
+| **Status** | ⬜ **Draft 2026-08-23, steps 1–5 implemented.** Written the same day as the second hardware boot, which failed for the same reason as the first. `dmesg` at the shell replays the boot report from its first line, and the report no longer names its own address space. Step 6 — reading it back on the SR550 — is the one that closes M1-17, and is not done |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/console`, `services/console`, `user/shell` |
 | **Milestone** | Phase 2. It gates nothing and unblocks **M1-17**, which has been open since Phase 0 |
@@ -86,9 +86,20 @@ on the boot line beside the other fixed tables.
 ### Reading it back is a capability, not a syscall
 
 The console already runs as a service and already answers `WRITE` and `READ`. It
-gains a third method, and a program that holds a capability to the console may
-ask for the log the same way it asks to write. **The kernel gains no method and
-no object** — the same bar RFC 0030 held itself to.
+gains two more, and a program that holds a capability to the console may ask for
+the log the same way it asks to write.
+
+> **"The kernel gains no method and no object" was wrong, and step 4 found out.**
+> That sentence stood here until 2026-08-23 and was written by analogy with RFC
+> 0030, which really did add nothing to the nucleus. This is not that case. The
+> boot report is written by the *kernel*, before any service exists, so the
+> record is kernel memory — and a console service running in its own domain
+> cannot read kernel memory. Asking is a method.
+>
+> The kernel gains **two**: `RECORD_SIZE` and `RECORD`, both on a `Console`
+> capability and both needing `READ`. The kernel gains no new *object*, which is
+> the part of the original claim that survives. The Linux adapter, the one holder
+> given `WRITE` alone, still cannot ask for either.
 
 The shell gains one command. Its name should be the one a person coming from
 Linux would guess, per the standing user-friendliness rule: **`dmesg`**. The name
@@ -226,8 +237,15 @@ say which of its three states this machine is in — a question open since
    stronger one on the lane that can ask for the evidence.
 
    *Still owed from this step:* `security.md` has not gained its row.
-4. The console service's third method, and the capability that permits it.
-5. `dmesg` in the shell, with paging, and a help line that says what it is not.
-6. A hardware boot on the SR550 that reads back the `serial` line — and, if it
+4. ✅ **Done 2026-08-23**, and it corrected this document — see the note above.
+   Two kernel methods rather than none, `RECORD_SIZE` and `RECORD`, both needing
+   `READ` on a `Console` capability; two service methods above them; both
+   placements wired, so the answer is the same whether the console runs in the
+   nucleus or in a domain.
+5. ✅ **Done 2026-08-23.** `dmesg` in the shell, and a help line that says what
+   it is not. Gated: it must replay the **first** thing the kernel printed, and
+   the check runs against the typed session only — where that text can have come
+   from nowhere but the replay.
+6. ⬜ A hardware boot on the SR550 that reads back the `serial` line — and, if it
    says what commit `0087b87` intended, closes a question open since the first
    physical boot this project ever did.

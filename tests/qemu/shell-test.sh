@@ -97,7 +97,7 @@ else
     # handle lives in one slot, so each `open` takes it from the one before --
     # and `inner` is the one whose page gets lent, so its handle has to still be
     # there when the lending is given back at the end.
-    commands=$'help\r'$'caps\r'$'map\r'$'irq\r'$'open greeting\r'
+    commands=$'help\r'$'dmesg\r'$'caps\r'$'map\r'$'irq\r'$'open greeting\r'
     commands+=$'open sub/inner\r'$'open ..\r'$'open inner\r'$'ls /\r'$'cat etc/hostname\r'
     if [[ "$MODE" == "iommu" ]]; then
         # `ask` was called `lend` until 2026-08-21, when the name was found to
@@ -319,6 +319,17 @@ else
         "the prompt appeared:bhaskix[$] "
         "a typed command was echoed and run:bhaskix[$] help"
         "help listed its commands:caps              what this program is allowed to do"
+        # RFC 0042. `dmesg` must reproduce the **beginning** of the boot
+        # report -- the part that scrolls off a framebuffer and that neither
+        # hardware boot could recover.
+        #
+        # This is checked against `$SESSION`, which is only the conversation
+        # after the shell started; the boot report itself is excluded from it
+        # for the reason the comment above `SESSION` gives. So this line can
+        # only be here because `dmesg` replayed it, and it is the *first* thing
+        # the kernel prints -- a weaker check for any output at all would pass
+        # on a command that printed the last line it could still see.
+        "dmesg replayed the start of the boot report:An open-source, AI-native, enterprise operating system"
         # The line the milestone is about. Two capabilities work; a slot this
         # program was never given is refused by the kernel, before any service
         # is reached -- and it says so in different words.

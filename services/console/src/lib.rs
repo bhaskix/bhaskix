@@ -27,6 +27,14 @@ pub struct Ports {
     pub read: fn() -> u8,
     /// Takes a byte if one is already waiting, without blocking.
     pub try_read: fn() -> Option<u8>,
+    /// How many bytes of what the kernel printed are kept. RFC 0042.
+    pub record_size: fn() -> usize,
+    /// Eight bytes of that record from `offset`, zero-padded past the end.
+    ///
+    /// Eight and not sixteen because that is what one reply word carries in the
+    /// domain placement, and the placement is what this abstraction exists to
+    /// hide. The service asks twice per chunk.
+    pub record_at: fn(usize) -> [u8; 8],
 }
 
 // There is deliberately no counter here.
@@ -58,6 +66,8 @@ impl Service for Console {
         match request.method {
             console::WRITE => Reply::new(write(ports, request.args)),
             console::READ => Reply::new(read(ports)),
+            console::RECORD_SIZE => Reply::new([(ports.record_size)() as u64, 0, 0, 0]),
+            console::RECORD => Reply::new(record(ports, request.args)),
             _ => Reply::new([with_outcome(0, outcome::WRONG_KIND), 0, 0, 0]),
         }
     }
@@ -107,6 +117,30 @@ fn read(ports: &Ports) -> [u64; 4] {
     chunk.pack(0)
 }
 
+/// Answers one chunk of the boot report, from the offset the caller asked for.
+///
+/// **A short chunk means the end, and an empty one means past it.** The caller
+/// asked [`console::RECORD_SIZE`] first, so it already knows where the end is;
+/// this being consistent with that is a second statement of the same fact, and
+/// a caller that trusted only one of them would still stop in the right place.
+fn record(ports: &Ports, args: &[u64; 4]) -> [u64; 4] {
+    let offset = args[0] as usize;
+    let size = (ports.record_size)();
+    let remaining = size.saturating_sub(offset);
+    let wanted = remaining.min(CHUNK_BYTES);
+
+    let mut bytes = [0u8; CHUNK_BYTES];
+    let mut filled = 0;
+    while filled < wanted {
+        let eight = (ports.record_at)(offset + filled);
+        let take = (wanted - filled).min(8);
+        bytes[filled..filled + take].copy_from_slice(&eight[..take]);
+        filled += take;
+    }
+    let (chunk, _) = Chunk::take(&bytes[..filled]);
+    chunk.pack(size as u64)
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -118,7 +152,7 @@ mod tests {
     use bhaskix_abi::{outcome, outcome_of};
     use bhaskix_service::{Request, Service};
 
-    use super::{Console, Ports};
+    use super::{Chunk, Console, Ports, console};
 
     /// What the fake console has been shown, and what it will hand back.
     ///
@@ -137,6 +171,9 @@ mod tests {
         lock.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// What the kernel is pretending to have printed. RFC 0042.
+    static RECORD: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
     fn ports() -> Ports {
         Ports {
             put: |character| held(&PUT).push(character),
@@ -144,6 +181,16 @@ mod tests {
             try_read: || {
                 let mut typed = held(&TYPED);
                 (!typed.is_empty()).then(|| typed.remove(0))
+            },
+            record_size: || held(&RECORD).len(),
+            record_at: |offset| {
+                let record = held(&RECORD);
+                let mut out = [0u8; 8];
+                if offset < record.len() {
+                    let end = (offset + 8).min(record.len());
+                    out[..end - offset].copy_from_slice(&record[offset..end]);
+                }
+                out
             },
         }
     }
@@ -201,5 +248,44 @@ mod tests {
         // its capability, so "the caller sent nonsense" has to be an outcome.
         let reply = Console::handle(&mut (), &ports(), request(0xdead_beef, &[0; 4]));
         assert_eq!(outcome_of(reply.args[0]), outcome::WRONG_KIND);
+    }
+
+    /// The boot report, served back a chunk at a time. RFC 0042.
+    #[test]
+    fn the_record_is_served_a_chunk_at_a_time_and_ends_where_it_ends() {
+        {
+            let mut record = held(&RECORD);
+            record.clear();
+            record.extend_from_slice(b"boot report line one\nline two\n");
+        }
+        let ports = ports();
+        let size = held(&RECORD).len();
+
+        // The size is asked before anything is read, because a zero byte is a
+        // byte somebody could have printed and cannot mean "the end".
+        let reply = Console::handle(&mut (), &ports, request(console::RECORD_SIZE, &[0; 4]));
+        assert_eq!(reply.args[0] as usize, size);
+
+        // Reassembled a chunk at a time, exactly as a caller would.
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset < size {
+            let args = [offset as u64, 0, 0, 0];
+            let reply = Console::handle(&mut (), &ports, request(console::RECORD, &args));
+            let chunk = Chunk::unpack(&reply.args);
+            assert!(
+                !chunk.bytes().is_empty(),
+                "a chunk before the end must carry bytes, or the caller loops for ever"
+            );
+            out.extend_from_slice(chunk.bytes());
+            offset += chunk.bytes().len();
+        }
+        assert_eq!(out, b"boot report line one\nline two\n");
+
+        // Past the end is empty rather than an error, so a caller that trusted
+        // the chunks alone stops where one that trusted the size does.
+        let args = [size as u64, 0, 0, 0];
+        let reply = Console::handle(&mut (), &ports, request(console::RECORD, &args));
+        assert!(Chunk::unpack(&reply.args).bytes().is_empty());
     }
 }

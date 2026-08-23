@@ -791,6 +791,80 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (RFC 0042 steps 4–5: `dmesg`, and the RFC's own "the kernel gains no method" was wrong)
+
+**A person at the machine can read the boot report back.**
+
+```
+bhaskix$ dmesg
+
+      ____  _   _    _    ____  _  _____  __
+     | __ )| | | |  / \  / ___|| |/ /_ _| \ \/ /
+     ...
+     An open-source, AI-native, enterprise operating system,
+     built from scratch, from India.
+```
+
+That is the *first* thing the kernel printed, replayed at a shell prompt — the
+part that scrolls off a framebuffer, and the part neither hardware boot could
+recover.
+
+**The gate is the beginning, not "some output".** It asserts that
+`An open-source, AI-native, enterprise operating system` appears in the **typed
+session**, which `shell-test.sh` keeps separate from the boot log for a reason it
+already documented: asserting against the whole log would pass with console input
+entirely broken. So that text can have come from nowhere but the replay. A weaker
+check for any output at all would pass on a command that printed the last line it
+could still see, which is exactly the failure being fixed.
+
+**RFC 0042 said "the kernel gains no method and no object". It was wrong, and
+step 4 found out.** That sentence was written by analogy with RFC 0030, which
+really did add nothing to the nucleus. This is not that case: the boot report is
+written by the **kernel**, before any service exists, so the record is kernel
+memory — and a console service running in its own domain cannot read kernel
+memory. Asking is a method.
+
+The kernel gains **two**: `RECORD_SIZE` and `RECORD`, on a `Console` capability,
+both needing `READ`. The part of the claim that survives is "no new object", and
+the containment still holds where it was designed to: the Linux adapter is the
+one holder given `WRITE` alone, and it cannot ask for either. The correction is
+written in the RFC beside the sentence it replaces.
+
+**Two methods and not one, because a reply carries one word.** `RECORD` answers
+eight bytes at an offset, zero-padded past the end — and a zero byte is a byte
+somebody could have printed, so it cannot mean *the end*. The size is therefore a
+separate question, asked first. The service above it reassembles sixteen-byte
+chunks and answers the size alongside every one, so a caller that trusted only
+the chunks stops where a caller that trusted only the size does. Both statements
+of the same fact, and a host test checks they agree.
+
+**Both placements, and that is the point of `Ports`.** In the nucleus the two are
+the kernel's own routines; in a domain they are calls out on the console
+capability. The service does not know which, which is RFC 0013's claim being
+true rather than repeated.
+
+**`security.md` gains the row that step 3 owed.** The boot report is now readable
+from ring 3, so every address in it is something a program can be told — and the
+report was **audited** rather than assumed. Exactly one line was secret: the
+KASLR slide. `hhdm base` is a compile-time constant stated in `architecture.md`;
+the ACPI and SMBIOS pointers are firmware *physical* addresses anything that can
+read ACPI can find; the rest are sizes and offsets, not the bases they are
+relative to.
+
+The row also says what is **not** claimed: the report is not sanitised and no
+filter runs over it. The argument is that there was one secret and it was removed
+at the source. A future line printing a slid address would put it back and
+nothing mechanical would notice. That is a real gap, stated rather than closed,
+because a filter that must recognise every address format is a parser with a
+security obligation and would be wrong the first time somebody printed an address
+in a new shape.
+
+**What is left is the one that matters.** Step 6: read it back on the SR550. The
+`serial` line has been unread since the first physical boot this project ever
+did, and it names which of three states the UART probe found. Until somebody
+types `dmesg` on that machine, M1-17 stays open and the serial question stays
+open with it.
+
 ### 2026-08-23 (RFC 0042 steps 1–3: what the kernel printed is kept, and the boot report stops naming its own address space)
 
 **The record exists.** Everything the kernel prints now also goes into a

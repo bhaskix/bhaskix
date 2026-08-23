@@ -167,6 +167,23 @@ pub fn recorded() -> (usize, usize) {
     (guard.recorder.kept().len(), guard.recorder.refused())
 }
 
+/// Eight bytes of the record starting at `offset`, zero-padded past the end.
+///
+/// Eight because that is what one reply word carries, and a caller asks
+/// [`recorded`] for the length first — a zero byte is a byte somebody could
+/// have printed, so it cannot mean "the end". RFC 0042.
+#[must_use]
+pub fn recorded_at(offset: usize) -> [u8; 8] {
+    let guard = CONSOLE.lock();
+    let kept = guard.recorder.kept();
+    let mut out = [0u8; 8];
+    if offset < kept.len() {
+        let end = (offset + 8).min(kept.len());
+        out[..end - offset].copy_from_slice(&kept[offset..end]);
+    }
+    out
+}
+
 /// Brings up the serial sink.
 ///
 /// Answers what the probe concluded. The caller reports it rather than

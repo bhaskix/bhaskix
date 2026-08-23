@@ -92,6 +92,26 @@ extern "C" fn consoled_main() -> ! {
                     None
                 }
             },
+            // RFC 0042. The record is kernel memory -- the boot report is
+            // written before this program exists -- so reading it is a call
+            // out, exactly as putting a character is.
+            record_size: || {
+                let (status, size) = call(syscall::INVOKE, CONSOLE, method::RECORD_SIZE, 0);
+                if status == status::OK {
+                    size as usize
+                } else {
+                    0
+                }
+            },
+            record_at: |offset| {
+                let (status, packed) =
+                    call(syscall::INVOKE, CONSOLE, method::RECORD, offset as u64);
+                if status == status::OK {
+                    packed.to_le_bytes()
+                } else {
+                    [0; 8]
+                }
+            },
         },
     )
 }

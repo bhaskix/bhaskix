@@ -159,6 +159,8 @@ const _: () = {
     assert!(method::PUT == bhaskix_abi::method::PUT);
     assert!(method::TAKE == bhaskix_abi::method::TAKE);
     assert!(method::POLL == bhaskix_abi::method::POLL);
+    assert!(method::RECORD_SIZE == bhaskix_abi::method::RECORD_SIZE);
+    assert!(method::RECORD == bhaskix_abi::method::RECORD);
     assert!(method::NOTHING == bhaskix_abi::method::NOTHING);
     assert!(Status::Ok as u64 == bhaskix_abi::status::OK);
     assert!(Status::NoSuchCapability as u64 == bhaskix_abi::status::NO_SUCH_CAPABILITY);
@@ -329,6 +331,10 @@ pub mod method {
     /// nobody has typed — the value is out of a byte's range, so "nothing"
     /// cannot be confused with a byte that was read.
     pub const POLL: u64 = 41;
+    /// How many bytes of what the kernel printed are kept. RFC 0042.
+    pub const RECORD_SIZE: u64 = 67;
+    /// Eight bytes of that record, starting at `arg0`. RFC 0042.
+    pub const RECORD: u64 = 68;
     /// What [`POLL`] returns when nothing was waiting.
     pub const NOTHING: u64 = 0x100;
     /// Say where a capability handed back by a server may be put.
@@ -1303,7 +1309,10 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // domain holds one of these and can do exactly that; the same service in
     // the nucleus can do anything, which is what the placement is for.
     if kind == Some(Kind::Invoke)
-        && matches!(frame.method, method::PUT | method::TAKE | method::POLL)
+        && matches!(
+            frame.method,
+            method::PUT | method::TAKE | method::POLL | method::RECORD_SIZE | method::RECORD
+        )
     {
         let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Console) {
             Ok(resolved) => resolved,
@@ -1317,6 +1326,10 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         // the console, and the adapter cannot take a byte somebody typed at
         // the shell. Without this the narrowing would be a comment rather
         // than a mechanism.
+        // Reading the record is a `READ`, like taking a byte. It is not a
+        // *weaker* authority than taking one: the record is what the kernel
+        // said, and the Linux adapter -- the one holder given `WRITE` alone --
+        // still cannot ask for it.
         let wanted = if frame.method == method::PUT {
             crate::cap::Rights::WRITE
         } else {
@@ -1344,6 +1357,17 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 let byte = crate::input::read();
                 crate::service::counted(0, 1);
                 Outcome::ok(u64::from(byte))
+            }
+            // RFC 0042. The boot report is written before any service
+            // exists, so the record is kernel memory and a console service in
+            // its own domain has to ask for it.
+            method::RECORD_SIZE => {
+                let (kept, _refused) = crate::console::recorded();
+                Outcome::ok(kept as u64)
+            }
+            method::RECORD => {
+                let bytes = crate::console::recorded_at(frame.arg0 as usize);
+                Outcome::ok(u64::from_le_bytes(bytes))
             }
             _ => match crate::input::try_read() {
                 Some(byte) => {

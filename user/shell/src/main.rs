@@ -290,6 +290,51 @@ fn exit() -> ! {
     loop {}
 }
 
+/// Prints what the kernel printed while it was booting.
+///
+/// **The report scrolls off a framebuffer and there is no way back to it**, and
+/// on a machine whose serial is carried by a service processor there is no
+/// second copy either. Both of this project's hardware boots died at exactly
+/// that: the machine ran, somebody watched it, and nothing anybody needed to
+/// read was still on screen. RFC 0042.
+///
+/// The name is the one somebody coming from Linux guesses. What it names is
+/// **not** a kernel ring buffer with priorities, facilities and timestamps: it
+/// is the bytes the kernel printed, in order, kept until a fixed buffer filled.
+/// The help text says so, because a familiar name must not imply a guarantee
+/// this system does not offer.
+fn dmesg() {
+    let reply = call(CONSOLE, console::RECORD_SIZE, [0; 4]);
+    if !reply.delivered() {
+        write(b"dmesg: the console service did not answer\n");
+        return;
+    }
+    let size = reply.args[0] as usize;
+    if size == 0 {
+        write(b"dmesg: nothing recorded\n");
+        return;
+    }
+
+    let mut offset = 0usize;
+    while offset < size {
+        let reply = call(CONSOLE, console::RECORD, [offset as u64, 0, 0, 0]);
+        if !reply.delivered() {
+            write(b"\ndmesg: the record stopped answering part way\n");
+            return;
+        }
+        let chunk = Chunk::unpack(&reply.args);
+        let bytes = chunk.bytes();
+        if bytes.is_empty() {
+            // Past the end. Believed rather than argued with: the service and
+            // the size agree, and stopping here is what a caller that trusted
+            // only one of them would also do.
+            break;
+        }
+        write(bytes);
+        offset += bytes.len();
+    }
+}
+
 /// Writes bytes to the console, one chunk per round trip.
 fn write(bytes: &[u8]) {
     let mut rest = bytes;
@@ -461,6 +506,9 @@ fn help() {
     write(b"    pkg list          what is installed\n");
     write(b"    pkg run <n>       start an installed program, grants from its manifest\n");
     write(b"    pkg remove <n>    remove an installed package\n");
+    write(b"    dmesg             print what the kernel printed while booting --\n");
+    write(b"                      the bytes themselves, in order, not a log with\n");
+    write(b"                      priorities or timestamps\n");
     write(b"    exit              end this shell\n");
     write(b"\n");
     write(b"  this shell runs in ring 3 and can do nothing it does not hold a\n");
@@ -2057,6 +2105,7 @@ fn run(line: &[u8]) {
     match command {
         b"" => {}
         b"help" => help(),
+        b"dmesg" => dmesg(),
         b"echo" => {
             write(rest);
             write(b"\n");

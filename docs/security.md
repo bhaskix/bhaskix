@@ -356,11 +356,39 @@ load-bearing:
 | UMIP | User mode cannot read descriptor-table registers | Warn |
 | CET (shadow stack, IBT) | Control-flow integrity | Enable when present; not required |
 | IOMMU (VT-d / AMD-Vi) | DMA containment | **Boot in degraded mode, printed at boot and recorded in attestation.** T3 and T4 are not mitigated without it. |
-| KASLR | Randomise the kernel image | Always on; `nokaslr` is a debug-build-only option |
+| KASLR | Randomise the kernel image | Always on; `nokaslr` is a debug-build-only option. **The slide is not printed in the boot report** since 2026-08-23 — see the note below |
 | `RDRAND` | The machine's only source of unpredictability ([RFC 0021](rfc/0021-unpredictability.md)) | **Boot, warn loudly, and let the caller refuse.** A machine with no `RDRAND` still has a filesystem, a shell and a supervisor, none of which need to be unpredictable — but `bin/tcpd` does not start, because a guessable TCP sequence number is an off-path injection nobody can see. Reported in the `features` line every boot. |
 
 The "refuse to boot" entries are deliberate. Booting with a silently broken guarantee is worse than
 not booting, because the operator believes they have protection they do not have.
+
+> **What the boot report may say about the kernel's own address space, decided 2026-08-23**
+> ([RFC 0042](rfc/0042-reading-the-boot-report-back.md)).
+>
+> The boot report became **readable from ring 3** — a program holding a console capability with
+> `READ` can ask for what the kernel printed, which is what makes a machine whose report scrolls off
+> a framebuffer diagnosable at all. That turns every address in the report into something a program
+> can be told.
+>
+> The report was audited for what is actually secret, rather than assumed:
+>
+> | Printed | Secret? |
+> |---|---|
+> | The KASLR slide | **Yes.** `LINK_BASE + slide` is where the kernel is, which is the whole of what KASLR hides |
+> | `hhdm base` | No — a **compile-time constant**, `0xffff800000000000`, stated in `architecture.md` and unchanged since |
+> | ACPI `RSDP`, SMBIOS | No — firmware **physical** addresses, findable by anything that can read ACPI |
+> | Fixed-table sizes, device windows, source locations | No — sizes and offsets, not the base they are relative to |
+>
+> So exactly one line changed. The report says `kaslr applied and confirmed`, and the number is
+> behind **`kaslr=show`** on the command line — an escape hatch in the same shape as `iommu=off`,
+> available only to somebody who already controls the machine enough to hand it a command line.
+>
+> **What this does not claim.** The report is not *sanitised*, and no filter runs over it: the
+> argument is that there was one secret and it was removed at the source. A future line that prints
+> a slid address would put it back, and nothing mechanical would notice — which is a real gap, and
+> it is stated here rather than closed, because a filter that must recognise every address format is
+> a parser with a security obligation and it would be wrong the first time somebody printed an
+> address in a new shape.
 
 > **Correction, 2026-08-14.** The KASLR row read *"Randomise kernel image and heap base"* until
 > [RFC 0021](rfc/0021-unpredictability.md) went looking for the randomness that would do it. **The

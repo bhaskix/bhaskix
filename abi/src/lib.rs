@@ -329,6 +329,23 @@ pub mod method {
     /// a byte that was read.
     pub const NOTHING: u64 = 0x100;
 
+    /// How many bytes of what the kernel printed are kept.
+    ///
+    /// Only on a `Console` capability, and it needs `READ`. RFC 0042.
+    pub const RECORD_SIZE: u64 = 67;
+    /// Eight bytes of that record, starting at `arg0`.
+    ///
+    /// Only on a `Console` capability, and it needs `READ`. Packed
+    /// little-endian, zero-padded past the end — which is why the size is a
+    /// separate question rather than something a caller infers from a zero
+    /// byte, since a zero byte is a byte somebody could have printed.
+    ///
+    /// **These two are why RFC 0042's "the kernel gains no method" was wrong**,
+    /// and the RFC says so now. The boot report is written by the kernel before
+    /// any service exists, so the record is kernel memory; a console service in
+    /// its own domain cannot read it without asking, and asking is a method.
+    pub const RECORD: u64 = 68;
+
     /// How big the object this capability names is.
     ///
     /// Bytes on a `File`. A `DmaWindow` answers the same number with its own
@@ -544,6 +561,12 @@ pub mod console {
     pub const WRITE: u64 = 1;
     /// Read whatever has been typed. Blocks until at least one byte has.
     pub const READ: u64 = 2;
+    /// How many bytes of the boot report are kept. RFC 0042.
+    pub const RECORD_SIZE: u64 = 3;
+    /// A chunk of the boot report, starting at the offset in `args[0]`.
+    ///
+    /// Replies with a [`crate::Chunk`]. Short at the end, empty past it.
+    pub const RECORD: u64 = 4;
 }
 
 /// Methods the filesystem service answers.

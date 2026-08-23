@@ -297,6 +297,8 @@ fn console_ports() -> Ports {
             counted(0, 1);
             byte
         },
+        record_size: || crate::console::recorded().0,
+        record_at: crate::console::recorded_at,
         try_read: || {
             let byte = crate::input::try_read();
             if byte.is_some() {
