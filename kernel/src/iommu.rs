@@ -417,6 +417,95 @@ fn zeroed_frame(hhdm: u64) -> Option<(u64, u64)> {
     }
     Some((physical, hhdm + physical))
 }
+/// What a survey of the bus found: functions, and how many this kernel drives.
+///
+/// RFC 0043 step 2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Survey {
+    /// Functions seen at all.
+    pub functions: usize,
+    /// Of them, ones this kernel has a driver for and can give a window to.
+    pub drivable: usize,
+    /// Of them, endpoints this kernel cannot describe.
+    ///
+    /// **The number that decides whether translation may be turned on**, and
+    /// the reason RFC 0043 exists: a device in here reaches all of memory today
+    /// and would be refused outright the moment a unit is programmed without a
+    /// window for it.
+    pub unknown: usize,
+    /// Of them, bridges — not endpoints, and not bus masters of their own.
+    ///
+    /// Counted apart because counting them as unknown overstates the problem:
+    /// the first version of this did, and reported five undescribable bus
+    /// masters on a QEMU machine whose bus masters are all describable.
+    pub bridges: usize,
+}
+
+/// Whether this kernel has a driver that would claim `identity`.
+///
+/// The list is short and that is the point: virtio block, virtio net, and xHCI.
+/// Everything else on a real machine — SAS, NVMe, a management NIC, a graphics
+/// adapter — is a bus master with no driver here and no window to give it.
+/// PCI class for a bridge: not an endpoint, and not a bus master of its own.
+const CLASS_BRIDGE: u8 = 0x06;
+
+#[must_use]
+fn drivable(identity: &bhaskix_arch::pci::Identity) -> bool {
+    // Class 0x0c subclass 0x03 is USB; the programming interface separates xHCI
+    // from its predecessors, and `xhci::discover` checks it. Here the class is
+    // enough: the question is "could this kernel contain it", and a UHCI
+    // controller is a bus master this kernel does not drive either.
+    let usb = identity.class == 0x0c && identity.subclass == 0x03;
+    let virtio = identity.vendor == 0x1af4;
+    usb || virtio
+}
+
+/// Walks the bus and says what is on it.
+///
+/// **Reporting only — this changes nothing.** RFC 0043's question is whether
+/// translation may be enabled on a machine holding devices this kernel cannot
+/// contain, and that question could not even be *asked* before, because nothing
+/// counted them. It is asked on every boot now, including every QEMU boot, so
+/// the answer for a real machine is not a surprise the first time one is seen.
+///
+/// # Safety
+///
+/// Configuration access must work, as [`crate::xhci::discover`].
+pub unsafe fn survey() -> Survey {
+    let mut survey = Survey::default();
+    let mut visit = |address: bhaskix_arch::pci::Address, identity: bhaskix_arch::pci::Identity| {
+        let _ = address;
+        survey.functions += 1;
+        if drivable(&identity) {
+            survey.drivable += 1;
+        } else if identity.class == CLASS_BRIDGE {
+            survey.bridges += 1;
+        } else {
+            survey.unknown += 1;
+            // **Named, not just counted.** RFC 0043's report has to say which
+            // device would stop translation coming up; a number cannot, and
+            // somebody reading it on a machine that will contain nothing needs
+            // to know what to go and look at.
+            crate::println!(
+                "      dma unknown  {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}.{:02x} -- no \
+                 driver here, so no window",
+                address.bus,
+                address.device,
+                address.function,
+                identity.vendor,
+                identity.device,
+                identity.class,
+                identity.subclass
+            );
+        }
+        true
+    };
+    // SAFETY: the caller's obligation; `for_each` reads configuration space
+    // only.
+    unsafe { bhaskix_arch::pci::for_each(&mut visit) };
+    survey
+}
+
 /// A unit's own tables: the root table, and the context table for bus zero.
 ///
 /// **The root table belongs to the machine, not to a device.** It was allocated

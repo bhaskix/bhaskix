@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-23, step 1 implemented.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 — refuse, or identity-map — is still unanswered, and steps 2–5 wait on it** |
+| **Status** | ⬜ **Draft 2026-08-23, steps 1–2 implemented.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 — refuse, or identity-map — is still unanswered, and steps 2–5 wait on it** |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/iommu`, `kernel/lib.rs` bring-up |
 | **Milestone** | Phase 2. It does not add a feature; it makes an existing one true off the emulator |
@@ -114,6 +114,45 @@ That is a weaker guarantee than "the IOMMU is always on", and it is the honest
 one. It also makes the boot report's job clear: it must say *which* devices got
 windows and which device, if any, stopped translation from coming up.
 
+### What step 2 found, which changes this argument
+
+**The emulator has the same problem, and has had it all along.** Surveying the
+bus on the `iommu` lane:
+
+```
+      dma unknown  00:01.0 1234:1111 class 03.00 -- no driver here, so no window
+      dma unknown  00:1f.2 8086:2922 class 01.06 -- no driver here, so no window
+      dma unknown  00:1f.3 8086:2930 class 0c.05 -- no driver here, so no window
+    dma devices    10 functions: 5 drivable, 2 bridges, and 3 endpoint(s) this kernel cannot describe
+```
+
+A display adapter, a **SATA AHCI controller** and an SMBus. The middle one is a
+real bus master. And on that lane **translation is enabled anyway** — it has been
+since RFC 0012 — with those three holding no context entry at all.
+
+Nothing faults, because nothing drives them and an idle device issues no
+transactions. But the guarantee this project states as *"a DMA-capable device
+reaches only what it was given"* has never held for them. It holds for the
+devices with drivers. That is a smaller claim than the one `security.md` makes,
+and it is true on the emulator as well as on hardware.
+
+**This eliminates answer 1 below.** "Refuse to enable unless every endpoint has a
+window" would turn the IOMMU **off on QEMU**, where three endpoints have none —
+taking every existing IOMMU gate with it. A rule that disables the feature on the
+only machine that currently exercises it is not a rule, it is a retreat.
+
+**And it re-frames the question.** The choice for an endpoint with no driver is
+not two options but three, and one of them is what the code already does:
+
+| | What the device can reach | What happens if it does DMA |
+|---|---|---|
+| **Absent** (today) | nothing | refused — a fault, and on a boot device a dead machine |
+| **Identity-mapped** | all of memory, at its own addresses | works; costs a page table over all of RAM |
+| **Passed through** | all of memory | works; costs nothing, and `vtd.rs` already warns that choosing it by accident is "a device that reaches all of memory while the machine reports an IOMMU" |
+
+Today's behaviour is *absent*, and it survives on QEMU only because the three
+endpoints there are idle. On a real server the boot device is not idle.
+
 ### What "DMA-capable device this kernel can see" means
 
 Enumerable from PCIe, and today that is: virtio block, virtio net, and xHCI
@@ -124,15 +163,20 @@ management NIC — is a bus master this kernel has no driver for and no window f
 question below, because the choice is a security decision rather than an
 engineering one:
 
-1. **Refuse to enable.** Nothing is contained, and the report says which device
-   prevented it. Safe for the machine, and the guarantee is off exactly when a
-   machine has hardware this kernel does not understand — which is most of them.
-2. **Give every enumerable function an identity-mapped window.** Translation is
+1. ~~**Refuse to enable.**~~ **Eliminated by step 2**, above: it would turn the
+   IOMMU off on QEMU, where three endpoints have no window, and take every
+   existing IOMMU gate with it.
+2. **Give every enumerable endpoint an identity-mapped window.** Translation is
    on, the units are programmed, and a device the kernel does not drive reaches
    what it always reached. That is *not containment* for those devices, and
    calling it so would be the kind of claim this project refuses — but it does
-   contain the devices that do have drivers, and it is what a real system does
-   during bring-up before it knows better.
+   contain the devices that do have drivers.
+3. **Pass those endpoints through**, which the hardware supports directly and
+   which costs no page table at all. Same guarantee as 2 and much cheaper — and
+   `arch/x86_64/src/vtd.rs` already carries the warning that makes it dangerous:
+   *"choosing it by accident is a device that reaches all of memory while the
+   machine reports an IOMMU."* Chosen **deliberately**, and reported per device,
+   it is not an accident. That distinction is the whole of the decision.
 
 ### The reserved regions become load-bearing
 
@@ -199,7 +243,9 @@ should be one somebody is watching.
 
 ## Unresolved questions
 
-1. **Refuse, or identity-map?** §"What DMA-capable device means". A security
+1. **Identity-map, or pass through?** Refusing is eliminated (step 2). Both
+   remaining answers give an undriven endpoint everything it already had; they
+   differ in cost and in what the boot report must then say. A security
    decision, and the one this RFC exists to put in front of somebody.
 2. **What about functions behind a bridge?** Requester ids are rewritten by
    PCIe-to-PCI bridges, and a context entry keyed on the wrong id contains
@@ -225,7 +271,10 @@ should be one somebody is watching.
    `root 0xec36000 ctx 0xec37000 pt 0xec38000 width 39 domain 0` — identical,
    because the allocation order is unchanged. The probe was removed; the change
    is one file.
-2. Enumerate every DMA-capable function the kernel can see, and report them.
+2. ✅ **Done 2026-08-23.** Enumerate every function on the bus and report them,
+   naming each endpoint with no driver rather than counting it. Reporting only —
+   no behaviour change — and it is what turned question 1 from two answers into
+   three and eliminated one of them.
 3. The predicate: may translation be enabled? Pure, host-tested, watched red.
 4. Wire the decision, with the report naming every device and its window.
 5. A boot on the SR550, watched, with `iommu=off` ready.

@@ -491,6 +491,30 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // What a device can reach, said once it is settled rather than before.
     iommu::report_dma(iommu_state.is_some());
 
+    // RFC 0043 step 2: what is actually on this bus, and how much of it this
+    // kernel could contain if it were asked to.
+    //
+    // **Reported on every boot including every QEMU boot**, so that the answer
+    // for a real machine is not a surprise the first time one is seen. On the
+    // emulator every function is drivable; on a Lenovo SR550 most are not, and
+    // that difference is the whole of RFC 0043's question.
+    // SAFETY: configuration access works by here.
+    let survey = unsafe { iommu::survey() };
+    if survey.unknown == 0 {
+        println!(
+            "    dma devices    {} functions: {} drivable, {} bridges, and no endpoint this \
+             kernel cannot describe",
+            survey.functions, survey.drivable, survey.bridges
+        );
+    } else {
+        println!(
+            "\x1b[93m    dma devices    {} functions: {} drivable, {} bridges, and {} endpoint(s) \
+             this kernel cannot describe (named above) -- a bus master with no driver has no \
+             window, and translation cannot contain what it cannot describe (RFC 0043)\x1b[0m",
+            survey.functions, survey.drivable, survey.bridges, survey.unknown
+        );
+    }
+
     // RFC 0041 step 2: xHCI controllers, and whether any of them may be
     // driven. **After the IOMMU windows exist**, which is the whole of this
     // call's safety contract: asking earlier would read "untranslated" for a

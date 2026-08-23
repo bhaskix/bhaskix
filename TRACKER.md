@@ -791,6 +791,58 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (RFC 0043 step 2: the bus is surveyed, and the emulator turns out to have the same hole)
+
+**Every function on the bus is now counted and the undescribable ones are
+named.** Reporting only — nothing behaves differently — and it changed the
+question it was built to inform.
+
+On the `iommu` lane, which has run in CI since RFC 0012:
+
+```
+      dma unknown  00:01.0 1234:1111 class 03.00 -- no driver here, so no window
+      dma unknown  00:1f.2 8086:2922 class 01.06 -- no driver here, so no window
+      dma unknown  00:1f.3 8086:2930 class 0c.05 -- no driver here, so no window
+    dma devices    10 functions: 5 drivable, 2 bridges, and 3 endpoint(s) this kernel cannot describe
+```
+
+A display adapter, a **SATA AHCI controller** and an SMBus. The middle one is a
+real bus master. **And translation is enabled on that lane anyway**, as it has
+been since RFC 0012, with all three holding no context entry.
+
+Nothing faults, because nothing drives them and an idle device issues no
+transactions. But *"a DMA-capable device reaches only what it was given"* has
+never held for those three. It holds for the devices with drivers — which is a
+smaller claim than the one this project makes, and it was true on the emulator
+the whole time, not only on hardware.
+
+**This eliminates one of RFC 0043's two answers.** "Refuse to enable unless every
+endpoint has a window" would turn the IOMMU **off on QEMU** and take every
+existing IOMMU gate with it. A rule that disables the feature on the only machine
+currently exercising it is a retreat, not a rule.
+
+**And it re-frames the rest.** The choice for an endpoint with no driver is three
+options, not two, and one of them is what the code already does:
+
+| | Reaches | If it does DMA |
+|---|---|---|
+| **Absent** (today) | nothing | refused — a fault, and on a boot device a dead machine |
+| **Identity-mapped** | all of memory | works; costs a page table over all of RAM |
+| **Passed through** | all of memory | works; costs nothing |
+
+Pass-through is the one `arch/x86_64/src/vtd.rs` already warns about — *"choosing
+it by accident is a device that reaches all of memory while the machine reports
+an IOMMU"* — and the warning is exactly right. Chosen deliberately and reported
+per device it is not an accident, and that distinction is the whole of the
+decision. It stays unresolved question 1.
+
+**Two corrections this step made to its own first version.** It counted every PCI
+function as a potential bus master, which called two bridges undescribable when a
+bridge is not an endpoint and does no DMA of its own — five "unknown bus masters"
+on a machine that has three. And it *counted* rather than *named* them, which is
+useless to somebody standing at a machine that will contain nothing: the report
+has to say which device to go and look at.
+
 ### 2026-08-23 (RFC 0043 step 1: the root table stops belonging to a device, and the windows are byte-for-byte the same)
 
 **`build_window` did two things and only one of them was about the unit.** It
