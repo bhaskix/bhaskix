@@ -52,7 +52,7 @@ nothing in the tree implements it yet.
 | T8 | Undetected compromise | Tamper-evident audit log; remote attestation; the telemetry plane is the audit source | 🔨 **partial** — the telemetry plane is built ([RFC 0026](rfc/0026-telemetry-plane.md)); the `Audit` class in it is **reserved and refused**, not served — emitting it is counted and dropped, because a best-effort audit event is false assurance with a checksum (§8). The backpressure ring, the hash chain, and remote attestation are a future RFC and are Phase 3. **This cell claimed backpressure when it was first written, on 2026-08-20, and §8 four sections below already said otherwise** — an error introduced by the same edit that added this column to stop exactly that |
 | T9 | Memory-safety bugs in kernel code | Rust; `unsafe` budget tracked per crate; every `unsafe` block justified and reviewed | 🔨 **partial, and permanently so** — Rust, `forbid(unsafe_op_in_unsafe_fn)`, `deny(undocumented_unsafe_blocks)`, and a per-crate budget enforced by the build. 4,170 lines of `unsafe` in tree, **2,740 of them (66%) in ring 0**. The discipline is built; the exposure is structural and does not go to zero |
 | T10 | Resource exhaustion by one domain denying service to others | `ResourceEnvelope` enforced at allocation and scheduling time, not by best effort | ✅ **built** — `ResourceEnvelope` enforced at allocation and scheduling time, gated ("envelope enforced, CPU share independent of thread count") |
-| T11 | A hostile or compromised **Linux application inside a compatibility domain**, attacking through malformed system-call arguments or through Linux privilege (`root`) | The Linux personality translates and never manufactures authority; a hosted process holds no capabilities and has no way to name one; a compatibility domain reaches only what it was granted; and **the translator itself runs in a service domain** as of 2026-08-20 — the nucleus interprets no Linux syscall number, gated on every boot ([RFC 0005](rfc/0005-linux-abi-compatibility.md), [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md), [RFC 0032](rfc/0032-a-supervisor-interface.md)) | 🔨 **mitigated 2026-08-20**, with the price written out in the note below rather than rounded to "contained" — the translator is in ring 3 and the nucleus interprets **0** Linux syscall numbers, gated; what a compromise of the adapter still reaches is enumerated |
+| T11 | A hostile or compromised **Linux application inside a compatibility domain**, attacking through malformed system-call arguments or through Linux privilege (`root`) | The Linux personality translates and never manufactures authority; a hosted process holds no capabilities and has no way to name one; a compatibility domain reaches only what it was granted; and **the translator itself runs in a service domain** as of 2026-08-20 — the nucleus interprets no Linux syscall number, gated on every boot ([RFC 0005](rfc/0005-linux-abi-compatibility.md), [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md), [RFC 0032](rfc/0032-a-supervisor-interface.md)) | 🔨 **mitigated 2026-08-20, and the price rose 2026-08-23**, with it written out in the note below rather than rounded to "contained" — the translator is in ring 3 and the nucleus interprets **0** Linux syscall numbers, gated; what a compromise of the adapter still reaches is enumerated, and it now includes **the network** |
 
 ### Out of scope — stated honestly
 
@@ -96,6 +96,22 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > This note said it would come out when the code landed. It is kept, rewritten, because the useful
 > version is not "delivered" but *under what conditions* — **a mitigation column is a claim, and a
 > claim whose limits are not written down is believed further than it should be.**
+
+> **What the adapter holds grew on 2026-08-23.** `bin/linuxd` now holds a
+> capability to the protocol service and a page for datagrams, because RFC 0005
+> step 9 wired `socket`, `bind`, `sendto` and `recvfrom` and a hosted program
+> calling `socket()` had nothing behind it. So a compromise of the adapter now
+> reaches **the network**, on top of every hosted process's files.
+>
+> **And it moves further from
+> [RFC 0031](rfc/0031-linux-compatibility-as-an-adapter.md)'s interface I5**,
+> which says an adapter should host *one workload's* process group rather than
+> being a system service every Linux process shares. One system-wide
+> `bin/linuxd` already contradicted that; the network makes the union larger.
+> The alternative was on the table — per-hosted-process authority declared in a
+> manifest, which is an RFC and a supervisor change before any socket works —
+> and the choice was the project lead's. It is written here rather than
+> absorbed, because the whole value of I5 is that drift from it stays visible.
 
 > **T11 is in scope and is mitigated, as of 2026-08-20 — and this note stays because how it
 > got there, and what it now costs, are worth more than the tick.**

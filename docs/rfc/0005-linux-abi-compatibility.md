@@ -738,6 +738,137 @@ bit, and the allow-list opened to everything.
   said: this system has no wall clock it can defend, and three separately
   wrong times would imply a precision that does not exist.
 
+## Step 9's record, the wiring (2026-08-23): a hosted program uses a socket, and three things had to be found first
+
+Step 9's first record (2026-08-19) landed Tier 2's *arithmetic* and proved its
+wiring impossible where the personality then lived: `bhaskix-sock` is a ring 3
+client, so a hosted `connect()` must be a capability call that kernel code
+cannot make. RFC 0032 moved the adapter out. This is the wiring.
+
+**What runs:** `socket`, `bind`, `sendto`, `recvfrom` — UDP, both families —
+and a hosted Linux program that binds a socket, sends four bytes to itself and
+reads them back. The bytes are `dup0`: written into a page by the probe, sent
+to `[::1]`, printed from what `recvfrom` returned. They are in no file, no
+service and no part of the adapter, so they cannot appear unless the datagram
+made the round trip.
+
+### The authority question came first, and it is not a code question
+
+`bin/linuxd` held a console, a read-only directory and its own endpoint. A
+hosted `socket()` had nothing behind it, and giving it something **widens what
+a compromise of the adapter reaches** — `security.md` §1 T11 enumerates that,
+and the network is now on the list.
+
+It also moves further from this project's own [RFC 0031](0031-linux-compatibility-as-an-adapter.md)
+interface **I5**: *"The adapter is not a system service that every Linux
+process shares. One adapter domain hosts one workload's process group."* One
+system-wide `bin/linuxd` already contradicted that; the network makes the union
+larger. The alternative — per-hosted-process authority declared in a manifest,
+as RFC 0030 declares a package's — is an RFC and a supervisor change before any
+socket works at all. **The choice was the project lead's, taken with both
+options written down**, and the drift is recorded in `security.md` rather than
+absorbed, because I5's whole value is that departures from it stay visible.
+
+### Over `[::1]`, and that is a fact about this machine
+
+`bin/ipd` reinjects a datagram addressed to loopback so it never touches a
+device — **for v6 only**. There is no v4 loopback in the service, so a hosted
+`sendto` to `127.0.0.1` leaves and does not come back, and the receiving half
+of this test could not exist over v4. The v4 path is wired identically and is
+**not** demonstrated; the trigger for demonstrating it is v4 loopback in
+`bin/ipd`, which is that service's decision.
+
+### Three findings, and the first is about the test rather than the code
+
+**A test that could not fail, caught by looking at the bytes.** The self-test
+first checked only that the probe's domain *ended* — and the probe ends
+cleanly when its bounded retry gives up, so the check was true whether the
+datagram came back or not. It reported success for a boot in which `bind` was
+refused outright. Nothing failed loudly; the gate now greps for the payload,
+and the kernel's line says what happened rather than claiming a result.
+
+**`bhaskix-sock` requires the receiving slot to be declared before the call,
+and its documentation says so.** `bind6` does not call `expect_socket` for
+you: the service hands the socket back with `HAND`, which puts it in the slot
+the *caller* declared and nowhere else. Omitting it fails quietly — the bind is
+refused and the probe simply never receives anything.
+
+**A six-argument syscall cannot be served from the boundary message.** RFC
+0032's message carries four arguments; `sendto` and `recvfrom` take six, and
+their fifth and sixth — the address and its length — arrived as hard zeros. The
+first wiring read them anyway and every `sendto` refused `EFAULT` on a null
+address. The mechanism for this already existed and is what `clone` and `fork`
+use: ask for the register frame. **This is the constraint to remember for the
+rest of Tier 2** — `accept4`, `epoll_pwait` and `recvmsg` are all six-argument
+calls.
+
+**A fifth, found by the shell losing its network: dropping a capability is
+not closing a socket.** `bin/ipd` holds four sockets in a table of its own and
+has no signal that a client has stopped caring — the same thing RFC 0016 says
+about its own sessions. The socket probe exited without closing, the adapter
+released only its *slot*, and the service's entry, its port and one of its four
+slots stayed occupied. That was the fourth of four, so the **shell** could no
+longer bind: a leak in a hosted program surfacing as an unrelated program
+losing its network, which is again RFC 0031's I5 shape.
+
+Two halves, and the first attempt had only one. `release_socket_slot` now tells
+the service and *then* drops the capability, and a hosted process's sockets are
+reclaimed when its domain ends rather than only when it closes them politely.
+Files are deliberately not treated the same way and the code says why: a file's
+slot comes from a pool of thirty-two that only this adapter draws on, while a
+socket comes from a service's table of four that everything on the machine
+shares.
+
+**A fourth, and it is the one with teeth: a hosted socket call can wedge the
+whole adapter.** On a lane whose network device gets no DMA window, RFC 0012's
+rule refuses the device — `bin/netd` has nothing to drive and `bin/ipd`
+nothing to answer with. The *capability* to the protocol service still exists
+and still installs, so the grant reports "holds a network now", and a hosted
+`bind` then blocks: a `CALL` to an endpoint nobody receives on queues for
+ever. **`bin/linuxd` is single-threaded**, so that one call stops it answering
+every hosted program on the machine.
+
+It was found the way such things are: the probe passed on the `iommu` lane and
+hung on `uefi` and `shell`, and two wrong diagnoses came first — the retry
+bound, then the self-test's patience — because both were plausible and the
+symptom was "did not finish". Neither was it. What settled it was noticing that
+`bin/udp6` already draws this line for itself: *"no unit contains the device,
+so there is no network to ask."* The self-test now draws the same line from the
+flag the kernel already sets, and skips.
+
+**The wedge itself is not fixed and is not this step's to fix.** A blocking
+call to a service that never receives is what the IPC design says a `CALL`
+does; what makes it serious here is the adapter being one thread for every
+hosted process, which is
+[RFC 0031](0031-linux-compatibility-as-an-adapter.md)'s **I5** again from a
+third direction — after the authority argument and the compromise argument,
+this is the *availability* one. Recorded, with the trigger being the first
+hosted workload that matters more than a test.
+
+And one repeat, worth its line because it is now the third time: **`ATTACH`
+refuses an address that is already mapped**, with the same `SlotUnavailable` it
+gives for every unusable address. `sendto` mapped the datagram page and
+`recvfrom` mapped it again, and the second call answered `EFAULT` for a reason
+that had nothing to do with the caller's memory. An operation with no inverse,
+called as though it had one — the same shape as
+[RFC 0044](0044-revocation-that-reaches-the-mapping.md)'s.
+
+### What this does not do
+
+- **No TCP.** `socket()` refuses `SOCK_STREAM` with `EPROTONOSUPPORT` rather
+  than handing back a descriptor that would fail at `connect` saying nothing.
+  RFC 0022's three-leg handover is the rest of step 9.
+- **No `epoll`.** Its arithmetic is in `personality::event` and unwired.
+- **`recvfrom` does not block.** `bin/ipd` answers "nothing yet" and this
+  passes it on as `EAGAIN`; a program that waits for a datagram is spinning.
+  Blocking is a reply shape rather than a value — the same mechanism `read` on
+  a pipe already uses — and it belongs with `epoll`.
+- **No `connect`, `listen`, `accept4`, `getsockname`, `setsockopt`.** Named in
+  Tier 2 and not here.
+- **Six sockets at once, machine-wide**, because six is what the adapter's
+  CSpace has left between the hosted-domain handles climbing from 24 and the
+  open files falling from 127. A seventh is `EMFILE`.
+
 ## Step 10's record (2026-08-19): the gate is unmet, and it is reported unmet rather than redefined
 
 **Step 10 cannot be run, and the reason is not a shortfall in this

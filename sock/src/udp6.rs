@@ -84,6 +84,17 @@ pub struct From6 {
 }
 
 impl Socket6 {
+    /// A socket whose capability is already in a slot this program holds.
+    ///
+    /// [`bind6`]'s counterpart for a program that keeps its sockets in a
+    /// table rather than in a local — see [`crate::udp::Socket::from_slot`],
+    /// which exists for the same caller and the same reason.
+    #[must_use]
+    pub const fn from_slot(slot: u64, port: u16) -> Self {
+        Self { slot, port }
+    }
+
+
     /// The slot this socket's capability occupies.
     #[must_use]
     pub const fn slot(&self) -> u64 {

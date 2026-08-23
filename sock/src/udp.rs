@@ -112,6 +112,22 @@ pub struct From {
 }
 
 impl Socket {
+    /// A socket whose capability is already in a slot this program holds.
+    ///
+    /// [`bind`] returns one because it is what just created the capability.
+    /// A program that keeps sockets in a *table* — `bin/linuxd`, holding one
+    /// per hosted descriptor — cannot keep the returned value beside each
+    /// row, so it keeps the slot and rebuilds the handle when it needs to
+    /// act. Nothing is created here and nothing is checked: this is a name
+    /// for a capability the caller already has, and if the slot is empty the
+    /// call made through it is refused by the kernel, which is where that
+    /// check belongs.
+    #[must_use]
+    pub const fn from_slot(slot: u64, port: u16) -> Self {
+        Self { slot, port }
+    }
+
+
     /// The slot this socket's capability occupies.
     #[must_use]
     pub const fn slot(&self) -> u64 {

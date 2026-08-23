@@ -5311,6 +5311,91 @@ const FILE_PROBE_CODE: [u8; 71] = [
     0xeb, 0xfe,                          // jmp $
 ];
 
+/// Where the socket probe's code lands in its own space.
+const SOCKET_PROBE_CODE_AT: u64 = 0x0000_0000_1900_0000;
+
+/// The socket probe, RFC 0005 step 9's witness: a hosted Linux program binds a
+/// UDP socket and echoes a datagram to itself.
+///
+/// Assembled from [`tools/probes/linux-socketeer.s`](../../tools/probes/linux-socketeer.s)
+/// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh), which verifies its
+/// transcription against the assembled binary.
+///
+/// **Over `[::1]` and not `127.0.0.1`, and that is a fact about this machine
+/// rather than a preference.** `bin/ipd` reinjects a datagram addressed to
+/// loopback so it never touches a device — and it does that for **v6 only**.
+/// There is no v4 loopback in the service, so a hosted `sendto` to
+/// `127.0.0.1` leaves and does not come back, and the receiving half of this
+/// test could not exist. The v4 path is wired the same way and is *not*
+/// demonstrated here; the trigger for demonstrating it is v4 loopback in
+/// `bin/ipd`, which is that service's decision and not this step's.
+///
+/// Four calls, and the four bytes it prints went out through `bin/ipd` and
+/// came back: no part of the adapter could have invented them.
+#[rustfmt::skip]
+#[rustfmt::skip]
+const SOCKET_PROBE_CODE: [u8; 181] = [
+    0x49, 0x89, 0xfc,                         // mov %rdi,%r12
+    0x49, 0x89, 0xf6,                         // mov %rsi,%r14
+    0xbf, 0x0a, 0x00, 0x00, 0x00,             // mov $0xa,%edi
+    0xbe, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x29, 0x00, 0x00, 0x00,             // mov $0x29,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0x88, 0x00, 0x00, 0x00,       // js aa <done>
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xf6,                         // mov %r14,%rsi
+    0xba, 0x1c, 0x00, 0x00, 0x00,             // mov $0x1c,%edx
+    0xb8, 0x31, 0x00, 0x00, 0x00,             // mov $0x31,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x6e,                               // js aa <done>
+    0x41, 0xc7, 0x04, 0x24, 0x64, 0x75, 0x70, 0x30, // movl $0x30707564,(%r12)
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0x4d, 0x89, 0xf0,                         // mov %r14,%r8
+    0x41, 0xb9, 0x1c, 0x00, 0x00, 0x00,       // mov $0x1c,%r9d
+    0xb8, 0x2c, 0x00, 0x00, 0x00,             // mov $0x2c,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x43,                               // js aa <done>
+    0x41, 0xbf, 0x40, 0x00, 0x00, 0x00,       // mov $0x40,%r15d
+    0x49, 0x8d, 0x74, 0x24, 0x40,             // lea 0x40(%r12),%rsi
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xba, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0x45, 0x31, 0xc0,                         // xor %r8d,%r8d
+    0x45, 0x31, 0xc9,                         // xor %r9d,%r9d
+    0xb8, 0x2d, 0x00, 0x00, 0x00,             // mov $0x2d,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x7f, 0x07,                               // jg 96 <arrived>
+    0x41, 0xff, 0xcf,                         // dec %r15d
+    0x75, 0xd9,                               // jne 6d <retry>
+    0xeb, 0x14,                               // jmp aa <done>
+    0x48, 0x89, 0xc2,                         // mov %rax,%rdx
+    0x49, 0x8d, 0x74, 0x24, 0x40,             // lea 0x40(%r12),%rsi
+    0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp b3 <done+0x9>
+];
+
+/// Where the socket the probe binds is placed: a `sockaddr_in6` for `[::1]`
+/// on port 7777, past the code.
+const SOCKET_PROBE_ADDRESS_AT: u64 = 256;
+const _: () = assert!(
+    SOCKET_PROBE_CODE.len() < SOCKET_PROBE_ADDRESS_AT as usize,
+    "the socket probe's code has grown into the address beside it"
+);
+
 /// Where the directory probe's code lands in its own space.
 const LIST_PROBE_CODE_AT: u64 = 0x0000_0000_1800_0000;
 
@@ -5485,6 +5570,72 @@ const _: () = assert!(
     LIST_PROBE_CODE.len() < LIST_PROBE_NAMES_AT as usize,
     "the directory probe's code has grown into the names beside it"
 );
+
+/// The thread that becomes the socket probe — RFC 0005 step 9.
+extern "C" fn ring3_socketeer(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const BUFFER_AT: u64 = SOCKET_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (SOCKET_PROBE_CODE_AT, Protection::ReadExecute),
+        (BUFFER_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(SOCKET_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the
+    // direct map; the executable mapping is never writable. The address goes
+    // at a fixed offset past the code, which a `const` assertion above holds
+    // clear of it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            SOCKET_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            SOCKET_PROBE_CODE.len(),
+        );
+        // A `sockaddr_in6` for `[::1]:7777`, laid out the way
+        // `personality::socket::parse_endpoint` reads one: the family in the
+        // first two bytes **little-endian**, the port in the next two
+        // **big-endian**, then four bytes of flow label, then the address.
+        // Two byte orders four bytes apart is exactly the trap that field
+        // layout sets, and it is written here once rather than assembled by
+        // hand in the probe.
+        let mut address = [0u8; 28];
+        address[0..2].copy_from_slice(&10u16.to_le_bytes()); // AF_INET6
+        address[2..4].copy_from_slice(&7777u16.to_be_bytes());
+        address[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        core::ptr::copy_nonoverlapping(
+            address.as_ptr(),
+            (hhdm_base + code_pa + SOCKET_PROBE_ADDRESS_AT) as *mut u8,
+            address.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page; `rdi` is
+    // the writable page it works in and `rsi` the address beside its code.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            SOCKET_PROBE_CODE_AT,
+            BUFFER_AT + 0x0f00,
+            [BUFFER_AT, SOCKET_PROBE_CODE_AT + SOCKET_PROBE_ADDRESS_AT],
+        )
+    }
+}
 
 /// The thread that becomes the directory probe — RFC 0005 step 8.
 extern "C" fn ring3_lister(hhdm_base: u64) -> ! {
@@ -6850,6 +7001,130 @@ fn lending_self_test(hhdm: u64) -> bool {
         );
     }
     ok
+}
+
+/// RFC 0005 step 9's witness: a hosted Linux program uses a socket.
+///
+/// **The four bytes it prints went out through `bin/ipd` and came back.** They
+/// are not in the adapter, not in the kernel, and not in any file; the probe
+/// writes them into a page, `sendto`s them to `[::1]`, and prints what
+/// `recvfrom` gives back. A version of this that printed a constant would be
+/// testing nothing, which is why the payload is written and read at opposite
+/// ends of a round trip rather than compared in place.
+fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux socket   skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    // The same two absences the file probe distinguishes. A machine with no
+    // protocol service has nothing to send through, and skipping is honest; a
+    // machine that has one and granted the adapter nothing is a bug in the
+    // grant, and a skip there would turn it green.
+    let adapter = syscall::ADAPTER_DOMAIN.load(core::sync::atomic::Ordering::Relaxed);
+    // **Having a capability to the protocol service is not having a network,
+    // and this test learned the difference the expensive way.** On a lane
+    // whose network device gets no DMA window, RFC 0012's rule refuses the
+    // device: `bin/netd` has nothing to drive and `bin/ipd` has nothing to
+    // answer with. The capability still exists and still installs, so the
+    // grant above says "holds a network now" -- and a hosted `bind` then
+    // *blocks*, because a `CALL` to an endpoint nobody receives on queues for
+    // ever. The adapter is single-threaded, so that one call wedges every
+    // hosted program on the machine, and the probe never ends.
+    //
+    // `bin/udp6` already draws this line for itself -- "no unit contains the
+    // device, so there is no network to ask" -- and this is the same line,
+    // drawn from the flag the kernel already sets.
+    let machine_has_network = network_endpoint_capability().is_some()
+        && NET_CONTAINED.load(core::sync::atomic::Ordering::Acquire);
+    let holds_network = adapter != u32::MAX
+        && domain::with(domain::DomainId::from_u32(adapter), |owner| {
+            owner.cspace.get(88).is_some() && owner.cspace.get(89).is_some()
+        }) == Some(true);
+    if !machine_has_network {
+        println!(
+            "    linux socket   skipped: no network this machine can drive, so there is nothing \
+             for a hosted socket to ask"
+        );
+        return true;
+    }
+    if !holds_network {
+        println!(
+            "\x1b[91m    linux socket   FAILED: this machine has a network and the adapter was \
+             given none\x1b[0m"
+        );
+        return false;
+    }
+
+    let Ok(realm) = domain::create("socketeer", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux socket   FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    linux socket   FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(
+        CPU,
+        "socketeer",
+        ring3_socketeer,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    linux socket   FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+    // **Twenty seconds, and the number is what the other lanes cost.** The
+    // file probe waits two and the directory probe three, and this one was
+    // given three by copying them -- which passed on the `iommu` lane and
+    // failed on `uefi` and `shell`, because every `recvfrom` retry here is an
+    // IPC round trip the adapter serves one at a time, and TCG makes each of
+    // those tens of milliseconds. A probe that exhausts its retries on a lane
+    // where no reply comes must still be allowed to *finish*, or the gate
+    // reports a hang where there is only a slow refusal.
+    let mut ended = false;
+    for _ in 0..4000 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    // **Ending is not passing, and the first version of this test thought it
+    // was.** The probe gives up after a bounded retry and exits cleanly when
+    // no datagram comes back, so "the domain ended" is true whether the round
+    // trip happened or not -- and it reported success for a boot in which
+    // `bind` was refused outright, because nothing here looked at the bytes.
+    //
+    // What decides it is the payload on the console, which the gate greps for
+    // and this line points at. The kernel cannot see the probe's output from
+    // here, so this says what happened rather than claiming a result.
+    let (last, stage, detail) = adapter_file_record();
+    if ended {
+        println!(
+            "    linux socket   a Linux program bound a UDP socket and sent a datagram to itself \
+             through bin/ipd; what came back is on the console above, or nothing did (last \
+             {last}, stage {stage}, detail {detail})"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux socket   FAILED: the probe never ended -- a bounded retry on \
+             recvfrom should have given up rather than hanging\x1b[0m"
+        );
+    }
+    ended
 }
 
 /// RFC 0005 step 8's witness: a hosted program lists a directory, stats a
@@ -14046,6 +14321,81 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // The same lesson as the bulk path's timing assertion, arriving from
     // another direction: a check that turns a small local failure into a broad
     // unrelated one is worse than the failure it reports.
+    // **And the same for the Linux adapter** — RFC 0005 step 9, Tier 2's
+    // prerequisite. Until now `bin/linuxd` held a console, a read-only
+    // directory and its own endpoint; a hosted program calling `socket()` had
+    // nothing behind it, and the arithmetic for one has been sitting in
+    // `personality::socket` since 2026-08-19 with nothing to wire it to.
+    //
+    // **This widens what a compromise of the adapter reaches, and that is
+    // recorded rather than absorbed.** `security.md` §1 T11's note enumerates
+    // what the adapter holds; the network now belongs on that list.
+    // [RFC 0031](../../docs/rfc/0031-linux-compatibility-as-an-adapter.md)'s
+    // interface **I5** says an adapter should host *one workload's* process
+    // group rather than being a system service every Linux process shares —
+    // and one system-wide `bin/linuxd` already contradicts that. Adding the
+    // network makes the drift larger, deliberately and with the project lead's
+    // decision behind it: the alternative is per-hosted-process authority from
+    // a manifest, which is an RFC and a supervisor change before any socket
+    // works at all.
+    //
+    // **Slot 88, and not 16 like the shell's, and not 2 either.** This
+    // adapter's CSpace is far fuller than the shell's: 0 and 1 are its
+    // endpoint and report, 2 is the page faults are handed over in, 3 is the
+    // console, **4 through 19 are its sixteen futex wakes**, 20 to 23 are the
+    // supervisor control, the child handle, the root directory and the lent
+    // page, hosted domains are allocated upward from 24 and open files
+    // downward from 127. What is left is 88 to 95.
+    //
+    // Two attempts were refused before this one -- 16, taken by a futex wake,
+    // and 2, taken by the fault page -- and both were refused by `install_at`
+    // rather than silently overwriting something a hosted thread depends on.
+    // That is the check earning its place: the failure was a boot line naming
+    // the problem, not a lost wakeup found weeks later.
+    let adapter = syscall::ADAPTER_DOMAIN.load(core::sync::atomic::Ordering::Relaxed);
+    if adapter != u32::MAX {
+        match network_endpoint_capability() {
+            Some(network)
+                if domain::with(domain::DomainId::from_u32(adapter), |owner| {
+                    owner.cspace.install_at(88, network).is_ok()
+                }) == Some(true) =>
+            {
+                println!(
+                    "    linux domain   holds a network now: a hosted program's socket reaches \
+                     bin/ipd, and the adapter's authority grew to match (RFC 0031 I5)"
+                )
+            }
+            Some(_) => println!(
+                "\x1b[93m    linux domain   the network capability would not install; hosted \
+                 programs have no sockets\x1b[0m"
+            ),
+            None => println!(
+                "    linux domain   no protocol service on this machine, so hosted programs get \
+                 no sockets"
+            ),
+        }
+
+        // **And a page for the datagrams themselves, at slot 89.** `SEND_TO`
+        // reads its payload with `DRAIN` from *offset zero* of a memory object
+        // the caller names, so the adapter needs one of its own: the report
+        // page it already holds begins with the `mmap` trace records, and
+        // using it would have a hosted `sendto` overwrite them.
+        let owner = domain::DomainId::from_u32(adapter);
+        match shared::create(owner, bhaskix_mm::FRAME_SIZE)
+            .ok()
+            .and_then(|page| shared::name(page).ok())
+        {
+            Some(named)
+                if domain::with(owner, |domain| {
+                    domain.cspace.install_at(89, named).is_ok()
+                }) == Some(true) => {}
+            _ => println!(
+                "\x1b[93m    linux domain   no page for datagrams; hosted sockets will not \
+                 carry bytes\x1b[0m"
+            ),
+        }
+    }
+
     match network_endpoint_capability() {
         Some(network)
             if domain::with(realm, |owner| owner.cspace.install_at(16, network).is_ok())
@@ -14537,6 +14887,13 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // they would read is empty. The first version of this line was up there
     // and printed nothing, which the gate caught immediately.
     report_lending_cost();
+
+    // RFC 0005 step 9, after the file probes because it needs the same second
+    // CPU and because a failure here should not be read as a filesystem
+    // problem.
+    if !socket_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    linux socket   FAILED\x1b[0m");
+    }
 
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
     println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");

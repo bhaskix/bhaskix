@@ -435,6 +435,24 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
     let (rdi, rsi, rdx, r10, r8, r9) = (image[5], image[4], image[3], image[9], image[7], image[8]);
 
     match number {
+        // Six arguments, which is two more than a message carries.
+        SENDTO | RECVFROM => {
+            let request = PersonalityCall::new(
+                Dialect::Linux,
+                number,
+                [rdi, rsi, rdx, r10, r8, r9],
+                0,
+                domain,
+            );
+            return (
+                REPLY_VALUE,
+                if number == SENDTO {
+                    answer_sendto(&request)
+                } else {
+                    answer_recvfrom(&request)
+                },
+            );
+        }
         CLONE => {
             let plan = thread::plan_clone(rdi, rsi, rdx, r10, r8);
             let ClonePlan::Thread { stack, tls, .. } = plan else {
@@ -716,7 +734,17 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
     // **`fork` needs the frame too**, and for the plainest reason: the child
     // resumes where the parent's call returns, and only the staged register
     // image says where that is.
-    if matches!(request.number, CLONE | RT_SIGRETURN | FORK) {
+    // **`sendto` and `recvfrom` are here for a structural reason, not a
+    // stylistic one.** The boundary message carries *four* arguments; both of
+    // those calls take six, and their fifth and sixth -- the address and its
+    // length -- arrive as hard zeros in a message. The first version of this
+    // wiring read them from the message anyway and every `sendto` refused
+    // `EFAULT` on a null address, which the socket probe found because its
+    // datagram never came back.
+    if matches!(
+        request.number,
+        CLONE | RT_SIGRETURN | FORK | SENDTO | RECVFROM
+    ) {
         return (REPLY_NEED_FRAME, Answer::ok(0));
     }
     // Acts on the caller that only the kernel can perform. **Which** of them,
@@ -770,6 +798,11 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         // the calls a message alone can answer.
         GETDENTS64 => return (REPLY_VALUE, answer_getdents64(request)),
         UNAME => return (REPLY_VALUE, answer_uname(request)),
+        // Tier 2's first four — RFC 0005 step 9. Each reads or writes the
+        // caller's memory, so each belongs in this block.
+        SOCKET => return (REPLY_VALUE, answer_socket(request)),
+        BIND => return (REPLY_VALUE, answer_bind(request)),
+
         IOCTL => return (REPLY_VALUE, answer_ioctl(request)),
         FSTAT => return (REPLY_VALUE, answer_fstat(request)),
         NEWFSTATAT => return (REPLY_VALUE, answer_newfstatat(request)),
@@ -1342,6 +1375,79 @@ const IOCTL: u64 = 16;
 const MKDIRAT: u64 = 258;
 /// `unlinkat(dirfd, path, flags)`.
 const UNLINKAT: u64 = 263;
+/// `socket(family, type, protocol)`.
+const SOCKET: u64 = 41;
+/// `bind(fd, sockaddr, length)`.
+const BIND: u64 = 49;
+/// `sendto(fd, buffer, length, flags, sockaddr, addrlen)`.
+const SENDTO: u64 = 44;
+/// `recvfrom(fd, buffer, length, flags, sockaddr, addrlen)`.
+const RECVFROM: u64 = 45;
+
+/// The protocol service, granted by the kernel — RFC 0005 step 9.
+///
+/// **Slot 88, and the number is what was left.** This program's CSpace is
+/// crowded: 0 and 1 are its endpoint and report, 2 the fault page, 3 the
+/// console, 4 to 19 its futex wakes, 20 to 23 the supervisor control, the
+/// child handle, the root directory and the lent page; hosted domains climb
+/// from 24 and open files fall from 127. Eighty-eight to ninety-five is the
+/// gap between them, and two attempts at tidier numbers were refused by
+/// `install_at` before this one.
+const NETWORK: u64 = 88;
+/// One page of this program's own memory, which datagrams cross in.
+///
+/// `SEND_TO` drains its payload from **offset zero** of a memory object, so
+/// the report page cannot serve: its first bytes are the `mmap` trace records.
+const PAYLOAD: u64 = 89;
+/// Where that page is mapped while bytes are staged in it.
+const PAYLOAD_AT: u64 = 0x0000_0000_1B00_0000;
+/// Where a hosted socket's capability lands: 90 up to 95, six of them.
+const SOCKET_SLOT: u64 = 90;
+/// How many sockets one machine's hosted programs may hold at once.
+///
+/// Six, because six is what the CSpace has left — and a limit met as `EMFILE`
+/// is a limit a program can act on, which is why it is checked rather than
+/// discovered by an `install_at` failing somewhere less legible.
+const SOCKETS: usize = 6;
+
+/// Which socket slots are taken.
+static mut SOCKET_HELD: [bool; SOCKETS] = [false; SOCKETS];
+
+/// Takes a free socket slot, or `None` when all six are in use.
+fn claim_socket_slot() -> Option<u64> {
+    // SAFETY: single-threaded by construction, as `claim_file_slot`.
+    let held = unsafe { &mut *core::ptr::addr_of_mut!(SOCKET_HELD) };
+    let index = held.iter().position(|taken| !*taken)?;
+    held[index] = true;
+    Some(SOCKET_SLOT + index as u64)
+}
+
+/// Gives a socket slot back: tells the service, then drops the capability.
+///
+/// **Both halves, and dropping the capability alone is not enough.**
+/// `bin/ipd` holds four sockets in a table of its own, and nothing tells it a
+/// client has stopped caring: a `DELETE` here takes the adapter's name for the
+/// socket away and leaves the service's entry, its port, and one of its four
+/// slots occupied until the machine restarts.
+///
+/// That is not a hypothetical either. The socket probe leaked one, it was the
+/// fourth of four, and the *shell* could no longer bind -- a leak in a hosted
+/// program surfacing as an unrelated program losing its network, which is the
+/// failure shape a shared adapter produces (RFC 0031 I5). The first attempt at
+/// a fix reclaimed the slot without telling the service and changed nothing,
+/// which is how the difference between the two halves got noticed.
+fn release_socket_slot(slot: u64) {
+    // The family does not matter for closing -- both crates send the same
+    // message to the same service -- so the v4 constructor serves for either.
+    let _ = bhaskix_sock::udp::Socket::from_slot(slot, 0).close();
+    let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
+    let index = (slot - SOCKET_SLOT) as usize;
+    // SAFETY: as `claim_socket_slot`.
+    let held = unsafe { &mut *core::ptr::addr_of_mut!(SOCKET_HELD) };
+    if let Some(taken) = held.get_mut(index) {
+        *taken = false;
+    }
+}
 /// `newfstatat`'s flag meaning "the path is empty; stat the descriptor" —
 /// which is how a libc turns `fstat` into this call.
 ///
@@ -1892,6 +1998,15 @@ const STAGE_LISTED: i64 = -120;
 const STAGE_STATTED: i64 = -121;
 const STAGE_SEEKED: i64 = -122;
 const STAGE_NOT_A_DIRECTORY: i64 = -123;
+/// And where a socket call stopped -- RFC 0005 step 9. Same record, because a
+/// probe uses one or the other and never both.
+const STAGE_SOCKET: i64 = -130;
+const STAGE_NO_EXPECT_SOCKET: i64 = -131;
+const STAGE_NOT_BOUND: i64 = -132;
+const STAGE_SENT: i64 = -133;
+const STAGE_SEND_REFUSED: i64 = -134;
+const STAGE_NOTHING_YET: i64 = -135;
+const STAGE_RECEIVED: i64 = -136;
 const STAGE_MAP_SILENT: i64 = -106;
 const STAGE_MAP_REFUSED: i64 = -107;
 const STAGE_NOT_ATTACHED: i64 = -109;
@@ -2693,6 +2808,375 @@ fn answer_fcntl(request: &PersonalityCall) -> Answer {
     }
 }
 
+/// Answers a hosted `socket` — RFC 0005 step 9, Tier 2's first call.
+///
+/// **No capability is taken here**, and that is not laziness: `bin/ipd` hands
+/// a socket back when it is *bound*, so there is nothing to hold until then.
+/// The descriptor exists so that `bind` has something to name and `close` has
+/// something to drop, which is what Linux's own split between the two calls
+/// means.
+fn answer_socket(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::{Entry, Kind};
+    use bhaskix_personality::socket::plan_socket;
+
+    let plan = match plan_socket(request.first(), request.second(), request.third()) {
+        Ok(plan) => plan,
+        Err(errno) => return Answer::error(errno),
+    };
+    // **Streams are refused and datagrams are not.** A descriptor handed back
+    // for a TCP socket would fail at `connect` with something that says
+    // nothing about why; RFC 0022's three-leg handover is step 9's second half
+    // and is not here.
+    if plan.stream {
+        return Answer::error(-93); // EPROTONOSUPPORT
+    }
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let entry = Entry {
+        // Unbound: no slot claimed until `bind` gets one from the service.
+        handle: u64::MAX,
+        inode: 0,
+        kind: Kind::Socket,
+        close_on_exec: plan.close_on_exec,
+        // **The family, on the row.** `bind` and `sendto` reach two different
+        // services' calls -- `udp` and `udp6` -- and the descriptor is the
+        // only place that choice is remembered between them.
+        offset: u64::from(plan.v6),
+        size: 0,
+        readable: true,
+        writable: true,
+    };
+    match process.descriptors.insert(entry, 0) {
+        Ok(descriptor) => Answer::ok(descriptor as u64),
+        Err(errno) => Answer::error(errno),
+    }
+}
+
+/// Answers a hosted `bind`.
+fn answer_bind(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::Kind;
+    use bhaskix_personality::socket::{Endpoint, parse_endpoint};
+
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9);
+    };
+    let mut address = [0u8; 32];
+    if !copy_in(request.domain, request.second(), &mut address) {
+        return Answer::error(-14); // EFAULT
+    }
+    let given = request.third() as usize;
+    let (port, v6) = match parse_endpoint(&address, given.min(address.len())) {
+        Ok(Endpoint::V4 { port, .. }) => (port, false),
+        Ok(Endpoint::V6 { port, .. }) => (port, true),
+        Err(errno) => return Answer::error(errno),
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    if entry.kind != Kind::Socket {
+        return Answer::error(-88); // ENOTSOCK
+    }
+    if entry.handle != u64::MAX {
+        return Answer::error(-22); // EINVAL: already bound
+    }
+    let Some(slot) = claim_socket_slot() else {
+        return Answer::error(-24); // EMFILE
+    };
+    // The address family the socket was made with decides which service call
+    // this is; binding a v6 address to a v4 socket is the caller's mistake and
+    // is refused rather than silently reinterpreted.
+    if v6 != (entry.offset != 0) {
+        release_socket_slot(slot);
+        return Answer::error(-97); // EAFNOSUPPORT
+    }
+    // **Where the capability may land, declared before asking for one.** The
+    // service hands the socket back with `HAND`, which puts it in the slot the
+    // caller declared and nowhere else; `bind6` does not do this for you, and
+    // its documentation says so. Omitting it does not fail loudly -- the bind
+    // is refused and a probe that only checked "did the program finish" sails
+    // past, which is what happened here before this line existed.
+    let declared = if v6 {
+        bhaskix_sock::udp6::expect_socket(NETWORK, slot)
+    } else {
+        bhaskix_sock::udp::expect_socket(NETWORK, slot)
+    };
+    if declared.is_err() {
+        trace_file(-5, STAGE_NO_EXPECT_SOCKET, slot);
+        release_socket_slot(slot);
+        return Answer::error(-5); // EIO
+    }
+    let bound = if v6 {
+        bhaskix_sock::udp6::bind6(NETWORK, slot, port).map(|socket| socket.slot())
+    } else {
+        bhaskix_sock::udp::bind(NETWORK, slot, port).map(|socket| socket.slot())
+    };
+    match bound {
+        Ok(held) => {
+            // The capability is the socket. Recording the slot on the row is
+            // what makes `sendto` and `close` able to find it again.
+            if let Some(process) = process_for(request.domain)
+                && let Some(entry) = process.descriptors.get_mut(descriptor)
+            {
+                entry.handle = held;
+                entry.size = u64::from(port);
+            }
+            trace_file(i64::from(descriptor), STAGE_SOCKET, u64::from(port));
+            Answer::ok(0)
+        }
+        Err(_) => {
+            trace_file(-98, STAGE_NOT_BOUND, u64::from(port));
+            release_socket_slot(slot);
+            Answer::error(-98) // EADDRINUSE
+        }
+    }
+}
+
+/// Whether the datagram page has been mapped yet.
+static mut PAYLOAD_MAPPED: bool = false;
+
+/// Maps the datagram page, once.
+///
+/// **`ATTACH` refuses an address that is already mapped**, and it refuses it
+/// with `SlotUnavailable` — the same answer it gives for every unusable
+/// address, which says nothing about which kind. So a second `ATTACH` at a
+/// working address looks exactly like a broken one. `sendto` mapped this page
+/// and then `recvfrom` mapped it again, and the second call failed `EFAULT`
+/// for a reason that had nothing to do with the caller's memory: the datagram
+/// went out and the reply was never read.
+///
+/// This is the third time in this tree that mapping twice has been the bug —
+/// RFC 0044 was the last — and the shape is always the same: an operation with
+/// no inverse, called as though it had one.
+fn payload_ready() -> bool {
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let mapped = unsafe { &mut *core::ptr::addr_of_mut!(PAYLOAD_MAPPED) };
+    if *mapped {
+        return true;
+    }
+    if call(
+        syscall::INVOKE,
+        PAYLOAD,
+        method::ATTACH,
+        [PAYLOAD_AT, 1, 0, 0],
+    )
+    .status
+        != status::OK
+    {
+        return false;
+    }
+    *mapped = true;
+    true
+}
+
+/// Stages bytes in the datagram page and answers whether they got there.
+fn stage_payload(domain: u32, at: u64, length: usize) -> bool {
+    if length > bhaskix_mm_frame() {
+        return false;
+    }
+    if !payload_ready() {
+        return false;
+    }
+    let mut bytes = [0u8; SCRATCH_BYTES as usize];
+    if !copy_in(domain, at, &mut bytes[..length]) {
+        return false;
+    }
+    for (index, byte) in bytes.iter().take(length).enumerate() {
+        // SAFETY: inside the page just mapped writable from this program's own
+        // object, bounded by the frame check above.
+        unsafe { core::ptr::write_volatile((PAYLOAD_AT + index as u64) as *mut u8, *byte) };
+    }
+    true
+}
+
+/// One frame, named once rather than spelled at each use.
+const fn bhaskix_mm_frame() -> usize {
+    4096
+}
+
+/// The port an endpoint names, for the record.
+fn from_port(endpoint: &bhaskix_personality::socket::Endpoint) -> u16 {
+    use bhaskix_personality::socket::Endpoint;
+    match endpoint {
+        Endpoint::V4 { port, .. } | Endpoint::V6 { port, .. } => *port,
+    }
+}
+
+/// Answers a hosted `sendto`.
+fn answer_sendto(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::Kind;
+    use bhaskix_personality::socket::{Endpoint, parse_endpoint};
+
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9);
+    };
+    let length = request.third() as usize;
+    let mut address = [0u8; 32];
+    if !copy_in(request.domain, request.fifth(), &mut address) {
+        trace_file(-14, STAGE_SEND_REFUSED, 1);
+        return Answer::error(-14);
+    }
+    let given = request.sixth() as usize;
+    let destination = match parse_endpoint(&address, given.min(address.len())) {
+        Ok(endpoint) => endpoint,
+        // **`EDESTADDRREQ` and not the parser's own errno.** A `sendto` with
+        // no address on an unconnected socket is a program that meant
+        // `connect` first, and this is the answer that says so.
+        Err(errno) => {
+            trace_file(-89, STAGE_SEND_REFUSED, (-errno) as u64 | 0x200);
+            return Answer::error(-89);
+        }
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    if entry.kind != Kind::Socket {
+        trace_file(-88, STAGE_SEND_REFUSED, 3);
+        return Answer::error(-88); // ENOTSOCK
+    }
+    if entry.handle == u64::MAX {
+        // Linux auto-binds here. This does not, and says so rather than
+        // inventing an ephemeral port the service never agreed to.
+        trace_file(-22, STAGE_SEND_REFUSED, 4);
+        return Answer::error(-22); // EINVAL
+    }
+    if length > bhaskix_mm_frame() {
+        return Answer::error(-90); // EMSGSIZE
+    }
+    if !stage_payload(request.domain, request.second(), length) {
+        trace_file(-14, STAGE_SEND_REFUSED, 5);
+        return Answer::error(-14);
+    }
+    let port = entry.size as u16;
+    let sent = match (destination, entry.offset != 0) {
+        // The parser gives four bytes; the v4 service speaks the wire word.
+        // Converted here and named, because getting it backwards sends every
+        // datagram to a mirrored address and nothing says so.
+        (Endpoint::V4 { address, port: to }, false) => {
+            bhaskix_sock::udp::Socket::from_slot(entry.handle, port).send_to(
+                PAYLOAD,
+                u32::from_be_bytes(address),
+                to,
+                length,
+            )
+        }
+        (Endpoint::V6 { address, port: to, .. }, true) => {
+            bhaskix_sock::udp6::Socket6::from_slot(entry.handle, port)
+                .send_to(PAYLOAD, address, to, length)
+        }
+        // A v6 address down a v4 socket, or the reverse. Linux answers this
+        // rather than translating, and so does this.
+        _ => {
+            trace_file(-97, STAGE_SEND_REFUSED, 6);
+            return Answer::error(-97); // EAFNOSUPPORT
+        }
+    };
+    match sent {
+        Ok(()) => {
+            trace_file(length as i64, STAGE_SENT, u64::from(port));
+            Answer::ok(length as u64)
+        }
+        Err(_) => {
+            trace_file(-101, STAGE_SEND_REFUSED, u64::from(port));
+            Answer::error(-101) // ENETUNREACH
+        }
+    }
+}
+
+/// Answers a hosted `recvfrom`.
+///
+/// **Non-blocking, and that is a limitation rather than a design.** `bin/ipd`
+/// answers "nothing yet" and this adapter passes that on as `EAGAIN`; a
+/// hosted program that blocks on a datagram would need this call to park it
+/// the way `read` on a pipe already does, which is a reply shape rather than
+/// a value and belongs with `epoll`. Recorded in the step, not smoothed over:
+/// a program looping on `EAGAIN` is spinning.
+fn answer_recvfrom(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::Kind;
+    use bhaskix_personality::socket::{Endpoint, write_endpoint};
+
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9);
+    };
+    let wanted = (request.third() as usize).min(bhaskix_mm_frame());
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11);
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9);
+    };
+    if entry.kind != Kind::Socket {
+        return Answer::error(-88);
+    }
+    if entry.handle == u64::MAX {
+        return Answer::error(-22);
+    }
+    if !payload_ready() {
+        trace_file(-14, STAGE_NOTHING_YET, 2);
+        return Answer::error(-14);
+    }
+    let port = entry.size as u16;
+    let sender = if entry.offset != 0 {
+        bhaskix_sock::udp6::Socket6::from_slot(entry.handle, port)
+            .recv_from(PAYLOAD)
+            .map(|taken| {
+                taken.map(|from| Endpoint::V6 {
+                    address: from.address,
+                    port: from.port,
+                    scope: 0,
+                })
+            })
+    } else {
+        bhaskix_sock::udp::Socket::from_slot(entry.handle, port)
+            .recv_from(PAYLOAD)
+            .map(|taken| {
+                taken.map(|from| Endpoint::V4 {
+                    address: from.address.to_be_bytes(),
+                    port: from.port,
+                })
+            })
+    };
+    let from = match sender {
+        Ok(Some(from)) => from,
+        Ok(None) => {
+            trace_file(-11, STAGE_NOTHING_YET, u64::from(port));
+            return Answer::error(-11); // EAGAIN: nothing yet
+        }
+        Err(_) => {
+            trace_file(-5, STAGE_NOTHING_YET, 1);
+            return Answer::error(-5); // EIO
+        }
+    };
+    trace_file(0, STAGE_RECEIVED, u64::from(from_port(&from)));
+    let mut bytes = [0u8; SCRATCH_BYTES as usize];
+    let take = wanted.min(bytes.len());
+    for (index, byte) in bytes.iter_mut().take(take).enumerate() {
+        // SAFETY: inside the page `ATTACH` mapped from this program's own
+        // object, bounded by the frame size above.
+        *byte = unsafe { core::ptr::read_volatile((PAYLOAD_AT + index as u64) as *const u8) };
+    }
+    if !copy_out(request.domain, request.second(), &bytes[..take]) {
+        return Answer::error(-14);
+    }
+    // The sender's address, if the caller asked where it came from. A caller
+    // that passed no buffer is not told, which is what a null pointer means.
+    if request.fifth() != 0 {
+        let mut out = [0u8; bhaskix_personality::socket::SOCKADDR_IN6_BYTES];
+        if let Ok(written) = write_endpoint(&mut out, &from)
+            && !copy_out(request.domain, request.fifth(), &out[..written])
+        {
+            return Answer::error(-14);
+        }
+    }
+    Answer::ok(take as u64)
+}
+
 /// Answers a hosted `close`, giving the capability back with the descriptor.
 fn answer_close(request: &PersonalityCall) -> Answer {
     let Ok(descriptor) = i32::try_from(request.first()) else {
@@ -2719,6 +3203,16 @@ fn answer_close(request: &PersonalityCall) -> Answer {
                 && matches!(entry.kind, Kind::File | Kind::Directory)
             {
                 release_file_slot(entry.handle);
+            }
+            // **And a socket's slot, which comes from a different pool.** A
+            // socket that was never bound holds nothing -- `u64::MAX` is the
+            // row's way of saying so -- and releasing that would compute an
+            // index far outside the six.
+            if entry.kind == Kind::Socket
+                && entry.handle != u64::MAX
+                && process.descriptors.holders(entry.handle) == 0
+            {
+                release_socket_slot(entry.handle);
             }
             // **A pipe end closing is a count, not a teardown** — RFC 0033
             // step 7. Which end matters: with no reader left a writer is told
@@ -2859,6 +3353,40 @@ fn note_exit(domain: u32, exit: Exit) {
         return;
     };
     let (pid, parent) = (process.pid, process.ppid);
+
+    // **A dead process's sockets come back, and nothing else would bring
+    // them.** `bin/ipd` holds four; a hosted program that exits without
+    // closing one keeps it for the life of the machine, because the
+    // capability sits in *this* program's CSpace rather than the dead
+    // domain's, and the service has no signal that a caller has gone --
+    // RFC 0016 says so about its own sessions and the same is true here.
+    //
+    // Found the hard way: the socket probe leaked its one socket, that was
+    // the fourth of four, and the *shell* could no longer bind. A leak in a
+    // hosted program showed up as an unrelated program losing its network,
+    // which is exactly the failure shape a shared adapter produces
+    // (RFC 0031 I5).
+    //
+    // Files are not released here and that is not an oversight: a file's slot
+    // is per-open and `close` returns it, and a hosted process that dies
+    // holding one leaks a slot from a pool of thirty-two rather than a
+    // service's scarce table. Recorded as a difference rather than made
+    // uniform, because the two pools are not the same size or the same kind.
+    for descriptor in 0..bhaskix_personality::file::MAX_DESCRIPTORS {
+        let Ok(number) = i32::try_from(descriptor) else {
+            break;
+        };
+        let Some(entry) = process.descriptors.get(number).copied() else {
+            continue;
+        };
+        if entry.kind == bhaskix_personality::file::Kind::Socket
+            && entry.handle != u64::MAX
+            && process.descriptors.holders(entry.handle) == 1
+        {
+            release_socket_slot(entry.handle);
+        }
+    }
+
     // SAFETY: single-threaded by construction, as elsewhere here.
     let processes = processes();
     let _ = processes.ended(pid, exit);

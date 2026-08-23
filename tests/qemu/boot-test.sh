@@ -2211,6 +2211,37 @@ fi
 # regression says by how much rather than only that there was one. This is the
 # frame-leak gate pointed at the newest thing that can leak, which is the whole
 # reason the object's frames are charged to an envelope at all.
+# RFC 0005 step 9: a hosted Linux program uses a socket.
+#
+# **The four bytes are the gate, and the kernel line is not.** The probe gives
+# up after a bounded retry and exits cleanly when no datagram returns, so "the
+# domain ended" is true either way -- and the first version of this test said
+# *passed* for a boot in which `bind` was refused, because `bhaskix-sock`
+# requires the receiving slot to be declared before the call and the adapter
+# was not doing it. Nothing failed loudly; the probe simply never received
+# anything, and only looking for the payload found it.
+#
+# `dup0` is written into a page by the probe, sent to `[::1]`, and printed from
+# what `recvfrom` gave back. It is in no file, no service and no part of the
+# adapter, so it cannot appear unless the datagram made the round trip.
+#
+# Over v6 because `bin/ipd` reinjects loopback for v6 only. The v4 path is
+# wired identically and is deliberately not claimed here.
+if grep -qE "linux socket   a Linux program bound a UDP socket and sent a datagram" "$LOG"; then
+    if grep -qF "dup0" "$LOG"; then
+        pass "a hosted program bound a UDP socket and echoed a datagram to itself"
+    else
+        fail "the socket probe ran and no datagram came back -- bind, sendto or recvfrom is the \
+one that did not work, and the adapter's own line will not tell you which"
+        status=1
+    fi
+elif grep -qF "linux socket   skipped" "$LOG"; then
+    pass "no network this machine can drive, so hosted sockets have nothing to ask"
+else
+    fail "the hosted socket test did not conclude: $(grep -aoE 'linux socket .*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0044's missing number, supplied.
 #
 # That RFC shipped un-measured -- and, worse, first claimed the boot report

@@ -791,6 +791,79 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (RFC 0005 step 9's wiring: a hosted program uses a socket, and a test that could not fail said it already did)
+
+Tier 2's arithmetic landed 2026-08-19 and its wiring was proved impossible in
+the nucleus; RFC 0032 moved the adapter out. This is the wiring: `socket`,
+`bind`, `sendto`, `recvfrom` over UDP, and a hosted Linux program that binds a
+socket, sends four bytes to itself through `bin/ipd` and reads them back.
+
+**The authority question came first and is not a code question.** `bin/linuxd`
+held a console, a read-only directory and its own endpoint; a hosted `socket()`
+had nothing behind it. Giving it a network widens what a compromise of the
+adapter reaches -- `security.md` T11 now lists the network -- and moves further
+from RFC 0031's **I5**, which says an adapter hosts *one workload's* process
+group rather than being a system service every Linux process shares. One
+system-wide `bin/linuxd` already contradicted that. The alternative was
+per-hosted-process authority from a manifest, an RFC and a supervisor change
+before any socket works; **the project lead chose the grant with both options
+written down**, and the drift is recorded rather than absorbed.
+
+**Over `[::1]` and not `127.0.0.1`, which is a fact about this machine.**
+`bin/ipd` reinjects loopback for v6 only, so a hosted v4 datagram leaves and
+does not come back and the receiving half could not be demonstrated over v4.
+The v4 path is wired identically and is not claimed.
+
+**Three findings, and the first is about the test.** The self-test checked only
+that the probe's domain *ended* -- and the probe ends cleanly when its bounded
+retry gives up, so the check was true either way. It reported success for a
+boot in which `bind` was refused outright. Looking for the payload is what
+found it. Then: `bhaskix-sock` requires the receiving slot to be declared
+before the call and `bind6` does not do it for you, which fails quietly. And
+**a six-argument syscall cannot be served from the boundary message** -- RFC
+0032's carries four, so `sendto`'s address and length arrived as zeros; the
+answer is the register frame `clone` and `fork` already ask for, and the same
+constraint is waiting for `accept4`, `epoll_pwait` and `recvmsg`.
+
+**A fifth, found by the shell losing its network: dropping a capability is not
+closing a socket.** `bin/ipd` holds four sockets and has no signal that a
+client has gone. The probe exited without closing, the adapter released only
+its own *slot*, and the service's entry stayed -- the fourth of four, so the
+**shell** could no longer bind. A leak in a hosted program surfaced as an
+unrelated program losing its network, RFC 0031's I5 shape again. The first fix
+reclaimed the slot without telling the service and changed nothing, which is
+how the two halves got told apart. Sockets are now closed at the service and
+reclaimed when a hosted domain ends; files deliberately are not, and the code
+says why -- a file slot comes from this adapter's pool of thirty-two, a socket
+from a table of four the whole machine shares.
+
+**A fourth finding, and the one with teeth: a hosted socket call can wedge the
+whole adapter.** On a lane whose network device gets no DMA window the device
+is refused, so `bin/ipd` has nothing to answer with -- but the *capability*
+still exists and installs, and a hosted `bind` then blocks for ever on a `CALL`
+nobody receives. `bin/linuxd` is one thread for every hosted process, so that
+single call stops it answering any of them. Two wrong diagnoses came first --
+the probe's retry bound, then the self-test's patience -- because the symptom
+was only "did not finish"; what settled it was that `bin/udp6` already draws
+this line for itself ("no unit contains the device, so there is no network to
+ask"). The self-test now skips on the flag the kernel already sets. **The wedge
+is recorded and not fixed**: it is RFC 0031's I5 from a third direction, after
+the authority and compromise arguments -- this one is availability.
+
+One repeat, third time in this tree: **`ATTACH` refuses an already-mapped
+address** with the same `SlotUnavailable` it gives for every unusable one.
+`sendto` mapped the datagram page and `recvfrom` mapped it again. An operation
+with no inverse, called as though it had one -- RFC 0044's shape exactly.
+
+Not done: TCP (refused as `EPROTONOSUPPORT` rather than failing later at
+`connect`), `epoll`, `connect`/`listen`/`accept4`/`getsockname`/`setsockopt`,
+and a blocking `recvfrom` -- which is a reply shape rather than a value and
+belongs with `epoll`. Six sockets at once, machine-wide, because six is what
+the adapter's CSpace has left.
+
+Gated on the payload, watched red twice: the slot never declared, and the
+six-argument calls served from a four-word message.
+
 ### 2026-08-23 (RFC 0005 step 8, second pass: the rest of Tier 1, and three places where it is a judgement rather than wiring)
 
 `uname`, `fcntl`, `ioctl` on an allow-list of two, and `mkdirat`/`unlinkat` as

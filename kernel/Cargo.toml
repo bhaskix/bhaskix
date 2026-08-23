@@ -422,7 +422,18 @@ asm_budget = 10
 # serial ports, this kernel probed one, and it spent two hardware boots writing
 # a boot report nobody could carry. Writing to both put 19,550 bytes of it on
 # serial-over-LAN and closed M1-17, open since Phase 0.
-unsafe_budget = 2111
+unsafe_budget = 2142
+# Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
+# is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
+# two filenames. The same two blocks every hosted probe has: one
+# `copy_nonoverlapping` filling a frame this space owns through the direct
+# map, and the `vm::install`/`enter_ring3` pair it ends with.
+#
+# None of the step's content is in it. `socket`, `bind`, `sendto` and
+# `recvfrom` are answered in `bin/linuxd`, and the arithmetic they rest on --
+# `parse_endpoint`, `write_endpoint`, `plan_socket` -- is in
+# `bhaskix-personality`, which is `forbid(unsafe_code)` and fuzzed. These
+# thirty-one lines are the cost of *running* the test.
 # Up one for RFC 0044, and it is the same statement moved rather than a new
 # kind of authority: `paging::unmap_page` on a root the object itself recorded
 # a mapping into. `shared::revoke` has had that line since RFC 0009; taking a

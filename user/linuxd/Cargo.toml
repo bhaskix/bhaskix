@@ -165,7 +165,17 @@ asm_budget = 3
 # and the number went to 84; taking the counter from `bhaskix-sock`, which owns
 # that read already, brought it back to 76. The gate reported both, before
 # either was committed.
-unsafe_budget = 78
+unsafe_budget = 83
+# Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
+# a payload into it, the volatile reads that take one back out, and the static
+# that remembers whether it has been mapped.
+#
+# **That last one is a line bought with a bug.** `ATTACH` refuses an address
+# that is already mapped, and refuses it with the same `SlotUnavailable` it
+# gives for every unusable address -- so `sendto` mapped the page, `recvfrom`
+# mapped it again, and the second call answered `EFAULT` for a reason that had
+# nothing to do with the caller's memory. Mapping once and remembering is what
+# the flag is for.
 # Up two for RFC 0044's measurement, and both are the same statement this
 # program already makes a dozen times: a volatile read and a volatile write
 # into the report page it mapped from its own object, at an offset the
