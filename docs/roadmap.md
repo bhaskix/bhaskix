@@ -38,7 +38,7 @@ survive in the same document.
 | [coding-style.md](coding-style.md) | ✅ adopted for Phase 1 |
 | A1 license | ✅ [RFC 0001](rfc/0001-license-apache-2.0.md) — Apache-2.0 |
 | A2 syscall ABI shape · A3 IPC style · A4 userspace ABI | ✅ [RFC 0008](rfc/0008-syscall-and-ipc-shape.md) |
-| A5 5-level paging (LA57) | ✅ [RFC 0025](rfc/0025-five-level-paging.md) — four-level on purpose, five behind written triggers |
+| A5 5-level paging (LA57) | ✅ [RFC 0025](rfc/0025-four-level-paging-on-purpose.md) — four-level on purpose, five behind written triggers |
 | Dev environment reproducible (`tools/setup-dev.sh`) | ✅ |
 | CI: build, fmt, clippy, host tests, QEMU boot | ✅ |
 | Design-document review by two people who did not write them | ⬜ **outstanding** |
@@ -501,6 +501,25 @@ this release**, and the release note says so in those words rather than describi
 tense that could be mistaken for a state.
 
 ---
+
+## The book
+
+***Mastering Bhaskix*** is scoped in
+[ebook-mastering-bhaskix.md](ebook-mastering-bhaskix.md) and written in
+[`book/`](../book/): four parts, thirty-six chapters, four interludes and a
+closing chapter, each carrying the evidence in this tree that makes its claim
+checkable.
+
+**It is deliberately not a milestone.** The book tracks the repository rather
+than the other way round, and scheduling it would invert that — a chapter due on
+a date is a chapter that gets written before its evidence exists, which is the
+one failure the scope document says would make the book worthless.
+
+What it does have is a **trigger**: thirty-five of the thirty-six chapters are
+writable today, and the one that is not (*The keystroke*) is waiting on RFC 0041
+step 7. The first edition's own open question — whether to ship stating USB and
+real hardware as gaps, or to wait — is question 4 of that document and is not
+settled here.
 
 ## How to pick up work
 

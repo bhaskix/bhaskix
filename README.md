@@ -114,6 +114,20 @@ Read in this order:
 | [docs/coding-style.md](docs/coding-style.md) | Engineering rules. Read before your first PR. |
 | [docs/roadmap.md](docs/roadmap.md) | Milestones and their verifiable exit criteria |
 
+## The book
+
+***Mastering Bhaskix***, by Tarun Kumar Kushwaha — a worked account of building
+this system, organised around the method rather than the module list. It lives in
+this repository so that a change to the system and the change to the book that
+describes it land together.
+
+**Scoped, one chapter of thirty-six written.** Do not expect a book yet.
+
+| | |
+|---|---|
+| [book/](book/) | What has been written. Today: one chapter, *What a capability is* |
+| [docs/ebook-mastering-bhaskix.md](docs/ebook-mastering-bhaskix.md) | The scope and the full chapter plan — what each chapter may claim, and the evidence in this tree that carries it |
+
 ## Technical summary
 
 | | |

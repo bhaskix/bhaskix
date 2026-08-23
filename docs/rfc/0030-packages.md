@@ -6,7 +6,7 @@
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/shell`, `bin/sup`), fs, tools, new leaf crate `pkg/` |
 | **Milestone** | Phase 2 — the "package management and image building" bullet, one of the two left on the phase's list |
-| **Depends on** | [RFC 0015](0015-filesystem.md)/[RFC 0016](0016-writable-filesystem.md) (the VFS and the journalled writable filesystem a package is installed onto), [RFC 0017](0017-process-management.md) (`START`, reaping, and the supervisor pattern the runner follows), [RFC 0008](0008-syscall-and-ipc-shape.md) (all authority arrives as a capability argument), `driver-model.md` §5 (the manifest-as-reviewable-authority principle this RFC generalises) |
+| **Depends on** | [RFC 0015](0015-filesystem.md)/[RFC 0016](0016-capability-in-a-reply.md) (the VFS and the journalled writable filesystem a package is installed onto), [RFC 0017](0017-process-management.md) (`START`, reaping, and the supervisor pattern the runner follows), [RFC 0008](0008-syscall-and-ipc-shape.md) (all authority arrives as a capability argument), `driver-model.md` §5 (the manifest-as-reviewable-authority principle this RFC generalises) |
 
 ---
 

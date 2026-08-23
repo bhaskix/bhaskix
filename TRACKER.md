@@ -791,6 +791,71 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (the book was on GitHub and nothing pointed at it; scoped into thirty-six chapters, and two links that went nowhere)
+
+**The complaint was that *Mastering Bhaskix* is nowhere on GitHub. It is there,
+and the complaint was still right.** Verified against the actual remote rather
+than a local ref — `origin/main` is `9aef582` and holds both
+`docs/ebook-mastering-bhaskix.md` and `book/02-authority/01-what-a-capability-is.md`.
+
+What was true is that nothing in the repository told anybody so:
+
+| Where a person would look | What was there |
+|---|---|
+| `README.md` | **no mention of a book at all** — zero hits for "book" or "ebook" |
+| `docs/roadmap.md` | not scheduled, not named |
+| `book/` | no index; one file at `02-authority/01-…`, so the directory listing showed a folder called `02-authority` and nothing else |
+| `docs/` | the scope document sat among thirteen others with no pointer to it |
+
+Committed and invisible is a state this project has been caught in before, from
+the other direction: on 2026-08-20 a change was *described* and never committed.
+This is the same gap with the halves swapped.
+
+**Scoped into a plan somebody could write against.** The scope document had a
+four-part *shape* described in prose. It now has **thirty-six numbered chapters,
+four interludes and a closing chapter**, each with three things: the one claim it
+is allowed to make, the evidence in this tree that makes the claim checkable, and
+whether it can be written yet. A chapter whose evidence column is empty may not
+be written — which is the same rule the code lives under, applied to prose.
+
+**Thirty-five of the thirty-six are writable today.** The one that is not is
+**4.13, *The keystroke***: nothing has reached the shell over USB, and RFC 0041
+step 7 is what would change that. Interlude A is writable *with a gap stated* —
+one boot on real hardware, observed on a screen and never captured — and a
+performance chapter cannot be written at all, because there is nothing to write
+it from.
+
+**§6 contradicted the plan it summarises, and was restated.** It said "USB beyond
+RFC 0041's definitions" is blocked. That was true when it was written on
+2026-08-22 and false the next morning, four steps later. Corrected where the
+wrong claim lived.
+
+**The counts in this entry were wrong once already.** The chapter list was
+written saying "four parts and thirty chapters" and "29 of 30 writable"; counting
+the table rows gives thirty-six and thirty-five. Both fixed before the commit, by
+counting rather than by re-reading.
+
+**Two links that went nowhere, found by sweeping all of them.** Neither was new:
+
+- `docs/roadmap.md` pointed at `rfc/0025-five-level-paging.md`; the file is
+  `0025-four-level-paging-on-purpose.md` and has been since the RFC was accepted.
+  The link had been dead since the rename.
+- `docs/rfc/0030-packages.md` pointed at `0016-writable-filesystem.md`, which is
+  an early working name for `0016-capability-in-a-reply.md`.
+
+Both are 404s for anybody reading the repository on the web — the same class of
+problem as the book being unfindable, which is why they were swept for rather
+than left. **Every relative link in every tracked markdown file now resolves**,
+checked across all of them and not only the ones touched here.
+
+**And the roadmap deliberately does not schedule the book.** It records it, with
+its trigger, and says why: the book tracks the repository rather than the other
+way round, and a chapter due on a date is a chapter written before its evidence
+exists — which the scope document lists as the first thing that would make the
+book worthless.
+
+No code. `make gates` green.
+
 ### 2026-08-23 (RFC 0041 step 6: the keyboard is asked what it is, answers, and its endpoint is configured)
 
 **The first control transfer, and the first thing a device has ever said to this
