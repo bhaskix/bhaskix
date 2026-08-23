@@ -280,6 +280,20 @@ bhaskix_device::register_block! {
 }
 
 bhaskix_device::register_block! {
+    /// One root hub port's status and control register.
+    ///
+    /// Named at the port being looked at rather than being an array, for the
+    /// same reason the doorbell is: the index reaches straight into an offset.
+    /// `PORTSC` is also the most dangerous register in the controller to
+    /// read-modify-write -- seven of its bits are write-one-to-clear and bit 1
+    /// is write-one-to-*disable* -- which is why every write here goes through
+    /// `preserving` or `acknowledging`.
+    struct PortRegister(0x04) {
+        0x00 => portsc: u32,
+    }
+}
+
+bhaskix_device::register_block! {
     /// One doorbell, inside the doorbell bank.
     ///
     /// **Write-only in practice**, which is why the block holds one register
@@ -739,6 +753,99 @@ pub fn command_ring_link(device_address: u64, entries: usize) -> Option<(usize, 
     Some((producer.link_index(), link))
 }
 
+/// The three contexts an Address Device command needs, and where each goes.
+///
+/// **This is the arithmetic RFC 0041 names as the trap**, extracted so a host
+/// test holds it rather than a comment. An input context is
+/// `[input control][slot][endpoint 1]…`, one context further along than a
+/// *device* context is — so the slot context sits at one stride and not at
+/// zero. A driver that fills an input context with device-context arithmetic
+/// writes the slot context on top of the input control context's add and drop
+/// flags, which is a command that configures the wrong endpoints and is
+/// accepted.
+///
+/// Returns `(offset, dwords)` for the input control context, the slot context
+/// and the control endpoint's context, in that order. Everything else in the
+/// input context stays zeroed, which is what "not being added" means.
+///
+/// `None` if the endpoint's transfer ring address is one the context cannot
+/// hold — 16-byte alignment, refused here because the controller would take the
+/// low bits as flags instead.
+#[must_use]
+pub fn address_device_input(
+    port: u8,
+    speed: u32,
+    transfer_ring: u64,
+    transfer_ring_cycle: bool,
+    context_size_64: bool,
+) -> Option<[(usize, [u32; context::DWORDS]); 3]> {
+    // A0 and A1: evaluate the slot context and the control endpoint. Nothing
+    // else exists yet, and adding a context that has not been written is how a
+    // controller is asked to read uninitialised memory.
+    let control = context::InputControl::new()
+        .adding(0)?
+        .adding(bhaskix_xhci::doorbell::CONTROL_ENDPOINT)?;
+
+    // One context entry: the control endpoint and nothing beyond it. This is
+    // the *highest* index in use, not a count of endpoints, and setting it too
+    // low makes the controller ignore contexts that are there.
+    let slot = context::Slot::new()
+        .with_route_and_speed(0, speed as u8)
+        .with_context_entries(bhaskix_xhci::doorbell::CONTROL_ENDPOINT)
+        .with_root_hub_port_number(port);
+
+    let endpoint = context::Endpoint::new()
+        .with_endpoint_type(context::EndpointType::Control)
+        .with_max_packet_size(initial_max_packet_size(speed))
+        // Three attempts before the controller gives up on a transfer. Zero
+        // means "retry for ever", which is a wedged endpoint rather than a
+        // reported error.
+        .with_error_count(3)
+        .with_transfer_ring(transfer_ring, transfer_ring_cycle)?;
+
+    Some([
+        (context::INPUT_CONTROL_OFFSET, control.0),
+        (context::input_context_offset(0, context_size_64)?, slot.0),
+        (
+            context::input_context_offset(
+                bhaskix_xhci::doorbell::CONTROL_ENDPOINT,
+                context_size_64,
+            )?,
+            endpoint.0,
+        ),
+    ])
+}
+
+/// The control endpoint's packet size to assume before the device is asked.
+///
+/// **A guess the specification prescribes, not a measurement**, and it is only
+/// ever a starting point: a full-speed device reports its real maximum in the
+/// device descriptor, and a driver that reads one is expected to correct the
+/// context afterwards. Nothing here corrects it yet, because nothing here reads
+/// a descriptor — that is step 6, and this constant is what it will have to
+/// revisit.
+///
+/// The speed ids are `PORTSC` bits 13:10. They are transcribed from the speed
+/// table rather than derived, and **have not been checked against a copy of the
+/// specification on this machine** — which is survivable at this step because
+/// Address Device does not care: the packet size governs transfers, and there
+/// are none until step 6. The trigger to check it is the first control transfer.
+#[must_use]
+const fn initial_max_packet_size(speed: u32) -> u16 {
+    match speed {
+        // Full speed and low speed both start at eight; a full-speed device may
+        // then say 8, 16, 32 or 64.
+        1 | 2 => 8,
+        // High speed is fixed at 64 and never negotiated.
+        3 => 64,
+        // SuperSpeed and above are fixed at 512.
+        4 | 5 => 512,
+        // Undefined. Eight is the smallest legal value, so it is the one that
+        // cannot ask a device for more than it can answer.
+        _ => 8,
+    }
+}
+
 /// What one drain of the event ring found.
 ///
 /// Counts rather than a queue: nothing in this step *acts* on an event, and a
@@ -769,6 +876,12 @@ pub struct Drained {
     pub last_command: u64,
     /// Which port the last change concerned.
     pub last_port: u8,
+    /// Which slot the last completion concerned.
+    ///
+    /// An Enable Slot completion carries the slot the controller handed out,
+    /// and it is carried here rather than returned separately because it
+    /// arrives the same way every other answer does.
+    pub last_slot: u8,
 }
 
 /// Consumes every event the controller has published, and dispatches by kind.
@@ -803,6 +916,7 @@ pub fn drain(
                 found.command_completions += 1;
                 found.last_completion = Some(event.completion_code());
                 found.last_command = event.command_trb_pointer();
+                found.last_slot = event.slot_id();
             }
             trb::Kind::PortStatusChange => {
                 found.port_changes += 1;
@@ -888,6 +1002,8 @@ pub struct Started {
     pub frames: usize,
     /// What asking it a question produced. RFC 0041 step 4.
     pub answered: Answered,
+    /// What addressing a device produced. RFC 0041 step 5.
+    pub attached: Attached,
 }
 
 /// Why a controller could not be brought up, from the kernel's side.
@@ -1108,131 +1224,540 @@ pub unsafe fn init(hhdm: u64) -> Result<Started, InitError> {
     // A running controller is only a controller that is *not halted*. This is
     // the first thing that proves the rings are real in both directions -- the
     // command ring the driver writes and the event ring the controller does.
+    let mut commander = Commander::new(
+        base,
+        &parameters,
+        &memory,
+        command_ring.virtual_address,
+        event_ring.virtual_address,
+    )
+    .ok_or(InitError::BringUp(BringUpError::RingTooSmall))?;
+
     // SAFETY: the controller is running, and this is its memory and its window.
-    let answered = unsafe {
-        exercise_the_rings(
-            base,
-            &parameters,
-            &memory,
-            command_ring.virtual_address,
-            event_ring.virtual_address,
-            &mut Settle,
-        )
+    let answered = unsafe { exercise_the_rings(&mut commander, &mut Settle) };
+
+    // RFC 0041 step 5: find a device, take a slot for it, and give it an
+    // address. Only attempted once the rings have answered -- addressing a
+    // device through a conversation that has not been shown to work would
+    // report a failure of the wrong thing.
+    let attached = if answered.matched {
+        // SAFETY: as above, and the controller has answered once already.
+        unsafe {
+            address_a_device(
+                &mut commander,
+                controller,
+                &parameters,
+                device_contexts.virtual_address,
+                hhdm,
+                &mut Settle,
+            )
+        }
+    } else {
+        Attached::default()
     };
 
     Ok(Started {
         running,
-        frames,
+        frames: frames + attached.frames,
         answered,
+        attached,
     })
+}
+
+/// A conversation with the controller: the command ring out, the event ring in.
+///
+/// **Step 4 did this once for a No-Op and step 5 needs it three times**, so the
+/// one-shot became a small engine rather than being copied. It owns the two
+/// cursors, because their state is the protocol: where the next command goes,
+/// which cycle bit publishes it, and which entry of the event ring is the
+/// driver's turn to read.
+struct Commander<'a> {
+    base: usize,
+    parameters: &'a Parameters,
+    memory: &'a Memory,
+    /// The kernel's view of the command ring.
+    command: u64,
+    /// The kernel's view of the event ring.
+    event: u64,
+    producer: ring::Producer,
+    consumer: ring::Consumer,
+    /// Whether the dequeue pointer has been written back at least once.
+    dequeue_advanced: bool,
+}
+
+/// What one command produced.
+struct Issued {
+    /// Where the command TRB was written, in the controller's addresses.
+    asked_at: u64,
+    /// Everything the drain found, which may include events for other things.
+    drained: Drained,
+    /// Whether anything arrived before the deadline.
+    arrived: bool,
+}
+
+impl Issued {
+    /// Whether the completion answered *this* command and answered it well.
+    const fn succeeded(&self) -> bool {
+        self.drained.command_completions > 0
+            && self.drained.last_command == self.asked_at
+            && match self.drained.last_completion {
+                Some(code) => code.is_success(),
+                None => false,
+            }
+    }
+}
+
+impl<'a> Commander<'a> {
+    /// Prepares to talk to a running controller.
+    fn new(
+        base: usize,
+        parameters: &'a Parameters,
+        memory: &'a Memory,
+        command: u64,
+        event: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            base,
+            parameters,
+            memory,
+            command,
+            event,
+            producer: ring::Producer::new(memory.command_ring_entries)?,
+            consumer: ring::Consumer::new(memory.event_ring_entries)?,
+            dequeue_advanced: false,
+        })
+    }
+
+    /// Writes one command, rings the doorbell, and drains what comes back.
+    ///
+    /// `build` is handed the cycle bit the command must carry, because that is
+    /// the producer's state and not the caller's business to track.
+    ///
+    /// # Safety
+    ///
+    /// The controller must be running and this `Commander`'s addresses must be
+    /// its rings.
+    unsafe fn issue<W: Wait>(
+        &mut self,
+        build: impl FnOnce(bool) -> trb::Trb,
+        wait: &mut W,
+    ) -> Option<Issued> {
+        // **The lap is not handled, so it is refused.** Wrapping means
+        // re-publishing the Link TRB with the producer's new cycle, and nothing
+        // here does that yet -- a ring that silently wrapped would hand the
+        // controller a link carrying the previous lap's bit, which it reads as
+        // stale and stops on. Step 5 issues three commands into a ring of
+        // sixteen; the refusal is here so that the day a caller issues fifteen
+        // it is told, rather than finding out from a controller that went quiet.
+        if self.producer.remaining_this_lap() == 0 {
+            return None;
+        }
+
+        let doorbell_offset =
+            bhaskix_xhci::doorbell::doorbell_at(bhaskix_xhci::doorbell::COMMAND_RING)?;
+
+        // Where the controller will say it found this command. The *device*
+        // address, because that is the number the controller deals in -- naming
+        // the physical one would compare an answer against a question nobody
+        // asked.
+        let asked_at = self.memory.command_ring + (self.producer.index() * trb::BYTES) as u64;
+
+        // SAFETY: a frame `init` allocated and zeroed, at an index `Producer`
+        // bounds to inside the ring.
+        unsafe {
+            core::ptr::write_volatile(
+                (self.command as *mut [u32; 4]).add(self.producer.index()),
+                build(self.producer.cycle()).0,
+            );
+        }
+        self.producer.advance();
+
+        // SAFETY: the doorbell bank is inside the window, which `parameters`
+        // checked, and the offset is bounded by `doorbell_at`.
+        let doorbell = unsafe {
+            DoorbellRegister::<bhaskix_device::Volatile>::new(
+                self.base + self.parameters.doorbells + doorbell_offset,
+            )
+        };
+        doorbell
+            .value
+            .write(bhaskix_xhci::doorbell::Doorbell::command().0);
+
+        // Wait for the controller to publish something at the entry this
+        // consumer is looking at. Ownership is the cycle bit and nothing else:
+        // a zeroed entry has bit 0, a fresh consumer expects 1, so "not written
+        // yet" and "written" are distinguishable without reading anything else.
+        let consumer = &self.consumer;
+        let event_ring = self.event;
+        let arrived = wait.until(&mut || {
+            // SAFETY: the event ring is a frame `init` allocated; this reads
+            // one TRB at an index `Consumer` bounds to inside it. Volatile
+            // because the controller writes here by DMA.
+            let event = unsafe {
+                core::ptr::read_volatile((event_ring as *const [u32; 4]).add(consumer.index()))
+            };
+            consumer.owns(trb::Trb(event).cycle_bit())
+        });
+
+        let drained = drain(
+            self.memory.event_ring_entries,
+            &mut self.consumer,
+            &mut |index| {
+                // SAFETY: as above.
+                trb::Trb(unsafe {
+                    core::ptr::read_volatile((event_ring as *const [u32; 4]).add(index))
+                })
+            },
+        );
+
+        // SAFETY: the runtime bank is inside the window, which `parameters`
+        // checked.
+        unsafe { self.advance_dequeue() };
+
+        Some(Issued {
+            asked_at,
+            drained,
+            arrived,
+        })
+    }
+
+    /// Tells the controller how far this driver has consumed.
+    ///
+    /// **And clears Event Handler Busy while doing it**, which is the write that
+    /// says "I am done looking". Without it the controller will not raise the
+    /// interrupter again, which is a ring that works exactly once -- and works
+    /// once is what every gate weaker than this one would accept.
+    ///
+    /// # Safety
+    ///
+    /// The runtime bank must be inside the mapped window.
+    unsafe fn advance_dequeue(&mut self) {
+        let Some(interrupter_zero) = runtime::interrupter_at(0) else {
+            return;
+        };
+        let Some(dequeue) = runtime::EventRingDequeuePointer::advancing(
+            self.memory.event_ring + (self.consumer.index() * trb::BYTES) as u64,
+            0,
+            true,
+        ) else {
+            return;
+        };
+        // SAFETY: the caller's obligation.
+        let interrupter = unsafe {
+            Interrupter::<bhaskix_device::Volatile>::new(
+                self.base + self.parameters.runtime + interrupter_zero,
+            )
+        };
+        interrupter.erdp.write(dequeue.0);
+        self.dequeue_advanced = true;
+    }
+}
+
+/// A port with something plugged into it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Connected {
+    /// Which port, numbered from one as the specification numbers them.
+    pub port: u8,
+    /// The negotiated speed, from `PORTSC` bits 13:10.
+    pub speed: u32,
+    /// Whether it had to be reset before it enabled.
+    pub reset: bool,
+}
+
+/// Finds the first port with an enabled device on it.
+///
+/// **A USB 3 port enables itself on connect and a USB 2 port must be reset**,
+/// and a driver cannot tell which kind it is looking at from the port number:
+/// the split between them is a controller's own business. So the rule is not
+/// "reset USB 2 ports" but *if it is connected and not enabled, reset it* --
+/// which is right for both and needs to know neither.
+///
+/// # Safety
+///
+/// `base` must be the mapped window and the port registers inside it, which
+/// [`parameters`] checked.
+unsafe fn find_connected_port<W: Wait>(
+    base: usize,
+    parameters: &Parameters,
+    wait: &mut W,
+) -> Option<Connected> {
+    for port in 1..=parameters.ports {
+        let Some(offset) = operational::port_status_control(port) else {
+            continue;
+        };
+        // SAFETY: the caller's obligation; the port register array is inside
+        // the operational bank, which is inside the window.
+        let register = unsafe {
+            PortRegister::<bhaskix_device::Volatile>::new(base + parameters.operational + offset)
+        };
+
+        let status = operational::PortStatusControl(register.portsc.read());
+        if !status.current_connect_status() {
+            continue;
+        }
+
+        let mut reset = false;
+        if !status.port_enabled() {
+            // **`preserving` and not the value just read.** Seven of this
+            // register's bits are write-one-to-clear and bit 1 is
+            // write-one-to-*disable*, so writing back what was read clears
+            // every change bit that happened to be set and disables the port
+            // into the bargain. The symptom is a port that works once and then
+            // never reports another device.
+            register.portsc.write(status.preserving().0 | (1 << 4));
+            reset = true;
+            wait.until(&mut || {
+                operational::PortStatusControl(register.portsc.read()).port_enabled()
+            });
+        }
+
+        let settled = operational::PortStatusControl(register.portsc.read());
+        // Acknowledge what changed, and only what changed. Built from the bits
+        // that are set rather than from the whole value, for the reason above.
+        register.portsc.write(
+            settled
+                .acknowledging(settled.0 & operational::PortStatusControl::WRITE_ONE_TO_CLEAR)
+                .0,
+        );
+
+        // **Speed zero is not a speed.** The specification says undefined, and
+        // a driver that passes it into a slot context has told the controller
+        // something it cannot act on -- so an enabled port that has not settled
+        // on a speed is not yet a device.
+        if settled.port_enabled() && settled.port_speed() != 0 {
+            return Some(Connected {
+                port,
+                speed: settled.port_speed(),
+                reset,
+            });
+        }
+    }
+    None
+}
+
+/// One word for what the controller thinks a slot is doing.
+///
+/// Named rather than derived from `Debug`, because this goes in a boot report a
+/// person reads and `Some(Addressed)` is not a sentence.
+#[must_use]
+pub const fn describe_slot_state(state: Option<context::SlotState>) -> &'static str {
+    match state {
+        Some(context::SlotState::DisabledEnabled) => "enabled, not addressed",
+        Some(context::SlotState::Default) => "default",
+        Some(context::SlotState::Addressed) => "addressed",
+        Some(context::SlotState::Configured) => "configured",
+        Some(context::SlotState::Reserved(_)) => "a value the specification does not define",
+        None => "not read",
+    }
+}
+
+/// What step 5 achieved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Attached {
+    /// The port a device was found on, if one was.
+    pub port: u8,
+    /// Its negotiated speed.
+    pub speed: u32,
+    /// Whether the port had to be reset.
+    pub reset: bool,
+    /// The slot the controller handed out, if it did.
+    pub slot: u8,
+    /// Whether Address Device succeeded.
+    pub addressed: bool,
+    /// The address the controller assigned, read back from the device context.
+    pub address: u8,
+    /// The slot state, read back from the device context the controller wrote.
+    pub state: Option<context::SlotState>,
+    /// Frames this step handed the controller.
+    pub frames: usize,
+    /// Why it stopped, when it did not finish.
+    pub stopped: Option<&'static str>,
+    /// The completion code of the command that refused, when one did.
+    ///
+    /// **A refusal that does not name its code is a refusal nobody can act
+    /// on.** `ParameterError` says a field of the input context is wrong;
+    /// `ContextStateError` says the slot was in the wrong state; `TrbError`
+    /// says the command itself was malformed. They send a reader to three
+    /// different places.
+    pub code: Option<trb::CompletionCode>,
+}
+
+/// Takes a slot for the device on a port and gives it an address.
+///
+/// RFC 0041 step 5. Three things in order, each of which can fail on its own
+/// and says so: find a port with a device on it, ask for a slot, and address
+/// the device through an input context naming its control endpoint.
+///
+/// **The claim at the end is read back from the controller's own memory**, not
+/// inferred from a success code. Address Device answering `Success` says the
+/// command was accepted; the *device context* saying `Addressed` with a nonzero
+/// address says the controller did the thing the command asked for.
+///
+/// # Safety
+///
+/// The controller must be running and answering commands, and the addresses
+/// must be its.
+unsafe fn address_a_device<W: Wait>(
+    commander: &mut Commander<'_>,
+    controller: (u8, u8, u8),
+    parameters: &Parameters,
+    device_contexts: u64,
+    hhdm: u64,
+    wait: &mut W,
+) -> Attached {
+    let mut attached = Attached::default();
+
+    // SAFETY: the caller's obligation.
+    let Some(found) = (unsafe { find_connected_port(commander.base, parameters, wait) }) else {
+        attached.stopped = Some("no port has a device on it");
+        return attached;
+    };
+    attached.port = found.port;
+    attached.speed = found.speed;
+    attached.reset = found.reset;
+
+    // --- a slot ------------------------------------------------------------
+    // SAFETY: the caller's obligation.
+    let Some(issued) = (unsafe { commander.issue(trb::Trb::enable_slot, wait) }) else {
+        attached.stopped = Some("the command ring would have wrapped");
+        return attached;
+    };
+    if !issued.succeeded() {
+        attached.stopped = Some("the controller would not enable a slot");
+        attached.code = issued.drained.last_completion;
+        return attached;
+    }
+    let slot = issued.drained.last_slot;
+    if slot == 0 {
+        // Slot zero is not a slot. A controller answering Success with a slot
+        // of zero has said yes to a question and named nothing.
+        attached.stopped = Some("the controller enabled slot zero, which is not a slot");
+        return attached;
+    }
+    attached.slot = slot;
+
+    // --- somewhere for the controller to keep this device -------------------
+    let Ok(device_context) = frame(controller, hhdm) else {
+        attached.stopped = Some("no frame for the device context");
+        return attached;
+    };
+    attached.frames += 1;
+    let Ok(transfer_ring) = frame(controller, hhdm) else {
+        attached.stopped = Some("no frame for the control endpoint's transfer ring");
+        return attached;
+    };
+    attached.frames += 1;
+    let Ok(input_context) = frame(controller, hhdm) else {
+        attached.stopped = Some("no frame for the input context");
+        return attached;
+    };
+    attached.frames += 1;
+
+    // The control endpoint's transfer ring needs its own wrap, for the same
+    // reason the command ring does.
+    let Some((link_index, link)) = command_ring_link(transfer_ring.device, RING_ENTRIES) else {
+        attached.stopped = Some("the transfer ring is too small for a link");
+        return attached;
+    };
+    // SAFETY: a frame just allocated and zeroed, at a bounded index.
+    unsafe {
+        core::ptr::write_volatile(
+            (transfer_ring.virtual_address as *mut [u32; 4]).add(link_index),
+            link.0,
+        );
+    }
+
+    // **Entry `slot` of the device context array, not entry `slot - 1`.** The
+    // array is indexed by slot number and entry zero is the scratchpad pointer,
+    // which is why it is sized slots *plus one*.
+    // SAFETY: a frame `init` allocated, at an index bounded by the slot count
+    // the controller was configured with.
+    unsafe {
+        core::ptr::write_volatile(
+            (device_contexts as *mut u64).add(slot as usize),
+            device_context.device,
+        );
+    }
+
+    // --- the input context, and the arithmetic that is the trap -------------
+    let Some(writes) = address_device_input(
+        found.port,
+        found.speed,
+        transfer_ring.device,
+        ring::Producer::new(RING_ENTRIES).is_some_and(|producer| producer.cycle()),
+        parameters.context_size_64,
+    ) else {
+        attached.stopped = Some("the input context could not be built");
+        return attached;
+    };
+    for (offset, dwords) in writes {
+        // SAFETY: a frame just allocated and zeroed; `address_device_input`
+        // bounds every offset to inside an input context, which for one
+        // endpoint is at most three 64-byte contexts.
+        unsafe {
+            core::ptr::write_volatile(
+                (input_context.virtual_address + offset as u64) as *mut [u32; context::DWORDS],
+                dwords,
+            );
+        }
+    }
+
+    // --- address it ---------------------------------------------------------
+    // Built before it is issued, so that "this address cannot go in a command"
+    // is a refusal with a reason rather than a zeroed TRB sent to a controller.
+    // The closure only re-stamps the cycle the producer hands it.
+    let Some(command) = trb::Trb::address_device(input_context.device, slot, false) else {
+        attached.stopped = Some("the input context address is one the command cannot hold");
+        return attached;
+    };
+    // SAFETY: the caller's obligation -- a running controller, and rings that
+    // are its.
+    let Some(issued) = (unsafe { commander.issue(|cycle| command.with_cycle_bit(cycle), wait) })
+    else {
+        attached.stopped = Some("the command ring would have wrapped");
+        return attached;
+    };
+    if !issued.succeeded() {
+        attached.stopped = Some("the controller would not address the device");
+        attached.code = issued.drained.last_completion;
+        return attached;
+    }
+
+    // --- and read back what the controller wrote ----------------------------
+    // SAFETY: the device context frame this function allocated and handed the
+    // controller; the slot context is its first context.
+    let slot_context = context::Slot(unsafe {
+        core::ptr::read_volatile(device_context.virtual_address as *const [u32; context::DWORDS])
+    });
+    attached.state = Some(slot_context.slot_state());
+    attached.address = slot_context.usb_device_address();
+    attached.addressed = matches!(slot_context.slot_state(), context::SlotState::Addressed)
+        && slot_context.usb_device_address() != 0;
+    attached
 }
 
 /// Sends a No-Op command and consumes the event it produces.
 ///
 /// **A No-Op is how a driver proves its command ring works**, which is what the
-/// vendored crate's own constructor says it is for. Nothing is plugged in and no
-/// slot exists, so this is the only question that can be asked at this step --
-/// and the answer is not merely "an event arrived": a Command Completion Event
-/// names *the address of the command TRB it is answering*, so a matching pointer
-/// is a round trip a coincidence cannot fake.
+/// vendored crate's own constructor says it is for. The answer is not merely
+/// "an event arrived": a Command Completion Event names *the address of the
+/// command TRB it is answering*, so a matching pointer is a round trip a
+/// coincidence cannot fake.
 ///
 /// # Safety
 ///
-/// The controller must be running, `base` its mapped window, and the two
-/// virtual addresses the kernel's view of the rings named in `memory`.
-unsafe fn exercise_the_rings<W: Wait>(
-    base: usize,
-    parameters: &Parameters,
-    memory: &Memory,
-    command_ring: u64,
-    event_ring: u64,
-    wait: &mut W,
-) -> Answered {
+/// The controller must be running and the `Commander`'s addresses its rings.
+unsafe fn exercise_the_rings<W: Wait>(commander: &mut Commander<'_>, wait: &mut W) -> Answered {
     let mut answered = Answered::default();
-
-    let Some(producer) = ring::Producer::new(memory.command_ring_entries) else {
+    // SAFETY: the caller's obligation.
+    let Some(issued) = (unsafe { commander.issue(trb::Trb::no_op_command, wait) }) else {
         return answered;
     };
-    let Some(mut consumer) = ring::Consumer::new(memory.event_ring_entries) else {
-        return answered;
-    };
-    let Some(doorbell_offset) =
-        bhaskix_xhci::doorbell::doorbell_at(bhaskix_xhci::doorbell::COMMAND_RING)
-    else {
-        return answered;
-    };
-
-    // Where the controller will say it found this command. The *device*
-    // address, because that is the number the controller deals in -- naming the
-    // physical one here would compare an answer against a question nobody asked.
-    let asked_at = memory.command_ring + (producer.index() * trb::BYTES) as u64;
-    answered.asked_at = asked_at;
-
-    // SAFETY: a frame `init` allocated and zeroed, at an index `Producer`
-    // bounds to inside the ring.
-    unsafe {
-        core::ptr::write_volatile(
-            (command_ring as *mut [u32; 4]).add(producer.index()),
-            trb::Trb::no_op_command(producer.cycle()).0,
-        );
-    }
-
-    // SAFETY: the doorbell bank is inside the window, which `parameters`
-    // checked, and the offset is bounded by `doorbell_at`.
-    let doorbell = unsafe {
-        DoorbellRegister::<bhaskix_device::Volatile>::new(
-            base + parameters.doorbells + doorbell_offset,
-        )
-    };
-    doorbell
-        .value
-        .write(bhaskix_xhci::doorbell::Doorbell::command().0);
-
-    // The controller has to run the command and post the event. Bounded, and a
-    // controller that never answers is a report rather than a hang.
-    // Wait for the controller to publish something at the entry this consumer
-    // is looking at. Ownership is the cycle bit and nothing else: a zeroed
-    // entry has bit 0, a fresh consumer expects 1, so "not written yet" and
-    // "written" are distinguishable without reading anything else.
-    answered.arrived = wait.until(&mut || {
-        // SAFETY: the event ring is a frame `init` allocated; this reads one
-        // TRB at an index `Consumer` bounds to inside it. Volatile because the
-        // controller writes here by DMA.
-        let event = unsafe {
-            core::ptr::read_volatile((event_ring as *const [u32; 4]).add(consumer.index()))
-        };
-        consumer.owns(trb::Trb(event).cycle_bit())
-    });
-
-    let drained = drain(memory.event_ring_entries, &mut consumer, &mut |index| {
-        // SAFETY: as above.
-        trb::Trb(unsafe { core::ptr::read_volatile((event_ring as *const [u32; 4]).add(index)) })
-    });
-    answered.drained = drained;
-
-    // Tell the controller how far this driver has consumed, and clear the
-    // Event Handler Busy bit while doing it -- the one write that says "I am
-    // done looking". Without it the controller will not raise the interrupter
-    // again, which is a ring that works exactly once.
-    if let Some(interrupter_zero) = runtime::interrupter_at(0)
-        && let Some(dequeue) = runtime::EventRingDequeuePointer::advancing(
-            memory.event_ring + (consumer.index() * trb::BYTES) as u64,
-            0,
-            true,
-        )
-    {
-        // SAFETY: the runtime bank is inside the window, which `parameters`
-        // checked.
-        let interrupter = unsafe {
-            Interrupter::<bhaskix_device::Volatile>::new(
-                base + parameters.runtime + interrupter_zero,
-            )
-        };
-        interrupter.erdp.write(dequeue.0);
-        answered.dequeue_advanced = true;
-    }
-
-    answered.matched = drained.command_completions > 0 && drained.last_command == asked_at;
+    answered.asked_at = issued.asked_at;
+    answered.arrived = issued.arrived;
+    answered.drained = issued.drained;
+    answered.matched = issued.succeeded();
+    answered.dequeue_advanced = commander.dequeue_advanced;
     answered
 }
 
@@ -2152,6 +2677,169 @@ mod drain_tests {
             "the low bits of a link pointer are not address, so a misaligned \
              one is silently truncated by the controller rather than refused"
         );
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use bhaskix_xhci::{context, doorbell};
+
+    use super::{RING_ENTRIES, address_device_input, initial_max_packet_size};
+
+    const TRANSFER_RING: u64 = 0x1_0000_5000;
+
+    fn built(context_size_64: bool) -> [(usize, [u32; context::DWORDS]); 3] {
+        address_device_input(5, 3, TRANSFER_RING, true, context_size_64)
+            .expect("a plausible device")
+    }
+
+    #[test]
+    fn the_slot_context_sits_one_stride_in_because_an_input_context_has_a_header() {
+        // **The trap RFC 0041 names.** An input context is
+        // `[input control][slot][endpoint 1]`, one context further along than a
+        // device context. A driver using device-context arithmetic writes the
+        // slot context on top of the input control context's add and drop
+        // flags -- which is a command that configures the wrong endpoints and
+        // is accepted.
+        for (size_64, stride) in [(false, 32usize), (true, 64usize)] {
+            let writes = built(size_64);
+            assert_eq!(writes[0].0, 0, "the input control context is first");
+            assert_eq!(
+                writes[1].0, stride,
+                "the slot context is at one stride, not at zero"
+            );
+            assert_eq!(
+                writes[2].0,
+                2 * stride,
+                "the control endpoint is at two strides: its Device Context \
+                 Index is 1, and an input context adds one to every index"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stride_doubles_with_the_context_size_and_the_field_offsets_do_not() {
+        // What `HCCPARAMS1`'s context-size bit buys is padding, not a different
+        // layout. Getting this backwards misplaces every context after the
+        // first by a factor of two, and misplaces no field within one.
+        let small = built(false);
+        let large = built(true);
+        assert_eq!(large[1].0, small[1].0 * 2);
+        assert_eq!(large[2].0, small[2].0 * 2);
+        assert_eq!(small[0].1, large[0].1, "the dwords written do not change");
+        assert_eq!(small[1].1, large[1].1);
+        assert_eq!(small[2].1, large[2].1);
+    }
+
+    #[test]
+    fn exactly_the_slot_and_the_control_endpoint_are_added_and_nothing_is_dropped() {
+        let writes = built(false);
+        let control = context::InputControl(writes[0].1);
+        assert_eq!(
+            control.add_flags(),
+            0b11,
+            "A0 and A1: the slot context and the control endpoint. Adding a \
+             context that has not been written asks the controller to read \
+             uninitialised memory"
+        );
+        assert_eq!(
+            control.drop_flags(),
+            0,
+            "nothing exists yet to drop, and bits 1:0 of the drop flags are \
+             reserved in any case"
+        );
+    }
+
+    #[test]
+    fn the_root_hub_port_lands_in_its_own_field_and_not_the_hub_port_count() {
+        // This is the bug a controller found on 2026-08-23: written at bits
+        // 31:24 -- which is Number of Ports -- Address Device is refused with
+        // TrbError, and every other field probes correct. Asserted on the raw
+        // dword, because reading it back through the accessor that wrote it
+        // is what failed to catch it.
+        let slot = context::Slot(built(false)[1].1);
+        assert_eq!(slot.root_hub_port_number(), 5);
+        assert_eq!(built(false)[1].1[1], 5 << 16, "bits 23:16, and alone");
+        assert_eq!(built(false)[1].1[1] >> 24, 0);
+    }
+
+    #[test]
+    fn the_slot_says_it_uses_exactly_one_context_and_no_more() {
+        let slot = context::Slot(built(false)[1].1);
+        assert_eq!(
+            slot.context_entries(),
+            doorbell::CONTROL_ENDPOINT,
+            "the highest Device Context Index in use, not a count of \
+             endpoints -- set too low, the controller ignores contexts that \
+             are there"
+        );
+        assert_eq!(slot.speed(), 3);
+        assert_eq!(
+            slot.route_string(),
+            0,
+            "a root port device routes through nothing"
+        );
+    }
+
+    #[test]
+    fn the_control_endpoint_is_a_control_endpoint_on_a_ring_it_was_given() {
+        let endpoint = context::Endpoint(built(false)[2].1);
+        assert_eq!(endpoint.endpoint_type(), context::EndpointType::Control);
+        assert_eq!(endpoint.transfer_ring_pointer(), TRANSFER_RING);
+        assert!(
+            endpoint.dequeue_cycle_state(),
+            "the controller must start on the same cycle the producer does, or \
+             it reads a ring it thinks is empty"
+        );
+        assert_eq!(
+            endpoint.error_count(),
+            3,
+            "zero means retry for ever, which is a wedged endpoint rather \
+             than a reported error"
+        );
+    }
+
+    #[test]
+    fn a_transfer_ring_the_context_cannot_hold_is_refused() {
+        assert!(address_device_input(5, 3, TRANSFER_RING, true, false).is_some());
+        assert!(
+            address_device_input(5, 3, TRANSFER_RING + 8, true, false).is_none(),
+            "the low bits of the pointer are flags, so a misaligned ring is \
+             silently truncated by the controller rather than refused"
+        );
+    }
+
+    #[test]
+    fn the_initial_packet_size_follows_the_speed_and_undefined_is_the_smallest() {
+        assert_eq!(initial_max_packet_size(1), 8, "full speed starts at eight");
+        assert_eq!(initial_max_packet_size(2), 8, "low speed is eight");
+        assert_eq!(initial_max_packet_size(3), 64, "high speed is fixed at 64");
+        assert_eq!(initial_max_packet_size(4), 512);
+        assert_eq!(
+            initial_max_packet_size(0),
+            8,
+            "speed zero is undefined, and eight is the value that cannot ask a \
+             device for more than it can answer"
+        );
+    }
+
+    #[test]
+    fn the_input_context_is_small_enough_for_the_frame_it_is_written_into() {
+        // Three 64-byte contexts at most. The write loop puts them in one
+        // allocated frame, and an offset past it would be a store into
+        // somebody else's memory.
+        let last = built(true)[2].0 + context::DWORDS * 4;
+        assert!(
+            last <= 4096,
+            "an input context must fit the frame it is given"
+        );
+        assert_eq!(
+            context::input_context_bytes(doorbell::CONTROL_ENDPOINT, true),
+            Some(3 * 64)
+        );
+        // And the transfer ring likewise.
+        assert!(super::ring_bytes() <= 4096);
+        assert_eq!(RING_ENTRIES * 16, super::ring_bytes());
     }
 }
 

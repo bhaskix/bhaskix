@@ -578,6 +578,58 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                         answered.drained.last_command,
                     );
                 }
+                // RFC 0041 step 5. **The claim is read back from the
+                // controller's own memory**, not inferred from a success code:
+                // Address Device answering `Success` says the command was
+                // accepted, and the device context saying `Addressed` with a
+                // nonzero address says the controller did what was asked.
+                let attached = &started.attached;
+                if attached.addressed {
+                    println!(
+                        "    xhci device    port {} at speed {}{}, slot {}, addressed {} \
+                         (slot state {}), {} frames",
+                        attached.port,
+                        attached.speed,
+                        if attached.reset { " after a reset" } else { "" },
+                        attached.slot,
+                        attached.address,
+                        xhci::describe_slot_state(attached.state),
+                        attached.frames,
+                    );
+                } else {
+                    // Yellow and not red: a machine with nothing plugged in is
+                    // a correct outcome, and the reason says which it was.
+                    println!(
+                        "\x1b[93m    xhci device    not addressed: {}{}\x1b[0m",
+                        attached.stopped.unwrap_or("no reason recorded"),
+                        match attached.code {
+                            Some(code) => {
+                                match code {
+                                    bhaskix_xhci::trb::CompletionCode::ParameterError => {
+                                        " (parameter error: a field of the input context is wrong)"
+                                    }
+                                    bhaskix_xhci::trb::CompletionCode::ContextStateError => {
+                                        " (context state error: the slot was in the wrong state)"
+                                    }
+                                    bhaskix_xhci::trb::CompletionCode::TrbError => {
+                                        " (trb error: the command itself was malformed)"
+                                    }
+                                    bhaskix_xhci::trb::CompletionCode::ResourceError => {
+                                        " (resource error)"
+                                    }
+                                    bhaskix_xhci::trb::CompletionCode::SlotNotEnabledError => {
+                                        " (slot not enabled)"
+                                    }
+                                    bhaskix_xhci::trb::CompletionCode::Invalid => {
+                                        " (no completion was written)"
+                                    }
+                                    _ => " (an unnamed completion code)",
+                                }
+                            }
+                            None => "",
+                        },
+                    );
+                }
             }
             Err(error) => println!(
                 "\x1b[91m    xhci           FAILED to bring up: {}\x1b[0m",

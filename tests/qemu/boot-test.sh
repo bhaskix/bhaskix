@@ -617,6 +617,32 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         grep -a "xhci" "$LOG" | sed 's/^/      /'
         status=1
     fi
+
+    # RFC 0041 step 5: a real device, a slot, and an address.
+    #
+    # `devices.sh` puts a USB keyboard on the controller this kernel drives, so
+    # there is something to enumerate. The gate asserts the whole chain -- a
+    # port with a device on it, a slot the controller handed out, and a USB
+    # address -- because each link fails differently and a driver that found a
+    # port and stopped would otherwise look the same as one that finished.
+    #
+    # **`slot state addressed` is the part that is read back from the
+    # controller's own memory.** Address Device answering Success says the
+    # command was accepted; the device context saying `Addressed` says the
+    # controller did what the command asked. The two came apart on 2026-08-23:
+    # the command was refused outright with TrbError because the root hub port
+    # number was being written into the Number of Ports field.
+    #
+    # Ports and slots are not pinned to particular numbers. Which port QEMU
+    # puts a keyboard on is its business and has changed between versions; that
+    # a device was found, given a slot and addressed is this kernel's.
+    if grep -qaE 'xhci device +port [1-9][0-9]* at speed [1-9][0-9]*.*slot [1-9][0-9]*, addressed [1-9][0-9]* \(slot state addressed\)' "$LOG"; then
+        pass "a USB device is found on a port, given a slot, and addressed"
+    else
+        fail "no USB device was enumerated and addressed"
+        grep -a "xhci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
 fi
 
 # The decline is reported. Deterministic, and it guards the gate below rather

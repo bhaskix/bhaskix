@@ -104,6 +104,28 @@ qemu_device_list() {
                 # devices attached and is never driven, so it does no DMA.
                 -device qemu-xhci,id=xhci0
                 -device qemu-xhci,id=xhci1
+                # And a keyboard on the driven one, from RFC 0041 step 5.
+                #
+                # A port with nothing on it enumerates to nothing, so `Enable
+                # Slot` and `Address Device` need a device to address. It is a
+                # keyboard rather than any cheaper device because step 6 reads
+                # its descriptors and step 7 its reports -- the same device all
+                # the way up rather than one swapped in later.
+                #
+                # **`bus=xhci0.0` is load-bearing**: unqualified, QEMU attaches
+                # it to whichever USB bus it finds first, which may be the
+                # controller this kernel refuses. The device would then be on a
+                # controller nobody drives and the port scan would find an empty
+                # machine.
+                #
+                # It does not take sendkey away from the i8042, which was
+                # checked rather than assumed before this line was added:
+                # `make test-keyboard` types at the PS/2 keyboard and its five
+                # gates still pass with this device present. That matters
+                # because RFC 0041's unresolved question 2 is what happens when
+                # both keyboards exist, and the answer must not be "the older
+                # test silently stopped testing anything".
+                -device usb-kbd,bus=xhci0.0
             )
             ;;
         disks)

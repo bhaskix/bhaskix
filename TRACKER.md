@@ -8,7 +8,7 @@ conversation disagrees with this file about *what is done* or *what is next*, th
 | **Last updated** | 2026-08-23 |
 | **Phase** | Phase 2 — Core Operating System |
 | **Active milestone** | **Phase 2 — Core Operating System.** The service framework (M7), the driver framework (M8) and the full VFS (M9, RFC 0015 and RFC 0016) are complete. Process management is **done** (RFC 0017 steps 1–6, a supervisor in ring 3). **Networking now runs** (RFC 0018 **accepted**, all seven steps): a virtio-net driver, a protocol service and a DHCP client, each in its own domain, obtain an address from the network and return a ping's payload unchanged, and the domain boundary is priced rather than argued about. **A program can be woken at a time it names** (RFC 0019 **accepted**, all four steps): a deadline on a notification it holds, honoured to a third of a millisecond. **TCP is complete and its RFC accepted 2026-08-16** ([RFC 0020](docs/rfc/0020-tcp.md), all six steps: `bin/tcpc` opens connections with rings its own domain owns, echoes through them both directions, and the boundary is measured — RFC 0022's capability-in-a-call is the mechanism underneath). **The sockets API exists** — `bhaskix-sock`, RFC 0027 accepted 2026-08-17 — and this cell said "no sockets API beyond UDP and TCP's own" until 2026-08-18, stale from the acceptance. **IPv6 is done** (RFC 0029, **accepted 2026-08-18**, all six steps): dual stack on every networked boot, both families measured on the same rings, and the networking bullet — the last open row of §4's table — is closed. **Packages are done** (RFC 0030, **accepted 2026-08-19**, all six steps): the image a deterministic function of the manifests, install/run/remove at the shell with manifest-derived grants, every operation priced. What remains on the roadmap's own Phase 2 list: libc — **RFC 0005 steps 2–8 of 10 are implemented**, a real static Go binary runs, and the translation sits in the nucleus where that RFC requires a service domain ([RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md), drafted 2026-08-19, carries the correction and its trigger) |
-| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed; the claim "no architecture question open" held from 2026-08-16 to 2026-08-19, when **A6** — where the Linux personality runs — was opened by RFC 0031) · **RFC 0026 ACCEPTED 2026-08-17** (the telemetry plane — six steps, drafted, built and accepted in one day) · **RFC 0027 ACCEPTED 2026-08-17** (a sockets API worth the name — `bhaskix-sock`, both ports paid) · **RFC 0028 ACCEPTED 2026-08-18** (`bhaskixboot.efi` — seven steps; the machine boots on its own loader at full gate parity, KASLR drawn and confirmed, four CPUs started by the kernel's own INIT-SIPI) · **RFC 0029 ACCEPTED 2026-08-18** (IPv6 — the second family, measured beside the first with no emulator in its numbers; drafted, built and accepted in one day, and the networking bullet — §4's last open row — closed with it) · **RFC 0030 ACCEPTED 2026-08-19** (packages — authority made reviewable: the image a function of the manifests, install/run/remove live at the shell with manifest-derived grants, every operation priced, and the kernel gained no method for any of it) · **RFC 0032 ACCEPTED 2026-08-20** (a supervisor interface — ten steps; the Linux personality left the nucleus entirely and the gated count of Linux syscall numbers the nucleus interprets went 18 → 0, while the kernel's `unsafe` budget *fell* across the move) · **RFC 0033 ACCEPTED 2026-08-20** (what a hosted process is — A6's second half, and the whole question closed with it: a Linux process is a record in `bin/linuxd` bound one-to-one to a domain, with a pid that survives an `execve`, descriptors that are capabilities the adapter holds, real files, pipes with blocking readers, `fork` by copying, `wait4` with the child's own status, and a `/proc` a host test proves cannot name a Bhaskix object; ten steps in one day, and the kernel gained exactly two generic methods — `MAKE_SPACE` and a reply shape — for all of it) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 72 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026's telemetry report line and then its round-trip check became gates; 48 until 2026-08-18, when RFC 0029's three joined — the SLAAC/NDP/echo gate, the v6 socket round trip, and the v6 TCP measurement instrument-check, each answered or its reduction stated per placement; the count sat at 48 through steps 3–5, stale from the moment the first v6 gate landed; 51 until 2026-08-19, when RFC 0005 step 2's personality gate joined, 53 when step 3's initial-image gate did, 54 when step 4's signal round trip did, 55 when step 5's memory calls did, 56 when step 6's futex edges did, and 57 when its clone half followed; 59 on 2026-08-19, when RFC 0031's two boundary gates joined -- the ratchet on how many Linux numbers the nucleus interprets, and the instrument's own accounting for every call it priced; 60 on 2026-08-19, when RFC 0032's supervisor-interface gate joined, and 61 when step 3's adapter gate did; 62 on 2026-08-20, when RFC 0032 step 6's fault crossing joined, 64 on 2026-08-20 when RFC 0033 step 3's two joined -- the free address-space count and the fixed tables' printed bill -- 65 when the exit check's own line became a gate, 66 when RFC 0033 step 4's pid claim did, 67 when step 5's exec did, 68 when step 6's file read did, 69 when step 7's pipe did, 70 when step 8's fork did, 71 when step 9's wait did, and 72 when step 10's /proc did), 77 with an IOMMU as of 2026-08-23, when RFC 0041 step 3's two joined -- the translated controller brought up and reporting its slots and ports, and the page table and domain of its own it does that behind -- and step 4's third did: a No-Op command answered by an event that names the address the command was written to, with the dequeue pointer written back, which is the pair of rings proved in both directions rather than a controller merely not halted; both are IOMMU-lane only, because on a lane with no unit **both** controllers are correctly refused and asserting a bring-up there would be asserting the rule is broken -- plus an `iommu=off` mode that proves the escape hatch escapes · 885 host tests, counted 2026-08-23 — a `make test-host` run, summed across the workspace (710 on 2026-08-20; 677 before RFC 0033 step 2's process record; 649 before RFC 0005 step 9, 674 before step 10's boundary type). The rise since the 20th is RFC 0041's parsers — `usb` and `kernel::xhci` — plus `sched::waited`, the one that made a dying caller testable off a machine; and 875 from 856 on 2026-08-23 is RFC 0041 step 3's nineteen, which are a *hardware bring-up* tested on the host against a device model — including the emulator's dword-only capability bank, reproduced so it is a host test rather than a boot; 885 is step 4's ten more, which are the event-ring drain, pure because it takes its reader as a closure rather than a slice over memory the controller is writing) |
+| **Overall progress** | M1 17/18 (hardware blocked) · M2 MET · M3 COMPLETE · M4 COMPLETE · M5 COMPLETE · M6 6/6 built + M6-07 … M6-18 (RFC 0009 steps 1–6, RFC 0011 COMPLETE, RFC 0012 **COMPLETE**, steps 1–7) · **M7 COMPLETE** (RFC 0013 steps 1–6, M7-01 … M7-15) · **M8 COMPLETE** (RFC 0014 steps 1–6) · M9-01 … M9-26 (RFC 0015 steps 1–6, RFC 0016 steps 1–5 — **COMPLETE**) · **RFC 0017 COMPLETE** (steps 1–6) · **RFC 0018 ACCEPTED** (steps 1–7) · **RFC 0019 ACCEPTED** (steps 1–4) · **RFC 0021 ACCEPTED** (one step) · **RFC 0020 ACCEPTED 2026-08-16** (all six steps — both directions echo through client-owned rings on every networked boot, and the boundary is measured; this cell said "steps 1–5a" until 2026-08-16, stale since step 6 landed on the 15th) · **RFC 0022 ACCEPTED** (steps 1–4) · **RFC 0023 ACCEPTED** (all three steps) · RFC 0024 closed without shipping · **RFC 0025 ACCEPTED** (A5 closed; the claim "no architecture question open" held from 2026-08-16 to 2026-08-19, when **A6** — where the Linux personality runs — was opened by RFC 0031) · **RFC 0026 ACCEPTED 2026-08-17** (the telemetry plane — six steps, drafted, built and accepted in one day) · **RFC 0027 ACCEPTED 2026-08-17** (a sockets API worth the name — `bhaskix-sock`, both ports paid) · **RFC 0028 ACCEPTED 2026-08-18** (`bhaskixboot.efi` — seven steps; the machine boots on its own loader at full gate parity, KASLR drawn and confirmed, four CPUs started by the kernel's own INIT-SIPI) · **RFC 0029 ACCEPTED 2026-08-18** (IPv6 — the second family, measured beside the first with no emulator in its numbers; drafted, built and accepted in one day, and the networking bullet — §4's last open row — closed with it) · **RFC 0030 ACCEPTED 2026-08-19** (packages — authority made reviewable: the image a function of the manifests, install/run/remove live at the shell with manifest-derived grants, every operation priced, and the kernel gained no method for any of it) · **RFC 0032 ACCEPTED 2026-08-20** (a supervisor interface — ten steps; the Linux personality left the nucleus entirely and the gated count of Linux syscall numbers the nucleus interprets went 18 → 0, while the kernel's `unsafe` budget *fell* across the move) · **RFC 0033 ACCEPTED 2026-08-20** (what a hosted process is — A6's second half, and the whole question closed with it: a Linux process is a record in `bin/linuxd` bound one-to-one to a domain, with a pid that survives an `execve`, descriptors that are capabilities the adapter holds, real files, pipes with blocking readers, `fork` by copying, `wait4` with the child's own status, and a `/proc` a host test proves cannot name a Bhaskix object; ten steps in one day, and the kernel gained exactly two generic methods — `MAKE_SPACE` and a reply shape — for all of it) · CI green as of 2026-08-16 — **this cell said "CI green" from 2026-08-14 to 2026-08-16 while both `qemu64` boot lanes were red**, invisible behind the CI-log-access blocker (§3); see the changelog · 601 suite checks · 72 boot gates per placement (5 placements — bios, uefi, iommu, iommu-off, and the dark `qemu64` machine; 46 until 2026-08-17, when RFC 0026's telemetry report line and then its round-trip check became gates; 48 until 2026-08-18, when RFC 0029's three joined — the SLAAC/NDP/echo gate, the v6 socket round trip, and the v6 TCP measurement instrument-check, each answered or its reduction stated per placement; the count sat at 48 through steps 3–5, stale from the moment the first v6 gate landed; 51 until 2026-08-19, when RFC 0005 step 2's personality gate joined, 53 when step 3's initial-image gate did, 54 when step 4's signal round trip did, 55 when step 5's memory calls did, 56 when step 6's futex edges did, and 57 when its clone half followed; 59 on 2026-08-19, when RFC 0031's two boundary gates joined -- the ratchet on how many Linux numbers the nucleus interprets, and the instrument's own accounting for every call it priced; 60 on 2026-08-19, when RFC 0032's supervisor-interface gate joined, and 61 when step 3's adapter gate did; 62 on 2026-08-20, when RFC 0032 step 6's fault crossing joined, 64 on 2026-08-20 when RFC 0033 step 3's two joined -- the free address-space count and the fixed tables' printed bill -- 65 when the exit check's own line became a gate, 66 when RFC 0033 step 4's pid claim did, 67 when step 5's exec did, 68 when step 6's file read did, 69 when step 7's pipe did, 70 when step 8's fork did, 71 when step 9's wait did, and 72 when step 10's /proc did), 78 with an IOMMU as of 2026-08-23, when RFC 0041 step 3's two joined -- the translated controller brought up and reporting its slots and ports, and the page table and domain of its own it does that behind -- and step 4's third did: a No-Op command answered by an event that names the address the command was written to, with the dequeue pointer written back, which is the pair of rings proved in both directions rather than a controller merely not halted -- and step 5's fourth: a USB keyboard found on a port, given a slot, and addressed, with the slot state read back from the controller's own memory rather than inferred from a success code; both are IOMMU-lane only, because on a lane with no unit **both** controllers are correctly refused and asserting a bring-up there would be asserting the rule is broken -- plus an `iommu=off` mode that proves the escape hatch escapes · 895 host tests, counted 2026-08-23 — a `make test-host` run, summed across the workspace (710 on 2026-08-20; 677 before RFC 0033 step 2's process record; 649 before RFC 0005 step 9, 674 before step 10's boundary type). The rise since the 20th is RFC 0041's parsers — `usb` and `kernel::xhci` — plus `sched::waited`, the one that made a dying caller testable off a machine; and 875 from 856 on 2026-08-23 is RFC 0041 step 3's nineteen, which are a *hardware bring-up* tested on the host against a device model — including the emulator's dword-only capability bank, reproduced so it is a host test rather than a boot; 885 is step 4's ten more, which are the event-ring drain, pure because it takes its reader as a closure rather than a slice over memory the controller is writing; and 895 is step 5's nine over the input-context arithmetic RFC 0041 calls the trap, plus one in the vendored crate that can catch a layout error a round-trip test cannot) |
 
 ### How far along is this, in numbers
 
@@ -790,6 +790,119 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-23 (RFC 0041 step 5: a device is addressed — and a controller found a bug in the vendored layouts that a round-trip test could not)
+
+**A USB keyboard is enumerated, given a slot, and addressed.** On the `iommu`
+lane:
+
+```
+    xhci device    port 5 at speed 3 after a reset, slot 1, addressed 1 (slot state addressed), 3 frames
+```
+
+Three things in order, each able to fail on its own and each saying so: find a
+port with a device on it, ask for a slot, and address the device through an
+input context naming its control endpoint. `devices.sh` gains
+`-device usb-kbd,bus=xhci0.0` — a keyboard rather than a cheaper device, because
+step 6 reads its descriptors and step 7 its reports, and the same device all the
+way up is worth more than one swapped in later.
+
+**`bus=xhci0.0` is load-bearing.** Unqualified, QEMU attaches the keyboard to
+whichever USB bus it finds first, which may be the controller this kernel
+*refuses* — and the port scan would then find an empty machine and be right. That
+it does not take `sendkey` away from the i8042 was **checked before the line was
+added**, not assumed: `make test-keyboard` types at the PS/2 keyboard and its
+five gates still pass. RFC 0041's unresolved question 2 is what happens when both
+keyboards exist, and the answer must not be "the older test silently stopped
+testing anything".
+
+**A bug in the vendored layouts, found by a controller and not by a reading.**
+Address Device was refused with `CC_TRB_ERROR` while every other field of the
+input context probed correct. `Slot::root_hub_port_number` and
+`Slot::with_root_hub_port_number` both used **dword 1 bits 31:24**. Written
+there the slot context read `0x05000000`; moved to **bits 23:16** it read
+`0x00050000`, and the same command succeeded — the device reaching slot state
+`Addressed` with USB address 1. Bits 31:24 are Number of Ports, which belongs to
+a hub.
+
+**The test that was there could not have caught it**, and that is the part worth
+keeping:
+
+```rust
+let slot = Slot::new().with_root_hub_port_number(7);
+assert_eq!(slot.root_hub_port_number(), 7);
+```
+
+It reads the value back through the very accessor that wrote it. That pins the
+getter and setter **to each other** and says nothing about where the field is, so
+it passed for as long as the two were wrong together. The replacement asserts the
+raw dword against literals — the same second-transcription technique this crate
+already uses for register offsets — and it is watched red against the old layout.
+`assert_eq!(dword1, 7 << 16)` is a test that can fail; the round trip never could.
+
+**This is evidence from this machine, not from a specification.** PROVENANCE.md
+says the specification wins where this source and xHCI disagree, and no copy of
+it can be read from this tree. What settles it here is that one arrangement is
+refused by a real controller and the other is accepted and produces an addressed
+device. That is a stronger form of evidence than recall and a weaker one than the
+document, and it is written down as such beside the correction.
+
+**The input-context arithmetic is the trap RFC 0041 names, and it is now a host
+test.** An input context is `[input control][slot][endpoint 1]`, one context
+further along than a device context — so the slot context sits at one stride, not
+zero. A driver using device-context arithmetic writes the slot context on top of
+the input control context's add and drop flags, which is a command that
+configures the wrong endpoints *and is accepted*. `address_device_input` returns
+the three writes as `(offset, dwords)` and is pure, so the offsets are asserted
+rather than described.
+
+**Nine host tests here and a tenth in the vendored crate, six watched red**: the input context filled with
+device-context arithmetic; only the slot added and not the control endpoint;
+context entries counting endpoints instead of naming the highest index; the
+endpoint left with the controller's retry-for-ever default; a misaligned transfer
+ring truncated instead of refused; and the root hub port put back in the
+number-of-ports field.
+
+**`PORTSC` is handled as the minefield it is.** Seven of its bits are
+write-one-to-clear and bit 1 is write-one-to-*disable*, so writing back a value
+just read clears every change bit that was set and disables the port into the
+bargain — a port that works once and then never reports another device. Every
+write here goes through `preserving` or `acknowledging`.
+
+**The reset rule needs to know nothing about USB versions.** A USB 3 port enables
+itself on connect and a USB 2 port must be reset, and a driver cannot tell which
+kind it is looking at from the port number. So the rule is not "reset USB 2
+ports" but *if it is connected and not enabled, reset it*, which is right for
+both.
+
+**Two silent failure paths removed on the way.** The Address Device TRB was being
+built inside the issue closure with `.unwrap_or(Trb::new())` — an unbuildable
+command would have been sent to the controller as a zeroed TRB. It is built
+before it is issued now, and an address the command cannot hold is a refusal with
+a reason. And the command ring **refuses to wrap**: wrapping means re-publishing
+the Link TRB with the producer's new cycle and nothing does that yet, so a caller
+issuing a sixteenth command is told rather than finding out from a controller
+that went quiet.
+
+**A refusal that does not name its code is a refusal nobody can act on.** The
+failure line now carries the completion code and what it means —
+`ParameterError` sends a reader to the input context, `ContextStateError` to the
+slot's state, `TrbError` to the command itself. It is what turned this bug from a
+guess into a bisection.
+
+**`unsafe` 1804 → 1896, +92**, itemised in `kernel/Cargo.toml`. `unsafe` grew;
+the *deciding* did not — `address_device_input` is outside it.
+
+**What this does not do.** No descriptors: nothing has asked the device what it
+is, and the control endpoint's packet size is still the speed table's guess
+rather than the device's answer. That guess is transcribed and **not checked
+against a copy of the specification on this machine**, which is survivable here
+because Address Device does not care — the packet size governs transfers and
+there are none until step 6, which is the trigger written beside it. No reports,
+no keystrokes. The teardown question is unchanged.
+
+Host tests 895, kernel lib 204. `make test` green on every lane and both
+placements.
 
 ### 2026-08-23 (RFC 0041 step 4: the controller is asked a question and answers it, and step 3's command ring had no way to wrap)
 

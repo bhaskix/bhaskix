@@ -372,7 +372,21 @@ asm_budget = 10
 # What is not in it: `drain` itself, which is pure and takes the reader as a
 # closure precisely so it can be host-tested, and `command_ring_link`, which is
 # the link *decision* separated from the store so a test can hold it.
-unsafe_budget = 1804
+# 1896 at RFC 0041 step 5, 2026-08-23: +92, for enumerating a port and
+# addressing the device on it. Where it went:
+#   * the port scan: one `Mmio::new` per port register, and `PORTSC` is the
+#     most dangerous register in the controller to read-modify-write -- seven
+#     write-one-to-clear bits and bit 1 write-one-to-*disable* -- so every
+#     write goes through `preserving` or `acknowledging`.
+#   * three more DMA structures written for the controller to read: the device
+#     context array entry for the slot, the control endpoint's transfer ring
+#     and its link, and the input context's three contexts.
+#   * one volatile read back of the device context the controller wrote, which
+#     is what turns "the command was accepted" into "the controller did it".
+# What is not in it: `address_device_input`, which builds all three contexts as
+# `(offset, dwords)` and is pure, so the input-context arithmetic RFC 0041
+# calls the trap is held by host tests rather than by a comment.
+unsafe_budget = 1896
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

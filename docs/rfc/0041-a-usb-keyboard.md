@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft — steps 1 to 4 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. Steps 5–8 are open |
+| **Status** | ⬜ **Draft — steps 1 to 5 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. **Step 5 (2026-08-23): a USB keyboard is enumerated, given a slot and addressed** — and a real controller caught a bug in RFC 0038's vendored layouts that the crate's own round-trip test could not see: the root hub port number was being written into the Number of Ports field. Steps 6–8 are open |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | drivers |
 | **Milestone** | Phase 2 (see docs/roadmap.md) |
@@ -141,6 +141,14 @@ usable.
 - `docs/security.md` §1 — the first DMA-capable device this kernel drives; the
   IOMMU stops being a thing that is tested and becomes a thing that is relied on.
 - `README.md` and `TRACKER.md` — the keyboard gap statement changes again.
+- `third_party/xhci/PROVENANCE.md` — **its central claim was tested and held**,
+  2026-08-23. "Everything here is reviewed as our own work … and tested here
+  rather than trusted because it was tested elsewhere" stopped being a policy
+  statement when step 5 found `Slot::root_hub_port_number` reading the wrong
+  bits. What the episode adds: a round-trip test over a getter and setter pair
+  proves nothing about a layout, because the two can be wrong together and
+  agree. The layout tests in that crate assert raw encodings against literals,
+  and the ones that did not now do.
 
 ## Security implications
 
@@ -237,7 +245,20 @@ arithmetic — each seen to fail on purpose.
    doorbell makes it live, and the controller would have stopped after fifteen
    commands. Written now, toggling. The event ring still gets none — that one
    wraps by the segment table.
-5. Port enumeration, Enable Slot, Address Device.
+5. ✅ **Done 2026-08-23.** Port enumeration, Enable Slot, Address Device.
+
+   *The reset rule needs to know nothing about USB versions.* A USB 3 port
+   enables itself on connect and a USB 2 port must be reset, and a driver cannot
+   tell which it is looking at from the port number — so the rule is *if it is
+   connected and not enabled, reset it*, which is right for both.
+
+   *And it found a bug in the vendored layouts.* `Slot::root_hub_port_number`
+   and its setter both used dword 1 bits 31:24, which is Number of Ports. Address
+   Device was refused with `CC_TRB_ERROR` until the field moved to bits 23:16,
+   after which the same command addressed the device. The crate's test had
+   round-tripped the value through the accessor that wrote it, which pins the
+   getter and setter to each other and cannot see the layout; it now asserts the
+   raw dword. See §"Impact on existing design documents".
 6. Descriptors over control transfers; Configure Endpoint for interrupt IN.
 7. Reports into `input::keyboard_produced`, which already exists and already
    merges a second source.
