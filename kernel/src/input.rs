@@ -271,11 +271,16 @@ pub fn service() -> usize {
     if raw != u64::MAX {
         let _ = crate::irq::acknowledge(crate::irq::handler_from_raw(raw));
     }
-    // Both sources share this notification, so a wake says only that *some*
-    // source has something. Servicing both is how it stays that way: asking
-    // the badge which one it was and draining only that would leave the other
-    // holding a byte until it happened to raise its own line again.
-    taken + crate::keyboard::service()
+    // **Three** sources share this notification now, so a wake says only that
+    // *some* source has something. Servicing all of them is how it stays that
+    // way: asking the badge which one it was and draining only that would leave
+    // the others holding a byte until they happened to raise their own line
+    // again.
+    //
+    // The third is a USB keyboard (RFC 0041 step 7). It costs one lock and an
+    // early return on a machine that has none, which every machine did until
+    // today.
+    taken + crate::keyboard::service() + crate::xhci::service()
 }
 
 /// Publishes what a keyboard produced.

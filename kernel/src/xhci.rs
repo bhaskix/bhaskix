@@ -2149,7 +2149,9 @@ unsafe fn address_a_device<W: Wait>(
                 wait,
             );
         }
-        attached.frames += 2;
+        // Two rings and an input context for Configure Endpoint, plus a
+        // report buffer for step 7.
+        attached.frames += 3;
     }
     attached
 }
@@ -2359,6 +2361,159 @@ unsafe fn configure_the_endpoint<W: Wait>(
     // 1 is Running. Anything else is a controller that accepted the command and
     // did not end up where the command asked.
     described.configured = endpoint_context.endpoint_state() == 1;
+    if !described.configured {
+        return;
+    }
+
+    // --- RFC 0041 step 7: somewhere to put a report ------------------------
+    let Ok(report) = frame(controller, hhdm) else {
+        described.stopped = Some("no frame for a report buffer");
+        return;
+    };
+
+    // **The consumer is carried over from bring-up, not made fresh.** The
+    // controller does not restart the event ring for a new reader; a fresh
+    // consumer would start at entry zero expecting cycle 1 and read entries
+    // that have already been consumed, which on a keyboard means replaying
+    // whatever the last command answered as if it were a keystroke.
+    *KEYBOARD.lock() = Some(UsbKeyboard {
+        controller,
+        base: commander.base,
+        doorbells: parameters.doorbells,
+        runtime: parameters.runtime,
+        slot,
+        endpoint_index: described.endpoint_index,
+        event_virtual: commander.event,
+        event_device: commander.memory.event_ring,
+        event_entries: commander.memory.event_ring_entries,
+        consumer: commander.consumer,
+        ring_virtual: ring.virtual_address,
+        producer: match ring::Producer::new(RING_ENTRIES) {
+            Some(producer) => producer,
+            None => return,
+        },
+        report_virtual: report.virtual_address,
+        report_device: report.device,
+        packet: max_packet_size,
+        keyboard: bhaskix_usb::hid::Keyboard::new(),
+        handler: u64::MAX,
+        reports: 0,
+        bytes: 0,
+        short: 0,
+    });
+}
+
+/// Claims the controller's interrupt and arms the first report.
+///
+/// **After the console's notification exists**, because this binds to it: three
+/// sources share one notification, and `input::service` drains all of them
+/// rather than asking the badge which fired. A wake says only that *something*
+/// has something.
+///
+/// Failure is survivable and says which: the machine boots, the i8042 still
+/// works if there is one, and serial is untouched.
+///
+/// # Safety
+///
+/// Must be called once, during boot, after the interrupt controller is up.
+pub unsafe fn install_interrupt(
+    apic_id: u32,
+    rsdp: Option<bhaskix_boot::PhysAddr>,
+    hhdm: u64,
+    notification: crate::notify::NotificationId,
+) -> Result<u8, &'static str> {
+    // Where the device is, and nothing else, under this lock. Everything that
+    // follows takes locks ranking *outside* it -- the notification arena, the
+    // interrupt handlers, the vector allocator -- and holding this across them
+    // is the inversion `virtio::enable_interrupts` documents having made.
+    let controller = {
+        let guard = KEYBOARD.lock();
+        guard
+            .as_ref()
+            .ok_or("no keyboard is configured")?
+            .controller
+    };
+    let address = pci::Address {
+        bus: controller.0,
+        device: controller.1,
+        function: controller.2,
+    };
+
+    // SAFETY: `trap` dispatches claimed vectors to `irq::on_interrupt`, which
+    // acknowledges the local APIC.
+    let handler = unsafe {
+        crate::irq::claim(
+            crate::irq::Source::MessageSignalled {
+                device: address,
+                entry: 0,
+            },
+            "usb-keyboard",
+            apic_id,
+            rsdp,
+            hhdm,
+        )
+    }
+    .map_err(|_| "the controller's MSI-X entry could not be claimed")?;
+
+    if crate::irq::bind(handler, notification, BADGE).is_err() {
+        crate::irq::release(handler);
+        return Err("the notification would not bind");
+    }
+    let vector = crate::irq::vector_of(handler).unwrap_or(0);
+
+    let mut guard = KEYBOARD.lock();
+    let keyboard = guard.as_mut().ok_or("no keyboard is configured")?;
+    keyboard.handler = crate::irq::handler_raw(handler);
+    // SAFETY: the endpoint is configured and these are its ring and buffer.
+    if !unsafe { keyboard.arm() } {
+        return Err("the first transfer could not be queued");
+    }
+    Ok(vector)
+}
+
+/// Reads whatever the keyboard has sent, and acknowledges the interrupt.
+///
+/// Called from [`crate::input::service`] beside the serial port and the i8042.
+/// Answers how many bytes reached the console ring.
+pub fn service() -> usize {
+    let (produced, handler) = {
+        let mut guard = KEYBOARD.lock();
+        let Some(keyboard) = guard.as_mut() else {
+            return 0;
+        };
+        if keyboard.handler == u64::MAX {
+            return 0;
+        }
+        // SAFETY: the endpoint is configured and these are its ring and buffer.
+        (unsafe { keyboard.drain_reports() }, keyboard.handler)
+    };
+
+    // **Acknowledged after the lock is released, not while it is held.**
+    // `irq::acknowledge` takes the handler table, whose rank is *outside* this
+    // one; taking it here would be the inversion this rank's comment exists to
+    // prevent. Draining before acknowledging is `driver-model.md` §2's rule and
+    // is preserved: the drain above has already happened.
+    if handler != u64::MAX {
+        let _ = crate::irq::acknowledge(crate::irq::handler_from_raw(handler));
+    }
+    produced
+}
+
+/// Whether a USB keyboard is configured and being read.
+#[must_use]
+pub fn keyboard_present() -> bool {
+    KEYBOARD
+        .lock()
+        .as_ref()
+        .is_some_and(|keyboard| keyboard.handler != u64::MAX)
+}
+
+/// Reports read, bytes produced, and reports shorter than the endpoint declared.
+#[must_use]
+pub fn keyboard_statistics() -> (u64, u64, u64) {
+    KEYBOARD.lock().as_ref().map_or((0, 0, 0), |keyboard| {
+        (keyboard.reports, keyboard.bytes, keyboard.short)
+    })
 }
 
 /// Sends a No-Op command and consumes the event it produces.
@@ -2404,6 +2559,190 @@ pub struct Answered {
     pub matched: bool,
     /// Whether the dequeue pointer was written back.
     pub dequeue_advanced: bool,
+}
+
+/// The badge this driver signals the console's notification with.
+///
+/// Third source on one notification: serial is 1, the i8042 is 2, this is 4.
+pub const BADGE: u64 = 4;
+
+/// A keyboard the controller is reading, and everything needed to keep reading.
+///
+/// **Owned rather than borrowed**, because it outlives bring-up: the structures
+/// that were locals while the device was being addressed have to survive into
+/// interrupt context, where there is no caller to have lent them.
+struct UsbKeyboard {
+    /// Where the controller is, for claiming its interrupt.
+    controller: (u8, u8, u8),
+    /// The mapped register window, and the two bank offsets used from here.
+    base: usize,
+    doorbells: usize,
+    runtime: usize,
+    /// Which slot and which endpoint, the latter as a Device Context Index.
+    slot: u8,
+    endpoint_index: u8,
+    /// The event ring, and where this driver has read up to. **Carried over
+    /// from bring-up**: the controller does not restart the ring for a new
+    /// reader, so a fresh consumer would read entries already consumed.
+    event_virtual: u64,
+    event_device: u64,
+    event_entries: usize,
+    consumer: ring::Consumer,
+    /// The interrupt endpoint's transfer ring, as the kernel sees it. The
+    /// controller was told its device address in the endpoint context and does
+    /// not need telling again.
+    ring_virtual: u64,
+    producer: ring::Producer,
+    /// Where the device writes a report, and how many bytes it may write.
+    report_virtual: u64,
+    report_device: u64,
+    packet: u16,
+    /// The boot-protocol state: which keys were held last time.
+    keyboard: bhaskix_usb::hid::Keyboard,
+    /// The claimed interrupt, packed as `irq::handler_raw`; `u64::MAX` is none.
+    handler: u64,
+    /// Reports read, and bytes produced from them.
+    reports: u64,
+    bytes: u64,
+    /// Reports the device sent that were shorter than the endpoint declared.
+    short: u64,
+}
+
+/// The keyboard this kernel is reading, once there is one.
+static KEYBOARD: crate::sync::SpinLock<Option<UsbKeyboard>> =
+    crate::sync::SpinLock::new(crate::sync::Rank::UsbKeyboard, None);
+
+impl UsbKeyboard {
+    /// Puts one Normal TRB on the interrupt endpoint's ring and rings for it.
+    ///
+    /// **A transfer is queued before a report can arrive, and again after every
+    /// one that does.** An interrupt endpoint does not stream: the controller
+    /// polls the device only while there is somewhere to put the answer, so a
+    /// driver that forgets to re-queue gets exactly one keystroke.
+    ///
+    /// # Safety
+    ///
+    /// The endpoint must be configured and these addresses its.
+    unsafe fn arm(&mut self) -> bool {
+        if self.producer.remaining_this_lap() == 0 {
+            // The lap is not handled here either -- see `Commander::issue`.
+            // Sixteen entries and one report per interrupt means this is
+            // reached after fifteen keystrokes, so it is a real bound and not
+            // a theoretical one.
+            return false;
+        }
+        let Some(transfer) = trb::Trb::normal(
+            self.report_device,
+            u32::from(self.packet),
+            self.producer.cycle(),
+        ) else {
+            return false;
+        };
+        // Report on completion, because this transfer *is* the whole
+        // descriptor -- there is no later stage to carry it.
+        let transfer = transfer.with_interrupt_on_completion(true);
+        // SAFETY: a frame `init` allocated, at an index `Producer` bounds to
+        // inside the ring.
+        unsafe {
+            core::ptr::write_volatile(
+                (self.ring_virtual as *mut [u32; 4]).add(self.producer.index()),
+                transfer.0,
+            );
+        }
+        self.producer.advance();
+
+        let Some(offset) = bhaskix_xhci::doorbell::for_slot(self.slot)
+            .and_then(bhaskix_xhci::doorbell::doorbell_at)
+        else {
+            return false;
+        };
+        // SAFETY: the doorbell bank is inside the window, and the offset is
+        // bounded by `doorbell_at`.
+        let doorbell = unsafe {
+            DoorbellRegister::<bhaskix_device::Volatile>::new(self.base + self.doorbells + offset)
+        };
+        // **The endpoint's Device Context Index, not the control endpoint's.**
+        // Ringing 1 here polls the device for a descriptor nobody asked for.
+        doorbell
+            .value
+            .write(bhaskix_xhci::doorbell::Doorbell::endpoint(self.endpoint_index).0);
+        true
+    }
+
+    /// Reads whatever the controller has published, and types it.
+    ///
+    /// # Safety
+    ///
+    /// As [`UsbKeyboard::arm`].
+    unsafe fn drain_reports(&mut self) -> usize {
+        let event_ring = self.event_virtual;
+        let drained = drain(self.event_entries, &mut self.consumer, &mut |index| {
+            // SAFETY: one TRB at an index `Consumer` bounds to inside the ring
+            // the controller writes by DMA.
+            trb::Trb(unsafe {
+                core::ptr::read_volatile((event_ring as *const [u32; 4]).add(index))
+            })
+        });
+
+        // Tell the controller how far this driver has read, and clear Event
+        // Handler Busy. Without it the interrupter never fires again.
+        if let Some(interrupter_zero) = runtime::interrupter_at(0)
+            && let Some(dequeue) = runtime::EventRingDequeuePointer::advancing(
+                self.event_device + (self.consumer.index() * trb::BYTES) as u64,
+                0,
+                true,
+            )
+        {
+            // SAFETY: the runtime bank is inside the window.
+            let interrupter = unsafe {
+                Interrupter::<bhaskix_device::Volatile>::new(
+                    self.base + self.runtime + interrupter_zero,
+                )
+            };
+            // Acknowledge the interrupt pending bit in the same write that
+            // moves the pointer: `IMAN` bit 0 is write-one-to-clear.
+            interrupter.iman.write(
+                runtime::InterrupterManagement(0)
+                    .with_interrupt_enable(true)
+                    .acknowledging()
+                    .0,
+            );
+            interrupter.erdp.write(dequeue.0);
+        }
+
+        if drained.transfers == 0 {
+            return 0;
+        }
+
+        // A short report is not a keystroke. The endpoint declared its packet
+        // size and the controller was told it; fewer bytes than that means the
+        // device sent something other than what it said it would, and
+        // `hid::Keyboard::feed` refuses it anyway.
+        let moved = usize::from(self.packet).saturating_sub(drained.remaining as usize);
+        if moved < bhaskix_usb::hid::REPORT_BYTES {
+            self.short += 1;
+        }
+
+        // SAFETY: a frame `init` allocated, read for the bytes the controller
+        // says it wrote, which is bounded by the packet size it was given.
+        let report = unsafe {
+            core::slice::from_raw_parts(
+                self.report_virtual as *const u8,
+                moved.min(usize::from(self.packet)),
+            )
+        };
+        let typed = self.keyboard.feed(report);
+        let produced = typed.as_slice().len();
+        if produced > 0 {
+            crate::input::keyboard_produced(typed.as_slice());
+        }
+        self.reports += 1;
+        self.bytes += produced as u64;
+
+        // SAFETY: as above.
+        unsafe { self.arm() };
+        produced
+    }
 }
 
 /// A controller to bring up without a machine.

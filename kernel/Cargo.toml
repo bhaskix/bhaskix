@@ -401,7 +401,21 @@ asm_budget = 10
 # are pure. Which stages exist, which way each points, which one carries
 # Interrupt On Completion, and the Device Context Index arithmetic RFC 0041
 # calls the trap are all decided in safe code that host tests hold.
-unsafe_budget = 2027
+# 2095 at RFC 0041 step 7, 2026-08-23: +68, for reading reports and typing them.
+# The smallest increment of the six, and deliberately: the interrupt path had to
+# be cheap because it runs with a lock held.
+#   * `arm`: one Normal TRB written to the interrupt endpoint's ring, and its
+#     doorbell -- once at install and once after every report.
+#   * `drain_reports`: the volatile read per event-ring entry, the dequeue and
+#     IMAN writes that re-arm the interrupter, and one `from_raw_parts` over the
+#     bytes the device wrote, bounded by the packet size the endpoint declared.
+#   * `install_interrupt`: nothing of its own -- `irq::claim` is safe to call
+#     and does the MSI-X programming.
+# What is not in it: the report itself is handed to `bhaskix_usb::hid::Keyboard`,
+# which is forbid(unsafe_code), and the translation from "the set of keys held"
+# to "what was newly pressed" -- the whole difference between a boot report and
+# a scancode stream -- happens there.
+unsafe_budget = 2095
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

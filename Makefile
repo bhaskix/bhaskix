@@ -177,7 +177,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
-        test-placements mkfs test-shell test-faults fmt clippy gates hooks clean distclean help
+        test-placements mkfs test-shell test-faults test-usb-keyboard fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -488,7 +488,7 @@ run-uefi: $(ISO)
 # seconds rather than after a QEMU boot.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-native test-boot-native-full test-placements test-shell \
-      test-keyboard test-faults
+      test-keyboard test-usb-keyboard test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -546,6 +546,15 @@ test-boot-uefi: $(ISO)
 # be a constant for a milestone.
 test-boot-iommu: $(ISO)
 	tests/qemu/boot-test.sh iommu
+
+# RFC 0041 step 7, and the counterpart to `test-keyboard`.
+#
+# A separate target and a separate machine, because the two keyboards cannot be
+# tested on one: QEMU delivers a key to a single keyboard, and with a USB
+# keyboard present that is the USB one. `test-keyboard` therefore keeps the
+# `disks` profile, which has no USB, and this one takes `usb`, which does.
+test-usb-keyboard: $(ISO)
+	tests/qemu/usb-keyboard-test.sh
 
 # RFC 0012's escape hatch, on a machine that has a unit to refuse -- turning
 # off an IOMMU that is not there proves nothing. The script builds an image

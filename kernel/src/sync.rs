@@ -218,24 +218,31 @@ pub enum Rank {
     /// not by blocking. Outside the console, because a driver reports what it
     /// found while holding itself.
     Block = 15,
-    /// **Nothing holds this rank any more**, as of RFC 0032 step 10.
+    /// `xhci::KEYBOARD` — the USB keyboard being read, and its rings.
     ///
-    /// It was `signal::DISPOSITIONS` (RFC 0005 step 4), then
-    /// `syscall::FUTEX_KEYS` when the dispositions moved to `bin/linuxd`
-    /// (step 7), and now the futex queues have moved there too — the last
-    /// Linux table in the nucleus. The variant is kept rather than removed
-    /// because the numbers are an *order*, and renumbering the ranks below it
-    /// to close a gap would rewrite the meaning of every recorded violation.
-    /// The next lock that belongs between `Block` and the console takes it,
-    /// with its own name.
+    /// **This rank was empty and invited its next holder by name.** It was
+    /// `signal::DISPOSITIONS` (RFC 0005 step 4), then `syscall::FUTEX_KEYS`
+    /// (RFC 0032 step 7), and then nothing at all once the futex queues left
+    /// the nucleus at step 10 — at which point its comment said "the next lock
+    /// that belongs between `Block` and the console takes it, with its own
+    /// name". This is that lock, taken 2026-08-23 by RFC 0041 step 7. The
+    /// number did not move, because the numbers are an *order* and renumbering
+    /// would rewrite the meaning of every recorded violation.
     ///
-    /// Nearly innermost, and taken from the page-fault handler: a user-mode
-    /// fault means the interrupted thread held no kernel lock at all, so
-    /// nothing outside is held when this is; and nothing is taken while it
-    /// is held — the frame is built into a local buffer and the lock
-    /// released before a single byte crosses to user memory. Outside the
-    /// console only because a delivery that refuses says so.
-    Signals = 16,
+    /// Beside `Block` and for the same reasons. Nothing here wakes a thread:
+    /// the driver reads a report the device has already written and pushes the
+    /// bytes into a lock-free ring. Outside the console, because a driver
+    /// reports what it found while holding itself.
+    ///
+    /// **Taken in interrupt context, which is why what it may reach matters.**
+    /// The service routine holds this while it reads the event ring, feeds the
+    /// report, and rings a doorbell — all of them either device memory or
+    /// arithmetic. `input::keyboard_produced` takes no lock. The one call that
+    /// does reach further is `irq::acknowledge`, whose `IrqHandlers` rank is
+    /// **13, outside this** — so it is made after this lock is released, not
+    /// while it is held. That ordering is the whole reason this rank sits where
+    /// it does.
+    UsbKeyboard = 16,
     /// `console::CONSOLE` — the innermost lock. Anything may print.
     Console = 17,
 }
@@ -277,7 +284,7 @@ impl Rank {
             Self::IrqHandlers => "irq::HANDLERS",
             Self::Vectors => "vectors::TABLE",
             Self::Block => "virtio::DEVICE",
-            Self::Signals => "(unused since RFC 0032 step 10)",
+            Self::UsbKeyboard => "usb-keyboard",
             Self::DmaWindow => "iommu::WINDOW",
             Self::Console => "console::CONSOLE",
         }

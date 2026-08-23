@@ -26,7 +26,7 @@
 
 # Builds the device list.
 #
-#   $1  profile — `full`, `disks`, or `one-disk`
+#   $1  profile — `full`, `usb`, `disks`, or `one-disk`
 #   $2  translated — `yes` if the devices must go through an IOMMU (optional,
 #       defaults to `no`; only `full` has ever needed it)
 #
@@ -139,6 +139,26 @@ qemu_device_list() {
                 # reason** and not by accident -- it is the profile where the
                 # i8042 is the only keyboard, which is the only machine on which
                 # it can be tested at all.
+                -device usb-kbd,bus=xhci0.0
+            )
+            ;;
+        usb)
+            # Two disks and a USB keyboard, no network: the smallest machine
+            # that can be typed at over USB.
+            #
+            # **It must be asked for translated.** RFC 0038's rule 1 is that a
+            # controller with no IOMMU translation is refused, so an untranslated
+            # machine here would boot, refuse the controller correctly, and give
+            # this harness nothing to type at -- a test that fails for the reason
+            # the system is working.
+            #
+            # One controller, not two. The refusal has its subject on `full`;
+            # what this profile is for is the keyboard, and a second controller
+            # would only add a device nobody drives.
+            VIRTIO_ARGS=(
+                -device "virtio-blk-pci,drive=disk0$suffix"
+                -device "virtio-blk-pci,drive=disk1$suffix"
+                -device qemu-xhci,id=xhci0
                 -device usb-kbd,bus=xhci0.0
             )
             ;;

@@ -224,7 +224,7 @@ reimplementation, packages, and input.
 | 4.10 | Somebody types | The i8042, and a keyboard that is state rather than events | [RFC 0037](rfc/0037-a-keyboard-on-real-hardware.md); `make test-keyboard` | ready |
 | 4.11 | A controller you may not drive | An xHCI controller is refused unless it is caged, and the refusal is watched on a real controller | [RFC 0041](rfc/0041-a-usb-keyboard.md) steps 2–3; two controllers in the machine, one driven and one turned down by name | ready |
 | 4.12 | Asking a device what it is | Descriptors over control transfers; a keyboard addressed, described, and its endpoint configured | RFC 0041 steps 4–6; the Device Context Index trap — endpoint 1 IN is index **3** — demonstrated live | ready |
-| 4.13 | The keystroke | A report crosses from the device to the shell | RFC 0041 step 7 | **blocked** |
+| 4.13 | The keystroke | A report crosses from the device to the shell, and a held key does not repeat | RFC 0041 step 7, done 2026-08-23; `make test-usb-keyboard`, six gates | ready |
 
 *Interlude D — Where a correction lives.* Why a wrong claim is corrected beside
 itself rather than deleted, and what a changelog looks like when that rule is
@@ -248,8 +248,8 @@ next day. A summary that contradicts the plan it summarises is worse than none.
 
 | | |
 |---|---|
-| **Writable now** | **All but one.** Thirty-five of the thirty-six numbered chapters, all four interludes, and the closing chapter. The per-chapter evidence in §5 is the authority; this row is only a count of it. |
-| **Blocked on the work** | **One chapter: 4.13, the keystroke** — RFC 0041 step 7. Nothing has reached the shell over USB. |
+| **Writable now** | **All of them**, as of 2026-08-23. Thirty-six numbered chapters, four interludes, and the closing chapter. The per-chapter evidence in §5 is the authority; this row is only a count of it. |
+| **Blocked on the work** | **None.** 4.13, *The keystroke*, was the last one and RFC 0041 step 7 closed it the same day this table was written — a key typed at a USB keyboard now reaches the shell. |
 | **Writable but must state a gap** | Interlude A: one boot on real hardware, observed on a screen and **not captured**, so no boot report was read and no self-test result from hardware is known. A performance chapter cannot be written at all; there is nothing to write it from. |
 | **Must not be written yet** | Anything about libc or self-hosting. Any claim that Bhaskix runs a real workload. Any comparison against a system it has not been measured beside. |
 

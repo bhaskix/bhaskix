@@ -30,9 +30,13 @@ parts, thirty-six chapters, four interludes and a closing chapter, each with the
 claim it is allowed to make, the evidence in this repository that carries it, and
 whether it can be written yet.
 
-**Thirty-five of the thirty-six can be written now.** The one that cannot is
-4.13, *The keystroke* — nothing has reached the shell over USB, and RFC 0041's
-step 7 is what would change that.
+**All thirty-six can be written now**, as of 2026-08-23. The last one that could
+not was 4.13, *The keystroke*, and RFC 0041 step 7 closed it the same day the
+plan was written: a key typed at a USB keyboard reaches the shell.
+
+That is a statement about *evidence*, not about difficulty. Every chapter has
+something in this repository that makes its claim checkable; none of them has
+been written.
 
 ## Why the book lives in this repository
 

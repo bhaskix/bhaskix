@@ -15953,6 +15953,14 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         window.width.levels()
     );
 
+    // **The device count these `verify_window` calls check against is computed,
+    // not written down.** It is how many context entries this table should now
+    // hold: everything already installed, plus the one being attached. They
+    // were literals -- 2, 3, 4 -- which are correct only on a machine that has
+    // every device before them. RFC 0041 step 7's `usb` profile has no network
+    // device, so the controller is the third and not the fourth, and the
+    // literal turned a correct window into "the tables did not read back".
+    //
     // The second block device, if there is one, gets a translation of its own
     // under the same unit: its own page table and its own domain id, reached
     // through its own context entry. Sharing the first device's page table
@@ -15964,7 +15972,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         let delegated = (second.bus, second.device, second.function);
         match iommu::attach_device(&window, delegated, 1, hhdm) {
             Some(second_window) => {
-                if iommu::verify_window(&second_window, 2, hhdm)
+                if iommu::verify_window(&second_window, iommu::windows() + 1, hhdm)
                     && iommu::install(delegated, found, second_window)
                 {
                     // The unit is already translating, and it caches context
@@ -16010,7 +16018,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         let delegated = (net.bus, net.device, net.function);
         match iommu::attach_device(&window, delegated, 2, hhdm) {
             Some(net_window) => {
-                if iommu::verify_window(&net_window, 3, hhdm)
+                if iommu::verify_window(&net_window, iommu::windows() + 1, hhdm)
                     && iommu::install(delegated, found, net_window)
                 {
                     // SAFETY: the unit these windows are programmed into. The
@@ -16057,7 +16065,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     if let Some(controller) = unsafe { xhci::probe() } {
         match iommu::attach_device(&window, controller, 3, hhdm) {
             Some(controller_window) => {
-                if iommu::verify_window(&controller_window, 4, hhdm)
+                if iommu::verify_window(&controller_window, iommu::windows() + 1, hhdm)
                     && iommu::install(controller, found, controller_window)
                 {
                     // SAFETY: the unit these windows are programmed into. The
@@ -16339,6 +16347,39 @@ fn console_input(handoff: &Handoff) -> bool {
             Err(reason) => println!(
                 "\x1b[93m    keyboard       none ({reason}); this machine can only be typed at over serial\x1b[0m"
             ),
+        }
+
+        // The USB keyboard, if step 6 configured one. RFC 0041 step 7.
+        //
+        // SAFETY: called once, here, with the interrupt controller up and the
+        // console's notification already created.
+        match unsafe {
+            xhci::install_interrupt(handoff.bsp_lapic_id, handoff.rsdp, hhdm, notification)
+        } {
+            Ok(usb_vector) => {
+                println!(
+                    "    usb keyboard   reading reports, msi-x entry 0 -> vector {usb_vector:#04x}"
+                );
+                // **RFC 0041's unresolved question 2, answered out loud.**
+                // "A machine with both should probably say so at boot rather
+                // than silently preferring one." Both exist here, and which one
+                // a keystroke reaches is decided by the *emulator or the
+                // firmware*, not by this kernel -- on QEMU a key goes to the USB
+                // keyboard and the i8042 never sees it. Both are serviced, so
+                // either works; what a person needs to know is that a key
+                // arriving at one is not evidence the other is alive.
+                if keyboard::present() {
+                    println!(
+                        "\x1b[93m    input sources  two keyboards on this machine (i8042 and USB) \
+                         plus serial; all three are read, and which one a keystroke reaches is not \
+                         this kernel's choice -- a key arriving proves one of them works, not \
+                         both\x1b[0m"
+                    );
+                }
+            }
+            // Not a failure worth colouring: a machine with no USB keyboard is
+            // the ordinary case, and step 6 already said why there is none.
+            Err(reason) => println!("    usb keyboard   none ({reason})"),
         }
     }
     true

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft — steps 1 to 6 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. **Step 5 (2026-08-23): a USB keyboard is enumerated, given a slot and addressed** — and a real controller caught a bug in RFC 0038's vendored layouts that the crate's own round-trip test could not see: the root hub port number was being written into the Number of Ports field. **Step 6 (2026-08-23): the keyboard answers a control transfer and its interrupt IN endpoint is configured and Running** — descriptors read and parsed by the fuzzed `usb` crate, and the Device Context Index trap (endpoint 1 IN is index 3) demonstrated on a real device. Steps 7–8 are open |
+| **Status** | ⬜ **Draft — steps 1 to 7 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. **Step 5 (2026-08-23): a USB keyboard is enumerated, given a slot and addressed** — and a real controller caught a bug in RFC 0038's vendored layouts that the crate's own round-trip test could not see: the root hub port number was being written into the Number of Ports field. **Step 6 (2026-08-23): the keyboard answers a control transfer and its interrupt IN endpoint is configured and Running** — descriptors read and parsed by the fuzzed `usb` crate, and the Device Context Index trap (endpoint 1 IN is index 3) demonstrated on a real device. **Step 7 (2026-08-23): a key typed at a USB keyboard reaches the shell**, interrupt-driven, with a held key producing one character rather than one per report. Only step 8 — the documents — is open |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | drivers |
 | **Milestone** | Phase 2 (see docs/roadmap.md) |
@@ -200,9 +200,20 @@ arithmetic — each seen to fail on purpose.
 
 1. **How much of the controller must be torn down on failure?** A driver that
    gives up half-initialised leaves a bus master with a live ring.
-2. **What happens to the i8042 driver when both exist?** Two sources, one
-   console ring — the design already allows it, but a machine with both should
-   probably say so at boot rather than silently preferring one.
+2. ~~**What happens to the i8042 driver when both exist?**~~ **Answered
+   2026-08-23, and the answer was found by being wrong about it first.** Both are
+   read: `input::service` drains serial, the i8042 and USB on every wake. What
+   the question did not anticipate is that *the choice is not this kernel's* —
+   QEMU delivers a key to **one** keyboard, and with a USB keyboard present that
+   is the USB one. Measured, not assumed: pointing `keyboard-test.sh` at a
+   machine containing a USB keyboard fails three of its five gates, the i8042
+   being found and prompting and then seeing nothing.
+
+   So the boot report says it out loud, which is what the question asked for: a
+   machine with both prints that all three sources are read and that **a key
+   arriving proves one of them works, not both**. And the two keyboards cannot
+   be tested on one machine — `test-keyboard` keeps the `disks` profile, which
+   has no USB, and `test-usb-keyboard` takes `usb`, which does.
 3. **Does console input move to a domain before or after this?** The debt is
    shared; the move is cheaper before there are two drivers in it.
 
@@ -278,7 +289,18 @@ arithmetic — each seen to fail on purpose.
    conversion. Configure Endpoint accepts any legal exponent, so no test here can
    tell a right conversion from a plausible one; what a wrong one produces is
    reports at the wrong rate. The trigger is step 7.
-7. Reports into `input::keyboard_produced`, which already exists and already
-   merges a second source.
+7. ✅ **Done 2026-08-23.** Reports into `input::keyboard_produced`, which
+   already existed and already merged a second source — and now merges a third.
+
+   *Interrupt-driven, not polled*, which is what the rejected alternative above
+   requires: MSI-X entry 0 claimed through `irq::Source::MessageSignalled`, bound
+   to the console's own notification with a third badge. `input::service` drains
+   all three sources on any wake rather than asking the badge which fired, for
+   the reason its own comment already gave about two.
+
+   *A transfer is queued again after every report.* An interrupt endpoint does
+   not stream — the controller polls the device only while there is somewhere to
+   put the answer — so a driver that forgets to re-queue gets exactly one
+   keystroke.
 8. The QEMU gate, watched red three ways, and the documents updated in the same
    change that makes them true.
