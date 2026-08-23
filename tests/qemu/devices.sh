@@ -118,13 +118,27 @@ qemu_device_list() {
                 # controller nobody drives and the port scan would find an empty
                 # machine.
                 #
-                # It does not take sendkey away from the i8042, which was
-                # checked rather than assumed before this line was added:
-                # `make test-keyboard` types at the PS/2 keyboard and its five
-                # gates still pass with this device present. That matters
-                # because RFC 0041's unresolved question 2 is what happens when
-                # both keyboards exist, and the answer must not be "the older
-                # test silently stopped testing anything".
+                # **IT DOES TAKE sendkey AWAY FROM THE i8042. Corrected
+                # 2026-08-23; this comment said the opposite for a day.**
+                #
+                # The check that was run was worthless: `make test-keyboard`
+                # boots the `disks` profile, which has no controller and no
+                # keyboard, so its five gates were always going to pass whatever
+                # was added *here*. A test on a machine that does not contain
+                # the change is not a test of the change.
+                #
+                # Run against a machine that does contain it -- this profile --
+                # three of those five gates fail. The i8042 is found and the
+                # shell reaches its prompt; nothing typed ever arrives. QEMU
+                # delivers a key to one keyboard, and with a USB keyboard
+                # present that is the USB one.
+                #
+                # That is RFC 0041's unresolved question 2 arriving in fact
+                # rather than in theory: two keyboards, and the machine silently
+                # prefers one. `keyboard-test.sh` keeps using `disks` **for this
+                # reason** and not by accident -- it is the profile where the
+                # i8042 is the only keyboard, which is the only machine on which
+                # it can be tested at all.
                 -device usb-kbd,bus=xhci0.0
             )
             ;;

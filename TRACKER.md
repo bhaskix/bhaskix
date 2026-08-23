@@ -791,6 +791,66 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-23 (a check that could not fail: the USB keyboard does take the keys, and yesterday's claim said the reverse)
+
+**Yesterday's step 5 added `-device usb-kbd` to the `full` profile and claimed,
+in the commit message, the tracker and the machine description, that it does not
+take `sendkey` away from the i8042 — "checked rather than assumed".** It was
+checked. The check could not have failed.
+
+`make test-keyboard` boots the **`disks`** profile: two disks, no network, no
+xHCI controller and no USB keyboard. The device was added to **`full`**. So the
+five i8042 gates were always going to pass, whatever was put in a profile that
+machine never boots. **A test run on a machine that does not contain the change
+is not a test of the change**, and the reasoning was exactly as strong as running
+no test at all.
+
+**Run against a machine that does contain it, the claim inverts.** Pointing
+`keyboard-test.sh` at `full` for one run:
+
+```
+ok    the i8042 controller was found and its line claimed
+ok    a shell reached its prompt
+FAIL  the shell never saw the typed command
+FAIL  the command echoed but never ran
+FAIL  shift did not produce a capital -- the modifier state is wrong
+```
+
+The controller is found and the shell prompts. Nothing typed ever arrives. QEMU
+delivers a key to **one** keyboard, and with a USB keyboard present that is the
+USB one.
+
+**This is RFC 0041's unresolved question 2, arriving in fact rather than in
+theory.** "What happens to the i8042 driver when both exist? Two sources, one
+console ring — the design already allows it, but a machine with both should
+probably say so at boot rather than silently preferring one." The machine with
+both now exists, it does silently prefer one, and it says nothing.
+
+**What was actually at risk, and what was not.** No suite went red, because the
+only harness that types keys boots the profile without the USB keyboard. So
+`keyboard-test.sh` using `disks` — which was incidental — is now **load-bearing**:
+it is the one machine on which the i8042 is the only keyboard, and therefore the
+only machine on which it can be tested at all. That is written into
+`devices.sh` where somebody might otherwise "tidy" the profile.
+
+**The corrections are made where the wrong claims live**: the comment in
+`tests/qemu/devices.sh` and the step 5 entry below in this section, both now
+carrying the opposite of what they said. The commit message `2cfc9f1` cannot be
+edited and is wrong; this entry is the record of that.
+
+**The pattern is worth naming, because it is not the first time.** A gate that
+has never failed is a gate nobody has tested — this project says that constantly
+and gates its code on it. The same rule applies to a one-off check run by hand
+during development, and there is nothing to enforce it there. The question to ask
+of any such check is not "did it pass" but **"what would have made it fail"**, and
+for this one the answer was: nothing.
+
+**One thing this makes possible.** `sendkey` reaching the USB keyboard is exactly
+what RFC 0041 step 7 needs to gate a keystroke arriving over USB. The finding
+that breaks one claim is the mechanism for the next step.
+
+No code. `make gates` green.
+
 ### 2026-08-23 (the book was on GitHub and nothing pointed at it; scoped into thirty-six chapters, and two links that went nowhere)
 
 **The complaint was that *Mastering Bhaskix* is nowhere on GitHub. It is there,
@@ -979,6 +1039,14 @@ added**, not assumed: `make test-keyboard` types at the PS/2 keyboard and its
 five gates still pass. RFC 0041's unresolved question 2 is what happens when both
 keyboards exist, and the answer must not be "the older test silently stopped
 testing anything".
+
+> **Corrected 2026-08-23, and the correction is the opposite of the claim.** A
+> USB keyboard **does** take `sendkey` away from the i8042. The check quoted
+> above proved nothing: `make test-keyboard` boots the `disks` profile, which has
+> no controller and no keyboard in it, so its gates were always going to pass
+> whatever was added to `full`. Run against a machine that actually contains the
+> device, three of the five fail — the i8042 is found and the shell prompts, and
+> nothing typed arrives. See the 2026-08-23 entry at the top of this section.
 
 **A bug in the vendored layouts, found by a controller and not by a reading.**
 Address Device was refused with `CC_TRB_ERROR` while every other field of the
