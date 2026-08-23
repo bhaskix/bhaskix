@@ -42,6 +42,7 @@ pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 
 [[ -f "$ISO" ]] || { fail "$ISO not found -- run 'make iso' first"; exit 1; }
 
+
 # The ring 0 shell is selected on the kernel command line, which is baked into
 # the image, so testing it means building one. The default image is put back
 # afterwards -- a test that left a non-default image behind would make every
@@ -70,6 +71,22 @@ if [[ -n "$cmdline" ]]; then
 else
     restore_image() { :; }
 fi
+
+# **Say which image this is booting, and how old it is** -- after the build
+# above, not before it, so the time is the image that will actually boot.
+#
+# Only the lanes with a kernel command line build one; the rest boot whatever
+# is in `build/`, and until 2026-08-23 said nothing about it. That silence cost
+# an hour: a `make` running beside a suite left a torn image, this lane booted
+# it, and the failure "reproduced" three times because all three runs booted
+# the same wreckage. A reproduction that reuses a cached build is not a
+# reproduction -- and the instrumented kernel that printed nothing should have
+# said so, if anything had been reporting where the image came from.
+#
+# A modification time rather than a hash: what a reader needs is "is this older
+# than my last build", which a clock answers at a glance and a digest does not.
+printf '\033[2m      image %s, built %s\033[0m\n' \
+    "${ISO#"$REPO_ROOT"/}" "$(date -r "$ISO" '+%H:%M:%S' 2>/dev/null || echo 'unknown')"
 
 # What to type, once the prompt appears. `\r` rather than `\n`: a terminal
 # sends a carriage return, and typing what a terminal actually sends is the
