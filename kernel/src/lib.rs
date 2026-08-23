@@ -596,6 +596,53 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                         xhci::describe_slot_state(attached.state),
                         attached.frames,
                     );
+                    // RFC 0041 step 6. The packet size is printed as a pair
+                    // because the interesting case is them differing: step 5
+                    // had to guess before the device could be asked, and a
+                    // full-speed device answering something else is normal.
+                    let described = &attached.described;
+                    if described.boot_keyboard {
+                        println!(
+                            "    xhci descrip   {:04x}:{:04x} said {} bytes of device and {} of \
+                             configuration; ep0 packet {} (assumed {}); a boot keyboard on \
+                             endpoint {} in, context index {}",
+                            described.vendor,
+                            described.product,
+                            described.device_bytes,
+                            described.configuration_bytes,
+                            described.max_packet_size_0,
+                            described.assumed_packet_size,
+                            described.endpoint,
+                            described.endpoint_index,
+                        );
+                        // The interval is printed as the descriptor's value
+                        // beside the exponent programmed, because the
+                        // conversion between them is speed-dependent and has
+                        // not been checked against a specification here. Two
+                        // numbers a reader can compare beat one they must
+                        // trust.
+                        if described.configured {
+                            println!(
+                                "    xhci endpoint  configured, running; packet {}, \
+                                 bInterval {} programmed as exponent {} ({} us)",
+                                described.endpoint_max_packet_size,
+                                described.interval,
+                                described.interval_exponent,
+                                125u32 << described.interval_exponent,
+                            );
+                        } else {
+                            println!(
+                                "\x1b[93m    xhci endpoint  not configured: {} (endpoint state {})\x1b[0m",
+                                described.stopped.unwrap_or("no reason recorded"),
+                                described.endpoint_state,
+                            );
+                        }
+                    } else {
+                        println!(
+                            "\x1b[93m    xhci descrip   not read: {}\x1b[0m",
+                            described.stopped.unwrap_or("no reason recorded"),
+                        );
+                    }
                 } else {
                     // Yellow and not red: a machine with nothing plugged in is
                     // a correct outcome, and the reason says which it was.

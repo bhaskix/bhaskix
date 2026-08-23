@@ -26,6 +26,7 @@
 
 use bhaskix_arch::pci;
 use bhaskix_device::Bus;
+use bhaskix_usb::setup as usb_setup;
 use bhaskix_xhci::{capability, context, operational, runtime, trb};
 
 /// PCI class for a serial bus controller.
@@ -816,6 +817,117 @@ pub fn address_device_input(
     ])
 }
 
+/// The three contexts a Configure Endpoint command needs for one interrupt IN
+/// endpoint, and where each goes.
+///
+/// The same shape as [`address_device_input`] and the same trap: an input
+/// context is one context further along than a device context. What differs is
+/// which contexts are added — the slot context, because its Context Entries
+/// field has to grow to cover the new endpoint, and the endpoint itself.
+///
+/// **The slot context is re-sent, not left alone.** Context Entries names the
+/// *highest* Device Context Index in use, and it says 1 after Address Device.
+/// Adding an endpoint at index 3 without raising it is a controller told to
+/// configure something it has been told does not exist.
+///
+/// `None` if the index is not one an input context can name, or the ring
+/// address is one the context cannot hold.
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a distinct field the controller is told, and the point of \
+              this function is that all of them are visible at the call site \
+              rather than folded into a struct somebody has to open"
+)]
+pub fn configure_endpoint_input(
+    port: u8,
+    speed: u32,
+    index: u8,
+    max_packet_size: u16,
+    interval: u8,
+    transfer_ring: u64,
+    transfer_ring_cycle: bool,
+    context_size_64: bool,
+) -> Option<[(usize, [u32; context::DWORDS]); 3]> {
+    if index < 2 {
+        // Index 0 is the slot and 1 the control endpoint; neither is configured
+        // by this command, and an index below 2 here means the Device Context
+        // Index arithmetic went wrong somewhere upstream.
+        return None;
+    }
+    let control = context::InputControl::new().adding(0)?.adding(index)?;
+
+    let slot = context::Slot::new()
+        .with_route_and_speed(0, speed as u8)
+        .with_context_entries(index)
+        .with_root_hub_port_number(port);
+
+    let endpoint = context::Endpoint::new()
+        .with_endpoint_type(context::EndpointType::InterruptIn)
+        .with_max_packet_size(max_packet_size)
+        .with_interval(interval)
+        .with_error_count(3)
+        .with_average_trb_length(max_packet_size)
+        .with_transfer_ring(transfer_ring, transfer_ring_cycle)?;
+
+    Some([
+        (context::INPUT_CONTROL_OFFSET, control.0),
+        (context::input_context_offset(0, context_size_64)?, slot.0),
+        (
+            context::input_context_offset(index, context_size_64)?,
+            endpoint.0,
+        ),
+    ])
+}
+
+/// The xHCI `Interval` exponent for a descriptor's `bInterval`, at a speed.
+///
+/// The field is an exponent: the period is `2^interval` × 125 µs. `bInterval`
+/// is **not** that, and is not even the same thing at different speeds — at
+/// high speed it is itself an exponent in microframes, and at full and low
+/// speed it is a count of frames.
+///
+/// # This conversion is unverified, and says so
+///
+/// It has **not** been checked against a copy of the specification on this
+/// machine, and no test here can tell a correct conversion from a plausible
+/// one: Configure Endpoint is accepted for any legal exponent, so the emulator
+/// will not object to a wrong one. What a wrong value produces is reports
+/// arriving at the wrong *rate*, which is only observable once reports arrive.
+///
+/// *Trigger:* RFC 0041 step 7. The boot report prints the descriptor's
+/// `bInterval` beside the exponent programmed, so the two can be compared
+/// against what the keyboard actually does.
+#[must_use]
+const fn interval_exponent(b_interval: u8, speed: u32) -> u8 {
+    match speed {
+        // High speed and above: `bInterval` is already an exponent, in
+        // microframes, counted from one where this field counts from zero.
+        3..=5 => {
+            if b_interval == 0 {
+                0
+            } else if b_interval > 16 {
+                15
+            } else {
+                b_interval - 1
+            }
+        }
+        // Full and low speed: `bInterval` is a count of *frames*, and a frame
+        // is eight microframes -- 2^3. The exponent for `n` frames is
+        // therefore 3 plus the exponent for `n`, and this takes the largest
+        // power of two not exceeding `n`, which polls no slower than asked.
+        _ => {
+            let mut exponent = 3;
+            let mut frames = b_interval;
+            while frames > 1 && exponent < 15 {
+                frames >>= 1;
+                exponent += 1;
+            }
+            exponent
+        }
+    }
+}
+
 /// The control endpoint's packet size to assume before the device is asked.
 ///
 /// **A guess the specification prescribes, not a measurement**, and it is only
@@ -876,6 +988,11 @@ pub struct Drained {
     pub last_command: u64,
     /// Which port the last change concerned.
     pub last_port: u8,
+    /// Bytes the last transfer event says were **not** moved.
+    ///
+    /// A residue and not a count: a complete transfer reports zero here, and
+    /// reading it as "bytes moved" inverts every length a driver computes.
+    pub remaining: u32,
     /// Which slot the last completion concerned.
     ///
     /// An Enable Slot completion carries the slot the controller handed out,
@@ -925,6 +1042,7 @@ pub fn drain(
             trb::Kind::TransferEvent => {
                 found.transfers += 1;
                 found.last_completion = Some(event.completion_code());
+                found.remaining = event.transfer_length_remaining();
             }
             trb::Kind::HostController => {
                 found.host_controller += 1;
@@ -946,6 +1064,16 @@ pub fn drain(
 /// real size needs the write-all-ones dance on a live bus master, which is a
 /// larger thing to get right than a bound that refuses loudly.
 const WINDOW_BYTES: u64 = 0x1_0000;
+
+/// The most descriptor bytes this driver will read in one transfer.
+///
+/// A configuration descriptor's total length is the **device's** number, and it
+/// sizes a transfer into a one-page buffer -- RFC 0038's rule 6. A keyboard's
+/// configuration is a few dozen bytes; anything claiming more than this is
+/// refused rather than truncated, because a truncated read of a
+/// length-prefixed, nested structure is what the parser is fuzzed against and
+/// not what it should be handed.
+const MAX_DESCRIPTOR_BYTES: usize = 1024;
 
 /// The most scratchpad buffers this driver will provide, each a whole page.
 ///
@@ -1421,6 +1549,40 @@ impl<'a> Commander<'a> {
         })
     }
 
+    /// Waits for the controller to publish something, then drains it.
+    ///
+    /// The half of `issue` that has nothing to do with commands -- a transfer
+    /// is rung on a slot's doorbell rather than the command ring's, and its
+    /// answer arrives on the same event ring.
+    ///
+    /// # Safety
+    ///
+    /// The event ring must be this commander's.
+    unsafe fn await_events<W: Wait>(&mut self, wait: &mut W) -> Drained {
+        let consumer = &self.consumer;
+        let event_ring = self.event;
+        wait.until(&mut || {
+            // SAFETY: the caller's obligation; one TRB at a bounded index.
+            let event = unsafe {
+                core::ptr::read_volatile((event_ring as *const [u32; 4]).add(consumer.index()))
+            };
+            consumer.owns(trb::Trb(event).cycle_bit())
+        });
+        let drained = drain(
+            self.memory.event_ring_entries,
+            &mut self.consumer,
+            &mut |index| {
+                // SAFETY: as above.
+                trb::Trb(unsafe {
+                    core::ptr::read_volatile((event_ring as *const [u32; 4]).add(index))
+                })
+            },
+        );
+        // SAFETY: the runtime bank is inside the window.
+        unsafe { self.advance_dequeue() };
+        drained
+    }
+
     /// Tells the controller how far this driver has consumed.
     ///
     /// **And clears Event Handler Busy while doing it**, which is the write that
@@ -1451,6 +1613,60 @@ impl<'a> Commander<'a> {
         interrupter.erdp.write(dequeue.0);
         self.dequeue_advanced = true;
     }
+}
+
+/// The three TRBs of one control transfer, in the order they go on the ring.
+///
+/// **Built as a list rather than written straight to memory**, so that the
+/// staging — which stages exist, which way each points, and which one carries
+/// Interrupt On Completion — is a value a host test can hold. Everything about
+/// a control transfer that a driver gets wrong is in this shape, and none of it
+/// needs a controller to check.
+///
+/// `data` is `None` for a request with no data stage; the transfer is then two
+/// TRBs and not three.
+///
+/// `None` if the length does not fit a data stage's transfer-length field.
+#[must_use]
+pub fn control_transfer_stages(
+    setup: [u8; 8],
+    buffer: u64,
+    length: u16,
+    device_to_host: bool,
+    cycle: bool,
+) -> Option<([trb::Trb; 3], usize)> {
+    let direction = if device_to_host {
+        trb::Direction::In
+    } else {
+        trb::Direction::Out
+    };
+    let transfer = if length == 0 {
+        trb::TransferType::NoData
+    } else if device_to_host {
+        trb::TransferType::In
+    } else {
+        trb::TransferType::Out
+    };
+
+    let setup_stage = trb::Trb::setup_stage(setup, transfer, cycle);
+
+    if length == 0 {
+        // **A status stage after no data points IN**, not at the opposite of a
+        // direction there was none of. The specification's rule is that a
+        // transfer with no data stage is acknowledged by reading nothing.
+        let status =
+            trb::Trb::status_stage(trb::Direction::In, cycle).with_interrupt_on_completion(true);
+        return Some(([setup_stage, status, trb::Trb::new()], 2));
+    }
+
+    let data = trb::Trb::data_stage(buffer, u32::from(length), direction, cycle)?;
+    // **The last TRB carries Interrupt On Completion and only the last one.**
+    // The controller executes the whole descriptor and reports where it is
+    // asked to; a transfer whose final stage does not ask completes correctly
+    // and silently, and the driver waits for ever.
+    let status =
+        trb::Trb::status_stage(direction.opposite(), cycle).with_interrupt_on_completion(true);
+    Some(([setup_stage, data, status], 3))
 }
 
 /// A port with something plugged into it.
@@ -1551,6 +1767,157 @@ pub const fn describe_slot_state(state: Option<context::SlotState>) -> &'static 
     }
 }
 
+/// The control endpoint of an addressed device, and its ring.
+struct ControlEndpoint<'a, 'b> {
+    commander: &'a mut Commander<'b>,
+    slot: u8,
+    /// The transfer ring, as the kernel sees it. The controller was told its
+    /// device address in the endpoint context and does not need telling again.
+    ring_virtual: u64,
+    producer: ring::Producer,
+    /// A page the device writes descriptors into, in both address spaces.
+    buffer_device: u64,
+    buffer_virtual: u64,
+}
+
+impl ControlEndpoint<'_, '_> {
+    /// Runs one control transfer and answers how many bytes came back.
+    ///
+    /// # Safety
+    ///
+    /// The device must be addressed, and the ring and buffer its.
+    unsafe fn transfer<W: Wait>(
+        &mut self,
+        setup: usb_setup::Setup,
+        length: u16,
+        wait: &mut W,
+    ) -> Option<usize> {
+        // The whole transfer descriptor must fit before the ring's link, or
+        // the controller runs onto a wrap in the middle of one -- which is a
+        // transfer split across a lap rather than a transfer.
+        let (stages, count) = control_transfer_stages(
+            setup.0,
+            self.buffer_device,
+            length,
+            setup.is_device_to_host(),
+            self.producer.cycle(),
+        )?;
+        if self.producer.remaining_this_lap() < count {
+            return None;
+        }
+
+        for stage in stages.iter().take(count) {
+            // SAFETY: a frame `init` allocated, at an index `Producer` bounds
+            // to inside the ring.
+            unsafe {
+                core::ptr::write_volatile(
+                    (self.ring_virtual as *mut [u32; 4]).add(self.producer.index()),
+                    stage.0,
+                );
+            }
+            self.producer.advance();
+        }
+
+        let doorbell_offset = bhaskix_xhci::doorbell::for_slot(self.slot)
+            .and_then(bhaskix_xhci::doorbell::doorbell_at)?;
+        // SAFETY: the doorbell bank is inside the window, and the offset is
+        // bounded by `doorbell_at`.
+        let doorbell = unsafe {
+            DoorbellRegister::<bhaskix_device::Volatile>::new(
+                self.commander.base + self.commander.parameters.doorbells + doorbell_offset,
+            )
+        };
+        // **The target is the Device Context Index, not the endpoint number.**
+        // The control endpoint is index 1, and 0 on a slot doorbell means
+        // something else entirely.
+        doorbell.value.write(
+            bhaskix_xhci::doorbell::Doorbell::endpoint(bhaskix_xhci::doorbell::CONTROL_ENDPOINT).0,
+        );
+
+        // SAFETY: the event ring is the commander's.
+        let drained = unsafe { self.commander.await_events(wait) };
+        if drained.transfers == 0 {
+            return None;
+        }
+        if !drained
+            .last_completion
+            .is_some_and(trb::CompletionCode::is_success)
+        {
+            return None;
+        }
+        // **The residue, not a count.** A transfer event reports how much was
+        // *not* moved, so a short read -- which is normal, and which
+        // `is_success` deliberately accepts -- means the device sent less than
+        // was asked for and the difference is what arrived.
+        Some(usize::from(length).saturating_sub(drained.remaining as usize))
+    }
+
+    /// Reads a descriptor into the buffer and hands back what arrived.
+    ///
+    /// # Safety
+    ///
+    /// As [`ControlEndpoint::transfer`].
+    unsafe fn descriptor<W: Wait>(
+        &mut self,
+        kind: u8,
+        index: u8,
+        length: u16,
+        wait: &mut W,
+    ) -> Option<&[u8]> {
+        // SAFETY: the caller's obligation.
+        let got = unsafe {
+            self.transfer(
+                usb_setup::Setup::get_descriptor(kind, index, length),
+                length,
+                wait,
+            )
+        }?;
+        // SAFETY: a frame `init` allocated, and `got` is bounded by the length
+        // asked for, which is bounded by the frame.
+        Some(unsafe { core::slice::from_raw_parts(self.buffer_virtual as *const u8, got) })
+    }
+}
+
+/// What the device said about itself. RFC 0041 step 6.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Described {
+    /// Bytes of device descriptor that came back.
+    pub device_bytes: usize,
+    /// `idVendor`.
+    pub vendor: u16,
+    /// `idProduct`.
+    pub product: u16,
+    /// The control endpoint's real packet size, as the device reports it.
+    ///
+    /// **The number step 5 had to guess.** Addressing a device needs a packet
+    /// size before the device can be asked for one, so the speed table supplies
+    /// a starting value; this is the device's own answer, and the two differing
+    /// is the normal case for a full-speed device rather than an error.
+    pub max_packet_size_0: u8,
+    /// What the driver assumed before asking.
+    pub assumed_packet_size: u16,
+    /// Bytes of configuration descriptor that came back.
+    pub configuration_bytes: usize,
+    /// Whether a boot-protocol keyboard interface was found in it.
+    pub boot_keyboard: bool,
+    /// The interrupt IN endpoint's number, if one was found.
+    pub endpoint: u8,
+    /// Its Device Context Index, which is not its number.
+    pub endpoint_index: u8,
+    /// Its polling interval, as the descriptor reports it.
+    pub interval: u8,
+    /// Its maximum packet size, as the descriptor reports it.
+    pub endpoint_max_packet_size: u16,
+    /// The exponent actually programmed into the endpoint context.
+    pub interval_exponent: u8,
+    /// Whether Configure Endpoint succeeded.
+    pub configured: bool,
+    /// The endpoint state the controller wrote back. 1 is Running.
+    pub endpoint_state: u32,
+    /// Why it stopped, when it did not finish.
+    pub stopped: Option<&'static str>,
+}
+
 /// What step 5 achieved.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Attached {
@@ -1570,6 +1937,8 @@ pub struct Attached {
     pub state: Option<context::SlotState>,
     /// Frames this step handed the controller.
     pub frames: usize,
+    /// What the device said when it was asked. RFC 0041 step 6.
+    pub described: Described,
     /// Why it stopped, when it did not finish.
     pub stopped: Option<&'static str>,
     /// The completion code of the command that refused, when one did.
@@ -1733,7 +2102,263 @@ unsafe fn address_a_device<W: Wait>(
     attached.address = slot_context.usb_device_address();
     attached.addressed = matches!(slot_context.slot_state(), context::SlotState::Addressed)
         && slot_context.usb_device_address() != 0;
+    if !attached.addressed {
+        return attached;
+    }
+
+    // --- RFC 0041 step 6: ask the device what it is -------------------------
+    let Ok(buffer) = frame(controller, hhdm) else {
+        attached.described.stopped = Some("no frame for a descriptor buffer");
+        return attached;
+    };
+    attached.frames += 1;
+
+    let mut endpoint = ControlEndpoint {
+        commander,
+        slot,
+        ring_virtual: transfer_ring.virtual_address,
+        producer: match ring::Producer::new(RING_ENTRIES) {
+            Some(producer) => producer,
+            None => {
+                attached.described.stopped = Some("the transfer ring is too small");
+                return attached;
+            }
+        },
+        buffer_device: buffer.device,
+        buffer_virtual: buffer.virtual_address,
+    };
+    // SAFETY: the device is addressed and these are its ring and buffer.
+    attached.described =
+        unsafe { interrogate(&mut endpoint, initial_max_packet_size(found.speed), wait) };
+
+    if attached.described.boot_keyboard {
+        let packet = attached.described.endpoint_max_packet_size;
+        // SAFETY: as above; the device is addressed and described.
+        unsafe {
+            configure_the_endpoint(
+                commander,
+                controller,
+                parameters,
+                device_context.virtual_address,
+                slot,
+                found.port,
+                found.speed,
+                &mut attached.described,
+                packet,
+                hhdm,
+                wait,
+            );
+        }
+        attached.frames += 2;
+    }
     attached
+}
+
+/// Asks an addressed device what it is.
+///
+/// Two descriptors and a decision: the device descriptor, which finally answers
+/// the packet-size question step 5 had to guess at, and the configuration
+/// descriptor, which is read **twice** — nine bytes to learn how long it is,
+/// then all of it. A driver that reads only the header gets an interface count
+/// and no interfaces; one that guesses the total length reads past what the
+/// device sent.
+///
+/// # Safety
+///
+/// The device must be addressed and the endpoint's ring and buffer its.
+unsafe fn interrogate<W: Wait>(
+    endpoint: &mut ControlEndpoint<'_, '_>,
+    assumed_packet_size: u16,
+    wait: &mut W,
+) -> Described {
+    let mut described = Described {
+        assumed_packet_size,
+        ..Described::default()
+    };
+
+    // SAFETY: the caller's obligation.
+    let Some(bytes) = (unsafe {
+        endpoint.descriptor(
+            bhaskix_usb::kind::DEVICE,
+            0,
+            bhaskix_usb::Device::LENGTH as u16,
+            wait,
+        )
+    }) else {
+        described.stopped = Some("the device did not answer for its descriptor");
+        return described;
+    };
+    described.device_bytes = bytes.len();
+    let Some(device) = bhaskix_usb::Device::parse(bytes) else {
+        described.stopped = Some("what came back is not a device descriptor");
+        return described;
+    };
+    described.vendor = device.vendor;
+    described.product = device.product;
+    described.max_packet_size_0 = device.max_packet_size_0;
+
+    // The configuration header first, for its total length.
+    // SAFETY: the caller's obligation.
+    let Some(header) = (unsafe {
+        endpoint.descriptor(
+            bhaskix_usb::kind::CONFIGURATION,
+            0,
+            bhaskix_usb::Configuration::LENGTH as u16,
+            wait,
+        )
+    }) else {
+        described.stopped = Some("the device did not answer for its configuration");
+        return described;
+    };
+    let Some(configuration) = bhaskix_usb::Configuration::parse(header) else {
+        described.stopped = Some("what came back is not a configuration descriptor");
+        return described;
+    };
+
+    // **Bounded before it sizes a transfer.** The total length is the device's
+    // own number, and a hostile one would otherwise ask for a transfer longer
+    // than the buffer it lands in.
+    let total = configuration.total_length;
+    if total as usize > MAX_DESCRIPTOR_BYTES {
+        described.stopped = Some("the configuration is longer than this driver will read");
+        return described;
+    }
+
+    // SAFETY: the caller's obligation.
+    let Some(blob) =
+        (unsafe { endpoint.descriptor(bhaskix_usb::kind::CONFIGURATION, 0, total, wait) })
+    else {
+        described.stopped = Some("the device did not answer for its full configuration");
+        return described;
+    };
+    described.configuration_bytes = blob.len();
+
+    // The parser is `usb`'s, which is `forbid(unsafe_code)` and fuzzed. What
+    // arrives here is written by whatever is plugged into the machine.
+    let Some((interface, found)) = bhaskix_usb::boot_keyboard(blob) else {
+        described.stopped = Some("no boot-protocol keyboard interface in the configuration");
+        return described;
+    };
+    let _ = interface;
+    described.boot_keyboard = true;
+    described.endpoint = found.number();
+    described.interval = found.interval;
+    described.endpoint_max_packet_size = found.max_packet_size;
+    // **The Device Context Index is not the endpoint number**, and this is the
+    // trap RFC 0041 names: endpoint 1 IN is index 3.
+    described.endpoint_index =
+        bhaskix_xhci::doorbell::device_context_index(found.number(), found.is_input()).unwrap_or(0);
+    described
+}
+
+/// Configures the interrupt IN endpoint a keyboard reports on.
+///
+/// The second half of RFC 0041 step 6. After this the endpoint has a ring of
+/// its own and the controller will accept a doorbell on it — which is step 7,
+/// and the first thing that could carry a keystroke.
+///
+/// # Safety
+///
+/// The device must be addressed and described, and every address must be its.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a distinct address or number the controller is told, and \
+              bundling them would hide which of them is wrong when one is"
+)]
+unsafe fn configure_the_endpoint<W: Wait>(
+    commander: &mut Commander<'_>,
+    controller: (u8, u8, u8),
+    parameters: &Parameters,
+    device_context_virtual: u64,
+    slot: u8,
+    port: u8,
+    speed: u32,
+    described: &mut Described,
+    max_packet_size: u16,
+    hhdm: u64,
+    wait: &mut W,
+) {
+    let Ok(ring) = frame(controller, hhdm) else {
+        described.stopped = Some("no frame for the interrupt endpoint's transfer ring");
+        return;
+    };
+    let Ok(input_context) = frame(controller, hhdm) else {
+        described.stopped = Some("no frame for the configure input context");
+        return;
+    };
+
+    let Some((link_index, link)) = command_ring_link(ring.device, RING_ENTRIES) else {
+        described.stopped = Some("the interrupt transfer ring is too small for a link");
+        return;
+    };
+    // SAFETY: a frame just allocated and zeroed, at a bounded index.
+    unsafe {
+        core::ptr::write_volatile(
+            (ring.virtual_address as *mut [u32; 4]).add(link_index),
+            link.0,
+        );
+    }
+
+    described.interval_exponent = interval_exponent(described.interval, speed);
+    let Some(writes) = configure_endpoint_input(
+        port,
+        speed,
+        described.endpoint_index,
+        max_packet_size,
+        described.interval_exponent,
+        ring.device,
+        ring::Producer::new(RING_ENTRIES).is_some_and(|producer| producer.cycle()),
+        parameters.context_size_64,
+    ) else {
+        described.stopped = Some("the configure input context could not be built");
+        return;
+    };
+    for (offset, dwords) in writes {
+        // SAFETY: a frame just allocated and zeroed; every offset is bounded to
+        // inside an input context, which for index 3 is five contexts.
+        unsafe {
+            core::ptr::write_volatile(
+                (input_context.virtual_address + offset as u64) as *mut [u32; context::DWORDS],
+                dwords,
+            );
+        }
+    }
+
+    let Some(command) = trb::Trb::configure_endpoint(input_context.device, slot, false) else {
+        described.stopped = Some("the input context address is one the command cannot hold");
+        return;
+    };
+    // SAFETY: the caller's obligation.
+    let Some(issued) = (unsafe { commander.issue(|cycle| command.with_cycle_bit(cycle), wait) })
+    else {
+        described.stopped = Some("the command ring would have wrapped");
+        return;
+    };
+    if !issued.succeeded() {
+        described.stopped = Some("the controller would not configure the endpoint");
+        return;
+    }
+
+    // **Read back from the device context, not inferred from the code.** The
+    // controller writes the endpoint's state there, and Running is what says it
+    // will accept a doorbell.
+    let Some(offset) =
+        context::device_context_offset(described.endpoint_index, parameters.context_size_64)
+    else {
+        described.stopped = Some("the endpoint index is not one a device context can hold");
+        return;
+    };
+    // SAFETY: the device context frame handed to the controller, at an offset
+    // `device_context_offset` bounds to inside it.
+    let endpoint_context = context::Endpoint(unsafe {
+        core::ptr::read_volatile(
+            (device_context_virtual + offset as u64) as *const [u32; context::DWORDS],
+        )
+    });
+    described.endpoint_state = endpoint_context.endpoint_state();
+    // 1 is Running. Anything else is a controller that accepted the command and
+    // did not end up where the command asked.
+    described.configured = endpoint_context.endpoint_state() == 1;
 }
 
 /// Sends a No-Op command and consumes the event it produces.
@@ -2840,6 +3465,183 @@ mod address_tests {
         // And the transfer ring likewise.
         assert!(super::ring_bytes() <= 4096);
         assert_eq!(RING_ENTRIES * 16, super::ring_bytes());
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use bhaskix_usb::setup::Setup;
+    use bhaskix_xhci::{context, doorbell, trb};
+
+    use super::{
+        RING_ENTRIES, configure_endpoint_input, control_transfer_stages, interval_exponent,
+    };
+
+    const BUFFER: u64 = 0x1_0000_4000;
+    const RING: u64 = 0x1_0000_6000;
+
+    fn read_18() -> ([trb::Trb; 3], usize) {
+        let setup = Setup::get_descriptor(bhaskix_usb::kind::DEVICE, 0, 18);
+        control_transfer_stages(setup.0, BUFFER, 18, true, true).expect("a plausible transfer")
+    }
+
+    #[test]
+    fn a_control_read_is_setup_then_data_then_status() {
+        let (stages, count) = read_18();
+        assert_eq!(count, 3);
+        assert_eq!(stages[0].kind(), trb::Kind::SetupStage);
+        assert_eq!(stages[1].kind(), trb::Kind::DataStage);
+        assert_eq!(stages[2].kind(), trb::Kind::StatusStage);
+    }
+
+    #[test]
+    fn only_the_last_stage_asks_to_be_reported() {
+        // The controller executes the whole descriptor and posts a Transfer
+        // Event where it is asked to. Asking on every stage is three events for
+        // one transfer; asking on none is a transfer that completes correctly
+        // and silently while the driver waits for ever.
+        let (stages, count) = read_18();
+        assert!(!stages[0].interrupt_on_completion(), "not the setup stage");
+        assert!(!stages[1].interrupt_on_completion(), "not the data stage");
+        assert!(
+            stages[count - 1].interrupt_on_completion(),
+            "the status stage, and only it"
+        );
+    }
+
+    #[test]
+    fn the_status_stage_points_the_opposite_way_to_the_data_stage() {
+        // A control read is acknowledged by writing nothing. A status stage
+        // pointing the same way as its data stage is a transfer the device
+        // never completes.
+        let (read, _) = read_18();
+        assert_eq!(read[1].0[3] & (1 << 16), 1 << 16, "data IN");
+        assert_eq!(read[2].0[3] & (1 << 16), 0, "status OUT");
+
+        let setup = Setup::set_configuration(1);
+        let (write, count) = control_transfer_stages(setup.0, BUFFER, 0, false, true)
+            .expect("a transfer with no data");
+        assert_eq!(count, 2, "no data stage means two TRBs, not three");
+        assert_eq!(write[1].kind(), trb::Kind::StatusStage);
+        assert_eq!(
+            write[1].0[3] & (1 << 16),
+            1 << 16,
+            "a transfer with no data at all is acknowledged by reading nothing"
+        );
+    }
+
+    #[test]
+    fn the_setup_stage_says_which_kind_of_transfer_follows_it() {
+        let (read, _) = read_18();
+        assert_eq!((read[0].0[3] >> 16) & 0b11, 3, "In");
+        let (none, _) =
+            control_transfer_stages(Setup::set_configuration(1).0, BUFFER, 0, false, true)
+                .expect("a transfer");
+        assert_eq!((none[0].0[3] >> 16) & 0b11, 0, "No Data");
+        let (out, _) =
+            control_transfer_stages(Setup::set_configuration(1).0, BUFFER, 4, false, true)
+                .expect("a transfer");
+        assert_eq!((out[0].0[3] >> 16) & 0b11, 2, "Out, which is 2 and not 1");
+    }
+
+    #[test]
+    fn every_stage_of_one_transfer_carries_the_same_cycle_bit() {
+        // They are published as one descriptor. A stage on the other cycle is a
+        // stage the controller reads as not yet written, in the middle of a
+        // transfer it has already begun.
+        for cycle in [false, true] {
+            let setup = Setup::get_descriptor(bhaskix_usb::kind::DEVICE, 0, 18);
+            let (stages, count) =
+                control_transfer_stages(setup.0, BUFFER, 18, true, cycle).expect("a transfer");
+            for stage in stages.iter().take(count) {
+                assert_eq!(stage.cycle_bit(), cycle);
+            }
+        }
+    }
+
+    #[test]
+    fn a_configure_adds_the_endpoint_and_re_sends_the_slot_that_must_grow() {
+        // Context Entries names the *highest* Device Context Index in use and
+        // says 1 after Address Device. Adding an endpoint at 3 without raising
+        // it is a controller told to configure something it has been told does
+        // not exist -- which is why the slot context is re-sent rather than
+        // left alone.
+        let writes = configure_endpoint_input(5, 3, 3, 8, 6, RING, true, false)
+            .expect("a plausible endpoint");
+        let control = context::InputControl(writes[0].1);
+        assert_eq!(control.add_flags(), 0b1001, "A0 and A3, not A0 and A1");
+        assert_eq!(control.drop_flags(), 0, "nothing is torn down by this");
+        assert_eq!(context::Slot(writes[1].1).context_entries(), 3);
+        assert_eq!(
+            writes[2].0,
+            4 * 32,
+            "index 3 in an input context is at four strides"
+        );
+    }
+
+    #[test]
+    fn the_endpoint_is_an_interrupt_in_endpoint_on_a_ring_of_its_own() {
+        let writes = configure_endpoint_input(5, 3, 3, 8, 6, RING, true, false).expect("built");
+        let endpoint = context::Endpoint(writes[2].1);
+        assert_eq!(endpoint.endpoint_type(), context::EndpointType::InterruptIn);
+        assert_eq!(endpoint.max_packet_size(), 8);
+        assert_eq!(endpoint.interval(), 6);
+        assert_eq!(endpoint.transfer_ring_pointer(), RING);
+        assert!(endpoint.dequeue_cycle_state());
+        assert_eq!(endpoint.error_count(), 3);
+    }
+
+    #[test]
+    fn an_index_the_control_endpoint_or_the_slot_already_owns_is_refused() {
+        // Index 0 is the slot and 1 the control endpoint. Neither is configured
+        // by this command, and an index below 2 means the Device Context Index
+        // arithmetic went wrong upstream -- which is the trap RFC 0041 names.
+        assert!(configure_endpoint_input(5, 3, 0, 8, 6, RING, true, false).is_none());
+        assert!(configure_endpoint_input(5, 3, 1, 8, 6, RING, true, false).is_none());
+        assert!(configure_endpoint_input(5, 3, 2, 8, 6, RING, true, false).is_some());
+    }
+
+    #[test]
+    fn endpoint_one_in_is_context_index_three() {
+        // The standing trap, asserted where a driver would trip on it: the
+        // Device Context Index is not the endpoint number.
+        assert_eq!(doorbell::device_context_index(1, true), Some(3));
+        assert_eq!(doorbell::device_context_index(1, false), Some(2));
+        assert_eq!(
+            doorbell::device_context_index(0, true),
+            Some(doorbell::CONTROL_ENDPOINT)
+        );
+    }
+
+    #[test]
+    fn the_interval_exponent_is_derived_and_not_copied() {
+        // The field is an exponent -- 2^interval x 125 us -- and `bInterval` is
+        // not that. At high speed it is itself an exponent counted from one; at
+        // full and low speed it is a count of frames, and a frame is eight
+        // microframes.
+        //
+        // NOT VERIFIED against a specification on this machine. What is
+        // corroborating: QEMU's keyboard reports bInterval 7 at high speed, and
+        // exponent 6 is 8 ms, which is the rate a HID keyboard is conventionally
+        // polled at.
+        assert_eq!(interval_exponent(7, 3), 6, "high speed: one less");
+        assert_eq!(125u32 << interval_exponent(7, 3), 8000);
+        assert_eq!(interval_exponent(1, 3), 0);
+        assert_eq!(interval_exponent(0, 3), 0, "zero must not underflow");
+        assert_eq!(interval_exponent(200, 3), 15, "and it is clamped");
+        // Full speed: 1 frame is 8 microframes, which is 2^3.
+        assert_eq!(interval_exponent(1, 1), 3);
+        assert_eq!(interval_exponent(8, 1), 6, "8 frames is 64 microframes");
+    }
+
+    #[test]
+    fn a_transfer_that_does_not_fit_before_the_wrap_is_refused_by_the_caller() {
+        // `control_transfer_stages` builds three TRBs; a ring with fewer than
+        // three entries left before its link cannot hold one transfer
+        // descriptor, and a descriptor split across a lap is not a descriptor.
+        let producer = super::ring::Producer::new(RING_ENTRIES).expect("a ring");
+        assert!(producer.remaining_this_lap() >= 3);
+        assert_eq!(read_18().1, 3);
     }
 }
 

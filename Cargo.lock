@@ -55,6 +55,7 @@ dependencies = [
  "bhaskix-service-console",
  "bhaskix-service-vfs",
  "bhaskix-telemetry",
+ "bhaskix-usb",
  "bhaskix-xhci",
 ]
 

@@ -643,6 +643,39 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         grep -a "xhci" "$LOG" | sed 's/^/      /'
         status=1
     fi
+
+    # RFC 0041 step 6, first half: the device is asked what it is, and answers.
+    #
+    # This is the first control transfer -- setup, data and status stages on the
+    # control endpoint's own ring -- so it asserts the whole path rather than
+    # any one register. `context index 3` is the part that carries the most:
+    # the Device Context Index is not the endpoint number, and a driver that
+    # conflates them polls a mouse for keystrokes. Endpoint 1 IN is index 3.
+    #
+    # The vendor and product are not pinned. Which keyboard QEMU emulates is its
+    # business; that the descriptor parsed into a boot keyboard is this
+    # kernel's.
+    if grep -qaE 'xhci descrip +[0-9a-f]{4}:[0-9a-f]{4} said 18 bytes of device.*a boot keyboard on endpoint [1-9][0-9]* in, context index 3' "$LOG"; then
+        pass "a USB device answers a control transfer and is parsed as a boot keyboard"
+    else
+        fail "no descriptors were read over a control transfer"
+        grep -a "xhci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
+    # RFC 0041 step 6, second half: the interrupt IN endpoint is configured.
+    #
+    # `running` is read back from the device context the controller wrote, not
+    # inferred from the command's completion code -- the same distinction that
+    # caught a real bug at step 5. An endpoint that is not Running will not
+    # accept a doorbell, which is what step 7 needs.
+    if grep -qa "xhci endpoint  configured, running" "$LOG"; then
+        pass "the keyboard's interrupt IN endpoint is configured and running"
+    else
+        fail "the interrupt IN endpoint was not configured"
+        grep -a "xhci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
 fi
 
 # The decline is reported. Deterministic, and it guards the gate below rather

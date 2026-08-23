@@ -25,6 +25,7 @@ bhaskix-fs = { path = "../fs" }
 bhaskix-elf = { path = "../elf" }
 # RFC 0038/0041: the vendored xHCI layouts. The ring cursors in
 # `kernel/src/xhci.rs` are this project's own logic built on them.
+bhaskix-usb = { path = "../usb" }
 bhaskix-xhci = { path = "../third_party/xhci" }
 # RFC 0021. The kernel does not need unpredictability itself yet -- randomising
 # the heap base is that RFC's open question 2 -- but it is the thing that boots,
@@ -386,7 +387,21 @@ asm_budget = 10
 # What is not in it: `address_device_input`, which builds all three contexts as
 # `(offset, dwords)` and is pure, so the input-context arithmetic RFC 0041
 # calls the trap is held by host tests rather than by a comment.
-unsafe_budget = 1896
+# 2027 at RFC 0041 step 6, 2026-08-23: +131, for asking a device what it is and
+# configuring the endpoint it answers on. Where it went:
+#   * control transfers: each stage written onto the endpoint's ring, the
+#     slot doorbell, and one `from_raw_parts` over the buffer the device wrote
+#     descriptors into -- untrusted bytes, handed straight to `bhaskix-usb`,
+#     which is `forbid(unsafe_code)` and fuzzed.
+#   * Configure Endpoint: a second transfer ring and its link, a second input
+#     context's three contexts, and the read-back of the endpoint context the
+#     controller wrote.
+# What is not in it, and this is where the step's real content lives:
+# `control_transfer_stages`, `configure_endpoint_input` and `interval_exponent`
+# are pure. Which stages exist, which way each points, which one carries
+# Interrupt On Completion, and the Device Context Index arithmetic RFC 0041
+# calls the trap are all decided in safe code that host tests hold.
+unsafe_budget = 2027
 # Up one, and it buys a rule that had never been written down. Every entry into
 # ring 3 now goes through `enter_user`, which refuses a thread that is not
 # pinned before it can enter the kernel on another CPU's stack -- so there is

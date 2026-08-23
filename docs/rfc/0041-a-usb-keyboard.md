@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft — steps 1 to 5 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. **Step 5 (2026-08-23): a USB keyboard is enumerated, given a slot and addressed** — and a real controller caught a bug in RFC 0038's vendored layouts that the crate's own round-trip test could not see: the root hub port number was being written into the Number of Ports field. Steps 6–8 are open |
+| **Status** | ⬜ **Draft — steps 1 to 6 implemented.** Step 1 (2026-08-22): the `usb` leaf crate, `forbid(unsafe_code)`, fuzzed. Step 2 (2026-08-22): controller discovery, rule 1 as a property of the type, and the ring cursors. **Step 3 (2026-08-23): a controller is brought up and running** — the sequence below, with `bring_up` touching registers and nothing else so the whole of it is host-testable against a device model, and seven properties watched red. It also found one defect no reading would have: `qemu-xhci` implements **dword reads only** of the capability bank, answering `0x0000` to a 16-bit read of `HCIVERSION` rather than faulting, so that bank is now read as dwords and the model reproduces the emulator. **Step 4 (2026-08-23): the controller is asked a No-Op and answers it**, matched by the address of the command TRB — and step 3's command ring turned out to have no Link TRB, which nothing had read until this step rang the doorbell. **Step 5 (2026-08-23): a USB keyboard is enumerated, given a slot and addressed** — and a real controller caught a bug in RFC 0038's vendored layouts that the crate's own round-trip test could not see: the root hub port number was being written into the Number of Ports field. **Step 6 (2026-08-23): the keyboard answers a control transfer and its interrupt IN endpoint is configured and Running** — descriptors read and parsed by the fuzzed `usb` crate, and the Device Context Index trap (endpoint 1 IN is index 3) demonstrated on a real device. Steps 7–8 are open |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | drivers |
 | **Milestone** | Phase 2 (see docs/roadmap.md) |
@@ -259,7 +259,25 @@ arithmetic — each seen to fail on purpose.
    round-tripped the value through the accessor that wrote it, which pins the
    getter and setter to each other and cannot see the layout; it now asserts the
    raw dword. See §"Impact on existing design documents".
-6. Descriptors over control transfers; Configure Endpoint for interrupt IN.
+6. ✅ **Done 2026-08-23.** Descriptors over control transfers; Configure
+   Endpoint for interrupt IN.
+
+   *The stage layouts were read, not recalled.* The vendored crate had no Setup,
+   Data or Status stage constructors, and their bit layouts are exactly what this
+   project forbids asserting from memory — so the upstream `xhci` 0.9.2 tree the
+   take was made from, still on the build machine, was read. They are adapted
+   layouts like the rest of that crate and live there; the kernel keeps which
+   stages exist and which way each points.
+
+   *Step 5's packet-size guess is tested here and was right* — for a high-speed
+   device, where 64 is fixed. The report prints assumed and actual side by side
+   because the interesting case is them differing, which is the normal case for a
+   full-speed device. This run does not exercise that.
+
+   *One number is unverified and says so*: the `bInterval` → `Interval` exponent
+   conversion. Configure Endpoint accepts any legal exponent, so no test here can
+   tell a right conversion from a plausible one; what a wrong one produces is
+   reports at the wrong rate. The trigger is step 7.
 7. Reports into `input::keyboard_produced`, which already exists and already
    merges a second source.
 8. The QEMU gate, watched red three ways, and the documents updated in the same
