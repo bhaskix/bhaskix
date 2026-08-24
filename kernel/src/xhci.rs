@@ -25,6 +25,11 @@
 //! require it.
 
 use bhaskix_arch::pci;
+// PCI's own offset for the programming-interface byte, shared with
+// `crate::iommu`'s survey rather than written out once per driver: class and
+// subclass say what a device is, and this byte says which register layout it
+// presents.
+use bhaskix_arch::pci::PROG_IF_OFFSET;
 use bhaskix_device::Bus;
 use bhaskix_usb::setup as usb_setup;
 use bhaskix_xhci::{capability, context, operational, runtime, trb};
@@ -40,8 +45,6 @@ const SUBCLASS_USB: u8 = 0x03;
 /// EHCI controller with xHCI's offsets would be writing arbitrary values into
 /// arbitrary registers of a bus master.
 const PROG_IF_XHCI: u8 = 0x30;
-/// Where the programming interface lives in configuration space.
-const PROG_IF_OFFSET: u8 = 0x09;
 
 /// The most controllers this module will report on.
 ///

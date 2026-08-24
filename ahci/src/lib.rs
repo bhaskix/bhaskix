@@ -221,9 +221,8 @@ pub fn read_identity(words: &[u8]) -> Result<Identity, Error> {
     if words.len() < IDENTIFY_BYTES {
         return Err(Error::TooSmall);
     }
-    let word = |index: usize| -> u16 {
-        u16::from_le_bytes([words[index * 2], words[index * 2 + 1]])
-    };
+    let word =
+        |index: usize| -> u16 { u16::from_le_bytes([words[index * 2], words[index * 2 + 1]]) };
     // Word 83 bit 10: the device supports the 48-bit commands. Without it the
     // 48-bit sector count in words 100..104 means nothing and must not be read.
     let lba48 = word(83) & (1 << 10) != 0;
@@ -272,7 +271,10 @@ mod tests {
         let mut out = [0xffu8; H2D_FIS_BYTES];
         write_h2d(&mut out, command::READ_DMA_EXT, 0x0000_5544_3322_1100, 8).expect("room");
         assert_eq!(out[0], fis::REGISTER_H2D);
-        assert_eq!(out[1], 0x80, "not marked as a command, so nothing is issued");
+        assert_eq!(
+            out[1], 0x80,
+            "not marked as a command, so nothing is issued"
+        );
         assert_eq!(out[2], command::READ_DMA_EXT);
         assert_eq!([out[4], out[5], out[6]], [0x00, 0x11, 0x22], "lba 0..24");
         assert_eq!([out[8], out[9], out[10]], [0x33, 0x44, 0x55], "lba 24..48");
@@ -314,7 +316,10 @@ mod tests {
         // one byte too many, and the thing doing the transfer is a bus master.
         let mut out = [0xffu8; PRD_BYTES];
         write_region(&mut out, 0xdead_0000, 512, false).expect("room");
-        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 0xdead_0000);
+        assert_eq!(
+            u64::from_le_bytes(out[0..8].try_into().unwrap()),
+            0xdead_0000
+        );
         let word = u32::from_le_bytes(out[12..16].try_into().unwrap());
         assert_eq!(word & 0x003f_ffff, 511, "512 bytes is stored as 511");
         assert_eq!(word & (1 << 31), 0, "no interrupt asked for");
@@ -329,7 +334,10 @@ mod tests {
         );
         // And zero, which would otherwise be stored as 0xffffffff -- a region
         // of four megabytes described by a caller that wanted none.
-        assert_eq!(write_region(&mut out, 0, 0, false), Err(Error::RegionTooLong));
+        assert_eq!(
+            write_region(&mut out, 0, 0, false),
+            Err(Error::RegionTooLong)
+        );
         assert!(write_region(&mut out, 0, PRD_MAX_BYTES, false).is_ok());
     }
 

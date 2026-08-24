@@ -608,10 +608,7 @@ fn selected_by_root(
     let mut chosen = [false; MAX_MAPPINGS];
     for (slot, mapping) in mappings.iter().enumerate() {
         let Some(mapping) = mapping else { continue };
-        chosen[slot] = roots
-            .iter()
-            .flatten()
-            .any(|root| *root == mapping.root);
+        chosen[slot] = roots.iter().flatten().any(|root| *root == mapping.root);
     }
     chosen
 }
@@ -1058,7 +1055,10 @@ mod tests {
         mappings[3] = mapping(0x3000, 0xcccc_0000); // a borrower that is not
 
         let chosen = selected_by_root(&mappings, &[Some(0x2000)]);
-        assert_eq!(chosen, [false, true, false, false, false, false, false, false]);
+        assert_eq!(
+            chosen,
+            [false, true, false, false, false, false, false, false]
+        );
     }
 
     #[test]
@@ -1073,7 +1073,10 @@ mod tests {
         mappings[1] = mapping(0x2000, 0x5000_0000);
 
         let chosen = selected_by_root(&mappings, &[Some(0x2000)]);
-        assert!(!chosen[0], "the owner's mapping at the same address survived");
+        assert!(
+            !chosen[0],
+            "the owner's mapping at the same address survived"
+        );
         assert!(chosen[1]);
     }
 

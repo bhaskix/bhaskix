@@ -3836,7 +3836,14 @@ fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
         let mut cspace = core::mem::take(&mut domain.cspace);
         let before = cspace.occupied();
         let outcome = cap::with_arena(|arena| {
-            invoke_capability(frame, owner, &mut cspace, arena, &mut revoked, &mut unmapping)
+            invoke_capability(
+                frame,
+                owner,
+                &mut cspace,
+                arena,
+                &mut revoked,
+                &mut unmapping,
+            )
         });
         let after = cspace.occupied();
 

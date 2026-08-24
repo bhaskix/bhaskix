@@ -441,23 +441,38 @@ pub struct Survey {
     pub bridges: usize,
 }
 
-/// Whether this kernel has a driver that would claim `identity`.
-///
-/// The list is short and that is the point: virtio block, virtio net, and xHCI.
-/// Everything else on a real machine — SAS, NVMe, a management NIC, a graphics
-/// adapter — is a bus master with no driver here and no window to give it.
 /// PCI class for a bridge: not an endpoint, and not a bus master of its own.
 const CLASS_BRIDGE: u8 = 0x06;
 
+/// Whether this kernel has a driver that would claim this function.
+///
+/// The list is short and that is the point: virtio block, virtio net, xHCI, and
+/// — since RFC 0046 — a SATA controller presenting AHCI's registers. Everything
+/// else on a real machine — SAS, NVMe, a management NIC, a graphics adapter —
+/// is a bus master with no driver here and no window to give it.
+///
+/// **The programming interface is part of the answer, and it was not until
+/// 2026-08-24.** This took an `Identity` alone and answered *yes* for any USB
+/// controller, on the reasoning that "could this kernel contain it" was a
+/// question the class settled. It is not: a UHCI or EHCI controller is a USB
+/// controller this kernel has no driver for, and counting it as drivable
+/// understated exactly the number RFC 0043's survey exists to report. No lane
+/// in this tree has one, so no count printed here has ever been wrong — which
+/// is why it survived, and is not a reason to leave it.
 #[must_use]
-fn drivable(identity: &bhaskix_arch::pci::Identity) -> bool {
+fn drivable(identity: &bhaskix_arch::pci::Identity, prog_if: u8) -> bool {
     // Class 0x0c subclass 0x03 is USB; the programming interface separates xHCI
-    // from its predecessors, and `xhci::discover` checks it. Here the class is
-    // enough: the question is "could this kernel contain it", and a UHCI
-    // controller is a bus master this kernel does not drive either.
-    let usb = identity.class == 0x0c && identity.subclass == 0x03;
+    // from its predecessors, and `xhci::discover` checks the same byte before
+    // it will drive one.
+    let usb = identity.class == 0x0c && identity.subclass == 0x03 && prog_if == 0x30;
+    // And `ahci::classify` is the one that decides for storage, called here so
+    // that the survey and the driver cannot disagree about which controller has
+    // a driver -- a report whose two halves contradict each other is worse than
+    // either half alone.
+    let ahci = crate::ahci::classify(identity.class, identity.subclass, prog_if)
+        == crate::ahci::Kind::Ahci;
     let virtio = identity.vendor == 0x1af4;
-    usb || virtio
+    usb || ahci || virtio
 }
 
 /// Walks the bus and says what is on it.
@@ -474,9 +489,12 @@ fn drivable(identity: &bhaskix_arch::pci::Identity) -> bool {
 pub unsafe fn survey() -> Survey {
     let mut survey = Survey::default();
     let mut visit = |address: bhaskix_arch::pci::Address, identity: bhaskix_arch::pci::Identity| {
-        let _ = address;
         survey.functions += 1;
-        if drivable(&identity) {
+        // SAFETY: one byte of configuration space, at a fixed offset, on a
+        // function `for_each` has already found present.
+        let prog_if =
+            unsafe { bhaskix_arch::pci::read8(address, bhaskix_arch::pci::PROG_IF_OFFSET) };
+        if drivable(&identity, prog_if) {
             survey.drivable += 1;
         } else if identity.class == CLASS_BRIDGE {
             survey.bridges += 1;

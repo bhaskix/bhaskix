@@ -28,6 +28,7 @@
 // The kernel heap makes `alloc` usable; see `heap`.
 extern crate alloc;
 
+pub mod ahci;
 pub mod cap;
 pub mod console;
 pub mod domain;
@@ -525,6 +526,17 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // IOMMU settled.
     let xhci_found = unsafe { xhci::discover() };
     xhci::report(&xhci_found);
+
+    // RFC 0046 step 2: SATA AHCI controllers, on exactly the same terms and in
+    // the same place, because they are the same question about a different bus
+    // master. Nothing is driven yet -- bring-up is step 3 -- so this reports
+    // which controller exists and which of the two rules refuses it: the
+    // programming interface, or the absence of a translation.
+    //
+    // SAFETY: as above -- once, here, with configuration access working and
+    // the IOMMU windows already built.
+    let ahci_found = unsafe { ahci::discover() };
+    ahci::report(&ahci_found);
     // RFC 0041 step 3: and the one that may be driven, is.
     //
     // Only reached for a controller `discover` answered as drivable, which is
@@ -14386,9 +14398,8 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             .and_then(|page| shared::name(page).ok())
         {
             Some(named)
-                if domain::with(owner, |domain| {
-                    domain.cspace.install_at(89, named).is_ok()
-                }) == Some(true) => {}
+                if domain::with(owner, |domain| domain.cspace.install_at(89, named).is_ok())
+                    == Some(true) => {}
             _ => println!(
                 "\x1b[93m    linux domain   no page for datagrams; hosted sockets will not \
                  carry bytes\x1b[0m"
@@ -16854,6 +16865,42 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         );
     }
 
+    // **And the AHCI controller, for the same reason and with better cause.**
+    // RFC 0046 step 2 gives it a window below, and of every endpoint on this
+    // bus it is the one the firmware is most likely to have driven: it looks
+    // for a boot sector on a SATA disk, and it does not tidy up afterwards.
+    // The controller keeps the firmware's command list, at physical addresses
+    // chosen when nothing was translating.
+    //
+    // Clearing bus mastering is the whole of it -- no BAR, no driver, no
+    // register layout -- and it reaches the device even if this kernel turns
+    // out never to drive it. Step 3's bring-up sets the bit again as its first
+    // act, so this costs the ordering and nothing else.
+    //
+    // Note for whoever reads this next: `virtio::quiesce`, which does the same
+    // thing for the kernel's own block device, has **no caller**. It has been
+    // dead since it was written. Not fixed here, and recorded in TRACKER --
+    // that device is reset by `init_mapped` on the path that matters, so the
+    // dead function is a redundancy that was never wired rather than a hole.
+    //
+    // The probe is hoisted out of the `if let` rather than written inside its
+    // condition, and that is not a style choice. `tools/check-unsafe-budget.py`
+    // is a line scanner: `if let Some(x) = unsafe { f() } {` leaves it one
+    // brace deep, so it counts the whole body as unsafe. Written the short way
+    // this block and the window below cost 46 lines of budget between them, for
+    // three configuration reads and one write. The number is supposed to mean
+    // something.
+    //
+    // SAFETY: configuration access works, and nothing in this kernel drives
+    // this controller -- there is no driver for it to interrupt.
+    let ahci_controller = unsafe { ahci::probe() };
+    if let Some((bus, device, function)) = ahci_controller {
+        // SAFETY: as above. One configuration write, clearing one bit.
+        unsafe {
+            bhaskix_arch::pci::quiesce(bhaskix_arch::pci::Address::new(bus, device, function));
+        }
+    }
+
     // SAFETY: the window is built and verified, and its tables are never
     // freed. Nothing is doing DMA yet -- the device has not been programmed.
     if let Err(reason) = unsafe { iommu::enable(&found, &window, hhdm) } {
@@ -17083,6 +17130,59 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
             }
             None => println!(
                 "\x1b[91m    iommu window   FAILED: no page table for the xhci controller\x1b[0m"
+            ),
+        }
+    }
+
+    // The **first** AHCI controller, on the same terms and for the fifth domain
+    // id. RFC 0046 step 2: a SATA controller is a bus master, and RFC 0012's
+    // rule is that a bus master is contained or it does not run -- which a
+    // storage driver is the last place to make an exception to.
+    //
+    // `ahci::probe` answers only a controller presenting AHCI's registers, so a
+    // vendor-specific SATA controller gets no window here and is refused by
+    // name in `ahci::report` instead. Building a window for a controller this
+    // kernel could never drive would contain it, which is not nothing -- but it
+    // is RFC 0043's open question and not this step's to answer.
+    //
+    // This is also motivation 3 of RFC 0046 arriving: on the `iommu` lane
+    // `00:1f.2` has been one of three endpoints with no driver, therefore no
+    // window, therefore no containment. It becomes two.
+    //
+    // Answered above, before translation was enabled, and reused rather than
+    // asked again: the bus has not changed and a second walk would only be a
+    // second chance to disagree with the first.
+    if let Some(controller) = ahci_controller {
+        match iommu::attach_device(&window, controller, 4, hhdm) {
+            Some(controller_window) => {
+                if iommu::verify_window(&controller_window, iommu::windows() + 1, hhdm)
+                    && iommu::install(controller, found, controller_window)
+                {
+                    // SAFETY: the unit these windows are programmed into. The
+                    // unit caches context entries, so without this it goes on
+                    // believing this device has none.
+                    let invalidated = unsafe { iommu::invalidate_contexts() };
+                    if !invalidated {
+                        println!(
+                            "\x1b[91m    iommu window   FAILED: the context cache did not invalidate\x1b[0m"
+                        );
+                    }
+                    println!(
+                        "    iommu window   {:02x}:{:02x}.{} translating too, the ahci \
+                         controller's own page table and domain, {} in use",
+                        controller.0,
+                        controller.1,
+                        controller.2,
+                        iommu::windows()
+                    );
+                } else {
+                    println!(
+                        "\x1b[91m    iommu window   FAILED: the ahci controller's tables did not read back\x1b[0m"
+                    );
+                }
+            }
+            None => println!(
+                "\x1b[91m    iommu window   FAILED: no page table for the ahci controller\x1b[0m"
             ),
         }
     }

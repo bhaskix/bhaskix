@@ -94,7 +94,6 @@ impl Socket6 {
         Self { slot, port }
     }
 
-
     /// The slot this socket's capability occupies.
     #[must_use]
     pub const fn slot(&self) -> u64 {

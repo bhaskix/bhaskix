@@ -136,6 +136,20 @@ reaches only what it was given"* has never held for them. It holds for the
 devices with drivers. That is a smaller claim than the one `security.md` makes,
 and it is true on the emulator as well as on hardware.
 
+> **Superseded in part, 2026-08-24.** RFC 0046 step 2 gave `00:1f.2` a driver, a
+> window and a domain of its own, so that lane now reads *"6 drivable, 2 bridges,
+> and 2 endpoint(s) this kernel cannot describe"*. **Three became two**, and what
+> remains is the display adapter and the SMBus. The survey above is kept as
+> written because it is what was measured on the day, and because the argument
+> below rests on it: two endpoints with no window is still not zero, so answer 1
+> stays eliminated for exactly the reason it was.
+>
+> One further correction the same day: the predicate that produced the
+> "drivable" count **ignored the programming interface** and answered *yes* for
+> any USB controller, so a UHCI or EHCI controller would have been counted as
+> containable and left out of this very number. No lane in this tree has one, so
+> no count printed here has ever been wrong. Fixed in `iommu::survey`.
+
 **This eliminates answer 1 below.** "Refuse to enable unless every endpoint has a
 window" would turn the IOMMU **off on QEMU**, where three endpoints have none —
 taking every existing IOMMU gate with it. A rule that disables the feature on the
@@ -155,8 +169,9 @@ endpoints there are idle. On a real server the boot device is not idle.
 
 ### What "DMA-capable device this kernel can see" means
 
-Enumerable from PCIe, and today that is: virtio block, virtio net, and xHCI
-controllers. Anything else on the bus — a SAS controller, an NVMe drive, a
+Enumerable from PCIe, and today that is: virtio block, virtio net, xHCI
+controllers, and — since RFC 0046 step 2, 2026-08-24 — a SATA controller
+presenting AHCI's registers. Anything else on the bus — a SAS controller, an NVMe drive, a
 management NIC — is a bus master this kernel has no driver for and no window for.
 
 **Two answers, and this RFC does not choose between them.** It is the unresolved

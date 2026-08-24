@@ -44,6 +44,19 @@ const ENABLE: u32 = 1 << 31;
 /// Returned by a read of a device that is not there.
 const ABSENT: u16 = 0xffff;
 
+/// Where the programming interface byte lives in configuration space.
+///
+/// Class and subclass say what a device *is*; this byte says which register
+/// layout it presents, and it is the difference between an xHCI controller and
+/// an EHCI one, or between an AHCI controller and a SATA controller with a
+/// vendor-specific interface. Driving one with the other's offsets is writing
+/// arbitrary values into a bus master's registers.
+///
+/// Here rather than in each driver because three modules were about to name it:
+/// `kernel::xhci`, `kernel::ahci`, and `kernel::iommu`'s survey, which asks the
+/// same question about every function on the bus.
+pub const PROG_IF_OFFSET: u8 = 0x09;
+
 /// Buses, devices per bus, and functions per device.
 const BUSES: u16 = 256;
 const DEVICES: u8 = 32;

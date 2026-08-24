@@ -678,6 +678,45 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     fi
 fi
 
+# RFC 0046 step 2. `q35` has a SATA AHCI controller at `00:1f.2` on every lane
+# in this file -- it is part of the machine, not something devices.sh adds -- so
+# the same controller is a live subject for both halves of the rule and which
+# half fires is decided by the lane rather than by a second device.
+#
+# Untranslated, which is every lane without a unit: refused by name. This is
+# RFC 0012's rule on the endpoint RFC 0043 named as one of three with no driver,
+# therefore no window, therefore no containment.
+if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
+    # Behind a window of its own, on the lanes that have a unit. Two assertions
+    # because they fail apart: the first is the driver's own account of what it
+    # found, the second is the kernel's account of what it built, and a report
+    # that claimed "translated" with no window behind it is exactly the failure
+    # worth catching.
+    if grep -qaE 'ahci +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]+ [0-9a-f]{4}:[0-9a-f]{4}, translated' "$LOG"; then
+        pass "the SATA AHCI controller is found and translated"
+    else
+        fail "the AHCI controller was not found, or is not translated"
+        grep -a "ahci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
+    if grep -qa "the ahci controller's own page table and domain" "$LOG"; then
+        pass "the AHCI controller translates through a page table and domain of its own"
+    else
+        fail "no separate IOMMU window for the AHCI controller"
+        grep -a "iommu window" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+else
+    if grep -qaE 'ahci +[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]+ [0-9a-f]{4}:[0-9a-f]{4} REFUSED: no iommu' "$LOG"; then
+        pass "an AHCI controller without IOMMU translation is found and refused"
+    else
+        fail "the AHCI controller was not found, or was not refused"
+        grep -a "ahci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+fi
+
 # The decline is reported. Deterministic, and it guards the gate below rather
 # than duplicating it: that one bounds the *latency*, which only moves when a
 # decline actually happens, and declines are rare. This one asserts the

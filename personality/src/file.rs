@@ -859,8 +859,13 @@ mod tests {
         let field = |index: usize| {
             let at = index * UTSNAME_FIELD;
             let bytes = &out[at..at + UTSNAME_FIELD];
-            let end = bytes.iter().position(|byte| *byte == 0).expect("terminated");
-            core::str::from_utf8(&bytes[..end]).expect("ascii").to_string()
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .expect("terminated");
+            core::str::from_utf8(&bytes[..end])
+                .expect("ascii")
+                .to_string()
         };
         // The ABI, which is the question `sysname` asks and the one field a
         // program branches on.

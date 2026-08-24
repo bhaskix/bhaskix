@@ -422,7 +422,23 @@ asm_budget = 10
 # serial ports, this kernel probed one, and it spent two hardware boots writing
 # a boot report nobody could carry. Writing to both put 19,550 bytes of it on
 # serial-over-LAN and closed M1-17, open since Phase 0.
-unsafe_budget = 2142
+# 2153 at RFC 0046 step 2, 2026-08-24: +11, for finding a SATA AHCI controller.
+#
+# Four configuration-space reads in `ahci.rs` -- two `for_each` walks and the
+# programming-interface byte each of them checks -- one more of the same byte in
+# `iommu::survey`, and one configuration *write*: clearing bus mastering on the
+# controller before a window goes in front of it, because the firmware looks for
+# a boot sector on a SATA disk and does not tidy up afterwards.
+#
+# It was +46, and the difference is worth recording because it is not a code
+# change. `check-unsafe-budget.py` is a line scanner, and
+# `if let Some(x) = unsafe { f() } {` leaves it one brace deep -- so it charges
+# the entire body of the block to the budget. Hoisting the probe into its own
+# `let` took 35 lines off a number that was measuring brace nesting rather than
+# danger. **The same shape is still there in RFC 0041's xHCI window**, twenty
+# lines above the one this change touched; not fixed here, and recorded in
+# TRACKER, because that number is quoted in an accepted RFC.
+unsafe_budget = 2153
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
