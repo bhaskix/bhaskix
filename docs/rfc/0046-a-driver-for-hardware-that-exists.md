@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-24** |
+| **Status** | ✅ **ACCEPTED 2026-08-24 — all six steps, in one day.** Bhaskix identifies, reads and writes a SATA disk from ring 3, behind an IOMMU window and domain of its own, and serves the same `block::READ`/`WRITE` interface `bin/blkd` serves. **Step 1**: the `ahci` crate — command lists, command tables, the H2D FIS, physical region descriptors and the `IDENTIFY` parser, `forbid(unsafe_code)`, eight properties watched red and 60,025,250 fuzz executions over the parser. **Step 2**: discovery and refusal — the controller found by class/subclass/**programming interface**, quiesced, given a window, and refused by name without one; RFC 0043's uncontained endpoints on the `iommu` lane went **3 → 2**, and `security.md` says so. **Step 3a**: the bring-up sequence, thirteen properties watched red against a device model that *refuses* rather than a register file that agrees. **Step 3b**: `bin/ahcid` in a domain — and the recalled register offsets met a real controller and held. **Step 4**: `IDENTIFY DEVICE`, and the first device this driver ever met was **not a disk** — QEMU's `q35` puts the boot CD on this controller, and ATAPI aborts that command by specification, so `PxSIG` is read before anything is asked. **Step 5**: sector zero, matched by its **bytes** and not a byte count. **Step 6**: a sector written and read back byte-for-byte on a sector that is not sector zero, and the block service a filesystem can mount on — whose self-test is `block_service_self_test` with one endpoint and one string changed, which is the whole argument of this document made checkable. **What acceptance does not claim, stated here rather than left to be inferred: the register offsets have never been read from a specification** — they are recall, confirmed by a machine agreeing with them; **nothing has run on the SR550's `00:11.5`**, because translation is off there pending RFC 0043, and that refusal is RFC 0012's rule working rather than a gap; and **no filesystem has been mounted on this driver** — the interface is served and answered, which is a smaller claim than `bin/fsd` running on it |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | a new `ahci` crate, a new `bin/ahcid` domain, `kernel/iommu` (one more window) |
 | **Milestone** | Phase 2. It is the first driver in this tree for a device that is not an emulator's invention |
@@ -181,16 +181,31 @@ behaviour, not a gap** — it is RFC 0012's rule doing its job on a real machine
 
 ## Unresolved questions
 
-1. **Is a disk attached to `00:11.5`?** The bus survey cannot say; `SSTS.DET`
-   can, and only a driver that reaches step 4 will read it. If nothing is
-   attached, this driver still closes RFC 0043's QEMU hole and still cannot be
-   exercised on that machine's storage.
+1. ~~**Is a disk attached to `00:11.5`?**~~ **Still open on the SR550, and the
+   instrument that answers it exists.** `SSTS.DET` is read per port and reported
+   per port, so the question is now one boot away — but that boot cannot happen
+   until RFC 0043 turns translation on, because the driver refuses an
+   uncontained controller and that refusal is the rule working.
+
+   **It was answered on QEMU, and the answer was a surprise worth keeping.**
+   `q35` has a device on port 2 and it is **the boot CD** — ATAPI, signature
+   `0xeb140101`, which aborts `IDENTIFY DEVICE` by specification. The first
+   command this project ever issued to a SATA controller came back `ABRT`,
+   which reads as "the disk said no" when the truth is "that is not a disk".
+   Hence `device_kind`, and hence a real `ide-hd` on `bus=ide.0` of the same
+   controller so the machine holds one of each and the driver has to tell them
+   apart.
 2. **NCQ, ever?** Native Command Queuing is what makes AHCI fast and it is a
    second command path. Not in this RFC; the trigger is a measurement showing
    the non-queued path is the bottleneck.
-3. **Does `bin/fsd` choose, or does the supervisor?** With two block drivers,
-   something must decide which one a filesystem mounts. Deferred: today only one
-   will exist on any given machine.
+3. **Does `bin/fsd` choose, or does the supervisor?** **Now live, and no longer
+   hypothetical.** Two block services answer `block::READ` on the same machine
+   as of step 6b — `bin/blkd` on the virtio disk and `bin/ahcid` on the SATA
+   one — and nothing yet decides which a filesystem mounts. The deferral's own
+   reasoning ("today only one will exist on any given machine") expired the day
+   this RFC was accepted. It stays deferred *as a decision*, but it is the first
+   thing the next storage RFC has to answer, and it is the reason no filesystem
+   has been mounted on this driver yet.
 
 ## Implementation plan
 
