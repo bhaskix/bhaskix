@@ -271,13 +271,29 @@ make -C "$REPO_ROOT" build/sata-disk.img >/dev/null 2>&1 || true
 
 # RFC 0020 step 5's inbound driver: a host-side client that connects *into*
 # the guest through hostfwd, sends sixteen bytes, and demands them back.
-# Retried for the whole boot, because the guest's listener arms only after
-# its outbound demonstration completes; each attempt is cheap and the loop
+# The guest's listener arms only after its outbound demonstration completes,
+# so this reattempts for the whole boot; each attempt is cheap and the loop
 # dies with the boot. `/dev/tcp` is bash itself, so the harness needs no new
 # tool. The verdict lands in a file, because the driver is a background job
 # and its exit status would be lost. On a machine with no network the
 # connection is never accepted, the file stays absent, and the gate's dark
 # arm expects exactly that.
+#
+# **What makes "reattempts" true is that the guest refuses** (RFC 0047), and
+# it is worth knowing why, because this loop retries only when `connect`
+# fails and slirp's `hostfwd` accepts on the host side whatever the guest
+# does. Before `bin/tcpd` answered a shut port with a `RST`, the first
+# connection blocked in the read below for the entire boot -- measured, 20
+# boots out of 20 -- and the whole gate rode slirp's SYN-retransmit ladder,
+# which puts a rung at roughly T+6 s and the next at T+18 s. That left about
+# a tenth of a second of margin against the guest's listener, and it is the
+# mechanism behind the intermittent TRACKER filed on 2026-08-24.
+#
+# **And the limit of that, stated rather than left to be discovered.** A
+# `RST` can only come from a guest that is *reachable*; a connection whose
+# SYN lands before the guest has an address gets no answer from anybody and
+# still waits for the next rung. Refusing a shut port removes the razor
+# edge, it does not remove the ladder.
 INBOUND_VERDICT=$(mktemp)
 rm -f "$INBOUND_VERDICT"
 (
@@ -297,10 +313,57 @@ rm -f "$INBOUND_VERDICT"
 ) &
 INBOUND_DRIVER=$!
 
+# RFC 0047's gate: a connection to a port nobody holds must be *refused*, and
+# refused promptly.
+#
+# Until RFC 0047 `bin/tcpd` could not refuse one at all -- a `SYN` naming no
+# connection and no listener was dropped, silently, because the only path to
+# the wire needed a control block. The peer therefore heard nothing and
+# retransmitted for its whole connect timeout. That is what made the inbound
+# gate above a coin flip: the driver's retry loop only retries when *connect*
+# fails, and slirp's `hostfwd` always accepts, so the one connection it opened
+# rode slirp's SYN backoff into or past the guest's ten-second accept window.
+#
+# The probe waits for `$INBOUND_VERDICT` first, deliberately. That file is
+# proof the guest is networked *and* serving, so a refusal seen after it is
+# the machine refusing rather than the machine being absent -- which is the
+# difference this gate would otherwise be unable to state. Its own verdict is
+# three-valued for the same reason: refused, never-refused, and never-asked.
+#
+# `timeout` is what makes it a test. A `RST` closes the connection at once and
+# `dd` reads end-of-file with nothing in it; with no `RST` the read blocks
+# past the end of the boot. Sixteen bytes are asked for and zero are required:
+# a port nobody holds has nothing to say.
+CLOSED_VERDICT=$(mktemp)
+rm -f "$CLOSED_VERDICT"
+(
+    until [[ -f "$INBOUND_VERDICT" ]]; do
+        sleep 0.25
+    done
+    for _ in $(seq 1 "$TIMEOUT"); do
+        if { exec 4<>/dev/tcp/127.0.0.1/45558; } 2>/dev/null; then
+            if stray=$(timeout 3 dd bs=1 count=16 <&4 2>/dev/null); then
+                exec 4>&- 4<&- || true
+                if [[ -z "$stray" ]]; then
+                    echo "refused" > "$CLOSED_VERDICT"
+                else
+                    echo "answered: $stray" > "$CLOSED_VERDICT"
+                fi
+                exit 0
+            fi
+            exec 4>&- 4<&- || true
+        fi
+        sleep 1
+    done
+) &
+CLOSED_DRIVER=$!
+
 echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
 kill "$INBOUND_DRIVER" 2>/dev/null || true
 wait "$INBOUND_DRIVER" 2>/dev/null || true
+kill "$CLOSED_DRIVER" 2>/dev/null || true
+wait "$CLOSED_DRIVER" 2>/dev/null || true
 
 status=0
 
@@ -1963,6 +2026,36 @@ else
     status=1
 fi
 rm -f "$INBOUND_VERDICT" 2>/dev/null || true
+
+# RFC 0047: a port nobody holds says so.
+#
+# The property is not "the connection failed" -- it is that the *machine
+# answered*. A peer that hears nothing cannot tell a closed port from a lost
+# packet and retransmits for its whole connect timeout; a peer that hears a
+# `RST` stops at once. That difference is measured here as a read that returns
+# within three seconds carrying nothing.
+#
+# Three arms, and the third is why the probe waited on the inbound driver
+# rather than racing the boot: if no inbound connection was ever served, the
+# probe never ran, and the gate above has already said why. Two lines of red
+# for one fault sends the reader looking for a second bug.
+if [[ -f "$CLOSED_VERDICT" ]]; then
+    closed_said=$(cat "$CLOSED_VERDICT" 2>/dev/null || true)
+    rm -f "$CLOSED_VERDICT"
+    if [[ "$closed_said" == "refused" ]]; then
+        pass "a connection to a port no listener holds was refused, and refused promptly"
+    else
+        fail "a port nothing holds answered the probe -- $closed_said"
+        status=1
+    fi
+elif grep -qE "tcp client +did everything outcome 9 says, then opened a v6 connection" "$LOG"; then
+    fail "the machine served an inbound connection but never refused one to a closed port"
+    echo "        a peer connecting to a shut port here hangs until its own timeout" >&2
+    status=1
+else
+    pass "closed-port refusal not attempted: no inbound connection was served (see above)"
+fi
+rm -f "$CLOSED_VERDICT" 2>/dev/null || true
 
 # RFC 0013 step 6: a block driver in ring 3, driving a device of its own.
 #

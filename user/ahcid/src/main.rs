@@ -681,19 +681,16 @@ extern "C" fn ahcid_main(hertz: u64) -> ! {
     // only on the way out would report nothing at all, because a service does
     // not have a way out. The kernel reads that report while this loop is
     // already running.
-    match (up, identity, translated) {
-        (Ok(started), Some(Ok(disk)), true) => {
-            if let Some(port) = started.ports().find(|port| port.has_device()) {
-                serve(
-                    &mut registers,
-                    port.index as usize,
-                    &disk,
-                    &mut clock,
-                    device_base,
-                );
-            }
-        }
-        _ => {}
+    if let (Ok(started), Some(Ok(disk)), true) = (up, identity, translated)
+        && let Some(port) = started.ports().find(|port| port.has_device())
+    {
+        serve(
+            &mut registers,
+            port.index as usize,
+            &disk,
+            &mut clock,
+            device_base,
+        );
     }
 
     // Nothing to serve: no disk, no window, or a controller that never came up.

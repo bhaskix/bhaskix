@@ -59,4 +59,9 @@ asm_budget = 5
 # first payload emit and the first delivery.
 # 105 after RFC 0026 step 5 retired the pipeline stamps: stamp_once_at
 # and its first-write check were nine lines of unsafe now gone.
-unsafe_budget = 105
+# 106 with RFC 0047's refusal: one line, the `send_entry` that puts a `RST`
+# on the wire for a port no listener holds. One rather than several because
+# the call is hoisted into its own `let` -- written as `if unsafe { .. } {`
+# it would have cost the whole function tail, which is the line-scanner
+# artifact TRACKER records against this tool on 2026-08-24.
+unsafe_budget = 106

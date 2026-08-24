@@ -942,28 +942,59 @@ fn arrived(tcb: &mut Tcb, actions: &mut Actions, segment: &Segment<'_>, now: u64
     }
 }
 
-/// Nothing here to receive it. RFC 793 §3.4: answer with `RST` so the peer
-/// stops rather than retransmitting into a hole.
-fn closed_arrival(actions: &mut Actions, segment: &Segment<'_>) {
+/// The `RST` that answers a segment naming no connection here, or `None` when
+/// there is nothing to say.
+///
+/// RFC 793 §3.4: a segment arriving for a connection that does not exist is
+/// answered with a reset, so the peer stops rather than retransmitting into a
+/// hole for the whole of its own connect timeout. A segment that already
+/// carries `RST` is answered with silence, or two stacks with nothing in
+/// common reset each other for ever.
+///
+/// Public, and pure, because this refusal is owed in two places that share no
+/// control block: [`closed_arrival`] below, where a machine in
+/// [`State::Closed`] has one, and `bin/tcpd`'s dispatcher, where a `SYN` for a
+/// port no listener holds has none and never will have one. One
+/// implementation is what stops those two drifting -- and the second caller is
+/// why this is a function rather than four lines inlined where they were.
+#[must_use]
+pub fn reset_for(segment: &Segment<'_>) -> Option<Emit> {
     if segment.flags.contains(Flags::RST) {
-        return;
+        return None;
     }
-    let (sequence, acknowledgement, flags) = match segment.acknowledgement {
-        Some(ack) => (ack, None, Flags::RST),
+    // RFC 793 §3.4's two shapes, and they differ in more than a field. A
+    // segment that acknowledged something is answered *at the number it
+    // acknowledged* and acknowledges nothing back. One that acknowledged
+    // nothing -- a bare `SYN` -- is answered at zero and acknowledges
+    // everything the segment occupied, the `SYN`'s own number included, which
+    // is exactly what `sequence_length` counts and why it is used here rather
+    // than the payload length.
+    //
+    // The `ACK` flag itself is not set here: `segment::write` derives it from
+    // whether an acknowledgement is present, so setting it as well would be
+    // two sources for one bit.
+    let (sequence, acknowledgement) = match segment.acknowledgement {
+        Some(ack) => (ack, None),
         None => (
             Sequence(0),
             Some(segment.sequence.wrapping_add(segment.sequence_length())),
-            Flags::RST,
         ),
     };
-    actions.push(Action::Emit(Emit {
-        flags,
+    Some(Emit {
+        flags: Flags::RST,
         sequence,
         acknowledgement,
         window: 0,
         length: 0,
         mss: None,
-    }));
+    })
+}
+
+/// Nothing here to receive it. RFC 793 §3.4, through [`reset_for`].
+fn closed_arrival(actions: &mut Actions, segment: &Segment<'_>) {
+    if let Some(emit) = reset_for(segment) {
+        actions.push(Action::Emit(emit));
+    }
 }
 
 /// Waiting for anyone. Only a `SYN` is interesting.
@@ -2345,5 +2376,92 @@ mod tests {
         link.drive(Event::Shutdown);
         assert!(!link.tcb.snd_una.follows(link.tcb.snd_nxt));
         assert!(link.tcb.in_flight() <= 501);
+    }
+
+    // ------------------------------------------------------------------
+    // RFC 0047: refusing a connection to a port nobody holds.
+    //
+    // These test `reset_for` directly rather than through a `Tcb`, because
+    // its second caller -- `bin/tcpd`'s dispatcher, for a `SYN` naming a port
+    // no listener holds -- has no control block to drive. A test that could
+    // only reach this through `State::Closed` would not cover the caller the
+    // function was made public for.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_syn_for_a_port_nobody_holds_is_acknowledged_at_the_syns_own_number() {
+        // RFC 793 §3.4's ack-less shape: <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST>.
+        // The `+1` is the `SYN` occupying a sequence number. Off by that one
+        // and the peer discards the reset as outside its window, which reads
+        // as this fix not working rather than as an arithmetic slip.
+        let emit = reset_for(&from_peer(IRS.0, None, Flags::SYN, PEER_WINDOW, &[]))
+            .expect("a SYN naming nothing here is refused");
+        assert!(emit.flags.contains(Flags::RST));
+        assert_eq!(emit.sequence, Sequence(0));
+        assert_eq!(emit.acknowledgement, Some(IRS.wrapping_add(1)));
+        assert_eq!(emit.length, 0, "a reset carries no stream bytes");
+        assert_eq!(emit.mss, None, "and no options");
+    }
+
+    #[test]
+    fn the_acknowledgement_counts_every_number_the_segment_occupied() {
+        // `sequence_length`, not `payload.len()`: a segment carrying both data
+        // and a control bit occupies one number more than its bytes. Asserted
+        // separately from the bare `SYN` above because a reset that used the
+        // payload length alone passes that test and fails this one.
+        let emit = reset_for(&from_peer(
+            IRS.0,
+            None,
+            Flags::SYN.with(Flags::FIN),
+            PEER_WINDOW,
+            &[1, 2, 3, 4, 5],
+        ))
+        .expect("refused");
+        assert_eq!(
+            emit.acknowledgement,
+            Some(IRS.wrapping_add(7)),
+            "five bytes, a SYN and a FIN"
+        );
+    }
+
+    #[test]
+    fn a_segment_that_acknowledged_something_is_reset_at_that_number() {
+        // The other shape: <SEQ=SEG.ACK><CTL=RST>, acknowledging nothing back.
+        // A reset that acknowledged here would be claiming to have received a
+        // stream from a connection this end does not have.
+        let emit = reset_for(&from_peer(
+            IRS.0,
+            Some(ISS.0 + 41),
+            Flags::default(),
+            PEER_WINDOW,
+            &[],
+        ))
+        .expect("refused");
+        assert!(emit.flags.contains(Flags::RST));
+        assert_eq!(emit.sequence, Sequence(ISS.0 + 41));
+        assert_eq!(emit.acknowledgement, None);
+    }
+
+    #[test]
+    fn reset_for_answers_a_reset_with_silence_on_both_its_branches() {
+        // `a_reset_is_never_answered_with_a_reset` above asserts this through a
+        // `Link` and reaches only the acknowledging branch. Both are tested
+        // here because the guard sits before the branch: a fix that moved it
+        // after would still pass that test and let a bare `RST` be answered.
+        assert!(
+            reset_for(&from_peer(IRS.0, None, Flags::RST, 0, &[])).is_none(),
+            "a bare RST"
+        );
+        assert!(
+            reset_for(&from_peer(
+                IRS.0,
+                Some(ISS.0),
+                Flags::RST.with(Flags::ACK),
+                0,
+                &[]
+            ))
+            .is_none(),
+            "and one that acknowledges, which takes the other branch"
+        );
     }
 }

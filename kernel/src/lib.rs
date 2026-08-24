@@ -5345,7 +5345,6 @@ const SOCKET_PROBE_CODE_AT: u64 = 0x0000_0000_1900_0000;
 /// Four calls, and the four bytes it prints went out through `bin/ipd` and
 /// came back: no part of the adapter could have invented them.
 #[rustfmt::skip]
-#[rustfmt::skip]
 const SOCKET_PROBE_CODE: [u8; 181] = [
     0x49, 0x89, 0xfc,                         // mov %rdi,%r12
     0x49, 0x89, 0xf6,                         // mov %rsi,%r14

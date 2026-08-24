@@ -784,14 +784,21 @@ fn drain_forward(service: &mut Service) {
         }
         let index = match index {
             Some(index) => index,
-            None => {
-                let born = accept_syn(service, &parsed, source, destination);
-                let Some(index) = born else {
+            None => match accept_syn(service, &parsed, source, destination) {
+                Ok(index) => index,
+                Err(unmatched) => {
+                    // RFC 0047: a `SYN` for a port no listener holds is
+                    // *answered*, not dropped. Every other unmatched segment
+                    // keeps the silence it has always had -- including the one
+                    // deliberate case, a busy accepted slot, whose comment in
+                    // `accept_syn` says why the peer's retry is the answer.
+                    if matches!(unmatched, Unmatched::NoListener) {
+                        refuse(service, &parsed, source, destination);
+                    }
                     service.refused += 1;
                     continue;
-                };
-                index
-            }
+                }
+            },
         };
         // What the machine takes, it reports as a count; the bytes behind the
         // count are captured here — `rcv_nxt` before and after telling how
@@ -857,20 +864,26 @@ fn accept_syn(
     parsed: &Segment<'_>,
     source: Address,
     destination: Address,
-) -> Option<usize> {
+) -> Result<usize, Unmatched> {
     use bhaskix_net::tcp::segment::Flags;
 
-    let listener = service.listener.as_ref()?;
-    // The listener is family-blind on purpose: the tuple carries the
-    // family, so one port serves both — a v6 SYN to `::1` births a v6
-    // connection on the same rings a v4 one would use.
+    // Whether this is a connection request at all comes first, because it is
+    // what decides between an answer and silence -- and it must be decided
+    // without a listener in hand, since "no listener" is precisely the case
+    // that gets answered.
+    //
+    // The listener is family-blind on purpose: the tuple carries the family,
+    // so one port serves both — a v6 SYN to `::1` births a v6 connection on
+    // the same rings a v4 one would use.
     let ours = destination == Address::V4(service.me) || destination == LOOPBACK6;
-    if !parsed.flags.contains(Flags::SYN)
-        || parsed.acknowledgement.is_some()
-        || parsed.destination != Port(listener.port)
-        || !ours
-    {
-        return None;
+    if !parsed.flags.contains(Flags::SYN) || parsed.acknowledgement.is_some() || !ours {
+        return Err(Unmatched::NotOurs);
+    }
+    let Some(listener) = service.listener.as_ref() else {
+        return Err(Unmatched::NoListener);
+    };
+    if parsed.destination != Port(listener.port) {
+        return Err(Unmatched::NoListener);
     }
     // TIME_WAIT holds the tuple, not the slot — the same reclamation the
     // outbound slot got, for the same reason: the machine there absorbs
@@ -887,7 +900,10 @@ fn accept_syn(
         // The one accepted slot is taken. `CONGESTED` is the table's word
         // for this, and the refusal is silent at this layer -- the peer
         // retries its `SYN`, and if the slot has freed by then, it lands.
-        return None;
+        // RFC 0047 deliberately did **not** make this one a `RST`: a reset
+        // here would tell a peer the port is shut when it is merely busy for
+        // a moment, and the retry is the better answer.
+        return Err(Unmatched::SlotBusy);
     }
     let connection = FourTuple {
         // The address the SYN was sent to, not an assumption about which
@@ -917,7 +933,65 @@ fn accept_syn(
             window: WINDOW,
         },
     );
-    Some(ACCEPTED)
+    Ok(ACCEPTED)
+}
+
+/// Why a segment that named no connection could not become one.
+///
+/// The distinction exists for exactly one caller: only [`Unmatched::NoListener`]
+/// is answered with a `RST`, and telling it apart from a busy slot is the whole
+/// difference between "nobody is here" and "come back in a moment".
+enum Unmatched {
+    /// Nothing holds that port. RFC 793 §3.4's case, and the one this service
+    /// owes an answer to.
+    NoListener,
+    /// A listener holds the port and its one accepted slot is taken. Silent on
+    /// purpose -- see the comment at the check itself.
+    SlotBusy,
+    /// Not a `SYN`, already acknowledging something, or addressed to somebody
+    /// this machine is not. Nothing to answer, and nothing new here: this is
+    /// the silence every unmatched segment had before RFC 0047.
+    NotOurs,
+}
+
+/// Answers a `SYN` for a port no listener holds, per RFC 793 §3.4.
+///
+/// **This is the whole of RFC 0047.** Until it existed, `bin/tcpd` could not
+/// refuse a connection at all: [`send_entry`] had one caller, inside
+/// `Action::Emit`, which needs a control block -- and a `SYN` naming no
+/// connection has none. A peer therefore heard nothing and retransmitted for
+/// its own connect timeout, which on a host stack is measured in minutes.
+///
+/// The arithmetic is [`state::reset_for`]'s, in the crate that is fuzzed and
+/// `forbid`s `unsafe`; what is here is the tuple swap and the ring.
+fn refuse(service: &mut Service, parsed: &Segment<'_>, source: Address, destination: Address) {
+    let Some(emit) = state::reset_for(parsed) else {
+        return;
+    };
+    // The four-tuple, swapped: this end is the address the `SYN` arrived at
+    // and the port it asked for, which is a port nothing holds -- the reply
+    // is the only thing that will ever be sent from it.
+    let back = FourTuple {
+        local: destination,
+        local_port: parsed.destination,
+        remote: source,
+        remote_port: parsed.source,
+    };
+    let built = emit.segment(back, &[]);
+    // A reset carries no payload, so the header is the whole of it.
+    let mut bytes = [0u8; segment::MAX_HEADER];
+    let Ok(written) = segment::write(&mut bytes, &built, destination, source) else {
+        return;
+    };
+    // Hoisted out of the `if` on purpose: `tools/check-unsafe-budget.py` is a
+    // line scanner and charges a trailing brace's whole block to the budget,
+    // so `if unsafe { .. } {` would bill this function's tail as unsafe.
+    // SAFETY: the back ring, mapped writable at `BACK_AT` -- the same ring
+    // every other segment this program sends leaves through.
+    let sent = unsafe { send_entry(destination, source, &bytes[..written]) };
+    if sent {
+        service.sent += 1;
+    }
 }
 
 /// Tells the producer how far this program has read.

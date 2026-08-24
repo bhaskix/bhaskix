@@ -1294,14 +1294,6 @@ mod tests {
             self.write_index(offset).is_some()
         }
 
-        /// How many writes to `offset` had `bit` set.
-        fn set_count(&self, offset: usize, bit: u32) -> usize {
-            self.writes()
-                .iter()
-                .filter(|(at, value)| *at == offset && value & bit != 0)
-                .count()
-        }
-
         /// Counts down `left`, answering whether the thing it gates has
         /// happened yet. `NEVER` never counts down and never happens.
         fn elapsed(left: &Cell<u32>) -> bool {

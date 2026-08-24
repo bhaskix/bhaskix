@@ -85,7 +85,15 @@ qemu_device_list() {
                 # same request, answered without the flag and silent with
                 # it). Do not "tidy" this line by making the default
                 # explicit; the default and the flag are different worlds.
-                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:45557-:7"
+                # A third forward, and the only one whose guest end nothing
+                # ever holds: RFC 0047's gate connects to 45558 and requires
+                # to be *refused*. Port 1234 is chosen because no program in
+                # this image listens on it and none is meant to -- if one ever
+                # does, that gate starts passing for the wrong reason, which
+                # is why the number is stated here rather than picked in the
+                # test. `bin/ipd` forwards TCP by address and not by port, so
+                # the SYN reaches `bin/tcpd` and is answered by it.
+                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:45557-:7,hostfwd=tcp:127.0.0.1:45558-:1234"
                 -device "virtio-net-pci,netdev=net0$suffix"
                 # Two xHCI controllers, and the pair is the point.
                 #
