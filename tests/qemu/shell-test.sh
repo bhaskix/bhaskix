@@ -205,6 +205,14 @@ fi
 rm -f "$REPO_ROOT/build/domain-disk.img"
 make -C "$REPO_ROOT" build/domain-disk.img >/dev/null 2>&1 || true
 
+# And the SATA disk, for the same reason and since RFC 0046 step 6: the AHCI
+# driver now *writes* to it -- a pattern into its last sector, read back to
+# prove the write happened. Sector zero carries the marker the read gate checks,
+# and leaving a mutated fixture in place would mean the next run starts wherever
+# the last one left it.
+rm -f "$REPO_ROOT/build/sata-disk.img"
+make -C "$REPO_ROOT" build/sata-disk.img >/dev/null 2>&1 || true
+
 echo "booting and typing at it, up to ${TIMEOUT}s..."
 
 # With a unit, the same flags RFC 0012's boot test uses. The block *service*

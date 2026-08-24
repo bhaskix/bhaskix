@@ -84,5 +84,19 @@ asm_budget = 4
 # Still nothing that decides an offset, an order or a bound: `plan_read` is in
 # the crate, and it is where the disk's own numbers are bounded before they size
 # a transfer.
-unsafe_budget = 41
+# **58 at RFC 0046 step 6a, 2026-08-24: +17.** The bill:
+#
+#   - the loop that fills the buffer with the pattern, written a byte at a time
+#     through a volatile write. Nine lines, and volatile on purpose: this is
+#     memory a bus master is about to read, and a compiler entitled to reorder
+#     or elide the stores would be entitled to hand the device a half-built
+#     sector.
+#   - the comparison loop that reads it back, same reasoning in reverse.
+#   - the second wipe, between the write and the read-back, which is the line
+#     that stops this test agreeing with itself.
+#
+# Still nothing that decides an offset, an order or a bound. `plan_write` shares
+# `plan_read`'s bounds by construction -- one function, one bit different -- and
+# both live in the crate `make test-host` reaches.
+unsafe_budget = 58
 unsafe_budget_exact = true

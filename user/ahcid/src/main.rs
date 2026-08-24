@@ -51,6 +51,13 @@ const WINDOW: u64 = 3;
 /// is what the gate greps for, and short enough that the report stays one line.
 const FIRST_BYTES: usize = 32;
 
+/// Whether the write self-test ran: 0 not attempted, 1 the bytes came back
+/// identical, 2 they came back different, 3 the write or the read-back was
+/// refused.
+static WRITE_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Which sector it used, so the report can name it.
+static WRITE_LBA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Whether sector zero was read: 0 not attempted, 1 read, 2 refused by the
 /// device or the bus, 3 refused by this driver before it was issued.
 static READ_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -147,6 +154,10 @@ const STAGE_ANSWERED: u64 = 7;
 const STAGE_PLANNED: u64 = 8;
 /// That read came back.
 const STAGE_READ: u64 = 9;
+/// A pattern was written to a spare sector.
+const STAGE_WROTE: u64 = 10;
+/// And read back.
+const STAGE_VERIFIED: u64 = 11;
 
 /// Issues one system call, and returns `(status, value)`.
 fn call(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> (u64, u64) {
@@ -354,6 +365,8 @@ fn report(
                 put(51, u64::from(disk.lba48));
                 put(52, READ_STATE.load(core::sync::atomic::Ordering::Relaxed));
                 put(53, READ_WHY.load(core::sync::atomic::Ordering::Relaxed));
+                put(54, WRITE_STATE.load(core::sync::atomic::Ordering::Relaxed));
+                put(55, WRITE_LBA.load(core::sync::atomic::Ordering::Relaxed));
                 for (word, cell) in FIRST.iter().enumerate() {
                     put(56 + word, cell.load(core::sync::atomic::Ordering::Relaxed));
                 }
@@ -619,7 +632,107 @@ fn identify(
         }
     }
 
+    // RFC 0046 step 6: `WRITE DMA EXT`, proved by reading back what was written.
+    //
+    // **Not sector zero.** That sector holds the bytes step 5's gate checks, and
+    // a driver that verified its writes by destroying the thing another gate
+    // depends on would be trading one proof for another. The *last* sector is
+    // used instead: it is inside every disk by definition, and on this image it
+    // holds nothing.
+    //
+    // The pattern is derived from the sector number rather than constant, so a
+    // driver that wrote to the wrong sector and read back the wrong sector
+    // cannot agree with itself.
+    if read_state_is_good() {
+        verify_write(registers, port, &identity, clock, device_base, list, table);
+    }
+
     Some(Ok(identity))
+}
+
+/// Whether the read above worked, so the write test has something to trust.
+fn read_state_is_good() -> bool {
+    READ_STATE.load(core::sync::atomic::Ordering::Relaxed) == 1
+}
+
+/// Writes a pattern to the last sector and reads it back.
+///
+/// A write nobody checks is a write that reported success. So this does both
+/// halves and compares them, and the comparison is what the boot gate watches.
+fn verify_write(
+    registers: &mut Abar,
+    port: usize,
+    identity: &ahci::Identity,
+    clock: &mut impl FnMut() -> u64,
+    device_base: u64,
+    list: &mut [u8],
+    table: &mut [u8],
+) {
+    let Some(lba) = identity.sectors.checked_sub(1) else {
+        return;
+    };
+    WRITE_LBA.store(lba, core::sync::atomic::Ordering::Relaxed);
+
+    let Ok(planned) = ahci::plan_write(identity, lba, 1, ahci::IDENTIFY_BYTES) else {
+        WRITE_STATE.store(3, core::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+
+    // The pattern, derived from the sector so that writing sector N and reading
+    // sector M cannot look like a success.
+    // SAFETY: page two, which this program holds and mapped writable, and which
+    // no command is outstanding against.
+    unsafe {
+        let buffer = MEMORY_AT + BUFFER_AT;
+        for offset in 0..planned.bytes {
+            let byte = (lba as u8).wrapping_add(offset as u8).wrapping_mul(31) ^ 0xa5;
+            core::ptr::write_volatile((buffer + offset as u64) as *mut u8, byte);
+        }
+    }
+
+    let at = ahci::Where {
+        table: device_base + TABLE_AT,
+        buffer: device_base + BUFFER_AT,
+        bytes: planned.bytes,
+    };
+    if ahci::build_command(list, table, 0, planned.ata, at).is_err()
+        || ahci::run(registers, port, 0, clock, SETTLE_NS).is_err()
+    {
+        WRITE_STATE.store(3, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    stage(STAGE_WROTE);
+
+    // Wipe, then read it back. Without the wipe the buffer still holds what was
+    // just written, so a read that moved nothing would compare equal -- which
+    // would make this whole test agree with itself and prove nothing.
+    // SAFETY: as above.
+    unsafe {
+        core::ptr::write_bytes((MEMORY_AT + BUFFER_AT) as *mut u8, 0, planned.bytes);
+    }
+
+    let Ok(back) = ahci::plan_read(identity, lba, 1, ahci::IDENTIFY_BYTES) else {
+        WRITE_STATE.store(3, core::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+    if ahci::build_command(list, table, 0, back.ata, at).is_err()
+        || ahci::run(registers, port, 0, clock, SETTLE_NS).is_err()
+    {
+        WRITE_STATE.store(3, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    stage(STAGE_VERIFIED);
+
+    // SAFETY: as above, and `run` returned `Ok` -- the only thing that says the
+    // device has finished writing into it.
+    let same = unsafe {
+        let buffer = MEMORY_AT + BUFFER_AT;
+        (0..back.bytes).all(|offset| {
+            let want = (lba as u8).wrapping_add(offset as u8).wrapping_mul(31) ^ 0xa5;
+            core::ptr::read_volatile((buffer + offset as u64) as *const u8) == want
+        })
+    };
+    WRITE_STATE.store(u64::from(!same) + 1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Stops where the kernel can see it.

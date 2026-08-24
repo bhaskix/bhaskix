@@ -11493,6 +11493,29 @@ fn report_ahci_domain(hhdm: u64) -> bool {
                 sectors.saturating_mul(bytes) / 1024,
                 if word(51) == 1 { 48 } else { 28 }
             );
+            // RFC 0046 step 6: a write, proved by reading it back.
+            //
+            // **Not sector zero**, whose bytes the read gate checks -- the last
+            // sector, and the pattern is derived from the sector number, so a
+            // driver that wrote sector N and read sector M cannot agree with
+            // itself and pass.
+            match word(54) {
+                0 => {}
+                1 => println!(
+                    "    ahci write     sector {} written and read back byte-for-byte",
+                    word(55)
+                ),
+                2 => println!(
+                    "\x1b[91m    ahci write     FAILED: sector {} read back different from what \
+                     was written\x1b[0m",
+                    word(55)
+                ),
+                _ => println!(
+                    "\x1b[91m    ahci write     FAILED: the write or its read-back was \
+                     refused\x1b[0m"
+                ),
+            }
+
             match read_state {
                 1 => {}
                 0 => println!(

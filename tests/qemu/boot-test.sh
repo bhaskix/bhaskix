@@ -261,6 +261,14 @@ fi
 rm -f "$REPO_ROOT/build/domain-disk.img"
 make -C "$REPO_ROOT" build/domain-disk.img >/dev/null 2>&1 || true
 
+# And the SATA disk, for the same reason and since RFC 0046 step 6: the AHCI
+# driver now *writes* to it -- a pattern into its last sector, read back to
+# prove the write happened. Sector zero carries the marker the read gate checks,
+# and leaving a mutated fixture in place would mean the next run starts wherever
+# the last one left it.
+rm -f "$REPO_ROOT/build/sata-disk.img"
+make -C "$REPO_ROOT" build/sata-disk.img >/dev/null 2>&1 || true
+
 # RFC 0020 step 5's inbound driver: a host-side client that connects *into*
 # the guest through hostfwd, sends sixteen bytes, and demands them back.
 # Retried for the whole boot, because the guest's listener arms only after
@@ -797,6 +805,21 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     else
         fail "sector 0 was not read, or did not hold what that disk holds"
         grep -a "ahci read\|ahci identify" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
+    # RFC 0046 step 6: a write, proved by reading it back.
+    #
+    # Byte-for-byte, and on a sector that is **not** sector zero -- that one
+    # holds the bytes the read gate above checks, and a driver that verified its
+    # writes by destroying another gate's subject would be trading one proof for
+    # another. The pattern the driver writes is derived from the sector number,
+    # so writing sector N and reading sector M cannot agree with itself and pass.
+    if grep -qaE 'ahci write +sector [0-9]+ written and read back byte-for-byte' "$LOG"; then
+        pass "a sector is written through the AHCI driver and reads back byte-for-byte"
+    else
+        fail "the write self-test did not confirm"
+        grep -a "ahci write\|ahci read" "$LOG" | sed 's/^/      /'
         status=1
     fi
 

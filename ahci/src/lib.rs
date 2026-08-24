@@ -880,6 +880,38 @@ pub fn plan_read(
     sectors: u16,
     buffer_bytes: usize,
 ) -> Result<Transfer, Error> {
+    plan(disk, lba, sectors, buffer_bytes, false)
+}
+
+/// Plans a write, or refuses it.
+///
+/// **The same bounds as [`plan_read`], and they matter more here.** A read past
+/// the end returns bytes nobody wanted; a write past the end *destroys* them,
+/// and on a disk holding a filesystem it destroys somebody else's. So this is
+/// deliberately the same function with one bit different rather than a second
+/// implementation that could drift from it -- which is the whole reason the
+/// bounds live in `plan` and not in either caller.
+///
+/// # Errors
+///
+/// As [`plan_read`].
+pub fn plan_write(
+    disk: &Identity,
+    lba: u64,
+    sectors: u16,
+    buffer_bytes: usize,
+) -> Result<Transfer, Error> {
+    plan(disk, lba, sectors, buffer_bytes, true)
+}
+
+/// The bounds both directions share.
+fn plan(
+    disk: &Identity,
+    lba: u64,
+    sectors: u16,
+    buffer_bytes: usize,
+    write: bool,
+) -> Result<Transfer, Error> {
     if sectors == 0 {
         return Err(Error::NoSectors);
     }
@@ -915,10 +947,14 @@ pub fn plan_read(
     }
     Ok(Transfer {
         ata: Ata {
-            command: command::READ_DMA_EXT,
+            command: if write {
+                command::WRITE_DMA_EXT
+            } else {
+                command::READ_DMA_EXT
+            },
             lba,
             sectors,
-            write: false,
+            write,
         },
         bytes,
     })
@@ -2226,5 +2262,71 @@ mod tests {
         // The largest transfer a caller can actually plan, for the same reason:
         // if `sectors` ever becomes a `u32` this assertion is what notices.
         assert_eq!(core::mem::size_of_val(&Ata::identify().sectors), 2);
+    }
+    #[test]
+    fn a_write_is_planned_by_the_same_bounds_as_a_read() {
+        // **One function with one bit different, not two implementations.** A
+        // read past the end returns bytes nobody wanted; a write past the end
+        // destroys them, and on a disk holding a filesystem it destroys somebody
+        // else's. So the bounds are asserted to be *identical* rather than
+        // merely both present -- two copies drift, and the copy that drifts is
+        // the one nobody reads.
+        let d = disk(512, 512);
+        for (lba, sectors, buffer) in [
+            (0u64, 0u16, 4096usize),
+            (512, 1, 4096),
+            (511, 2, 4096),
+            (0, 9, 4096),
+            (u64::MAX, 2, 4096),
+        ] {
+            assert_eq!(
+                plan_read(&d, lba, sectors, buffer).map(|t| t.bytes),
+                plan_write(&d, lba, sectors, buffer).map(|t| t.bytes),
+                "read and write disagreed about lba {lba}, {sectors} sectors"
+            );
+        }
+    }
+
+    #[test]
+    fn a_planned_write_carries_the_write_command_and_the_direction_bit() {
+        // The direction bit is the one a mistake here makes silent: a transfer
+        // that runs the wrong way reports no error anywhere, it just moves the
+        // wrong bytes -- into the disk, on a write.
+        let planned = plan_write(&disk(1024, 512), 8, 2, 4096).expect("fits");
+        assert_eq!(planned.ata.command, command::WRITE_DMA_EXT);
+        assert!(planned.ata.write, "a write must set the direction bit");
+        assert_eq!(planned.ata.lba, 8);
+        assert_eq!(planned.bytes, 1024);
+
+        let read = plan_read(&disk(1024, 512), 8, 2, 4096).expect("fits");
+        assert_eq!(read.ata.command, command::READ_DMA_EXT);
+        assert!(!read.ata.write);
+        // The two commands are different numbers, which is what a copy-paste
+        // between the two planners would get wrong.
+        assert_ne!(command::READ_DMA_EXT, command::WRITE_DMA_EXT);
+    }
+
+    #[test]
+    fn a_write_commands_header_says_the_device_reads_from_memory() {
+        // `build_command` puts the direction in the header's bit 6. A write with
+        // that bit clear tells the controller to *fill* the buffer instead of
+        // draining it -- so the sector on disk keeps whatever it had and the
+        // buffer is overwritten, which looks like a write that did nothing.
+        let mut list = [0u8; COMMAND_LIST_BYTES];
+        let mut table = [0u8; PRDT_AT + PRD_BYTES];
+        let at = Where {
+            table: 0x8000,
+            buffer: 0x9000,
+            bytes: 512,
+        };
+        let planned = plan_write(&disk(1024, 512), 0, 1, 512).expect("fits");
+        build_command(&mut list, &mut table, 0, planned.ata, at).expect("fits");
+        let dword0 = u32::from_le_bytes(list[0..4].try_into().unwrap());
+        assert_ne!(dword0 & (1 << 6), 0, "the write bit must be set");
+
+        let planned = plan_read(&disk(1024, 512), 0, 1, 512).expect("fits");
+        build_command(&mut list, &mut table, 0, planned.ata, at).expect("fits");
+        let dword0 = u32::from_le_bytes(list[0..4].try_into().unwrap());
+        assert_eq!(dword0 & (1 << 6), 0, "a read must leave it clear");
     }
 }
