@@ -710,7 +710,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | **A single `SYN` from a peer that vanishes wedges every listener (found 2026-08-24; narrowed 2026-08-24 by [RFC 0048](docs/rfc/0048-a-listener-that-cannot-be-wedged.md) step 1, and still open).** `bin/tcpd` has **one** accepted slot. A `SYN` births a connection in `SynReceived`; if the peer never completes the handshake, that connection holds the slot until `MAX_RETRANSMITS` (eight, with backoff) — far beyond any accept window — and every later `SYN` is refused **silently** as `SlotBusy`. The listener is then deaf while looking healthy. **This is a remote denial of service against any listener this system offers**: one packet, from an address that need not exist, and nothing is listening any more. It needs no authority and no capability. | Measured 2026-08-24 by temporarily separating `accept_syn`'s three refusal reasons into the report word (`1` no-listener, `1000` slot-busy, `10^6` not-ours) and reading them off one boot: a failing run read **1000** — one slot-busy, zero no-listener — and a **passing** run read **2001**, so the condition occurs on ordinary boots and is survived by luck. Instrumentation reverted. **Not fixed deliberately**: the fix is a design decision, not a bug fix — a bounded half-open queue, a `SynReceived` deadline, or both — and belongs in its own RFC. **Measured at 242 seconds** by driving the state machine on the host -- and an arithmetic estimate in the same investigation said 183, which is why the number comes from a test. **[RFC 0048](docs/rfc/0048-a-listener-that-cannot-be-wedged.md) step 1 takes it to 14 seconds** (`MAX_SYNACK_RETRANSMITS`, a half-open connection given less patience than one somebody completed), measured the same way, with both host tests watched red three ways -- including the mutation that shortens *every* connection, which a pre-existing test catches. **That is a 17x reduction and not a fix**: one `SYN` every fourteen seconds still owns the slot. The fix is SYN cookies -- no state for a peer that has proved nothing -- specified as that RFC's steps 2-4 and **not built**. **Its acceptance should block on reading RFC 1122 §4.2.3.5**: step 1 may sit below the floor that specification sets for `SYN` retries, and there is no copy of it on this machine, so the question is recorded rather than guessed. | unassigned |
 | **`make gates` runs neither `cargo fmt --check` nor `cargo clippy`, so both unformatted code and lint failures land (2026-08-24; the clippy half found the same day).** **`make test` was red on `main` for three separate clippy errors**, none of them noticed, because `gates` is the fast target and the one usually run while `fmt` and `clippy` are siblings of it under `test`: a duplicated `#[rustfmt::skip]` in `kernel/src/lib.rs` from `2980f74`, a dead test helper `set_count` in `ahci/src/lib.rs`, and a `single_match` in `user/ahcid/src/main.rs`. All three are from commits of 2026-08-23/24, and all three are fixed by the RFC 0047 change **only because they blocked its verification** -- the tree could not be shown green otherwise. `§6`'s gate table has claimed `cargo clippy -D warnings` active **from M1**, which was true of CI and not of the command a developer runs. `cargo fmt --check` runs under `make test` and not under `make gates`, which is the faster target and therefore the one usually run. A `cargo fmt --all` during RFC 0046 step 2 reflowed **six files that change was not touching** — including `ahci/src/lib.rs`, committed the day before — all line-wrapping and one stray blank line, nothing semantic. Not fixed by moving `fmt` into `gates`, because that changes a developer-facing gate and would have been a silent widening of an unrelated commit. | `git diff -w` was identical to `git diff` across all six, which is what says it is formatting and not code. Reproduce with `cargo fmt --all --check` **or** `make clippy` on a tree where only `make gates` has been run. The clippy half is reproducible on `face679` exactly. | unassigned |
 | ~~**`make test-boot-native-full` fails on a pristine tree, and has (2026-08-24).**~~ **FIXED 2026-08-24, and it was a regression from [RFC 0046](docs/rfc/0046-a-driver-for-hardware-that-exists.md) rather than anything about the loader.** QEMU exited **before producing a byte**: `-device ide-hd,drive=sata0,bus=ide.0: Can't create IDE unit 1, bus supports only 1 units`. The native lane is the only one whose boot medium is a bare `-drive` (`format=raw,file=fat:rw:$ESP`) rather than `-cdrom`; a bare `-drive` takes `if=ide` and QEMU auto-assigns it the first free index, which is `ide.0` -- where RFC 0046's SATA disk now sits, and q35's `ich9-ahci` gives each port a bus of exactly one unit. Fixed by giving the ESP a port of its own, `bus=ide.2`, which is where the boot medium sits on every other lane. **107 gates, zero failures.** | **This row said "QEMU is not the problem: the staged ESP mounts and boots when the same `fat:rw:` drive is handed to `qemu-system-x86_64` by hand" -- true, and exactly the wrong experiment**, because handing QEMU that drive *alone* removes the disk it collided with. The error was found by capturing QEMU's own stderr, which `run_until` sends to `/dev/null`; the lane's failure text ("the machine did not finish booting", empty serial log) reads as a loader that hangs rather than a machine that never started. Chain verified rather than argued: `devices.sh` at `98f9bb9` has **0** `sata`/`ide-hd` lines against **5** at HEAD, so `ide.0` was free before RFC 0046; and a live boot report reads `ahci port 0 ... a SATA disk` with `port 2 ... a device attached`, which is the boot CD, confirming `ide.2` is where `-cdrom` lands. **It went unnoticed because no gate runs the boot lanes** -- `make gates` does not, and `make test` was red ahead of this lane for the three clippy errors in the row above. | fixed |
-| **Two small things found while giving the AHCI controller a window, recorded rather than fixed (2026-08-24).** (1) **`virtio::quiesce` has no caller** and has been dead since it was written. Not a hole — the kernel's own block device is reset by `init_mapped` on the path that matters — but its doc comment reads as though it runs before translation is enabled, and it does not. (2) **`check-unsafe-budget.py` charges brace nesting to the budget**: it is a line scanner, so `if let Some(x) = unsafe { f() } {` leaves it one brace deep and the entire body of the block counts as unsafe. RFC 0046 step 2 was +46 lines written that way and +11 after hoisting the probe into its own `let`. **The same shape is still in RFC 0041's xHCI window**, and untangling it would lower `bhaskix-kernel`'s headline `unsafe` count by roughly thirty-five lines without deleting a single unsafe operation — which is why it is not a quiet edit: that number is quoted in an accepted RFC. | Both read off the code on 2026-08-24 while wiring `ahci::probe` into `iommu_bringup`; the budget artifact is reproducible by writing the probe back inside its `if let` and running `tools/check-unsafe-budget.py --report`. | unassigned |
+| **Two small things found while giving the AHCI controller a window. (2) is FIXED 2026-08-24 and was far larger than this row estimated; (1) stands.** (1) **`virtio::quiesce` has no caller** and has been dead since it was written. Not a hole — the kernel's own block device is reset by `init_mapped` on the path that matters — but its doc comment reads as though it runs before translation is enabled, and it does not. (2) **`check-unsafe-budget.py` charges brace nesting to the budget**: it is a line scanner, so `if let Some(x) = unsafe { f() } {` leaves it one brace deep and the entire body of the block counts as unsafe. RFC 0046 step 2 was +46 lines written that way and +11 after hoisting the probe into its own `let`. ~~**The same shape is still in RFC 0041's xHCI window**, and untangling it would lower `bhaskix-kernel`'s headline `unsafe` count by roughly thirty-five lines.~~ **Thirty-five was a guess and it was wrong by an order of magnitude: the real figure is 408, and the fix was to the scanner rather than to any code.** `bhaskix-kernel` reads **2167 → 1759**, 19% of its declared number, with **not one unsafe operation deleted**; 448 phantom lines across six crates. The scanner now walks braces from the block's own opening brace and stops when it closes, and it has a `--self-test` of hand-counted shapes wired into `make gates`, watched catching the old arithmetic (it counts the miscounted case as 4 against a true 1). | Both read off the code on 2026-08-24 while wiring `ahci::probe` into `iommu_bringup`; the budget artifact is reproducible by writing the probe back inside its `if let` and running `tools/check-unsafe-budget.py --report`. | unassigned |
 
 ### Blockers
 
@@ -795,6 +795,61 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-24 (the `unsafe` budget was over-counting by 448 lines, and the guess about how much was wrong by an order of magnitude)
+
+**A safety metric that reported too much never fails a build, so nothing found
+it for as long as it existed.** `tools/check-unsafe-budget.py` took a whole
+line's brace balance, so
+
+```rust
+if let Some(x) = unsafe { g() } { ... }
+```
+
+balanced to **+1** — two opens, one close — and the scanner believed the
+`unsafe` block was still open when it had already closed. Every line of the
+*outer* block was then charged to the crate.
+
+| crate | was | is | phantom |
+|---|---|---|---|
+| `bhaskix-kernel` | 2167 | **1759** | **−408** |
+| `bhaskix-user-netd` | 327 | 308 | −19 |
+| `bhaskix-arch-x86-64` | 1169 | 1157 | −12 |
+| `bhaskix-user-ipd` | 161 | 156 | −5 |
+| `bhaskix-boot-shim` | 35 | 33 | −2 |
+| `bhaskix-user-tcpd` | 106 | 104 | −2 |
+| | | | **448 total** |
+
+**Not one `unsafe` operation was deleted.** The kernel's headline number — the
+one `coding-style.md` §3 exists to make visible — was **19% too high**.
+
+**This row's own estimate was wrong by an order of magnitude.** It was filed
+this morning saying the untangling "would lower `bhaskix-kernel`'s headline
+`unsafe` count by roughly thirty-five lines". Thirty-five was a guess; 408 is a
+measurement. The guess is left in place, struck through, because the gap is the
+point.
+
+**It was found by being obeyed.** RFC 0047 hoisted a call into its own `let`
+*to appease this tool*, with a comment saying so. Contorting code to satisfy an
+instrument is the signal that the instrument is wrong, and that comment is now
+corrected in both places it appears.
+
+**The scale changed, so old figures were re-measured rather than reinterpreted.**
+[RFC 0032](docs/rfc/0032-a-supervisor-interface.md) quotes kernel budgets
+throughout — 1,514 → 1,504 → 1,506. Run against that RFC's own tree (`9c893b3`,
+2026-08-20) the old scanner says **1,510** and the corrected one **1,368**: an
+over-count of **142** then, against 408 now, so the miscounted shape spread as
+the tree grew. The RFC's *deltas* stand — every number in a delta was taken the
+same way — and its absolutes were about ten percent high. A note saying so sits
+where those numbers live. **The kernel's real growth since RFC 0032 is
+1,368 → 1,759, not the 1,506 → 2,167 a naive comparison shows.**
+
+**And the instrument now has an instrument.** `--self-test` checks four
+hand-counted shapes, including the one that was miscounted, and is wired into
+`make gates`. Watched catching the old arithmetic: it counts that case as **4**
+against a true **1**. Six budgets are lowered to their measured counts; the
+crates that had genuine headroom keep it, because a ceiling with room is the
+normal mode and only these six sat exactly at their number.
 
 ### 2026-08-24 (CI was red for sixteen commits, and the thing that hid it was a belief rather than a limit)
 

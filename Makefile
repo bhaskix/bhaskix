@@ -753,6 +753,7 @@ gates:
 	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-pkg --features tool \
 	    && printf '  \033[1;32mok\033[0m    the package image assembler still builds\n' \
 	    || { echo "  FAIL  the package image assembler does not build"; exit 1; }
+	tools/check-unsafe-budget.py --self-test
 	tools/check-unsafe-budget.py
 	tools/check-instruction-containment.py
 # And watched refusing one. `architecture.md` §7 claimed for a year that

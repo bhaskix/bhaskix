@@ -73,4 +73,9 @@ asm_budget = 3
 # is left here is the byte moving — one helper per region rather than the two
 # general walkers they replaced. Fewer lines of arithmetic, marginally more
 # lines of `unsafe`, and the arithmetic was the part that was getting it wrong.
-unsafe_budget = 327
+# 308 on 2026-08-24, and **not one unsafe operation was deleted**: the
+# budget check was over-counting by 19 lines here. It took a whole line's
+# brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
+# charged the outer block's body to this crate. See the changelog; the
+# scanner now walks from the block's own brace and has a self-test.
+unsafe_budget = 308

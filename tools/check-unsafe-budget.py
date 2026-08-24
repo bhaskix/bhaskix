@@ -101,6 +101,31 @@ def strip_test_modules(lines: list[str]) -> list[str]:
     return output
 
 
+def _advance(depth: int, text: str) -> int:
+    """Walk `text`'s braces from `depth`, stopping the moment the block closes.
+
+    **This is the arithmetic that was wrong, and it mattered.** The scanner used
+    to take `line.count("{") - line.count("}")` for the whole line, which reads
+    `if let Some(x) = unsafe { f() } {` as *+1* -- two opens, one close -- and so
+    believed the `unsafe` block was still open when it had already closed. Every
+    line of the *outer* block was then charged to the crate's budget, sometimes
+    dozens of them, none of which contains an unsafe operation.
+
+    Once the depth returns to zero the block has ended and the rest of the line
+    is ordinary code, so any brace after that point is somebody else's. Walking
+    characters instead of counting them is what makes that expressible, and it
+    is still a scanner anyone can read rather than a parser.
+    """
+    for character in text:
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth <= 0:
+                return 0
+    return depth
+
+
 def scan(source: str) -> tuple[int, list[int]]:
     """Return (lines inside unsafe blocks, line numbers missing // SAFETY:).
 
@@ -119,9 +144,7 @@ def scan(source: str) -> tuple[int, list[int]]:
 
         if depth > 0:
             unsafe_lines += 1
-            depth += line.count("{") - line.count("}")
-            if depth <= 0:
-                depth = 0
+            depth = _advance(depth, line)
             continue
 
         # `unsafe fn`, `unsafe trait`, `unsafe impl` are declarations, not
@@ -156,17 +179,94 @@ def scan(source: str) -> tuple[int, list[int]]:
                 missing.append(index + 1)
 
             unsafe_lines += 1
-            depth = line.count("{") - line.count("}")
-            if depth < 0:
-                depth = 0
+            # From the block's own opening brace, not from the start of the
+            # line: anything before it -- `if let Some(x) = ` -- is not inside
+            # the block and its braces are not the block's.
+            opening = stripped.find("{", re.search(r"\bunsafe\s*\{", stripped).start())
+            depth = _advance(0, stripped[opening:])
 
     return unsafe_lines, missing
+
+
+# Hand-counted cases for `--self-test`. Each is (source, expected unsafe lines),
+# and the expectation is a number a person worked out by reading it.
+#
+# **The first two are why this exists.** The scanner used to take a whole line's
+# brace balance, so a line that both closed an `unsafe` block and opened another
+# one read as still-open and charged the outer block's entire body to the
+# budget. That over-counted `bhaskix-kernel` by 408 lines -- 19% of its declared
+# number, a figure quoted in accepted RFCs and in security.md -- and nobody
+# could see it, because a budget check that reports too *much* never fails a
+# build. It was found only because somebody contorted a call into a `let` to
+# appease it.
+SELF_TEST = [
+    (
+        "fn f() {\n"
+        "    // SAFETY: a test.\n"
+        "    if let Some(x) = unsafe { g() } {\n"
+        "        a();\n"
+        "        b();\n"
+        "    }\n"
+        "}\n",
+        1,
+    ),
+    (
+        "fn f() {\n"
+        "    // SAFETY: a test.\n"
+        "    let y = unsafe { g() };\n"
+        "    a();\n"
+        "    b();\n"
+        "}\n",
+        1,
+    ),
+    (
+        "fn f() {\n"
+        "    // SAFETY: a test.\n"
+        "    unsafe {\n"
+        "        if x {\n"
+        "            y();\n"
+        "        }\n"
+        "        z();\n"
+        "    }\n"
+        "    after();\n"
+        "}\n",
+        6,
+    ),
+    (
+        "fn f() {\n"
+        "    // SAFETY: a test.\n"
+        "    unsafe { foo(|| {\n"
+        "        bar()\n"
+        "    }) }\n"
+        "    after();\n"
+        "}\n",
+        3,
+    ),
+]
+
+
+def self_test() -> int:
+    """Check the scanner against hand-counted sources. Exits non-zero on any miss."""
+    bad = 0
+    for index, (source, expected) in enumerate(SELF_TEST):
+        got, _ = scan(source)
+        if got != expected:
+            print(f"  {RED}FAIL{RESET}  self-test {index}: counted {got}, expected {expected}")
+            bad += 1
+    if bad:
+        print(f"  {RED}FAIL{RESET}  the unsafe scanner miscounts {bad} of {len(SELF_TEST)} cases")
+        return 1
+    print(f"  {GREEN}ok{RESET}    the unsafe scanner counts {len(SELF_TEST)} hand-checked shapes correctly")
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", action="store_true", help="print the table, always exit 0")
+    parser.add_argument("--self-test", action="store_true", help="check the scanner itself")
     args = parser.parse_args()
+    if args.self_test:
+        return self_test()
 
     status = 0
     rows = []

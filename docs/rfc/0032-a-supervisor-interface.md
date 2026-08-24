@@ -554,6 +554,18 @@ pattern is worth naming: *a counter whose name is a sentence about intent
 rather than about a distinguishable event will eventually be measured by
 someone who needs the distinction.*
 
+> **Every kernel `unsafe` figure in this document was taken with a scanner that
+> over-counted, and they are left as they were rather than rewritten.**
+> `tools/check-unsafe-budget.py` took a whole line's brace balance, so a line
+> that both closed an `unsafe` block and opened another read as still-open and
+> charged the outer block's body to the crate. Measured at this document's own
+> tree (`9c893b3`, 2026-08-20) after the fix of 2026-08-24: **1,510 by the old
+> scanner, 1,368 by the corrected one — an over-count of 142.** The *deltas*
+> below are still sound, because every number in a delta was taken the same
+> way; the absolutes were about ten percent high. Today's figures are on the
+> corrected scale, so the kernel's real growth since this RFC is 1,368 → 1,759
+> and not the 1,506 → 2,167 a naive comparison would show.
+
 **The kernel's `unsafe` budget went down while this was added**: 1,514 to
 1,512. The memory calls left with their `uaccess` copies, and handing a fault
 to ring 3 needs one `unsafe` line — the `enable_interrupts` above. A

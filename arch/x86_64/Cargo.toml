@@ -129,7 +129,12 @@ asm_budget = 37
 # the old code's two early returns left the port wired to itself. Every line is
 # an I/O port access; the *decision* those lines feed is a pure function tested
 # on the host, and holds no `unsafe` at all.
-unsafe_budget = 1169
+# 1157 on 2026-08-24, and **not one unsafe operation was deleted**: the
+# budget check was over-counting by 12 lines here. It took a whole line's
+# brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
+# charged the outer block's body to this crate. See the changelog; the
+# scanner now walks from the block's own brace and has a self-test.
+unsafe_budget = 1157
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

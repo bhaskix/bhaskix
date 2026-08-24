@@ -76,4 +76,9 @@ asm_budget = 4
 # 161 at step 5: forward_tcp6's ring writes and doorbell (the v4 forward's
 # shape, second record format), and the back ring's v6 arm -- the loopback
 # reinjection and the routed send. Every line a twin of an existing one.
-unsafe_budget = 161
+# 156 on 2026-08-24, and **not one unsafe operation was deleted**: the
+# budget check was over-counting by 5 lines here. It took a whole line's
+# brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
+# charged the outer block's body to this crate. See the changelog; the
+# scanner now walks from the block's own brace and has a self-test.
+unsafe_budget = 156

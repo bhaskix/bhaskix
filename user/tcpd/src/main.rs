@@ -983,9 +983,12 @@ fn refuse(service: &mut Service, parsed: &Segment<'_>, source: Address, destinat
     let Ok(written) = segment::write(&mut bytes, &built, destination, source) else {
         return;
     };
-    // Hoisted out of the `if` on purpose: `tools/check-unsafe-budget.py` is a
-    // line scanner and charges a trailing brace's whole block to the budget,
-    // so `if unsafe { .. } {` would bill this function's tail as unsafe.
+    // Hoisted out of the `if`, and the reason changed the same day. It was
+    // written this way to appease `tools/check-unsafe-budget.py`, which charged
+    // a trailing brace's whole block to the budget -- **that was a defect in
+    // the instrument and is fixed**, so the contortion is no longer required.
+    // It stays because a named `sent` reads better than a condition with a
+    // system call inside it, which is a reason that does not depend on a tool.
     // SAFETY: the back ring, mapped writable at `BACK_AT` -- the same ring
     // every other segment this program sends leaves through.
     let sent = unsafe { send_entry(destination, source, &bytes[..written]) };

@@ -107,8 +107,11 @@ disagree later.
 `NoListener`, `SlotBusy`, `NotOurs`. Only `NoListener` is refused on the wire.
 The reply's four-tuple is the arriving segment's, swapped, and it goes out
 through the same `send_entry` every other segment uses. **One line of `unsafe`**,
-hoisted into its own `let` because `tools/check-unsafe-budget.py` is a line
-scanner and would otherwise bill the function's tail; `unsafe_budget` 105 → 106.
+hoisted into its own `let` — originally to appease `tools/check-unsafe-budget.py`,
+which billed the function's tail because it took a whole line's brace balance.
+**That was a defect in the instrument, found by this contortion and fixed the
+same day**; the hoist stays on its own merits. `unsafe_budget` 105 → 106, and
+then 106 → 104 when the corrected scanner stopped counting two phantom lines.
 
 ### Failure behaviour
 

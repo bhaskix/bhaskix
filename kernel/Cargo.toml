@@ -459,7 +459,12 @@ asm_budget = 10
 # 2167 at RFC 0046 step 6b, 2026-08-24: +1, for the self-test that asks the AHCI
 # service for a sector -- one direct-map read of the frame the service filled,
 # which is how the *contents* are checked rather than the byte count.
-unsafe_budget = 2167
+# 1759 on 2026-08-24, and **not one unsafe operation was deleted**: the
+# budget check was over-counting by 408 lines here. It took a whole line's
+# brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
+# charged the outer block's body to this crate. See the changelog; the
+# scanner now walks from the block's own brace and has a self-test.
+unsafe_budget = 1759
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
