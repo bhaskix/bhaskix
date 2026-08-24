@@ -753,6 +753,36 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         status=1
     fi
 
+    # RFC 0046 step 4: the first command this system has ever issued to a SATA
+    # device, and the first thing a disk has said about itself.
+    #
+    # The signature gate comes first because it is what makes the identify gate
+    # meaningful. `q35` puts the boot CD on this same controller and an ATAPI
+    # device **aborts IDENTIFY DEVICE by specification** -- so a driver that
+    # issued it blind would read the specification out of an error code, which
+    # is exactly what happened on the first boot of step 4. `devices.sh` puts a
+    # real disk on port 0 and leaves the CD on port 2, so the machine has one of
+    # each and the driver has to tell them apart.
+    if grep -qaE 'ahci port [0-9]+ +started; signature 0x00000101 -- a SATA disk' "$LOG"; then
+        pass "a started port's signature identifies a SATA disk rather than the boot CD"
+    else
+        fail "no port was started, or its device was not identified as a disk"
+        grep -a "ahci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
+    # And the disk answered. Non-zero sectors and a sector size of at least 512
+    # rather than exact numbers: the geometry is the image's and may change, but
+    # zero of either means the 512 bytes were never read or were read from the
+    # wrong place.
+    if grep -qaE 'ahci identify +the disk answered: [1-9][0-9]* sectors of [5-9][0-9]{2,} bytes' "$LOG"; then
+        pass "IDENTIFY DEVICE is issued and the disk answers with its own geometry"
+    else
+        fail "IDENTIFY DEVICE was not answered"
+        grep -a "ahci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
     # The driver holds a window. Separate again: the bring-up above would work
     # just as well without one, and this is what says the controller it drives
     # is contained.

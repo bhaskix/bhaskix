@@ -451,7 +451,12 @@ asm_budget = 10
 # answers, and the direct-map reads of the report the driver leaves behind. The
 # driver itself sits at 22, because the arithmetic it runs on lives in
 # `bhaskix-ahci` under `forbid(unsafe_code)`.
-unsafe_budget = 2165
+# 2166 at RFC 0046 step 4, 2026-08-24: +1, for `pci::enable` -- bus mastering,
+# granted only behind a window. Step 3b left it out and said so; step 4 issues a
+# command, and a controller that cannot master the bus cannot fetch its own
+# command list. On QEMU that was not a clean refusal but a machine with no
+# console output at all.
+unsafe_budget = 2166
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

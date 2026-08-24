@@ -9120,11 +9120,9 @@ pub fn start_ahci_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     };
     let address = bhaskix_arch::pci::Address::new(bus, device, function);
 
-    // Memory space, so the register file answers. **Bus mastering is
-    // deliberately not enabled**, here or anywhere in this step: nothing is
-    // issued, so nothing does DMA, and a controller that cannot master the bus
-    // cannot reach memory however wrong the rest of this is. It is granted when
-    // there is a command to run and a window to run it behind.
+    // Memory space, so the register file answers. Bus mastering is **not**
+    // enabled here: `enable_memory` clears it on purpose, and it is granted
+    // below only once there is a window to bound what the controller can reach.
     // SAFETY: this device belongs to nobody -- this kernel has no AHCI driver,
     // and step 2 already cleared its bus-master bit.
     unsafe { bhaskix_arch::pci::enable_memory(address) };
@@ -9227,6 +9225,28 @@ pub fn start_ahci_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
         println!(
             "\x1b[93m    ahci domain    no dma window: nothing would contain the controller, so \
              the driver gets registers and no way to make it read\x1b[0m"
+        );
+    }
+
+    // **Bus mastering, and only behind a window.** Step 3b left this out and
+    // said so: nothing was issued, so nothing needed to reach memory. Step 4
+    // issues a command, and a controller that cannot master the bus cannot
+    // fetch its own command list -- which on QEMU is not a clean refusal but a
+    // port told to run with no way to run, and it took the machine down with no
+    // console output at all. Three boots looked like a hung driver.
+    //
+    // Granted only when `contained`, which is stricter than the virtio paths:
+    // they enable it unconditionally and rely on the window being granted
+    // first. Here the device either translates or never masters the bus.
+    if contained {
+        // SAFETY: this controller is the ahci domain's, nothing else in this
+        // kernel drives it, and a window is installed for it -- so a stray DMA
+        // with whatever the firmware left reaches nothing it was not given and
+        // arrives as a fault rather than as somebody else's memory.
+        unsafe { bhaskix_arch::pci::enable(address) };
+        println!(
+            "    ahci domain    bus mastering enabled behind that window; nothing it fetches \
+             can leave it"
         );
     }
 
@@ -11264,10 +11284,26 @@ fn report_ahci_domain(hhdm: u64) -> bool {
     let word = |index: usize| unsafe { core::ptr::read_volatile((base as *const u64).add(index)) };
 
     if word(0) != AHCID_MARKER {
-        println!(
-            "\x1b[91m    ahci domain    the driver left no report; it did not reach its own \
-             last line\x1b[0m"
-        );
+        // **Which stage it stopped at, because "no report" is a dead end.** The
+        // driver writes this as it goes rather than at the end, so a hang and a
+        // fault and a program that never started are three different answers
+        // instead of one. Step 4 spent two boots not knowing which it had.
+        let where_it_stopped = match word(12) {
+            // One answer and not three, because recording a stage means
+            // writing to this memory: nothing before the attach can be
+            // recorded. The first attempt put a stage above the attach and
+            // faulted on it immediately.
+            0 => "it never ran, could not map its registers, or could not reach its own memory",
+            1 => "it mapped everything and the window would not answer",
+            2 => "it was in the bring-up",
+            3 => "it finished the bring-up and stopped before starting a port",
+            4 => "it started a port and stopped before building a command",
+            5 => "it built a command and stopped before issuing it",
+            6 => "it issued a command and never came back",
+            7 => "the command came back and it stopped before reporting",
+            _ => "somewhere this kernel has no name for",
+        };
+        println!("\x1b[91m    ahci domain    the driver left no report: {where_it_stopped}\x1b[0m");
         return false;
     }
 
@@ -11321,6 +11357,10 @@ fn report_ahci_domain(hhdm: u64) -> bool {
     // One line per port, and the three `DET` values are not flattened into two:
     // an empty port and a port whose link will not come up are different things
     // to whoever is standing at the machine.
+    println!(
+        "    ahci dma       the driver's memory is at {:#x} as the controller sees it",
+        word(10)
+    );
     let ports = word(8) as usize;
     let mut disks = 0usize;
     for index in 0..ports.min(bhaskix_ahci::MAX_PORTS) {
@@ -11363,8 +11403,96 @@ fn report_ahci_domain(hhdm: u64) -> bool {
             "\x1b[93m    ahci domain    brought up with no dma window; nothing may be issued \
              to it, which is RFC 0012's rule and not a shortcoming\x1b[0m"
         );
+        return true;
     }
-    let _ = disks;
+
+    // RFC 0046 step 4: what the disk said about itself, which is the first
+    // thing this system has ever heard from a SATA device.
+    // What the started port's device turned out to be. Printed whether or not
+    // a command followed, because "there is a device and it is not a disk" is a
+    // different fact from "nothing answered" and both look like silence.
+    if word(13) != u64::MAX {
+        let sig = word(11) as u32;
+        let what = match bhaskix_ahci::device_kind(sig) {
+            bhaskix_ahci::DeviceKind::Disk => "a SATA disk",
+            bhaskix_ahci::DeviceKind::Packet => {
+                "an ATAPI device -- a CD or DVD, which answers IDENTIFY PACKET DEVICE and \
+                 aborts IDENTIFY DEVICE by specification"
+            }
+            bhaskix_ahci::DeviceKind::PortMultiplier => "a port multiplier",
+            bhaskix_ahci::DeviceKind::Enclosure => "an enclosure management bridge",
+            bhaskix_ahci::DeviceKind::Unknown(_) => "a device this driver has no name for",
+        };
+        println!(
+            "    ahci port {}    started; signature {sig:#010x} -- {what}",
+            word(13)
+        );
+    }
+
+    match word(48) {
+        0 if disks == 0 => println!(
+            "    ahci           no port has a disk, so nothing was asked; the controller is up \
+             and idle"
+        ),
+        0 if word(13) != u64::MAX
+            && bhaskix_ahci::device_kind(word(11) as u32) != bhaskix_ahci::DeviceKind::Disk =>
+        {
+            println!(
+                "    ahci identify  not asked: the device on that port is not a disk, so \
+                 IDENTIFY DEVICE does not apply to it"
+            );
+        }
+        0 => println!(
+            "\x1b[91m    ahci identify  FAILED: {disks} port(s) hold a device and none was \
+             asked\x1b[0m"
+        ),
+        1 => {
+            // **The sector count is a number the device chose**, and it is
+            // printed beside the size it was multiplied by rather than only as
+            // a capacity -- so a disk answering something absurd is visible as
+            // the two numbers it answered rather than as one product.
+            let sectors = word(49);
+            let bytes = word(50);
+            // KiB rather than MiB. The first disk this ever ran against is
+            // 256 KiB, which printed as "0 MiB" -- a true number that reads as
+            // a failure, and the last thing a first result should do.
+            println!(
+                "    ahci identify  the disk answered: {sectors} sectors of {bytes} bytes \
+                 ({} KiB), {}-bit addressing",
+                sectors.saturating_mul(bytes) / 1024,
+                if word(51) == 1 { 48 } else { 28 }
+            );
+        }
+        _ => {
+            let why = match (word(49), word(50)) {
+                (1, _) => "the command never completed",
+                (2, 0) => "the controller finished the slot while the device was still busy",
+                (2, error) => {
+                    // ATA's error register says *what*, and throwing that away
+                    // would discard the only diagnosis the disk offered.
+                    println!(
+                        "\x1b[91m    ahci identify  FAILED: the device refused it, error \
+                         {error:#04x}\x1b[0m"
+                    );
+                    return false;
+                }
+                (3, bits) => {
+                    // A bus error on a *translated* device is what a missing
+                    // mapping looks like. Named apart from a refusal so nobody
+                    // is sent to the disk for a window's problem.
+                    println!(
+                        "\x1b[91m    ahci identify  FAILED: a host bus error, {bits:#010x} -- on \
+                         a translated controller this is what an unmapped address looks \
+                         like\x1b[0m"
+                    );
+                    return false;
+                }
+                _ => "the driver refused a slot or a port it was not given",
+            };
+            println!("\x1b[91m    ahci identify  FAILED: {why}\x1b[0m");
+            return false;
+        }
+    }
     true
 }
 
@@ -13388,9 +13516,14 @@ extern "C" fn ahci_domain_entry(hhdm_base: u64) -> ! {
     unsafe { vm::install(space) };
 
     // The cycle counter's rate, because a program in ring 3 cannot calibrate
-    // one and every deadline in the bring-up needs it. Zero on a machine with
-    // no calibrated counter, which `now_nanos` answers with a clock that never
-    // advances -- so the first wait refuses rather than the driver hanging.
+    // one and every deadline in the bring-up needs it.
+    //
+    // **This comment said the wrong thing until 2026-08-24.** It claimed that a
+    // zero rate left `now_nanos` answering a clock that never advances "so the
+    // first wait refuses rather than the driver hanging". The opposite: a clock
+    // that never advances makes `now - started >= budget` unreachable, so every
+    // bounded wait becomes unbounded. Step 4's first boot hung on exactly that.
+    // The driver now falls back to the raw cycle count, which always moves.
     let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
     let rsp = AHCID_STACK + AHCID_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
     // SAFETY: `entry` is inside a user-executable segment of the space just

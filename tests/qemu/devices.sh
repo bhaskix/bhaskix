@@ -38,6 +38,10 @@ qemu_device_list() {
     local profile="$1"
     local translated="${2:-no}"
     local suffix=""
+    # Derived from this file's own location rather than taken from the harness,
+    # so a drive declared here needs nothing of whoever sources it.
+    local sata_disk
+    sata_disk="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/build/sata-disk.img"
 
     MACHINE="q35"
     IOMMU_ARGS=()
@@ -140,6 +144,29 @@ qemu_device_list() {
                 # i8042 is the only keyboard, which is the only machine on which
                 # it can be tested at all.
                 -device usb-kbd,bus=xhci0.0
+                # RFC 0046 step 4: a real SATA disk on the machine's own AHCI
+                # controller.
+                #
+                # **Its `-drive` is here too, and that is the point.** This file
+                # exists because two harnesses' device lists drifted; a `-device`
+                # here whose `-drive` lives over there is the same bug wearing a
+                # different hat. It was added to `boot-test.sh` alone, and
+                # `shell-test.sh` then booted a machine QEMU refused outright --
+                # `Property 'ide-hd.drive' can't find value 'sata0'` -- so the
+                # shell never started and fifty-two checks failed for a reason
+                # none of them named. Keeping the pair in one place is what makes
+                # that impossible rather than documented.
+                #
+                # **`bus=ide.0` is load-bearing, for the same reason
+                # `bus=xhci0.0` is.** q35's `ich9-ahci` is built in, and QEMU
+                # maps `-cdrom` onto it at index 2 -- which is why the first
+                # device this driver ever found was on port 2 and was ATAPI.
+                # Unqualified, this disk would land on whichever port QEMU
+                # picked next; named, it is port 0 and the CD stays on port 2,
+                # so the driver meets a disk and a not-disk on one machine and
+                # has to tell them apart.
+                -drive "file=$sata_disk,format=raw,if=none,id=sata0"
+                -device ide-hd,drive=sata0,bus=ide.0
             )
             ;;
         usb)

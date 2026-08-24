@@ -45,10 +45,34 @@ const MEMORY: u64 = 2;
 /// at memory.
 const WINDOW: u64 = 3;
 
+/// What the started port's device said it is, and which port it was.
+static SIGNATURE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Where the window said this program's memory is, as the controller sees it.
+///
+/// Reported because it is the number every structure below is built from, and
+/// because a driver in a domain cannot be asked what it thinks afterwards.
+static DEVICE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Where the register file goes in this program's address space.
 const ABAR_AT: u64 = 0x2000_0000;
 /// Where its own memory goes.
 const MEMORY_AT: u64 = 0x2010_0000;
+/// Where the command list sits: the start of page zero.
+///
+/// 1 KiB and 1 KiB aligned, which a page boundary gives for nothing. The
+/// received-FIS area follows it at 0x400 -- 256-aligned, as it must be -- and
+/// the two do not overlap because the list is exactly 1 KiB.
+const LIST_AT: u64 = 0;
+/// The received-FIS area, which the controller writes and this program reads.
+const FIS_AT: u64 = 0x400;
+/// The command table: page one, so its 128-byte alignment is free.
+const TABLE_AT: u64 = 0x1000;
+/// Where `IDENTIFY`'s 512 bytes land: page two, alone, because it is the one
+/// buffer a *device* writes and nothing else may share a page with it.
+const BUFFER_AT: u64 = 0x2000;
+
 /// Where in it the report sits: the **last** of the four pages.
 ///
 /// Every earlier one becomes a command list, a received-FIS area or a data
@@ -69,6 +93,37 @@ const SETTLE_NS: u64 = 5_000_000_000;
 /// A word the kernel looks for, so a zeroed page is not mistaken for a report
 /// nobody wrote. `AHCIRPT1` in ASCII.
 const MARKER: u64 = 0x4148_4349_5250_5431;
+
+/// Where the driver leaves how far it got, **written as it goes**.
+///
+/// The marker at word zero says "there is a finished report here"; this says
+/// "this is where I am". Without it a driver that hangs or faults is
+/// indistinguishable from one that never started, and step 4's first boot spent
+/// two boots being exactly that. A zeroed page reads stage 0, which is
+/// "never ran" and is the truth.
+const STAGE_AT: usize = 12;
+
+/// Mapped its registers and its memory.
+///
+/// **The first stage there can be, and that is not a choice.** Recording a
+/// stage means writing to this memory, so nothing before the attach can be
+/// recorded -- which is why "never ran", "could not map its registers" and
+/// "could not reach its own memory" are one answer rather than three. The first
+/// attempt put a stage above this one and faulted on it immediately, which is
+/// the mistake this paragraph exists to stop somebody repeating.
+const STAGE_ATTACHED: u64 = 1;
+/// Asked the window for a device address.
+const STAGE_MAPPED: u64 = 2;
+/// Finished the bring-up, one way or the other.
+const STAGE_BROUGHT_UP: u64 = 3;
+/// Started a port.
+const STAGE_PORT_STARTED: u64 = 4;
+/// Built the command.
+const STAGE_BUILT: u64 = 5;
+/// Issued it, and is waiting.
+const STAGE_ISSUED: u64 = 6;
+/// The command came back.
+const STAGE_ANSWERED: u64 = 7;
 
 /// Issues one system call, and returns `(status, value)`.
 fn call(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> (u64, u64) {
@@ -118,16 +173,31 @@ fn rdtsc() -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
-/// Monotonic nanoseconds.
+/// Monotonic nanoseconds, and **it must always advance**.
 ///
 /// 128-bit intermediate for the reason `bin/tcpd` gives: `tsc * 1_000_000_000`
 /// overflows a `u64` eighteen seconds after reset on a gigahertz counter, and a
 /// clock that wraps during boot fires every armed deadline at once.
+///
+/// # Why a zero rate is not answered with zero
+///
+/// `bin/tcpd` answers zero, and can: it falls back to a yield. A driver cannot.
+/// Every wait in `bhaskix-ahci` is `now - started >= budget`, so a clock stuck
+/// at zero makes every deadline unreachable and turns each bounded wait into a
+/// **hang** -- which is exactly what happened on the first boot of step 4, and
+/// which the comment in this program's own trampoline claimed would not.
+///
+/// So an uncalibrated counter falls back to the raw cycle count read as though
+/// one cycle were one nanosecond. The scale is wrong and the direction of the
+/// error is the safe one: on any real machine a cycle is well under a
+/// nanosecond, so the deadline fires *early*. An early refusal is a report; a
+/// clock that never moves is a machine that never finishes booting.
 fn now_nanos(hertz: u64) -> u64 {
+    let ticks = rdtsc();
     if hertz == 0 {
-        return 0;
+        return ticks;
     }
-    (u128::from(rdtsc()) * 1_000_000_000 / u128::from(hertz)) as u64
+    (u128::from(ticks) * 1_000_000_000 / u128::from(hertz)) as u64
 }
 
 /// The controller's register file, as a mapping this program was given.
@@ -168,11 +238,22 @@ impl Registers for Abar {
     }
 }
 
+/// Records how far this program has got, for a kernel that finds no report.
+fn stage(which: u64) {
+    // SAFETY: inside the four pages this program holds and mapped writable, in
+    // the last of them, at a fixed index well inside the page.
+    unsafe { core::ptr::write_volatile((REPORT_AT as *mut u64).add(STAGE_AT), which) };
+}
+
 /// Leaves the findings where the kernel reads them.
 ///
 /// The marker last, with a fence before it, so a kernel that sees the marker
 /// sees everything under it.
-fn report(up: Result<ahci::Started, ahci::NotUp>, translated: bool) {
+fn report(
+    up: Result<ahci::Started, ahci::NotUp>,
+    translated: bool,
+    identity: Option<Result<ahci::Identity, ahci::Failed>>,
+) {
     // One word, one `unsafe`, so the report below is ordinary code.
     //
     // `bin/blkd` writes its report inside a single block spanning forty lines,
@@ -200,6 +281,12 @@ fn report(up: Result<ahci::Started, ahci::NotUp>, translated: bool) {
                 put(7, u64::from(started.took_from_firmware));
                 put(8, started.port_count as u64);
                 put(9, u64::from(translated));
+                put(10, DEVICE_BASE.load(core::sync::atomic::Ordering::Relaxed));
+                put(
+                    11,
+                    u64::from(SIGNATURE.load(core::sync::atomic::Ordering::Relaxed)),
+                );
+                put(13, PORT.load(core::sync::atomic::Ordering::Relaxed));
                 // One word per port: index, DET, IPM and signature packed so
                 // the kernel prints what the controller said rather than what
                 // this program concluded.
@@ -232,6 +319,29 @@ fn report(up: Result<ahci::Started, ahci::NotUp>, translated: bool) {
                 put(9, u64::from(translated));
             }
         }
+        // What the disk said about itself, or why it did not. Words 48 up, so
+        // the per-port block below 48 can grow to all thirty-two without
+        // moving this.
+        match identity {
+            None => put(48, 0),
+            Some(Ok(disk)) => {
+                put(48, 1);
+                put(49, disk.sectors);
+                put(50, disk.sector_bytes as u64);
+                put(51, u64::from(disk.lba48));
+            }
+            Some(Err(why)) => {
+                put(48, 2);
+                let (kind, detail) = match why {
+                    ahci::Failed::TimedOut => (1u64, 0u64),
+                    ahci::Failed::Device(error) => (2, u64::from(error)),
+                    ahci::Failed::Bus(bits) => (3, u64::from(bits)),
+                    ahci::Failed::NoSuchSlot => (4, 0),
+                };
+                put(49, kind);
+                put(50, detail);
+            }
+        }
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         put(0, MARKER);
     }
@@ -253,21 +363,155 @@ extern "C" fn ahcid_main(hertz: u64) -> ! {
         // Nothing can be said and nowhere to say it.
         exit();
     }
+    stage(STAGE_ATTACHED);
 
     // The window is not used at this step -- nothing is issued, so nothing does
     // DMA -- but whether it exists is the difference between a controller this
     // driver could later drive and one it must refuse. `MAP` is the only
     // question that can be asked of it from here.
-    let translated = call(syscall::INVOKE, WINDOW, method::MAP, [MEMORY, 0, 0, 0]).0 == status::OK;
+    let (mapped, device_base) = call(syscall::INVOKE, WINDOW, method::MAP, [MEMORY, 0, 0, 0]);
+    let translated = mapped == status::OK;
+    DEVICE_BASE.store(device_base, core::sync::atomic::Ordering::Relaxed);
+    stage(STAGE_MAPPED);
 
     let mut registers = Abar {
         base: ABAR_AT,
         length: if high { 0x2000 } else { 0x1000 },
     };
-    let mut clock = || now_nanos(hertz);
+    // **The clock yields, and that is not decoration.** RFC 0046 chose polling
+    // before interrupts on purpose, and a polling loop in ring 3 that never
+    // yields does not merely waste a CPU: pinned to the same one the boot
+    // thread is on, it starves it, and the kernel's own three-second wait for
+    // this driver's report never gets to run. Step 4 spent three boots looking
+    // like a hung *driver* when what was hung was everything else on that CPU.
+    //
+    // Every deadline check in `bhaskix-ahci` calls this, so putting the yield
+    // here puts one in every wait the crate has, without the crate -- which is
+    // `no_std` and holds no capability -- needing to know a system call exists.
+    let mut clock = || {
+        call(syscall::YIELD, 0, 0, [0; 4]);
+        now_nanos(hertz)
+    };
     let up = ahci::bring_up(&mut registers, &mut clock, SETTLE_NS);
-    report(up, translated);
+    stage(STAGE_BROUGHT_UP);
+
+    // **Report the bring-up before issuing anything.** Said once so it is not
+    // rediscovered: a driver that reports only at the end tells you nothing
+    // when the thing it does in between is what fails, and the kernel's reader
+    // then has a zeroed page and no way to say why. Step 4 spent three boots
+    // in exactly that position. This report is overwritten below with the
+    // identity when there is one; the stage word carries how far it got either
+    // way.
+    report(up, translated, None);
+
+    // RFC 0046 step 4: the first command, on the first port that has a disk.
+    //
+    // Only with a window. Every structure below is an address the *controller*
+    // reads, and without a translation this program cannot name one -- which is
+    // the refusal RFC 0012 asks for and not a shortcoming. A driver that
+    // guessed would be aiming a bus master with numbers that mean nothing.
+    let identity = match (&up, translated) {
+        (Ok(started), true) => identify(&mut registers, started, &mut clock, device_base),
+        _ => None,
+    };
+
+    report(up, translated, identity);
     exit()
+}
+
+/// Asks the first port with a disk on it what that disk is.
+///
+/// Returns `None` when there is no such port, which is not a failure: five of
+/// six ports being empty is what a machine looks like.
+fn identify(
+    registers: &mut Abar,
+    started: &ahci::Started,
+    clock: &mut impl FnMut() -> u64,
+    device_base: u64,
+) -> Option<Result<ahci::Identity, ahci::Failed>> {
+    let port = started.ports().find(|port| port.has_device())?.index as usize;
+
+    // The structures, at addresses the controller sees. `device_base` is what
+    // `MAP` answered for this program's memory; the offsets are the same ones
+    // it mapped for itself, so the two views agree by construction rather than
+    // by a second calculation that could disagree.
+    if ahci::start_port(
+        registers,
+        started,
+        port,
+        device_base + LIST_AT,
+        device_base + FIS_AT,
+    )
+    .is_err()
+    {
+        return Some(Err(ahci::Failed::NoSuchSlot));
+    }
+    stage(STAGE_PORT_STARTED);
+
+    // **What kind of device this is, before asking it anything.** `PxSIG` is
+    // only meaningful now that the port is started and the device has sent its
+    // first D2H FIS. `IDENTIFY DEVICE` is *aborted* by an ATAPI device -- the
+    // specification says so -- and QEMU's `q35` puts the boot CD on this very
+    // controller, so issuing it blind means reading the specification out of an
+    // error code.
+    let sig = ahci::read_signature(registers, port);
+    SIGNATURE.store(sig, core::sync::atomic::Ordering::Relaxed);
+    PORT.store(port as u64, core::sync::atomic::Ordering::Relaxed);
+    if ahci::device_kind(sig) != ahci::DeviceKind::Disk {
+        // Not a failure. A machine whose only SATA device is its boot CD is a
+        // normal machine, and saying "there is no disk here" beats issuing a
+        // command that cannot apply and reporting its refusal.
+        return None;
+    }
+
+    // Slot zero. One command outstanding at a time, which is all a driver with
+    // no queue needs and all RFC 0046 asks for before NCQ is measured.
+    // SAFETY: two disjoint windows inside the four pages this program holds and
+    // mapped writable -- the list at page zero and the table at page one, whose
+    // sizes are the crate's own constants and both under a page. Nothing else
+    // in this program aliases either.
+    let list = unsafe {
+        core::slice::from_raw_parts_mut((MEMORY_AT + LIST_AT) as *mut u8, ahci::COMMAND_LIST_BYTES)
+    };
+    // SAFETY: as above, page one.
+    let table = unsafe {
+        core::slice::from_raw_parts_mut(
+            (MEMORY_AT + TABLE_AT) as *mut u8,
+            ahci::PRDT_AT + ahci::PRD_BYTES,
+        )
+    };
+    if ahci::build_command(
+        list,
+        table,
+        0,
+        ahci::Ata::identify(),
+        ahci::Where {
+            table: device_base + TABLE_AT,
+            buffer: device_base + BUFFER_AT,
+            bytes: ahci::IDENTIFY_BYTES,
+        },
+    )
+    .is_err()
+    {
+        return Some(Err(ahci::Failed::NoSuchSlot));
+    }
+    stage(STAGE_BUILT);
+
+    stage(STAGE_ISSUED);
+    if let Err(why) = ahci::run(registers, port, 0, clock, SETTLE_NS) {
+        return Some(Err(why));
+    }
+    stage(STAGE_ANSWERED);
+
+    // 512 bytes a *device* wrote. `read_identity` is the crate's untrusted-input
+    // parser and the one with a fuzz target, for exactly this reason.
+    // SAFETY: page two, which this program holds, and which the controller has
+    // just finished writing -- `run` returned `Ok`, which is the only thing
+    // that says the device is no longer busy with it.
+    let answered = unsafe {
+        core::slice::from_raw_parts((MEMORY_AT + BUFFER_AT) as *const u8, ahci::IDENTIFY_BYTES)
+    };
+    Some(ahci::read_identity(answered).map_err(|_| ahci::Failed::Device(0)))
 }
 
 /// Stops where the kernel can see it.

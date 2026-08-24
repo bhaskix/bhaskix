@@ -56,5 +56,21 @@ asm_budget = 4
 # what it cost rather than spending headroom nobody reviewed. If this number
 # climbs by more than a few lines a step, logic has moved out of the crate the
 # tests can reach and into the one they cannot.
-unsafe_budget = 22
+# **35 at RFC 0046 step 4, 2026-08-24: +13.** The `exact` budget did its job on
+# the first step that had to spend it, so here is the bill:
+#
+#   - the three raw slices over this program's own memory -- the command list,
+#     the command table, and the 512 bytes a *device* writes into. Nine lines of
+#     the thirteen, and each one is a window whose length is a constant from
+#     `bhaskix-ahci` rather than a number written here.
+#   - the stage word, which records how far this program got. Its own line and
+#     worth every byte: without it a driver that hangs and a driver that never
+#     ran are the same silence, and step 4 spent three boots not knowing which
+#     it had.
+#   - two atomics' worth of reporting, which are safe, and the `rdtsc` the
+#     deadlines already paid for.
+#
+# What did **not** grow: nothing that decides an offset, an order or a bound.
+# `build_command`, `run` and `device_kind` are all in the crate the tests reach.
+unsafe_budget = 35
 unsafe_budget_exact = true

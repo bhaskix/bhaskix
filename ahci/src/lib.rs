@@ -68,6 +68,12 @@ pub enum Error {
     TooManyRegions,
     /// A device's answer that does not describe a usable disk.
     NotADisk,
+    /// A sector count of zero, which ATA reads as sixty-five thousand.
+    NoSectors,
+    /// A slot number this controller does not have.
+    NoSuchSlot,
+    /// A structure at an address the controller would silently round down.
+    Misaligned,
 }
 
 /// The ATA commands this driver issues, and no others.
@@ -98,15 +104,28 @@ pub mod fis {
 /// checks a value whose halves differ, because an LBA of zero passes either
 /// way.
 ///
-/// `count` is sectors, and zero means 65,536 in ATA — this refuses it rather
-/// than sending a request whose size is the opposite of what it looks like.
+/// `count` is sectors, and **zero means 65,536 in ATA** -- so this refuses it
+/// rather than sending a request whose size is the opposite of what it looks
+/// like. A caller wanting no transfer at all is asking for a command with no
+/// data, and those carry a count of one that the device ignores.
+///
+/// **This paragraph was here from step 1 and the check was not**, found while
+/// writing step 4 -- the one place that had to pass a zero. A doc that promises
+/// a refusal the code does not make is worse than neither, because the next
+/// caller reads it and believes it. RFC 0046's own rule, and
+/// `docs/coding-style.md`'s: if code and a document disagree, one of them is a
+/// bug and both are fixed in the same change.
 ///
 /// # Errors
 ///
-/// [`Error::TooSmall`] if `out` is shorter than [`H2D_FIS_BYTES`].
+/// [`Error::TooSmall`] if `out` is shorter than [`H2D_FIS_BYTES`];
+/// [`Error::NoSectors`] for a count of zero.
 pub fn write_h2d(out: &mut [u8], ata: u8, lba: u64, count: u16) -> Result<(), Error> {
     if out.len() < H2D_FIS_BYTES {
         return Err(Error::TooSmall);
+    }
+    if count == 0 {
+        return Err(Error::NoSectors);
     }
     out[..H2D_FIS_BYTES].fill(0);
     out[0] = fis::REGISTER_H2D;
@@ -714,6 +733,286 @@ pub fn start_port<R: Registers>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// RFC 0046 step 4: issuing one command, and reading what the disk answers.
+//
+// The same caveat as the bring-up above: these register offsets and bits come
+// from recall, not from a source on this machine. Step 3b's boot confirmed the
+// generic host control block and the port block as far as `SSTS`; `PxCI`,
+// `PxIS`, `PxTFD` and `PxSERR` are checked the first time a command completes,
+// which is what step 4's gate watches.
+// ---------------------------------------------------------------------------
+
+/// `PxTFD` fields -- the device's own status and error bytes.
+pub mod tfd {
+    /// The device is busy. Set while it has the command.
+    pub const BSY: u32 = 1 << 7;
+    /// Data request: it wants a transfer.
+    pub const DRQ: u32 = 1 << 3;
+    /// **Error.** The command failed and `PxTFD`'s high byte says why.
+    pub const ERR: u32 = 1 << 0;
+    /// Where the error byte lives.
+    pub const ERROR_SHIFT: u32 = 8;
+}
+
+/// `PxIS` and `PxSERR` bits this driver reads.
+pub mod interrupt {
+    /// Task file error. The command completed and the device refused it.
+    pub const TFES: u32 = 1 << 30;
+    /// Host bus fatal error -- a DMA that could not be completed.
+    pub const HBFS: u32 = 1 << 29;
+    /// Host bus data error.
+    pub const HBDS: u32 = 1 << 28;
+    /// Interface fatal error.
+    pub const IFS: u32 = 1 << 27;
+}
+
+/// What kind of device answered on a port, from `PxSIG`.
+///
+/// **Read before a command is issued, not after it fails.** `IDENTIFY DEVICE`
+/// is *aborted* by an ATAPI device -- that is the specification, not a fault --
+/// and a driver that issues it anyway learns the same thing from an error code
+/// while looking like a driver whose command failed. QEMU's `q35` puts the boot
+/// CD on this controller, so the first device this driver ever met was ATAPI and
+/// answered `ABRT`; that is how this function came to exist.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeviceKind {
+    /// A SATA disk. The only kind `IDENTIFY DEVICE` applies to.
+    Disk,
+    /// An ATAPI device -- a CD or DVD. Answers `IDENTIFY PACKET DEVICE`, which
+    /// this driver does not issue and RFC 0046 does not ask for.
+    Packet,
+    /// A port multiplier.
+    PortMultiplier,
+    /// An enclosure management bridge.
+    Enclosure,
+    /// Nothing, or a signature this driver has no name for. Reported verbatim
+    /// rather than guessed at.
+    Unknown(u32),
+}
+
+/// The signatures the specification fixes.
+pub mod signature {
+    /// A SATA disk.
+    pub const DISK: u32 = 0x0000_0101;
+    /// An ATAPI device.
+    pub const PACKET: u32 = 0xeb14_0101;
+    /// A port multiplier.
+    pub const PORT_MULTIPLIER: u32 = 0x9669_0101;
+    /// An enclosure management bridge.
+    pub const ENCLOSURE: u32 = 0xc33c_0101;
+}
+
+/// What `PxSIG` says is attached.
+#[must_use]
+pub fn device_kind(sig: u32) -> DeviceKind {
+    match sig {
+        signature::DISK => DeviceKind::Disk,
+        signature::PACKET => DeviceKind::Packet,
+        signature::PORT_MULTIPLIER => DeviceKind::PortMultiplier,
+        signature::ENCLOSURE => DeviceKind::Enclosure,
+        other => DeviceKind::Unknown(other),
+    }
+}
+
+/// Reads a started port's signature.
+///
+/// Only meaningful **after** the port has been started: `PxSIG` holds what the
+/// device sent in its first D2H FIS, and reads all-ones until one has arrived.
+pub fn read_signature<R: Registers>(regs: &R, port: usize) -> u32 {
+    regs.read(port_at(port, port::SIG))
+}
+
+/// The ATA side of one command.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ata {
+    /// Which command, from [`command`].
+    pub command: u8,
+    /// The 48-bit address it starts at.
+    pub lba: u64,
+    /// How many sectors. **Never zero** -- see [`write_h2d`].
+    pub sectors: u16,
+    /// Whether the device writes to memory or reads from it. The direction bit
+    /// in the command header, and getting it backwards is a transfer that runs
+    /// the wrong way with no error anywhere.
+    pub write: bool,
+}
+
+impl Ata {
+    /// `IDENTIFY DEVICE`: no address, and a sector count the device ignores.
+    ///
+    /// One rather than zero, and that is the whole reason [`write_h2d`]'s
+    /// missing check was found: a command with no transfer still carries a
+    /// count, and zero in that field is sixty-five thousand sectors.
+    #[must_use]
+    pub fn identify() -> Self {
+        Self {
+            command: command::IDENTIFY,
+            lba: 0,
+            sectors: 1,
+            write: false,
+        }
+    }
+}
+
+/// Where the controller will look for the two structures a command needs.
+///
+/// **Device addresses, not this program's.** A driver in a domain cannot name a
+/// physical address and must not be able to: these are whatever the IOMMU
+/// translates back to the frames it was given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Where {
+    /// The command table. Must be 128-byte aligned.
+    pub table: u64,
+    /// The buffer the data lands in, or comes from.
+    pub buffer: u64,
+    /// How many bytes of it the command will move.
+    pub bytes: usize,
+}
+
+/// Lays out one command: its header in the list, its table, its FIS, its region.
+///
+/// # Errors
+///
+/// [`Error`] naming what would not fit or what could not be described --
+/// including a table address the controller cannot use, since the low seven
+/// bits of `CTBA` are reserved and a misaligned table is silently read from
+/// somewhere else.
+pub fn build_command(
+    list: &mut [u8],
+    table: &mut [u8],
+    slot: usize,
+    ata: Ata,
+    at: Where,
+) -> Result<(), Error> {
+    if slot >= COMMAND_SLOTS {
+        return Err(Error::NoSuchSlot);
+    }
+    if list.len() < (slot + 1) * COMMAND_HEADER_BYTES {
+        return Err(Error::TooSmall);
+    }
+    if table.len() < PRDT_AT + PRD_BYTES {
+        return Err(Error::TooSmall);
+    }
+    // The low seven bits of the command-table address are reserved, so the
+    // controller ignores them rather than refusing: an unaligned table is a
+    // command read from up to 127 bytes before the one that was built.
+    if !at.table.is_multiple_of(PRDT_AT as u64) {
+        return Err(Error::Misaligned);
+    }
+
+    // The table first, so the header never names a table that has not been
+    // written. On a controller already running, a header written first is a
+    // slot the hardware could in principle look at.
+    table[..PRDT_AT + PRD_BYTES].fill(0);
+    write_h2d(
+        &mut table[..H2D_FIS_BYTES],
+        ata.command,
+        ata.lba,
+        ata.sectors,
+    )?;
+    write_region(
+        &mut table[PRDT_AT..PRDT_AT + PRD_BYTES],
+        at.buffer,
+        at.bytes,
+        false,
+    )?;
+
+    let header = &mut list[slot * COMMAND_HEADER_BYTES..(slot + 1) * COMMAND_HEADER_BYTES];
+    write_command_header(header, H2D_FIS_BYTES, ata.write, 1, at.table)
+}
+
+/// Why a command did not complete.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Failed {
+    /// It never completed. The slot is still set in `PxCI`.
+    TimedOut,
+    /// The device refused it. The byte is `PxTFD`'s error field, verbatim.
+    Device(u8),
+    /// The *bus* failed -- a DMA that could not be completed, or an interface
+    /// error. Distinct from a device refusal on purpose: one means the disk
+    /// said no and the other means the transfer did not happen, and on a
+    /// translated device the second is what a missing mapping looks like.
+    Bus(u32),
+    /// The slot asked for does not exist on this controller.
+    NoSuchSlot,
+}
+
+/// Issues the command in `slot` and waits for the controller to finish with it.
+///
+/// **Polled, on purpose.** RFC 0046 chose polling before interrupts so that a
+/// failure is a timeout rather than a lost wakeup, and so the interrupt path
+/// has something to be measured against when it arrives.
+///
+/// The error registers are read **before** the completion is believed. A slot
+/// that clears in `PxCI` says the controller is done with it and says nothing
+/// about whether the device did what was asked -- `PxIS.TFES` and `PxTFD.ERR`
+/// are where a refusal lives, and a driver that only watched `PxCI` would
+/// report a failed read as a successful one full of stale bytes.
+///
+/// # Errors
+///
+/// [`Failed`], distinguishing a timeout from a device refusal from a bus error.
+pub fn run<R: Registers>(
+    regs: &mut R,
+    port: usize,
+    slot: usize,
+    clock: &mut impl FnMut() -> u64,
+    budget_ns: u64,
+) -> Result<(), Failed> {
+    if slot >= COMMAND_SLOTS || port >= MAX_PORTS {
+        return Err(Failed::NoSuchSlot);
+    }
+    // Clear the port's stale interrupt status first. It is write-one-to-clear,
+    // and a bit left over from the bring-up would be read below as this
+    // command's failure.
+    let status_at = port_at(port, port::IS);
+    let stale = regs.read(status_at);
+    regs.write(status_at, stale);
+
+    regs.write(port_at(port, port::CI), 1 << slot);
+
+    let started = clock();
+    let issued = 1u32 << slot;
+    loop {
+        let pending = regs.read(port_at(port, port::CI));
+        let status = regs.read(status_at);
+
+        // Errors are checked on every pass, not only after the slot clears. A
+        // task-file error can leave the slot set for ever, and waiting for it
+        // would turn a refusal the device already reported into a timeout.
+        let fatal = status & (interrupt::HBFS | interrupt::HBDS | interrupt::IFS);
+        if fatal != 0 {
+            return Err(Failed::Bus(fatal));
+        }
+        if status & interrupt::TFES != 0 {
+            let task = regs.read(port_at(port, port::TFD));
+            return Err(Failed::Device((task >> tfd::ERROR_SHIFT) as u8));
+        }
+
+        if pending & issued == 0 {
+            // Done with the slot. One last look at the device's own status,
+            // because a command can fail without raising `TFES` on every
+            // controller.
+            let task = regs.read(port_at(port, port::TFD));
+            if task & tfd::ERR != 0 {
+                return Err(Failed::Device((task >> tfd::ERROR_SHIFT) as u8));
+            }
+            if task & (tfd::BSY | tfd::DRQ) != 0 {
+                // The controller is finished and the device is not. Not a
+                // success: a driver that read the buffer here would read it
+                // while the device was still filling it.
+                return Err(Failed::Device(0));
+            }
+            return Ok(());
+        }
+
+        if clock().saturating_sub(started) >= budget_ns {
+            return Err(Failed::TimedOut);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +1050,14 @@ mod tests {
         fr_left: [Cell<u32>; MAX_PORTS],
         /// What each port's `SSTS` answers.
         status: [u32; MAX_PORTS],
+        /// Reads of `PxCI` remaining before an issued slot clears.
+        ci_left: Cell<u32>,
+        /// What `PxIS` reads once a command has been issued -- an error bit set
+        /// here is a controller reporting a failure, which is the half of this
+        /// model that matters. A register file could not do it.
+        raise: u32,
+        /// What `PxTFD` reads. The device's own status and error bytes.
+        task: Cell<u32>,
         /// Every write, in order. Tests about *ordering* read this rather than
         /// the final state, because a final state cannot tell "low half then
         /// high half" from the other way round.
@@ -774,6 +1081,9 @@ mod tests {
                 cr_left: array::from_fn(|_| Cell::new(2)),
                 fr_left: array::from_fn(|_| Cell::new(2)),
                 status: [0; MAX_PORTS],
+                ci_left: Cell::new(2),
+                raise: 0,
+                task: Cell::new(0),
                 writes: [(0, 0); 256],
                 written: 0,
             };
@@ -808,6 +1118,31 @@ mod tests {
         /// A controller whose firmware never lets go.
         fn firmware_never_lets_go(mut self) -> Self {
             self.bos_left = Cell::new(NEVER);
+            self
+        }
+
+        /// A controller that reports an error rather than a completion.
+        fn raising(mut self, bits: u32) -> Self {
+            self.raise = bits;
+            self
+        }
+
+        /// A controller whose device answers with an error byte set.
+        fn refusing(self, error: u8) -> Self {
+            self.task
+                .set(u32::from(error) << tfd::ERROR_SHIFT | tfd::ERR);
+            self
+        }
+
+        /// A controller that never finishes the command.
+        fn never_completing(mut self) -> Self {
+            self.ci_left = Cell::new(NEVER);
+            self
+        }
+
+        /// A controller that finishes the slot while its device is still busy.
+        fn finishing_while_busy(self) -> Self {
+            self.task.set(tfd::BSY);
             self
         }
 
@@ -879,6 +1214,26 @@ mod tests {
                 if offset == port_at(index, port::SSTS) {
                     return self.status[index];
                 }
+                if offset == port_at(index, port::CI) {
+                    // The slot stays set until the controller is done with it.
+                    let issued = self.file[offset / 4];
+                    return if Self::elapsed(&self.ci_left) {
+                        0
+                    } else {
+                        issued
+                    };
+                }
+                if offset == port_at(index, port::IS) {
+                    // Whatever was written back plus whatever this controller
+                    // is configured to report, but only once something has
+                    // been issued -- so a stale bit from the bring-up cannot
+                    // be read as this command's failure.
+                    let issued = self.file[port_at(index, port::CI) / 4] != 0;
+                    return self.file[offset / 4] | if issued { self.raise } else { 0 };
+                }
+                if offset == port_at(index, port::TFD) {
+                    return self.task.get();
+                }
                 if offset == port_at(index, port::CMD) {
                     let value = self.file[offset / 4];
                     let mut out = value & !(cmd::CR | cmd::FR);
@@ -901,6 +1256,20 @@ mod tests {
             assert!(self.written < self.writes.len(), "the model's log is full");
             self.writes[self.written] = (offset, value);
             self.written += 1;
+
+            // **`PxIS` and `PxSERR` are write-one-to-clear**, and a model that
+            // stored what was written would report every error the driver had
+            // just acknowledged. Found by the issue test, which set a stale
+            // error bit and then saw the driver's own clearing write put it
+            // back -- a register file cannot tell these two registers apart
+            // from the rest, and a controller can.
+            for index in 0..MAX_PORTS {
+                if offset == port_at(index, port::IS) || offset == port_at(index, port::SERR) {
+                    self.file[offset / 4] &= !value;
+                    return;
+                }
+            }
+
             self.file[offset / 4] = value;
             if offset == ghc::GHC && value & ghc::HR != 0 {
                 self.hr_left.set(self.hr_takes);
@@ -1414,5 +1783,249 @@ mod tests {
             bring_up(&mut controller, &mut clock, PATIENT),
             Err(NotUp::NoPortsImplemented)
         );
+    }
+    #[test]
+    fn a_sector_count_of_zero_is_refused_because_ata_reads_it_as_sixty_five_thousand() {
+        // The check this crate's own doc comment promised from step 1 and did
+        // not make, found while writing step 4 -- the one caller that had to
+        // pass a count for a command that transfers nothing.
+        let mut out = [0xffu8; H2D_FIS_BYTES];
+        assert_eq!(
+            write_h2d(&mut out, command::READ_DMA_EXT, 0, 0),
+            Err(Error::NoSectors)
+        );
+        assert!(write_h2d(&mut out, command::READ_DMA_EXT, 0, 1).is_ok());
+        // And IDENTIFY, which transfers 512 bytes and no sectors, asks for one
+        // rather than none.
+        assert_eq!(Ata::identify().sectors, 1);
+    }
+
+    #[test]
+    fn a_command_is_laid_out_with_its_table_written_before_its_header() {
+        // A header naming a table that has not been written is a slot the
+        // hardware could in principle look at. Checked by *offset order* in the
+        // buffers rather than by write order, since these are plain slices --
+        // so the assertion is that both are complete and consistent.
+        let mut list = [0xffu8; COMMAND_LIST_BYTES];
+        let mut table = [0xffu8; PRDT_AT + PRD_BYTES];
+        build_command(
+            &mut list,
+            &mut table,
+            0,
+            Ata::identify(),
+            Where {
+                table: 0x8000,
+                buffer: 0x9000,
+                bytes: IDENTIFY_BYTES,
+            },
+        )
+        .expect("fits");
+
+        // The header: five dwords of FIS, one region, not a write, and the
+        // table's address.
+        let dword0 = u32::from_le_bytes(list[0..4].try_into().unwrap());
+        assert_eq!(dword0 & 0x1f, 5, "a 20-byte FIS is five dwords");
+        assert_eq!(dword0 & (1 << 6), 0, "IDENTIFY reads, it does not write");
+        assert_eq!(dword0 >> 16, 1, "one region");
+        assert_eq!(
+            u64::from_le_bytes(list[8..16].try_into().unwrap()),
+            0x8000,
+            "the table's address"
+        );
+
+        // The table: the FIS, then the region 128 bytes in.
+        assert_eq!(table[0], fis::REGISTER_H2D);
+        assert_eq!(table[2], command::IDENTIFY);
+        assert_eq!(
+            u64::from_le_bytes(table[PRDT_AT..PRDT_AT + 8].try_into().unwrap()),
+            0x9000
+        );
+        let region = u32::from_le_bytes(table[PRDT_AT + 12..PRDT_AT + 16].try_into().unwrap());
+        assert_eq!(region & 0x003f_ffff, (IDENTIFY_BYTES - 1) as u32);
+    }
+
+    #[test]
+    fn a_command_table_the_controller_would_round_down_is_refused() {
+        // The low seven bits of `CTBA` are reserved, so a misaligned table is
+        // not refused by the hardware -- it is read from up to 127 bytes before
+        // the one that was built.
+        let mut list = [0u8; COMMAND_LIST_BYTES];
+        let mut table = [0u8; PRDT_AT + PRD_BYTES];
+        let at = Where {
+            table: 0x8040,
+            buffer: 0x9000,
+            bytes: IDENTIFY_BYTES,
+        };
+        assert_eq!(
+            build_command(&mut list, &mut table, 0, Ata::identify(), at),
+            Err(Error::Misaligned)
+        );
+        assert!(
+            build_command(
+                &mut list,
+                &mut table,
+                0,
+                Ata::identify(),
+                Where {
+                    table: 0x8080,
+                    ..at
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_slot_this_controller_does_not_have_is_refused_by_both_halves() {
+        let mut list = [0u8; COMMAND_LIST_BYTES];
+        let mut table = [0u8; PRDT_AT + PRD_BYTES];
+        let at = Where {
+            table: 0x8000,
+            buffer: 0x9000,
+            bytes: IDENTIFY_BYTES,
+        };
+        assert_eq!(
+            build_command(&mut list, &mut table, COMMAND_SLOTS, Ata::identify(), at),
+            Err(Error::NoSuchSlot)
+        );
+        let mut controller = Controller::new();
+        let mut clock = ticking();
+        assert_eq!(
+            run(&mut controller, 0, COMMAND_SLOTS, &mut clock, PATIENT),
+            Err(Failed::NoSuchSlot)
+        );
+        assert_eq!(
+            run(&mut controller, MAX_PORTS, 0, &mut clock, PATIENT),
+            Err(Failed::NoSuchSlot)
+        );
+    }
+
+    #[test]
+    fn a_command_is_issued_by_its_own_bit_and_the_stale_status_is_cleared_first() {
+        let mut controller = Controller::new();
+        // A bit left over from the bring-up. Write-one-to-clear, so it must be
+        // written back before the command or it reads as this command's error.
+        controller.file[port_at(0, port::IS) / 4] = interrupt::TFES;
+        controller.written = 0;
+        let mut clock = ticking();
+        run(&mut controller, 0, 3, &mut clock, PATIENT).expect("completes");
+
+        let cleared = controller
+            .write_index(port_at(0, port::IS))
+            .expect("the stale status was written back");
+        let issued = controller
+            .write_index(port_at(0, port::CI))
+            .expect("the command was issued");
+        assert!(
+            cleared < issued,
+            "the status must be cleared before issuing"
+        );
+        // Its own bit, and only its own: writing all-ones would issue every
+        // slot in the list, most of which hold nothing.
+        let (_, value) = controller.writes()[issued];
+        assert_eq!(value, 1 << 3);
+    }
+
+    #[test]
+    fn a_command_that_never_completes_times_out_rather_than_spinning_for_ever() {
+        let mut controller = Controller::new().never_completing();
+        let mut clock = ticking();
+        assert_eq!(
+            run(&mut controller, 0, 0, &mut clock, 32),
+            Err(Failed::TimedOut)
+        );
+    }
+
+    #[test]
+    fn a_device_that_refuses_is_a_refusal_and_not_a_timeout() {
+        // A task-file error can leave the slot set for ever. Waiting for it to
+        // clear would turn a refusal the device already reported into a
+        // timeout, and send the next reader looking for a hang.
+        let mut controller = Controller::new()
+            .never_completing()
+            .raising(interrupt::TFES)
+            .refusing(0x40);
+        let mut clock = ticking();
+        assert_eq!(
+            run(&mut controller, 0, 0, &mut clock, PATIENT),
+            Err(Failed::Device(0x40))
+        );
+    }
+
+    #[test]
+    fn a_bus_error_is_told_apart_from_a_device_refusal() {
+        // On a translated device a host-bus error is what a missing mapping
+        // looks like. Reporting it as "the disk said no" would send somebody to
+        // the disk.
+        for bit in [interrupt::HBFS, interrupt::HBDS, interrupt::IFS] {
+            let mut controller = Controller::new().never_completing().raising(bit);
+            let mut clock = ticking();
+            assert_eq!(
+                run(&mut controller, 0, 0, &mut clock, PATIENT),
+                Err(Failed::Bus(bit))
+            );
+        }
+    }
+
+    #[test]
+    fn a_slot_that_clears_while_the_device_is_busy_is_not_a_success() {
+        // `PxCI` clearing says the controller is done with the slot. It says
+        // nothing about the device -- and a driver that read its buffer here
+        // would read it while the device was still filling it.
+        let mut controller = Controller::new().finishing_while_busy();
+        let mut clock = ticking();
+        assert_eq!(
+            run(&mut controller, 0, 0, &mut clock, PATIENT),
+            Err(Failed::Device(0))
+        );
+    }
+
+    #[test]
+    fn an_error_byte_is_reported_verbatim_rather_than_reduced_to_a_boolean() {
+        // ATA's error register says *what* went wrong -- 0x10 is "the address
+        // is not there", 0x40 is "the media is bad" -- and a driver that
+        // answered "it failed" would throw away the only diagnosis available.
+        for error in [0x01u8, 0x04, 0x10, 0x40, 0x80] {
+            let mut controller = Controller::new()
+                .never_completing()
+                .raising(interrupt::TFES)
+                .refusing(error);
+            let mut clock = ticking();
+            assert_eq!(
+                run(&mut controller, 0, 0, &mut clock, PATIENT),
+                Err(Failed::Device(error))
+            );
+        }
+    }
+    #[test]
+    fn the_signature_says_what_kind_of_device_answered() {
+        // The four the specification fixes, and everything else reported
+        // verbatim rather than guessed at.
+        assert_eq!(device_kind(signature::DISK), DeviceKind::Disk);
+        assert_eq!(device_kind(signature::PACKET), DeviceKind::Packet);
+        assert_eq!(
+            device_kind(signature::PORT_MULTIPLIER),
+            DeviceKind::PortMultiplier
+        );
+        assert_eq!(device_kind(signature::ENCLOSURE), DeviceKind::Enclosure);
+        assert_eq!(device_kind(0), DeviceKind::Unknown(0));
+        // All-ones is what an unstarted port reads, and it is not a device.
+        assert_eq!(device_kind(u32::MAX), DeviceKind::Unknown(u32::MAX));
+    }
+
+    #[test]
+    fn an_atapi_device_is_not_a_disk_and_the_two_are_never_confused() {
+        // The distinction that cost step 4 a boot. QEMU's `q35` puts the boot CD
+        // on this controller, so the first device this driver ever met was
+        // ATAPI -- and `IDENTIFY DEVICE` on one is *aborted by the
+        // specification*, not by a fault. The two signatures differ only in
+        // their top sixteen bits, which is exactly the comparison a mask would
+        // get wrong.
+        assert_ne!(device_kind(signature::PACKET), DeviceKind::Disk);
+        assert_ne!(device_kind(signature::DISK), DeviceKind::Packet);
+        assert_eq!(signature::DISK & 0xffff, signature::PACKET & 0xffff);
+        // So a check on the low half alone cannot tell them apart, and this is
+        // the assertion that says the full word is compared.
+        assert_ne!(signature::DISK, signature::PACKET);
     }
 }

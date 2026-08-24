@@ -27,6 +27,12 @@ INITRD       := build/initrd.tar
 # driver reading the *kernel's* disk would not show that it had read anything
 # the kernel did not hand it.
 DOMAIN_DISK  := build/domain-disk.img
+# RFC 0046 step 4. A disk on the *AHCI* controller, so `IDENTIFY DEVICE` and
+# later `READ DMA EXT` have a subject that is not the boot CD -- q35 puts the
+# CD on that controller too, and an ATAPI device aborts IDENTIFY DEVICE by
+# specification. Its own file with its own first sector, so a read that returned
+# the wrong disk's bytes is visible rather than plausible.
+SATA_DISK    := build/sata-disk.img
 # An image in the new on-disk format, carried *inside* the archive -- which is
 # what makes RFC 0015 step 3's "beside the archive" literal. The machine mounts
 # both and reads a file from each.
@@ -227,6 +233,16 @@ $(DOMAIN_DISK):
 	@mkdir -p $(dir $@)
 	@printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > $@
 	@dd if=/dev/zero bs=1 count=262116 >> $@ 2>/dev/null
+	@echo "built $@"
+
+# The AHCI disk. Same size and shape as the domain disk and a **different first
+# sector**, which is the whole point: step 5 reads sector zero through the AHCI
+# driver, and a gate that accepted either disk's bytes would pass a driver that
+# read the wrong device.
+$(SATA_DISK):
+	@mkdir -p $(dir $@)
+	@printf 'BHASKIX-SATA-DISK-SECTOR-0' > $@
+	@dd if=/dev/zero bs=1 count=262118 >> $@ 2>/dev/null
 	@echo "built $@"
 
 # Depends on the phony `kernel` target directly, so the image is rebuilt every
@@ -458,7 +474,7 @@ $(USER_FSD): $(FSD_DIR)/src/main.rs $(FSD_DIR)/link.ld $(FSD_DIR)/Cargo.toml \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
-$(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) $(INITRD) $(DOMAIN_DISK) | $(LIMINE_DIR)
+$(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) $(INITRD) $(DOMAIN_DISK) $(SATA_DISK) | $(LIMINE_DIR)
 	@rm -rf $(ISO_ROOT)
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/bhaskix
