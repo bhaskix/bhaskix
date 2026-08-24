@@ -796,6 +796,62 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-25 (the kernel programmed one IOMMU of four, and the xHCI was behind another)
+
+**RFC 0049, and the end of a four-boot hunt.** The xHCI's No-Op command went
+unanswered on the SR550. The controller reported itself running, its command
+ring running, and no error of its own; no IOMMU fault was recorded. All three
+of those facts were true and all three were unreadable, because the instruments
+that produced them could not see:
+
+- `iommu::faulted` had **no callers** — written for RFC 0012, never once called.
+- `take_fault` read **fault record zero only**, never consulting `NFR`, and
+  printed **nothing** when it found none. "No fault in slot zero" is not "no
+  fault", and a silent report cannot be told apart from one that did not run.
+- The boot report printed a **count** of remapping units and then silently
+  programmed `dmar.units().next()`.
+
+Fixed in `4df5ccd`, and the fixed instruments named the cause on the next boot:
+the SR550 describes **four** units, and unit 3 — the one carrying
+`INCLUDE_PCI_ALL`, which governs the PCH and therefore `00:14.0` — was never
+programmed. The controller's context entry went into unit 0's tables, where no
+hardware looks for it; the unit that governs it was off; so the controller used
+the address it was handed as a **physical** address, read whatever the machine
+keeps at `0x100001000`, and found no command. Ring running, no error, no fault:
+every symptom follows, and none of them is a driver bug.
+
+RFC 0049 programs every unit the firmware names, sharing one root table so that
+"which unit governs this device" stops mattering for correctness. Width is now
+negotiated as the narrowest every unit supports, since they share the tables;
+invalidation and fault reporting reach every unit. Measured on the machine:
+
+    iommu          all 4 units programmed
+    xhci rings     answered the no-op at 0x100001000: 1 event (1 completion), success, dequeue advanced
+
+**And the first genuine DMA refusal this project has ever recorded from real
+hardware**, on the same boot — containment working, and visible only because
+the instrument was fixed first:
+
+    iommu fault    unit 3: 00:14.0 was refused a read of 0xaa95f000: it asked to
+                   read where it has no read permission -- not mapped (reason 0x6)
+
+**`security.md`'s IOMMU row is corrected in place.** Its claim that translation
+was "enabled on real hardware for the first time 2026-08-24" was true of one
+unit out of four; on that boot most of the machine's devices were untranslated
+while being reported as contained. Containment on a multi-unit machine dates
+from 2026-08-25, not from the boot that sentence celebrates.
+
+**Still open on that machine, and not claimed:** `xhci device not addressed: no
+port has a device on it`, and the refused read at `0xaa95f000` — which sits just
+below the firmware-reserved region at `0xaabf8000` that this kernel refuses to
+identity-map **because it overlaps the kernel image**. That conflict is real and
+gets its own RFC.
+
+Two gates joined the USB keyboard lane, both watched red: every unit the
+firmware named is listed, and every one of them is programmed. QEMU describes
+exactly one, so what they pin is the single-unit case — the multi-unit case has
+no emulator that can show it, which is how it survived this long.
+
 ### 2026-08-24 (the xHCI wants 34 scratchpad buffers, and giving them to it hangs the boot)
 
 **Asked for as a fix, delivered as a measurement and a reverted attempt.**

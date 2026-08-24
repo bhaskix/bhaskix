@@ -152,6 +152,40 @@ else
     status=1
 fi
 
+# RFC 0049. Every unit the firmware named is listed, and every one of them is
+# programmed. This emulator describes exactly one, so these gates prove the
+# enumeration runs and reports -- **not** that the multi-unit case works, which
+# no emulator here can show. That was measured on an SR550, where the unit
+# carrying INCLUDE_PCI_ALL was the fourth and had never been programmed.
+if await "iommu unit 0   registers at .*claims every device"; then
+    pass "every remapping unit the firmware named is listed"
+else
+    fail "the unit list did not report"
+    grep -aE "iommu" "$LOG" | sed 's/^/      /'
+    status=1
+fi
+
+# The outcome, which is the claim that matters: not "a unit was found" but
+# "every unit the firmware named is programmed". A machine where that is false
+# has devices reaching all of memory while the report says they are contained.
+if await "iommu          all 1 unit programmed"; then
+    pass "every unit the firmware named was programmed"
+else
+    fail "the kernel did not report programming every unit"
+    grep -aE "iommu" "$LOG" | sed 's/^/      /'
+    status=1
+fi
+
+# The other half: a fault line every boot, saying none rather than saying
+# nothing. Silence here used to be indistinguishable from a check that did not
+# run, which is what made a real DMA failure unreadable for four boots.
+if await "iommu faults   none recorded by the one programmed unit"; then
+    pass "the IOMMU was asked about faults, and answered"
+else
+    fail "no fault line was printed"
+    status=1
+fi
+
 # The pre-OS handoff ran, and said what it found. On this emulator the answer
 # is always "no legacy capability" -- QEMU's controller declares none, so there
 # is no firmware to take it from. That makes this a weak assertion about

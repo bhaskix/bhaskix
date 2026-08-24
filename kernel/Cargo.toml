@@ -487,7 +487,13 @@ asm_budget = 10
 # 1815 for the controller state a failed command now carries: one mapped
 # operational bank, read after the wait so it describes the failure rather than
 # what came before it.
-unsafe_budget = 1815
+# 1825 for RFC 0049 step 2: every unit the firmware named is programmed, so the
+# register access that was written once is now written once per unit --
+# `program_unit`, `invalidate_contexts_of`, `invalidate_one` and `take_fault_of`
+# are each one unit's worth of what `enable` used to do inline, plus the width
+# read that now runs across all of them. No new *kind* of access: the same
+# operations, reaching the units that were being skipped.
+unsafe_budget = 1825
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

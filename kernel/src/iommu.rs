@@ -80,7 +80,29 @@ pub const fn device_key(device: (u8, u8, u8)) -> u64 {
 /// than a performance one: mapping MMIO reaches the heap, which is the
 /// outermost lock here, and invalidating an IOTLB happens while holding the
 /// innermost. Doing it per use would be an inversion on every unmap.
-static UNIT_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static UNIT_BASES: [core::sync::atomic::AtomicU64; bhaskix_arch::acpi::MAX_UNITS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; bhaskix_arch::acpi::MAX_UNITS];
+
+/// How many of [`UNIT_BASES`] hold a unit this kernel programmed.
+///
+/// **This was one unit until RFC 0049.** The kernel programmed
+/// `dmar.units().next()` and called it the IOMMU, which is right on a machine
+/// that has one and silently wrong on a machine that has four: the devices
+/// governed by every other unit were untranslated while being reported as
+/// contained.
+static UNITS_PROGRAMMED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The register windows of every unit this kernel programmed.
+///
+/// Empty before [`enable`] runs, and after it fails.
+fn programmed_units() -> impl Iterator<Item = u64> {
+    let count = UNITS_PROGRAMMED.load(core::sync::atomic::Ordering::Acquire);
+    UNIT_BASES
+        .iter()
+        .take(count)
+        .map(|base| base.load(core::sync::atomic::Ordering::Acquire))
+        .filter(|base| *base != 0)
+}
 
 /// What discovery found, if anything.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -202,27 +224,21 @@ pub fn report(found: Option<Report>) {
                     "absent"
                 },
             );
-            // **Every unit, and which one this kernel programs.** A count
-            // alone reads as "the IOMMU was found"; it does not say that only
-            // one of them is being programmed, or that the one being
-            // programmed may govern none of the devices in question. On a
-            // machine with a single unit these lines are redundant. On a
-            // machine with four they are the difference between a report that
-            // is true and one that is merely not false.
+            // **Every unit the firmware named.** A count alone reads as "the
+            // IOMMU was found" and says nothing about how many units there
+            // are or what each claims. This runs before anything is
+            // programmed, so it deliberately does **not** say which are: that
+            // is `enable`'s outcome to report, and a line here claiming it in
+            // advance was wrong for exactly one commit.
             for (index, (base, covers_all)) in
                 report.unit_list.iter().take(report.units).enumerate()
             {
                 println!(
-                    "    iommu unit {index}   registers at {base:#x}, {}{}",
+                    "    iommu unit {index}   registers at {base:#x}, {}",
                     if *covers_all {
                         "claims every device not claimed by another"
                     } else {
                         "claims only the devices its scope names"
-                    },
-                    if *base == report.first_register_base {
-                        "  <- the one this kernel programs"
-                    } else {
-                        "  (NOT PROGRAMMED: devices under it are not translated)"
                     },
                 );
             }
@@ -658,13 +674,35 @@ pub fn build_tables(report: &Report, hhdm: u64) -> Option<Tables> {
 ///
 /// The `DMAR` must name a real remapping unit at `report.first_register_base`.
 unsafe fn widest_supported(report: &Report, hhdm: u64) -> Option<bhaskix_arch::vtd::AddressWidth> {
-    let base = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)?;
-    // SAFETY: the caller's obligation; this reads one register and programs
-    // nothing.
-    unsafe {
-        let unit = bhaskix_arch::vtd::Unit::new(base as *mut u8);
-        unit.largest_width()
+    // **The narrowest of what every unit supports**, because RFC 0049 gives
+    // them all the same root table and a unit asked to walk tables built to a
+    // depth it does not support refuses -- and a refusal is a set of devices
+    // nobody translates. Taking the first unit's answer would build tables
+    // that unit alone can read.
+    //
+    // A unit whose registers will not map is skipped rather than treated as
+    // supporting nothing: `enable` will refuse it by name, and letting it
+    // narrow the tables here would degrade every other unit's translation on
+    // account of a unit that is not going to be used.
+    let mut narrowest: Option<bhaskix_arch::vtd::AddressWidth> = None;
+    for (register_base, _) in report.unit_list.iter().take(report.units) {
+        let Some(base) = crate::mmio::map(*register_base, bhaskix_mm::FRAME_SIZE, hhdm) else {
+            continue;
+        };
+        // SAFETY: the caller's obligation; this reads one register and
+        // programs nothing.
+        let Some(width) = (unsafe {
+            let unit = bhaskix_arch::vtd::Unit::new(base as *mut u8);
+            unit.largest_width()
+        }) else {
+            continue;
+        };
+        narrowest = Some(match narrowest {
+            Some(sofar) if sofar.levels() <= width.levels() => sofar,
+            _ => width,
+        });
     }
+    narrowest
 }
 
 /// The context table for `bus`, allocating and installing one the first time
@@ -1507,10 +1545,16 @@ pub fn remapping() -> bool {
 /// The unit must already be programmed by [`enable`], and no interrupt source
 /// may have been routed yet.
 pub unsafe fn enable_interrupt_remapping(hhdm: u64) -> Result<(), &'static str> {
-    let base = UNIT_BASE.load(core::sync::atomic::Ordering::Acquire);
-    if base == 0 {
+    // The first programmed unit, and **only** it. Interrupt remapping is per
+    // unit like translation is, so on a multi-unit machine this leaves the
+    // others unremapped. That is a narrower claim than this function's name
+    // suggests and is left as it was rather than widened silently: RFC 0049
+    // covers translation, which is what the evidence was about, and extending
+    // it to remapping needs its own measurement on a machine that routes an
+    // interrupt through a unit this does not program.
+    let Some(base) = programmed_units().next() else {
         return Err("no unit");
-    }
+    };
     let (table, _) = zeroed_frame(hhdm).ok_or("no frame for the remapping table")?;
 
     // SAFETY: the unit `enable` programmed, and a table this function just
@@ -1787,14 +1831,99 @@ pub fn kernel_extent(handoff: &bhaskix_boot::Handoff) -> (u64, u64) {
 /// `window` must be built and populated, and its tables must not be freed. The
 /// unit walks them by physical address with no notice.
 pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), &'static str> {
-    let base = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)
-        .ok_or("the unit's registers could not be mapped")?;
+    // **Every unit the firmware named, not the first of them.** RFC 0049. A
+    // device is governed by whichever unit claims it, and a unit that is not
+    // programmed does not translate: its devices use the addresses they are
+    // handed as physical addresses and reach whatever lives there. Sharing one
+    // root table across every unit makes "which unit governs this device" stop
+    // mattering for correctness, because they all walk the same tables.
+    let mut programmed = 0usize;
+    let mut first_failure: Option<&'static str> = None;
 
-    // SAFETY: the window the `DMAR` named, just mapped, and nothing else in
-    // this kernel programs a remapping unit.
-    let mut unit = unsafe { vtd::Unit::new(base as *mut u8) };
+    for (index, (register_base, covers_all)) in
+        report.unit_list.iter().take(report.units).enumerate()
+    {
+        let Some(base) = crate::mmio::map(*register_base, bhaskix_mm::FRAME_SIZE, hhdm) else {
+            report_unit_refusal(index, *covers_all, "its registers could not be mapped");
+            first_failure = first_failure.or(Some("a unit's registers could not be mapped"));
+            continue;
+        };
 
-    // SAFETY: a mapped register window, as above.
+        // SAFETY: the window the `DMAR` named, just mapped, and nothing else
+        // in this kernel programs a remapping unit.
+        let mut unit = unsafe { vtd::Unit::new(base as *mut u8) };
+
+        // SAFETY: a mapped register window, as above.
+        let outcome = unsafe { program_unit(&mut unit, window, hhdm, index == 0) };
+        match outcome {
+            Ok(()) => {
+                UNIT_BASES[programmed].store(base, core::sync::atomic::Ordering::Release);
+                programmed += 1;
+                // Published as they are programmed rather than at the end, so
+                // an invalidation issued partway through reaches the units
+                // that are already live.
+                UNITS_PROGRAMMED.store(programmed, core::sync::atomic::Ordering::Release);
+            }
+            Err(why) => {
+                report_unit_refusal(index, *covers_all, why);
+                first_failure = first_failure.or(Some(why));
+            }
+        }
+    }
+
+    // A unit that refused is a set of devices nobody is translating. RFC 0012's
+    // rule is that such a device is to be treated as if there were no IOMMU at
+    // all, so the count is reported rather than rounded up to "translating".
+    if programmed != report.units {
+        crate::println!(
+            "\x1b[91m    iommu          {programmed} of {} units programmed -- devices governed \
+             by the rest are NOT translated\x1b[0m",
+            report.units,
+        );
+    } else {
+        // Printed on every machine, including the one-unit case. A line that
+        // appears only when there is more than one unit is a line whose
+        // absence means two different things.
+        crate::println!(
+            "    iommu          all {programmed} unit{} programmed",
+            if programmed == 1 { "" } else { "s" }
+        );
+    }
+
+    if programmed == 0 {
+        return Err(first_failure.unwrap_or("no unit could be programmed"));
+    }
+    Ok(())
+}
+
+/// Says which unit refused and why, in the same shape for every reason.
+fn report_unit_refusal(index: usize, covers_all: bool, why: &str) {
+    crate::println!(
+        "\x1b[91m    iommu unit {index}   REFUSED: {why}{}\x1b[0m",
+        if covers_all {
+            " -- and this is the unit claiming every device not claimed by another"
+        } else {
+            ""
+        },
+    );
+}
+
+/// Programs one unit with the shared root table.
+///
+/// `pass_through` asks for RFC 0043's pass-through entries to be written, which
+/// is a property of the *tables* and so is done once rather than per unit.
+///
+/// # Safety
+///
+/// `unit` must be a mapped register window of a real remapping unit, and
+/// `window` must be built and populated.
+unsafe fn program_unit(
+    unit: &mut vtd::Unit,
+    window: &Window,
+    hhdm: u64,
+    pass_through: bool,
+) -> Result<(), &'static str> {
+    // SAFETY: the caller's obligation.
     unsafe {
         // A zero version register means the `DMAR` named an address that is
         // not a remapping unit. The parser's alignment check makes that
@@ -1816,8 +1945,14 @@ pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), 
         // RFC 0043 step 4. The reasoning is on `pass_through_undrivable`; what
         // matters here is the ordering, which is why this is inside `enable`
         // and not in a caller that could get it wrong silently.
-        let pass = (unit.supports_pass_through(), unit.largest_width());
-        pass_through_or_say_why(pass, window, hhdm);
+        //
+        // Written once, against the shared tables, rather than once per unit:
+        // a second pass would find every entry already present and report a
+        // second set of pass-through lines for the same devices.
+        if pass_through {
+            let pass = (unit.supports_pass_through(), unit.largest_width());
+            pass_through_or_say_why(pass, window, hhdm);
+        }
 
         if !unit.set_root_table(window.root_table) {
             return Err("the unit did not accept the root table");
@@ -1834,7 +1969,6 @@ pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), 
             return Err("the unit did not report translation enabled");
         }
     }
-    UNIT_BASE.store(base, core::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -1852,13 +1986,7 @@ pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), 
 /// # Safety
 ///
 /// As [`enable`], and the unit must already have been mapped by it.
-pub unsafe fn report_faults(report: &Report, hhdm: u64) {
-    let Some(base) = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)
-    else {
-        crate::println!("    iommu faults   the unit's registers could not be mapped to ask");
-        return;
-    };
-
+pub unsafe fn report_faults(_report: &Report, _hhdm: u64) {
     let mut records = [vtd::FaultRecord {
         source: 0,
         address: 0,
@@ -1866,34 +1994,51 @@ pub unsafe fn report_faults(report: &Report, hhdm: u64) {
         read: false,
     }; MAX_FAULTS_REPORTED];
 
-    // SAFETY: the same window `enable` mapped and programmed.
-    let found = unsafe {
-        let unit = vtd::Unit::new(base as *mut u8);
-        unit.fault_records(&mut records)
-    };
-
-    if found == 0 {
-        crate::println!("    iommu faults   none recorded by the unit this kernel programs\x1b[0m");
-        return;
+    let mut units = 0usize;
+    let mut total = 0usize;
+    for (index, base) in programmed_units().enumerate() {
+        units += 1;
+        // SAFETY: a window `enable` mapped and programmed.
+        let found = unsafe {
+            let unit = vtd::Unit::new(base as *mut u8);
+            unit.fault_records(&mut records)
+        };
+        total += found;
+        for record in &records[..found] {
+            let (bus, device, function) = record.bus_device_function();
+            crate::println!(
+                "\x1b[91m    iommu fault    unit {index}: {:02x}:{:02x}.{} was refused a {} of \
+                 {:#x}: {} (reason {:#x})\x1b[0m",
+                bus,
+                device,
+                function,
+                if record.read { "read" } else { "write" },
+                record.address,
+                vtd::describe_fault(record.reason),
+                record.reason,
+            );
+        }
+        if found == MAX_FAULTS_REPORTED {
+            crate::println!(
+                "    iommu fault    unit {index}: {found} is as many as this report holds; \
+                 there may be more"
+            );
+        }
     }
 
-    for record in &records[..found] {
-        let (bus, device, function) = record.bus_device_function();
+    if units == 0 {
+        crate::println!("    iommu faults   no unit is programmed, so nothing could be asked");
+    } else if total == 0 {
+        // Said out loud. A silent report cannot be told apart from one that did
+        // not run, and the absence of a fault is often the most useful fact
+        // available about a device that is not working.
         crate::println!(
-            "\x1b[91m    iommu fault    {:02x}:{:02x}.{} was refused a {} of {:#x}: {} \
-             (reason {:#x})\x1b[0m",
-            bus,
-            device,
-            function,
-            if record.read { "read" } else { "write" },
-            record.address,
-            vtd::describe_fault(record.reason),
-            record.reason,
-        );
-    }
-    if found == MAX_FAULTS_REPORTED {
-        crate::println!(
-            "    iommu fault    {found} is as many as this report holds; there may be more"
+            "    iommu faults   none recorded by {}",
+            if units == 1 {
+                "the one programmed unit"
+            } else {
+                "any programmed unit"
+            }
         );
     }
 }
@@ -2034,10 +2179,25 @@ fn clear_page(window: &Window, address: u64, hhdm: u64) -> bool {
 ///
 /// The unit must be the one the windows are programmed into.
 pub unsafe fn invalidate_contexts() -> bool {
-    let base = UNIT_BASE.load(core::sync::atomic::Ordering::Acquire);
-    if base == 0 {
-        return false;
+    // **Every programmed unit.** They share the root table, so a context entry
+    // written after translation is live is stale in all of their caches, not
+    // just the first one's.
+    let mut any = false;
+    let mut all = true;
+    for base in programmed_units() {
+        any = true;
+        // SAFETY: the caller's obligation.
+        all &= unsafe { invalidate_contexts_of(base) };
     }
+    any && all
+}
+
+/// Invalidates one unit's context cache and IOTLB, in that order.
+///
+/// # Safety
+///
+/// `base` must be a mapped register window of a unit [`enable`] programmed.
+unsafe fn invalidate_contexts_of(base: u64) -> bool {
     // SAFETY: the caller's obligation. Invalidating a cache cannot make a
     // translation wrong; it can only make a stale one stop being used.
     unsafe {
@@ -2062,10 +2222,22 @@ pub unsafe fn invalidate_contexts() -> bool {
 ///
 /// The unit must be the one this window is programmed into.
 unsafe fn invalidate() -> bool {
-    let base = UNIT_BASE.load(core::sync::atomic::Ordering::Acquire);
-    if base == 0 {
-        return false;
+    let mut any = false;
+    let mut all = true;
+    for base in programmed_units() {
+        any = true;
+        // SAFETY: the caller's obligation.
+        all &= unsafe { invalidate_one(base) };
     }
+    any && all
+}
+
+/// Invalidates one unit's IOTLB.
+///
+/// # Safety
+///
+/// `base` must be a mapped register window of a unit [`enable`] programmed.
+unsafe fn invalidate_one(base: u64) -> bool {
     // SAFETY: the caller's obligation.
     unsafe {
         let unit = vtd::Unit::new(base as *mut u8);
@@ -2099,8 +2271,26 @@ pub struct Fault {
 /// # Safety
 ///
 /// As [`enable`], and the unit must already have been programmed by it.
-pub unsafe fn take_fault(report: &Report, hhdm: u64) -> Option<Fault> {
-    let base = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)?;
+pub unsafe fn take_fault(_report: &Report, _hhdm: u64) -> Option<Fault> {
+    // **Across every programmed unit**, not the first. A device's fault is
+    // recorded by the unit that governs it, and on a multi-unit machine that
+    // is usually not unit zero -- so a self-test that deliberately causes one
+    // and then read only the first unit would find nothing and call it a pass.
+    for base in programmed_units() {
+        // SAFETY: the caller's obligation.
+        if let Some(fault) = unsafe { take_fault_of(base) } {
+            return Some(fault);
+        }
+    }
+    None
+}
+
+/// Takes one fault from one unit.
+///
+/// # Safety
+///
+/// `base` must be a mapped register window of a unit [`enable`] programmed.
+unsafe fn take_fault_of(base: u64) -> Option<Fault> {
     // SAFETY: the caller's obligation.
     unsafe {
         let unit = vtd::Unit::new(base as *mut u8);
