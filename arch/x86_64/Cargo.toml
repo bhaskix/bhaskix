@@ -137,7 +137,11 @@ asm_budget = 37
 # 1159 with RFC 0043 step 3: `supports_pass_through` and `largest_width`,
 # one capability-register read each -- ECAP bit 6 and the SAGAW bitmap, both
 # read from Intel's VT-d specification rather than recalled.
-unsafe_budget = 1159
+# 1162 for `fault_records`: the capability read that says where the fault
+# registers are and how many there are, the pair of reads per record, and the
+# write-one-to-clear. The decoding is `FaultRecord::from_bits`, which is pure
+# and host-tested -- the register access is all that is charged here.
+unsafe_budget = 1162
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

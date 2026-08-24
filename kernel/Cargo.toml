@@ -482,7 +482,12 @@ asm_budget = 10
 # Every bit decision they act on is in `bhaskix-xhci::extended`, in safe code
 # with host tests; what is charged here is the register access alone, which is
 # the split this budget is supposed to reward.
-unsafe_budget = 1808
+# 1812 for `report_faults`, which reads every fault record the unit holds
+# rather than the first: one mapped-window read and the call that drains them.
+# 1815 for the controller state a failed command now carries: one mapped
+# operational bank, read after the wait so it describes the failure rather than
+# what came before it.
+unsafe_budget = 1815
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

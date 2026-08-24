@@ -1654,6 +1654,50 @@ struct Commander<'a> {
     dequeue_advanced: bool,
 }
 
+/// What the controller said about itself when asked.
+///
+/// Read when a command goes unanswered, because "no event arrived" is a
+/// symptom and these bits are the difference between the causes: a controller
+/// that stopped, a controller whose memory reads are being refused, and a
+/// controller that never started running the command ring at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ControllerState {
+    /// `USBSTS`, as read.
+    pub status: u32,
+    /// `CRCR`. Command Ring Running is bit 3, and the rest reads as zero.
+    pub command_ring: u64,
+}
+
+impl ControllerState {
+    /// Whether the controller has stopped.
+    #[must_use]
+    pub const fn halted(self) -> bool {
+        operational::UsbStatus(self.status).hc_halted()
+    }
+
+    /// Whether a memory read or write by the controller was answered with an
+    /// error — which is what an IOMMU refusal looks like from this side.
+    #[must_use]
+    pub const fn host_system_error(self) -> bool {
+        operational::UsbStatus(self.status).host_system_error()
+    }
+
+    /// Whether the controller has faulted internally.
+    #[must_use]
+    pub const fn host_controller_error(self) -> bool {
+        operational::UsbStatus(self.status).host_controller_error()
+    }
+
+    /// Whether the command ring is running. Bit 3 of `CRCR`.
+    ///
+    /// Clear after a doorbell means the controller never picked the ring up,
+    /// which is a different failure from picking it up and finding nothing.
+    #[must_use]
+    pub const fn command_ring_running(self) -> bool {
+        self.command_ring & (1 << 3) != 0
+    }
+}
+
 /// What one command produced.
 struct Issued {
     /// Where the command TRB was written, in the controller's addresses.
@@ -1662,6 +1706,8 @@ struct Issued {
     drained: Drained,
     /// Whether anything arrived before the deadline.
     arrived: bool,
+    /// What the controller said about itself once the wait ended.
+    state: ControllerState,
 }
 
 impl Issued {
@@ -1783,10 +1829,26 @@ impl<'a> Commander<'a> {
         // checked.
         unsafe { self.advance_dequeue() };
 
+        // What the controller says about itself, read *after* the wait so it
+        // describes the state the failure happened in rather than the state
+        // before it. Cheap enough to read always: a command that succeeded
+        // still carries it, and nothing has to decide in advance whether this
+        // is going to be the interesting case.
+        // SAFETY: the operational bank is inside the window, which
+        // `parameters` checked.
+        let operational_bank = unsafe {
+            Operational::<bhaskix_device::Volatile>::new(self.base + self.parameters.operational)
+        };
+        let state = ControllerState {
+            status: operational_bank.usbsts.read(),
+            command_ring: operational_bank.crcr.read(),
+        };
+
         Some(Issued {
             asked_at,
             drained,
             arrived,
+            state,
         })
     }
 
@@ -2778,6 +2840,7 @@ unsafe fn exercise_the_rings<W: Wait>(commander: &mut Commander<'_>, wait: &mut 
     answered.arrived = issued.arrived;
     answered.drained = issued.drained;
     answered.matched = issued.succeeded();
+    answered.state = issued.state;
     answered.dequeue_advanced = commander.dequeue_advanced;
     answered
 }
@@ -2800,6 +2863,8 @@ pub struct Answered {
     pub matched: bool,
     /// Whether the dequeue pointer was written back.
     pub dequeue_advanced: bool,
+    /// What the controller said about itself when the wait ended.
+    pub state: ControllerState,
 }
 
 /// The badge this driver signals the console's notification with.

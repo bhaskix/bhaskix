@@ -104,7 +104,21 @@ pub struct Report {
     /// that was refused.
     pub incomplete: bool,
     /// The first unit's register window, for the step that programs it.
+    ///
+    /// **The first, which is not necessarily the right one.** A platform may
+    /// describe several units, each governing a different set of devices, and
+    /// exactly one of them may carry `INCLUDE_PCI_ALL` for everything the
+    /// others do not claim. This kernel programs `units[0]` and always has.
+    /// On a machine with one unit — every emulator this has run on — that is
+    /// correct by accident. See [`Report::unit_list`].
     pub first_register_base: u64,
+    /// Every unit the firmware described: its register window, and whether it
+    /// claims every device not claimed by another.
+    ///
+    /// Carried so the boot report can say how many units there are and which
+    /// one is being programmed, rather than reporting a count and then
+    /// silently acting on one of them.
+    pub unit_list: [(u64, bool); bhaskix_arch::acpi::MAX_UNITS],
 }
 
 /// Finds the IOMMU units the firmware describes.
@@ -129,6 +143,11 @@ pub unsafe fn discover(rsdp: Option<PhysAddr>, hhdm: u64) -> Option<Report> {
         })
     }?;
 
+    let mut unit_list = [(0u64, false); bhaskix_arch::acpi::MAX_UNITS];
+    for (slot, unit) in unit_list.iter_mut().zip(dmar.units()) {
+        *slot = (unit.register_base, unit.covers_all);
+    }
+
     let mut region_list = [(0u64, 0u64); bhaskix_arch::acpi::MAX_RESERVED];
     for (slot, region) in region_list.iter_mut().zip(dmar.regions()) {
         *slot = (region.base, region.limit);
@@ -143,6 +162,7 @@ pub unsafe fn discover(rsdp: Option<PhysAddr>, hhdm: u64) -> Option<Report> {
         interrupt_remapping: dmar.interrupt_remapping,
         incomplete: dmar.truncated,
         first_register_base: dmar.units().next().map_or(0, |unit| unit.register_base),
+        unit_list,
     })
 }
 
@@ -182,6 +202,31 @@ pub fn report(found: Option<Report>) {
                     "absent"
                 },
             );
+            // **Every unit, and which one this kernel programs.** A count
+            // alone reads as "the IOMMU was found"; it does not say that only
+            // one of them is being programmed, or that the one being
+            // programmed may govern none of the devices in question. On a
+            // machine with a single unit these lines are redundant. On a
+            // machine with four they are the difference between a report that
+            // is true and one that is merely not false.
+            for (index, (base, covers_all)) in
+                report.unit_list.iter().take(report.units).enumerate()
+            {
+                println!(
+                    "    iommu unit {index}   registers at {base:#x}, {}{}",
+                    if *covers_all {
+                        "claims every device not claimed by another"
+                    } else {
+                        "claims only the devices its scope names"
+                    },
+                    if *base == report.first_register_base {
+                        "  <- the one this kernel programs"
+                    } else {
+                        "  (NOT PROGRAMMED: devices under it are not translated)"
+                    },
+                );
+            }
+
             if report.incomplete {
                 // Not a detail. A unit that was refused or dropped is a set of
                 // devices nobody is translating, and RFC 0012's rule is that a
@@ -1792,6 +1837,73 @@ pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), 
     UNIT_BASE.store(base, core::sync::atomic::Ordering::Release);
     Ok(())
 }
+
+/// Prints every fault the unit has recorded, and says so when there are none.
+///
+/// **This is the line that was missing.** [`faulted`] below has existed since
+/// RFC 0012 and was never called from anywhere, so a device refused by the
+/// IOMMU produced exactly the same boot report as a device that worked: the
+/// kernel held a bit saying "something faulted" and never read it, and held no
+/// way at all to learn *which device*, *what address*, or *why*.
+///
+/// Only the unit this kernel programs is read, which on a machine with several
+/// is not all of them. That is stated in the line rather than left implied.
+///
+/// # Safety
+///
+/// As [`enable`], and the unit must already have been mapped by it.
+pub unsafe fn report_faults(report: &Report, hhdm: u64) {
+    let Some(base) = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)
+    else {
+        crate::println!("    iommu faults   the unit's registers could not be mapped to ask");
+        return;
+    };
+
+    let mut records = [vtd::FaultRecord {
+        source: 0,
+        address: 0,
+        reason: 0,
+        read: false,
+    }; MAX_FAULTS_REPORTED];
+
+    // SAFETY: the same window `enable` mapped and programmed.
+    let found = unsafe {
+        let unit = vtd::Unit::new(base as *mut u8);
+        unit.fault_records(&mut records)
+    };
+
+    if found == 0 {
+        crate::println!("    iommu faults   none recorded by the unit this kernel programs\x1b[0m");
+        return;
+    }
+
+    for record in &records[..found] {
+        let (bus, device, function) = record.bus_device_function();
+        crate::println!(
+            "\x1b[91m    iommu fault    {:02x}:{:02x}.{} was refused a {} of {:#x}: {} \
+             (reason {:#x})\x1b[0m",
+            bus,
+            device,
+            function,
+            if record.read { "read" } else { "write" },
+            record.address,
+            vtd::describe_fault(record.reason),
+            record.reason,
+        );
+    }
+    if found == MAX_FAULTS_REPORTED {
+        crate::println!(
+            "    iommu fault    {found} is as many as this report holds; there may be more"
+        );
+    }
+}
+
+/// How many fault records one boot report will print.
+///
+/// A unit may hold up to 256. A boot that faults that many times has one bug
+/// repeated, not 256 findings, and a report that scrolls the first one off the
+/// screen has hidden the only line that mattered.
+const MAX_FAULTS_REPORTED: usize = 8;
 
 /// Whether the unit has recorded a fault since translation was enabled.
 ///

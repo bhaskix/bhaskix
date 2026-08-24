@@ -606,6 +606,16 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                         },
                     );
                 } else {
+                    // **What the controller says about itself, on the same
+                    // line.** "Not answered" is a symptom with several causes
+                    // and no way to tell them apart: a controller that
+                    // stopped, one whose memory reads are being refused, and
+                    // one that never picked the command ring up at all all
+                    // produce exactly this silence. `HSE` is the one that
+                    // matters most -- the controller sets it when a read or
+                    // write of its own is answered with an error, which is
+                    // what a refused DMA looks like from this side.
+                    let state = answered.state;
                     println!(
                         "\x1b[91m    xhci rings     the no-op at {:#x} was not answered: \
                          {} event(s) arrived{}, last command {:#x}\x1b[0m",
@@ -617,6 +627,25 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                             " (nothing before the deadline)"
                         },
                         answered.drained.last_command,
+                    );
+                    println!(
+                        "\x1b[91m    xhci rings     controller says: {}, {}, {}, command ring {}\x1b[0m",
+                        if state.halted() { "HALTED" } else { "running" },
+                        if state.host_system_error() {
+                            "HOST SYSTEM ERROR (a read or write of its own was refused)"
+                        } else {
+                            "no host system error"
+                        },
+                        if state.host_controller_error() {
+                            "HOST CONTROLLER ERROR"
+                        } else {
+                            "no internal error"
+                        },
+                        if state.command_ring_running() {
+                            "running"
+                        } else {
+                            "NOT running (it never picked the ring up)"
+                        },
                     );
                 }
                 // RFC 0041 step 5. **The claim is read back from the
@@ -739,16 +768,17 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if let Some((found, _)) = iommu_state.as_ref() {
         // A fault here means a device reached for something nobody granted it,
         // during its own bring-up. RFC 0012 calls that the feature.
+        //
+        // **Every record, and a line when there are none.** This read one
+        // record until 2026-08-24 -- the first of however many the unit holds
+        // -- and printed nothing at all when it found none. Both halves were
+        // wrong in the same way: a silent report is indistinguishable from a
+        // report that did not run, and "no fault in slot zero" is not "no
+        // fault". That ambiguity cost real time on an xHCI controller whose
+        // DMA was going unanswered, where the absence of a fault line was the
+        // single most useful fact available and could not be trusted.
         // SAFETY: the unit `iommu_bringup` mapped and programmed.
-        if let Some(fault) = unsafe { iommu::take_fault(found, handoff.hhdm_base.as_u64()) } {
-            let (bus, slot, function) = fault.device;
-            println!(
-                "    iommu          FAULT {bus:02x}:{slot:02x}.{function} {} {:#x}, reason {:#04x}",
-                if fault.read { "read" } else { "write" },
-                fault.address,
-                fault.reason
-            );
-        }
+        unsafe { iommu::report_faults(found, handoff.hhdm_base.as_u64()) };
     }
     mount_root(handoff);
     if !vfs_self_test(handoff) {

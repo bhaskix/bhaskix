@@ -649,6 +649,88 @@ pub const fn iotlb_invalidation() -> [u64; 2] {
 /// spinning in a kernel with no console yet. Generous, because the operations
 /// below invalidate caches in hardware and an emulator is not fast.
 const WAIT_POLLS: u32 = 1_000_000;
+/// One entry of a Fault Recording Register, decoded.
+///
+/// The unit records *which* device asked for *what* and *why it was
+/// refused*. Until this existed the kernel could only read the one bit
+/// saying a fault had happened somewhere — which is the difference between
+/// "the IOMMU is unhappy" and "00:14.0 was refused a read of 0x100001000
+/// because its context entry says it may not".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FaultRecord {
+    /// The requester id that faulted: bus, device, function.
+    pub source: u16,
+    /// The page address the request named. Bits 63:12 of the record,
+    /// already shifted back into an address.
+    pub address: u64,
+    /// Why it was refused. Specification Table 30, §7.1.3.
+    pub reason: u8,
+    /// Whether the faulted request was a read. A write is the other case;
+    /// the specification calls this the Type field.
+    pub read: bool,
+}
+
+impl FaultRecord {
+    /// Decodes one 128-bit record, or `None` if it holds no fault.
+    ///
+    /// `low` is bits 63:0 and `high` bits 127:64, which is the order two
+    /// 64-bit reads of a 128-bit-aligned register produce.
+    #[must_use]
+    pub const fn from_bits(low: u64, high: u64) -> Option<Self> {
+        // Bit 127 is F, and every other field is defined only when it is
+        // set. A record read before hardware has filled one in is not a
+        // fault at address zero from device zero.
+        if high & (1 << 63) == 0 {
+            return None;
+        }
+        Some(Self {
+            // SID, bits 79:64.
+            source: (high & 0xffff) as u16,
+            // FI, bits 63:12: *the page address*, so it is shifted back
+            // rather than masked in place.
+            address: (low >> 12) << 12,
+            // FR, bits 103:96.
+            reason: ((high >> 32) & 0xff) as u8,
+            // T1, bit 126: 1 is a read, 0 a write.
+            read: high & (1 << 62) != 0,
+        })
+    }
+
+    /// The requester id split the way a boot report prints it.
+    #[must_use]
+    pub const fn bus_device_function(self) -> (u8, u8, u8) {
+        (
+            (self.source >> 8) as u8,
+            ((self.source >> 3) & 0x1f) as u8,
+            (self.source & 0x7) as u8,
+        )
+    }
+}
+
+/// What a fault reason code means, in the words of Table 30.
+///
+/// Legacy-mode codes only, because that is the mode this kernel programs.
+/// An unknown code is reported as unknown rather than guessed at: the
+/// number is printed beside it, so a code this list does not carry is
+/// still actionable.
+#[must_use]
+pub const fn describe_fault(reason: u8) -> &'static str {
+    match reason {
+        0x1 => "the root entry for its bus is not present",
+        0x2 => "its context entry is not present -- no window was ever built for it",
+        0x3 => "its context entry is programmed invalidly",
+        0x4 => "the address is above what this unit can translate",
+        0x5 => "it asked to write where it has no write permission",
+        0x6 => "it asked to read where it has no read permission -- not mapped",
+        0x8 => "the root table address this kernel gave the unit is invalid",
+        0x9 => "the context table address for its bus is invalid",
+        0xa => "a reserved field is set in its root entry",
+        0xb => "a reserved field is set in its context entry",
+        0xd => "its context entry blocks translated requests",
+        0xe => "the translated address landed in the interrupt range",
+        _ => "unknown reason",
+    }
+}
 
 impl Unit {
     /// Wraps a mapped register window.
@@ -1188,6 +1270,46 @@ impl Unit {
         unsafe { self.read32(reg::FSTS) }
     }
 
+    /// Reads every fault the unit has recorded, clearing each as it is read.
+    ///
+    /// Returns how many were written into `into`. The fault registers are not
+    /// at a fixed offset — the unit reports where they are and how many there
+    /// are in its capability register, and assuming either writes into
+    /// whatever happens to be there.
+    ///
+    /// Each record is cleared because `F` is `RW1CS`: a fault left set is one
+    /// this boot cannot distinguish from the next boot's, and the whole value
+    /// of the record is knowing *when* it happened.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`].
+    pub unsafe fn fault_records(&self, into: &mut [FaultRecord]) -> usize {
+        // SAFETY: the caller's obligation.
+        let capabilities = unsafe { self.capabilities() };
+        // FRO, bits 33:24, in sixteen-byte units.
+        let offset = (((capabilities >> 24) & 0x3ff) as usize) * 16;
+        // NFR, bits 47:40, and the count is N+1.
+        let registers = (((capabilities >> 40) & 0xff) as usize) + 1;
+
+        let mut found = 0;
+        for index in 0..registers {
+            if found == into.len() {
+                break;
+            }
+            let at = offset + index * 16;
+            // SAFETY: an offset the unit itself reported, inside its window.
+            let (low, high) = unsafe { (self.read64(at), self.read64(at + 8)) };
+            if let Some(record) = FaultRecord::from_bits(low, high) {
+                into[found] = record;
+                found += 1;
+                // SAFETY: as above. `F` is write-one-to-clear.
+                unsafe { self.write64(at + 8, 1 << 63) };
+            }
+        }
+        found
+    }
+
     /// Whether any fault has been recorded.
     ///
     /// # Safety
@@ -1207,6 +1329,68 @@ impl Unit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_fault_record_is_not_a_fault_from_device_zero() {
+        // Every other field is defined only when F is set. Decoding a record
+        // hardware has not filled in yields 00:00.0 reading address zero,
+        // which is a device that exists and an address that means something.
+        assert_eq!(FaultRecord::from_bits(0, 0), None);
+        assert_eq!(
+            FaultRecord::from_bits(0xffff_ffff_ffff_f000, 0x7fff_ffff_ffff_ffff),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fault_record_names_the_device_the_address_and_the_reason() {
+        // 00:14.0 -- the xHCI on the machine this was written for -- refused a
+        // read of 0x100001000 because nothing was mapped there.
+        let source = 0x00a0u64; // bus 0, device 0x14, function 0
+        let high = (1 << 63) | (1 << 62) | (0x6u64 << 32) | source;
+        let record = FaultRecord::from_bits(0x1_0000_1000, high).expect("F is set");
+
+        assert_eq!(record.bus_device_function(), (0x00, 0x14, 0));
+        assert_eq!(record.address, 0x1_0000_1000);
+        assert_eq!(record.reason, 0x6);
+        assert!(record.read, "a read was recorded as a write");
+    }
+
+    #[test]
+    fn the_fault_address_is_a_page_address_not_a_field() {
+        // FI is bits 63:12 and *is* the address, so the low twelve bits are
+        // not part of it. Masking them in place rather than shifting would
+        // report an address a thousand times too small.
+        let high = 1u64 << 63;
+        let record = FaultRecord::from_bits(0xdead_b000, high).expect("F is set");
+        assert_eq!(record.address, 0xdead_b000);
+    }
+
+    #[test]
+    fn a_write_fault_is_distinguished_from_a_read() {
+        let read = FaultRecord::from_bits(0, (1 << 63) | (1 << 62)).expect("F");
+        let write = FaultRecord::from_bits(0, 1 << 63).expect("F");
+        assert!(read.read);
+        assert!(!write.read, "T1 clear is a write");
+    }
+
+    #[test]
+    fn the_source_id_splits_the_way_pci_numbers_it() {
+        // Bus 8:15, device 3:7, function 0:2. Getting the split wrong names a
+        // device that is not the one that faulted, which is worse than saying
+        // nothing.
+        let record = FaultRecord::from_bits(0, (1 << 63) | 0x07fb).expect("F");
+        assert_eq!(record.bus_device_function(), (0x07, 0x1f, 0x3));
+    }
+
+    #[test]
+    fn every_legacy_fault_reason_this_kernel_can_cause_has_words() {
+        // The two that this kernel's own bugs produce: a device with no window
+        // at all, and a device with a window that does not cover the address.
+        assert!(describe_fault(0x2).contains("context entry is not present"));
+        assert!(describe_fault(0x6).contains("not mapped"));
+        assert_eq!(describe_fault(0x77), "unknown reason");
+    }
 
     #[test]
     fn a_remapping_entry_validates_the_source_that_may_use_it() {
