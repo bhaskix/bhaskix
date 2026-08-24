@@ -199,10 +199,10 @@ Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 
 `make test` runs, cheapest first, so a trivial mistake fails in seconds rather
 than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host
-targets; **949 host tests** (counted 2026-08-23 from a `make test-host` run —
+targets; **1,010 host tests** (recounted 2026-08-24 from a `make test-host` run —
 this line said "346 host assertions" for months, carried forward uncounted,
-which [TRACKER.md](TRACKER.md) §3 had already recorded as not comparable with
-what a run prints); the project-invariant gates (bootloader
+and then **949 for a day after that count went stale**, which is the same
+failure one recount later); the project-invariant gates (bootloader
 containment, `unsafe` budgets with mandatory `// SAFETY:` justifications,
 dependency direction, service placements, no vendor strings, SPDX headers);
 BIOS, UEFI and IOMMU boot tests asserting on captured serial output across four
@@ -213,9 +213,29 @@ triggers six CPU exceptions and checks each is reported rather than
 triple-faulting. Any `FAILED` the kernel prints fails the run, whether or not a
 gate was looking for that particular one.
 
-That is **601 checks**. A gate that has never been watched failing is not
-counted as a gate here — see [TRACKER.md](TRACKER.md), which records the ones
-that turned out to prove nothing and what was done about them.
+That is **1,262 assertions**, on a definition written down at last on
+2026-08-24: every line a harness prints through its own success marker during
+one `make test`, counted once per run — so a gate that answers on five
+placements counts five times, because the suite executes it five times. Run it
+yourself:
+
+```
+make test | sed 's/\x1b\[[0-9;]*m//g' | grep -cE '^ *ok +'
+```
+
+> This line said **"601 checks"** and had been stale since at least
+> 2026-08-14, when [TRACKER.md](TRACKER.md) recorded that it no longer matched
+> what a run printed and **declined to replace it** — on the grounds that
+> nobody had written down what counts as a check. That refusal was right, and
+> what was missing was the definition rather than the number. **1,262 is not a
+> corrected 601**; it is a different measurement on a stated scale, and no
+> growth should be read into the difference.
+
+**A gate that has never been watched failing is not counted as a gate here.**
+That is a standard for adding one, not a counting rule — it is not derivable
+from any run, which is part of why the old number could not be reproduced. See
+[TRACKER.md](TRACKER.md), which records the gates that turned out to prove
+nothing and what was done about them.
 
 ## Contributing
 

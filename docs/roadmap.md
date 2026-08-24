@@ -233,7 +233,14 @@ scheduled here — promoting a merge-gate obligation to a phase item would turn 
   plan: the second driver — `bin/blkd`, in a domain — cost three bugs the first one had already
   learned and written down in comments, and a framework is the difference between a lesson recorded
   and a lesson enforced
-- ✅ **Networking** — every word of the bullet's name real as of 2026-08-18, IPv6 last. [RFC 0018](rfc/0018-networking.md)
+- ✅ **Networking** — every word of the bullet's name real as of 2026-08-18, IPv6 last. **And every
+  word of it rests on one machine, which this bullet did not say until 2026-08-24**: this system's
+  only NIC driver is virtio (`bin/netd` drives that and nothing else, and the kernel has no network
+  driver at all), *and* a network device is refused unless an IOMMU contains it — so QEMU's
+  `intel-iommu` lane is the only machine, physical or virtual, where any of this has ever run. The
+  SR550 has neither half: four Intel X722s and four IOMMU units off pending
+  [RFC 0043](rfc/0043-an-iommu-on-a-machine-with-no-virtio.md). **Nothing here has run on physical
+  hardware and currently cannot.** [RFC 0018](rfc/0018-networking.md)
   (accepted, all seven steps): virtio-net in a domain, Ethernet, ARP, IPv4, ICMP and UDP in a
   `no_std` crate with six fuzz targets, a socket that is a badged capability rather than a
   descriptor, DHCP by demonstration. [RFC 0020](rfc/0020-tcp.md) (implemented, all six steps): a
@@ -271,8 +278,13 @@ scheduled here — promoting a merge-gate obligation to a phase item would turn 
   sovereignty milestone the boot shim was designed to enable). [RFC 0028](rfc/0028-bhaskixboot.md),
   steps 1–7 implemented, closed 2026-08-18: hand-rolled firmware bindings, byte-proven payload,
   a drawn KASLR slide the kernel confirms, four CPUs the kernel starts itself (MADT discovery,
-  kernel-side INIT-SIPI), and **the full Limine-lane gate set answered natively** — 74 gates
-  green on both loaders, plus the loader-specific lane's 23 and its permanent negative arm.
+  kernel-side INIT-SIPI), and **the full Limine-lane gate set answered natively** — **107
+  passing assertions on both loaders as measured 2026-08-24**
+  (`tests/qemu/boot-test.sh native | sed 's/\x1b\[[0-9;]*m//g' | grep -c '^ok '`), plus the
+  loader-specific lane's own set and its permanent negative arm. *This line said "74 gates",
+  a hand-maintained tally that nothing in the tree produces; see TRACKER's changelog for
+  2026-08-24. The claim it carries — parity between the two loaders — is unchanged and is now
+  checkable by running each lane and comparing.*
   Limine remains as the second lane, exactly as the RFC keeps it
 - ✅ **Package management and image building** — [RFC 0030](rfc/0030-packages.md), accepted
   2026-08-19, all six steps. A package is a program plus the

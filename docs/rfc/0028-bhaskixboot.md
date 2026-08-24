@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **Accepted 2026-08-18**, all seven steps implemented — accepted on the working demonstration: the native lane answers the full Limine-lane gate set (74 gates, both loaders, same list — `tests/qemu/boot-test.sh native`), the loader-specific lane holds its 23 plus the permanent negative arm, and the roadmap bullet is closed. Question 2 was answered against its own sketch — bring-up lives in the kernel — and questions 1 and 3 closed with their steps (one hybrid-free ESP directory per lane; Secure Boot stays deferred to hardware, M1-17) |
+| **Status** | ✅ **Accepted 2026-08-18**, all seven steps implemented — accepted on the working demonstration: the native lane answers the full Limine-lane gate set (74 gates, both loaders, same list — `tests/qemu/boot-test.sh native`), the loader-specific lane holds its 23 plus the permanent negative arm, and the roadmap bullet is closed. **The figure "74 gates" is on the hand-maintained scale retired 2026-08-24 and is left as it was; the *claim* it carries — parity between the two loaders — was re-checked on that date and holds: 107 passing assertions on each lane, same list, by the command in TRACKER's header.** Question 2 was answered against its own sketch — bring-up lives in the kernel — and questions 1 and 3 closed with their steps (one hybrid-free ESP directory per lane; Secure Boot stays deferred to hardware, M1-17) |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot |
 | **Milestone** | Phase 2 — the roadmap's `bhaskixboot.efi` bullet, and half of the phase's exit criterion ("boots on its own bootloader") |

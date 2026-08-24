@@ -154,7 +154,7 @@ replace the one it started with.
 | 1.3 | Addresses that are not memory | Paging, the direct map, and why a register window is not a page of RAM | `kernel/src/mmio.rs`, and the uncached-mapping rule | ready |
 | 1.4 | Four levels, on purpose | Five-level paging was refused with written triggers, not overlooked | [RFC 0025](rfc/0025-four-level-paging-on-purpose.md); the boot-time refusal of a machine entered with LA57 live | ready |
 | 1.5 | The first thing on a screen | Framebuffer and serial, and that a shared UART is not an absent one | The SR550's serial probe, wrong until 2026-08-22 — a correction with hardware behind it | ready |
-| 1.6 | Writing our own loader | `bhaskixboot.efi` reached parity with the incumbent rather than replacing it on faith | [RFC 0028](rfc/0028-bhaskixboot.md); 74 gates green on both loaders plus the loader lane's own 23 | ready |
+| 1.6 | Writing our own loader | `bhaskixboot.efi` reached parity with the incumbent rather than replacing it on faith | [RFC 0028](rfc/0028-bhaskixboot.md); the same gate set answered on both loaders — 107 passing assertions each, measured 2026-08-24 (this said "74 gates", a hand-maintained tally nothing produced) | ready |
 | 1.7 | KASLR, drawn and confirmed | The loader draws the slide and the kernel confirms it, because either alone is a claim | The boot gate that reads the slide back | ready |
 
 *Interlude A — The first boot on metal.* One machine, one boot, observed on a

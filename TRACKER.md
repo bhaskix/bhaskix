@@ -796,6 +796,40 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (the same claim in five documents, and today's own fixes had made three of them wrong)
+
+**This file warns about exactly this.** Its milestone note records a stale claim
+that lived in `README.md`, `docs/roadmap.md` and this file at once, and ends
+*"check all four when it changes again"*. Today changed several status claims
+here and in nothing else, so by the afternoon the drift was self-inflicted.
+
+Swept and reconciled:
+
+| document | said | now |
+|---|---|---|
+| `README.md` | "949 host tests" | **1,010**, recounted |
+| `README.md` | "601 checks" | **1,262**, with the definition and the command |
+| `docs/roadmap.md` | "74 gates green on both loaders" | **107 passing assertions each**, measured |
+| `docs/roadmap.md` | Networking: "every word real" | *and* every word rests on one machine — the hardware gap |
+| `docs/ebook-mastering-bhaskix.md` | "74 gates … plus the loader lane's own 23" | the measured figures |
+
+**Five documents, not four.** The ebook carries the same tally and is not in the
+list that sentence names. It is now.
+
+**Two accepted RFCs keep their historical numbers, with a note rather than a
+rewrite** — [RFC 0028](docs/rfc/0028-bhaskixboot.md)'s "74 gates" and
+[RFC 0032](docs/rfc/0032-a-supervisor-interface.md)'s kernel `unsafe` figures.
+An accepted document records what was measured at the time; changing the number
+would falsify the record. What each now says is which scale it is on, and — for
+RFC 0028 — that the *claim* was re-checked and holds: parity between the two
+loaders, 107 assertions on each lane.
+
+**And README's line turned out to hold a fragment of the definition nobody
+could find.** *"A gate that has never been watched failing is not counted as a
+gate here."* That is a standard for adding a gate, not a counting rule — it is
+not derivable from any run, which is part of why "601" could never be
+reproduced. Kept, and labelled as what it is.
+
 ### 2026-08-24 (a function that had never been called, and the sentence saying it was harmless was wrong)
 
 **`virtio::quiesce` was written to stop the kernel's own disk doing DMA before
