@@ -190,6 +190,37 @@ pub const MSL_US: u64 = 30_000_000;
 /// 1122's hundred-second floor for `R2`.
 pub const MAX_RETRANSMITS: u8 = 8;
 
+/// How many times a `SYN·ACK` is retransmitted before a connection **nobody
+/// has proved they wanted** is abandoned. Named after Linux's
+/// `tcp_synack_retries`, which is the same knob.
+///
+/// # Why this is smaller than [`MAX_RETRANSMITS`]
+///
+/// A connection in [`State::SynReceived`] was created by one packet from an
+/// address that need not exist, and the peer has not yet said anything only a
+/// real peer could say. Until the handshake completes, patience is spent on
+/// somebody who may not be there — and it is spent out of a table this service
+/// refuses at the size of, so the patience is *somebody else's connection*.
+///
+/// Under RFC 0047 that cost was measured rather than argued about: one such
+/// connection held `bin/tcpd`'s single accepted slot for **242 seconds**, and
+/// every later `SYN` was refused silently for all of it.
+///
+/// **This is deliberately below the floor RFC 1122 sets for `R2` on a `SYN`**,
+/// which the comment above invokes for the established case. That floor has
+/// **not** been read from the specification on this machine — there is no copy
+/// of it here — so it is recorded as a known trade rather than a settled
+/// number. What is known: Linux ships `tcp_synack_retries` at 5 by default and
+/// every stack makes this trade, because the alternative is a table an
+/// unauthenticated peer decides the contents of. [RFC 0048] carries the
+/// argument; SYN cookies are what make this constant stop mattering.
+pub const MAX_SYNACK_RETRANSMITS: u8 = 3;
+
+/// The whole point is that these differ, and that it is *this* one that is
+/// smaller. Checked at compile time rather than in a test, because a test can
+/// only fail after somebody has built the thing.
+const _: () = assert!(MAX_SYNACK_RETRANSMITS < MAX_RETRANSMITS);
+
 /// The largest number of actions a single [`step`] can produce.
 ///
 /// # This number was wrong, and the fuzz target is what said so
@@ -680,7 +711,15 @@ fn retransmit(tcb: &mut Tcb, actions: &mut Actions, now: u64) {
     if tcb.state == State::Closed || !tcb.awaiting_ack() {
         return;
     }
-    if tcb.retransmits >= MAX_RETRANSMITS {
+    // A half-open connection is given less patience than an established one,
+    // and the reason is whose it is: until the handshake completes, the slot
+    // is held on the word of one packet. See [`MAX_SYNACK_RETRANSMITS`].
+    let limit = if tcb.state == State::SynReceived {
+        MAX_SYNACK_RETRANSMITS
+    } else {
+        MAX_RETRANSMITS
+    };
+    if tcb.retransmits >= limit {
         tcb.state = State::Closed;
         actions.push(Action::Closed(Ended::Unreachable));
         return;
@@ -2376,6 +2415,98 @@ mod tests {
         link.drive(Event::Shutdown);
         assert!(!link.tcb.snd_una.follows(link.tcb.snd_nxt));
         assert!(link.tcb.in_flight() <= 501);
+    }
+
+    // ------------------------------------------------------------------
+    // RFC 0048 step 1: a connection nobody has proved they wanted is given
+    // less patience than one somebody completed.
+    //
+    // Both tests are here rather than one, and the second is the important
+    // one: shortening the wrong connections would be a worse bug than the one
+    // being fixed, and a test that only checked the half-open case would pass
+    // a change that shortened everything.
+    // ------------------------------------------------------------------
+
+    /// Drives `Expired(Retransmit)` at whatever instant the machine asks for
+    /// next, and answers how long it took to reach `Closed` and after how many
+    /// retransmissions. The clock is the machine's own, so this measures the
+    /// backoff rather than assuming it.
+    fn hold_until_closed(mut tcb: Tcb) -> (u64, u32) {
+        let mut now = 0u64;
+        let mut fired = 0;
+        while tcb.state != State::Closed && fired < 64 {
+            let (next_tcb, actions) = step(tcb, Event::Expired(Timer::Retransmit), now);
+            tcb = next_tcb;
+            let mut next = None;
+            for action in actions.iter() {
+                if let Action::Arm {
+                    timer: Timer::Retransmit,
+                    at,
+                } = action
+                {
+                    next = Some(at);
+                }
+            }
+            match next {
+                Some(at) => now = at,
+                None => break,
+            }
+            fired += 1;
+        }
+        (now / 1_000_000_000, fired)
+    }
+
+    #[test]
+    fn a_half_open_connection_is_abandoned_in_seconds_not_minutes() {
+        // The measured cost of the defect RFC 0048 exists for: before the
+        // split limit, one `SYN` from a peer that then vanished held
+        // `bin/tcpd`'s single accepted slot for **242 seconds**, and every
+        // later `SYN` was refused silently for all of it.
+        //
+        // The number is asserted, not just the state. "It closes eventually"
+        // was already true at 242 seconds.
+        let mut link = Link::new();
+        link.drive(Event::Listen {
+            iss: ISS,
+            window: RING,
+        });
+        link.drive(Event::Arrived(from_peer(
+            IRS.0,
+            None,
+            Flags::SYN,
+            PEER_WINDOW,
+            &[],
+        )));
+        assert_eq!(link.tcb.state, State::SynReceived, "the peer knocked");
+
+        let (seconds, retransmits) = hold_until_closed(link.tcb);
+        assert_eq!(
+            retransmits,
+            u32::from(MAX_SYNACK_RETRANSMITS),
+            "a half-open connection gets the SYN·ACK budget"
+        );
+        assert_eq!(seconds, 14, "fourteen seconds, measured -- and it was 242");
+    }
+
+    #[test]
+    fn an_established_connection_keeps_the_patience_it_always_had() {
+        // The half of this that must not break. A connection somebody
+        // completed has proved the peer exists, so it keeps `MAX_RETRANSMITS`
+        // — and shortening *this* would drop live connections on a lossy path,
+        // which is a worse defect than the one being fixed.
+        let mut link = Link::established();
+        link.drive(Event::Wrote(100));
+        assert!(
+            link.tcb.awaiting_ack(),
+            "something is outstanding to resend"
+        );
+
+        let (_, retransmits) = hold_until_closed(link.tcb);
+        assert_eq!(
+            retransmits,
+            u32::from(MAX_RETRANSMITS),
+            "eight, unchanged, and more than the SYN·ACK budget"
+        );
     }
 
     // ------------------------------------------------------------------
