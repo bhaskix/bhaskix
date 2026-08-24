@@ -152,6 +152,25 @@ else
     status=1
 fi
 
+# The pre-OS handoff ran, and said what it found. On this emulator the answer
+# is always "no legacy capability" -- QEMU's controller declares none, so there
+# is no firmware to take it from. That makes this a weak assertion about
+# *ownership* and a strong one about *reporting*: it fails if the handoff stops
+# running, stops printing, or starts refusing a controller nobody claimed.
+#
+# **The branch that matters here cannot be reached on this machine.** Firmware
+# holding the controller, and the SMI sources it arms, exist only on a real
+# server -- which is exactly why an unenforced ownership contract survived until
+# an SR550 hung on it. What this gate protects is the line that would have said
+# so.
+if await "xhci           no legacy capability"; then
+    pass "the controller was asked for, and firmware had never claimed it"
+else
+    fail "the pre-OS handoff did not report"
+    grep -aE "xhci" "$LOG" | sed 's/^/      /'
+    status=1
+fi
+
 # Either shell will do: this is a test of the input path, not of which shell
 # happens to be running. One pattern, for the reason `await` gives.
 if await 'bhaskix[>$] '; then

@@ -41,6 +41,7 @@
 pub mod capability;
 pub mod context;
 pub mod doorbell;
+pub mod extended;
 pub mod operational;
 pub mod runtime;
 pub mod trb;

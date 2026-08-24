@@ -32,7 +32,7 @@ use bhaskix_arch::pci;
 use bhaskix_arch::pci::PROG_IF_OFFSET;
 use bhaskix_device::Bus;
 use bhaskix_usb::setup as usb_setup;
-use bhaskix_xhci::{capability, context, operational, runtime, trb};
+use bhaskix_xhci::{capability, context, extended, operational, runtime, trb};
 
 /// PCI class for a serial bus controller.
 const CLASS_SERIAL_BUS: u8 = 0x0c;
@@ -472,6 +472,13 @@ pub struct Parameters {
     /// here because it is a bound: a controller whose doorbells are outside the
     /// window has reported an offset this driver must not later trust.
     pub doorbells: usize,
+    /// Start of the extended capability list, **in dwords** from the window
+    /// base, or zero for a controller that declares none.
+    ///
+    /// Dwords because `HCCPARAMS1` says dwords. The unit is carried this far
+    /// rather than converted at the read so that the shift happens next to the
+    /// specification's own worked example, in [`extended::first_capability`].
+    pub extended_capabilities: u32,
 }
 
 /// How many bytes of a controller's window this driver must be able to reach.
@@ -493,6 +500,157 @@ const fn required_window(parameters: &Parameters) -> usize {
         most = doorbells;
     }
     most
+}
+
+/// What the pre-OS handoff found, and what it did about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ownership {
+    /// The controller declares no USB Legacy Support capability, so firmware
+    /// was never in the way.
+    ///
+    /// **Every emulator this driver has ever run on answers this**, which is
+    /// why the rest of this enum had no witness until a real server produced
+    /// one. A path that is dead on the machine you test on is not a path that
+    /// works.
+    NoCapability,
+    /// This driver holds the controller.
+    Held {
+        /// Whether firmware's semaphore was set when the driver asked.
+        firmware_held: bool,
+        /// Whether firmware had SMI sources armed that this driver turned off.
+        silenced: bool,
+    },
+    /// Firmware still claims the controller after the second the specification
+    /// allows it. Its semaphore has been handed back and the controller left
+    /// exactly as it was found.
+    Refused,
+}
+
+impl Ownership {
+    /// Whether the driver may go on to use the controller.
+    #[must_use]
+    pub const fn may_proceed(self) -> bool {
+        !matches!(self, Self::Refused)
+    }
+}
+
+/// Takes the controller from firmware before anything else touches it.
+///
+/// A server's firmware drives the xHC to offer a USB keyboard and a virtual
+/// CD, and it does that from System Management Mode, having asked the
+/// controller to raise an SMI on the events it cares about. Starting such a
+/// controller without the handoff does not race firmware for a device: it
+/// wakes firmware's SMI handler on a controller firmware no longer recognises,
+/// inside an interrupt the operating system cannot see, end of boot.
+/// Specification §4.22.1 states the consequence directly — *"two software
+/// agents believing they each have exclusive ownership of the xHC"*.
+///
+/// Two things are needed and neither is sufficient alone: the semaphore, which
+/// stops firmware from *using* the controller, and the SMI enables, which stop
+/// the controller from *summoning* firmware. The second outlives the first,
+/// because it lives in the controller rather than in firmware.
+///
+/// # Safety
+///
+/// `base` must be a mapped xHCI register window of at least `window` bytes.
+pub unsafe fn take_ownership<B: Bus, W: Wait>(
+    base: usize,
+    window: usize,
+    parameters: &Parameters,
+    wait: &mut W,
+) -> Ownership {
+    let Some(mut at) = extended::first_capability(parameters.extended_capabilities, window) else {
+        return Ownership::NoCapability;
+    };
+
+    // Walk the list for the one capability this driver needs. Bounded twice:
+    // by the window, which `next_capability` checks, and by a step count,
+    // because a malformed list can be circular and a boot that hangs here
+    // cannot say why.
+    let mut steps = 0;
+    let legacy = loop {
+        // SAFETY: `at` is inside the window, which `first_capability` checked
+        // for the head and `next_capability` for every entry after it, and a
+        // dword offset from a dword-aligned base is dword-aligned.
+        let header = extended::CapabilityHeader(unsafe { B::load32(base + at) });
+        if header.id() == extended::LEGACY_SUPPORT {
+            break Some(at);
+        }
+        steps += 1;
+        if steps >= extended::MAX_CAPABILITIES {
+            break None;
+        }
+        match extended::next_capability(at, header, window) {
+            Some(next) => at = next,
+            None => break None,
+        }
+    };
+
+    let Some(legacy) = legacy else {
+        return Ownership::NoCapability;
+    };
+
+    // The capability is two registers, not one, and the second is the half
+    // that matters. A window that holds only the first is not one this can be
+    // done safely in.
+    let control = legacy + extended::CONTROL_OFFSET;
+    if control + 4 > window {
+        return Ownership::NoCapability;
+    }
+
+    // SAFETY: `legacy` is a capability header found inside the window.
+    let found = extended::LegacySupport(unsafe { B::load32(base + legacy) });
+    let firmware_held = found.bios_owned();
+
+    // SAFETY: as above; the register is RW and the value preserves firmware's
+    // own semaphore, which it may be changing concurrently.
+    unsafe { B::store32(base + legacy, found.requesting().0) };
+
+    // §4.22.1: *"The time that OS shall wait for BIOS to respond to the
+    // request for ownership should not exceed '1' second."* One `Settle` is
+    // half of that, so this asks twice rather than quietly halving the
+    // allowance the specification gives firmware -- a machine refused for
+    // being 600 ms slow would look exactly like a machine that is broken.
+    let mut ours = || {
+        // SAFETY: as above, a read of a register inside the window.
+        let raw = unsafe { B::load32(base + legacy) };
+        extended::LegacySupport(raw).owned_by_us()
+    };
+    let mut granted = false;
+    for _ in 0..2 {
+        if wait.until(&mut ours) {
+            granted = true;
+            break;
+        }
+    }
+
+    if !granted {
+        // Hand the semaphore back rather than hold one firmware never
+        // acknowledged. The specification's own words for relinquishing are to
+        // set the OS Owned semaphore to zero, and leaving it set would tell a
+        // firmware that is merely slow that the operating system owns a
+        // controller it is not going to use.
+        //
+        // Its SMI enables are left alone on purpose: this driver is not taking
+        // the controller, so disabling the interrupts firmware relies on would
+        // break a working keyboard to no end.
+        // SAFETY: as above.
+        let now = extended::LegacySupport(unsafe { B::load32(base + legacy) });
+        // SAFETY: as above.
+        unsafe { B::store32(base + legacy, now.0 & !(1 << 24)) };
+        return Ownership::Refused;
+    }
+
+    // SAFETY: `control` was checked to be inside the window just above.
+    let smi = extended::LegacyControlStatus(unsafe { B::load32(base + control) });
+    let silenced = smi.smi_enabled();
+    // SAFETY: as above. `quietened` preserves every RsvdP field it read.
+    unsafe { B::store32(base + control, smi.quietened().0) };
+
+    Ownership::Held {
+        firmware_held,
+        silenced,
+    }
 }
 
 /// Reads the capability bank and bounds everything in it.
@@ -553,6 +711,7 @@ pub unsafe fn parameters<B: Bus>(base: usize, window: usize) -> Result<Parameter
         operational: caplength,
         runtime: runtime_offset,
         doorbells: doorbell_offset,
+        extended_capabilities: hccparams1.extended_capabilities_pointer_dwords(),
     };
 
     if required_window(&parameters) > window {
@@ -1085,26 +1244,34 @@ const MAX_DESCRIPTOR_BYTES: usize = 1024;
 /// than this is refused rather than partially satisfied, because a controller
 /// given fewer buffers than it asked for does not run.
 ///
-/// # It stays 32, and raising it was tried on hardware and reverted
+/// # Sixty-four, and the reasoning that produced 32 was wrong
 ///
-/// Thirty-two is a guess that fits every controller this driver has met — all
-/// of them QEMU's. On 2026-08-24 an Intel C620 on an SR550 refused to come up
-/// because it wants more, and the obvious repair was to raise the bound to the
-/// structure's own limit: the scratchpad array is a single frame of 64-bit
-/// pointers, so `FRAME_SIZE / 8` = 512 is what one array frame holds.
+/// Thirty-two was a guess that fitted every controller this driver had met —
+/// all of them QEMU's, and QEMU asks for **none**, so the whole scratchpad path
+/// had never executed anywhere. On 2026-08-24 an Intel C620 on an SR550 asked
+/// for **34** and was refused.
 ///
-/// **That was built, booted on the machine, and made it worse.** With the bound
-/// at 512 the driver stopped refusing and started allocating, and the boot
-/// **hung** inside bring-up — 29,666 bytes of report against 52,763 for the
-/// same machine refusing cleanly. A refusal that costs a controller is much
-/// better than a hang that costs the boot, so the bound went back.
+/// The obvious repair was to raise the bound to the structure's own limit — one
+/// frame of 64-bit pointers, `FRAME_SIZE / 8` = 512. That was built, booted on
+/// the machine, and the boot **hung** inside bring-up, against a clean refusal
+/// for the same machine at 32. This comment then recorded the conclusion that
+/// raising the bound had made things worse, and put it back.
 ///
-/// What is *not* yet known is the number that controller wants, because the
-/// refusal never said. [`InitError::TooManyScratchpads`] now carries it, so the
-/// next boot of a machine that asks for too many prints the figure — and
-/// whatever raises this constant afterwards will be sized against a measurement
-/// rather than against the shape of a frame.
-const MAX_SCRATCHPADS: u32 = 32;
+/// **That conclusion was wrong, and it is worth saying why rather than
+/// deleting it.** The bound was never what hung the machine. At 32 the driver
+/// refused *before* `bring_up` and the controller was never started; at 512 it
+/// got past the refusal and reached the code that hangs. Raising the limit did
+/// not cause the failure, it revealed it — and the real cause was that this
+/// driver started a controller firmware still owned, which raises a System
+/// Management Interrupt firmware can no longer service. See [`take_ownership`].
+/// A number was blamed for a hang because changing it changed the symptom,
+/// which is the cheapest kind of wrong explanation to believe.
+///
+/// Sixty-four covers the one measurement there is with room above it, and is
+/// small enough that the allocation stays a page of pointers and 64 frames.
+/// [`InitError::TooManyScratchpads`] carries both numbers, so the next
+/// controller that wants more says so instead of merely failing.
+const MAX_SCRATCHPADS: u32 = 64;
 
 /// Microseconds any one register is given to settle.
 const SETTLE_MICROS: u64 = 500_000;
@@ -1186,6 +1353,8 @@ pub enum InitError {
         /// What this driver will provide -- one array frame's worth.
         limit: u32,
     },
+    /// Firmware would not hand the controller over. Specification §4.22.1.
+    FirmwareKeptTheController,
     /// The bring-up itself refused.
     BringUp(BringUpError),
 }
@@ -1204,6 +1373,9 @@ impl InitError {
             Self::MapFailed => "its register window could not be mapped",
             Self::OutOfMemory => "no frame for a ring, a table or a scratchpad",
             Self::NotMappable => "a frame could not be mapped into its window",
+            Self::FirmwareKeptTheController => {
+                "firmware would not hand it over within the second the specification allows"
+            }
             Self::TooManyScratchpads { .. } => {
                 "it wants more scratchpad buffers than this driver provides"
             }
@@ -1293,6 +1465,39 @@ pub unsafe fn init(hhdm: u64) -> Result<Started, InitError> {
     // offset read here is checked against that length.
     let parameters = unsafe { parameters::<bhaskix_device::Volatile>(base, WINDOW_BYTES as usize) }
         .map_err(InitError::BringUp)?;
+
+    // **Before the controller is touched at all.** `bring_up`'s contract has
+    // said "this driver must own the controller" since it was written, and
+    // nothing enforced it: on an emulator there is no firmware to take it from,
+    // so the unenforced contract held by luck for as long as only emulators ran
+    // this code. On a server it does not, and the first thing the driver does
+    // to an unowned controller -- halt it -- is already a violation.
+    // SAFETY: `base` is the mapped window, `WINDOW_BYTES` long, and every
+    // offset reached is checked against that length.
+    let ownership = unsafe {
+        take_ownership::<bhaskix_device::Volatile, _>(
+            base,
+            WINDOW_BYTES as usize,
+            &parameters,
+            &mut Settle,
+        )
+    };
+    match ownership {
+        Ownership::NoCapability => {
+            crate::println!("    xhci           no legacy capability; firmware never claimed it");
+        }
+        Ownership::Held {
+            firmware_held,
+            silenced,
+        } => {
+            crate::println!(
+                "    xhci           taken from firmware: semaphore {}, smi {}",
+                if firmware_held { "held" } else { "clear" },
+                if silenced { "disarmed" } else { "already off" },
+            );
+        }
+        Ownership::Refused => return Err(InitError::FirmwareKeptTheController),
+    }
 
     if parameters.scratchpads > MAX_SCRATCHPADS {
         return Err(InitError::TooManyScratchpads {

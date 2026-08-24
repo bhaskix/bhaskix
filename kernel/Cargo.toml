@@ -475,7 +475,14 @@ asm_budget = 10
 # scanner charges them to the budget. They moved to a function in safe code.
 # The number is supposed to mean something, so prose does not get to inflate
 # it -- and after this morning's fix to that scanner, it does.
-unsafe_budget = 1792
+# 1808 for the pre-OS handoff, `take_ownership`: six MMIO accesses against the
+# USB Legacy Support capability -- the walk's header read, the semaphore read
+# and the write that claims it, the read and write that hand it back when
+# firmware will not release, and the pair that disarms firmware's SMI sources.
+# Every bit decision they act on is in `bhaskix-xhci::extended`, in safe code
+# with host tests; what is charged here is the register access alone, which is
+# the split this budget is supposed to reward.
+unsafe_budget = 1808
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
