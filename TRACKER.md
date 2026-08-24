@@ -791,6 +791,55 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (RFC 0046 drafted and step 1 built: AHCI's byte layouts, for hardware that exists on both machines)
+
+**Every storage device this system can drive is an emulator's invention.**
+`bin/blkd` is virtio-blk, which is the right first driver and the wrong only
+one: the filesystem, the journal, the page cache and the package manager have
+all been exercised against exactly one backing device, whose failure modes are
+the ones a cooperative hypervisor produces.
+
+The hardware is not hypothetical in either direction. QEMU's `q35` has an AHCI
+controller at `00:1f.2` and always has; the SR550 has one at `00:11.5`, found
+by the survey the same day. Neither has ever had a driver here.
+
+**And it closes one of RFC 0043's own holes.** That RFC records QEMU's AHCI
+controller as one of three endpoints with no driver, therefore no window,
+therefore no containment — *while translation is enabled around them*. A driver
+gives it a window, and the gap between `security.md`'s "a DMA-capable device
+reaches only what it was given" and what actually holds gets one endpoint
+smaller on the lane that exercises the IOMMU.
+
+**Step 1 is built: the `ahci` crate**, `#![forbid(unsafe_code)]`, depending on
+nothing. Command list entries, command tables, the Register Host-to-Device FIS,
+physical region descriptors, and the `IDENTIFY DEVICE` parser. Ten host tests,
+**all eight properties watched red**, and the layouts asserted as raw dwords
+rather than round-tripped — a round trip through this crate's own writer and
+reader agrees with itself about a field at the wrong offset, and the controller
+does not.
+
+Three of those traps are worth naming because each is a silent wrong answer
+rather than a failure: the 48-bit **LBA is split across two groups of three
+bytes** with the device register between them; a command header states its FIS
+length **in dwords, not bytes**; and a region descriptor stores **one less**
+than its byte count, so storing the true count transfers one byte too many —
+by a bus master.
+
+`IDENTIFY` is the untrusted input and has the fuzz target RFC 0046 makes
+mandatory: **60,025,250 executions, no crash**, and watched red by removing the
+overflow bound, after which the fuzzer finds an accepted disk whose size cannot
+be multiplied out. It is easy to mistake that structure for configuration; it
+is 512 bytes a *device* wrote, and one of its fields sizes a bus master's
+transfers.
+
+Nothing is driven yet. Steps 2–6 are discovery and refusal, bring-up,
+`IDENTIFY`, `READ DMA EXT` with a gate that reads sector zero, and `bin/ahcid`
+serving `block::READ`/`WRITE`. **On the SR550 the driver will refuse**, because
+translation is off there pending RFC 0043 — and that refusal is RFC 0012's rule
+working on real hardware, not a gap.
+
+959 host tests. make gates green.
+
 ### 2026-08-24 (host3's bus, surveyed: an AHCI controller, four X722s, and four IOMMU units this system declines to turn on)
 
 A second boot of the SR550, with the console attached **before** the reset so

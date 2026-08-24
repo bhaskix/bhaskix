@@ -97,6 +97,12 @@ LAYERS = {
     # without a controller, and it depends on nothing so that nothing it
     # depends on can be the thing that fails.
     "bhaskix-usb": -3,
+    # AHCI's byte layouts and the IDENTIFY a disk answers with, RFC 0046. A
+    # leaf for both of the reasons above at once: the structures it builds are
+    # read by a *bus master*, and the 512 bytes it parses were written by a
+    # device. Neither needs a controller to be tested, and a crate that cannot
+    # reach one cannot be the thing that lets a disk reach memory.
+    "bhaskix-ahci": -3,
     # The Linux personality's arithmetic, RFC 0005: the kernel builds a real
     # initial stack with it and a host test checks the bytes, so it depends
     # on nothing -- the leaf-layer argument a seventh time.

@@ -7,6 +7,10 @@ name = "bhaskix-abi"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-ahci"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-arch-x86-64"
 version = "0.0.0"
 dependencies = [

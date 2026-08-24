@@ -13,6 +13,10 @@ name = "bhaskix-abi"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-ahci"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-arch-x86-64"
 version = "0.0.0"
 dependencies = [
@@ -39,6 +43,7 @@ version = "0.0.0"
 name = "bhaskix-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bhaskix-ahci",
  "bhaskix-arch-x86-64",
  "bhaskix-elf",
  "bhaskix-fs",

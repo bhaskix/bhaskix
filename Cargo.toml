@@ -34,6 +34,7 @@ members = [
     # RFC 0041 -- USB descriptors, parsed away from the driver so a fuzzer can
     # drive them without a controller.
     "usb",
+    "ahci",
 
     # M6
     "fs",

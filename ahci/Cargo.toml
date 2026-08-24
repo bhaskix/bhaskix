@@ -1,0 +1,24 @@
+[package]
+name = "bhaskix-ahci"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "AHCI's byte layouts: command lists, command tables, FISes, and the IDENTIFY a disk answers with. No machine required."
+authors = ["Tarun Kumar Kushwaha"]
+publish = false
+
+[lib]
+name = "bhaskix_ahci"
+path = "src/lib.rs"
+
+# Nothing. A command table is bytes at offsets and an IDENTIFY response is 512
+# bytes a *device* chose; neither needs a controller to be tested and neither
+# should be able to reach one from here. RFC 0046.
+[dependencies]
+
+[package.metadata.bhaskix]
+# Building structures a DMA-capable device will read, and parsing 512 bytes it
+# wrote. The first is arithmetic and the second is untrusted input; there is no
+# `unsafe` that could be justified for either, and `forbid(unsafe_code)` in the
+# source says so where a reader will see it.
+unsafe_budget = 0

@@ -39,6 +39,7 @@ bhaskix-pkg = { path = "../pkg" }
 bhaskix-ustar = { path = "../ustar", features = ["test-support"] }
 bhaskix-usb = { path = "../usb" }
 bhaskix-personality = { path = "../personality" }
+bhaskix-ahci = { path = "../ahci" }
 
 [[bin]]
 name = "elf_parse"
@@ -172,6 +173,15 @@ bench = false
 [[bin]]
 name = "linux_dirent"
 path = "fuzz_targets/linux_dirent.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 0046: `IDENTIFY DEVICE` looks like configuration and is input -- 512
+# bytes a device wrote, one of which sizes a bus master's transfers.
+[[bin]]
+name = "ahci_identify"
+path = "fuzz_targets/ahci_identify.rs"
 test = false
 doc = false
 bench = false

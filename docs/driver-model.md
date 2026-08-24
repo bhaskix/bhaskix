@@ -298,7 +298,9 @@ Ordered by "what makes the system useful soonest", not by interest.
 
 **Phase 3 (enterprise):**
 10. VT-d / AMD-Vi IOMMU (needed earlier for security; listed here as *full* support)
-11. AHCI/SATA, SR-IOV, multi-queue NIC support
+11. SR-IOV, multi-queue NIC support — **AHCI/SATA left this list on 2026-08-24**, when
+    [RFC 0046](rfc/0046-a-driver-for-hardware-that-exists.md) took it up: the layouts are built
+    and host-tested, the driver itself is steps 2–6
 12. TPM 2.0 (CRB/TIS) — required for [security.md](security.md) §3
 
 **Later:** GPU (`domain` placement, mandatory), WiFi, audio, media.
