@@ -1397,6 +1397,25 @@ struct Frame {
 }
 
 /// Allocates a zeroed frame and maps it into `controller`'s window.
+/// The lowest and highest physical frame this driver has allocated.
+///
+/// Recorded so that a DMA fault naming an address can be **classified** rather
+/// than stared at. A refused address inside this range is a frame this driver
+/// owns, which means a device address and a physical address were confused
+/// somewhere in this kernel; an address outside it is memory nobody here ever
+/// handed to the controller. Those are different bugs and the boot report
+/// could not tell them apart.
+static FRAMES_LOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static FRAMES_HIGH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The physical extent of what this driver allocated, if it allocated anything.
+#[must_use]
+pub fn frame_extent() -> Option<(u64, u64)> {
+    let low = FRAMES_LOW.load(core::sync::atomic::Ordering::Acquire);
+    let high = FRAMES_HIGH.load(core::sync::atomic::Ordering::Acquire);
+    (low <= high).then_some((low, high))
+}
+
 fn frame(controller: (u8, u8, u8), hhdm: u64) -> Result<Frame, InitError> {
     use bhaskix_mm::{FRAME_SIZE, Zone};
 
@@ -1410,6 +1429,12 @@ fn frame(controller: (u8, u8, u8), hhdm: u64) -> Result<Frame, InitError> {
     unsafe {
         core::ptr::write_bytes((hhdm + physical) as *mut u8, 0, FRAME_SIZE as usize);
     }
+    FRAMES_LOW.fetch_min(physical, core::sync::atomic::Ordering::AcqRel);
+    FRAMES_HIGH.fetch_max(
+        physical + FRAME_SIZE - 1,
+        core::sync::atomic::Ordering::AcqRel,
+    );
+
     let device = crate::iommu::map_frame(controller, physical, hhdm)
         .ok_or(InitError::NotMappable)?
         .as_u64();

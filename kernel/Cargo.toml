@@ -493,7 +493,12 @@ asm_budget = 10
 # are each one unit's worth of what `enable` used to do inline, plus the width
 # read that now runs across all of them. No new *kind* of access: the same
 # operations, reaching the units that were being skipped.
-unsafe_budget = 1825
+# 1826 for the second fault report: faults are now read once before any driver
+# here has touched a device and once after bring-up, so a fault left by whoever
+# drove the hardware before this kernel cannot be mistaken for one this kernel
+# caused. One extra call, and reading clears the records so the two are
+# disjoint by construction.
+unsafe_budget = 1826
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

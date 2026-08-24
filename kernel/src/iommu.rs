@@ -1986,7 +1986,7 @@ unsafe fn program_unit(
 /// # Safety
 ///
 /// As [`enable`], and the unit must already have been mapped by it.
-pub unsafe fn report_faults(_report: &Report, _hhdm: u64) {
+pub unsafe fn report_faults_since(_report: &Report, _hhdm: u64, when: &str) {
     let mut records = [vtd::FaultRecord {
         source: 0,
         address: 0,
@@ -2007,8 +2007,8 @@ pub unsafe fn report_faults(_report: &Report, _hhdm: u64) {
         for record in &records[..found] {
             let (bus, device, function) = record.bus_device_function();
             crate::println!(
-                "\x1b[91m    iommu fault    unit {index}: {:02x}:{:02x}.{} was refused a {} of \
-                 {:#x}: {} (reason {:#x})\x1b[0m",
+                "\x1b[91m    iommu fault    [{when}] unit {index}: {:02x}:{:02x}.{} was refused \
+                 a {} of {:#x}: {} (reason {:#x})\x1b[0m",
                 bus,
                 device,
                 function,
@@ -2020,20 +2020,22 @@ pub unsafe fn report_faults(_report: &Report, _hhdm: u64) {
         }
         if found == MAX_FAULTS_REPORTED {
             crate::println!(
-                "    iommu fault    unit {index}: {found} is as many as this report holds; \
-                 there may be more"
+                "    iommu fault    [{when}] unit {index}: {found} is as many as this report \
+                 holds; there may be more"
             );
         }
     }
 
     if units == 0 {
-        crate::println!("    iommu faults   no unit is programmed, so nothing could be asked");
+        crate::println!(
+            "    iommu faults   [{when}] no unit is programmed, so nothing could be asked"
+        );
     } else if total == 0 {
         // Said out loud. A silent report cannot be told apart from one that did
         // not run, and the absence of a fault is often the most useful fact
         // available about a device that is not working.
         crate::println!(
-            "    iommu faults   none recorded by {}",
+            "    iommu faults   [{when}] none recorded by {}",
             if units == 1 {
                 "the one programmed unit"
             } else {

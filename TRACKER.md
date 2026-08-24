@@ -854,9 +854,31 @@ an inference from two numbers that look alike, and subtracting them refutes it:
 commit message `fe121ff` carries the same wrong claim and cannot be edited; this
 is where the record is corrected.
 
-What is known is smaller: the controller read an address **nobody gave it** —
-not from its window, which starts at `0x100000000`, and not a reserved region.
-The cause is not established and is not guessed at here.
+**Then two more instruments settled it, and each killed a guess.** The driver
+now records the physical extent of the frames it allocates, and faults are read
+twice — once before any driver here touches a device, once after bring-up, the
+reads being clearing so the two are disjoint:
+
+    xhci frames    physical 0x303f8c0000..=0x303f8e9fff
+    iommu faults   [before drivers] none recorded by any programmed unit
+    iommu fault    [during bring-up] unit 3: 00:14.0 was refused a read of 0xaa95f000
+
+Frames at **194 GiB**, refused address at **2.66 GiB** — so not a device
+address confused with a physical one. Nothing faulted before this kernel
+touched anything — so not firmware's own DMA either. **Three guesses, three
+refuted by measurement**, which is the whole argument for building the
+instrument instead of reasoning from nearby numbers.
+
+**What the evidence supports:** the window for `00:14.0` is built in
+`iommu_bringup`, long before `xhci::init`. From then on the controller is
+translated into a page table holding this driver's frames and nothing else —
+but firmware left it **running**, pointing at firmware's structures in low
+memory, and `take_ownership` takes the semaphore without stopping it.
+`bring_up` halts it a moment later. In that gap an unreset bus master does DMA
+to firmware's addresses and the IOMMU refuses it. **This is containment
+working**, and it is benign. The available fix — halt the controller the instant
+ownership is taken — is a bring-up ordering change and is left for whoever next
+has the machine to measure.
 
 **CI went red for one commit and is green again.** Run 324 (`08c4d2a`, the
 scratchpad measurement) failed; run 325 (`fe121ff`, RFC 0049) passes. Recorded

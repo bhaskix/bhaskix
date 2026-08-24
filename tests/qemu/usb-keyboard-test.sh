@@ -179,7 +179,7 @@ fi
 # The other half: a fault line every boot, saying none rather than saying
 # nothing. Silence here used to be indistinguishable from a check that did not
 # run, which is what made a real DMA failure unreadable for four boots.
-if await "iommu faults   none recorded by the one programmed unit"; then
+if await "iommu faults   .during bring-up. none recorded by the one programmed unit"; then
     pass "the IOMMU was asked about faults, and answered"
 else
     fail "no fault line was printed"

@@ -527,6 +527,22 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     let xhci_found = unsafe { xhci::discover() };
     xhci::report(&xhci_found);
 
+    // **Faults recorded before any driver here has touched anything.**
+    //
+    // The windows exist by now and translation is on, but nothing in this
+    // kernel drives a device yet -- so a fault at this point belongs to
+    // whoever was driving before this kernel did, which on a server is
+    // firmware. It gets read and reported here so that it cannot be mistaken
+    // for one caused by a driver below, and so that the drivers below start
+    // from a clean set of records.
+    //
+    // Reading clears them, so the two reports are disjoint by construction:
+    // anything printed at the end of the boot happened *after* this line.
+    if let Some((found, _)) = iommu_state.as_ref() {
+        // SAFETY: the unit `iommu_bringup` mapped and programmed.
+        unsafe { iommu::report_faults_since(found, handoff.hhdm_base.as_u64(), "before drivers") };
+    }
+
     // RFC 0046 step 2: SATA AHCI controllers, on exactly the same terms and in
     // the same place, because they are the same question about a different bus
     // master. Nothing is driven yet -- bring-up is step 3 -- so this reports
@@ -777,8 +793,18 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // fault". That ambiguity cost real time on an xHCI controller whose
         // DMA was going unanswered, where the absence of a fault line was the
         // single most useful fact available and could not be trusted.
+        // The xHCI's frames, so a refused address can be classified instead of
+        // merely printed. RFC 0049's boot produced a fault naming an address
+        // that was explained by looking at a nearby number and getting it
+        // wrong; this is the line that makes the comparison rather than
+        // inviting one.
+        if let Some((low, high)) = xhci::frame_extent() {
+            println!(
+                "    xhci frames    physical {low:#x}..={high:#x} -- an address refused inside                  this range is a device address confused with a physical one"
+            );
+        }
         // SAFETY: the unit `iommu_bringup` mapped and programmed.
-        unsafe { iommu::report_faults(found, handoff.hhdm_base.as_u64()) };
+        unsafe { iommu::report_faults_since(found, handoff.hhdm_base.as_u64(), "during bring-up") };
     }
     mount_root(handoff);
     if !vfs_self_test(handoff) {

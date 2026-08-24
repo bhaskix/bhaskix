@@ -151,11 +151,47 @@ iommu fault    unit 3: 00:14.0 was refused a read of 0xaa95f000: it asked to rea
 
    What is actually known is smaller and stranger: **the controller read an
    address nobody gave it.** It is not an address from its window — those are
-   at `0x100000000` and above — and it is not a reserved region. Whether it is
-   firmware-era state that survived the reset, a pointer this driver wrote
-   wrongly, or something else, is not established, and this RFC does not
-   establish it. It gets its own investigation, starting from an instrument
-   rather than from a guess.
+   at `0x100000000` and above — and it is not a reserved region.
+
+   **Two more instruments settled it, and the second refuted the first
+   guess.** The driver now records the physical extent of every frame it
+   allocates, and faults are read twice: once before any driver here has
+   touched a device, and once after bring-up. Reading clears the records, so
+   the two reports are disjoint by construction.
+
+```
+xhci frames    physical 0x303f8c0000..=0x303f8e9fff
+iommu faults   [before drivers] none recorded by any programmed unit
+iommu fault    [during bring-up] unit 3: 00:14.0 was refused a read of 0xaa95f000
+```
+
+   The frames are at **194 GiB**; the refused address is at **2.66 GiB**. So it
+   is not a device address confused with a physical one either — that was
+   guess two, and the extent line kills it.
+
+   And the fault is **not** left over from firmware's own use, which was guess
+   three: nothing faulted before this kernel touched anything.
+
+   **What the evidence supports.** The IOMMU window for `00:14.0` is built in
+   `iommu_bringup`, well before `xhci::init` runs. From that moment the
+   controller is translated, and its page table contains this driver's frames
+   and nothing else. But firmware left the controller **running**, with
+   `DCBAAP`, `CRCR` and `ERSTBA` pointing at firmware's own structures in low
+   memory — and `take_ownership` takes the semaphore without stopping it.
+   `bring_up` halts it a moment later. In that window a controller nobody has
+   reset yet does DMA to firmware's addresses, and the IOMMU refuses it.
+
+   `0xaa95f000` is in low memory where firmware's structures live, the fault is
+   a **read**, and it appears only in the window between caging the controller
+   and resetting it. **This is containment working**, on a bus master that
+   firmware left running, and it is benign: the controller is reset moments
+   later and then answers its first command.
+
+   It is left in place rather than suppressed. The available fix — halting the
+   controller the instant ownership is taken, rather than at the start of
+   `bring_up` — is a change to bring-up ordering, and it belongs to whoever
+   next has the machine and can measure it. A fault line that is explained is
+   worth more than a boot report with nothing in it.
 
    Still open on that machine, and not claimed by this RFC: `xhci device not
    addressed: no port has a device on it`. The controller works; nothing has
