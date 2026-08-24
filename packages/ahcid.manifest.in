@@ -1,0 +1,15 @@
+# The AHCI driver, in a domain: two pages of the controller's register file,
+# four pages of its own memory, and the window that bounds what the
+# controller may reach. No interrupt -- RFC 0046 polls first on purpose,
+# so that a failure is a timeout rather than a lost wakeup -- and nothing
+# served yet, because nothing is issued until step 6.
+package ahcid
+version 0.1.0
+
+program bin/ahcid
+entry hertz
+cap device-registers
+cap memory pages=4
+cap dma-window
+
+payload bin/ahcid from user/ahcid/target/x86_64-unknown-none/release/ahcid

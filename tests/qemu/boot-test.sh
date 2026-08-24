@@ -717,6 +717,54 @@ else
     fi
 fi
 
+# RFC 0046 step 3b: the controller is not merely found, it runs -- and a driver
+# in ring 3 is what ran it. The counts are required to be plausible rather than
+# exact: ports and slots are the controller's own numbers and an emulator is
+# entitled to change them between versions, but zero ports or zero slots means
+# the capability register was not read, which is the failure this is for.
+#
+# **This gate is also what checks RFC 0046's recalled register offsets.** There
+# is no AHCI specification on the machine this was written on, so the constants
+# came from memory; a wrong `PI` offset shows here as an implausible port count
+# and a wrong `GHC` offset as a reset that never settles.
+#
+# IOMMU lanes only, and for the reason RFC 0041's bring-up gate gives: on a lane
+# with no unit the controller is correctly refused a window, and asserting a
+# bring-up there would be asserting the rule is broken.
+if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
+    if grep -qaE 'ahci +up: [1-9][0-9]* ports? implemented \(0x[0-9a-f]+\), [1-9][0-9]* slots?' "$LOG"; then
+        pass "the AHCI controller is brought up from ring 3 and reports its ports and slots"
+    else
+        fail "the AHCI controller was not brought up"
+        grep -a "ahci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
+    # And a port was actually interrogated. Named separately from the bring-up
+    # because they fail apart: a controller can come up and report its
+    # capabilities while every `PxSSTS` read lands on the wrong offset, and
+    # `DET` is the register RFC 0046 exists to reach -- the one that answers
+    # "is there a disk on this port", which the bus survey could not.
+    if grep -qaE 'ahci port [0-9]+ +det [0-9]+ ipm [0-9]+' "$LOG"; then
+        pass "each implemented port's SATA status is read and reported"
+    else
+        fail "no port status was reported"
+        grep -a "ahci" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
+    # The driver holds a window. Separate again: the bring-up above would work
+    # just as well without one, and this is what says the controller it drives
+    # is contained.
+    if grep -qa "ahci domain    dma window granted" "$LOG"; then
+        pass "the AHCI driver in ring 3 holds a DMA window for its controller"
+    else
+        fail "the AHCI driver was given no DMA window"
+        grep -a "ahci domain" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+fi
+
 # The decline is reported. Deterministic, and it guards the gate below rather
 # than duplicating it: that one bounds the *latency*, which only moves when a
 # decline actually happens, and declines are rare. This one asserts the
@@ -800,7 +848,13 @@ fi
 # program headers, so a loader that stopped reading them -- or read them wrongly
 # -- shows up here as a changed number rather than as a ring 3 failure with no
 # obvious cause.
-if grep -qE "vfs +[0-9]+ entries in /, 16 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+# The count is exact and is **the second place that has to change** when a
+# program is added: the kernel's own self-test asserts it too. That is
+# deliberate duplication -- the kernel checks that its VFS lists what is there,
+# and this checks that the kernel said so out loud -- but it means adding a
+# program fails twice, in two files, which is worth knowing before it happens
+# rather than after. Seventeen since `bin/ahcid` joined, 2026-08-24.
+if grep -qE "vfs +[0-9]+ entries in /, 17 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"

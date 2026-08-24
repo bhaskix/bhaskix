@@ -8568,6 +8568,16 @@ const BLKD_STACK_PAGES: u64 = 4;
 /// Where the block driver's program is.
 const BLKD_PROGRAM: &[u8] = b"bin/blkd";
 
+/// Where `bin/ahcid`'s stack goes. Its own address, because it has its own
+/// address space; the number differs from `bin/blkd`'s only so that a fault
+/// address in a report says which driver it came from without being looked up.
+const AHCID_STACK: u64 = 0x0000_0000_1200_0000;
+/// How many pages of it. Four, as every other driver here: this one keeps a
+/// `Started` on the stack, which is thirty-two port records.
+const AHCID_STACK_PAGES: u64 = 4;
+/// The program.
+const AHCID_PROGRAM: &[u8] = b"bin/ahcid";
+
 /// Where the network driver's domain keeps its stack.
 const NETD_STACK: u64 = 0x0000_0000_1200_0000;
 const NETD_STACK_PAGES: u64 = 4;
@@ -9080,6 +9090,160 @@ pub fn start_block_domain(
     .map_err(|_| "the block domain would not spawn")?;
 
     BLOCK_RINGS.store(rings.as_u64(), core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Hands the AHCI controller to a domain in ring 3.
+///
+/// RFC 0046 step 3b. The same delegation `start_block_domain` performs, for a
+/// device that differs in one way that matters here: **this kernel has no
+/// driver for it at all.** The virtio paths hand over a *second* device whose
+/// first the kernel drives; there is one SATA controller and ring 3 gets it,
+/// which is what RFC 0046 means by "a domain, like every other driver here".
+///
+/// What the domain is given: two `Frame`s covering the register file, memory to
+/// leave its findings in, and -- where a unit exists -- the `DmaWindow` for its
+/// own device. What it is not given is the bus: finding the controller means
+/// reading configuration space, which is port I/O, and a domain holding that
+/// would hold every device on the machine.
+///
+/// # Errors
+///
+/// A `&'static str` naming what would not be created. A machine with no AHCI
+/// controller is **not** an error and returns `Ok`, the way a machine with one
+/// virtio disk does.
+pub fn start_ahci_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
+    // SAFETY: bootstrap CPU during boot; configuration reads only.
+    let Some((bus, device, function)) = (unsafe { ahci::probe() }) else {
+        println!("    ahci domain    no AHCI controller on the bus; nothing delegated");
+        return Ok(());
+    };
+    let address = bhaskix_arch::pci::Address::new(bus, device, function);
+
+    // Memory space, so the register file answers. **Bus mastering is
+    // deliberately not enabled**, here or anywhere in this step: nothing is
+    // issued, so nothing does DMA, and a controller that cannot master the bus
+    // cannot reach memory however wrong the rest of this is. It is granted when
+    // there is a command to run and a window to run it behind.
+    // SAFETY: this device belongs to nobody -- this kernel has no AHCI driver,
+    // and step 2 already cleared its bus-master bit.
+    unsafe { bhaskix_arch::pci::enable_memory(address) };
+
+    // The register file's address, read from BAR5 -- which is where AHCI puts
+    // it and nowhere else. The low four bits are type bits and not address.
+    let Some(configuration) = configuration_page(address) else {
+        println!(
+            "\x1b[93m    ahci domain    no ECAM, so no BAR to read; the controller is not \
+             delegated\x1b[0m"
+        );
+        return Ok(());
+    };
+    // SAFETY: a dword of this function's configuration space, through the
+    // mapping `configuration_page` describes, at the offset of BAR5.
+    let abar = unsafe {
+        core::ptr::read_volatile((hhdm_base + configuration + 0x24) as *const u32) & !0xf
+    };
+    if abar == 0 {
+        println!(
+            "\x1b[93m    ahci domain    the controller's BAR5 is unassigned; nothing to \
+             map\x1b[0m"
+        );
+        return Ok(());
+    }
+    let abar = u64::from(abar);
+
+    let realm = domain::create("ahci", domain::ResourceEnvelope::new())
+        .map_err(|_| "the ahci domain would not be created")?;
+
+    // Two pages, which is the whole of the register file AHCI defines: the
+    // generic host control block is 0x100 and thirty-two ports of 0x80 follow,
+    // so the last defined byte is at 0x10ff. Granted as two `Frame`s because a
+    // `Frame` names one page -- and the driver is told which it got, by the
+    // second attach succeeding or not.
+    for (slot, page) in [abar, abar + bhaskix_mm::FRAME_SIZE].iter().enumerate() {
+        let window = cap::with_arena(|arena| {
+            arena
+                .insert_root(
+                    cap::ObjectRef::new(
+                        cap::ObjectKind::Frame,
+                        page & !(bhaskix_mm::FRAME_SIZE - 1),
+                    ),
+                    // No `GRANT`. A register window is the one thing this
+                    // driver must not be able to hand on: it is the whole
+                    // device, and `DERIVE` without `GRANT` lets it weaken a
+                    // copy for itself and give nothing away.
+                    cap::Rights::READ
+                        .union(cap::Rights::WRITE)
+                        .union(cap::Rights::DERIVE),
+                    0,
+                )
+                .ok()
+        })
+        .ok_or("an ahci register window would not be created")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(slot, window).is_ok()) != Some(true)
+        {
+            return Err("an ahci register window would not install");
+        }
+    }
+
+    // Owned by a domain that outlives the driver. `bin/ahcid` exits when it has
+    // reported, and a domain's memory is freed when its last thread goes -- so
+    // memory owned by the driver would be returned frames by the time the
+    // kernel read the report out of them. `bin/blkd` learned this first.
+    let keeper = domain::create("ahci-keeper", domain::ResourceEnvelope::new())
+        .map_err(|_| "the ahci report's owner would not be created")?;
+    let memory = shared::create(keeper, 4 * bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the ahci domain's memory would not be created")?;
+    let named = shared::name(memory).map_err(|_| "the ahci memory would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(2, named).is_ok()) != Some(true) {
+        return Err("the ahci memory capability would not install");
+    }
+
+    // The authority to say what this *device* may reach. Granted only where a
+    // unit exists, for the reason the block path states: without one a device
+    // address is a physical address, and a domain that could name one could
+    // point its controller at the kernel.
+    let delegated = (bus, device, function);
+    let contained = if iommu::present_for(delegated) {
+        let window =
+            iommu::name(delegated).map_err(|_| "the ahci dma window would not be named")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(3, window).is_ok()) != Some(true) {
+            return Err("the ahci dma window capability would not install");
+        }
+        true
+    } else {
+        false
+    };
+
+    println!(
+        "    ahci domain    {bus:02x}:{device:02x}.{function} delegated: registers at \
+         {abar:#x}, two pages"
+    );
+    if contained {
+        println!(
+            "    ahci domain    dma window granted; the controller translates through its own"
+        );
+    } else {
+        println!(
+            "\x1b[93m    ahci domain    no dma window: nothing would contain the controller, so \
+             the driver gets registers and no way to make it read\x1b[0m"
+        );
+    }
+
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        cpu,
+        "ahcid",
+        ahci_domain_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the ahci domain would not spawn")?;
+
+    AHCI_MEMORY.store(memory.as_u64(), core::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -10415,6 +10579,9 @@ fn block_service_endpoint() -> Option<ipc::EndpointId> {
 /// The rings the block domain was given, so its report can be read back.
 static BLOCK_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// The memory `bin/ahcid` leaves its report in, or `u64::MAX` if it never ran.
+static AHCI_MEMORY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// Asks the block *service* for a sector, and checks what came back.
 ///
 /// RFC 0015 step 1's criterion. The oracle is the image itself: the Makefile
@@ -11031,6 +11198,174 @@ fn block_domain_reported(hhdm: u64) -> bool {
     // SAFETY: a frame this object owns, through the direct map.
     let marker = unsafe { core::ptr::read_volatile((hhdm + frames[3]) as *const u64) };
     marker == 0x424c_4b44_5250_5431
+}
+
+/// The marker `bin/ahcid` writes before its report. `AHCIRPT1` in ASCII.
+const AHCID_MARKER: u64 = 0x4148_4349_5250_5431;
+
+/// Which of its four pages the AHCI driver leaves its report in.
+///
+/// The last, for the reason `bin/netd`'s is in its last: every earlier page
+/// becomes a structure the controller reads at the next step, and a report a
+/// bus master can overwrite is not a report.
+const AHCID_REPORT_PAGE: usize = 3;
+
+/// Whether `bin/ahcid` has written its report yet.
+///
+/// The marker only, so waiting for it costs nothing and cannot be confused with
+/// reading it: a page of zeroes has no marker, and a driver that never ran
+/// leaves the page as it found it.
+fn ahci_domain_reported(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = AHCI_MEMORY.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return true;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return true;
+    };
+    if count <= AHCID_REPORT_PAGE {
+        return true;
+    }
+    // SAFETY: a frame this object owns, through the direct map.
+    let marker =
+        unsafe { core::ptr::read_volatile((hhdm + frames[AHCID_REPORT_PAGE]) as *const u64) };
+    marker == AHCID_MARKER
+}
+
+/// Prints what `bin/ahcid` found, and returns whether it found anything.
+///
+/// **This is where RFC 0046's recalled register offsets meet a machine.** The
+/// raw `CAP`, `PI` and `VS` are printed rather than only what was concluded
+/// from them, because the numbers are what a reader checks: a wrong `PI` offset
+/// shows as an implausible port bitmap, and a wrong `CAP` offset as a slot
+/// count outside 1..=32.
+fn report_ahci_domain(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let raw = AHCI_MEMORY.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        // No controller was delegated. Already said, once, where it was found.
+        return true;
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        println!("\x1b[91m    ahci domain    the report memory is gone\x1b[0m");
+        return false;
+    };
+    if count <= AHCID_REPORT_PAGE {
+        println!("\x1b[91m    ahci domain    the report memory is too small\x1b[0m");
+        return false;
+    }
+    let base = hhdm + frames[AHCID_REPORT_PAGE];
+    // SAFETY: frames this object owns, through the direct map. The driver
+    // writes the marker last with a release fence, so a marker that is there
+    // means everything under it is too.
+    let word = |index: usize| unsafe { core::ptr::read_volatile((base as *const u64).add(index)) };
+
+    if word(0) != AHCID_MARKER {
+        println!(
+            "\x1b[91m    ahci domain    the driver left no report; it did not reach its own \
+             last line\x1b[0m"
+        );
+        return false;
+    }
+
+    let translated = word(9) == 1;
+    if word(1) != 1 {
+        let why = match (word(2), word(3)) {
+            (1, 0) => "GHC.HR did not clear: the controller never finished its reset",
+            (1, 1) => "BOHC.BOS did not clear: the firmware never let go",
+            (1, 2) => "PxCMD.CR did not clear: a port's command engine would not stop",
+            (1, 3) => "PxCMD.FR did not clear: a port's fis receive would not stop",
+            (1, _) => "a register did not settle",
+            (2, _) => "the controller implements no ports at all",
+            (3, _) => "a structure was offered at an address the controller cannot be given",
+            (4, _) => "a structure above 4 GiB on a controller that cannot address one",
+            _ => "the driver refused a port it was not given",
+        };
+        println!("\x1b[91m    ahci domain    NOT up: {why}\x1b[0m");
+        return false;
+    }
+
+    let implemented = word(2) as u32;
+    let version = word(4) as u32;
+    println!(
+        "    ahci           up: {} port{} implemented ({:#010x}), {} slot{} each, version \
+         {}.{}{}, {}-bit addressing, ncq {}{}",
+        implemented.count_ones(),
+        if implemented.count_ones() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        implemented,
+        word(3),
+        if word(3) == 1 { "" } else { "s" },
+        version >> 16,
+        (version >> 8) & 0xff,
+        if version & 0xff == 0 {
+            ""
+        } else {
+            " (revision set)"
+        },
+        if word(5) == 1 { 64 } else { 32 },
+        if word(6) == 1 { "yes" } else { "no" },
+        if word(7) == 1 {
+            ", taken from the firmware"
+        } else {
+            ""
+        }
+    );
+
+    // One line per port, and the three `DET` values are not flattened into two:
+    // an empty port and a port whose link will not come up are different things
+    // to whoever is standing at the machine.
+    let ports = word(8) as usize;
+    let mut disks = 0usize;
+    for index in 0..ports.min(bhaskix_ahci::MAX_PORTS) {
+        let packed = word(16 + index);
+        let port = packed & 0xff;
+        let det = (packed >> 8) & 0xff;
+        let ipm = (packed >> 16) & 0xff;
+        let signature = (packed >> 32) as u32;
+        let what = match det {
+            0 => "nothing attached",
+            1 => "a device attached whose link will not come up",
+            3 => "a device attached and communicating",
+            _ => "an unrecognised detection state",
+        };
+        if det == 3 {
+            disks += 1;
+        }
+        // **The signature is not meaningful yet, and the report says so rather
+        // than printing a number that looks like an answer.** `PxSIG` holds
+        // what the device sent in its first D2H FIS, and no port has been
+        // started -- step 4 -- so every one of them reads all-ones. Which is
+        // also exactly what a read past the end of the mapping answers, so a
+        // bare number here would be two different facts printed identically.
+        let latched = if signature == u32::MAX {
+            "signature not latched (no port is started until step 4)"
+        } else {
+            "signature"
+        };
+        if signature == u32::MAX {
+            println!("    ahci port {port:<2}   det {det} ipm {ipm}, {latched} -- {what}");
+        } else {
+            println!(
+                "    ahci port {port:<2}   det {det} ipm {ipm}, {latched} {signature:#010x} -- \
+                 {what}"
+            );
+        }
+    }
+    if !translated {
+        println!(
+            "\x1b[93m    ahci domain    brought up with no dma window; nothing may be issued \
+             to it, which is RFC 0012's rule and not a shortcoming\x1b[0m"
+        );
+    }
+    let _ = disks;
+    true
 }
 
 /// The marker `bin/netd` writes before its report.
@@ -13018,6 +13353,51 @@ extern "C" fn block_domain_entry(hhdm_base: u64) -> ! {
     unsafe { enter_user("block domain", entry, rsp, [0, 0]) }
 }
 
+/// Loads `bin/ahcid` and becomes the AHCI driver, in ring 3.
+extern "C" fn ahci_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    ahci domain    FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(AHCID_PROGRAM) else {
+        stop("bin/ahcid is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/ahcid is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(AHCID_STACK), AHCID_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/ahcid would not load")
+    };
+
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+
+    // The cycle counter's rate, because a program in ring 3 cannot calibrate
+    // one and every deadline in the bring-up needs it. Zero on a machine with
+    // no calibrated counter, which `now_nanos` answers with a clock that never
+    // advances -- so the first wait refuses rather than the driver hanging.
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    let rsp = AHCID_STACK + AHCID_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, and `rsp` is one past user-writable memory in it.
+    unsafe { enter_user("ahci domain", entry, rsp, [hertz, 0]) }
+}
+
 /// Loads and enters `bin/netd`.
 extern "C" fn net_domain_entry(hhdm_base: u64) -> ! {
     use bhaskix_boot::VirtAddr;
@@ -14127,6 +14507,30 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
         if !start_fs_domain(hhdm) {
             println!("\x1b[91m    fs domain      FAILED\x1b[0m");
+        }
+    }
+
+    // RFC 0046 step 3b: the SATA controller, driven from ring 3. Not gated on
+    // the block path either, and for a stronger reason than the network's: this
+    // is the machine's *other* storage, and a machine whose virtio disk is
+    // missing is exactly the machine where knowing what is on the SATA ports
+    // matters most.
+    if let Err(reason) = start_ahci_domain(cpu, hhdm) {
+        println!("\x1b[91m    ahci domain    FAILED: {reason}\x1b[0m");
+    } else {
+        // Waited for the report rather than for a duration, as every other
+        // driver domain here is: a fixed wait is a guess that is too short on a
+        // loaded machine and too long on every other boot. The bring-up's own
+        // deadlines bound how long the driver can take, so this bounds only how
+        // long the kernel will believe it is still coming.
+        for _ in 0..60 {
+            if ahci_domain_reported(hhdm) {
+                break;
+            }
+            wait_millis(50);
+        }
+        if !report_ahci_domain(hhdm) {
+            println!("\x1b[91m    ahci domain    FAILED\x1b[0m");
         }
     }
 
@@ -17677,8 +18081,10 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             // has. Sixteen now -- `bin/linuxd` joined 2026-08-19 -- and this
             // line caught each of them as designed, exactly as it caught
             // `bin/traced`, `bin/tcpc` and `bin/tcpd` before them.
+            // **Seventeen** as of 2026-08-24 -- `bin/ahcid`, RFC 0046 step 3b's
+            // AHCI driver -- and it caught that one too, on the first boot.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 16,
+            entries >= 3 && bin == 17,
         ),
         (
             "the user program is an ELF the loader accepts",

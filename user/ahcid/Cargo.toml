@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The AHCI driver, in a domain of its own.
+#
+# Not a member of the root workspace, for the reason `user/blkd/Cargo.toml`
+# gives: it needs its own code model and its own linker script, and a workspace
+# member cannot have its own `rustflags`.
+#
+# **Which is also why almost nothing is here.** A user crate is outside
+# `cargo test --workspace`, so anything written in this file has no host tests
+# at all. The bring-up sequence therefore lives in `bhaskix-ahci`, a library
+# crate the suite does reach, and this program is the two unsafe accesses that
+# crate deliberately cannot perform: one volatile read and one volatile write
+# of a mapping the kernel made on request.
+[workspace]
+
+[package]
+name = "bhaskix-user-ahcid"
+description = "The AHCI driver in a domain of its own."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "ahcid"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-ahci = { path = "../../ahci" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 4 — the `_start` stub the ABI requires, the `syscall` sequence this program
+# carries rather than taking a dependency for, the `rdtsc` its deadlines are
+# measured with, and the `ud2` that stops a panic where the kernel can see it.
+asm_budget = 4
+# **22, and the number is the whole claim.** A driver is usually mostly
+# `unsafe`, because a driver is mostly registers: `bin/blkd` sits at 220. This
+# one does not, because `bhaskix-ahci` holds the register *arithmetic* under
+# `forbid(unsafe_code)` and this program holds only the accesses -- one volatile
+# read, one volatile write, one word of report, `rdtsc`, and the syscall and
+# entry stubs.
+#
+# It was 68 before the report was written through a one-line helper instead of
+# inside a forty-line block. That is not a saving in danger, it is a saving in
+# *reading*: the same one fact, stated once.
+#
+# `exact`, so shrinking is a build failure too. RFC 0046's remaining steps add
+# DMA setup to this program, and each of them should have to come here and say
+# what it cost rather than spending headroom nobody reviewed. If this number
+# climbs by more than a few lines a step, logic has moved out of the crate the
+# tests can reach and into the one they cannot.
+unsafe_budget = 22
+unsafe_budget_exact = true

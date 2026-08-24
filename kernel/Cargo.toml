@@ -27,6 +27,11 @@ bhaskix-elf = { path = "../elf" }
 # `kernel/src/xhci.rs` are this project's own logic built on them.
 bhaskix-usb = { path = "../usb" }
 bhaskix-xhci = { path = "../third_party/xhci" }
+# RFC 0046. The kernel drives no AHCI controller -- `bin/ahcid` does -- and
+# depends on the crate anyway for the two constants the *report format* is made
+# of. The alternative was a literal 32 here and `MAX_PORTS` there, which is a
+# format defined twice and a drift waiting to happen.
+bhaskix-ahci = { path = "../ahci" }
 # RFC 0021. The kernel does not need unpredictability itself yet -- randomising
 # the heap base is that RFC's open question 2 -- but it is the thing that boots,
 # so it is where "the instruction actually works on this machine" is checked.
@@ -438,7 +443,15 @@ asm_budget = 10
 # danger. **The same shape is still there in RFC 0041's xHCI window**, twenty
 # lines above the one this change touched; not fixed here, and recorded in
 # TRACKER, because that number is quoted in an accepted RFC.
-unsafe_budget = 2153
+# 2165 at RFC 0046 step 3b, 2026-08-24: +12, for handing the controller to a
+# domain.
+#
+# One configuration read of BAR5 -- the register file's address, which the
+# driver is given and cannot look up for itself -- `enable_memory` so that file
+# answers, and the direct-map reads of the report the driver leaves behind. The
+# driver itself sits at 22, because the arithmetic it runs on lives in
+# `bhaskix-ahci` under `forbid(unsafe_code)`.
+unsafe_budget = 2165
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

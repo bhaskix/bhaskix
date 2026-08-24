@@ -247,6 +247,15 @@ PLACEMENTS: dict[str, set[str]] = {
     # The block driver shares no code with the kernel's, only the
     # specification, so the ABI is the whole of what it may reach.
     "bhaskix-user-blkd": {"bhaskix-abi", "bhaskix-device"},
+    # The AHCI driver, and the one entry here whose *second* name is the point.
+    # `bhaskix-ahci` is the same crate the kernel links, and deliberately so:
+    # a user crate is its own workspace and therefore outside
+    # `cargo test --workspace`, so anything written in `bin/ahcid` has no host
+    # test at all. Everything that can be got wrong -- the register arithmetic,
+    # the bring-up order, the deadlines -- lives in the shared crate the suite
+    # does reach, and the driver is the two volatile accesses that crate is
+    # `forbid(unsafe_code)` precisely so it cannot perform.
+    "bhaskix-user-ahcid": {"bhaskix-abi", "bhaskix-ahci"},
     # The filesystem, unlike the driver, **is** the kernel's own code: it
     # depends on `bhaskix-fs`, the same crate the kernel links. That is the
     # point of it -- one parser, two places -- and it is why this entry names
