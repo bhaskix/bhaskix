@@ -842,10 +842,26 @@ while being reported as contained. Containment on a multi-unit machine dates
 from 2026-08-25, not from the boot that sentence celebrates.
 
 **Still open on that machine, and not claimed:** `xhci device not addressed: no
-port has a device on it`, and the refused read at `0xaa95f000` — which sits just
-below the firmware-reserved region at `0xaabf8000` that this kernel refuses to
-identity-map **because it overlaps the kernel image**. That conflict is real and
-gets its own RFC.
+port has a device on it`, and the refused read at `0xaa95f000`.
+
+**A correction inside this very entry, made the same day it was written.** The
+sentence above originally said that address *"sits just below the
+firmware-reserved region at `0xaabf8000`"* and treated the refused read as the
+controller reaching for a region this kernel declines to identity-map. That was
+an inference from two numbers that look alike, and subtracting them refutes it:
+`0xaa95f000` is **2.60 MiB below** the start of `0xaabf8000..=0xaac09fff` and
+**52.01 MiB above** the end of `0x9f554000..=0xa755bfff`. It is in neither. The
+commit message `fe121ff` carries the same wrong claim and cannot be edited; this
+is where the record is corrected.
+
+What is known is smaller: the controller read an address **nobody gave it** —
+not from its window, which starts at `0x100000000`, and not a reserved region.
+The cause is not established and is not guessed at here.
+
+**CI went red for one commit and is green again.** Run 324 (`08c4d2a`, the
+scratchpad measurement) failed; run 325 (`fe121ff`, RFC 0049) passes. Recorded
+because this file has twice claimed "CI green" while it was not, and a red run
+that is fixed by the next commit is exactly the kind that goes unmentioned.
 
 Two gates joined the USB keyboard lane, both watched red: every unit the
 firmware named is listed, and every one of them is programmed. QEMU describes

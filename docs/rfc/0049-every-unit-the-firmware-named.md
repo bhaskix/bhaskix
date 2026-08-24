@@ -137,12 +137,25 @@ iommu fault    unit 3: 00:14.0 was refused a read of 0xaa95f000: it asked to rea
 ```
 
    That is containment working — a device reaching for memory nobody granted
-   it, refused and named. It is also a **new open question**: `0xaa95f000` sits
-   just below the firmware-reserved region at `0xaabf8000` that this kernel
-   **refused to identity-map because it overlaps the kernel image**. A
-   controller asking for its reserved region after being taken from firmware is
-   a separate problem from this one, and it gets its own RFC rather than being
-   folded in here.
+   it, refused and named.
+
+   **A correction, recorded rather than edited away.** This paragraph first
+   said `0xaa95f000` *"sits just below the firmware-reserved region at
+   `0xaabf8000`"* and implied the controller was reaching for the reserved
+   region this kernel refuses to identity-map. **That was an inference, it was
+   not checked, and it is wrong.** The address is in neither region: 2.60 MiB
+   below the start of `0xaabf8000..=0xaac09fff`, and 52.01 MiB above the end of
+   `0x9f554000..=0xa755bfff`. Two point six megabytes is not "just below", and
+   the reserved-region story was a tidy explanation arrived at by looking at
+   the first nearby number rather than by subtracting.
+
+   What is actually known is smaller and stranger: **the controller read an
+   address nobody gave it.** It is not an address from its window — those are
+   at `0x100000000` and above — and it is not a reserved region. Whether it is
+   firmware-era state that survived the reset, a pointer this driver wrote
+   wrongly, or something else, is not established, and this RFC does not
+   establish it. It gets its own investigation, starting from an instrument
+   rather than from a guess.
 
    Still open on that machine, and not claimed by this RFC: `xhci device not
    addressed: no port has a device on it`. The controller works; nothing has
