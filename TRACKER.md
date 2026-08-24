@@ -796,6 +796,65 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (RFC 0043 unblocked: the VT-d layout was a public document all along, and the spec added an obligation nobody knew about)
+
+**The blocker was a document, and the document is free.** RFC 0043 has been
+stuck since 2026-08-23 on one thing: *"the setter that places those two bits
+inside the low word lives in `drivers/iommu/intel/iommu.c`, which headers do not
+ship. The layout is therefore **unverified**, and this project does not write a
+register field from recall."* The Intel VT-d Architecture Specification rev 5.20
+is published by Intel; fetching it took a minute.
+
+**§9.3, figure 9-3, "Context-Entry Format":**
+
+| bits | field |
+|---|---|
+| `0` | `P` Present |
+| `1` | `FPD` Fault Processing Disable |
+| **`3:2`** | **`TT` Translation Type** — `00b` second-stage, **`10b` pass-through** |
+| `11:4` | Reserved, must be 0 |
+| `63:12` | `SSPTPTR`, ignored when `TT` is `10b` |
+| `66:64` | `AW` Address Width |
+| `87:72` | `DID` Domain Identifier |
+
+`ECAP.PT` is **bit 6**. Both agree with the Linux header the RFC had leaned on,
+and both are now sourced from the vendor rather than from GPL code — which
+matters for licence as well as for correctness in an Apache-2.0 tree.
+
+**The specification added a requirement the RFC did not know it needed.** Of
+`AW`: *"When the Translation-type (TT) field indicates pass-through processing
+(10b), this field must be programmed to indicate the largest AGAW value
+supported by hardware."* **Pass-through is two fields, not one.** Writing `TT`
+alone would produce a context entry that looks right and is not — precisely the
+failure the RFC refused to risk. Nobody would have guessed that; it is the
+clearest argument yet for reading the document rather than the header.
+
+**And the existing code was checked while the specification was open.** Every
+field `ContextEntry::to_bits` writes matches figure 9-3 — `P`, `FPD`, `TT`,
+`SSPTPTR`, `AW`, `DID`, and the reserved bits clear. `supports_width` reads
+`SAGAW` correctly as a bitmap at bits 12:8, and `enable` checks it **before**
+setting the root table, which is the right order. RFC 0012's context entries
+have been right since 2026-08-04 and are now *sourced*.
+
+**One finding, latent rather than live.** `AddressWidth::Bits30 = 0` names an
+encoding **this revision marks Reserved** — `SAGAW` defines only bits 1, 2 and 3,
+and the phrase "30-bit AGAW" appears nowhere in the document's 22,741 lines. It
+was defined by older revisions and removed. It is unreachable on conforming
+hardware, because `supports_width` tests `SAGAW` bit 0, every unit reports it
+clear, and `enable` refuses — so the machine declines rather than programming a
+reserved encoding. Documented at the variant rather than deleted, since
+`fitting` must answer something below 39 bits.
+
+**What is still open, and it is not a document.** *Refuse, identity-map, or
+pass-through* remains the project lead's decision. Reading the specification
+settled what pass-through **costs to write**; it does not settle whether this
+system should offer it. Steps 2–5 wait on the answer, not on the layout.
+
+**Fourth specification read today.** RFC 1122 changed an acceptance. AHCI 1.3.1
+confirmed thirty-three values and found nothing. ATA8-ACS confirmed two and
+refused a third. VT-d unblocked a milestone *and* produced a requirement nobody
+had. Four different outcomes; none predictable from outside the document.
+
 ### 2026-08-24 (the AHCI signatures, sourced — and it took a second document, because the first one deliberately does not say)
 
 **The caveat left over from this morning's AHCI verification is discharged, and
@@ -2238,9 +2297,12 @@ enumerates ports will settle it. Said rather than assumed.
 enabled; 46-bit addresses, 2 reserved regions, interrupt remapping
 supported`.** The units are there and they work. The xHCI is refused for want
 of translation, and translation is off because [RFC 0043](docs/rfc/0043-an-iommu-on-a-machine-with-no-virtio.md)'s
-unresolved question 1 — identity-map or pass-through — is unanswered, and that
+unresolved question 1 — identity-map or pass-through — is unanswered. ~~and that
 is unanswered because the VT-d context-entry layout cannot be read from
-anything on this machine. **RFC 0043 is therefore not a theoretical blocker any
+anything on this machine.~~ **The layout stopped being the reason on 2026-08-24**:
+the Intel VT-d specification was fetched and read, `TT` is at bits 3:2 with
+pass-through `10b`, and what remains unanswered is the *decision*, which was
+always the project lead's. **RFC 0043 is therefore not a theoretical blocker any
 more**: it stands between hardware the project owns and device containment on
 it, and it also blocks RFC 0041's USB keyboard there. The two RFCs are more
 coupled than either says.

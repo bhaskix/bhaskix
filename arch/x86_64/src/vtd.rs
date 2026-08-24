@@ -55,6 +55,19 @@ pub const ENTRIES: usize = 512;
 #[repr(u8)]
 pub enum AddressWidth {
     /// 30-bit addresses, two levels.
+    ///
+    /// **This encoding no longer exists in the architecture.** VT-d rev 5.20's
+    /// context-entry `AW` field (§9.3) reads `000b` as *Reserved*, its `SAGAW`
+    /// capability bitmap defines only bits 1, 2 and 3, and the phrase "30-bit
+    /// AGAW" appears nowhere in the 22,741 lines of that document — it was
+    /// defined by older revisions and removed. Kept rather than deleted
+    /// because `fitting` must still answer *something* for a host address
+    /// width below 39, and the honest answer is a width no unit will claim:
+    /// `supports_width` tests `SAGAW` bit 0, every conforming unit reports it
+    /// clear, and `enable` then refuses with *"the unit does not support the
+    /// width the tables were built to"* rather than programming a reserved
+    /// encoding. Unreachable on conforming hardware, and named here so the
+    /// next reader does not take it for a live option.
     Bits30 = 0,
     /// 39-bit addresses, three levels. What QEMU's `intel-iommu` defaults to.
     Bits39 = 1,
@@ -219,11 +232,36 @@ pub struct ContextEntry {
 impl ContextEntry {
     /// The two 64-bit words the hardware reads, low first.
     ///
+    /// # The layout, sourced 2026-08-24
+    ///
+    /// Intel VT-d Architecture Specification rev 5.20, §9.3, figure 9-3
+    /// "Context-Entry Format". Every field this function writes was checked
+    /// against it and every one was already right:
+    ///
+    /// | bits | field | what this writes |
+    /// |---|---|---|
+    /// | `0` | `P` Present | `1` |
+    /// | `1` | `FPD` Fault Processing Disable | `0`, so faults are reported |
+    /// | `3:2` | `TT` Translation Type | `00b` — second-stage paging |
+    /// | `11:4` | Reserved, must be 0 | cleared by the page mask |
+    /// | `63:12` | `SSPTPTR` second-stage page-table pointer | the table |
+    /// | `66:64` | `AW` Address Width | [`AddressWidth`] |
+    /// | `71` | Reserved, must be 0 | zero |
+    /// | `87:72` | `DID` Domain Identifier | the domain |
+    ///
     /// Translation type is left at zero — "untranslated requests only, walk
     /// the second-level table" — because that is the only mode this kernel
     /// implements. Pass-through is a *different* mode, and choosing it by
     /// accident is a device that reaches all of memory while the machine
     /// reports an IOMMU.
+    ///
+    /// **Pass-through, for whoever builds it** ([RFC 0043] unresolved question
+    /// 1, unblocked by this reading): `TT` = `10b`, and the specification adds
+    /// an obligation that is easy to miss — *"When the Translation-type (TT)
+    /// field indicates pass-through processing (10b), this field must be
+    /// programmed to indicate the largest AGAW value supported by hardware"*,
+    /// of `AW`. So it is two fields, not one, and `SSPTPTR` is then ignored.
+    /// The capability to check first is `ECAP.PT`, **bit 6**.
     #[must_use]
     pub const fn to_bits(self) -> (u64, u64) {
         let low = (self.page_table & !(PAGE_SIZE - 1)) | 1;

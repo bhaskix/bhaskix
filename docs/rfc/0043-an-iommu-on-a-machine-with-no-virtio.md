@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-23, steps 1–2 implemented.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 — refuse, or identity-map — is still unanswered, and steps 2–5 wait on it** |
+| **Status** | ⬜ **Draft 2026-08-23, steps 1–2 implemented.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 — refuse, identity-map, or pass-through — is still the project lead's to answer, but it is no longer blocked on a document.** The Intel VT-d specification was read on 2026-08-24: the context-entry translation-type field is at **bits 3:2**, pass-through is **`10b`**, `ECAP.PT` is bit 6, and pass-through carries a second obligation the RFC had not known — `AW` must be set to the largest AGAW the hardware supports. Steps 2–5 wait on the decision, not on the layout |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/iommu`, `kernel/lib.rs` bring-up |
 | **Milestone** | Phase 2. It does not add a feature; it makes an existing one true off the emulator |
@@ -274,22 +274,41 @@ should be one somebody is watching.
    > tables per device**, before the levels above them. Not a tuning problem; a
    > missing feature.
    >
-   > **Pass-through** needs the context entry's translation-type field, and
-   > **the field's position could not be established on this machine.** Linux's
-   > `intel-iommu.h` is here and gives `CONTEXT_TT_PASS_THROUGH = 2` and
-   > `ecap_pass_through(e) = (e >> 6) & 1` — the *value* and the *capability
-   > bit*, both read rather than recalled, and the same header's
-   > `ecap_ir_support` at bit 3 agrees with what this kernel already does, which
-   > is worth something as a cross-check. But the setter that places those two
-   > bits inside the low word lives in `drivers/iommu/intel/iommu.c`, which
-   > headers do not ship. The layout is therefore **unverified**, and this
-   > project does not write a register field from recall.
+   > ~~**Pass-through** needs the context entry's translation-type field, and
+   > **the field's position could not be established on this machine.**~~
+   > **UNBLOCKED 2026-08-24.** The Intel VT-d Architecture Specification is a
+   > public document; it was fetched and read, and it answers this directly.
+   > **rev 5.20 §9.3, figure 9-3 "Context-Entry Format":**
    >
-   > *Recommendation, offered rather than taken:* **pass-through**, once that
-   > field can be read. It costs no page tables, and "this device is not
+   > | bits | field |
+   > |---|---|
+   > | `0` | `P` Present |
+   > | `1` | `FPD` Fault Processing Disable |
+   > | **`3:2`** | **`TT` Translation Type** — `00b` second-stage, **`10b` pass-through**, `11b` reserved |
+   > | `11:4` | Reserved, must be 0 |
+   > | `63:12` | `SSPTPTR`, *"ignored by hardware when TT is 10b"* |
+   > | `66:64` | `AW` Address Width |
+   > | `87:72` | `DID` Domain Identifier |
+   >
+   > This agrees with Linux's `CONTEXT_TT_PASS_THROUGH = 2` — `10b` at bits 3:2
+   > — and **`ECAP.PT` is bit 6**, which the header also said. Both are now
+   > sourced from the vendor's document rather than from a GPL header, which
+   > was worth doing for licence reasons as well as for correctness.
+   >
+   > **And the specification adds an obligation this RFC did not know about.**
+   > Of `AW`: *"When the Translation-type (TT) field indicates pass-through
+   > processing (10b), this field must be programmed to indicate the largest
+   > AGAW value supported by hardware."* So pass-through is **two** fields, not
+   > one. Writing `TT` alone and leaving `AW` at the tables' width would be a
+   > context entry that looks right and is not — exactly the class of error
+   > this RFC refused to risk by writing a field from recall.
+   >
+   > *Recommendation, offered rather than taken:* **pass-through**, and the
+   > prerequisite is now met. It costs no page tables, and "this device is not
    > translated" is a more honest thing for a table dump to say than a mapping
-   > that looks like containment and is not. The prerequisite is a copy of the
-   > VT-d specification, or the driver source, and neither is on this machine.
+   > that looks like containment and is not. **The choice remains the project
+   > lead's** — reading the document settles what pass-through *costs to
+   > write*, not whether this system should offer it.
 2. **What about functions behind a bridge?** Requester ids are rewritten by
    PCIe-to-PCI bridges, and a context entry keyed on the wrong id contains
    nothing. No machine here has one yet.
