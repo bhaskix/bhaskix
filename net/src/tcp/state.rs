@@ -206,14 +206,32 @@ pub const MAX_RETRANSMITS: u8 = 8;
 /// connection held `bin/tcpd`'s single accepted slot for **242 seconds**, and
 /// every later `SYN` was refused silently for all of it.
 ///
-/// **This is deliberately below the floor RFC 1122 sets for `R2` on a `SYN`**,
-/// which the comment above invokes for the established case. That floor has
-/// **not** been read from the specification on this machine — there is no copy
-/// of it here — so it is recorded as a known trade rather than a settled
-/// number. What is known: Linux ships `tcp_synack_retries` at 5 by default and
-/// every stack makes this trade, because the alternative is a table an
-/// unauthenticated peer decides the contents of. [RFC 0048] carries the
-/// argument; SYN cookies are what make this constant stop mattering.
+/// # This is a deliberate deviation from RFC 1122, read and quoted
+///
+/// RFC 1122 §4.2.3.5, on connection failures:
+///
+/// > *"However, the values of R1 and R2 may be different for SYN and data
+/// > segments. In particular, R2 for a SYN segment MUST be set large enough to
+/// > provide retransmission of the segment for at least 3 minutes. The
+/// > application can close the connection (i.e., give up on the open attempt)
+/// > sooner, of course."*
+///
+/// Three retransmissions is **fourteen seconds**, and 180 is the floor. The
+/// specification was read on 2026-08-24 rather than recalled, and this constant
+/// does not meet it. The deviation is taken knowingly, for one reason: the
+/// compliant value is what let **one packet from an address that need not
+/// exist** take a listener out for 242 seconds, and keep taking it out for as
+/// long as the sender cared to continue. Availability was chosen over the
+/// letter, and the choice is written here rather than left for somebody to
+/// discover in a packet trace.
+///
+/// Two things bound it. The spec's own escape hatch is an *application*
+/// giving up sooner, which is a shape this system could adopt — the listening
+/// program choosing its own patience — and has not. And **SYN cookies remove
+/// the trade rather than repricing it**: with no state allocated for a peer
+/// that has proved nothing, there is no half-open connection for `R2` to
+/// govern and this constant stops mattering. That is [RFC 0048]'s steps 2 to 4,
+/// specified and not built.
 pub const MAX_SYNACK_RETRANSMITS: u8 = 3;
 
 /// The whole point is that these differ, and that it is *this* one that is

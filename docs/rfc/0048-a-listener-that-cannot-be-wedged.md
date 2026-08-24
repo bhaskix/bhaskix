@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-08-24. Step 1 implemented and host-tested; steps 2–4 are designed and not built.** Opened the same day [RFC 0047](0047-refusing-a-connection-to-a-port-nobody-holds.md) found the defect while measuring something else, and deliberately split from it: 0047 was a bug fix, this is a design decision |
+| **Status** | ✅ **ACCEPTED 2026-08-24 — step 1 only, and accepted *as a deliberate deviation from a MUST*.** One `SYN` from a peer that vanishes held `bin/tcpd`'s single accepted slot for **242 seconds**, refusing every later connection **silently**; `MAX_SYNACK_RETRANSMITS` takes that to **14 seconds**, measured both times by driving the state machine. **The question this document said should block its acceptance was answered, and answered against it.** RFC 1122 §4.2.3.5: *"R2 for a SYN segment MUST be set large enough to provide retransmission of the segment for at least 3 minutes."* Fourteen seconds is not 180, and the old compliant value is exactly what made the listener wedgeable. **The project lead accepted with the deviation recorded rather than hidden**: availability over the letter, taken knowingly. Steps 2–4 — SYN cookies — are specified and **not built**, and they are what removes the trade rather than repricing it: with no state allocated for a peer that has proved nothing, there is no half-open connection for `R2` to govern |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — Core Operating System |
@@ -99,23 +99,37 @@ every fourteen seconds still owns the slot essentially all of the time. Step 1
 buys back the accidental case and the casual one; it does not buy back the
 deliberate one. That is why this RFC does not stop here.
 
-### A specification question this document cannot settle
+### A specification question this document could not settle, and then did
 
+*Written as an open risk, and resolved on the day of acceptance.*
 `MAX_RETRANSMITS`'s own comment invokes *"RFC 1122's hundred-second floor for
-`R2`"*. RFC 1122 also sets a floor for `R2` on a `SYN`, and **the value of that
-floor has not been read from the specification, because there is no copy of RFC
-1122 on this machine.** It is therefore recorded here as an open risk rather
-than asserted from recall:
+`R2`"*. RFC 1122 sets a **separate** floor for `R2` on a `SYN`, and the value of
+it was not known when this section was drafted, there being no copy of the
+document on this machine. It was recorded as an open risk rather than asserted
+from recall — and then the document was fetched and read:
 
-> **Step 1 may put this stack below a floor RFC 1122 sets for `SYN` retries.**
-> What is known without the document: Linux ships `tcp_synack_retries` at 5 by
-> default, so real stacks do make this trade. What is not known is the exact
-> number the specification names.
+> *"However, the values of R1 and R2 may be different for SYN and data
+> segments. In particular, **R2 for a SYN segment MUST be set large enough to
+> provide retransmission of the segment for at least 3 minutes.** The
+> application can close the connection (i.e., give up on the open attempt)
+> sooner, of course."*
+> — RFC 1122 §4.2.3.5
 
-**Whoever accepts this RFC should read RFC 1122 §4.2.3.5 first.** If the floor
-is above fourteen seconds, the honest resolutions are to raise
-`MAX_SYNACK_RETRANSMITS` and lean harder on step 2, or to record a deliberate
-deviation — not to leave the question unasked.
+**180 seconds is the floor. Step 1 gives 14.** The original open-risk note
+follows, struck through, because what it feared turned out to be the case:
+
+> ~~**Step 1 may put this stack below a floor RFC 1122 sets for `SYN`
+> retries.** What is not known is the exact number the specification names.~~
+> **It was read on 2026-08-24: the floor is 180 seconds and step 1 gives 14.
+> This is below it — a violation of a MUST, not an uncertainty.**
+
+~~**Whoever accepts this RFC should read RFC 1122 §4.2.3.5 first.**~~ It was
+read first, and it said the thing that would have been least convenient to
+assume. Of the two honest resolutions this section named — raise the constant,
+or record a deliberate deviation — **the second was taken**, because raising it
+restores the denial of service this RFC exists to remove. The deviation is
+recorded in the status line, in the constant's own doc comment with the
+sentence quoted beside it, and in [security.md](../security.md).
 
 ### Steps 2–4 — SYN cookies, which make step 1 stop mattering
 
@@ -219,10 +233,23 @@ surviving a flood the harness *can* produce.
 
 ## Unresolved questions
 
-1. **What floor does RFC 1122 set for `R2` on a `SYN`?** Named above. It
-   decides whether `MAX_SYNACK_RETRANSMITS = 3` is a trade or a violation, and
-   it cannot be answered on this machine. **This is the one question that
-   should block acceptance.**
+1. ~~**What floor does RFC 1122 set for `R2` on a `SYN`?**~~ **ANSWERED
+   2026-08-24, by reading it, and answered against this RFC.** §4.2.3.5:
+   *"However, the values of R1 and R2 may be different for SYN and data
+   segments. In particular, R2 for a SYN segment MUST be set large enough to
+   provide retransmission of the segment for at least 3 minutes. The
+   application can close the connection (i.e., give up on the open attempt)
+   sooner, of course."* The floor is **180 seconds**; step 1 gives **14**. So it
+   is a **violation**, not a trade — accepted deliberately, because the
+   compliant value is the one that let a single packet deny service.
+
+   Two things bound it, and both are follow-ups rather than excuses. The
+   specification's own escape hatch is the *application* giving up sooner,
+   which this system could adopt — the listening program choosing its own
+   patience, defaulting to compliant — and has not; that is the smallest way
+   back to conformance and it wants an interface on `LISTEN`. And steps 2–4
+   dissolve the question: cookies allocate nothing, so there is no half-open
+   connection whose `R2` could be short.
 2. **Do cookies become the always-on path, or a fallback under pressure?**
    Always-on is simpler to reason about and loses the options a `SYN` carried;
    a fallback keeps the fast path and adds a mode. Deferred to step 2, where
