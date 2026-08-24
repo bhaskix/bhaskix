@@ -28,7 +28,7 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{method, status, syscall};
+use bhaskix_abi::{block, method, status, syscall};
 use bhaskix_ahci::{self as ahci, Registers};
 
 /// Slot: the first page of the controller's register file.
@@ -37,6 +37,14 @@ const ABAR_LOW: u64 = 0;
 const ABAR_HIGH: u64 = 1;
 /// Slot: memory for the report, and later for the command list.
 const MEMORY: u64 = 2;
+/// Slot: the endpoint this driver answers block requests on.
+///
+/// Holding it is what says this program is *a* block service rather than a
+/// program pretending to be one — and `bin/fsd` cannot tell it from `bin/blkd`,
+/// which is RFC 0046's whole claim about why RFC 0015's interface was drawn
+/// where it was.
+const BLOCK_ENDPOINT: u64 = 4;
+
 /// Slot: the authority to say what this device may reach.
 ///
 /// Unused at this step and held anyway, because holding it is what the next
@@ -272,6 +280,197 @@ impl Registers for Abar {
     }
 }
 
+/// Blocks until a request arrives, and returns `(status, badge, method, args)`.
+///
+/// The caller is not returned, because the kernel remembers it: a service that
+/// could name its own reply target could answer a question nobody asked it.
+fn receive() -> (u64, u64, u64, [u64; 4]) {
+    let status: u64;
+    let mut badge = BLOCK_ENDPOINT;
+    let mut method_out = 0u64;
+    let (mut a0, mut a1, mut a2, mut a3) = (0u64, 0u64, 0u64, 0u64);
+    // SAFETY: the system call convention from RFC 0008. Every argument register
+    // is an output because the kernel writes the whole frame back.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") syscall::RECV => status,
+            inlateout("rdi") badge,
+            inlateout("rsi") method_out,
+            inlateout("rdx") a0,
+            inlateout("r10") a1,
+            inlateout("r8") a2,
+            inlateout("r9") a3,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    (status, badge, method_out, [a0, a1, a2, a3])
+}
+
+/// Answers the caller this thread received from, and nobody else.
+fn reply(answered: u64, value: u64) {
+    let _ = call(syscall::REPLY, 0, answered, [value, 0, 0, 0]);
+}
+
+/// Answers `block::READ` and `block::WRITE` for as long as anybody asks.
+///
+/// **The same interface `bin/blkd` serves, and that is the point.** RFC 0046's
+/// claim is that a filesystem which had to know which driver was underneath
+/// would be a filesystem with a driver inside it; this is what makes that
+/// checkable rather than asserted.
+///
+/// Every request is bounded by [`ahci::plan_read`] or [`ahci::plan_write`], so a
+/// sector past the end is refused **here** rather than asked of the hardware —
+/// a device is entitled to do anything with a sector that does not exist, and on
+/// a write that includes doing it to somebody else's.
+fn serve(
+    registers: &mut Abar,
+    port: usize,
+    identity: &ahci::Identity,
+    clock: &mut impl FnMut() -> u64,
+    device_base: u64,
+) -> ! {
+    loop {
+        let (received, _badge, asked, args) = receive();
+        if received != status::OK {
+            exit()
+        }
+
+        let answer = match asked {
+            block::CAPACITY => identity.sectors,
+            block::READ => {
+                let sectors = clamp_sectors(args[1]);
+                match plan_and_run(
+                    registers,
+                    port,
+                    identity,
+                    clock,
+                    device_base,
+                    args[0],
+                    sectors,
+                    false,
+                ) {
+                    // Into the caller's memory, named by a slot in the
+                    // *caller's* CSpace -- which the kernel re-checks and which
+                    // this service could not have chosen.
+                    Some(bytes) => {
+                        let (filled, landed) = call(
+                            syscall::INVOKE,
+                            BLOCK_ENDPOINT,
+                            method::FILL,
+                            [args[2], MEMORY_AT + BUFFER_AT, bytes, 0],
+                        );
+                        if filled == status::OK { landed } else { 0 }
+                    }
+                    None => 0,
+                }
+            }
+            block::WRITE => {
+                let sectors = clamp_sectors(args[1]);
+                // Refused before anything is taken from the caller, and said so
+                // in a way the *device* cannot imitate: a disk refuses an
+                // out-of-range write too, so answering zero would make this
+                // check and its absence indistinguishable from outside.
+                if ahci::plan_write(identity, args[0], sectors, ahci::IDENTIFY_BYTES).is_err() {
+                    block::REFUSED
+                } else {
+                    let bytes = u64::from(sectors) * u64::from(identity.sector_bytes);
+                    let (taken, got) = call(
+                        syscall::INVOKE,
+                        BLOCK_ENDPOINT,
+                        method::DRAIN,
+                        [args[2], MEMORY_AT + BUFFER_AT, bytes, 0],
+                    );
+                    if taken == status::OK
+                        && got == bytes
+                        && plan_and_run(
+                            registers,
+                            port,
+                            identity,
+                            clock,
+                            device_base,
+                            args[0],
+                            sectors,
+                            true,
+                        )
+                        .is_some()
+                    {
+                        bytes
+                    } else {
+                        0
+                    }
+                }
+            }
+            _ => 0,
+        };
+        reply(asked, answer);
+    }
+}
+
+/// How many sectors one request may carry, bounded by the buffer.
+///
+/// A caller asking for more is answered with what fits rather than refused: the
+/// reply says how many bytes landed, so a short answer is a complete answer to a
+/// smaller question. Zero becomes one, because zero sectors is not a request.
+fn clamp_sectors(asked: u64) -> u16 {
+    let most = (ahci::IDENTIFY_BYTES / 512) as u64;
+    asked.clamp(1, most) as u16
+}
+
+/// Plans one transfer, builds it, runs it, and says how many bytes moved.
+///
+/// `None` for anything refused — by the bounds or by the device — because the
+/// caller is told in bytes and zero is the honest answer for both.
+#[allow(clippy::too_many_arguments)]
+fn plan_and_run(
+    registers: &mut Abar,
+    port: usize,
+    identity: &ahci::Identity,
+    clock: &mut impl FnMut() -> u64,
+    device_base: u64,
+    lba: u64,
+    sectors: u16,
+    write: bool,
+) -> Option<u64> {
+    let planned = if write {
+        ahci::plan_write(identity, lba, sectors, ahci::IDENTIFY_BYTES)
+    } else {
+        ahci::plan_read(identity, lba, sectors, ahci::IDENTIFY_BYTES)
+    }
+    .ok()?;
+
+    // SAFETY: pages zero and one of the four this program holds and mapped
+    // writable, disjoint, and no command is outstanding against either.
+    let (list, table) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(
+                (MEMORY_AT + LIST_AT) as *mut u8,
+                ahci::COMMAND_LIST_BYTES,
+            ),
+            core::slice::from_raw_parts_mut(
+                (MEMORY_AT + TABLE_AT) as *mut u8,
+                ahci::PRDT_AT + ahci::PRD_BYTES,
+            ),
+        )
+    };
+    ahci::build_command(
+        list,
+        table,
+        0,
+        planned.ata,
+        ahci::Where {
+            table: device_base + TABLE_AT,
+            buffer: device_base + BUFFER_AT,
+            bytes: planned.bytes,
+        },
+    )
+    .ok()?;
+    ahci::run(registers, port, 0, clock, SETTLE_NS).ok()?;
+    Some(planned.bytes as u64)
+}
+
 /// Records how far this program has got, for a kernel that finds no report.
 fn stage(which: u64) {
     // SAFETY: inside the four pages this program holds and mapped writable, in
@@ -457,6 +656,31 @@ extern "C" fn ahcid_main(hertz: u64) -> ! {
     };
 
     report(up, translated, identity);
+
+    // RFC 0046 step 6b: and then answer, for as long as anybody asks.
+    //
+    // The report is written *first* and deliberately: a service that reported
+    // only on the way out would report nothing at all, because a service does
+    // not have a way out. The kernel reads that report while this loop is
+    // already running.
+    match (up, identity, translated) {
+        (Ok(started), Some(Ok(disk)), true) => {
+            if let Some(port) = started.ports().find(|port| port.has_device()) {
+                serve(
+                    &mut registers,
+                    port.index as usize,
+                    &disk,
+                    &mut clock,
+                    device_base,
+                );
+            }
+        }
+        _ => {}
+    }
+
+    // Nothing to serve: no disk, no window, or a controller that never came up.
+    // Ending is right -- an endpoint nobody answers would make a caller wait for
+    // something that is never coming.
     exit()
 }
 

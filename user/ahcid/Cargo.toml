@@ -36,10 +36,17 @@ panic = "abort"
 opt-level = "s"
 
 [package.metadata.bhaskix]
-# 4 — the `_start` stub the ABI requires, the `syscall` sequence this program
-# carries rather than taking a dependency for, the `rdtsc` its deadlines are
-# measured with, and the `ud2` that stops a panic where the kernel can see it.
-asm_budget = 4
+# 5 at RFC 0046 step 6b — the `_start` stub the ABI requires, the `syscall`
+# sequence this program carries rather than taking a dependency for, the `rdtsc`
+# its deadlines are measured with, the `ud2` that stops a panic where the kernel
+# can see it, and — since step 6b — a **second** `syscall` sequence for `RECV`.
+#
+# Two and not one because they return different things: `call` hands back a
+# status and a value, `receive` hands back a badge, a method and four arguments.
+# `bin/blkd` carries the same pair for the same reason. A single wrapper that
+# did both would have to return the union of them, which is a wider interface
+# than either caller wants.
+asm_budget = 5
 # **22, and the number is the whole claim.** A driver is usually mostly
 # `unsafe`, because a driver is mostly registers: `bin/blkd` sits at 220. This
 # one does not, because `bhaskix-ahci` holds the register *arithmetic* under
@@ -98,5 +105,20 @@ asm_budget = 4
 # Still nothing that decides an offset, an order or a bound. `plan_write` shares
 # `plan_read`'s bounds by construction -- one function, one bit different -- and
 # both live in the crate `make test-host` reaches.
-unsafe_budget = 58
+# **85 at RFC 0046 step 6b, 2026-08-24: +27.** The bill:
+#
+#   - `receive`, the `RECV` system call. Fifteen of the twenty-seven, and almost
+#     all of it operand list: every argument register is an output because the
+#     kernel writes the whole frame back. `bin/blkd`'s costs the same and for the
+#     same reason -- this is what becoming a *service* costs a program that was
+#     only talking to hardware.
+#   - the two slices over the command list and the command table in
+#     `plan_and_run`, which is the serving path's copy of what the self-test
+#     already had.
+#
+# Still nothing that decides an offset, an order or a bound. Every request this
+# service answers is bounded by `plan_read` or `plan_write` in the crate
+# `make test-host` reaches -- including the sector past the end, which is
+# refused there rather than asked of the hardware.
+unsafe_budget = 85
 unsafe_budget_exact = true

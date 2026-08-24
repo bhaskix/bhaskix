@@ -823,6 +823,27 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         status=1
     fi
 
+    # RFC 0046 step 6b, and the RFC's actual claim: a filesystem that had to know
+    # which driver was underneath would be a filesystem with a driver inside it.
+    #
+    # So this asks `bin/ahcid` through `block::READ` -- the same method
+    # `bin/blkd` answers, called the same way -- and demands the SATA disk's own
+    # sector-zero bytes back. The string is matched rather than the byte count,
+    # for the same reason step 5's gate matches it: a service answering from the
+    # wrong device, or answering zeroes, fails here instead of passing.
+    #
+    # And a sector past the end must be refused. That refusal happens in
+    # `ahci::plan_read`, the same bound every other transfer this driver makes
+    # goes through -- a disk refuses an out-of-range read too, so a service
+    # without the check would look identical from outside.
+    if grep -qaE 'ahci service +512 bytes of sector 0 through the block interface, and they are the SATA disk.s own; a sector past the end is refused' "$LOG"; then
+        pass "the AHCI driver answers block::READ with that disk's own sector, and refuses one past the end"
+    else
+        fail "the AHCI block service did not answer, or answered wrongly"
+        grep -a "ahci service\|ahci read" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
     # The driver holds a window. Separate again: the bring-up above would work
     # just as well without one, and this is what says the controller it drives
     # is contained.

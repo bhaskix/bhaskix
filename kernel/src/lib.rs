@@ -9197,6 +9197,28 @@ pub fn start_ahci_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
         return Err("the ahci memory capability would not install");
     }
 
+    // The endpoint this driver answers block requests on, at slot 4.
+    //
+    // RFC 0046 step 6b, and the RFC's actual claim: `bin/fsd` calls
+    // `block::READ` and cannot tell this service from `bin/blkd`. A filesystem
+    // that had to know which driver was underneath would be a filesystem with a
+    // driver inside it, and this is what makes that checkable rather than
+    // asserted.
+    let served_on = ipc::create().map_err(|_| "no endpoint for the ahci block service")?;
+    let served = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(served_on.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the ahci endpoint capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(4, served).is_ok()) != Some(true) {
+        return Err("the ahci endpoint capability would not install");
+    }
+
     // The authority to say what this *device* may reach. Granted only where a
     // unit exists, for the reason the block path states: without one a device
     // address is a physical address, and a domain that could name one could
@@ -9264,6 +9286,16 @@ pub fn start_ahci_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     .map_err(|_| "the ahci domain would not spawn")?;
 
     AHCI_MEMORY.store(memory.as_u64(), core::sync::atomic::Ordering::Release);
+    // Recorded only where the driver can actually serve, which needs a window:
+    // without one it cannot read a sector, so an endpoint nobody answers would
+    // make the self-test wait for something that is never coming. The block
+    // path learned this first and its comment says so.
+    if contained {
+        AHCI_ENDPOINT.store(
+            u64::from(served_on.as_u32()),
+            core::sync::atomic::Ordering::Release,
+        );
+    }
     Ok(())
 }
 
@@ -10599,6 +10631,9 @@ fn block_service_endpoint() -> Option<ipc::EndpointId> {
 /// The rings the block domain was given, so its report can be read back.
 static BLOCK_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// The endpoint `bin/ahcid` answers `block::READ` on, or 0 if it cannot serve.
+static AHCI_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The memory `bin/ahcid` leaves its report in, or `u64::MAX` if it never ran.
 static AHCI_MEMORY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -11195,6 +11230,142 @@ extern "C" fn block_asks(endpoint: u64) -> ! {
     BLOCK_REFUSED.store(past, Ordering::Release);
     BLOCK_READ.store(landed, Ordering::Release);
     sched::exit()
+}
+
+/// Asks the AHCI block service for sector zero, and for one past the end.
+extern "C" fn ahci_asks(endpoint: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    const BADGE: u64 = 0x00a4_0000;
+
+    let endpoint = ipc::EndpointId::from_u32(endpoint as u32);
+    // Slot 0 of *this* domain's CSpace, where the memory was installed. The
+    // service cannot choose it and the kernel re-checks it.
+    let landed = match ipc::call(endpoint, BADGE, bhaskix_abi::block::READ, [0, 1, 0, 0]) {
+        Ok(reply) => reply.args[0],
+        Err(_) => 0,
+    };
+
+    // And a sector past the end, refused *here* rather than asked of the
+    // hardware -- which for this driver means refused by `ahci::plan_read`, the
+    // same function that bounds every other transfer it makes.
+    let past = match ipc::call(
+        endpoint,
+        BADGE,
+        bhaskix_abi::block::READ,
+        [1 << 40, 1, 0, 0],
+    ) {
+        Ok(reply) => reply.args[0],
+        Err(_) => u64::MAX,
+    };
+    AHCI_REFUSED.store(past, Ordering::Release);
+    AHCI_READ.store(landed, Ordering::Release);
+    sched::exit()
+}
+
+/// What the AHCI service answered, or `u64::MAX` while the question is open.
+static AHCI_READ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// What it answered for a sector past the end.
+static AHCI_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Asks `bin/ahcid` for a sector, the same way anything asks `bin/blkd`.
+///
+/// **This is RFC 0046's claim, executed.** The RFC says a filesystem that had to
+/// know which driver was underneath would be a filesystem with a driver inside
+/// it. So this test is `block_service_self_test` with one endpoint changed and
+/// one expected string changed, and nothing else -- if the two had to differ by
+/// more than that, the interface would be in the wrong place.
+fn ahci_service_self_test(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    /// What the Makefile puts in sector zero of the AHCI disk. **Not** the
+    /// domain disk's string: a service answering from the wrong device fails
+    /// here rather than passing plausibly.
+    const EXPECTED: &[u8] = b"BHASKIX-SATA-DISK-SECTOR-0";
+
+    let raw = AHCI_ENDPOINT.load(Ordering::Acquire);
+    if raw == 0 {
+        // No controller, no disk, or no window -- all of which are reported
+        // where they happen. Not a failure here.
+        return true;
+    }
+
+    let Ok(owner) = domain::create("ahci-reader", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    ahci service   FAILED to create a domain to ask from\x1b[0m");
+        return false;
+    };
+    // The object outlives the asker, because the asker does not outlive its
+    // question -- the block path's own comment, and the failure it records was
+    // 512 plausible bytes read out of frames already handed back.
+    let Ok(keeper) = domain::create("ahci-keeper", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    ahci service   FAILED to create the owning domain\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
+    let Ok(object) = shared::create(keeper, bhaskix_mm::FRAME_SIZE) else {
+        println!("\x1b[91m    ahci service   FAILED to create a memory object\x1b[0m");
+        domain::destroy(owner);
+        domain::destroy(keeper);
+        return false;
+    };
+    let installed = shared::name(object)
+        .ok()
+        .and_then(|memory| domain::with(owner, |d| d.cspace.install_at(0, memory).is_ok()));
+    if installed != Some(true) {
+        println!("\x1b[91m    ahci service   FAILED to give the caller its memory\x1b[0m");
+        domain::destroy(owner);
+        domain::destroy(keeper);
+        return false;
+    }
+
+    AHCI_READ.store(u64::MAX, Ordering::Release);
+    AHCI_REFUSED.store(u64::MAX, Ordering::Release);
+    let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
+    if sched::spawn_on_with(0, "ahci-ask", ahci_asks, raw, hhdm, options).is_err() {
+        println!("\x1b[91m    ahci service   FAILED to spawn a caller\x1b[0m");
+        domain::destroy(owner);
+        domain::destroy(keeper);
+        return false;
+    }
+
+    // Waited for the answer rather than for a duration.
+    let mut landed = u64::MAX;
+    for _ in 0..80 {
+        landed = AHCI_READ.load(Ordering::Acquire);
+        if landed != u64::MAX {
+            break;
+        }
+        wait_millis(50);
+    }
+
+    let refused = AHCI_REFUSED.load(Ordering::Acquire) == 0;
+    let matches = match shared::frames_of(object) {
+        Some((frames, count)) if count > 0 && landed == 512 => {
+            // SAFETY: a frame this object owns, through the direct map.
+            let bytes =
+                unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, 512) };
+            bytes.starts_with(EXPECTED)
+        }
+        _ => false,
+    };
+
+    shared::revoke(object);
+    domain::destroy(owner);
+    domain::destroy(keeper);
+
+    let ok = matches && refused;
+    if ok {
+        println!(
+            "    ahci service   {landed} bytes of sector 0 through the block interface, and \
+             they are the SATA disk's own; a sector past the end is refused"
+        );
+    } else {
+        println!(
+            "\x1b[91m    ahci service   FAILED: {landed} bytes, contents match {matches}, \
+             past the end refused {refused}\x1b[0m"
+        );
+    }
+    ok
 }
 
 /// Whether the driver has left its report yet.
@@ -14754,6 +14925,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
         if !report_ahci_domain(hhdm) {
             println!("\x1b[91m    ahci domain    FAILED\x1b[0m");
+        }
+        if !ahci_service_self_test(hhdm) {
+            println!("\x1b[91m    ahci service   FAILED\x1b[0m");
         }
     }
 

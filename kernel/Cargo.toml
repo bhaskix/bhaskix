@@ -456,7 +456,10 @@ asm_budget = 10
 # command, and a controller that cannot master the bus cannot fetch its own
 # command list. On QEMU that was not a clean refusal but a machine with no
 # console output at all.
-unsafe_budget = 2166
+# 2167 at RFC 0046 step 6b, 2026-08-24: +1, for the self-test that asks the AHCI
+# service for a sector -- one direct-map read of the frame the service filled,
+# which is how the *contents* are checked rather than the byte count.
+unsafe_budget = 2167
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
