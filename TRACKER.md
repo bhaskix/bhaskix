@@ -796,6 +796,53 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (two more self-tests stop calling a true fact a failure — and one of them was leaking a domain per boot)
+
+`iommu grant` and `iommu memory` both grant a domain a window for a device the
+kernel drives, and the only device they know how to ask for is **virtio**. On a
+machine without one — every real server so far — they returned `false` and the
+boot printed `FAILED`. That is the same shape as the AHCI service test fixed an
+hour earlier, and the same answer: a fact about the machine is not a fault in
+it.
+
+```
+    iommu grant    not asked: no virtio device on this machine to grant a window for
+    iommu memory   not asked: no virtio device on this machine to map memory for
+```
+
+**And the grant test was leaking a domain.** Its no-device arm read
+
+```rust
+let Some(device) = virtio::probe() else {
+    return false;
+};
+```
+
+— returning **before** `domain::destroy(owner)`, which every other failure path
+in that function calls. So a machine with no virtio device lost one domain per
+boot, on top of being told it was broken. Two bugs on one line, and both are
+invisible to an emulator that always has the device. The memory test's arm did
+clean up; only its verdict was wrong.
+
+Verified on the SR550, where all three of the day's skip arms now fire together
+and the IOMMU is on:
+
+```
+    dma            translating: this device reaches only what it was given
+    iommu grant    not asked: no virtio device on this machine to grant a window for
+    iommu memory   not asked: no virtio device on this machine to map memory for
+    ahci service   not asked: the controller is up and no port has a disk, so there is no sector to read
+```
+
+QEMU still runs all three for real — `iommu grant` still maps a device at
+`0x100005000` and `iommu memory` still revokes it — so nothing was traded for
+the quiet. Both arms of each were watched.
+
+**What still fails on that machine**, and neither is a skip arm: `linux exec`,
+pre-existing on a host with no storage the personality can use, and `xhci
+FAILED to bring up: it wants more scratchpad buffers than this driver provides`
+— a real limit in RFC 0041's driver with a number behind it.
+
 ### 2026-08-24 (the AHCI service test stopped calling an empty controller broken — and the TCP intermittent recurred while proving it)
 
 **A gate that fails because the machine has no disk says "broken" about a true
@@ -898,8 +945,13 @@ than fixed:
   a timeout**, so a disk that is present and does not answer still fails — which
   is the case worth keeping. QEMU still reads its 512 bytes and matches, and
   both arms were watched.
-- `iommu grant FAILED` / `iommu memory FAILED` — self-tests that need a virtio
-  device to grant memory for, with no skip arm on a machine that has none.
+- ~~`iommu grant FAILED` / `iommu memory FAILED`~~ **FIXED and verified on the
+  machine the same day** — both said *"broken"* about a true fact, and the grant
+  test **also leaked a domain**: its no-device arm returned before
+  `domain::destroy(owner)`, so a machine with no virtio device lost one per
+  boot. Two bugs on one line, both invisible to an emulator that always has the
+  device. They now read *"not asked: no virtio device on this machine to grant a
+  window for"* and *"…to map memory for"*, and QEMU still runs both for real.
 
 **Both reserved regions on this machine overlap the kernel and are refused.**
 `0xaabf8000..=0xaac09fff` and `0x9f554000..=0xa755bfff`. `map_reserved` has

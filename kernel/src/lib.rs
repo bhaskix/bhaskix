@@ -17296,7 +17296,21 @@ fn iommu_delegation_self_test(hhdm: u64) -> bool {
     };
 
     let Some(device) = virtio::probe() else {
-        return false;
+        // **Not a failure, and it used to be one.** This test grants a domain a
+        // window for a device the kernel drives, and the only device it knows
+        // how to ask for is virtio. A machine without one -- every real server
+        // so far -- reported `iommu grant FAILED` on every boot, which says
+        // "broken" about a true fact.
+        //
+        // It also **leaked the domain**: this arm returned before
+        // `domain::destroy(owner)`, so a machine with no virtio device lost one
+        // per boot. Two bugs on one line, both invisible to an emulator that
+        // always has the device.
+        println!(
+            "    iommu grant    not asked: no virtio device on this machine to grant a window for"
+        );
+        domain::destroy(owner);
+        return true;
     };
     let (Ok(memory_cap), Ok(window_cap)) = (shared::name(object), iommu::name(device)) else {
         println!("\x1b[91m    iommu grant    FAILED to name the object or the window\x1b[0m");
@@ -17533,8 +17547,13 @@ fn iommu_memory_self_test(found: &iommu::Report, handoff: &Handoff, hhdm: u64) -
     };
 
     let Some(device) = virtio::probe() else {
+        // As the grant test above: no virtio device is a fact about the
+        // machine, not a fault in it. This arm at least cleaned up.
+        println!(
+            "    iommu memory   not asked: no virtio device on this machine to map memory for"
+        );
         domain::destroy(owner);
-        return false;
+        return true;
     };
     let Some(address) = iommu::map_memory(
         device,
