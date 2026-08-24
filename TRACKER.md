@@ -796,6 +796,48 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (RFC 0046's first stated limit is discharged: the AHCI offsets were read, and the recall was right)
+
+**RFC 0046 was accepted this morning with three limits written into its own
+status line rather than left to be inferred. The first was *"the register
+offsets have never been read from a specification"*. It has been read.**
+
+The Serial ATA AHCI 1.3.1 Specification is a public Intel document; fetching it
+took a minute, and `pdftotext` was already installed. **Every value it covers
+was correct** — the recall was right, and it is now *sourced* rather than
+merely agreed with by one controller:
+
+- **Twenty register offsets.** Six generic host control (`CAP` 00h, `GHC` 04h,
+  `IS` 08h, `PI` 0Ch, `VS` 10h, `BOHC` 28h) and fourteen per port (`PxCLB` 00h
+  through `PxCI` 38h). No discrepancy.
+- **The port address formula, verbatim.** §3: *"Port offset = 100h + (PI
+  Asserted Bit Position * 80h)"* — which is `0x100 + index * 0x80` in the crate.
+- **Thirteen bit positions.** `AE` 31, `HR` 0, `S64A` 31, `SNCQ` 30, `NCS`
+  12:08 and 0's-based (the crate's `+ 1` is right), `BOS` 0, `OOS` 1, `BB` 4,
+  `ST` 0, `FRE` 4, `FR` 14, `CR` 15, `DET` 3:0, `IPM` 11:08, and the four
+  `PxIS` error bits at 30, 29, 28, 27. Both field shifts are 8, as the field
+  positions require.
+
+**A narrower caveat replaces the old one, rather than the caveat disappearing.**
+AHCI §3.3.9 defines `PxSIG` as a *layout* — LBA High/Mid/Low and Sector Count —
+and says **nothing** about which values mean which device. So
+`sig::DISK = 0x0000_0101` and `sig::PACKET = 0xeb14_0101` are still recall, and
+they belong to the Serial ATA / ATA command set, which is not on this machine.
+That is a smaller claim than the one it replaces and it is stated in the same
+three places the old one was.
+
+**Nothing changed in the code except comments**, which is the good outcome: a
+verification that finds nothing is still worth its minute, because *"confirmed
+by a machine agreeing with them"* and *"read from the specification"* are
+different sentences, and only the second survives the controller being wrong in
+the same direction as the reader.
+
+**Second specification read today.** RFC 0048's acceptance turned on RFC 1122
+§4.2.3.5, where reading changed the outcome from *"a trade Linux also makes"*
+to *"a violation, taken deliberately"*. Here it changed nothing and confirmed
+everything. Both were a minute's work, and the project could not have known in
+advance which kind it was getting — which is the argument for reading.
+
 ### 2026-08-24 (RFC 0048 ACCEPTED: a deliberate deviation from a MUST, after reading the specification that forbids it)
 
 **The question this RFC named as the one that should block its acceptance was

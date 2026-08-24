@@ -283,23 +283,33 @@ pub fn read_identity(words: &[u8]) -> Result<Identity, Error> {
 // ---------------------------------------------------------------------------
 // RFC 0046 step 3a: the bring-up sequence.
 //
-// **The register offsets and bit positions below come from recall, not from a
-// source on this machine.** There is no AHCI specification here and no
-// `drivers/ata/ahci.h` -- the installed linux-headers packages ship Kconfig and
-// a Makefile under `drivers/ata` and no sources. This project's standard is
-// that a specification is **read, not recalled**, which is what RFC 0038 spent
-// a whole document arranging for xHCI. So this says so plainly rather than
-// letting the numbers below pass as sourced.
+// **These offsets and bit positions were verified against the Serial ATA AHCI
+// 1.3.1 Specification on 2026-08-24.** They were written from recall, and this
+// comment used to say so and stop there: *"there is no AHCI specification here
+// and no `drivers/ata/ahci.h`"*. The document is public, fetching it took a
+// minute, and this project's standard is that a specification is **read, not
+// recalled** -- which is what RFC 0038 spent a whole document arranging for
+// xHCI. It was read.
+//
+// **Every value below that the document covers was correct.** Twenty register
+// offsets (six generic host control, fourteen per port), the port address
+// formula -- §3 states it as *"Port offset = 100h + (PI Asserted Bit Position *
+// 80h)"*, which is this file's `0x100 + index * 0x80` -- and thirteen bit
+// positions: `AE` 31, `HR` 0, `S64A` 31, `SNCQ` 30, `NCS` 12:08 and 0's-based,
+// `BOS` 0, `OOS` 1, `BB` 4, `ST` 0, `FRE` 4, `FR` 14, `CR` 15, `DET` 3:0,
+// `IPM` 11:08, and the four `PxIS` error bits at 30, 29, 28 and 27.
+//
+// **One thing this document does not source, and it is in `sig` below.** AHCI
+// §3.3.9 defines `PxSIG` as the *layout* of a D2H Register FIS's LBA and sector
+// count fields and says nothing about what values mean which device. The two
+// signature constants therefore remain from recall, sourced to the Serial ATA
+// / ATA command set rather than to anything on this machine. Narrower than the
+// old caveat, and still a caveat.
 //
 // What the tests below can prove and what they cannot: they prove **the
 // sequence is right given these constants**. They cannot prove the constants,
 // because a test and an implementation sharing a wrong number agree with each
-// other. The constants get their first real check on the first boot that reads
-// a controller and prints raw `CAP`, `PI` and `VS` -- a wrong `PI` offset shows
-// as an implausible port bitmap, a wrong `GHC` offset as a reset that never
-// settles, and a wrong `CAP` offset as a slot count outside 1..=32. The byte
-// layouts of step 1 are in the same position and get theirs at step 5's
-// sector-zero gate.
+// other -- which is exactly why reading the document was worth a minute.
 // ---------------------------------------------------------------------------
 
 /// The controller's registers, as somebody else's problem.
@@ -738,11 +748,12 @@ pub fn start_port<R: Registers>(
 // ---------------------------------------------------------------------------
 // RFC 0046 step 4: issuing one command, and reading what the disk answers.
 //
-// The same caveat as the bring-up above: these register offsets and bits come
-// from recall, not from a source on this machine. Step 3b's boot confirmed the
-// generic host control block and the port block as far as `SSTS`; `PxCI`,
-// `PxIS`, `PxTFD` and `PxSERR` are checked the first time a command completes,
-// which is what step 4's gate watches.
+// The same status as the bring-up above: these offsets and bits were written
+// from recall and **verified against AHCI 1.3.1 on 2026-08-24** -- `PxCI` 38h,
+// `PxIS` 10h, `PxTFD` 20h, `PxSERR` 30h, and the four `PxIS` error bits. Step
+// 3b's boot had already confirmed the generic host control block and the port
+// block as far as `SSTS`; the document confirms the rest, which a completing
+// command could only ever have made *plausible*.
 // ---------------------------------------------------------------------------
 
 /// `PxTFD` fields -- the device's own status and error bytes.
