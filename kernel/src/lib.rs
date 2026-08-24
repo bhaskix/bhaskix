@@ -17647,11 +17647,20 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // bus master this kernel drives (RFC 0046). A machine with neither still
     // returns, because there is nothing to build tables around.
     //
-    let device = match virtio::probe() {
-        Some(device) => device,
-        // SAFETY: configuration access works by here, and `ahci::probe` only
-        // reads configuration space on functions the bus walk found present.
-        None => unsafe { ahci::probe() }?,
+    // SAFETY: configuration access works by here, and `ahci::probe` only reads
+    // configuration space on functions the bus walk found present.
+    let first = virtio::probe().or_else(|| unsafe { ahci::probe() });
+    let Some(device) = first else {
+        // **Said, not returned silently.** Bring-up returning with no line at
+        // all is what made an SR550 boot on 2026-08-24 unreadable: the report
+        // showed the units found and then nothing, and the only way to learn
+        // where it stopped was another reboot of a live server. There is no
+        // first device to build tables around, and that sentence is cheap.
+        println!(
+            "\x1b[93m    iommu          no device this kernel can drive to build tables around \
+             (no virtio, no AHCI controller); the units stay unprogrammed\x1b[0m"
+        );
+        return None;
     };
     let first_device = device;
     let (bus, slot, function) = device;

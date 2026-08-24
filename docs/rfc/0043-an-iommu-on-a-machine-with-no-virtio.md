@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-08-23, steps 1–4 implemented and gated; step 5 — a watched boot on the SR550 — is what remains.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 is ANSWERED: pass-through, chosen by the project lead 2026-08-24**, and steps 3–4 are built and gated. Steps 1–2 landed 2026-08-23; step 5 — the watched boot on the SR550 — is the one that remains. ~~unresolved question 1 — refuse, identity-map, or pass-through — is still the project lead's to answer, but it is no longer blocked on a document.** The Intel VT-d specification was read on 2026-08-24: the context-entry translation-type field is at **bits 3:2**, pass-through is **`10b`**, `ECAP.PT` is bit 6, and pass-through carries a second obligation the RFC had not known — `AW` must be set to the largest AGAW the hardware supports. Steps 2–5 wait on the decision, not on the layout |
+| **Status** | 🔨 **Draft 2026-08-23, all five steps done 2026-08-24 — including a boot on the SR550 where translation came up for the first time on physical hardware — awaiting the project lead's acceptance.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 is ANSWERED: pass-through, chosen by the project lead 2026-08-24**, and steps 3–4 are built and gated. Steps 1–2 landed 2026-08-23; step 5 — the watched boot on the SR550 — is the one that remains. ~~unresolved question 1 — refuse, identity-map, or pass-through — is still the project lead's to answer, but it is no longer blocked on a document.** The Intel VT-d specification was read on 2026-08-24: the context-entry translation-type field is at **bits 3:2**, pass-through is **`10b`**, `ECAP.PT` is bit 6, and pass-through carries a second obligation the RFC had not known — `AW` must be set to the largest AGAW the hardware supports. Steps 2–5 wait on the decision, not on the layout |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/iommu`, `kernel/lib.rs` bring-up |
 | **Milestone** | Phase 2. It does not add a feature; it makes an existing one true off the emulator |
@@ -404,7 +404,38 @@ should be one somebody is watching.
    nothing to report it. Context tables are now allocated per bus, lazily, as
    the specification describes. Verified by adding a `pcie-root-port` to the
    QEMU machine and watching a device on **bus 1** get its own entry.
-5. A boot on the SR550, watched, with `iommu=off` ready. **Not done, and not to
-   be done unasked**: it reboots a live cluster node, and this RFC's own testing
-   plan says *"the first boot that tries it should be one somebody is
-   watching"*.
+5. ✅ **DONE 2026-08-24. Translation is enabled on the SR550, and this is the
+   first time an IOMMU has been programmed on physical hardware in this
+   project's history.**
+
+   ```
+   iommu window   00:11.5 48-bit, 4 levels, 0 reserved pages mapped, 2 refused
+   iommu window   00:14.0 translating too, the xhci controller's own page table and domain, 2 in use
+   iommu irq      remapping interrupts; compatibility format blocked
+   dma            translating: this device reaches only what it was given
+   ahci           00:11.5 8086:a1d2, translated
+   ```
+
+   **105 endpoints passed through across seven buses** — `00`, `02`, `07`,
+   `5a`, `ad`, `ae`, `b1` — two devices contained, interrupt remapping on,
+   16 CPUs, boot to completion. Captured over serial-over-LAN, so it is a boot
+   somebody *read* rather than one somebody saw.
+
+   **Three defects had to be fixed between step 4 and this working**, and each
+   was invisible to every emulator boot:
+
+   1. **The tables were built to a width the unit does not support.**
+      `AddressWidth::fitting` chose from the `DMAR`'s host address width — 46
+      bits here, so 39 — and these units do not offer 39-bit at all. The
+      specification is explicit that the field must match `SAGAW`, and the
+      tables are now built from it: **48-bit, 4 levels**. QEMU's unit reports
+      `SAGAW` `0b00010`, 39-bit only, which is what the old code also chose —
+      so no emulator boot could ever have found this.
+   2. **The pass-through count was machine-wide and the check is per bus.**
+      `verify_window` counts the present entries in *one* bus's context table;
+      the expected total included pass-through entries living in six others, so
+      the xHCI's window failed to read back. One counter per bus.
+   3. **Bring-up returned silently** when there was no first device, which is
+      what made the first hardware boot unreadable.
+
+   `iommu=off` was ready and not needed.

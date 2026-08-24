@@ -574,11 +574,52 @@ pub struct Tables {
 /// built to the wrong width are tables the hardware walks to the wrong depth.
 #[must_use]
 pub fn build_tables(report: &Report, hhdm: u64) -> Option<Tables> {
-    use bhaskix_arch::vtd;
-
-    let width = vtd::AddressWidth::fitting(report.address_width)?;
+    // SAFETY: the unit the `DMAR` named; mapping it and reading one register.
+    let width = unsafe { widest_supported(report, hhdm) }?;
     let (root_table, _) = zeroed_frame(hhdm)?;
     Some(Tables { root_table, width })
+}
+
+/// The widest translation width **the unit says it can walk**.
+///
+/// # Why this is not the `DMAR`'s host address width
+///
+/// It was, until 2026-08-24, and on an SR550 that was the difference between
+/// containment and none. Two different numbers describe two different things:
+///
+/// - **MGAW / host address width**, from the `DMAR` table, is how many address
+///   bits the *hardware can generate*.
+/// - **`SAGAW`**, a bitmap in the unit's capability register, is which
+///   page-table depths the unit *will walk*.
+///
+/// `AddressWidth::fitting` picked from the first. The SR550 reports **46-bit
+/// addresses**, so it chose 39-bit — the widest encoding no wider than 46 — and
+/// its units do not offer 39-bit at all. `enable` then refused, correctly, with
+/// *"the unit does not support the width the tables were built to"*, and the
+/// machine ran with four working remapping units and nothing programmed.
+///
+/// The specification is explicit about which of the two governs: *"The value
+/// specified in this field must match an AGAW value supported by hardware (as
+/// reported in the SAGAW field in the Capability Register)"* (VT-d rev 5.20
+/// §9.3, of a context entry's `AW`). So the tables are built to a width the
+/// unit offers, and `None` — a refusal — if it offers none this kernel can
+/// describe.
+///
+/// QEMU's unit reports `SAGAW` `0b00010`: 39-bit only, which is what
+/// `fitting(39)` also chose, which is why no emulator boot could have found
+/// this.
+///
+/// # Safety
+///
+/// The `DMAR` must name a real remapping unit at `report.first_register_base`.
+unsafe fn widest_supported(report: &Report, hhdm: u64) -> Option<bhaskix_arch::vtd::AddressWidth> {
+    let base = crate::mmio::map(report.first_register_base, bhaskix_mm::FRAME_SIZE, hhdm)?;
+    // SAFETY: the caller's obligation; this reads one register and programs
+    // nothing.
+    unsafe {
+        let unit = bhaskix_arch::vtd::Unit::new(base as *mut u8);
+        unit.largest_width()
+    }
 }
 
 /// The context table for `bus`, allocating and installing one the first time
@@ -727,8 +768,47 @@ fn pass_through_or_say_why(
     }
 }
 
-/// Endpoints given a pass-through entry, for [`verify_window`]'s count.
-static PASSED_THROUGH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Says *which* widths disagreed when a unit refuses the tables' width.
+///
+/// **Both numbers, not just the verdict.** The refusal said only *"the unit
+/// does not support the width the tables were built to"* until 2026-08-24, and
+/// on a real server that is a sentence with no next step in it: the reader
+/// cannot tell whether the tables are too wide, too narrow, or the unit claims
+/// nothing at all. A refusal that cannot be acted on is one somebody re-runs
+/// the boot to understand — and on a live cluster node that is a reboot per
+/// question.
+///
+/// The widths come from `SAGAW`, which is the field the specification says the
+/// tables' width must match: *"The value specified in this field must match an
+/// AGAW value supported by hardware (as reported in the SAGAW field in the
+/// Capability Register)."* `build_tables` chooses from the `DMAR`'s host
+/// address width instead, which is a different number and is why this refusal
+/// can fire at all.
+fn report_width_refusal(
+    built: bhaskix_arch::vtd::AddressWidth,
+    sagaw: u64,
+    widest: Option<bhaskix_arch::vtd::AddressWidth>,
+) {
+    crate::println!(
+        "\x1b[91m    iommu enable   the tables are {}-bit; this unit's SAGAW is {:#07b}, widest \
+         supported {:?}\x1b[0m",
+        built.bits(),
+        sagaw,
+        widest
+    );
+}
+
+/// Endpoints given a pass-through entry, **per bus**, for [`verify_window`].
+///
+/// One counter per bus rather than one for the machine, and the distinction is
+/// not academic. `verify_window` counts the present entries in **one bus's**
+/// context table; a machine-wide total is only equal to that when every device
+/// is on one bus. QEMU is such a machine and the SR550 is not: it passed 105
+/// endpoints through across seven buses, and the xHCI's window then failed to
+/// verify because the expected count included pass-through entries living in
+/// six other tables. The check was right and the arithmetic was wrong.
+static PASSED_THROUGH: [core::sync::atomic::AtomicUsize; 256] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 256];
 
 /// The domain every passed-through device shares.
 ///
@@ -781,7 +861,7 @@ pub unsafe fn pass_through_undrivable(
         let device = (address.bus, address.device, address.function);
         if pass_through_to(tables, device, PASS_THROUGH_DOMAIN, widest, hhdm) {
             result.passed += 1;
-            PASSED_THROUGH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            PASSED_THROUGH[device.0 as usize].fetch_add(1, core::sync::atomic::Ordering::AcqRel);
             crate::println!(
                 "    dma untranslated {:02x}:{:02x}.{} {:04x}:{:04x} passed through deliberately -- it reaches all of memory, and is not contained",
                 device.0,
@@ -1002,10 +1082,12 @@ pub fn verify_window(window: &Window, devices: usize, hhdm: u64) -> bool {
                 present += 1;
             }
         }
-        // `+ passed_through()`: those entries are present and deliberate. The
-        // invariant is unweakened -- a stray entry still breaks it, because the
-        // pass-through count is itself tracked rather than assumed.
-        present == devices + passed_through()
+        // `+ passed_through(bus)`: those entries are present and deliberate, and
+        // the count is **this bus's** -- the table being counted holds only its
+        // own bus's devices. The invariant is unweakened: a stray entry still
+        // breaks it, because the pass-through count is tracked rather than
+        // assumed.
+        present == devices + passed_through(bus)
     }
 }
 
@@ -1176,8 +1258,8 @@ pub fn present_for(device: (u8, u8, u8)) -> bool {
         .any(|(held, ..)| *held == key)
 }
 
-/// How many endpoints were passed through -- present in the context table, and
-/// deliberately not translated.
+/// How many endpoints on `bus` were passed through -- present in that bus's
+/// context table, and deliberately not translated.
 ///
 /// [`verify_window`] needs this: its invariant is that the number of *present*
 /// context entries equals the number of devices attached, which is what catches
@@ -1185,8 +1267,8 @@ pub fn present_for(device: (u8, u8, u8)) -> bool {
 /// so without this the check would read every one of them as a stray -- and it
 /// did, the first time this was wired up, which is the check working.
 #[must_use]
-pub fn passed_through() -> usize {
-    PASSED_THROUGH.load(core::sync::atomic::Ordering::Acquire)
+pub fn passed_through(bus: u8) -> usize {
+    PASSED_THROUGH[bus as usize].load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// How many devices are translating.
@@ -1680,6 +1762,9 @@ pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), 
         // *walk*. Building tables to an unsupported width is a walk to the
         // wrong depth, and the tables are already built by now.
         if !unit.supports_width(window.width) {
+            let sagaw = (unit.capabilities() >> 8) & 0x1f;
+            let widest = unit.largest_width();
+            report_width_refusal(window.width, sagaw, widest);
             return Err("the unit does not support the width the tables were built to");
         }
 

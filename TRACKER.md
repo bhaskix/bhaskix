@@ -796,6 +796,74 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (an IOMMU is enabled on physical hardware for the first time, and three defects no emulator could show had to go first)
+
+**RFC 0043 step 5. Read off an SR550 over serial-over-LAN, not seen on a
+screen.**
+
+```
+    iommu window   00:11.5 48-bit, 4 levels, 0 reserved pages mapped, 2 refused
+    iommu window   00:14.0 translating too, the xhci controller's own page table and domain, 2 in use
+    iommu irq      remapping interrupts; compatibility format blocked
+    dma            translating: this device reaches only what it was given
+    ahci           00:11.5 8086:a1d2, translated
+```
+
+**105 endpoints passed through across seven buses** (`00 02 07 5a ad ae b1`),
+two devices contained, interrupt remapping on, 16 CPUs, boot to completion,
+**zero window failures**. `iommu=off` was ready and not needed.
+
+**RFC 0046's third stated limit is discharged in the same boot.** *"Nothing has
+run on the SR550's `00:11.5`"* — it has: `ahci up: 4 ports implemented
+(0x0000003c), 32 slots each, version 1.3 (revision set), 64-bit addressing, ncq
+yes`. Every register offset verified against the specification this morning met
+an Intel C620 that is not QEMU's ICH9, and held. No disk is attached, so it
+idles honestly.
+
+**Three defects stood between step 4 and this, and each was invisible to every
+QEMU boot ever run.**
+
+1. **The tables were built to a width the unit does not support.**
+   `AddressWidth::fitting` chose from the `DMAR`'s **host address width** — 46
+   bits on this machine, so 39 — and these units do not offer 39-bit at all.
+   VT-d rev 5.20 §9.3 is explicit that the value must match **`SAGAW`**, a
+   different field, and the tables are now built from it: **48-bit, 4 levels**.
+   QEMU's unit reports `SAGAW` `0b00010` — 39-bit only, exactly what the old
+   code also picked — so the two numbers agree on the emulator and only there.
+2. **The pass-through count was machine-wide and the check is per bus.**
+   `verify_window` counts present entries in *one* bus's context table; the
+   expected total included pass-through entries in six others, so the xHCI's
+   window failed to read back. **The check was right and my arithmetic was
+   wrong** — one counter per bus now.
+3. **Bring-up returned silently** with no first device and no line, which is
+   what made the first hardware boot of the day unreadable and cost a reboot to
+   learn nothing.
+
+**And the reporting defect that cost the most.** `iommu ... found, not enabled`
+is printed at discovery on *every* machine, including ones where translation
+comes up four lines later. It was read off this machine as the answer to "did
+the units come up?" — by the author of the change meant to make them come up.
+It now says `none programmed yet (the dma line below is the verdict)`.
+
+**Three findings this boot produced that are not IOMMU work**, recorded rather
+than fixed:
+
+- `xhci FAILED to bring up: it wants more scratchpad buffers than this driver
+  provides` — RFC 0041's driver meets a controller that asks for more than it
+  allocates. A real-hardware limit with a number behind it.
+- `ahci service FAILED: 18446744073709551615 bytes` — the block-service
+  self-test has no skip arm for *the controller is up and no port has a disk*,
+  so it reports a failure where the honest answer is "nothing to read".
+- `iommu grant FAILED` / `iommu memory FAILED` — self-tests that need a virtio
+  device to grant memory for, with no skip arm on a machine that has none.
+
+**Both reserved regions on this machine overlap the kernel and are refused.**
+`0xaabf8000..=0xaac09fff` and `0x9f554000..=0xa755bfff`. `map_reserved` has
+never had a machine that declared any until today; it now has one, and it
+refuses both because KASLR put the kernel across them. What that costs is not
+yet known — those regions are typically USB legacy emulation, which is how a
+BMC's virtual keyboard works.
+
 ### 2026-08-24 (a line that said "not enabled" on every machine, including the ones where it was enabled)
 
 **Found by being misled by it, on the machine it matters most on.**
@@ -2443,8 +2511,10 @@ is unanswered because the VT-d context-entry layout cannot be read from
 anything on this machine.~~ **The layout stopped being the reason on 2026-08-24**:
 the Intel VT-d specification was fetched and read, `TT` is at bits 3:2 with
 pass-through `10b`, and what remains unanswered is the *decision*, which was
-always the project lead's. **RFC 0043 is therefore not a theoretical blocker any
-more**: it stands between hardware the project owns and device containment on
+always the project lead's. ~~**RFC 0043 is therefore not a theoretical blocker any
+more**~~ **— and as of 2026-08-24 it is not a blocker at all: translation is
+enabled on that machine, the AHCI and xHCI controllers are contained, and 105
+endpoints are passed through by name.** What follows is kept as it was written: it stands between hardware the project owns and device containment on
 it, and it also blocks RFC 0041's USB keyboard there. The two RFCs are more
 coupled than either says.
 
