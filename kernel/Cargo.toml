@@ -464,7 +464,18 @@ asm_budget = 10
 # brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
 # charged the outer block's body to this crate. See the changelog; the
 # scanner now walks from the block's own brace and has a self-test.
-unsafe_budget = 1759
+# 1782 with RFC 0043 step 4: `pass_through_to`, the one place an *untranslated*
+# context entry is written -- four volatile writes and their pointer
+# arithmetic, the same shape `attach_to` has beside it -- plus the bus walk's
+# configuration read and the two capability reads that decide whether the unit
+# can pass a device through at all.
+#
+# It was 1820 on the first attempt, and the difference is not code: thirty
+# lines of reasoning sat *inside* an existing `unsafe` block, where the line
+# scanner charges them to the budget. They moved to a function in safe code.
+# The number is supposed to mean something, so prose does not get to inflate
+# it -- and after this morning's fix to that scanner, it does.
+unsafe_budget = 1782
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

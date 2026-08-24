@@ -218,12 +218,50 @@ impl RootEntry {
     }
 }
 
-/// A context-table entry: one device's page tables and how wide they are.
+/// How the hardware treats a device's requests. VT-d rev 5.20 §9.3, `TT`.
+///
+/// **This is a required field of [`ContextEntry`] and that is the point.** The
+/// two variants differ by two bits and by everything else: one contains a
+/// device, the other lets it reach all of memory. Making the caller name which
+/// is how *"choosing it by accident is a device that reaches all of memory
+/// while the machine reports an IOMMU"* stops being a warning somebody has to
+/// read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Translation {
+    /// `TT` = `00b`. Untranslated requests walk the second-stage tables at
+    /// `SSPTPTR`; translated requests and translation requests are blocked.
+    /// The contained case, and what every device with a driver gets.
+    SecondStage {
+        /// Physical address of the second-stage page table's root.
+        page_table: u64,
+    },
+    /// `TT` = `10b`. Untranslated requests are **passed through** — the device
+    /// reaches memory at its own addresses, exactly as it would with no unit
+    /// at all. `SSPTPTR` is ignored by hardware, so no page table is
+    /// allocated, which is the whole saving over an identity map.
+    ///
+    /// **Requires `ECAP.PT`** (bit 6). Where hardware does not report it, this
+    /// encoding is *reserved* and must not be written —
+    /// [`Unit::supports_pass_through`] is the check.
+    ///
+    /// Chosen by [RFC 0043] for an endpoint this kernel has no driver for: not
+    /// containment, and more honest than a mapping that looks like it.
+    PassThrough,
+}
+
+/// A context-table entry: one device's translation, and how wide it is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ContextEntry {
-    /// Physical address of the second-level page table's root.
-    pub page_table: u64,
+    /// How the hardware treats this device's requests.
+    pub translation: Translation,
     /// How many address bits it translates.
+    ///
+    /// For [`Translation::SecondStage`] this is the width the tables were built
+    /// to. For [`Translation::PassThrough`] the specification is specific and
+    /// it is **not** the tables' width: *"When the Translation-type (TT) field
+    /// indicates pass-through processing (10b), this field must be programmed
+    /// to indicate the largest AGAW value supported by hardware."*
+    /// [`Unit::largest_width`] is where that comes from.
     pub width: AddressWidth,
     /// Which domain this device belongs to, for invalidation.
     pub domain: u16,
@@ -264,11 +302,21 @@ impl ContextEntry {
     /// The capability to check first is `ECAP.PT`, **bit 6**.
     #[must_use]
     pub const fn to_bits(self) -> (u64, u64) {
-        let low = (self.page_table & !(PAGE_SIZE - 1)) | 1;
+        // Bit 0 is `P`, bits 3:2 are `TT`, bits 63:12 are `SSPTPTR`. Bits 11:4
+        // are reserved and must be zero, which the page mask guarantees.
+        let low = match self.translation {
+            Translation::SecondStage { page_table } => (page_table & !(PAGE_SIZE - 1)) | 1,
+            // No address: `SSPTPTR` is ignored for pass-through, so writing one
+            // would be stating something the hardware will not read.
+            Translation::PassThrough => (TT_PASS_THROUGH << 2) | 1,
+        };
         let high = (self.width as u64) | ((self.domain as u64) << 8);
         (low, high)
     }
 }
+
+/// `TT` = `10b`, pass-through. VT-d rev 5.20 §9.3.
+const TT_PASS_THROUGH: u64 = 0b10;
 
 /// A second-level page-table entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1062,6 +1110,55 @@ impl Unit {
         unsafe { self.read32(reg::GSTS) & command::IRE != 0 }
     }
 
+    /// Whether the unit can pass a device's requests through untranslated.
+    ///
+    /// `PT`, **bit 6 of the extended capability register** (VT-d rev 5.20).
+    /// Read from Intel's specification on 2026-08-24, which matters because
+    /// with this clear the [`Translation::PassThrough`] encoding is *reserved*
+    /// and writing it is a context entry the hardware rejects.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`].
+    #[must_use]
+    pub unsafe fn supports_pass_through(&self) -> bool {
+        // SAFETY: the caller's obligation.
+        unsafe { self.extended_capabilities() & (1 << 6) != 0 }
+    }
+
+    /// The widest translation this unit supports, from `SAGAW`.
+    ///
+    /// **This is what a pass-through entry's `AW` field must carry**, and it is
+    /// not the width the tables were built to: *"When the Translation-type (TT)
+    /// field indicates pass-through processing (10b), this field must be
+    /// programmed to indicate the largest AGAW value supported by hardware."*
+    ///
+    /// `SAGAW` is a bitmap at bits 12:8 of the capability register, one bit per
+    /// width in the same order the width encoding uses -- the same field
+    /// [`supports_width`](Self::supports_width) tests. `None` means the unit
+    /// claims no width this code can describe, which is a refusal rather than a
+    /// guess.
+    ///
+    /// # Safety
+    ///
+    /// The caller's obligation from [`Unit::new`].
+    #[must_use]
+    pub unsafe fn largest_width(&self) -> Option<AddressWidth> {
+        // SAFETY: the caller's obligation.
+        let supported = unsafe { (self.capabilities() >> 8) & 0x1f };
+        // Widest first: the largest supported, not the first that fits.
+        //
+        // `Bits30` is deliberately absent: rev 5.20 reads `000b` as reserved
+        // and defines no `SAGAW` bit 0. See the variant's own note.
+        [
+            AddressWidth::Bits57,
+            AddressWidth::Bits48,
+            AddressWidth::Bits39,
+        ]
+        .into_iter()
+        .find(|&width| supported & (1 << (width as u64)) != 0)
+    }
+
     /// Whether the unit supports interrupt remapping at all.
     ///
     /// # Safety
@@ -1278,9 +1375,95 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_through_entry_sets_tt_and_names_no_page_table() {
+        // VT-d rev 5.20 §9.3: `TT` is bits 3:2 and pass-through is `10b`, so
+        // the low word is the present bit plus `0b10 << 2` -- and **nothing
+        // else**. `SSPTPTR` is ignored by hardware for this encoding, so an
+        // address here would be stating something never read.
+        let entry = ContextEntry {
+            translation: Translation::PassThrough,
+            width: AddressWidth::Bits48,
+            domain: 3,
+        };
+        let (low, high) = entry.to_bits();
+
+        assert_eq!(low, 0b1001, "present, and TT = 10b at bits 3:2");
+        assert_eq!((low >> 2) & 0b11, 0b10, "the pass-through encoding");
+        assert_eq!(low & 1, 1, "still present");
+        assert_eq!(low >> 12, 0, "no page table address");
+        assert_eq!(
+            low & 0b1111_1111_0000,
+            0,
+            "bits 11:4 are reserved, must be 0"
+        );
+        // The high word is unchanged in shape: width at 66:64, domain at 87:72.
+        assert_eq!(high & 0b111, AddressWidth::Bits48 as u64);
+        assert_eq!((high >> 8) & 0xffff, 3);
+    }
+
+    #[test]
+    fn a_second_stage_entry_leaves_tt_at_zero() {
+        // The other half of the pair, asserted separately: a translating entry
+        // must **not** carry the pass-through bits, and a change that set them
+        // for everybody would otherwise pass the test above.
+        let entry = ContextEntry {
+            translation: Translation::SecondStage {
+                page_table: 0x2000_0000,
+            },
+            width: AddressWidth::Bits39,
+            domain: 0,
+        };
+        let (low, _) = entry.to_bits();
+        assert_eq!((low >> 2) & 0b11, 0b00, "second-stage is TT = 00b");
+        assert_eq!(
+            low & !(PAGE_SIZE - 1),
+            0x2000_0000,
+            "and it keeps its table"
+        );
+    }
+
+    #[test]
+    fn the_largest_width_is_the_widest_bit_sagaw_sets_and_never_the_retired_one() {
+        // `largest_width` reads the same bitmap `supports_width` does, and must
+        // answer the *widest* rather than the first that fits -- a pass-through
+        // entry programmed narrower than hardware supports is a device that
+        // faults above its limit.
+        //
+        // This exercises the pure selection over a synthetic `SAGAW`, since a
+        // `Unit` needs a mapped register window.
+        let widest = |sagaw: u64| -> Option<AddressWidth> {
+            [
+                AddressWidth::Bits57,
+                AddressWidth::Bits48,
+                AddressWidth::Bits39,
+            ]
+            .into_iter()
+            .find(|&width| sagaw & (1 << (width as u64)) != 0)
+        };
+
+        assert_eq!(widest(0b0000), None, "a unit claiming nothing is refused");
+        assert_eq!(widest(0b0010), Some(AddressWidth::Bits39));
+        assert_eq!(
+            widest(0b0110),
+            Some(AddressWidth::Bits48),
+            "widest, not first"
+        );
+        assert_eq!(widest(0b1110), Some(AddressWidth::Bits57));
+        // Bit 0 is not a width in rev 5.20: a unit setting only it supports
+        // nothing this code may program.
+        assert_eq!(
+            widest(0b0001),
+            None,
+            "SAGAW bit 0 is not 30-bit AGAW any more"
+        );
+    }
+
+    #[test]
     fn a_context_entry_carries_the_width_and_the_domain_in_the_high_word() {
         let entry = ContextEntry {
-            page_table: 0x2000_0000,
+            translation: Translation::SecondStage {
+                page_table: 0x2000_0000,
+            },
             width: AddressWidth::Bits39,
             domain: 7,
         };

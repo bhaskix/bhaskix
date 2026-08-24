@@ -585,7 +585,7 @@ pub fn attach_to(tables: &Tables, device: (u8, u8, u8), domain: u16, hhdm: u64) 
     };
     let (root_low, root_high) = root.to_bits();
     let context = vtd::ContextEntry {
-        page_table,
+        translation: vtd::Translation::SecondStage { page_table },
         width: tables.width,
         domain,
     };
@@ -616,6 +616,204 @@ pub fn attach_to(tables: &Tables, device: (u8, u8, u8), domain: u16, hhdm: u64) 
         device,
         addresses: DevAddrSpace::new(tables.width),
     })
+}
+
+/// Passes every undrivable endpoint through, or says why it could not.
+///
+/// **Split out of [`enable`] so that its reasoning -- and its comments -- sit
+/// in safe code.** The budget check counts every line inside an `unsafe` block,
+/// and the argument below is thirty lines of prose that perform no unsafe
+/// operation. Putting them there would have charged them to the number
+/// `coding-style.md` §3 exists to keep meaningful.
+///
+/// Until 2026-08-24 an endpoint this kernel cannot drive had no context entry,
+/// so the moment translation came on its DMA was refused. That survives on QEMU
+/// because the endpoints there are idle -- a display adapter and an SMBus this
+/// kernel never touches. On a real server the boot device is one of them and is
+/// not idle, which is why translation has never been enabled on the SR550:
+/// four working units, all off.
+///
+/// **This is not containment for those devices and is never reported as if it
+/// were.** They reach all of memory, exactly as with no unit at all. What it
+/// buys is that the unit can be *enabled*, so the devices that do have drivers
+/// are contained -- on real hardware, the difference between some containment
+/// and none.
+fn pass_through_or_say_why(
+    unit: (bool, Option<bhaskix_arch::vtd::AddressWidth>),
+    window: &Window,
+    hhdm: u64,
+) {
+    let tables = Tables {
+        root_table: window.root_table,
+        context_table: window.context_table,
+        width: window.width,
+    };
+    match unit {
+        (true, Some(widest)) => {
+            // SAFETY: configuration access works by here, and these are this
+            // kernel's tables with nothing else programming them. `enable` has
+            // not yet turned translation on, which is this call's whole point.
+            let passed = unsafe { pass_through_undrivable(&tables, widest, hhdm) };
+            if passed.failed != 0 {
+                crate::println!(
+                    "\x1b[91m    dma untranslated FAILED: {} endpoint(s) could not be passed \
+                     through\x1b[0m",
+                    passed.failed
+                );
+            }
+        }
+        (supported, widest) => {
+            // Said, rather than fallen back into silently. Absent entries are
+            // this kernel's old behaviour: safe here, and fatal on a machine
+            // that boots from a device it cannot drive.
+            crate::println!(
+                "\x1b[93m    dma untranslated the unit cannot pass devices through (ECAP.PT {}, \
+                 widest {:?}); undrivable endpoints stay absent and their DMA is refused\x1b[0m",
+                u8::from(supported),
+                widest
+            );
+        }
+    }
+}
+
+/// Endpoints given a pass-through entry, for [`verify_window`]'s count.
+static PASSED_THROUGH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The domain every passed-through device shares.
+///
+/// One rather than one each: VT-d rev 5.20 §9.3 requires context entries with
+/// the same domain id to reference the same address translation, and
+/// pass-through entries all reference *none*, so they agree trivially. Clear of
+/// 0..=4, which the translating windows use, and non-zero because the
+/// specification reserves domain id zero on any unit reporting Caching Mode.
+pub const PASS_THROUGH_DOMAIN: u16 = 15;
+
+/// What [`pass_through_undrivable`] did, for the report.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct PassedThrough {
+    /// Endpoints given a pass-through entry.
+    pub passed: usize,
+    /// Endpoints that needed one and could not be written.
+    pub failed: usize,
+}
+
+/// Gives every endpoint this kernel cannot drive a pass-through entry.
+///
+/// **RFC 0043 step 4, and the reason translation can be enabled on a real
+/// machine at all.** Walks the bus with the *same* predicate the survey uses --
+/// [`drivable`] and [`CLASS_BRIDGE`] -- so the count a boot reports and the set
+/// of devices actually passed through cannot disagree. Bridges are skipped:
+/// they are not endpoints, and requester-id rewriting behind one is RFC 0043's
+/// unresolved question 2, which no machine here can yet exercise.
+///
+/// Must run **before** the unit is enabled. Afterwards is a device whose first
+/// transaction faults, which on a boot device is the machine.
+///
+/// # Safety
+///
+/// Configuration access must work, and `tables` must be this kernel's, with
+/// nothing else programming them.
+pub unsafe fn pass_through_undrivable(
+    tables: &Tables,
+    widest: bhaskix_arch::vtd::AddressWidth,
+    hhdm: u64,
+) -> PassedThrough {
+    let mut result = PassedThrough::default();
+    let mut visit = |address: bhaskix_arch::pci::Address, identity: bhaskix_arch::pci::Identity| {
+        // SAFETY: one byte of configuration space at a fixed offset, on a
+        // function `for_each` has already found present.
+        let prog_if =
+            unsafe { bhaskix_arch::pci::read8(address, bhaskix_arch::pci::PROG_IF_OFFSET) };
+        if drivable(&identity, prog_if) || identity.class == CLASS_BRIDGE {
+            return true;
+        }
+        let device = (address.bus, address.device, address.function);
+        if pass_through_to(tables, device, PASS_THROUGH_DOMAIN, widest, hhdm) {
+            result.passed += 1;
+            PASSED_THROUGH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            crate::println!(
+                "    dma untranslated {:02x}:{:02x}.{} {:04x}:{:04x} passed through deliberately -- it reaches all of memory, and is not contained",
+                device.0,
+                device.1,
+                device.2,
+                identity.vendor,
+                identity.device
+            );
+        } else {
+            result.failed += 1;
+        }
+        true
+    };
+    // SAFETY: the caller's obligation.
+    unsafe { bhaskix_arch::pci::for_each(&mut visit) };
+    result
+}
+
+/// Writes a **pass-through** context entry: this device is not translated.
+///
+/// The one place an *untranslated* entry is written, as [`attach_to`] is the
+/// one place a translating one is. [RFC 0043]'s answer to what an endpoint this
+/// kernel has no driver for should get, chosen by the project lead on
+/// 2026-08-24 over *absent* (which refuses its DMA, and on a real server's boot
+/// device is a dead machine) and over *identity-mapped* (which reaches the same
+/// memory and costs a page table over all of RAM -- 402 MB per device on the
+/// SR550).
+///
+/// **This is not containment and must never be reported as containment.** The
+/// device reaches all of memory, exactly as it would with no unit at all. What
+/// it buys is that the unit can be *enabled*, so the devices that do have
+/// drivers are contained -- which on real hardware is the difference between
+/// some containment and none.
+///
+/// # Two obligations from the specification, both easy to miss
+///
+/// **No page table is allocated.** VT-d rev 5.20 §9.3: `SSPTPTR` is *"ignored
+/// by hardware when Translation-Type (TT) field is 10b"*. Allocating one would
+/// be a frame per undrivable device that nothing ever reads.
+///
+/// **`AW` is the unit's widest, not the tables' width**: *"When the
+/// Translation-type (TT) field indicates pass-through processing (10b), this
+/// field must be programmed to indicate the largest AGAW value supported by
+/// hardware."* The caller passes it, from `Unit::largest_width`.
+///
+/// `None` if the root entry could not be written. The caller must have checked
+/// `Unit::supports_pass_through` first: with `ECAP.PT` clear this encoding is
+/// *reserved*, and a reserved context entry is not a device that works.
+pub fn pass_through_to(
+    tables: &Tables,
+    device: (u8, u8, u8),
+    domain: u16,
+    widest: bhaskix_arch::vtd::AddressWidth,
+    hhdm: u64,
+) -> bool {
+    use bhaskix_arch::vtd;
+
+    let (bus, slot, function) = device;
+    let root = vtd::RootEntry {
+        context_table: tables.context_table,
+    };
+    let (root_low, root_high) = root.to_bits();
+    let context = vtd::ContextEntry {
+        translation: vtd::Translation::PassThrough,
+        width: widest,
+        domain,
+    };
+    let (context_low, context_high) = context.to_bits();
+
+    // SAFETY: the same tables `attach_to` writes, reached through the direct
+    // map, with indices bounded by construction -- a root index is a byte and a
+    // context index is masked to eight bits, so neither can leave its page.
+    unsafe {
+        let root_entry = ((hhdm + tables.root_table) as *mut u64).add(vtd::root_index(bus) * 2);
+        core::ptr::write_volatile(root_entry, root_low);
+        core::ptr::write_volatile(root_entry.add(1), root_high);
+
+        let context_entry =
+            ((hhdm + tables.context_table) as *mut u64).add(vtd::context_index(slot, function) * 2);
+        core::ptr::write_volatile(context_entry, context_low);
+        core::ptr::write_volatile(context_entry.add(1), context_high);
+    }
+    true
 }
 
 /// Builds the translation structures for one device, and enables nothing.
@@ -705,7 +903,9 @@ pub fn verify_window(window: &Window, devices: usize, hhdm: u64) -> bool {
     }
     .to_bits();
     let expected_context = vtd::ContextEntry {
-        page_table: window.page_table,
+        translation: vtd::Translation::SecondStage {
+            page_table: window.page_table,
+        },
         width: window.width,
         // From the window rather than a constant. It was zero here, which was
         // true of the only window there was and became a false expectation the
@@ -754,7 +954,10 @@ pub fn verify_window(window: &Window, devices: usize, hhdm: u64) -> bool {
                 present += 1;
             }
         }
-        present == devices
+        // `+ passed_through()`: those entries are present and deliberate. The
+        // invariant is unweakened -- a stray entry still breaks it, because the
+        // pass-through count is itself tracked rather than assumed.
+        present == devices + passed_through()
     }
 }
 
@@ -923,6 +1126,19 @@ pub fn present_for(device: (u8, u8, u8)) -> bool {
         .iter()
         .flatten()
         .any(|(held, ..)| *held == key)
+}
+
+/// How many endpoints were passed through -- present in the context table, and
+/// deliberately not translated.
+///
+/// [`verify_window`] needs this: its invariant is that the number of *present*
+/// context entries equals the number of devices attached, which is what catches
+/// an entry written at the wrong offset. A pass-through entry is present too,
+/// so without this the check would read every one of them as a stray -- and it
+/// did, the first time this was wired up, which is the check working.
+#[must_use]
+pub fn passed_through() -> usize {
+    PASSED_THROUGH.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// How many devices are translating.
@@ -1418,6 +1634,13 @@ pub unsafe fn enable(report: &Report, window: &Window, hhdm: u64) -> Result<(), 
         if !unit.supports_width(window.width) {
             return Err("the unit does not support the width the tables were built to");
         }
+
+        // RFC 0043 step 4. The reasoning is on `pass_through_undrivable`; what
+        // matters here is the ordering, which is why this is inside `enable`
+        // and not in a caller that could get it wrong silently.
+        let pass = (unit.supports_pass_through(), unit.largest_width());
+        pass_through_or_say_why(pass, window, hhdm);
+
         if !unit.set_root_table(window.root_table) {
             return Err("the unit did not accept the root table");
         }

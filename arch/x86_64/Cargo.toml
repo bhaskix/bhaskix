@@ -134,7 +134,10 @@ asm_budget = 37
 # brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
 # charged the outer block's body to this crate. See the changelog; the
 # scanner now walks from the block's own brace and has a self-test.
-unsafe_budget = 1157
+# 1159 with RFC 0043 step 3: `supports_pass_through` and `largest_width`,
+# one capability-register read each -- ECAP bit 6 and the SAGAW bitmap, both
+# read from Intel's VT-d specification rather than recalled.
+unsafe_budget = 1159
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

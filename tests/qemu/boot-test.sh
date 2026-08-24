@@ -1197,6 +1197,35 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         status=1
     fi
 
+    # RFC 0043 step 4: every endpoint this kernel cannot drive is passed
+    # through, deliberately, and the report says so per device.
+    #
+    # **The gate is on the words as much as the count.** The RFC's requirement
+    # is that "the boot report must name every device that got a window and say
+    # which kind it got", because the danger in this answer is a reader seeing
+    # "iommu enabled" and believing a device is contained when it reaches all
+    # of memory. So the line must carry the device, and must say *not
+    # contained* -- a version that printed only a tally would pass a machine
+    # that had quietly passed something through.
+    #
+    # Both endpoints are asserted, not just one: `00:01.0` is a display adapter
+    # and `00:1f.3` an SMBus, and a walk that stopped at the first would leave
+    # the second absent and its DMA refused, which is the failure this step
+    # exists to remove.
+    untranslated=$(grep -acE "dma untranslated [0-9a-f]{2}:[0-9a-f]{2}\.[0-9] [0-9a-f]{4}:[0-9a-f]{4} passed through deliberately -- it reaches all of memory, and is not contained" "$LOG")
+    if [[ "$untranslated" -eq 2 ]]; then
+        pass "both endpoints with no driver are passed through, named, and reported as not contained"
+    elif grep -qa "dma untranslated the unit cannot pass devices through" "$LOG"; then
+        # The honest other ending: a unit without `ECAP.PT` cannot do this, and
+        # the kernel says so rather than falling back silently. No QEMU machine
+        # here takes this arm; it is kept so the day one does is not a mystery.
+        pass "the unit cannot pass devices through, and the boot says so instead of pretending"
+    else
+        fail "endpoints with no driver were not passed through (found $untranslated of 2)"
+        grep -a "dma untranslated" "$LOG" | sed 's/^/        /' >&2
+        status=1
+    fi
+
     # RFC 0012 step 4. The device is handed a `DevAddr` and translation is on
     # before it is programmed, so this asserts the machine finished bring-up
     # with the disk working -- which it cannot do unless every ring and buffer

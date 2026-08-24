@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-23, steps 1–2 implemented.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 — refuse, identity-map, or pass-through — is still the project lead's to answer, but it is no longer blocked on a document.** The Intel VT-d specification was read on 2026-08-24: the context-entry translation-type field is at **bits 3:2**, pass-through is **`10b`**, `ECAP.PT` is bit 6, and pass-through carries a second obligation the RFC had not known — `AW` must be set to the largest AGAW the hardware supports. Steps 2–5 wait on the decision, not on the layout |
+| **Status** | 🔨 **Draft 2026-08-23, steps 1–4 implemented and gated; step 5 — a watched boot on the SR550 — is what remains.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 is ANSWERED: pass-through, chosen by the project lead 2026-08-24**, and steps 3–4 are built and gated. Steps 1–2 landed 2026-08-23; step 5 — the watched boot on the SR550 — is the one that remains. ~~unresolved question 1 — refuse, identity-map, or pass-through — is still the project lead's to answer, but it is no longer blocked on a document.** The Intel VT-d specification was read on 2026-08-24: the context-entry translation-type field is at **bits 3:2**, pass-through is **`10b`**, `ECAP.PT` is bit 6, and pass-through carries a second obligation the RFC had not known — `AW` must be set to the largest AGAW the hardware supports. Steps 2–5 wait on the decision, not on the layout |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/iommu`, `kernel/lib.rs` bring-up |
 | **Milestone** | Phase 2. It does not add a feature; it makes an existing one true off the emulator |
@@ -229,11 +229,34 @@ claimed falsely. But T3 and T4 are the rows the whole IOMMU exists for.
 
 ## Security implications
 
-**This RFC does not weaken anything; it is about a guarantee that is currently
-absent.** The danger is in answer 2: identity-mapping a device the kernel does not
-drive gives it what it already had, and a reader who saw "iommu enabled" might
-believe otherwise. Whichever answer is taken, the boot report must name every
-device that got a window and say which kind it got.
+> ~~**This RFC does not weaken anything; it is about a guarantee that is
+> currently absent.**~~ **Corrected 2026-08-24, when answer 3 was taken.** That
+> sentence was written while the answer was still open and it is no longer
+> true on the emulator. **On QEMU this is a loosening**: the display adapter at
+> `00:01.0` and the SMBus at `00:1f.3` had no context entry, so their DMA was
+> *refused*; they now reach all of memory. Nothing drives them and nothing has
+> ever faulted, which is why it costs nothing today — but "refused" and
+> "unrestricted" are different, and the document said otherwise.
+>
+> **On real hardware it is a strict improvement**, and that is the trade: those
+> endpoints reached everything already, because translation could not be turned
+> on at all. Enabling it contains the devices that *do* have drivers. Some
+> containment, where there was none.
+
+The danger is in answers 2 and 3 alike: giving a device the kernel does not
+drive what it already had, where a reader who saw "iommu enabled" might believe
+otherwise. **Whichever answer is taken, the boot report must name every device
+that got a window and say which kind it got** — which is why the line reads
+*"passed through deliberately -- it reaches all of memory, and is not
+contained"*, names the device, and is gated on those words rather than on a
+tally.
+
+**A limit found by trying to break it.** Writing the *reserved* `TT` encoding
+`11b` instead of pass-through's `10b` produced a **completely clean boot** —
+QEMU's `intel-iommu` did not police it, and the two devices never issue DMA, so
+nothing ever walked their context entry. The host test over the bit layout is
+therefore the **only** thing standing between the right encoding and a wrong
+one; no boot gate can see it. Stated because the reverse would be assumed.
 
 ## Performance implications
 
@@ -337,6 +360,26 @@ should be one somebody is watching.
    naming each endpoint with no driver rather than counting it. Reporting only —
    no behaviour change — and it is what turned question 1 from two answers into
    three and eliminated one of them.
-3. The predicate: may translation be enabled? Pure, host-tested, watched red.
-4. Wire the decision, with the report naming every device and its window.
-5. A boot on the SR550, watched, with `iommu=off` ready.
+3. ✅ **Done 2026-08-24.** The decision, in `pass_through_or_say_why`: given
+   what the unit supports, either every undrivable endpoint is passed through or
+   the boot says why it could not. The bit layout it produces is host-tested and
+   watched red — and that host test turned out to be the *only* thing that can
+   catch a wrong `TT`, since a reserved encoding boots clean.
+4. ✅ **Done 2026-08-24.** Wired into `enable` rather than a caller, because
+   "before translation is on" is a property of that function's ordering and a
+   caller could get it wrong silently. The report names every passed-through
+   device and says it is not contained; one boot gate on the `iommu` lane,
+   watched red three ways — the walk removed (0 of 2), the walk stopping after
+   one endpoint (**1 of 2**, which is why the gate asserts the count rather than
+   "at least one"), and the reserved `TT` encoding, which the boot could *not*
+   catch.
+
+   It also found a real check doing its job: `verify_window` asserts that the
+   number of present context entries equals the number of devices attached, and
+   the first wiring made three windows fail to read back — the pass-through
+   entries looked exactly like the strays that check exists to catch. It now
+   counts them explicitly rather than being loosened.
+5. A boot on the SR550, watched, with `iommu=off` ready. **Not done, and not to
+   be done unasked**: it reboots a live cluster node, and this RFC's own testing
+   plan says *"the first boot that tries it should be one somebody is
+   watching"*.
