@@ -709,7 +709,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | **The TCP inbound gate fails intermittently (filed 2026-08-24) — root-caused 2026-08-24, and the fix is [RFC 0047](docs/rfc/0047-refusing-a-connection-to-a-port-nobody-holds.md); one mechanism behind it is fixed and a second, worse one is not.** ~~The guest reaches the line before it — `tcp client did everything outcome 9 says, then opened a v6 connection` — so the guest's side completes and the host-side client is what comes away empty.~~ **That sentence was wrong and is corrected rather than deleted.** The guest reports **outcome 10, `NOBODY`** — `tcp client  echoed outbound, listened, and nobody called` — so the guest's side does *not* complete and it never received a connection at all. What is true: `$INBOUND_VERDICT` stays absent and the gate reports *"the ring handover or the stream through it did not complete"*, every AHCI gate passes, and the boot takes 28 s of its 120 s budget. **RFC 0046 is not convicted**: the margin it is accused of eating was always about a tenth of a second wide. | **Measured, not argued.** *(1)* The host driver **never retried**: instrumented, 20 boots of 20 opened one connection at t≈1.5 s and blocked in a single read for 18.2 s — it retries only when `connect` fails, and slirp's `hostfwd` always accepts. *(2)* Delivery is therefore on slirp's SYN-retransmit ladder, measured by a delayed-start sweep as a fixed offset from when the **host** opens, not from when the guest is ready: opens 1.54 s → served 19.64 s; 5.52 → 23.72; 10.51 → 28.77; 14.52 → 20.81. Rungs at ≈T+6.3 s and ≈T+18.2 s. *(3)* The guest becomes reachable at **19.62 s**, measured directly by hammering a port nothing holds through a whole boot. The shipped configuration lands on the 19.64 s rung — **≈0.1 s of margin**. *(4)* `bin/tcpd` could not refuse: `send_entry` had one caller, inside `Action::Emit`, which needs a control block. **Fixed by RFC 0047**, gated, and the gate watched red. **What is NOT fixed, and is the more serious half — see the row below.** A synthetic anti-phase (`BHASKIX_DRIVER_DELAY=11`, a temporary harness knob, reverted) fails 3/3 where delay 0 passes 3/3, and with the refusal reasons temporarily separated it read **one `SlotBusy` and zero `NoListener`** — the connection reached the guest and was refused because the single accepted slot was already wedged. **The filed flake was never reproduced on an idle machine in 33 runs**, so which of the two mechanisms it is remains unproven; both were live. Reproduce the ladder with `tests/qemu/boot-test.sh iommu` on an idle machine. | unassigned |
 | **A single `SYN` from a peer that vanishes wedges every listener (found 2026-08-24; narrowed 2026-08-24 by [RFC 0048](docs/rfc/0048-a-listener-that-cannot-be-wedged.md) step 1, and still open).** `bin/tcpd` has **one** accepted slot. A `SYN` births a connection in `SynReceived`; if the peer never completes the handshake, that connection holds the slot until `MAX_RETRANSMITS` (eight, with backoff) — far beyond any accept window — and every later `SYN` is refused **silently** as `SlotBusy`. The listener is then deaf while looking healthy. **This is a remote denial of service against any listener this system offers**: one packet, from an address that need not exist, and nothing is listening any more. It needs no authority and no capability. | Measured 2026-08-24 by temporarily separating `accept_syn`'s three refusal reasons into the report word (`1` no-listener, `1000` slot-busy, `10^6` not-ours) and reading them off one boot: a failing run read **1000** — one slot-busy, zero no-listener — and a **passing** run read **2001**, so the condition occurs on ordinary boots and is survived by luck. Instrumentation reverted. **Not fixed deliberately**: the fix is a design decision, not a bug fix — a bounded half-open queue, a `SynReceived` deadline, or both — and belongs in its own RFC. **Measured at 242 seconds** by driving the state machine on the host -- and an arithmetic estimate in the same investigation said 183, which is why the number comes from a test. **[RFC 0048](docs/rfc/0048-a-listener-that-cannot-be-wedged.md) step 1 takes it to 14 seconds** (`MAX_SYNACK_RETRANSMITS`, a half-open connection given less patience than one somebody completed), measured the same way, with both host tests watched red three ways -- including the mutation that shortens *every* connection, which a pre-existing test catches. **That is a 17x reduction and not a fix**: one `SYN` every fourteen seconds still owns the slot. The fix is SYN cookies -- no state for a peer that has proved nothing -- specified as that RFC's steps 2-4 and **not built**. **Its acceptance should block on reading RFC 1122 §4.2.3.5**: step 1 may sit below the floor that specification sets for `SYN` retries, and there is no copy of it on this machine, so the question is recorded rather than guessed. | unassigned |
 | **`make gates` runs neither `cargo fmt --check` nor `cargo clippy`, so both unformatted code and lint failures land (2026-08-24; the clippy half found the same day).** **`make test` was red on `main` for three separate clippy errors**, none of them noticed, because `gates` is the fast target and the one usually run while `fmt` and `clippy` are siblings of it under `test`: a duplicated `#[rustfmt::skip]` in `kernel/src/lib.rs` from `2980f74`, a dead test helper `set_count` in `ahci/src/lib.rs`, and a `single_match` in `user/ahcid/src/main.rs`. All three are from commits of 2026-08-23/24, and all three are fixed by the RFC 0047 change **only because they blocked its verification** -- the tree could not be shown green otherwise. `§6`'s gate table has claimed `cargo clippy -D warnings` active **from M1**, which was true of CI and not of the command a developer runs. `cargo fmt --check` runs under `make test` and not under `make gates`, which is the faster target and therefore the one usually run. A `cargo fmt --all` during RFC 0046 step 2 reflowed **six files that change was not touching** — including `ahci/src/lib.rs`, committed the day before — all line-wrapping and one stray blank line, nothing semantic. Not fixed by moving `fmt` into `gates`, because that changes a developer-facing gate and would have been a silent widening of an unrelated commit. | `git diff -w` was identical to `git diff` across all six, which is what says it is formatting and not code. Reproduce with `cargo fmt --all --check` **or** `make clippy` on a tree where only `make gates` has been run. The clippy half is reproducible on `face679` exactly. | unassigned |
-| **`make test-boot-native-full` fails on a pristine tree, and has (2026-08-24).** The native loader's full-parity lane -- RFC 0028 step 7's closing claim, `bhaskixboot` held to the same gate list as every Limine lane -- reports *"the machine did not finish booting within 120s"* with an **empty serial log**. QEMU is not the problem: the staged ESP mounts and boots when the same `fat:rw:` drive is handed to `qemu-system-x86_64` by hand. So the loader or the kernel starts and says nothing, which is a harder failure than a refusal. **Not caused by RFC 0047**, and not fixed by it. | **Reproduced on `face679` with every local change stashed** -- `git stash push` then `make test-boot-native-full`, which fails identically -- and again with only `tests/qemu/devices.sh` reverted, which rules out this change's second `hostfwd`. `tests/qemu/native-boot-test.sh` (the loader-specific lane, which runs just before it) **passes**, including its corrupted-kernel negative arm, so whatever this is lives between that lane's coverage and the full one's. The last recorded green native run was 2026-08-18 (RFC 0028's acceptance); `build/bhaskix-native.iso` on the build machine is dated 2026-08-22. | unassigned |
+| ~~**`make test-boot-native-full` fails on a pristine tree, and has (2026-08-24).**~~ **FIXED 2026-08-24, and it was a regression from [RFC 0046](docs/rfc/0046-a-driver-for-hardware-that-exists.md) rather than anything about the loader.** QEMU exited **before producing a byte**: `-device ide-hd,drive=sata0,bus=ide.0: Can't create IDE unit 1, bus supports only 1 units`. The native lane is the only one whose boot medium is a bare `-drive` (`format=raw,file=fat:rw:$ESP`) rather than `-cdrom`; a bare `-drive` takes `if=ide` and QEMU auto-assigns it the first free index, which is `ide.0` -- where RFC 0046's SATA disk now sits, and q35's `ich9-ahci` gives each port a bus of exactly one unit. Fixed by giving the ESP a port of its own, `bus=ide.2`, which is where the boot medium sits on every other lane. **107 gates, zero failures.** | **This row said "QEMU is not the problem: the staged ESP mounts and boots when the same `fat:rw:` drive is handed to `qemu-system-x86_64` by hand" -- true, and exactly the wrong experiment**, because handing QEMU that drive *alone* removes the disk it collided with. The error was found by capturing QEMU's own stderr, which `run_until` sends to `/dev/null`; the lane's failure text ("the machine did not finish booting", empty serial log) reads as a loader that hangs rather than a machine that never started. Chain verified rather than argued: `devices.sh` at `98f9bb9` has **0** `sata`/`ide-hd` lines against **5** at HEAD, so `ide.0` was free before RFC 0046; and a live boot report reads `ahci port 0 ... a SATA disk` with `port 2 ... a device attached`, which is the boot CD, confirming `ide.2` is where `-cdrom` lands. **It went unnoticed because no gate runs the boot lanes** -- `make gates` does not, and `make test` was red ahead of this lane for the three clippy errors in the row above. | fixed |
 | **Two small things found while giving the AHCI controller a window, recorded rather than fixed (2026-08-24).** (1) **`virtio::quiesce` has no caller** and has been dead since it was written. Not a hole — the kernel's own block device is reset by `init_mapped` on the path that matters — but its doc comment reads as though it runs before translation is enabled, and it does not. (2) **`check-unsafe-budget.py` charges brace nesting to the budget**: it is a line scanner, so `if let Some(x) = unsafe { f() } {` leaves it one brace deep and the entire body of the block counts as unsafe. RFC 0046 step 2 was +46 lines written that way and +11 after hoisting the probe into its own `let`. **The same shape is still in RFC 0041's xHCI window**, and untangling it would lower `bhaskix-kernel`'s headline `unsafe` count by roughly thirty-five lines without deleting a single unsafe operation — which is why it is not a quiet edit: that number is quoted in an accepted RFC. | Both read off the code on 2026-08-24 while wiring `ahci::probe` into `iommu_bringup`; the budget artifact is reproducible by writing the probe back inside its `if let` and running `tools/check-unsafe-budget.py --report`. | unassigned |
 
 ### Blockers
@@ -795,6 +795,67 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-08-24 (the native loader's parity lane, red since the SATA disk landed, and the wrong experiment that hid it)
+
+**`make test-boot-native-full` had been failing on a pristine tree, and it was
+never the loader.** QEMU exited **before producing a byte**:
+
+```
+-device ide-hd,drive=sata0,bus=ide.0: Can't create IDE unit 1, bus supports only 1 units
+```
+
+The native lane is the only one whose boot medium is a bare `-drive`
+(`format=raw,file=fat:rw:$ESP`) rather than `-cdrom`. A bare `-drive` takes
+`if=ide` and QEMU auto-assigns the first free index — `ide.0`, which is where
+[RFC 0046](docs/rfc/0046-a-driver-for-hardware-that-exists.md)'s SATA disk now
+sits, and q35's `ich9-ahci` gives each port a bus of exactly one unit. **A
+regression from RFC 0046, not from anything about `bhaskixboot`.**
+
+Fixed by giving the ESP a port of its own — `bus=ide.2`, which is where the
+boot medium sits on every other lane, so one index means "the thing this
+machine was booted from" whichever lane is booting it. **107 gates, zero
+failures**, and [RFC 0028](docs/rfc/0028-bhaskixboot.md)'s closing claim is
+checkable again.
+
+**The instructive part is how it stayed hidden, and one of the two reasons was
+mine.**
+
+1. **The lane's own failure text points at the wrong subsystem.** "The machine
+   did not finish booting within 120s" with an empty serial log reads as a
+   loader that hangs. It was a machine that never started. `run_until` sends
+   QEMU's stderr to `/dev/null`, so the one line that named the fault was
+   thrown away; capturing it took ten seconds and ended the hunt.
+
+2. **The first experiment run against it was the wrong one, and this file said
+   so as evidence.** The open-defect row read *"QEMU is not the problem: the
+   staged ESP mounts and boots when the same `fat:rw:` drive is handed to
+   `qemu-system-x86_64` by hand."* That was true and useless — handing QEMU
+   that drive *alone* removes the disk it collided with. The row is corrected
+   in place rather than deleted, because a plausible experiment that excludes
+   the cause is the failure worth keeping.
+
+3. **Nothing gates the boot lanes.** `make gates` does not run them, and
+   `make test` — which does — was red ahead of this lane for the three clippy
+   errors recorded above. Two independent reasons why a lane can be red for a
+   day without anyone learning it, and both are in the open-defects table.
+
+Verified rather than argued: `tests/qemu/devices.sh` at `98f9bb9` holds **0**
+`sata`/`ide-hd` lines against **5** at HEAD, so `ide.0` was free before RFC
+0046; and a live boot report reads `ahci port 0 ... a SATA disk` with
+`ahci port 2 ... a device attached`, which is the boot CD. Watched red the way
+everything else here is: with `index=2` removed the lane fails again, with the
+same empty log.
+
+**And the first version of the fix was refused by this project's own gate**,
+which is worth more than the fix. It said `-device ide-hd,drive=esp,bus=ide.2`
+in the harness, and `tools/check-one-machine.sh` failed it: *"a QEMU harness
+builds its own device list ... Two lists drift, and the drift is invisible from
+either one."* That gate had already been widened once for this exact class — a
+`-device ide-hd,drive=sata0` whose `-drive` lived in one harness only. The
+right answer is `-drive if=ide,index=2`, no device at all, because an ESP is
+boot **media** like the `-cdrom` beside it and not machine hardware. A gate
+catching the person adding a gate is the check earning its keep.
 
 ### 2026-08-24 (RFC 0048 step 1: one packet took a listener out for four minutes, and now it takes it out for fourteen seconds)
 

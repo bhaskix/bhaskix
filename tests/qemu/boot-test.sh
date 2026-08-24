@@ -252,7 +252,30 @@ if [[ "$MODE" == "native" ]]; then
     cp "$KERNEL_ELF" "$ESP/bhaskix/kernel"
     cp "$DISK" "$ESP/bhaskix/initrd.tar"
     printf 'cmdline=\n' > "$ESP/bhaskix/boot.conf"
-    QEMU_ARGS+=(-drive "format=raw,file=fat:rw:$ESP")
+    # **Explicitly on a port of its own, and this is not tidiness.**
+    #
+    # A bare `-drive` takes `if=ide` and QEMU auto-assigns it the first free
+    # index -- which is `ide.0`, where RFC 0046's SATA disk now sits. q35's
+    # `ich9-ahci` gives each port a bus of one unit, so the two collided and
+    # **QEMU exited before producing a byte**: `Can't create IDE unit 1, bus
+    # supports only 1 units`. The lane then failed as "the machine did not
+    # finish booting" with an empty serial log, which reads as a loader that
+    # hangs rather than as a machine that never started -- and it stayed that
+    # way from 2026-08-24, when the SATA disk landed, because `make gates`
+    # does not run the boot lanes and `make test` was red for other reasons.
+    #
+    # `index=2` because that is where the boot medium sits on every other lane:
+    # `-cdrom` lands there once the SATA disk holds `ide.0`, which is how RFC
+    # 0046 step 4 came to find the boot CD answering `IDENTIFY` with ATAPI's
+    # abort. One index for "the thing this machine was booted from", whichever
+    # lane is booting it.
+    #
+    # Said with `if=ide,index=` and not with a `-device`, because this is boot
+    # *media* and not machine hardware -- the same reason `-cdrom` above is a
+    # flag here rather than a device in `devices.sh`. `tools/check-one-machine.sh`
+    # enforces exactly that line and refused the first version of this fix,
+    # which is the gate doing its job on the person adding a gate.
+    QEMU_ARGS+=(-drive "if=ide,index=2,format=raw,file=fat:rw:$ESP")
 fi
 
 # The domain's disk is written to now, so it is rebuilt before every run.
