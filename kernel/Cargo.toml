@@ -475,7 +475,7 @@ asm_budget = 10
 # scanner charges them to the budget. They moved to a function in safe code.
 # The number is supposed to mean something, so prose does not get to inflate
 # it -- and after this morning's fix to that scanner, it does.
-unsafe_budget = 1782
+unsafe_budget = 1781
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

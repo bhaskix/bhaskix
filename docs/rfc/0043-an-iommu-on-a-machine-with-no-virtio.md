@@ -379,6 +379,31 @@ should be one somebody is watching.
    the first wiring made three windows fail to read back — the pass-through
    entries looked exactly like the strays that check exists to catch. It now
    counts them explicitly rather than being loosened.
+4b. ✅ **Done 2026-08-24, and it is why step 5 was not attempted on the first
+   try.** Two things stood between this and a machine that is not QEMU, both
+   found by reading rather than by booting:
+
+   **Bring-up was gated on virtio.** `iommu_bringup` began `virtio::probe()?`,
+   so on a server with no virtio device it returned before touching a register
+   — which is the whole reason the SR550 has four working units and none
+   programmed. `security.md` had recorded it as a sentence that described a
+   defect and read like an explanation. The first device is now whatever this
+   kernel can drive: virtio where there is one, so every lane keeps the machine
+   it had, otherwise the AHCI controller. Verified by forcing the fallback on
+   QEMU, where the machine came up around `00:1f.2` instead.
+
+   **One context table was shared by every bus.** A context entry is selected by
+   `(device << 3) | function` — unique within a bus and *not* across them; the
+   bus is selected one level up by the root entry. This kernel allocated one
+   context table and pointed every bus's root entry at it, which was invisible
+   because every device on every machine it had run on was on bus 0. The SR550
+   has 115 functions across `00`, `b1`, `ae` and more, and step 4 gives an entry
+   to every endpoint it cannot drive — so **the first multi-bus machine would
+   have been the first collision**, and one that replaced a *translating* entry
+   with a pass-through one would have silently un-contained a device with
+   nothing to report it. Context tables are now allocated per bus, lazily, as
+   the specification describes. Verified by adding a `pcie-root-port` to the
+   QEMU machine and watching a device on **bus 1** get its own entry.
 5. A boot on the SR550, watched, with `iommu=off` ready. **Not done, and not to
    be done unasked**: it reboots a live cluster node, and this RFC's own testing
    plan says *"the first boot that tries it should be one somebody is

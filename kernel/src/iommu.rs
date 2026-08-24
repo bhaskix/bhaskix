@@ -539,14 +539,22 @@ pub unsafe fn survey() -> Survey {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tables {
     /// Physical address of the root table.
+    ///
+    /// **One root table, and a context table per bus reached through it.** The
+    /// root table has an entry per bus (VT-d rev 5.20 §9.1) and each points at
+    /// that bus's own 256-entry context table; [`context_table_for`] allocates
+    /// them as buses are first seen, so a machine with one bus pays for one.
     pub root_table: u64,
-    /// Physical address of the context table.
-    pub context_table: u64,
     /// How many address bits the unit translates.
     pub width: bhaskix_arch::vtd::AddressWidth,
 }
 
-/// Allocates a unit's root and context tables, both empty.
+/// Allocates a unit's root table, empty.
+///
+/// Context tables are **not** allocated here: there is one per bus and they are
+/// built as buses are first seen. This held a single `context_table` until
+/// 2026-08-24, which was correct only because every device on every machine
+/// this had run on was on bus 0 -- see [`context_table_for`].
 ///
 /// `None` if there are no frames, or if the hardware reported an address width
 /// this kernel cannot describe. Both are refusals rather than defaults: tables
@@ -557,12 +565,49 @@ pub fn build_tables(report: &Report, hhdm: u64) -> Option<Tables> {
 
     let width = vtd::AddressWidth::fitting(report.address_width)?;
     let (root_table, _) = zeroed_frame(hhdm)?;
+    Some(Tables { root_table, width })
+}
+
+/// The context table for `bus`, allocating and installing one the first time
+/// that bus is seen.
+///
+/// # Why this exists, and what it was before
+///
+/// **A context entry is selected by `(device << 3) | function` alone** -- eight
+/// bits, unique within a bus and *not* across buses. The bus is selected one
+/// level up, by the root entry. Until 2026-08-24 this kernel allocated **one**
+/// context table and pointed every bus's root entry at it, so `00:11.5` and
+/// `b1:11.5` would have indexed the same entry and the second written would
+/// have replaced the first.
+///
+/// That was invisible because every device on every machine this had ever run
+/// on was on bus 0. The SR550 has 115 functions across buses `00`, `b1`, `ae`
+/// and more, and [RFC 0043] step 4 gives an entry to every endpoint it cannot
+/// drive -- so the first multi-bus machine would have been the first collision,
+/// and a collision that replaced a *translating* entry with a pass-through one
+/// would have silently un-contained the device, with nothing to report it.
+///
+/// Found by reading before booting that machine rather than by booting it.
+fn context_table_for(tables: &Tables, bus: u8, hhdm: u64) -> Option<u64> {
+    use bhaskix_arch::vtd;
+
+    // SAFETY: the root table this module allocated and never frees, reached
+    // through the direct map; a root index is a byte, so it cannot leave the
+    // page.
+    let entry = unsafe { ((hhdm + tables.root_table) as *mut u64).add(vtd::root_index(bus) * 2) };
+    // SAFETY: as above.
+    let present = unsafe { core::ptr::read_volatile(entry) };
+    if present & 1 != 0 {
+        return Some(present & !(vtd::PAGE_SIZE - 1));
+    }
     let (context_table, _) = zeroed_frame(hhdm)?;
-    Some(Tables {
-        root_table,
-        context_table,
-        width,
-    })
+    let (low, high) = vtd::RootEntry { context_table }.to_bits();
+    // SAFETY: as above, and the table was just allocated and zeroed.
+    unsafe {
+        core::ptr::write_volatile(entry, low);
+        core::ptr::write_volatile(entry.add(1), high);
+    }
+    Some(context_table)
 }
 
 /// Gives `device` a page table of its own, reached through `tables`.
@@ -579,11 +624,10 @@ pub fn attach_to(tables: &Tables, device: (u8, u8, u8), domain: u16, hhdm: u64) 
 
     let (page_table, _) = zeroed_frame(hhdm)?;
     let (bus, slot, function) = device;
+    // This bus's own table, allocated and installed the first time the bus is
+    // seen. The root entry is written there rather than here.
+    let context_table = context_table_for(tables, bus, hhdm)?;
 
-    let root = vtd::RootEntry {
-        context_table: tables.context_table,
-    };
-    let (root_low, root_high) = root.to_bits();
     let context = vtd::ContextEntry {
         translation: vtd::Translation::SecondStage { page_table },
         width: tables.width,
@@ -591,25 +635,20 @@ pub fn attach_to(tables: &Tables, device: (u8, u8, u8), domain: u16, hhdm: u64) 
     };
     let (context_low, context_high) = context.to_bits();
 
-    // SAFETY: tables this module allocated and never frees, reached through the
-    // direct map; the indices are bounded by construction -- a root index is a
-    // byte and a context index is masked to eight bits, so neither can leave
-    // its page. Written as two 64-bit words each, which is the layout the
-    // hardware reads.
+    // SAFETY: a table this module allocated and never frees, reached through
+    // the direct map; a context index is masked to eight bits, so it cannot
+    // leave its page. Written as two 64-bit words, the layout the hardware
+    // reads.
     unsafe {
-        let root_entry = ((hhdm + tables.root_table) as *mut u64).add(vtd::root_index(bus) * 2);
-        core::ptr::write_volatile(root_entry, root_low);
-        core::ptr::write_volatile(root_entry.add(1), root_high);
-
         let context_entry =
-            ((hhdm + tables.context_table) as *mut u64).add(vtd::context_index(slot, function) * 2);
+            ((hhdm + context_table) as *mut u64).add(vtd::context_index(slot, function) * 2);
         core::ptr::write_volatile(context_entry, context_low);
         core::ptr::write_volatile(context_entry.add(1), context_high);
     }
 
     Some(Window {
         root_table: tables.root_table,
-        context_table: tables.context_table,
+        context_table,
         page_table,
         width: tables.width,
         domain,
@@ -645,7 +684,6 @@ fn pass_through_or_say_why(
 ) {
     let tables = Tables {
         root_table: window.root_table,
-        context_table: window.context_table,
         width: window.width,
     };
     match unit {
@@ -789,10 +827,12 @@ pub fn pass_through_to(
     use bhaskix_arch::vtd;
 
     let (bus, slot, function) = device;
-    let root = vtd::RootEntry {
-        context_table: tables.context_table,
+    // This device's own bus's table -- **the reason this function is safe on a
+    // machine with more than one bus.** Sharing one across buses would let two
+    // devices with the same `(device, function)` index the same entry.
+    let Some(context_table) = context_table_for(tables, bus, hhdm) else {
+        return false;
     };
-    let (root_low, root_high) = root.to_bits();
     let context = vtd::ContextEntry {
         translation: vtd::Translation::PassThrough,
         width: widest,
@@ -800,16 +840,12 @@ pub fn pass_through_to(
     };
     let (context_low, context_high) = context.to_bits();
 
-    // SAFETY: the same tables `attach_to` writes, reached through the direct
-    // map, with indices bounded by construction -- a root index is a byte and a
-    // context index is masked to eight bits, so neither can leave its page.
+    // SAFETY: a table this module allocated and never frees, reached through
+    // the direct map; a context index is masked to eight bits, so it cannot
+    // leave its page.
     unsafe {
-        let root_entry = ((hhdm + tables.root_table) as *mut u64).add(vtd::root_index(bus) * 2);
-        core::ptr::write_volatile(root_entry, root_low);
-        core::ptr::write_volatile(root_entry.add(1), root_high);
-
         let context_entry =
-            ((hhdm + tables.context_table) as *mut u64).add(vtd::context_index(slot, function) * 2);
+            ((hhdm + context_table) as *mut u64).add(vtd::context_index(slot, function) * 2);
         core::ptr::write_volatile(context_entry, context_low);
         core::ptr::write_volatile(context_entry.add(1), context_high);
     }
@@ -881,7 +917,6 @@ impl Window {
     pub const fn tables(&self) -> Tables {
         Tables {
             root_table: self.root_table,
-            context_table: self.context_table,
             width: self.width,
         }
     }

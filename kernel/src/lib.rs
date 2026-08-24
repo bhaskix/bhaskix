@@ -17628,7 +17628,32 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     }
 
     let found = found.filter(|report| report.units > 0)?;
-    let device = virtio::probe()?;
+
+    // **The first device is whatever this kernel can drive, not whatever is
+    // virtio.**
+    //
+    // This read `virtio::probe()?` until 2026-08-24, and that `?` is why the
+    // SR550 has four working remapping units with none of them programmed:
+    // bring-up returned before touching a register, because a real server has
+    // no virtio device. `security.md` recorded it as *"`iommu_bringup`
+    // sequences itself after `virtio::probe()` and no real server has a virtio
+    // block device"* -- a sentence that describes a defect and reads like an
+    // explanation.
+    //
+    // The first device is special only because reserved regions and the tables
+    // are built alongside it; *which* device it is has never mattered. So:
+    // virtio where there is one, so every existing lane keeps the machine it
+    // had, and otherwise the AHCI controller -- which on that server is a real
+    // bus master this kernel drives (RFC 0046). A machine with neither still
+    // returns, because there is nothing to build tables around.
+    //
+    let device = match virtio::probe() {
+        Some(device) => device,
+        // SAFETY: configuration access works by here, and `ahci::probe` only
+        // reads configuration space on functions the bus walk found present.
+        None => unsafe { ahci::probe() }?,
+    };
+    let first_device = device;
     let (bus, slot, function) = device;
 
     let window = iommu::build_window(&found, device, 0, hhdm)?;
@@ -17969,7 +17994,14 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // Answered above, before translation was enabled, and reused rather than
     // asked again: the bus has not changed and a second walk would only be a
     // second chance to disagree with the first.
-    if let Some(controller) = ahci_controller {
+    // Skipped when this controller *is* the first device, which happens on a
+    // machine with no virtio: it already holds a window, domain 0, and the
+    // reserved regions mapped into that page table. Attaching it again would
+    // write its context entry a second time with a different domain and a
+    // different page table, orphaning the one the reserved regions went into
+    // -- and on the SR550 those regions are the BMC's, so that is a keyboard
+    // that stops working.
+    if let Some(controller) = ahci_controller.filter(|c| *c != first_device) {
         match iommu::attach_device(&window, controller, 4, hhdm) {
             Some(controller_window) => {
                 if iommu::verify_window(&controller_window, iommu::windows() + 1, hhdm)

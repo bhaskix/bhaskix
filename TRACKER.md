@@ -796,6 +796,54 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (two things stood between pass-through and real hardware, and both were found by reading rather than by rebooting a live node)
+
+**The project lead asked for the SR550 boot. It was not attempted, twice, and
+each refusal bought a defect.**
+
+**One: bring-up was gated on virtio.** `iommu_bringup` began
+`virtio::probe()?` — so on a server with no virtio device it returned before
+touching a register. That is the entire reason the SR550 has four working
+remapping units with none programmed, and `security.md` had recorded it as
+*"`iommu_bringup` sequences itself after `virtio::probe()` and no real server
+has a virtio block device"* — a sentence that describes a defect and reads like
+an explanation. Booting would have reproduced 2026-08-23's result exactly and
+proved nothing.
+
+The first device is now **whatever this kernel can drive**: virtio where there
+is one, so every existing lane keeps the machine it had, otherwise the AHCI
+controller RFC 0046 gave a driver. Verified by forcing the fallback on QEMU,
+where the machine came up around `00:1f.2` instead — the SR550's shape, on
+hardware that can be iterated on.
+
+**Two, and worse: one context table was shared by every bus.** A context entry
+is selected by `(device << 3) | function` — eight bits, unique *within* a bus.
+The bus is selected one level up, by the root entry. This kernel allocated
+**one** context table and pointed every bus's root entry at it.
+
+That was invisible because every device on every machine it had ever run on was
+on bus 0. **The SR550 has 115 functions across `00`, `b1`, `ae` and more**, and
+step 4 gives an entry to every endpoint it cannot drive — so the first multi-bus
+machine would have been the first collision. A collision between two
+pass-through entries is harmless, they are identical bytes; a collision that
+replaced the *first device's translating entry* with a pass-through one would
+have **silently un-contained the one device the exercise exists to contain**,
+and nothing would have reported it.
+
+Context tables are now allocated **per bus, lazily**, as VT-d rev 5.20 §9.1
+describes. Verified by adding a `pcie-root-port` to the QEMU machine and
+watching a device on **bus 1** receive its own entry — then reverting the
+machine.
+
+**Both were latent before today.** The shared table is as old as RFC 0012; step
+4 is what would have made it bite. Neither is a bug this session introduced, and
+both would have been found the hard way — on a live cluster node, as a machine
+that did not come back or, worse, one that did and was not contained.
+
+Every lane unchanged: `iommu` 131, `iommu-off` 110, `bios` 107. Kernel `unsafe`
+1783 → 1781, because routing both writers through one helper removed more than
+the helper added.
+
 ### 2026-08-24 (RFC 0043 steps 3–4: an endpoint this kernel cannot drive is passed through, deliberately and by name)
 
 **The project lead answered unresolved question 1 — pass-through — hours after
