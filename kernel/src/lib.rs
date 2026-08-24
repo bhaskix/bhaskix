@@ -11453,6 +11453,37 @@ fn report_ahci_domain(hhdm: u64) -> bool {
             // the two numbers it answered rather than as one product.
             let sectors = word(49);
             let bytes = word(50);
+            // RFC 0046 step 5: what sector zero actually holds.
+            //
+            // **The bytes, printed as bytes.** A gate that checked only "a read
+            // returned" would pass a driver that returned zeroes, or the other
+            // disk's sector -- which is why the image builder writes a distinct
+            // string into this disk and not the domain disk, and why this line
+            // prints what came back rather than how many bytes did.
+            let read_state = word(52);
+            if read_state == 1 {
+                let mut text = [0u8; 32];
+                for word_index in 0..4 {
+                    let bytes = word(56 + word_index).to_le_bytes();
+                    text[word_index * 8..word_index * 8 + 8].copy_from_slice(&bytes);
+                }
+                // Printable characters only. A sector of arbitrary bytes is not
+                // a string, and a console that took a stray escape from a disk
+                // would be a console a disk can drive.
+                let mut shown = [b'.'; 32];
+                for (at, byte) in text.iter().enumerate() {
+                    shown[at] = if byte.is_ascii_graphic() || *byte == b' ' {
+                        *byte
+                    } else {
+                        b'.'
+                    };
+                }
+                println!(
+                    "    ahci read      sector 0 begins \"{}\"",
+                    core::str::from_utf8(&shown).unwrap_or("??")
+                );
+            }
+
             // KiB rather than MiB. The first disk this ever ran against is
             // 256 KiB, which printed as "0 MiB" -- a true number that reads as
             // a failure, and the last thing a first result should do.
@@ -11462,6 +11493,42 @@ fn report_ahci_domain(hhdm: u64) -> bool {
                 sectors.saturating_mul(bytes) / 1024,
                 if word(51) == 1 { 48 } else { 28 }
             );
+            match read_state {
+                1 => {}
+                0 => println!(
+                    "\x1b[91m    ahci read      FAILED: sector 0 was never asked for\x1b[0m"
+                ),
+                3 => println!(
+                    "\x1b[93m    ahci read      not asked: the disk's own answer would not \
+                     permit a read of its first sector\x1b[0m"
+                ),
+                _ => {
+                    let why = word(53);
+                    if why & 0x100 != 0 {
+                        println!(
+                            "\x1b[91m    ahci read      FAILED: the device refused it, error \
+                             {:#04x}\x1b[0m",
+                            why & 0xff
+                        );
+                    } else if why & 0x200 != 0 {
+                        println!(
+                            "\x1b[91m    ahci read      FAILED: a host bus error, {:#x} -- on a \
+                             translated controller this is what an unmapped address looks \
+                             like\x1b[0m",
+                            why & 0xff
+                        );
+                    } else if why == 1 {
+                        println!(
+                            "\x1b[91m    ahci read      FAILED: the read never completed\x1b[0m"
+                        );
+                    } else {
+                        println!(
+                            "\x1b[91m    ahci read      FAILED: the driver refused a slot it was \
+                             not given\x1b[0m"
+                        );
+                    }
+                }
+            }
         }
         _ => {
             let why = match (word(49), word(50)) {

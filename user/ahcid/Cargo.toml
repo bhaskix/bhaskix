@@ -72,5 +72,17 @@ asm_budget = 4
 #
 # What did **not** grow: nothing that decides an offset, an order or a bound.
 # `build_command`, `run` and `device_kind` are all in the crate the tests reach.
-unsafe_budget = 35
+# **41 at RFC 0046 step 5, 2026-08-24: +6.** The bill, as `exact` requires:
+#
+#   - wiping the buffer before the read. Left as it was, a read that moved no
+#     bytes would be indistinguishable from one that worked, because the
+#     IDENTIFY response is still sitting there and its first bytes are not zero.
+#     One line, and it is the difference between a gate and a decoration.
+#   - the slice over the bytes the disk returned, which is the third window over
+#     this program's own memory and the one a *device* filled.
+#
+# Still nothing that decides an offset, an order or a bound: `plan_read` is in
+# the crate, and it is where the disk's own numbers are bounded before they size
+# a transfer.
+unsafe_budget = 41
 unsafe_budget_exact = true

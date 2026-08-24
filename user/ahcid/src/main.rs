@@ -45,6 +45,25 @@ const MEMORY: u64 = 2;
 /// at memory.
 const WINDOW: u64 = 3;
 
+/// How many bytes of sector zero are carried back for the report.
+///
+/// Thirty-two: enough to hold the string the image builder writes there, which
+/// is what the gate greps for, and short enough that the report stays one line.
+const FIRST_BYTES: usize = 32;
+
+/// Whether sector zero was read: 0 not attempted, 1 read, 2 refused by the
+/// device or the bus, 3 refused by this driver before it was issued.
+static READ_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Why, when it was 2.
+static READ_WHY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The first [`FIRST_BYTES`] of it, packed little-endian.
+static FIRST: [core::sync::atomic::AtomicU64; FIRST_BYTES / 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
 /// What the started port's device said it is, and which port it was.
 static SIGNATURE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static PORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -124,6 +143,10 @@ const STAGE_BUILT: u64 = 5;
 const STAGE_ISSUED: u64 = 6;
 /// The command came back.
 const STAGE_ANSWERED: u64 = 7;
+/// The disk's answer parsed, and a read of sector zero was planned.
+const STAGE_PLANNED: u64 = 8;
+/// That read came back.
+const STAGE_READ: u64 = 9;
 
 /// Issues one system call, and returns `(status, value)`.
 fn call(kind: u64, capability: u64, method: u64, args: [u64; 4]) -> (u64, u64) {
@@ -329,6 +352,11 @@ fn report(
                 put(49, disk.sectors);
                 put(50, disk.sector_bytes as u64);
                 put(51, u64::from(disk.lba48));
+                put(52, READ_STATE.load(core::sync::atomic::Ordering::Relaxed));
+                put(53, READ_WHY.load(core::sync::atomic::Ordering::Relaxed));
+                for (word, cell) in FIRST.iter().enumerate() {
+                    put(56 + word, cell.load(core::sync::atomic::Ordering::Relaxed));
+                }
             }
             Some(Err(why)) => {
                 put(48, 2);
@@ -511,7 +539,87 @@ fn identify(
     let answered = unsafe {
         core::slice::from_raw_parts((MEMORY_AT + BUFFER_AT) as *const u8, ahci::IDENTIFY_BYTES)
     };
-    Some(ahci::read_identity(answered).map_err(|_| ahci::Failed::Device(0)))
+    let identity = match ahci::read_identity(answered) {
+        Ok(identity) => identity,
+        Err(_) => return Some(Err(ahci::Failed::Device(0))),
+    };
+
+    // RFC 0046 step 5: `READ DMA EXT`, sector zero.
+    //
+    // **Planned rather than asked for.** `plan_read` is where the disk's own
+    // numbers are bounded before they size a transfer, which is RFC 0046's
+    // security section in one call: the thing about to fill this buffer is a bus
+    // master, and a byte count it is handed is a count it will honour.
+    let planned = match ahci::plan_read(&identity, 0, 1, ahci::IDENTIFY_BYTES) {
+        Ok(planned) => planned,
+        // A disk whose own answer will not permit a read of its first sector.
+        // Reported as a refusal rather than attempted anyway.
+        Err(_) => {
+            READ_STATE.store(3, core::sync::atomic::Ordering::Relaxed);
+            return Some(Ok(identity));
+        }
+    };
+    stage(STAGE_PLANNED);
+
+    // The buffer is reused, and wiped first. Left as it was, a read that moved
+    // no bytes would be indistinguishable from one that worked -- the IDENTIFY
+    // response is still sitting there, and its first bytes are not zero.
+    // SAFETY: page two, which this program holds and mapped writable, and which
+    // no command is outstanding against.
+    unsafe {
+        core::ptr::write_bytes((MEMORY_AT + BUFFER_AT) as *mut u8, 0, ahci::IDENTIFY_BYTES);
+    }
+
+    if ahci::build_command(
+        list,
+        table,
+        0,
+        planned.ata,
+        ahci::Where {
+            table: device_base + TABLE_AT,
+            buffer: device_base + BUFFER_AT,
+            bytes: planned.bytes,
+        },
+    )
+    .is_err()
+    {
+        READ_STATE.store(3, core::sync::atomic::Ordering::Relaxed);
+        return Some(Ok(identity));
+    }
+
+    match ahci::run(registers, port, 0, clock, SETTLE_NS) {
+        Ok(()) => {
+            stage(STAGE_READ);
+            // SAFETY: as above, and `run` returned `Ok` -- the only thing that
+            // says the device is no longer writing into it.
+            let sector = unsafe {
+                core::slice::from_raw_parts((MEMORY_AT + BUFFER_AT) as *const u8, FIRST_BYTES)
+            };
+            for (word, chunk) in sector.chunks(8).enumerate() {
+                let mut packed = [0u8; 8];
+                packed[..chunk.len()].copy_from_slice(chunk);
+                FIRST[word].store(
+                    u64::from_le_bytes(packed),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            READ_STATE.store(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        Err(why) => {
+            READ_STATE.store(2, core::sync::atomic::Ordering::Relaxed);
+            READ_WHY.store(
+                match why {
+                    ahci::Failed::TimedOut => 1,
+                    ahci::Failed::Device(error) => 0x100 | u64::from(error),
+                    ahci::Failed::Bus(bits) => 0x200 | u64::from(bits),
+                    ahci::Failed::NoSuchSlot => 3,
+                },
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    Some(Ok(identity))
 }
 
 /// Stops where the kernel can see it.

@@ -783,6 +783,23 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         status=1
     fi
 
+    # RFC 0046 step 5: sector zero, read through the AHCI driver, and the bytes
+    # are the ones that disk holds.
+    #
+    # **The content and not the success.** RFC 0046's testing plan asks for this
+    # in as many words -- "a driver that returned zeroes would pass anything
+    # weaker" -- so the string is matched. `build/sata-disk.img` is written with
+    # `BHASKIX-SATA-DISK-SECTOR-0` and the *domain* disk with
+    # `BHASKIX-DOMAIN-DISK-SECTOR-0`, so a driver that read the wrong device
+    # fails here rather than passing plausibly.
+    if grep -qa 'ahci read      sector 0 begins "BHASKIX-SATA-DISK-SECTOR-0' "$LOG"; then
+        pass "sector 0 is read through the AHCI driver and holds that disk's own bytes"
+    else
+        fail "sector 0 was not read, or did not hold what that disk holds"
+        grep -a "ahci read\|ahci identify" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+
     # The driver holds a window. Separate again: the bring-up above would work
     # just as well without one, and this is what says the controller it drives
     # is contained.

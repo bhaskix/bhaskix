@@ -74,6 +74,8 @@ pub enum Error {
     NoSuchSlot,
     /// A structure at an address the controller would silently round down.
     Misaligned,
+    /// A read that would reach past the last sector the disk says it has.
+    PastTheEnd,
 }
 
 /// The ATA commands this driver issues, and no others.
@@ -836,6 +838,90 @@ pub struct Ata {
     /// in the command header, and getting it backwards is a transfer that runs
     /// the wrong way with no error anywhere.
     pub write: bool,
+}
+
+/// A transfer this driver is willing to ask for.
+///
+/// Returned by [`plan_read`] rather than built by a caller, because the numbers
+/// it holds are **derived from a device's own answer** and RFC 0046's security
+/// section is explicit about what that means: *no field taken from `IDENTIFY`
+/// may size an allocation or an unchecked loop.* A `Transfer` exists only where
+/// that check has run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Transfer {
+    /// The command to issue.
+    pub ata: Ata,
+    /// How many bytes it will move. Never more than the buffer holds.
+    pub bytes: usize,
+}
+
+/// Plans a read, or refuses it.
+///
+/// **Every bound here exists because the number on the other side of it came
+/// from a disk.** `disk.sectors` and `disk.sector_bytes` are 512 bytes a device
+/// wrote, and firmware is buggy and a disk on a shared bus is not a trusted
+/// peer. So:
+///
+/// - zero sectors is refused, because ATA reads it as 65,536;
+/// - a read reaching past the last sector is refused, computed without
+///   overflowing -- `lba + sectors` on a device claiming `u64::MAX` sectors is
+///   exactly the arithmetic a hostile answer is aiming at;
+/// - a transfer larger than the buffer is refused, which is the one that
+///   matters most: the thing filling that buffer is a **bus master**, and a
+///   count it was given is a count it will honour.
+///
+/// # Errors
+///
+/// [`Error::NoSectors`], [`Error::PastTheEnd`], [`Error::TooSmall`], or
+/// [`Error::NotADisk`] for a sector size that cannot be right.
+pub fn plan_read(
+    disk: &Identity,
+    lba: u64,
+    sectors: u16,
+    buffer_bytes: usize,
+) -> Result<Transfer, Error> {
+    if sectors == 0 {
+        return Err(Error::NoSectors);
+    }
+    // A sector size the device made up. Checked again here rather than trusted
+    // from `read_identity`, because this is the function whose answer sizes a
+    // transfer and a bound is worth stating where it is used.
+    if disk.sector_bytes < 512 || !disk.sector_bytes.is_multiple_of(512) {
+        return Err(Error::NotADisk);
+    }
+    // Addition that cannot wrap, and a comparison that therefore means
+    // something. `lba.checked_add` is the whole defence against a device
+    // claiming it has `u64::MAX` sectors.
+    let last = lba
+        .checked_add(u64::from(sectors))
+        .ok_or(Error::PastTheEnd)?;
+    if last > disk.sectors {
+        return Err(Error::PastTheEnd);
+    }
+    // `checked_mul` and **not** because it can fire on this target: `sectors` is
+    // a `u16` and `sector_bytes` a `u32`, so the largest product is about
+    // 2.8e14 and a 64-bit `usize` holds it with room to spare. It is kept
+    // because this crate is `no_std` and nothing stops it being built for a
+    // 32-bit target, where the same product overflows and the buffer bound
+    // below would then be comparing a wrapped number. The test that follows
+    // pins that range rather than pretending to exercise the branch -- a guard
+    // that cannot fire here was written as a watched-red property once already
+    // in this crate, and was deleted for it.
+    let bytes = usize::from(sectors)
+        .checked_mul(disk.sector_bytes as usize)
+        .ok_or(Error::TooSmall)?;
+    if bytes > buffer_bytes {
+        return Err(Error::TooSmall);
+    }
+    Ok(Transfer {
+        ata: Ata {
+            command: command::READ_DMA_EXT,
+            lba,
+            sectors,
+            write: false,
+        },
+        bytes,
+    })
 }
 
 impl Ata {
@@ -2027,5 +2113,118 @@ mod tests {
         // So a check on the low half alone cannot tell them apart, and this is
         // the assertion that says the full word is compared.
         assert_ne!(signature::DISK, signature::PACKET);
+    }
+    /// A disk that answered plausibly, for the bound tests to work against.
+    fn disk(sectors: u64, sector_bytes: u32) -> Identity {
+        Identity {
+            sectors,
+            sector_bytes,
+            lba48: true,
+        }
+    }
+
+    #[test]
+    fn a_read_of_no_sectors_is_refused_because_ata_reads_zero_as_sixty_five_thousand() {
+        assert_eq!(
+            plan_read(&disk(512, 512), 0, 0, 4096),
+            Err(Error::NoSectors)
+        );
+        assert!(plan_read(&disk(512, 512), 0, 1, 4096).is_ok());
+    }
+
+    #[test]
+    fn a_read_past_the_last_sector_is_refused() {
+        let d = disk(512, 512);
+        // The last sector is 511, so one sector at 511 is the last legal read.
+        assert!(plan_read(&d, 511, 1, 4096).is_ok());
+        assert_eq!(plan_read(&d, 512, 1, 4096), Err(Error::PastTheEnd));
+        // And a read that starts inside and ends outside. This is the one an
+        // off-by-one gets wrong, because the start is legal.
+        assert_eq!(plan_read(&d, 511, 2, 4096), Err(Error::PastTheEnd));
+    }
+
+    #[test]
+    fn a_disk_claiming_the_whole_address_space_cannot_make_the_bound_wrap() {
+        // **The arithmetic a hostile answer is aiming at.** `lba + sectors` on a
+        // device claiming `u64::MAX` sectors wraps, and a wrapped sum is smaller
+        // than the count it is compared against -- so the check passes and the
+        // read is issued at an address nobody chose.
+        let d = disk(u64::MAX, 512);
+        assert_eq!(
+            plan_read(&d, u64::MAX, 2, 4096),
+            Err(Error::PastTheEnd),
+            "the sum must not wrap"
+        );
+        assert_eq!(plan_read(&d, u64::MAX - 1, 8, 4096), Err(Error::PastTheEnd));
+        // A read well inside such a disk is still bounded by the buffer.
+        assert_eq!(plan_read(&d, 0, 64, 4096), Err(Error::TooSmall));
+    }
+
+    #[test]
+    fn a_transfer_larger_than_the_buffer_is_refused_because_a_bus_master_honours_it() {
+        // The bound that matters most: the thing filling that buffer is a bus
+        // master, and a byte count it was handed is a count it will write.
+        let d = disk(1024, 512);
+        assert_eq!(plan_read(&d, 0, 8, 4096).map(|t| t.bytes), Ok(4096));
+        assert_eq!(plan_read(&d, 0, 9, 4096), Err(Error::TooSmall));
+        // And a 4096-byte-sector disk fills the same buffer in one sector.
+        let big = disk(1024, 4096);
+        assert_eq!(plan_read(&big, 0, 1, 4096).map(|t| t.bytes), Ok(4096));
+        assert_eq!(plan_read(&big, 0, 2, 4096), Err(Error::TooSmall));
+    }
+
+    #[test]
+    fn a_sector_size_that_cannot_be_right_is_refused_where_it_sizes_a_transfer() {
+        // Checked here and not only in `read_identity`, because this is the
+        // function whose answer sizes a transfer -- and a bound is worth stating
+        // where it is used rather than trusted from three calls away.
+        for bad in [0u32, 3, 511, 513, 1000] {
+            assert_eq!(
+                plan_read(&disk(1024, bad), 0, 1, 4096),
+                Err(Error::NotADisk),
+                "sector size {bad} was accepted"
+            );
+        }
+        for good in [512u32, 1024, 4096] {
+            assert!(plan_read(&disk(1024, good), 0, 1, 8192).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_planned_read_carries_the_command_and_the_address_it_was_given() {
+        // A disk large enough to hold the address. The first version of this
+        // test asked for LBA 0x1234_5678_9abc on a million-sector disk and was
+        // refused -- correctly, and the test was the thing that was wrong.
+        let planned =
+            plan_read(&disk(0x2000_0000_0000, 512), 0x1234_5678_9abc, 4, 4096).expect("fits");
+        assert_eq!(planned.ata.command, command::READ_DMA_EXT);
+        assert_eq!(planned.ata.lba, 0x1234_5678_9abc);
+        assert_eq!(planned.ata.sectors, 4);
+        assert!(!planned.ata.write, "a read does not write");
+        assert_eq!(planned.bytes, 2048);
+    }
+
+    #[test]
+    fn the_byte_count_cannot_overflow_on_this_target_and_could_on_a_smaller_one() {
+        // **This is not a watched-red property and says so.** The `checked_mul`
+        // in `plan_read` is unreachable on a 64-bit `usize`: the operands are a
+        // `u16` and a 512-aligned `u32`, so the largest product is bounded well
+        // below `usize::MAX`. Removing the check changes no test, and a mutation
+        // run proved exactly that.
+        //
+        // What this test does instead is pin the arithmetic's range, so the
+        // reasoning above stays true if either type widens -- and record that on
+        // a 32-bit target the check is load-bearing rather than decorative.
+        let widest = usize::from(u16::MAX)
+            .checked_mul(u32::MAX as usize)
+            .expect("the product fits a 64-bit usize");
+        assert!(widest < usize::MAX / 2, "the bound has room to spare");
+        assert!(
+            widest > u32::MAX as usize,
+            "and would not fit a 32-bit usize, which is why the check stays"
+        );
+        // The largest transfer a caller can actually plan, for the same reason:
+        // if `sectors` ever becomes a `u32` this assertion is what notices.
+        assert_eq!(core::mem::size_of_val(&Ata::identify().sectors), 2);
     }
 }
