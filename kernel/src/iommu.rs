@@ -148,16 +148,29 @@ pub unsafe fn discover(rsdp: Option<PhysAddr>, hhdm: u64) -> Option<Report> {
 
 /// Prints what was found, or that nothing was.
 ///
-/// Deliberately says "found, not enabled". A line that reported an IOMMU
-/// without that qualifier would read, correctly and wrongly, as protection the
-/// machine does not yet have: step 1 programs nothing, and every device still
-/// reaches all of memory.
+/// Deliberately refuses to claim protection. A line that reported an IOMMU
+/// without a qualifier would read, correctly and wrongly, as protection the
+/// machine does not yet have: this runs before anything is programmed, and
+/// every device still reaches all of memory.
+///
+/// # It used to say "not enabled", and that was a different wrong
+///
+/// The qualifier was right and the tense was not: printed once at discovery,
+/// **it says "not enabled" on every machine including the ones where
+/// translation is enabled four lines later.** On 2026-08-24 it was read off an
+/// SR550 as the answer to *"did the units come up?"* — by the person who had
+/// just changed the code to make them come up — and it is not that answer. It
+/// is not any answer; it is a fixed string.
+///
+/// So it now points at the line that *is* the verdict. [`report_dma`] prints
+/// exactly one of `translating:` or `NO IOMMU:` after bring-up has either
+/// succeeded or returned, and that is the line to read.
 pub fn report(found: Option<Report>) {
     match found {
         Some(report) if report.units > 0 => {
             println!(
-                "    iommu          {} unit{} found, not enabled; {}-bit addresses, \
-                 {} reserved region{}, interrupt remapping {}",
+                "    iommu          {} unit{} found, none programmed yet (the dma line below \
+                 is the verdict); {}-bit addresses, {} reserved region{}, interrupt remapping {}",
                 report.units,
                 if report.units == 1 { "" } else { "s" },
                 report.address_width,

@@ -796,6 +796,38 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (a line that said "not enabled" on every machine, including the ones where it was enabled)
+
+**Found by being misled by it, on the machine it matters most on.**
+
+`iommu::report` printed `N units found, not enabled` at discovery — before
+anything is programmed. The qualifier was deliberate and right: a line claiming
+an IOMMU before bring-up would read as protection the machine does not have.
+**The tense was wrong.** Printed once, early, it says *"not enabled"* on every
+machine — including QEMU's `iommu` lane, where translation is enabled four lines
+later and the boot then says so.
+
+On 2026-08-24 that line was read off an SR550 boot as the answer to *"did the
+units come up?"* — by the author of the change that was supposed to make them
+come up. It is not that answer. It is not any answer.
+
+The machine already had a verdict and it was three lines further down:
+`report_dma` prints exactly one of
+
+```
+    dma            translating: this device reaches only what it was given
+    dma            NO IOMMU: this device can reach all of physical memory
+```
+
+after bring-up has either succeeded or returned. So the discovery line now says
+`none programmed yet (the dma line below is the verdict)` and points at it. Two
+boot gates asserted the old wording on purpose — they assert the new one, for
+the same reason, with the history in their comment.
+
+**Nothing about the hardware question is settled by this.** Whether the SR550's
+units came up is still open; what changed is that the next person to ask will be
+reading a line that can answer.
+
 ### 2026-08-24 (two things stood between pass-through and real hardware, and both were found by reading rather than by rebooting a live node)
 
 **The project lead asked for the SR550 boot. It was not attempted, twice, and

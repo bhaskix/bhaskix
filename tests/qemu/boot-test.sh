@@ -1136,7 +1136,7 @@ fi
 # past translation, so a hatch that boots no further than the thing it bypasses
 # is worthless.
 if [[ "$MODE" == "iommu-off" ]]; then
-    if grep -qE "iommu +[1-9][0-9]* unit(s)? found, not enabled; [0-9]+-bit addresses" "$LOG"; then
+    if grep -qE "iommu +[1-9][0-9]* unit(s)? found, none programmed yet \(the dma line below is the verdict\); [0-9]+-bit addresses" "$LOG"; then
         pass "iommu=off still reports what the firmware declared"
     else
         fail "iommu=off silenced discovery -- the one thing a stuck machine needs"
@@ -1160,11 +1160,16 @@ if [[ "$MODE" == "iommu-off" ]]; then
 fi
 
 # RFC 0012 step 1, and only on the machine that has one: the units the firmware
-# describes are found and described. "not enabled" is asserted with them --
+# describes are found and described. The qualifier is asserted with them --
 # nothing is programmed at this step, and a line that claimed an IOMMU without
 # saying so would read as protection the machine does not have.
+#
+# It said "not enabled" until 2026-08-24, which was a fixed string printed
+# before bring-up and therefore identical on a machine where translation comes
+# up and one where it does not. It cost a wrong reading of an SR550 boot. The
+# verdict is `report_dma`'s line, and this one now says so.
 if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
-    if grep -qE "iommu +[1-9][0-9]* unit(s)? found, not enabled; [0-9]+-bit addresses" "$LOG"; then
+    if grep -qE "iommu +[1-9][0-9]* unit(s)? found, none programmed yet \(the dma line below is the verdict\); [0-9]+-bit addresses" "$LOG"; then
         pass "the IOMMU the firmware describes is found and reported"
     else
         fail "an intel-iommu was present and the DMAR table was not read"
