@@ -395,8 +395,28 @@ every other CPU, which under TCG is expensive and on hardware would not be
 free either. That is the cost the rule requires; a revocation that skipped it
 would be `security.md` §2 rule 3's delay fuse.
 
-**Neither figure is a measurement of hardware.** This machine has never booted
-on any (M1-17).
+### On real silicon, 2026-08-24: about a fifth of what the emulator said
+
+The paragraph above ended *"neither figure is a measurement of hardware"*. It
+is one now. The same self-test, on the Lenovo SR550 — one Xeon Silver 4110,
+booted from its BMC's virtual media:
+
+> **9,764 cycles**, best of eight, against **46,084 and 49,440** under TCG.
+
+**The emulator overstated this path by roughly five times**, and the reason is
+the part of it TCG is worst at: the work is dominated by a TLB shootdown, which
+is an IPI to every other CPU, and cross-CPU synchronisation is exactly what an
+emulator that serialises guest CPUs makes look expensive. A change judged
+"about a quarter of a supervised page copy" from the QEMU numbers is nearer a
+twentieth on silicon.
+
+Nothing else about the run needed correcting: the lending self-test passed on
+hardware unchanged, and no line of the boot report was red. What the machine
+could *not* exercise is the rest — it has no virtio disk and no NIC this system
+can drive, so `linux file`, `linux dir` and `linux socket` all took their skip
+arms. That is worth as much as the number: those arms were written against
+QEMU lanes that lacked the devices, and this is the first time they have been
+taken on a machine that lacks them for real.
 
 ## Testing plan
 

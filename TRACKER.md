@@ -791,6 +791,39 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (the SR550 says RFC 0044's revocation costs a fifth of what QEMU said, and three skip arms fired on a machine that really lacks the devices)
+
+Booted 2026-08-23's work on the Lenovo SR550 — one Xeon Silver 4110, over the
+BMC's virtual media, serial-over-LAN carrying the report. Nothing red.
+
+**The number that changes.** RFC 0044 shipped saying its measurement was "not a
+measurement of hardware", and gave 46,084 and 49,440 cycles across two QEMU
+boots for the unmapping a revocation now does. On silicon it is **9,764 cycles,
+best of eight** — about a fifth. The work is dominated by a TLB shootdown,
+which is an IPI to every other CPU, and cross-CPU synchronisation is precisely
+what an emulator serialising guest CPUs makes look expensive. A cost judged
+"about a quarter of a supervised page copy" from QEMU is nearer a twentieth
+here. Corrected in RFC 0044 where the QEMU figure was published.
+
+**And three skip arms took their skip on a machine that genuinely lacks the
+devices.** `linux file`, `linux dir` and `linux socket` all skipped: no virtio
+disk, no NIC this system can drive. Those arms were written against QEMU lanes
+that lacked the same things — the socket one only yesterday, after a hosted
+`bind` wedged the adapter on a lane with no DMA window — and this is the first
+time any of them has been exercised by a machine that lacks the devices for
+real rather than by a profile that omits them. The grant path's own dark arm
+fired too: *"no protocol service on this machine, so hosted programs get no
+sockets."*
+
+The rest of Tier 1 and Tier 2 therefore has **still never run on hardware**, and
+cannot until this machine has storage and a network this system can drive.
+Said rather than left implied: the hardware evidence here is the nucleus's, not
+the personality's.
+
+Other numbers off the same boot, for whoever wants them beside the emulator's:
+`bulk cost` 16,320 cycles shared against 172,828 by message (10.58x), and
+wake-to-dispatch p50 3 us, p99 32 ms.
+
 ### 2026-08-23 (RFC 0045 drafted: three failures in one day all traced to one shared adapter, and the decision is the lead's)
 
 **No code, deliberately.** RFC 0031's interface **I5** says the Linux adapter
