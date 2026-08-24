@@ -618,17 +618,35 @@ extern "C" fn ahcid_main(hertz: u64) -> ! {
         base: ABAR_AT,
         length: if high { 0x2000 } else { 0x1000 },
     };
-    // **The clock yields, and that is not decoration.** RFC 0046 chose polling
-    // before interrupts on purpose, and a polling loop in ring 3 that never
-    // yields does not merely waste a CPU: pinned to the same one the boot
-    // thread is on, it starves it, and the kernel's own three-second wait for
-    // this driver's report never gets to run. Step 4 spent three boots looking
-    // like a hung *driver* when what was hung was everything else on that CPU.
+    // **The clock yields, and it backs off.** Two separate lessons, in one
+    // closure, because every deadline check in `bhaskix-ahci` calls this -- so
+    // this is the one place that can fix a wait for the whole crate, without the
+    // crate (which is `no_std` and holds no capability) needing to know a system
+    // call exists.
     //
-    // Every deadline check in `bhaskix-ahci` calls this, so putting the yield
-    // here puts one in every wait the crate has, without the crate -- which is
-    // `no_std` and holds no capability -- needing to know a system call exists.
+    // *Why it yields.* A polling loop in ring 3 that never yields does not
+    // merely waste a CPU: pinned to the same one the boot thread is on, it
+    // starves it, and the kernel's own wait for this driver's report never gets
+    // to run. Step 4 spent three boots looking like a hung *driver* when what
+    // was hung was everything else on that CPU.
+    //
+    // *Why it backs off.* Yielding on every iteration made the loop as fast as
+    // the scheduler could turn it around, which is a system call and an MMIO
+    // read of the very controller being waited on, tens of thousands of times a
+    // second. The pause spin grows with the number of polls, capped, so a wait
+    // that settles at once still costs almost nothing -- which is nearly all of
+    // them -- while a wait that is still going after a few hundred polls stops
+    // hammering the bus it is listening to. `spin_loop` is the architecture's
+    // own hint for exactly this and costs no `asm!` of ours.
+    let mut polls: u32 = 0;
     let mut clock = || {
+        polls = polls.saturating_add(1);
+        // Capped at 512 pauses: enough to take the poll rate down by orders of
+        // magnitude, small enough that it cannot itself become the reason a
+        // deadline is missed.
+        for _ in 0..polls.min(512) {
+            core::hint::spin_loop();
+        }
         call(syscall::YIELD, 0, 0, [0; 4]);
         now_nanos(hertz)
     };
