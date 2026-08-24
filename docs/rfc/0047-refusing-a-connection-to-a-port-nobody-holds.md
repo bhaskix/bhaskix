@@ -181,8 +181,23 @@ refused, never-refused, and never-asked. Watched red by deleting the emit: the
 closed-port gate failed, alone.
 
 **Real hardware.** Nothing here is hardware-specific and nothing needs the
-SR550. It is, though, the first thing on this list that a person can check by
-hand on that machine with a stock client, which is worth more than it sounds.
+SR550.
+
+> ~~It is, though, the first thing on this list that a person can check by hand
+> on that machine with a stock client, which is worth more than it sounds.~~
+> **Wrong, and corrected the same day it was written.** It cannot be checked on
+> the SR550 by any means, because **that machine has no network Bhaskix can
+> drive.** Two independent reasons, either sufficient: the only NIC driver in
+> this tree is `bin/netd`, which drives a *virtio* network device and nothing
+> else, and the SR550's are four Intel X722s; and a network device is refused
+> unless an IOMMU contains it — *"no dma window for the network device, so it
+> cannot be driven"* — while the SR550's four units are off pending
+> [RFC 0043](0043-an-iommu-on-a-machine-with-no-virtio.md).
+>
+> The general form of that is worth more than this RFC: **every networking
+> claim this project makes rests on one machine**, QEMU's `intel-iommu` lane,
+> because that is the only machine in existence with both halves. It is
+> recorded in `TRACKER.md` rather than only here.
 
 ## Unresolved questions
 
