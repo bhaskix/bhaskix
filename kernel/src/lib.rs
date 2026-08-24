@@ -17677,19 +17677,15 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // out never to drive it. Step 3's bring-up sets the bit again as its first
     // act, so this costs the ordering and nothing else.
     //
-    // Note for whoever reads this next: `virtio::quiesce`, which does the same
-    // thing for the kernel's own block device, has **no caller**. It has been
-    // dead since it was written. Not fixed here, and recorded in TRACKER --
-    // that device is reset by `init_mapped` on the path that matters, so the
-    // dead function is a redundancy that was never wired rather than a hole.
-    //
     // The probe is hoisted out of the `if let` rather than written inside its
-    // condition, and that is not a style choice. `tools/check-unsafe-budget.py`
-    // is a line scanner: `if let Some(x) = unsafe { f() } {` leaves it one
-    // brace deep, so it counts the whole body as unsafe. Written the short way
-    // this block and the window below cost 46 lines of budget between them, for
-    // three configuration reads and one write. The number is supposed to mean
-    // something.
+    // condition. That began as an appeasement -- `tools/check-unsafe-budget.py`
+    // was a line scanner that read `if let Some(x) = unsafe { f() } {` as one
+    // brace deep and charged the whole body to the budget, 46 lines here for
+    // three configuration reads and one write. **That was a defect in the
+    // instrument and was fixed on 2026-08-24**, so the shape is no longer
+    // required; it stays because a named binding reads better than a condition
+    // with a bus walk inside it, which is a reason that does not depend on a
+    // tool.
     //
     // SAFETY: configuration access works, and nothing in this kernel drives
     // this controller -- there is no driver for it to interrupt.
@@ -17700,6 +17696,27 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
             bhaskix_arch::pci::quiesce(bhaskix_arch::pci::Address::new(bus, device, function));
         }
     }
+
+    // **And the kernel's own disk, which until 2026-08-24 was the one endpoint
+    // on this bus nobody quiesced.**
+    //
+    // `virtio::quiesce` was written for exactly this and **had no caller since
+    // the day it was written** -- invisible to the compiler because a `pub fn`
+    // in a library crate is never dead code as far as the lint is concerned.
+    // TRACKER recorded it as harmless on the grounds that `init_mapped` resets
+    // this device anyway. It does, and that is not sufficient: `init_mapped`
+    // runs *after* `iommu::enable` below, and its own comment says why that
+    // matters -- it withholds bus mastering until the device has been reset,
+    // precisely so the device cannot touch memory "with the ring firmware
+    // configured, which with translation on is a fault nobody owns". What it
+    // cannot do is clear bus mastering the *firmware* left set, which survives
+    // from power-on, through `enable`, to that reset.
+    //
+    // On the emulator the firmware boots from the CD and has no reason to
+    // master a virtio disk, which is why this has never faulted. A machine
+    // that boots from one is a different machine, and this is the ordering the
+    // other two devices above already get.
+    virtio::quiesce();
 
     // SAFETY: the window is built and verified, and its tables are never
     // freed. Nothing is doing DMA yet -- the device has not been programmed.

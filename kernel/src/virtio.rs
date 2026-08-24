@@ -607,13 +607,21 @@ pub fn read_into(sector: u64, device_address: u64) -> Result<(), BlockError> {
 
 /// Stops the block device doing DMA, before anything else is decided.
 ///
-/// Called before translation is enabled. See `pci::quiesce`: the device the
-/// firmware enumerated is still a bus master, still pointed at physical
-/// addresses, and the moment a unit starts translating those become faults
-/// attributed to a driver that has not run yet.
+/// Called from `iommu_bringup` before translation is enabled. See
+/// `pci::quiesce`: the device the firmware enumerated is still a bus master,
+/// still pointed at physical addresses, and the moment a unit starts
+/// translating those become faults attributed to a driver that has not run yet.
 ///
 /// Bringing the device up afterwards re-enables bus mastering, so this costs
 /// nothing but the ordering it enforces.
+///
+/// # This sentence was false for as long as the function existed
+///
+/// "Called before translation is enabled" was written in the present tense and
+/// **nothing called it** until 2026-08-24. A `pub fn` in a library crate is not
+/// dead code to the compiler, so nothing said so; it was found by reading. The
+/// doc comment described the design and the design was never wired, which is
+/// the failure mode a doc comment is least able to catch about itself.
 pub fn quiesce() {
     if let Some((address, _)) = find() {
         // SAFETY: this device is the kernel's -- it is about to be brought up
