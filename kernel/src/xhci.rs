@@ -1084,6 +1084,26 @@ const MAX_DESCRIPTOR_BYTES: usize = 1024;
 /// bounded before it is believed — RFC 0038's rule 6. A controller wanting more
 /// than this is refused rather than partially satisfied, because a controller
 /// given fewer buffers than it asked for does not run.
+///
+/// # It stays 32, and raising it was tried on hardware and reverted
+///
+/// Thirty-two is a guess that fits every controller this driver has met — all
+/// of them QEMU's. On 2026-08-24 an Intel C620 on an SR550 refused to come up
+/// because it wants more, and the obvious repair was to raise the bound to the
+/// structure's own limit: the scratchpad array is a single frame of 64-bit
+/// pointers, so `FRAME_SIZE / 8` = 512 is what one array frame holds.
+///
+/// **That was built, booted on the machine, and made it worse.** With the bound
+/// at 512 the driver stopped refusing and started allocating, and the boot
+/// **hung** inside bring-up — 29,666 bytes of report against 52,763 for the
+/// same machine refusing cleanly. A refusal that costs a controller is much
+/// better than a hang that costs the boot, so the bound went back.
+///
+/// What is *not* yet known is the number that controller wants, because the
+/// refusal never said. [`InitError::TooManyScratchpads`] now carries it, so the
+/// next boot of a machine that asks for too many prints the figure — and
+/// whatever raises this constant afterwards will be sized against a measurement
+/// rather than against the shape of a frame.
 const MAX_SCRATCHPADS: u32 = 32;
 
 /// Microseconds any one register is given to settle.
@@ -1155,7 +1175,17 @@ pub enum InitError {
     /// controller has no way to reach it.
     NotMappable,
     /// The controller wants more scratchpad buffers than this driver provides.
-    TooManyScratchpads,
+    ///
+    /// **Carries both numbers.** A refusal that says only "more than this
+    /// driver provides" cannot be acted on: the reader learns there is a limit
+    /// and not what it is or how far past it the machine is. That cost a reboot
+    /// of a live server on 2026-08-24 to find out.
+    TooManyScratchpads {
+        /// What the controller's `HCSPARAMS2` asked for.
+        wanted: u32,
+        /// What this driver will provide -- one array frame's worth.
+        limit: u32,
+    },
     /// The bring-up itself refused.
     BringUp(BringUpError),
 }
@@ -1174,7 +1204,7 @@ impl InitError {
             Self::MapFailed => "its register window could not be mapped",
             Self::OutOfMemory => "no frame for a ring, a table or a scratchpad",
             Self::NotMappable => "a frame could not be mapped into its window",
-            Self::TooManyScratchpads => {
+            Self::TooManyScratchpads { .. } => {
                 "it wants more scratchpad buffers than this driver provides"
             }
             Self::BringUp(error) => error.describe(),
@@ -1265,7 +1295,10 @@ pub unsafe fn init(hhdm: u64) -> Result<Started, InitError> {
         .map_err(InitError::BringUp)?;
 
     if parameters.scratchpads > MAX_SCRATCHPADS {
-        return Err(InitError::TooManyScratchpads);
+        return Err(InitError::TooManyScratchpads {
+            wanted: parameters.scratchpads,
+            limit: MAX_SCRATCHPADS,
+        });
     }
 
     let device_contexts = frame(controller, hhdm)?;

@@ -796,6 +796,43 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (the xHCI wants 34 scratchpad buffers, and giving them to it hangs the boot)
+
+**Asked for as a fix, delivered as a measurement and a reverted attempt.**
+
+`MAX_SCRATCHPADS` is 32 — a guess that fitted every controller this driver had
+met, all of them QEMU's. The SR550's Intel C620 refused to come up because it
+wants more, and the refusal did not say how many, so the first thing built was
+the number:
+
+```
+    xhci           FAILED to bring up: it wants more scratchpad buffers than this driver provides
+    xhci           it asked for 34 scratchpad buffers and this driver provides 32
+```
+
+**Thirty-four against thirty-two. Off by two.**
+
+**And raising the limit made it worse, which is why the limit is back at 32.**
+The obvious repair was the structure's own bound — the scratchpad array is one
+frame of 64-bit pointers, so 512 is what it holds. Built, booted on the machine,
+and the boot **hung**: 29,666 bytes of report against 52,763 for the same
+machine refusing cleanly, stopping inside bring-up. A refusal that costs a
+controller is much better than a hang that costs the boot.
+
+**The important part is what that rules out.** With the bound at 512 the driver
+still allocated only **34** buffers, because that is what the controller asked
+for. So the hang is **not** an allocation-size problem and not the bound: *this
+controller hangs during bring-up once it is actually given its scratchpad
+buffers.* That is a different defect from the one this started as, it is now
+isolated to a known code path, and it is the thing standing between this machine
+and RFC 0041's USB keyboard.
+
+What ships: the limit unchanged at 32, and
+[`InitError::TooManyScratchpads`] carrying both numbers so no future machine
+costs a reboot to learn what it wants. What does not ship: a raise, until the
+hang is understood — sized against a measurement rather than against the shape
+of a frame.
+
 ### 2026-08-24 (two more self-tests stop calling a true fact a failure — and one of them was leaking a domain per boot)
 
 `iommu grant` and `iommu memory` both grant a domain a window for a device the
@@ -934,8 +971,10 @@ It now says `none programmed yet (the dma line below is the verdict)`.
 than fixed:
 
 - `xhci FAILED to bring up: it wants more scratchpad buffers than this driver
-  provides` — RFC 0041's driver meets a controller that asks for more than it
-  allocates. A real-hardware limit with a number behind it.
+  provides` — **the number is 34 against a limit of 32, measured 2026-08-24**,
+  and raising the limit is *necessary and not sufficient*: with it raised the
+  driver allocates the 34 and then **hangs inside bring-up**. See the changelog
+  entry for that day; the hang is the real defect and it is now isolated.
 - ~~`ahci service FAILED: 18446744073709551615 bytes`~~ **FIXED and verified on
   the machine the same day** — the block-service self-test had no skip arm for
   *the controller is up and no port has a disk*, so it asked anyway, waited four

@@ -719,10 +719,21 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                     );
                 }
             }
-            Err(error) => println!(
-                "\x1b[91m    xhci           FAILED to bring up: {}\x1b[0m",
-                error.describe()
-            ),
+            Err(error) => {
+                println!(
+                    "\x1b[91m    xhci           FAILED to bring up: {}\x1b[0m",
+                    error.describe()
+                );
+                // The numbers, where the refusal has them. `describe` is a
+                // `&'static str` and cannot format; a reader who is told only
+                // that a limit exists has to reboot the machine to learn what
+                // it is, which on a server is a question per restart.
+                if let xhci::InitError::TooManyScratchpads { wanted, limit } = error {
+                    println!(
+                        "\x1b[91m    xhci           it asked for {wanted} scratchpad buffers and this driver provides {limit}\x1b[0m"
+                    );
+                }
+            }
         }
     }
     if let Some((found, _)) = iommu_state.as_ref() {
