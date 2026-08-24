@@ -299,12 +299,15 @@ pub fn read_identity(words: &[u8]) -> Result<Identity, Error> {
 // `BOS` 0, `OOS` 1, `BB` 4, `ST` 0, `FRE` 4, `FR` 14, `CR` 15, `DET` 3:0,
 // `IPM` 11:08, and the four `PxIS` error bits at 30, 29, 28 and 27.
 //
-// **One thing this document does not source, and it is in `sig` below.** AHCI
-// §3.3.9 defines `PxSIG` as the *layout* of a D2H Register FIS's LBA and sector
-// count fields and says nothing about what values mean which device. The two
-// signature constants therefore remain from recall, sourced to the Serial ATA
-// / ATA command set rather than to anything on this machine. Narrower than the
-// old caveat, and still a caveat.
+// **One thing this document does not source, and it needed a second one.**
+// AHCI §3.3.9 defines `PxSIG` as the *layout* of a D2H Register FIS's LBA and
+// sector count fields and says nothing about what values mean which device.
+// **ATA8-ACS table 206 does**, and it was read the same day: `DISK` and
+// `PACKET` are now sourced and were both right. What remains unsourced is one
+// step smaller again — table 206 names two further signatures only as
+// "Reserved for SATA", so which of `0x9669_0101` and `0xc33c_0101` is a port
+// multiplier and which an enclosure bridge is still recall. See the
+// `signature` module, which prices that at one noun in a boot report.
 //
 // What the tests below can prove and what they cannot: they prove **the
 // sequence is right given these constants**. They cannot prove the constants,
@@ -805,14 +808,50 @@ pub enum DeviceKind {
 }
 
 /// The signatures the specification fixes.
+///
+/// # Where these come from, and it takes two documents
+///
+/// Neither one is sufficient. **ATA8-ACS table 206, "Device Signatures for
+/// Normal Output"**, gives the field values a device presents after a reset;
+/// **AHCI 1.3.1 §3.3.9** gives the order they are packed into `PxSIG`:
+/// `31:24` LBA High, `23:16` LBA Mid, `15:08` LBA Low, `07:00` Sector Count.
+/// Read together on 2026-08-24:
+///
+/// | device | LBA High | LBA Mid | LBA Low | COUNT | `PxSIG` |
+/// |---|---|---|---|---|---|
+/// | ATA | `00h` | `00h` | `01h` | `01h` | `0x0000_0101` |
+/// | ATAPI | `EBh` | `14h` | `01h` | `01h` | `0xeb14_0101` |
+///
+/// **[`DISK`] and [`PACKET`] are therefore sourced**, and both were already
+/// right.
+///
+/// # The other two are half-sourced, and the half that is missing is the name
+///
+/// Table 206 has two further columns, both headed only **"Reserved for SATA"**:
+/// `C3h`/`3Ch` and `96h`/`69h`, which pack to `0xc33c_0101` and `0x9669_0101`.
+/// So both *values* are real signatures fixed by the standard. **Which of them
+/// is a port multiplier and which is an enclosure management bridge is stated
+/// by neither document** — AHCI only says *"if the signature returned
+/// corresponds to a Port Multiplier"* without giving the number, and ATA8-ACS
+/// declines to name them at all. That mapping is recall, belonging to the
+/// Serial ATA specification and to SES/SEMB, neither of which is on this
+/// machine.
+///
+/// **What it would cost to have them the wrong way round: one noun in a boot
+/// report.** `device_kind` is consumed in exactly one behavioural test —
+/// `!= DeviceKind::Disk` — so a swap changes the word the kernel prints and
+/// never changes a command issued to hardware. Bounded, and said here rather
+/// than left for somebody to work out.
 pub mod signature {
-    /// A SATA disk.
+    /// A SATA disk. ATA8-ACS table 206, ATA device column.
     pub const DISK: u32 = 0x0000_0101;
-    /// An ATAPI device.
+    /// An ATAPI device. ATA8-ACS table 206, ATAPI device column.
     pub const PACKET: u32 = 0xeb14_0101;
-    /// A port multiplier.
+    /// A port multiplier. One of table 206's two "Reserved for SATA" columns;
+    /// *which* one is not sourced -- see the module note.
     pub const PORT_MULTIPLIER: u32 = 0x9669_0101;
-    /// An enclosure management bridge.
+    /// An enclosure management bridge. The other "Reserved for SATA" column,
+    /// with the same caveat.
     pub const ENCLOSURE: u32 = 0xc33c_0101;
 }
 

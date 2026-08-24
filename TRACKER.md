@@ -796,6 +796,47 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (the AHCI signatures, sourced — and it took a second document, because the first one deliberately does not say)
+
+**The caveat left over from this morning's AHCI verification is discharged, and
+what remains is one step smaller again.**
+
+AHCI 1.3.1 §3.3.9 defines `PxSIG` as a *layout* — `31:24` LBA High, `23:16` LBA
+Mid, `15:08` LBA Low, `07:00` Sector Count — and says nothing about which values
+mean which device. That is not an omission; it is the right division, and the
+values live in **ATA8-ACS table 206, "Device Signatures for Normal Output"**
+(T13/1699-D, a public working draft). Read together:
+
+| device | LBA High | LBA Mid | LBA Low | COUNT | packs to |
+|---|---|---|---|---|---|
+| ATA | `00h` | `00h` | `01h` | `01h` | **`0x0000_0101`** |
+| ATAPI | `EBh` | `14h` | `01h` | `01h` | **`0xeb14_0101`** |
+
+**Both match the crate exactly.** Neither document alone would have done it —
+one has the packing order, the other the field values.
+
+**What is still recall, stated precisely rather than waved at.** Table 206 has
+two further columns and heads them both only **"Reserved for SATA"**: `C3h`/`3Ch`
+and `96h`/`69h`, which pack to `0xc33c_0101` and `0x9669_0101`. So both *values*
+are standard signatures. **Which one is a port multiplier and which an enclosure
+management bridge is stated by neither document** — AHCI says only *"if the
+signature returned corresponds to a Port Multiplier"* without giving a number,
+and ATA8-ACS declines to name them. That mapping belongs to the Serial ATA
+specification and to SES/SEMB, neither of which is on this machine, and
+**SATA-IO's documents are members-only**, so this one may stay open.
+
+**And it is priced.** `device_kind` is consumed in exactly one behavioural test,
+`!= DeviceKind::Disk`. Having those two labels the wrong way round would change
+**one noun in a boot report** and never a command issued to hardware. A caveat
+worth keeping is worth bounding.
+
+**Three specifications read in one day**, and the score is worth recording
+because it is the argument: RFC 1122 changed an acceptance from *"a trade"* to
+*"a violation"*; AHCI 1.3.1 confirmed twenty offsets and thirteen bit positions
+with no discrepancy; ATA8-ACS confirmed two signatures and refused to settle a
+third thing, which is itself information. None of them took more than a few
+minutes, and none could have been predicted from the outside.
+
 ### 2026-08-24 (RFC 0046's first stated limit is discharged: the AHCI offsets were read, and the recall was right)
 
 **RFC 0046 was accepted this morning with three limits written into its own
