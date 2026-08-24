@@ -61,6 +61,11 @@ Not sure whether your idea needs an RFC? Open an issue and ask. The answer is qu
 - **Sign off every commit** (`git commit -s`) — see DCO below.
 - CI must be green: `cargo fmt --check`, `cargo clippy -D warnings`, host tests, QEMU tests,
   `unsafe`-budget check, dependency-cycle check.
+- **`make gates` is not that list.** It is the fast local target and runs neither `fmt` nor
+  `clippy`; `make test` runs both, and CI runs them as jobs of their own. Between 2026-08-23 and
+  2026-08-24 that gap let sixteen consecutive commits land on a red `main`, so it is written here
+  rather than learned again. **Run `make test` before you push, and `tools/ci-status.sh` after** —
+  the latter needs no token and names the failing job.
 - Every bug fix adds a regression test. If the bug was not testable, say what you changed to make it
   testable.
 - Describe the design decision in the PR body, not the diff.
