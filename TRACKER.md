@@ -791,6 +791,44 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (host3's bus, surveyed: an AHCI controller, four X722s, and four IOMMU units this system declines to turn on)
+
+A second boot of the SR550, with the console attached **before** the reset so
+the early report did not scroll away — the first capture missed it and that is
+the whole reason there was a second. What it cost: two restarts of a live
+cluster node. What it buys: nobody has to spend those again to learn this.
+
+**115 PCI functions: 1 drivable, 8 bridges, 106 this kernel cannot describe.**
+Eighty-one of the 106 are class `08.80`, the Xeon's uncore, and are noise. The
+ones that matter:
+
+| | | |
+|---|---|---|
+| `b1:00.0`–`.3` | `8086:37d1` | Ethernet ×4 — Intel X722, class 02.00 |
+| `00:11.5` | `8086:a1d2` | SATA in **AHCI** mode, class 01.06 |
+| `00:17.0` | `8086:2826` | SATA in RAID mode, class 01.04 |
+| `ae:00.0` | `1000:0017` | LSI/Broadcom MegaRAID, class 01.04 |
+| `00:14.0` | `8086:a1af` | xHCI — **refused: no IOMMU translation** |
+
+**The realistic driver target is AHCI at `00:11.5`**: a documented, stable
+interface, against an X722 (i40e-class) or a vendor-specific MegaRAID. What
+this survey cannot say is whether a disk is *attached* to it — the machine's
+real storage is most likely behind the MegaRAID, and only a driver that
+enumerates ports will settle it. Said rather than assumed.
+
+**And the finding that changes an RFC's priority: `iommu 4 units found, not
+enabled; 46-bit addresses, 2 reserved regions, interrupt remapping
+supported`.** The units are there and they work. The xHCI is refused for want
+of translation, and translation is off because [RFC 0043](docs/rfc/0043-an-iommu-on-a-machine-with-no-virtio.md)'s
+unresolved question 1 — identity-map or pass-through — is unanswered, and that
+is unanswered because the VT-d context-entry layout cannot be read from
+anything on this machine. **RFC 0043 is therefore not a theoretical blocker any
+more**: it stands between hardware the project owns and device containment on
+it, and it also blocks RFC 0041's USB keyboard there. The two RFCs are more
+coupled than either says.
+
+16 CPUs online of 16, boot clean to the shell, nothing red.
+
 ### 2026-08-24 (the SR550 says RFC 0044's revocation costs a fifth of what QEMU said, and three skip arms fired on a machine that really lacks the devices)
 
 Booted 2026-08-23's work on the Lenovo SR550 — one Xeon Silver 4110, over the
