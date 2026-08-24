@@ -796,6 +796,44 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-24 (the AHCI service test stopped calling an empty controller broken — and the TCP intermittent recurred while proving it)
+
+**A gate that fails because the machine has no disk says "broken" about a true
+fact.** On the SR550 the driver brings up four implemented ports, none with a
+device attached, and says so: *"no port has a disk, so nothing was asked; the
+controller is up and idle"*. The service self-test then asked anyway, waited
+four seconds, and reported
+
+```
+    ahci service   FAILED: 18446744073709551615 bytes, contents match false, past the end refused false
+```
+
+— which is `u64::MAX` wearing a number's clothes. It said that on **every boot
+of the only physical machine this project has**.
+
+Now:
+
+```
+    ahci service   not asked: the controller is up and no port has a disk, so there is no sector to read
+```
+
+**The skip is keyed to the driver's own `DET` count, not to a timeout**, and
+that is the whole design: a disk that *is* present and does not answer still
+fails, which is the case worth keeping. `ahci_disks` reads the same report words
+`report_ahci_domain` prints from, so the two cannot disagree about whether this
+machine has a disk. Both arms watched — QEMU still reads its 512 bytes and
+matches them; forcing the skip prints the line above.
+
+Verified on the machine, not only in the emulator.
+
+**And the TCP inbound intermittent recurred, in the `make test` run that proved
+this.** One failure — *"the ring handover or the stream through it did not
+complete"* — and the two re-runs after it passed. That is the open row from this
+morning behaving exactly as filed: RFC 0047 removed one mechanism and RFC 0048
+step 1 narrowed the other 17×, and **neither was ever claimed to have closed
+it**. Recorded here rather than left in a log, because a flake that recurs
+silently is how a rate becomes folklore.
+
 ### 2026-08-24 (an IOMMU is enabled on physical hardware for the first time, and three defects no emulator could show had to go first)
 
 **RFC 0043 step 5. Read off an SR550 over serial-over-LAN, not seen on a
@@ -851,9 +889,15 @@ than fixed:
 - `xhci FAILED to bring up: it wants more scratchpad buffers than this driver
   provides` — RFC 0041's driver meets a controller that asks for more than it
   allocates. A real-hardware limit with a number behind it.
-- `ahci service FAILED: 18446744073709551615 bytes` — the block-service
-  self-test has no skip arm for *the controller is up and no port has a disk*,
-  so it reports a failure where the honest answer is "nothing to read".
+- ~~`ahci service FAILED: 18446744073709551615 bytes`~~ **FIXED and verified on
+  the machine the same day** — the block-service self-test had no skip arm for
+  *the controller is up and no port has a disk*, so it asked anyway, waited four
+  seconds and reported `u64::MAX` wearing a number's clothes. It now reads
+  *"not asked: the controller is up and no port has a disk, so there is no
+  sector to read"*. **The skip is keyed to the driver's own `DET` count, not to
+  a timeout**, so a disk that is present and does not answer still fails — which
+  is the case worth keeping. QEMU still reads its 512 bytes and matches, and
+  both arms were watched.
 - `iommu grant FAILED` / `iommu memory FAILED` — self-tests that need a virtio
   device to grant memory for, with no skip arm on a machine that has none.
 

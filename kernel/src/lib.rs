@@ -11274,6 +11274,40 @@ static AHCI_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// it. So this test is `block_service_self_test` with one endpoint changed and
 /// one expected string changed, and nothing else -- if the two had to differ by
 /// more than that, the interface would be in the wrong place.
+/// How many ports the driver found a device communicating on, or `None` if it
+/// has not left a report yet.
+///
+/// Reads the same words `report_ahci_domain` prints from -- `word(8)` for the
+/// implemented-port count and the packed per-port word for `DET` -- so the two
+/// cannot disagree about whether this machine has a disk.
+fn ahci_disks(hhdm: u64) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+
+    let raw = AHCI_MEMORY.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    let (frames, count) = shared::frames_of(shared::MemoryId::from_u64(raw))?;
+    if count <= AHCID_REPORT_PAGE {
+        return None;
+    }
+    let base = hhdm + frames[AHCID_REPORT_PAGE];
+    // SAFETY: a frame this object owns, through the direct map; the driver
+    // writes it and this only reads.
+    let word = |index: usize| unsafe { core::ptr::read_volatile((base as *const u64).add(index)) };
+    if word(0) != AHCID_MARKER {
+        return None;
+    }
+    let ports = word(8) as usize;
+    let mut disks = 0usize;
+    for index in 0..ports.min(bhaskix_ahci::MAX_PORTS) {
+        if (word(16 + index) >> 8) & 0xff == 3 {
+            disks += 1;
+        }
+    }
+    Some(disks)
+}
+
 fn ahci_service_self_test(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
 
@@ -11284,8 +11318,28 @@ fn ahci_service_self_test(hhdm: u64) -> bool {
 
     let raw = AHCI_ENDPOINT.load(Ordering::Acquire);
     if raw == 0 {
-        // No controller, no disk, or no window -- all of which are reported
-        // where they happen. Not a failure here.
+        // No controller, or no window -- both reported where they happen. Not
+        // a failure here.
+        return true;
+    }
+
+    // **The controller can be up with nothing attached, and that is not a
+    // failure.** On an SR550 the driver brings up four implemented ports, none
+    // of which has a device: it says so -- *"no port has a disk, so nothing was
+    // asked"* -- and this test then asked anyway, waited four seconds, and
+    // reported `FAILED: 18446744073709551615 bytes`, which is `u64::MAX`
+    // wearing a number's clothes.
+    //
+    // A gate that fails because the machine has no disk is a gate that says
+    // "broken" about a true fact, and on the only physical machine this project
+    // has it said it on every boot. The skip is keyed to the driver's own
+    // count rather than to a timeout, so a disk that *is* present and does not
+    // answer still fails here, which is the case worth keeping.
+    if ahci_disks(hhdm) == Some(0) {
+        println!(
+            "    ahci service   not asked: the controller is up and no port has a disk, so there \
+             is no sector to read"
+        );
         return true;
     }
 
