@@ -714,6 +714,36 @@ fi
 # says that is the right answer rather than a failure. Asserting a bring-up
 # there would be asserting that the rule is broken.
 if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
+    # **The fault instrument ran, at both moments it is asked to.**
+    #
+    # This is the third time this project has found the same shape, so the gate
+    # is for the shape and not for this instance. `iommu::faulted` was written
+    # for RFC 0012 and had **no callers** for months. `take_fault` read record
+    # zero only and printed nothing when it found none, so "no fault in slot
+    # zero" was indistinguishable from "this did not run". Between them they
+    # cost a four-boot hunt on a live server, and RFC 0049 came out of it.
+    #
+    # What replaced them is `report_faults_since`, printed twice on every boot
+    # with a unit -- and, until 2026-08-25, matched by **no gate at all**. An
+    # instrument nobody asserts is an instrument that can stop running quietly,
+    # which is the exact failure it was built to end.
+    #
+    # **What is asserted is that it spoke, not what it said.** A fault is not a
+    # failure: the first genuine DMA refusal this project ever recorded from
+    # real hardware was containment working, and a gate demanding "none
+    # recorded" would go red on the machine behaving correctly. So either form
+    # counts -- the summary line when there were none, or a fault line when
+    # there were -- and both moments must produce one.
+    for moment in "before drivers" "during bring-up"; do
+        if grep -qaE "iommu faults? +\[$moment\]" "$LOG"; then
+            pass "the IOMMU fault records are read and reported [$moment]"
+        else
+            fail "nothing reported IOMMU faults [$moment] -- the instrument did not run"
+            grep -a "iommu" "$LOG" | sed 's/^/      /'
+            status=1
+        fi
+    done
+
     # The counts are required to be non-zero rather than exact. Slots and ports
     # are the controller's own numbers and an emulator is entitled to change
     # them between versions -- but zero of either means the capability bank was

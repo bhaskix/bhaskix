@@ -996,6 +996,50 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-25 (the same shape, a third time: the IOMMU fault report was gated by nothing)
+
+**An audit rather than an accident.** Twice today a measurement turned out to be
+printed on every boot and asserted by nothing — `time::hastened()`, and before
+that `iommu::faulted` having no callers at all. Two is a coincidence; the third
+was gone looking for. Every label the `iommu` lane prints was extracted from a
+boot — **174 of them** — and checked against the harness.
+
+The sweep is crude and its output is mostly noise: a gate can match a line's
+content without its label, and most of these lines are descriptions of a machine
+(`hhdm base`, `gdt`, `framebuffer`) where there is nothing to regress. So the
+list was not acted on wholesale. One entry was checked properly and was real.
+
+**`iommu faults` appears zero times in `boot-test.sh`.** `report_faults_since`
+is called twice on every boot that has a unit — before drivers, and during
+bring-up — and nothing asserted either. That instrument exists *because* its
+predecessors did not report: `iommu::faulted` was written for RFC 0012 and never
+called, and `take_fault` read fault record zero only and printed nothing when it
+found none, so "no fault in slot zero" could not be told from "this did not run".
+Between them they cost a four-boot hunt on a live server and produced RFC 0049.
+The replacement was then left in exactly the position that made its predecessors
+useless: running, and unwatched.
+
+**The gate asserts that it spoke, not what it said**, and the distinction is not
+pedantry. A fault is not a failure — the first genuine DMA refusal this project
+ever recorded from real hardware was containment *working* — so a gate demanding
+`none recorded` would go red on the machine behaving correctly. Either form
+counts: the summary line when there were no faults, or a fault line when there
+were, at each of the two moments. Watched red by removing the second call, which
+fails the second gate alone while the first still passes. The `iommu` lane goes
+**133 → 135**; every other lane is unchanged, which is correct, since a lane with
+no unit has no records to read.
+
+**Left undone deliberately.** Roughly forty labels came back unmatched and were
+not gated. Most describe rather than claim; a few — `net echo`, `ipd state`,
+`spawn retry`, `notifications`, `dma devices` — are counters that could plausibly
+go quiet the same way, and are recorded here as a list somebody can work through
+rather than a gate written in a hurry against a line nobody has thought about.
+The `xhci ports` survey is a known one and is not a missing gate but a wrong
+line: it is printed **before** the two-second attach debounce that follows it, so
+on an SR550 it said *"0 with something attached, 26 quiet"* and the next line
+addressed a device on port 1. Two lines of one report contradicting each other,
+still unfixed, and written down here so it is not found a third time.
+
 ### 2026-08-25 (the tool that exists so CI cannot be red unnoticed misread its own commonest failure)
 
 `tools/ci-status.sh` returned *"no ci runs returned -- this says nothing about
