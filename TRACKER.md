@@ -996,6 +996,110 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-25 (the tool that exists so CI cannot be red unnoticed misread its own commonest failure)
+
+`tools/ci-status.sh` returned *"no ci runs returned -- this says nothing about
+CI"* while the API was plainly serving runs. It was rate-limited — the
+unauthenticated limit is 60 requests an hour and a polling loop had spent
+them — and the script **has** an arm for exactly that, which never matched:
+
+    *'"message": "API rate limit exceeded'*)
+
+GitHub sends `{"message":"API rate limit exceeded for …` with **no space after
+the colon**. The `Not Found` arm beside it was written with two wildcards and
+was therefore right; this one carried a literal `": "` and was not. Fixed the
+same way, and verified against a live rate-limited response rather than a
+constructed one — the limit was still spent, so the wrong message could be
+watched turning into the right one.
+
+**It never lied, and that is the design working.** Both branches say *"this
+says nothing about CI"*, so neither could ever be read as green — which is the
+property this tool exists for, after CI stayed red for sixteen commits in
+August without anybody learning. What was lost is smaller and still real: one
+message tells you to wait an hour, the other sends you looking for a workflow
+that is not broken.
+
+**A habit worth naming, since it caused this.** Waiting for a run by looping on
+`tools/ci-status.sh` every thirty seconds spends the hour's budget in half an
+hour and then blinds the tool for the rest of it. The run being waited for
+(337) had in fact passed.
+
+### 2026-08-25 (the specification's recovery was quoted in the source and not performed)
+
+**The xHCI driver retried a failed addressing by doing the one thing the
+specification does not list.** Found by reading the specification instead of
+experimenting further, which is the standing instruction and was the right call:
+five explanations for port 1 had already been measured away, and each cost a
+reboot of a live server.
+
+xHCI *Requirements Specification* revision 1.2, May 2019, §4.6.5 — fetched and
+read, not recalled:
+
+> A USB Transaction Error Completion Code for an Address Device Command may be
+> due to a Stall response from a device. Software should issue a Disable Slot
+> Command for the Device Slot then an Enable Slot Command to recover from this
+> error.
+
+and, in the same list of notes:
+
+> If the SET_ADDRESS request was unsuccessful, system software may issue a
+> Disable Slot Command for the slot or reset the device and attempt the Address
+> Device Command again. An unsuccessful Address Device Command shall leave the
+> Device Slot in the Default state.
+
+Two recoveries are offered: release the slot, or reset the device. **This driver
+did neither.** It waited fifty milliseconds and re-issued the same command
+against the same slot — which is on neither list, and is asked of a slot the
+same paragraph says is left in the Default state. An SR550 spent three attempts
+that way on port 1 and reported a working device as absent.
+
+**The worst part is that both quotes were already in the file**, in a comment
+directly above the retry loop, introduced to justify retrying at all. The
+sentence was read as "so retry" when what it says is "so release the slot and
+retry". A quotation is not a check: nothing compared what the comment said with
+what the code below it did. The `ADDRESS_TRIES` doc comment even stated the gap
+in as many words — *"this driver has no `Disable Slot`/`Enable Slot` recovery to
+fall back on yet"* — and that sentence sat there as a known limit rather than a
+defect anybody acted on.
+
+**What changed.** `Trb::disable_slot` — the crate had no way to spell the
+command — and a retry that performs the prescribed sequence: Disable Slot, clear
+the released slot's entry in the device context array, Enable Slot, zero the
+device context frame the controller has been writing in, write the **new** slot's
+array entry, and rebuild the Address Device command, because the slot is inside
+it and the controller need not hand back the one it took. The command used to be
+built once outside the loop, so a retry after a recovery would have addressed the
+slot that had just been released.
+
+**Exercised, not merely written.** No emulator here refuses Address Device, so
+the path would otherwise have shipped unrun. Forcing the first attempt to count
+as failed and booting the `iommu` lane:
+
+    xhci recover   the slot was released and taken again 1 time(s): xHCI 1.2 §4.6.5's
+                   recovery for a refused addressing, which this driver did not perform
+                   until 2026-08-25
+    xhci device    port 5 at speed 3 after a reset, slot 1, addressed 1 (slot state addressed)
+    xhci endpoint  configured, running
+
+All 133 gates green with the forced failure in place, so the recovery both runs
+and leaves the controller in a state the rest of the driver can use. The report
+line is silent at zero recoveries, so a machine that addresses first time reads
+exactly as it always has and no gate's text moved.
+
+**What is not claimed.** This has **not run on the SR550**, so whether it fixes
+that machine's port 1 is unknown. It is what the specification prescribes, which
+is a different thing from a diagnosis: the device there may still be the BMC's
+emulated peripheral behaving as the BMC pleases. The tracker's existing note
+saying so is left standing rather than quietly upgraded to a fix.
+
+**And one thing seen in passing, recorded because it is the first of its kind
+here.** The `iommu` lane failed once locally during this work and passed on
+immediate re-run, with nothing else on the machine. Its log was overwritten
+before it could be read, so **which gate went red is not known** — the same gap
+the CI flake has. Recorded as an observation, not a reproduction: it is one
+event, and the seven-local-passes claim it bears on was already corrected once
+for being made to carry more than it could.
+
 ### 2026-08-25 (the boot harness could measure how close it came only after it had already lost)
 
 **A candidate for the two red boot lanes, and an instrument that can settle it

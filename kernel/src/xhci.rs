@@ -2170,9 +2170,16 @@ const DEBOUNCE_TIMEOUT_MICROS: u64 = 2_000_000;
 
 /// How many times an Address Device command is attempted before giving up.
 ///
-/// Three, which is one more than Linux's `SET_ADDRESS_TRIES`, and the extra is
-/// because this driver has no `Disable Slot`/`Enable Slot` recovery to fall
-/// back on yet -- so its only other move is to report the device absent.
+/// Three, which is one more than Linux's `SET_ADDRESS_TRIES`.
+///
+/// ~~The extra is because this driver has no `Disable Slot`/`Enable Slot`
+/// recovery to fall back on yet.~~ **It has one as of 2026-08-25**, and that
+/// is what the attempts after the first now do: xHCI 1.2 §4.6.5 says a USB
+/// Transaction Error here *"should"* be recovered by releasing the slot and
+/// taking a new one, and the loop below does exactly that between attempts
+/// rather than re-asking a slot the same paragraph says is left in the Default
+/// state. The count stays at three: the recovery is what changed, not how many
+/// times it is worth trying.
 const ADDRESS_TRIES: u8 = 3;
 
 /// How long to leave a device alone after resetting its port.
@@ -2594,6 +2601,14 @@ pub struct Attached {
     /// one attempt and at three, and because a device that answers on the
     /// second is a device this driver would have called absent before.
     pub attempts: u8,
+    /// How many times the slot was released and taken again to try afresh.
+    ///
+    /// The recovery xHCI §4.6.5 prescribes for a failed addressing. Reported
+    /// because a device that answers only after its slot was recycled is a
+    /// different fact about a machine than one that answers first time, and
+    /// because until this field existed the path could not be seen from a boot
+    /// report at all.
+    pub recoveries: u8,
     /// Why it stopped, when it did not finish.
     pub stopped: Option<&'static str>,
     /// The completion code of the command that refused, when one did.
@@ -2738,27 +2753,106 @@ unsafe fn address_a_device<W: Wait>(
     // Built before it is issued, so that "this address cannot go in a command"
     // is a refusal with a reason rather than a zeroed TRB sent to a controller.
     // The closure only re-stamps the cycle the producer hands it.
-    let Some(command) = trb::Trb::address_device(input_context.device, slot, false) else {
-        attached.stopped = Some("the input context address is one the command cannot hold");
-        return attached;
-    };
-    // **Asked more than once, because a device is entitled to be slow.** The
-    // specification's own note: *"If the SET_ADDRESS request was unsuccessful,
-    // system software may issue a Disable Slot Command for the slot or reset
-    // the device and attempt the Address Device Command again."* And on this
-    // exact completion code: *"A USB Transaction Error Completion Code for an
-    // Address Device Command may be due to a Stall response from a device."*
+    // **Asked more than once, and the specification says how to ask again.**
     //
-    // A driver that asks once and gives up reports a device that is present
-    // and working as no device at all, which is what an SR550 did on port 1.
+    // xHCI revision 1.2 §4.6.5 offers two recoveries for an addressing that
+    // did not work -- *"system software may issue a Disable Slot Command for
+    // the slot or reset the device and attempt the Address Device Command
+    // again"* -- and for this completion code in particular it is specific:
+    // *"A USB Transaction Error Completion Code for an Address Device Command
+    // may be due to a Stall response from a device. Software should issue a
+    // Disable Slot Command for the Device Slot then an Enable Slot Command to
+    // recover from this error."*
+    //
+    // **Until 2026-08-25 this loop did neither.** It waited fifty milliseconds
+    // and re-issued the same command against the same slot -- the one action
+    // that appears in neither branch of that note -- on a slot the same
+    // paragraph says an unsuccessful command *"shall leave in the Default
+    // state"*. An SR550 spent three attempts that way on port 1 and reported a
+    // working device as absent. Both quotes were already in this file, directly
+    // above this loop, describing a recovery the code did not perform.
+    let mut slot = slot;
     let mut issued = None;
     for attempt in 0..ADDRESS_TRIES {
         if attempt > 0 {
+            // --- Disable Slot, and then Enable Slot -------------------------
+            let Some(disable) = trb::Trb::disable_slot(slot, false) else {
+                attached.stopped = Some("the slot to release is not a slot");
+                return attached;
+            };
+            // SAFETY: the caller's obligation -- a running controller, and
+            // rings that are its.
+            let Some(released) =
+                (unsafe { commander.issue(|cycle| disable.with_cycle_bit(cycle), wait) })
+            else {
+                attached.stopped = Some("the command ring would have wrapped");
+                return attached;
+            };
+            if !released.succeeded() {
+                attached.stopped = Some("the controller would not release the slot to retry it");
+                attached.code = released.drained.last_completion;
+                return attached;
+            }
+            // The array entry stops naming a context that is no longer part of
+            // any slot. Left set, it points at a frame this driver is about to
+            // zero and hand back under a different number.
+            // SAFETY: a frame `init` allocated, at an index bounded by the slot
+            // count the controller was configured with.
+            unsafe {
+                core::ptr::write_volatile((device_contexts as *mut u64).add(slot as usize), 0);
+            }
+
+            // SAFETY: as above.
+            let Some(again) = (unsafe { commander.issue(trb::Trb::enable_slot, wait) }) else {
+                attached.stopped = Some("the command ring would have wrapped");
+                return attached;
+            };
+            if !again.succeeded() || again.drained.last_slot == 0 {
+                attached.stopped = Some("the controller would not enable a slot to retry with");
+                attached.code = again.drained.last_completion;
+                return attached;
+            }
+            // **And it need not be the slot that was just released.** The
+            // controller chooses. A driver that assumed otherwise would write
+            // the array entry for one slot and address another.
+            slot = again.drained.last_slot;
+            attached.slot = slot;
+            attached.recoveries = attached.recoveries.saturating_add(1);
+
+            // **Zeroed again, because the controller has been writing in it.**
+            // A device context belongs to the controller, and an Address Device
+            // that failed still left a slot context behind in this frame.
+            // Handed straight back, the next command reads a state this driver
+            // did not put there.
+            // SAFETY: a frame this function allocated and still owns; the
+            // controller has just been told it is part of no slot.
+            unsafe {
+                core::ptr::write_bytes(
+                    device_context.virtual_address as *mut u8,
+                    0,
+                    bhaskix_mm::FRAME_SIZE as usize,
+                );
+            }
+            // SAFETY: as above, at an index bounded by the slot count.
+            unsafe {
+                core::ptr::write_volatile(
+                    (device_contexts as *mut u64).add(slot as usize),
+                    device_context.device,
+                );
+            }
             // The same recovery interval a reset gets. A device that has just
             // refused an address is in no better a state than one that has
             // just come out of reset.
             pause(RESET_RECOVERY_MICROS);
         }
+
+        // **Rebuilt every attempt, because the slot is inside the command.**
+        // Hoisted out of the loop -- where it used to be -- a retry after a
+        // recovery would silently address the slot that was just released.
+        let Some(command) = trb::Trb::address_device(input_context.device, slot, false) else {
+            attached.stopped = Some("the input context address is one the command cannot hold");
+            return attached;
+        };
         // SAFETY: the caller's obligation -- a running controller, and rings
         // that are its.
         let Some(this) = (unsafe { commander.issue(|cycle| command.with_cycle_bit(cycle), wait) })

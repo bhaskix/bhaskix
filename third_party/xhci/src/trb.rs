@@ -505,6 +505,30 @@ impl Trb {
         Some(trb.with_cycle_bit(cycle))
     }
 
+    /// A Disable Slot command for `slot`.
+    ///
+    /// **The recovery the specification prescribes for a failed addressing**,
+    /// and until 2026-08-25 this crate had no way to spell it. Revision 1.2
+    /// §4.6.5: *"A USB Transaction Error Completion Code for an Address Device
+    /// Command may be due to a Stall response from a device. Software should
+    /// issue a Disable Slot Command for the Device Slot then an Enable Slot
+    /// Command to recover from this error."*
+    ///
+    /// # Errors
+    ///
+    /// `None` if `slot` is zero — slot zero is not a slot, and a Disable Slot
+    /// naming it is a command asking the controller to release something that
+    /// was never handed out.
+    #[must_use]
+    pub const fn disable_slot(slot: u8, cycle: bool) -> Option<Self> {
+        if slot == 0 {
+            return None;
+        }
+        let mut trb = Self::new().with_kind(Kind::DisableSlot);
+        trb.0[3] |= (slot as u32) << 24;
+        Some(trb.with_cycle_bit(cycle))
+    }
+
     /// A Configure Endpoint command for `slot`.
     ///
     /// # Errors
@@ -1016,6 +1040,26 @@ mod tests {
         assert!(Trb::address_device(0x1000, 1, true).is_some());
         assert!(Trb::address_device(0x1000, 0, true).is_none());
         assert!(Trb::configure_endpoint(0x1000, 0, true).is_none());
+        assert!(Trb::disable_slot(1, true).is_some());
+        assert!(Trb::disable_slot(0, true).is_none());
+    }
+
+    /// A Disable Slot carries a slot and **no parameter**.
+    ///
+    /// The other commands here put an address in the parameter component, and
+    /// a Disable Slot built by copying one of them would hand the controller a
+    /// pointer in a field the specification reserves. Asserted rather than
+    /// assumed, because the failure is silent: the slot is released either way
+    /// and the stray bits are only noticed by a controller that checks them.
+    #[test]
+    fn a_disable_slot_names_a_slot_and_nothing_else() {
+        let trb = Trb::disable_slot(7, true).expect("valid");
+        assert_eq!(trb.kind(), Kind::DisableSlot);
+        assert_eq!(trb.slot_id(), 7);
+        assert_eq!(trb.parameter(), 0, "a Disable Slot has no parameter");
+        assert_eq!(trb.status(), 0, "a Disable Slot has no status component");
+        assert!(trb.cycle_bit());
+        assert!(!Trb::disable_slot(7, false).expect("valid").cycle_bit());
     }
 
     #[test]

@@ -512,7 +512,17 @@ asm_budget = 10
 # its reset, on connected-and-enabled-and-has-a-speed rather than on a fixed
 # recovery interval. One mapped port register, sampled -- the same access
 # `port_connected` makes, on the one port already chosen.
-unsafe_budget = 1839
+# 1857 for xHCI §4.6.5's slot recovery: an Address Device that fails is
+# recovered by releasing the slot and taking a new one, which is what the
+# specification prescribes for a USB Transaction Error and what this driver did
+# not do -- it re-asked the same slot, the one action neither branch of that
+# note lists. Four mapped writes and two ring issues: the released slot's entry
+# in the device context array cleared, the device context frame zeroed because
+# the controller has been writing in it, and the new slot's entry set. None of
+# it could be safe code: every one of them is a pointer the controller reads by
+# DMA, and the array index is a slot number the controller chose. The
+# arithmetic that decides *whether* to recover is safe code beside it.
+unsafe_budget = 1857
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

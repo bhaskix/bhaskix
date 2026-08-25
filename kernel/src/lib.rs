@@ -670,6 +670,20 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                 // accepted, and the device context saying `Addressed` with a
                 // nonzero address says the controller did what was asked.
                 let attached = &started.attached;
+                // **Printed before the outcome, because it belongs to both.**
+                // A slot recycled and then addressed and a slot recycled and
+                // still refused are different facts, and neither of the two
+                // lines below has room to say so without changing text a gate
+                // matches on. Silent at zero, so a machine that addressed its
+                // device first time reads exactly as it always has.
+                if attached.recoveries > 0 {
+                    println!(
+                        "    xhci recover   the slot was released and taken again {} time(s): \
+                         xHCI 1.2 §4.6.5's recovery for a refused addressing, which this driver \
+                         did not perform until 2026-08-25",
+                        attached.recoveries,
+                    );
+                }
                 if attached.addressed {
                     println!(
                         "    xhci device    port {} at speed {}{}, slot {}, addressed {} \

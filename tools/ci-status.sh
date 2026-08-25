@@ -63,7 +63,14 @@ runs_json="$(fetch "$API/runs?per_page=60&branch=main&event=push")"
 # "nothing is wrong".
 case "$runs_json" in
     "")   echo "${YELLOW}ci-status${RESET}  GitHub unreachable -- this says nothing about CI" >&2; exit 3 ;;
-    *'"message": "API rate limit exceeded'*)
+    # **Two wildcards, not a literal `": "`.** This arm was written expecting
+    # `"message": "API rate limit exceeded` and GitHub sends `"message":"API
+    # rate limit exceeded` -- no space -- so it never matched, and a
+    # rate-limited run fell through to the vaguer "no ci runs returned" below.
+    # Both are honest and neither claims CI is green, but one tells you to wait
+    # an hour and the other sends you looking for a broken workflow. The `Not
+    # Found` arm below already had the wildcard and was already right.
+    *'"message":'*'API rate limit exceeded'*)
           echo "${YELLOW}ci-status${RESET}  rate-limited (60/hour unauthenticated) -- try later" >&2; exit 3 ;;
     *'"message":'*'Not Found'*)
           echo "${YELLOW}ci-status${RESET}  no such repository: $REPO" >&2; exit 3 ;;
