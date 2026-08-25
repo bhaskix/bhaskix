@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-08-24 — step 1 only, and accepted *as a deliberate deviation from a MUST*.** One `SYN` from a peer that vanishes held `bin/tcpd`'s single accepted slot for **242 seconds**, refusing every later connection **silently**; `MAX_SYNACK_RETRANSMITS` takes that to **14 seconds**, measured both times by driving the state machine. **The question this document said should block its acceptance was answered, and answered against it.** RFC 1122 §4.2.3.5: *"R2 for a SYN segment MUST be set large enough to provide retransmission of the segment for at least 3 minutes."* Fourteen seconds is not 180, and the old compliant value is exactly what made the listener wedgeable. **The project lead accepted with the deviation recorded rather than hidden**: availability over the letter, taken knowingly. Steps 2–4 — SYN cookies — are specified and **not built**, and they are what removes the trade rather than repricing it: with no state allocated for a peer that has proved nothing, there is no half-open connection for `R2` to govern |
+| **Status** | ✅ **ACCEPTED 2026-08-24 — step 1 only, and accepted *as a deliberate deviation from a MUST*.** One `SYN` from a peer that vanishes held `bin/tcpd`'s single accepted slot for **242 seconds**, refusing every later connection **silently**; `MAX_SYNACK_RETRANSMITS` takes that to **14 seconds**, measured both times by driving the state machine. **The question this document said should block its acceptance was answered, and answered against it.** RFC 1122 §4.2.3.5: *"R2 for a SYN segment MUST be set large enough to provide retransmission of the segment for at least 3 minutes."* Fourteen seconds is not 180, and the old compliant value is exactly what made the listener wedgeable. **The project lead accepted with the deviation recorded rather than hidden**: availability over the letter, taken knowingly. ~~Steps 2–4 — SYN cookies — are specified and **not built**~~ — **step 2 was built 2026-08-25** (`net/src/tcp/cookie.rs`: mint, verify, expire; twelve host tests, six mutations each watched red, a fuzz target at 163,665,094 executions clean), and this line went on saying otherwise for a day. **Steps 3–4 remain, and until they land nothing on the wire uses the cookie** — the arithmetic exists and `bin/tcpd` still builds a connection from a `SYN`, so the denial of service is repriced and not removed. **Acceptance is still step 1 only, on purpose**: step 3 changes what this system puts on the wire, and widening an acceptance is the project lead's call and not the implementer's. They are what removes the trade rather than repricing it: with no state allocated for a peer that has proved nothing, there is no half-open connection for `R2` to govern |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — Core Operating System |
@@ -270,8 +270,7 @@ surviving a flood the harness *can* produce.
    fuzz target — **163,665,094 executions clean** — that was itself watched red
    by breaking `verify` in the permissive direction. The layout is the standard
    one: an 8-bit counter, a 3-bit MSS index and a 21-bit keyed hash, with the
-   counter and the index
-   **inside** the hash rather than merely beside it — otherwise a captured
+   counter and the index **inside** the hash rather than merely beside it — otherwise a captured
    cookie can be aged backwards into validity or have its segment size raised
    to something the peer never offered, and both attacks have a test.
 
