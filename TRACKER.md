@@ -1000,6 +1000,57 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-25 (the boot lanes finally ran on the emulator CI uses, and it was never a limit — only a belief)
+
+**`TRACKER.md` has said, in several places and correctly, that the boot lanes
+had never been run on the emulator CI uses.** This machine has QEMU **4.2.1**
+and its apt offers nothing newer; the runner installs `qemu-system-x86` from
+Ubuntu 24.04. So "seven local runs do not reproduce it" established that the
+gates pass on 4.2.1 and said very little about a failure on the other one — a
+correction already made here on the 25th.
+
+**It was never a limit.** A container with the runner's base image has the
+runner's emulator, and the harness does not care what is underneath it. Docker
+was already on this machine.
+
+First: what Ubuntu 24.04 actually ships, measured rather than assumed —
+**`QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)`**. The
+four-major-versions figure this file has been quoting was right.
+
+Then the lanes, on that emulator, across **all four CI matrix cells**:
+
+| | `-cpu max` | `-cpu qemu64` |
+|---|---|---|
+| `bios` | 6/6 pass, 109 gates | 6/6 pass, 109 gates |
+| `uefi` | 6/6 pass, 109 gates | 6/6 pass, 109 gates |
+
+**Twenty-four boots, twenty-four passes.** Including `uefi`/`qemu64` and
+`bios`/`max` — the exact cells that went red as runs 328 and 330.
+
+**What this result is, and what it is not.** It discharges the limit: the lanes
+have run on CI's emulator, and the sentence saying they never had is struck
+through above. It does **not** explain runs 328 and 330, and it does not
+disprove a version-specific cause — those were about two failures in fifteen
+pushes, and twenty-four clean runs is evidence against a *determinism*, not
+against a rare race. What it removes is the excuse for never having looked.
+
+**Where that leaves the two red lanes.** Not a timeout — measured at 26–28% of
+the old budget from CI's own annotations. Not obviously the emulator — 24 clean
+runs on it. What is left is the runner's hardware, and rarity. The gap is
+narrower and still open, and it is now narrower by measurement rather than by
+argument.
+
+`tools/boot-on-ci-emulator.sh` keeps the capability instead of leaving it as an
+afternoon's shell history. Deliberately **not** in `make test` and not a gate: it
+needs a network, a Docker daemon and a few hundred megabytes of image, and a
+check that needs all three should not be something every build depends on — the
+same reasoning that keeps `ci-status.sh` out of `make gates`. The base image is a
+named variable rather than buried, because the day `ubuntu-latest` moves is the
+day this has to move with it, and a tool that quietly tests the *wrong* emulator
+is worse than one that does not exist. Both paths were watched: a real run
+reports per-cell gate counts, and a forced timeout reports the failure and says
+plainly that `--rm` took the serial log with it.
+
 ### 2026-08-25 (five lanes, five different intermittents, and what they have in common)
 
 **`make test` failed five times today, on five different lanes, and none of the
@@ -1450,10 +1501,10 @@ unattended runner wants a slow machine to pass.
   consistent with the timeout *and* with the flake simply not recurring.
 - The measurement is on `boot-test.sh` only. `shell-test.sh` — which is the
   third red lane, run 324 — got the larger budget but not the instrument.
-- **The QEMU version gap is untouched**: 4.2.1 here against 8.2.2 there, and
-  the boot lanes have still never been run on the emulator CI uses. That
-  remains the better explanation of a *gate* failing, and this one only
-  competes for the other reading.
+- ~~**The QEMU version gap is untouched**: 4.2.1 here against 8.2.2 there, and
+  the boot lanes have still never been run on the emulator CI uses.~~
+  **DISCHARGED 2026-08-25** — see the entry below. They have now, all four
+  matrix cells, and they pass.
 
 **REFUTED 2026-08-25, by the instrument this entry added.** The `::notice::`
 annotations turned out to be readable without a token, and the first thing they
@@ -1532,10 +1583,13 @@ Corrected the same day, before anyone relied on it. This machine runs **QEMU
 4.2.1**; CI installs `qemu-system-x86` from the Ubuntu archive on
 `ubuntu-latest`, which is 24.04 and ships **8.2.2** — four major versions
 apart. So seven local passes establish that these gates pass *on QEMU 4.2.1*.
-They say very little about a failure on 8.2.2, and **the boot lanes have never
-been run on the emulator CI uses**. "It does not reproduce here" was doing work
-it had not earned, which is the same mistake as blaming a scratchpad bound for a
-hang because changing it changed the symptom.
+They say very little about a failure on 8.2.2, and ~~**the boot lanes have never
+been run on the emulator CI uses**~~ — **that clause was true when written and
+was discharged later the same day**; see the entry above, and
+`tools/boot-on-ci-emulator.sh`. The 8.2.2 figure, asserted here from what
+`ubuntu-latest` ships, was afterwards **measured** and is right. "It does not
+reproduce here" was doing work it had not earned, which is the same mistake as
+blaming a scratchpad bound for a hang because changing it changed the symptom.
 
 Contention was ruled out properly, at least: the `bios`/`max` lane passes with
 twelve busy loops on eight CPUs, so it is not simply a slow machine.
