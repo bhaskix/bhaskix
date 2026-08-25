@@ -129,9 +129,20 @@ jobs:
           # is a cheaper mistake than a red lane on a slow runner.
           #
           # The margin, measured: a boot here takes 32-39s. A runner needing
-          # seven times that still passes. The harness now prints what
-          # fraction of the budget each run actually used, so this figure can
-          # be argued with from data instead of adjusted by feel.
+          # seven times that still passes.
+          #
+          # **And the runner turned out not to be slower at all.** The harness
+          # emits its budget fraction as a `::notice::`, those annotations are
+          # readable without a token, and the first answer was `bios` 30.926s
+          # and `uefi` 33.927s -- against 30.1-32.6 and 37.1-39.4 here. Same
+          # speed; `uefi` is faster there. So the old 120s was being used at
+          # about a quarter, the red boot lanes of 2026-08-25 were **not**
+          # timeouts, and this larger budget is insurance against a hypothesis
+          # that has since been refuted rather than a fix for anything.
+          #
+          # Kept anyway, because it costs nothing on a passing run -- polling
+          # stops the machine at the completion marker -- and is paid only by a
+          # boot that genuinely hangs.
           BOOT_TEST_TIMEOUT: 300
           # A known path, so the failure artifact below can carry it. Without
           # this the harness writes to `mktemp` and the one file that says
@@ -186,8 +197,10 @@ jobs:
       - name: Type at both shells and assert on their replies
         env:
           # Same reasoning as the boot lane's budget above, and the same
-          # evidence: this job has gone red once (run 324) without being
-          # reproducible locally.
+          # correction: this job went red once (run 324) without being
+          # reproducible locally, and it reaches its prompt in 13.7-28.3s on CI
+          # against 13.4-25.0s here -- **4% of this budget**. Whatever run 324
+          # was, it was not a timeout.
           SHELL_TEST_TIMEOUT: 600
         run: make test-shell
 

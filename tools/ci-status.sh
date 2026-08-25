@@ -4,6 +4,7 @@
 # What CI thinks of `main`, and which job -- and which step of it -- says so.
 #
 # Usage:  tools/ci-status.sh [count]        # default 12 pushes
+#         tools/ci-status.sh --budgets      # what the newest run's lanes measured
 #
 # # Why this exists
 #
@@ -47,8 +48,11 @@
 set -uo pipefail
 
 REPO="${BHASKIX_CI_REPO:-bhaskix/bhaskix}"
+BUDGETS=0
+[[ ${1:-} == "--budgets" ]] && { BUDGETS=1; shift; }
 COUNT="${1:-12}"
 API="https://api.github.com/repos/$REPO/actions"
+CHECKS="https://api.github.com/repos/$REPO"
 
 RED=$'\033[1;31m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 
@@ -159,6 +163,66 @@ print(", ".join(bad))
         fi
         shown=$((shown + 1))
     done
+fi
+
+# **What each lane measured, which is readable without a token after all.**
+#
+# The harnesses print the fraction of their timeout a *passing* run used, and on
+# CI that went into a job log, which does need authentication -- so the one
+# number worth having was produced where nobody could read it. Emitting it as a
+# workflow `::notice::` puts it in the run's **annotations**, and those come back
+# on the same unauthenticated requests everything else here uses.
+#
+# Behind a flag rather than always, because it costs one request per check run
+# with annotations and this script is careful with a 60-an-hour budget on
+# purpose.
+#
+# What it answered the first time it was asked, 2026-08-25: `bios` 30.926s and
+# `uefi` 33.927s on CI against 30.1-32.6s and 37.1-39.4s on the machine this was
+# written on. **The runner is the same speed**, which killed the theory that the
+# boot lanes were timing out -- they were at a quarter of the old budget.
+if [[ $BUDGETS -eq 1 ]]; then
+    head_sha="$(printf '%s' "${failing[0]}" | cut -f3)"
+    echo
+    echo "${DIM}  what each lane measured (newest run, $head_sha):${RESET}"
+    checks_json="$(fetch "$CHECKS/commits/$head_sha/check-runs?per_page=30")"
+    ids="$(printf '%s' "$checks_json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for r in data.get("check_runs", []):
+    if (r.get("output") or {}).get("annotations_count", 0):
+        print(r["id"])
+')"
+    if [[ -z "$ids" ]]; then
+        echo "${DIM}    none reported -- rate limit, or the run predates the notices${RESET}"
+    else
+        for id in $ids; do
+            fetch "$CHECKS/check-runs/$id/annotations" | python3 -c '
+import json, sys
+try:
+    anns = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(anns, list):
+    sys.exit(0)
+for a in anns:
+    if a.get("annotation_level") != "notice":
+        continue
+    # Assembled rather than f-stringed. This runs inside a single-quoted shell
+    # heredoc, so the inner quotes an f-string needs cannot be escaped -- and a
+    # backslash inside an f-string expression is a SyntaxError regardless.
+    # Found by running the fragment on its own before shipping it, which is the
+    # only reason this is not a broken flag nobody discovers until the hour they
+    # need it. (No apostrophes here either, for the same heredoc reason.)
+    title = a.get("title") or ""
+    message = a.get("message") or ""
+    print("    " + title + ": " + message)
+'
+        done
+    fi
 fi
 
 echo
