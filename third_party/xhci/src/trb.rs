@@ -227,6 +227,84 @@ impl CompletionCode {
         }
     }
 
+    /// The wire value, whether or not this code has a name here.
+    ///
+    /// **A code without a name still has a number**, and the number is what a
+    /// reader looks up. A report that says only "an unnamed completion code"
+    /// has told them the driver does not recognise it and nothing they can act
+    /// on -- which cost a reboot of a server on 2026-08-25 to learn what an
+    /// Address Device command had actually answered.
+    #[must_use]
+    pub const fn raw(self) -> u8 {
+        match self {
+            Self::Invalid => 0,
+            Self::Success => 1,
+            Self::DataBufferError => 2,
+            Self::BabbleDetectedError => 3,
+            Self::UsbTransactionError => 4,
+            Self::TrbError => 5,
+            Self::StallError => 6,
+            Self::ResourceError => 7,
+            Self::NoSlotsAvailableError => 9,
+            Self::SlotNotEnabledError => 11,
+            Self::EndpointNotEnabledError => 12,
+            Self::ShortPacket => 13,
+            Self::ParameterError => 17,
+            Self::ContextStateError => 19,
+            Self::Other(raw) => raw,
+        }
+    }
+
+    /// What this code means, in words a boot report can print.
+    ///
+    /// Codes this enum does not name are described by what the specification's
+    /// table calls them where that is known, and as unnamed otherwise -- but
+    /// [`CompletionCode::raw`] always has the number.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Invalid => "no completion was written",
+            Self::Success => "success",
+            Self::DataBufferError => "data buffer error",
+            Self::BabbleDetectedError => "the device babbled",
+            Self::UsbTransactionError => "usb transaction error -- the device did not answer",
+            Self::TrbError => "trb error: the command itself was malformed",
+            Self::StallError => "the endpoint stalled",
+            Self::ResourceError => "the controller is out of resources",
+            Self::NoSlotsAvailableError => "no device slots left",
+            Self::SlotNotEnabledError => "that slot is not enabled",
+            Self::EndpointNotEnabledError => "that endpoint is not enabled",
+            Self::ShortPacket => "short packet",
+            Self::ParameterError => "parameter error: a field of the input context is wrong",
+            Self::ContextStateError => "context state error: the slot was in the wrong state",
+            // Codes the specification defines that this enum has no variant
+            // for. Named here rather than left to the number alone, because
+            // these are the ones a bring-up actually meets.
+            Self::Other(8) => "bandwidth error",
+            Self::Other(10) => "the stream id is invalid",
+            Self::Other(14) => "ring underrun",
+            Self::Other(15) => "ring overrun",
+            Self::Other(16) => "vf event ring full",
+            Self::Other(18) => "bandwidth overrun",
+            Self::Other(20) => "no ping response",
+            Self::Other(21) => "the event ring is full",
+            Self::Other(22) => "the device was disconnected",
+            Self::Other(23) => "missed service error",
+            Self::Other(24) => "command ring stopped",
+            Self::Other(25) => "the command was aborted",
+            Self::Other(26) => "stopped",
+            Self::Other(27) => "stopped -- length invalid",
+            Self::Other(29) => "max exit latency too large",
+            Self::Other(31) => "isoch buffer overrun",
+            Self::Other(32) => "the event was lost",
+            Self::Other(33) => "an undefined error",
+            Self::Other(34) => "the stream id is invalid",
+            Self::Other(35) => "secondary bandwidth error",
+            Self::Other(36) => "split transaction error",
+            Self::Other(_) => "an unnamed completion code",
+        }
+    }
+
     /// Whether this code means the operation did what was asked.
     ///
     /// **`ShortPacket` counts as success**, which is the point of asking
@@ -805,6 +883,42 @@ mod control_transfer_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_named_completion_code_round_trips_through_its_number() {
+        // `raw` and `from_raw` are two hand-written tables of the same
+        // mapping. A variant added to one and not the other reports a code
+        // that decodes back to something else.
+        for raw in 0u8..=255 {
+            let code = CompletionCode::from_raw(raw);
+            assert_eq!(code.raw(), raw, "code {raw} does not round trip");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_code_still_carries_its_number() {
+        // The property the boot report depends on: a code this enum has no
+        // variant for must still print as a number a reader can look up.
+        let code = CompletionCode::from_raw(200);
+        assert_eq!(code.raw(), 200);
+        assert_eq!(code.describe(), "an unnamed completion code");
+    }
+
+    #[test]
+    fn codes_the_enum_does_not_name_are_still_described() {
+        // 22 is "the device was disconnected" -- the kind of answer a
+        // bring-up on real hardware actually gets, and one this enum has no
+        // variant for.
+        assert_eq!(
+            CompletionCode::from_raw(22).describe(),
+            "the device was disconnected"
+        );
+        assert_eq!(
+            CompletionCode::from_raw(4).describe(),
+            "usb transaction error -- the device did not answer"
+        );
+    }
+
     use super::*;
 
     #[test]

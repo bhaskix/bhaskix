@@ -733,34 +733,30 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
                     // Yellow and not red: a machine with nothing plugged in is
                     // a correct outcome, and the reason says which it was.
                     println!(
-                        "\x1b[93m    xhci device    not addressed: {}{}\x1b[0m",
+                        "\x1b[93m    xhci device    not addressed on port {} at speed {}{} after {} attempt(s): {} ({}, code {}); portsc {:#010x}\x1b[0m",
+                        attached.port,
+                        attached.speed,
+                        if attached.reset { " after a reset" } else { "" },
+                        attached.attempts,
                         attached.stopped.unwrap_or("no reason recorded"),
                         match attached.code {
-                            Some(code) => {
-                                match code {
-                                    bhaskix_xhci::trb::CompletionCode::ParameterError => {
-                                        " (parameter error: a field of the input context is wrong)"
-                                    }
-                                    bhaskix_xhci::trb::CompletionCode::ContextStateError => {
-                                        " (context state error: the slot was in the wrong state)"
-                                    }
-                                    bhaskix_xhci::trb::CompletionCode::TrbError => {
-                                        " (trb error: the command itself was malformed)"
-                                    }
-                                    bhaskix_xhci::trb::CompletionCode::ResourceError => {
-                                        " (resource error)"
-                                    }
-                                    bhaskix_xhci::trb::CompletionCode::SlotNotEnabledError => {
-                                        " (slot not enabled)"
-                                    }
-                                    bhaskix_xhci::trb::CompletionCode::Invalid => {
-                                        " (no completion was written)"
-                                    }
-                                    _ => " (an unnamed completion code)",
-                                }
-                            }
-                            None => "",
+                            // **The number, always.** This was a match over six
+                            // named codes with `_ => "(an unnamed completion
+                            // code)"` behind them, and the code an SR550
+                            // actually answered Address Device with fell into
+                            // that arm -- so the report named neither the
+                            // meaning nor the value, and the only way to learn
+                            // it was another boot of a live server. The crate
+                            // now carries both.
+                            Some(code) => code,
+                            None => bhaskix_xhci::trb::CompletionCode::Invalid,
+                        }
+                        .describe(),
+                        match attached.code {
+                            Some(code) => code.raw(),
+                            None => 0,
                         },
+                        attached.portsc,
                     );
                 }
             }

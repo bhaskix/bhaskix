@@ -796,6 +796,62 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-25 (three bugs behind "no port has a device on it", and a fourth that is not ours)
+
+The SR550's xHCI ran and answered commands but reported no device on any of its
+26 ports. That one line hid three separate bugs, each found only after the
+instrument that could see it was built.
+
+**1. The event ring was answering the wrong question.** `issue` waited for one
+owned entry, drained once, and took whatever that found as the answer to the
+command it had just sent. The event ring carries every kind of event: a port
+reset moments earlier leaves Port Status Change Events sitting at the
+consumer's index, so the wait returned immediately, the drain consumed those,
+and the command's completion -- not yet written -- was reported as never
+arriving. On an emulator the completion is already there and one drain finds
+both, which is why this never showed. It now drains until it sees the
+completion for **its own** command. `Enable Slot` started working immediately.
+
+**2. Ports were read before they had settled.** The driver scanned once and
+took the first port whose connect bit was set. A port sampled during the moment
+it changes reports a connection that is not yet a device. There is now a proper
+debounce -- steady for 100 ms, sampled every 25 ms, 2 s timeout, the values
+read out of Linux's `drivers/usb/core/hub.c` rather than recalled -- and a
+second debounce after the port reset, on connected-**and**-enabled-**and**-has-a-speed.
+
+**3. The port was reset only if it was not already enabled.** That is the same
+thing as trusting the state firmware left the bus in. `HCRST` resets the
+controller, not the wire. The port is now always reset before addressing,
+because a reset is what returns an attached device to the Default state.
+
+Along the way the report stopped hiding things. `CompletionCode` gained `raw()`
+and `describe()`, host-tested with a round trip over all 256 values: the report
+used to print **"an unnamed completion code"** for anything outside six named
+ones, which is what an SR550 hit, so it named neither the meaning nor the
+number and the only way to learn either was another boot of a live server. A
+failed addressing now names the port, the speed, whether it was reset, how many
+attempts were spent, the completion code **and its number**, and the raw
+`PORTSC`. Address Device is also retried three times, which the specification
+prescribes in as many words.
+
+**What is still not fixed, and is probably not ours.** On the SR550 the device
+on port 1 does not answer:
+
+    xhci ports     26 of 26 powered, 0 with something attached, 26 quiet
+    xhci device    not addressed on port 1 at speed 3 after a reset after 3 attempt(s):
+                   the controller would not address the device
+                   (usb transaction error -- the device did not answer, code 4); portsc 0x00220e03
+
+`0x00220e03` decodes as connected, enabled, not resetting, link state **U0**,
+powered, high-speed, with the connect and reset change bits set. That is a
+healthy port with a live link. **USB Transaction Error** means the controller
+put `SET_ADDRESS` on the wire and got nothing back -- a USB-level silence, not
+a DMA failure, which is also why the `0xaa95f000` IOMMU fault is very likely
+unrelated to it. The device on that port is almost certainly the BMC's own
+emulated peripheral, and what it does after its port is reset is the BMC's
+business. Recorded rather than guessed at further: five explanations were tried
+and measured away before this one, and each cost a reboot of a live server.
+
 ### 2026-08-25 (the kernel programmed one IOMMU of four, and the xHCI was behind another)
 
 **RFC 0049, and the end of a four-boot hunt.** The xHCI's No-Op command went

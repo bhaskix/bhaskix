@@ -309,6 +309,15 @@ bhaskix_device::register_block! {
     }
 }
 
+/// How many times a command will drain the event ring waiting for its answer.
+///
+/// Each round is a whole `Wait`, so this bounds a command at `DRAIN_ROUNDS`
+/// settle periods rather than at one. Four because the events that get in the
+/// way are the port changes from a reset -- a small, bounded number of them --
+/// and a command that has not been answered after four full waits is not going
+/// to be.
+const DRAIN_ROUNDS: usize = 4;
+
 /// The moderation interval, in 250 ns units — about one interrupt per 16 µs.
 ///
 /// **Not left at the reset value**, which is zero and means an interrupt per
@@ -1163,6 +1172,32 @@ pub struct Drained {
     pub last_slot: u8,
 }
 
+impl Drained {
+    /// Folds a later drain's results into this one.
+    ///
+    /// Counts add. The "last" fields take the later round's value only when
+    /// that round saw an event of the matching kind, because a round that
+    /// drained nothing of a kind has no opinion about it and must not
+    /// overwrite what an earlier round learned.
+    fn absorb(&mut self, other: Self) {
+        self.events += other.events;
+        self.command_completions += other.command_completions;
+        self.port_changes += other.port_changes;
+        self.transfers += other.transfers;
+        self.host_controller += other.host_controller;
+        self.unrecognised += other.unrecognised;
+        if other.command_completions > 0 || other.transfers > 0 {
+            self.last_completion = other.last_completion;
+            self.last_command = other.last_command;
+            self.last_slot = other.last_slot;
+            self.remaining = other.remaining;
+        }
+        if other.port_changes > 0 {
+            self.last_port = other.last_port;
+        }
+    }
+}
+
 /// Consumes every event the controller has published, and dispatches by kind.
 ///
 /// **Pure, and reads through a closure rather than a slice.** The event ring is
@@ -1823,32 +1858,61 @@ impl<'a> Commander<'a> {
             .value
             .write(bhaskix_xhci::doorbell::Doorbell::command().0);
 
-        // Wait for the controller to publish something at the entry this
-        // consumer is looking at. Ownership is the cycle bit and nothing else:
-        // a zeroed entry has bit 0, a fresh consumer expects 1, so "not written
-        // yet" and "written" are distinguishable without reading anything else.
-        let consumer = &self.consumer;
+        // Wait for **this command's** answer, not for the next event to
+        // appear. Ownership is the cycle bit and nothing else: a zeroed entry
+        // has bit 0, a fresh consumer expects 1, so "not written yet" and
+        // "written" are distinguishable without reading anything else.
+        //
+        // # Why this is a loop, and what it cost to find out
+        //
+        // This used to wait for one owned entry, drain once, and take whatever
+        // that found as the answer. The event ring carries **every** kind of
+        // event, and the events waiting there are very often not answers to
+        // anything this function asked: a port reset moments earlier leaves
+        // Port Status Change Events sitting at the consumer's index, so the
+        // wait returns immediately, the drain consumes those, and the command's
+        // completion -- which the controller had not written yet -- is reported
+        // as never having arrived.
+        //
+        // On an emulator the completion is already in the ring by the time
+        // anything is read, so one drain finds both and the difference never
+        // shows. On an SR550 it showed as `Enable Slot` failing with **no
+        // completion code at all**, immediately after a No-Op on the same ring
+        // succeeded, which is the shape of a race rather than a refusal.
         let event_ring = self.event;
-        let arrived = wait.until(&mut || {
-            // SAFETY: the event ring is a frame `init` allocated; this reads
-            // one TRB at an index `Consumer` bounds to inside it. Volatile
-            // because the controller writes here by DMA.
-            let event = unsafe {
-                core::ptr::read_volatile((event_ring as *const [u32; 4]).add(consumer.index()))
-            };
-            consumer.owns(trb::Trb(event).cycle_bit())
-        });
+        let entries = self.memory.event_ring_entries;
+        let mut drained = Drained::default();
+        let mut arrived = false;
 
-        let drained = drain(
-            self.memory.event_ring_entries,
-            &mut self.consumer,
-            &mut |index| {
+        for _ in 0..DRAIN_ROUNDS {
+            let consumer = &self.consumer;
+            let owned = wait.until(&mut || {
+                // SAFETY: the event ring is a frame `init` allocated; this
+                // reads one TRB at an index `Consumer` bounds to inside it.
+                // Volatile because the controller writes here by DMA.
+                let event = unsafe {
+                    core::ptr::read_volatile((event_ring as *const [u32; 4]).add(consumer.index()))
+                };
+                consumer.owns(trb::Trb(event).cycle_bit())
+            });
+            if !owned {
+                break;
+            }
+            arrived = true;
+            drained.absorb(drain(entries, &mut self.consumer, &mut |index| {
                 // SAFETY: as above.
                 trb::Trb(unsafe {
                     core::ptr::read_volatile((event_ring as *const [u32; 4]).add(index))
                 })
-            },
-        );
+            }));
+            // The answer to *this* command, which is the only thing that ends
+            // the wait early. Anything else drained on the way is kept and
+            // counted, because an event this driver did not expect is a fact
+            // about the controller worth reporting.
+            if drained.command_completions > 0 && drained.last_command == asked_at {
+                break;
+            }
+        }
 
         // SAFETY: the runtime bank is inside the window, which `parameters`
         // checked.
@@ -2000,6 +2064,13 @@ pub fn control_transfer_stages(
 /// A port with something plugged into it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Connected {
+    /// `PORTSC` as it read once the port had settled.
+    ///
+    /// Carried so a failure to address can print the port's actual state
+    /// rather than leave a reader to infer it. Link state, connect, enable and
+    /// speed are all in here, and "the device did not answer" says none of
+    /// them.
+    portsc: u32,
     /// Which port, numbered from one as the specification numbers them.
     pub port: u8,
     /// The negotiated speed, from `PORTSC` bits 13:10.
@@ -2020,11 +2091,24 @@ pub struct Connected {
 ///
 /// `base` must be the mapped window and the port registers inside it, which
 /// [`parameters`] checked.
-unsafe fn find_connected_port<W: Wait>(
-    base: usize,
-    parameters: &Parameters,
-    wait: &mut W,
-) -> Option<Connected> {
+/// Reports what every root hub port says about itself.
+///
+/// **Because "no port has a device on it" is not a finding.** With 26 ports on
+/// a real machine that line says nothing about whether the ports are powered,
+/// whether anything is attached, or whether the driver looked too early. Each
+/// of those is a different bug and they were indistinguishable.
+///
+/// Ports with nothing to say are counted rather than printed: a boot report
+/// that lists 26 empty ports has buried the two that matter.
+///
+/// # Safety
+///
+/// The controller must be running and `base` its mapped window.
+unsafe fn report_ports(base: usize, parameters: &Parameters) {
+    let mut powered = 0u32;
+    let mut connected = 0u32;
+    let mut quiet = 0u32;
+
     for port in 1..=parameters.ports {
         let Some(offset) = operational::port_status_control(port) else {
             continue;
@@ -2034,47 +2118,282 @@ unsafe fn find_connected_port<W: Wait>(
         let register = unsafe {
             PortRegister::<bhaskix_device::Volatile>::new(base + parameters.operational + offset)
         };
-
         let status = operational::PortStatusControl(register.portsc.read());
-        if !status.current_connect_status() {
-            continue;
-        }
 
-        let mut reset = false;
-        if !status.port_enabled() {
-            // **`preserving` and not the value just read.** Seven of this
-            // register's bits are write-one-to-clear and bit 1 is
-            // write-one-to-*disable*, so writing back what was read clears
-            // every change bit that happened to be set and disables the port
-            // into the bargain. The symptom is a port that works once and then
-            // never reports another device.
-            register.portsc.write(status.preserving().0 | (1 << 4));
-            reset = true;
-            wait.until(&mut || {
-                operational::PortStatusControl(register.portsc.read()).port_enabled()
-            });
+        if status.port_power() {
+            powered += 1;
         }
-
-        let settled = operational::PortStatusControl(register.portsc.read());
-        // Acknowledge what changed, and only what changed. Built from the bits
-        // that are set rather than from the whole value, for the reason above.
-        register.portsc.write(
-            settled
-                .acknowledging(settled.0 & operational::PortStatusControl::WRITE_ONE_TO_CLEAR)
-                .0,
-        );
-
-        // **Speed zero is not a speed.** The specification says undefined, and
-        // a driver that passes it into a slot context has told the controller
-        // something it cannot act on -- so an enabled port that has not settled
-        // on a speed is not yet a device.
-        if settled.port_enabled() && settled.port_speed() != 0 {
-            return Some(Connected {
-                port,
-                speed: settled.port_speed(),
-                reset,
-            });
+        if status.current_connect_status() {
+            connected += 1;
+            crate::println!(
+                "    xhci port {port:<2}   connected: {}, {}, link state {}, speed {}",
+                if status.port_power() {
+                    "powered"
+                } else {
+                    "NOT POWERED"
+                },
+                if status.port_enabled() {
+                    "enabled"
+                } else {
+                    "not enabled"
+                },
+                status.port_link_state(),
+                status.port_speed(),
+            );
+        } else {
+            quiet += 1;
         }
+    }
+
+    crate::println!(
+        "    xhci ports     {} of {} powered, {connected} with something attached, {quiet} quiet",
+        powered,
+        parameters.ports,
+    );
+}
+
+/// How long a port must report a connection before the driver believes it.
+///
+/// **A connection is not a device.** A port that has just reported one is
+/// mid-transition, and resetting it then addresses something that is not ready
+/// to answer -- which on an SR550 came back as `Address Device` completing with
+/// **USB Transaction Error**: the controller asked and nothing replied.
+///
+/// The values are the ones Linux's `drivers/usb/core/hub.c` uses, read from it
+/// rather than recalled: stable for 100 ms, sampled every 25 ms, and give up
+/// after 2 seconds.
+const DEBOUNCE_STABLE_MICROS: u64 = 100_000;
+/// How often the port is sampled while debouncing.
+const DEBOUNCE_STEP_MICROS: u64 = 25_000;
+/// How long to keep looking for a port to settle before deciding none will.
+const DEBOUNCE_TIMEOUT_MICROS: u64 = 2_000_000;
+
+/// How many times an Address Device command is attempted before giving up.
+///
+/// Three, which is one more than Linux's `SET_ADDRESS_TRIES`, and the extra is
+/// because this driver has no `Disable Slot`/`Enable Slot` recovery to fall
+/// back on yet -- so its only other move is to report the device absent.
+const ADDRESS_TRIES: u8 = 3;
+
+/// How long to leave a device alone after resetting its port.
+///
+/// USB calls this `TRSTRCY` and requires 10 ms. Linux waits 10 + 40, and the
+/// extra is not superstition: a device that is addressed the instant its port
+/// enables is a device that has not finished coming out of reset.
+const RESET_RECOVERY_MICROS: u64 = 50_000;
+
+/// How many spins stand in for a delay on a machine with no calibrated clock.
+///
+/// The same second bound `Settle` carries and for the same reason: a boot that
+/// hangs in a delay loop is a machine that cannot say why.
+const PAUSE_SPINS: u64 = 2_000_000;
+
+/// Spins for roughly `micros`.
+///
+/// A busy wait rather than `time::sleep_micros`, because this runs during
+/// bring-up on the boot path and a driver that yields here is a driver whose
+/// device state can change under it.
+fn pause(micros: u64) {
+    let Some(span) = crate::time::micros(micros) else {
+        for _ in 0..PAUSE_SPINS {
+            core::hint::spin_loop();
+        }
+        return;
+    };
+    let deadline = crate::time::now() + span;
+    let mut spins = 0u64;
+    while crate::time::now() < deadline {
+        spins += 1;
+        if spins >= PAUSE_SPINS {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Whether a port currently reports something attached.
+///
+/// # Safety
+///
+/// `base` must be the controller's mapped window.
+unsafe fn port_connected(base: usize, parameters: &Parameters, port: u8) -> bool {
+    let Some(offset) = operational::port_status_control(port) else {
+        return false;
+    };
+    // SAFETY: the caller's obligation; the port register array is inside the
+    // operational bank, which is inside the window.
+    let register = unsafe {
+        PortRegister::<bhaskix_device::Volatile>::new(base + parameters.operational + offset)
+    };
+    operational::PortStatusControl(register.portsc.read()).current_connect_status()
+}
+
+/// The first port that has reported a connection steadily, or `None`.
+///
+/// **Steadily**, which is the whole point: the driver used to scan once and
+/// take the first port with the connect bit set. A port sampled during the
+/// moment it changes reports a connection that is not yet a device, and
+/// everything after that -- reset, slot, address -- is done to something that
+/// is not listening.
+///
+/// # Safety
+///
+/// The controller must be running and `base` its mapped window.
+unsafe fn debounced_port(base: usize, parameters: &Parameters) -> Option<u8> {
+    let mut waited = 0;
+    let mut steady: Option<(u8, u64)> = None;
+
+    while waited < DEBOUNCE_TIMEOUT_MICROS {
+        // SAFETY: the caller's obligation.
+        let found =
+            (1..=parameters.ports).find(|&port| unsafe { port_connected(base, parameters, port) });
+
+        steady = match (found, steady) {
+            // The same port again: it has now been connected for one more
+            // sampling interval.
+            (Some(port), Some((before, held))) if before == port => {
+                let held = held + DEBOUNCE_STEP_MICROS;
+                if held >= DEBOUNCE_STABLE_MICROS {
+                    return Some(port);
+                }
+                Some((port, held))
+            }
+            // A different port, or the first one seen: start counting again.
+            (Some(port), _) => Some((port, 0)),
+            // Nothing attached right now, so nothing is steady.
+            (None, _) => None,
+        };
+
+        pause(DEBOUNCE_STEP_MICROS);
+        waited += DEBOUNCE_STEP_MICROS;
+    }
+    None
+}
+
+/// Whether a port has come back from its reset ready to be addressed.
+///
+/// Connected, enabled and settled on a speed, held steady for the debounce
+/// interval. All three, because a port can report any one of them during a
+/// transition it has not finished.
+///
+/// # Safety
+///
+/// `base` must be the controller's mapped window.
+unsafe fn settled_after_reset(base: usize, parameters: &Parameters, port: u8) -> bool {
+    let Some(offset) = operational::port_status_control(port) else {
+        return false;
+    };
+    // SAFETY: the caller's obligation; the port register array is inside the
+    // operational bank, which is inside the window.
+    let register = unsafe {
+        PortRegister::<bhaskix_device::Volatile>::new(base + parameters.operational + offset)
+    };
+
+    let mut waited = 0;
+    let mut held = 0;
+    while waited < DEBOUNCE_TIMEOUT_MICROS {
+        let status = operational::PortStatusControl(register.portsc.read());
+        let ready =
+            status.current_connect_status() && status.port_enabled() && status.port_speed() != 0;
+        held = if ready {
+            held + DEBOUNCE_STEP_MICROS
+        } else {
+            0
+        };
+        if held >= DEBOUNCE_STABLE_MICROS {
+            return true;
+        }
+        pause(DEBOUNCE_STEP_MICROS);
+        waited += DEBOUNCE_STEP_MICROS;
+    }
+    false
+}
+
+unsafe fn find_connected_port<W: Wait>(
+    base: usize,
+    parameters: &Parameters,
+    wait: &mut W,
+) -> Option<Connected> {
+    // SAFETY: the caller's obligation.
+    let port = unsafe { debounced_port(base, parameters) }?;
+    let offset = operational::port_status_control(port)?;
+    // SAFETY: the caller's obligation; the port register array is inside the
+    // operational bank, which is inside the window.
+    let register = unsafe {
+        PortRegister::<bhaskix_device::Volatile>::new(base + parameters.operational + offset)
+    };
+
+    let status = operational::PortStatusControl(register.portsc.read());
+    // **Always, and not only when the port is disabled.**
+    //
+    // This used to reset the port only `if !status.port_enabled()`, which is
+    // the same thing as trusting whatever state the previous owner of this bus
+    // left it in. Firmware enumerates USB to look for a boot device: it
+    // resets, addresses and configures whatever it finds, and it leaves those
+    // ports **enabled**, with devices holding the addresses *it* assigned.
+    //
+    // `HCRST` resets the *controller*. It does not reach down the wire. A
+    // device that firmware addressed is still listening on that address, while
+    // `Address Device` speaks to the default address of zero -- so the device
+    // does not answer, the controller reports **USB Transaction Error**, and a
+    // working device is reported as no device at all. That is what an SR550
+    // did on port 1, three attempts running.
+    //
+    // A port reset is what puts an attached device back into the Default
+    // state, listening on address zero. It is not an error path; it is the
+    // first step of addressing anything.
+    //
+    // **`preserving` and not the value just read.** Seven of this register's
+    // bits are write-one-to-clear and bit 1 is write-one-to-*disable*, so
+    // writing back what was read clears every change bit that happened to be
+    // set and disables the port into the bargain. The symptom is a port that
+    // works once and then never reports another device.
+    register.portsc.write(status.preserving().0 | (1 << 4));
+    let reset = true;
+    wait.until(&mut || operational::PortStatusControl(register.portsc.read()).port_enabled());
+    // The recovery interval. The specification makes this software's job in as
+    // many words: "Software shall be responsible for timing the Reset
+    // 'recovery interval' required by USB."
+    pause(RESET_RECOVERY_MICROS);
+
+    // **And then wait for the device to come back, rather than assuming it
+    // already has.**
+    //
+    // A fixed recovery interval is right for a device made of silicon. The
+    // device on port 1 of a managed server is not: a BMC presents its virtual
+    // keyboard and virtual CD by *emulating* USB devices, and a port reset
+    // makes one of those detach and re-attach in the BMC's own time, which is
+    // not fifty milliseconds. Addressing it during that gap asks a device that
+    // is not there yet, and the controller answers **USB Transaction Error** --
+    // indistinguishable, in a boot report, from no device at all.
+    //
+    // So the port is debounced a second time, on everything addressing needs:
+    // still connected, now enabled, and settled on a speed.
+    // SAFETY: the caller's obligation.
+    if !unsafe { settled_after_reset(base, parameters, port) } {
+        return None;
+    }
+
+    let settled = operational::PortStatusControl(register.portsc.read());
+    // Acknowledge what changed, and only what changed. Built from the bits
+    // that are set rather than from the whole value, for the reason above.
+    register.portsc.write(
+        settled
+            .acknowledging(settled.0 & operational::PortStatusControl::WRITE_ONE_TO_CLEAR)
+            .0,
+    );
+
+    // **Speed zero is not a speed.** The specification says undefined, and
+    // a driver that passes it into a slot context has told the controller
+    // something it cannot act on -- so an enabled port that has not settled
+    // on a speed is not yet a device.
+    if settled.port_enabled() && settled.port_speed() != 0 {
+        return Some(Connected {
+            portsc: settled.0,
+            port,
+            speed: settled.port_speed(),
+            reset,
+        });
     }
     None
 }
@@ -2267,6 +2586,14 @@ pub struct Attached {
     pub frames: usize,
     /// What the device said when it was asked. RFC 0041 step 6.
     pub described: Described,
+    /// `PORTSC` of the port this step chose, once it had settled.
+    pub portsc: u32,
+    /// How many Address Device commands it took, or were spent failing.
+    ///
+    /// Reported because "the device did not answer" reads very differently at
+    /// one attempt and at three, and because a device that answers on the
+    /// second is a device this driver would have called absent before.
+    pub attempts: u8,
     /// Why it stopped, when it did not finish.
     pub stopped: Option<&'static str>,
     /// The completion code of the command that refused, when one did.
@@ -2305,6 +2632,13 @@ unsafe fn address_a_device<W: Wait>(
     let mut attached = Attached::default();
 
     // SAFETY: the caller's obligation.
+    // What the ports say, before deciding none of them has anything. Printed
+    // whether or not a device is found, because the interesting case is the
+    // one where the answer is "none" and the reason is invisible.
+    // SAFETY: the caller's obligation.
+    unsafe { report_ports(commander.base, parameters) };
+
+    // SAFETY: the caller's obligation.
     let Some(found) = (unsafe { find_connected_port(commander.base, parameters, wait) }) else {
         attached.stopped = Some("no port has a device on it");
         return attached;
@@ -2312,6 +2646,7 @@ unsafe fn address_a_device<W: Wait>(
     attached.port = found.port;
     attached.speed = found.speed;
     attached.reset = found.reset;
+    attached.portsc = found.portsc;
 
     // --- a slot ------------------------------------------------------------
     // SAFETY: the caller's obligation.
@@ -2407,11 +2742,39 @@ unsafe fn address_a_device<W: Wait>(
         attached.stopped = Some("the input context address is one the command cannot hold");
         return attached;
     };
-    // SAFETY: the caller's obligation -- a running controller, and rings that
-    // are its.
-    let Some(issued) = (unsafe { commander.issue(|cycle| command.with_cycle_bit(cycle), wait) })
-    else {
-        attached.stopped = Some("the command ring would have wrapped");
+    // **Asked more than once, because a device is entitled to be slow.** The
+    // specification's own note: *"If the SET_ADDRESS request was unsuccessful,
+    // system software may issue a Disable Slot Command for the slot or reset
+    // the device and attempt the Address Device Command again."* And on this
+    // exact completion code: *"A USB Transaction Error Completion Code for an
+    // Address Device Command may be due to a Stall response from a device."*
+    //
+    // A driver that asks once and gives up reports a device that is present
+    // and working as no device at all, which is what an SR550 did on port 1.
+    let mut issued = None;
+    for attempt in 0..ADDRESS_TRIES {
+        if attempt > 0 {
+            // The same recovery interval a reset gets. A device that has just
+            // refused an address is in no better a state than one that has
+            // just come out of reset.
+            pause(RESET_RECOVERY_MICROS);
+        }
+        // SAFETY: the caller's obligation -- a running controller, and rings
+        // that are its.
+        let Some(this) = (unsafe { commander.issue(|cycle| command.with_cycle_bit(cycle), wait) })
+        else {
+            attached.stopped = Some("the command ring would have wrapped");
+            return attached;
+        };
+        attached.attempts = attempt + 1;
+        let worked = this.succeeded();
+        issued = Some(this);
+        if worked {
+            break;
+        }
+    }
+    let Some(issued) = issued else {
+        attached.stopped = Some("the address command was never issued");
         return attached;
     };
     if !issued.succeeded() {
@@ -3753,6 +4116,93 @@ mod bringup_tests {
         // follows the allocation, which the controller writes to by DMA.
         assert_eq!(super::device_context_array_bytes(4), 5 * 8);
         assert_eq!(super::device_context_array_bytes(1), 2 * 8);
+    }
+}
+
+#[cfg(test)]
+mod absorb_tests {
+    use bhaskix_xhci::trb::CompletionCode;
+
+    use super::Drained;
+
+    /// A drain that saw only port changes -- what a port reset leaves behind.
+    fn ports(count: usize, last_port: u8) -> Drained {
+        Drained {
+            events: count,
+            port_changes: count,
+            last_port,
+            ..Drained::default()
+        }
+    }
+
+    /// A drain that saw one command completion.
+    fn completion(code: CompletionCode, command: u64, slot: u8) -> Drained {
+        Drained {
+            events: 1,
+            command_completions: 1,
+            last_completion: Some(code),
+            last_command: command,
+            last_slot: slot,
+            ..Drained::default()
+        }
+    }
+
+    #[test]
+    fn counts_add_across_rounds() {
+        let mut total = ports(2, 5);
+        total.absorb(completion(CompletionCode::Success, 0x1000, 3));
+        assert_eq!(total.events, 3);
+        assert_eq!(total.port_changes, 2);
+        assert_eq!(total.command_completions, 1);
+    }
+
+    #[test]
+    fn a_later_round_with_no_completion_does_not_erase_one() {
+        // **The property the fix depends on.** A command's answer arrives in
+        // round two; round three drains a stray port change. If that round
+        // overwrote the "last" fields the caller would be told the command was
+        // never answered, which is exactly the bug being fixed -- moved from
+        // the ring into the bookkeeping.
+        let mut total = ports(1, 4);
+        total.absorb(completion(CompletionCode::Success, 0x2000, 7));
+        total.absorb(ports(1, 9));
+
+        assert_eq!(total.last_command, 0x2000, "the completion was forgotten");
+        assert_eq!(total.last_completion, Some(CompletionCode::Success));
+        assert_eq!(total.last_slot, 7);
+        assert_eq!(total.last_port, 9, "the newer port change should win");
+    }
+
+    #[test]
+    fn a_later_completion_replaces_an_earlier_one() {
+        let mut total = completion(CompletionCode::Success, 0x1000, 1);
+        total.absorb(completion(CompletionCode::TrbError, 0x2000, 2));
+        assert_eq!(total.last_command, 0x2000);
+        assert_eq!(total.last_completion, Some(CompletionCode::TrbError));
+        assert_eq!(total.last_slot, 2);
+        assert_eq!(total.command_completions, 2);
+    }
+
+    #[test]
+    fn an_empty_round_changes_nothing() {
+        // Every "last" field set to something distinguishable from the
+        // default, because a round that drained nothing must not overwrite any
+        // of them -- and a test that starts from zeroes cannot tell an
+        // untouched field from one clobbered with a zero.
+        let before = Drained {
+            events: 3,
+            command_completions: 1,
+            port_changes: 2,
+            last_completion: Some(CompletionCode::Success),
+            last_command: 0x3000,
+            last_slot: 4,
+            last_port: 9,
+            remaining: 17,
+            ..Drained::default()
+        };
+        let mut total = before;
+        total.absorb(Drained::default());
+        assert_eq!(total, before);
     }
 }
 

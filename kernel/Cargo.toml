@@ -498,7 +498,21 @@ asm_budget = 10
 # drove the hardware before this kernel cannot be mistaken for one this kernel
 # caused. One extra call, and reading clears the records so the two are
 # disjoint by construction.
-unsafe_budget = 1826
+# 1830 for `report_ports`: every root hub port read and summarised before the
+# driver concludes none of them has a device. "No port has a device on it" is
+# not a finding on a machine with 26 ports -- unpowered, nothing attached, and
+# looked-at-too-early are different bugs and were indistinguishable. One mapped
+# port register per port, which is the same access `find_connected_port` makes
+# beside it.
+# 1835 for the port debounce: `port_connected` reads one port register and
+# `debounced_port` samples through it until a connection has held steady, which
+# is one mapped register per sample where the old code read each port once.
+# The debounce arithmetic itself is safe code beside it.
+# 1839 for `settled_after_reset`: the port is debounced a second time, after
+# its reset, on connected-and-enabled-and-has-a-speed rather than on a fixed
+# recovery interval. One mapped port register, sampled -- the same access
+# `port_connected` makes, on the one port already chosen.
+unsafe_budget = 1839
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
