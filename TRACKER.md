@@ -916,12 +916,35 @@ serial output`. That lane also passes locally: **4 of 4**
 
 Two different lanes, two commits that changed only Markdown, both failing at
 the assert step and neither reproducing in **seven** local runs between them.
-That is no longer "a flake" as a shrug: it is a **timing-sensitive gate that
-fails on CI's machines and not on this one**, and the shape of it — assert
-step, any lane — says a boot is running out of some budget under a slower,
-noisier runner. Which gate, and which budget, needs the log. Filed here rather
-than left as folklore, because "CI is flaky" is exactly the belief that let
-`main` stay red for sixteen commits in August.
+
+**And that last clause was presented as stronger evidence than it is.**
+Corrected the same day, before anyone relied on it. This machine runs **QEMU
+4.2.1**; CI installs `qemu-system-x86` from the Ubuntu archive on
+`ubuntu-latest`, which is 24.04 and ships **8.2.2** — four major versions
+apart. So seven local passes establish that these gates pass *on QEMU 4.2.1*.
+They say very little about a failure on 8.2.2, and **the boot lanes have never
+been run on the emulator CI uses**. "It does not reproduce here" was doing work
+it had not earned, which is the same mistake as blaming a scratchpad bound for a
+hang because changing it changed the symptom.
+
+Contention was ruled out properly, at least: the `bios`/`max` lane passes with
+twelve busy loops on eight CPUs, so it is not simply a slow machine.
+Acceleration was ruled out too — neither side passes `-enable-kvm` or `-accel`,
+so both run TCG.
+
+**What is now fixed is the ability to answer this at all.** The boot job
+uploads the serial log and the recorded environment as a failure artifact.
+Until today it uploaded the ISO and the kernel binary and *not* the log — so a
+red lane could be reproduced but not read, and `tools/ci-status.sh` could say
+`boot (bios, max) -- Boot and assert on serial output` while nothing on earth
+could say which of the 107 assertions that was. The next failure names its own
+gate.
+
+**Open, and a decision rather than a bug:** CI runs `ubuntu-latest`, so the
+emulator under 107 boot gates changes when GitHub moves that label, with no
+commit and no notice. Pinning it makes the environment reviewable and also
+freezes it. Not decided here, because what CI should guarantee is the project
+lead's call and not a tidy-up.
 
 **And the step name was free the whole time.** `tools/ci-status.sh` existed
 because the recorded blocker — *"reading Actions logs needs authentication"* —

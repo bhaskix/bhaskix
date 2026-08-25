@@ -97,10 +97,16 @@ jobs:
         # Printed because the two failures that matter here -- which APIC path
         # is taken, and whether the firmware image exists -- are decided by the
         # QEMU version and the packaging, not by our code.
+        #
+        # **Written to a file as well as printed**, because printing it puts it
+        # in a log that needs a token to read, and the version is exactly what
+        # a failure here needs. It is uploaded with the boot log below.
         run: |
-          qemu-system-x86_64 --version
-          echo "--- OVMF images present ---"
-          ls -la /usr/share/OVMF/ 2>/dev/null || echo "no /usr/share/OVMF"
+          {
+            qemu-system-x86_64 --version
+            echo "--- OVMF images present ---"
+            ls -la /usr/share/OVMF/ 2>/dev/null || echo "no /usr/share/OVMF"
+          } | tee ci-env-${{ matrix.firmware }}-${{ matrix.cpu }}.txt
 
       - name: Fetch Limine
         run: |
@@ -114,14 +120,26 @@ jobs:
       - name: Boot and assert on serial output
         env:
           QEMU_CPU: ${{ matrix.cpu }}
+          # A known path, so the failure artifact below can carry it. Without
+          # this the harness writes to `mktemp` and the one file that says
+          # *which gate went red* dies with the runner.
+          BHASKIX_BOOT_LOG: boot-${{ matrix.firmware }}-${{ matrix.cpu }}.log
         run: tests/qemu/boot-test.sh ${{ matrix.firmware }}
 
-      - name: Upload the image on failure
+      - name: Upload the boot log and image on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: bhaskix-${{ matrix.firmware }}-${{ matrix.cpu }}-failed
+          # **The serial log first, because it is the only thing here that
+          # names the failing gate.** This step used to upload the ISO and the
+          # kernel binary and not the log, so a red boot lane could be
+          # reproduced but not read: `tools/ci-status.sh` could say
+          # "boot (bios, max) -- Boot and assert on serial output" and nothing
+          # could say which of the 107 assertions that was.
           path: |
+            boot-${{ matrix.firmware }}-${{ matrix.cpu }}.log
+            ci-env-${{ matrix.firmware }}-${{ matrix.cpu }}.txt
             build/bhaskix.iso
             target/x86_64-unknown-none/release/bhaskix
           retention-days: 7
