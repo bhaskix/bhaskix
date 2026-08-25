@@ -185,7 +185,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso demo run run-uefi test test-host test-boot test-boot-uefi test-boot-iommu test-keyboard \
+.PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
         test-placements mkfs test-shell test-faults test-usb-keyboard fmt clippy gates hooks clean distclean help
 
@@ -542,6 +542,14 @@ test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-b
 # The shim is excluded because it is a freestanding binary with its own panic
 # handler, which collides with the test harness's. That is a reason, and it is
 # the only entry here that needs one.
+# The progress chart, drawn from `TRACKER.md` and the RFC headers.
+#
+# `TRACKER.md` stays the source of truth and is four thousand lines of prose;
+# this is the view of it that a person can read in one screen. Run it whenever
+# the tracker changes -- `make gates` fails when it is stale.
+progress:
+	@tools/progress.py
+
 test-host:
 	$(CARGO) test --target $(HOST_TARGET) --workspace --exclude bhaskix-boot-shim
 
@@ -744,6 +752,15 @@ hooks:
 # class of mistake that review reliably misses.
 gates:
 	tools/check-containment.sh
+# The progress chart still matches the tracker it is drawn from.
+#
+# `docs/progress.md` is generated, and a generated file that nobody
+# regenerates is a document that quietly stops being true -- which is the
+# failure three documents hit on 2026-08-25, when they went on stating a limit
+# a boot report had already discharged. Prose has no gate; this one does.
+	@tools/progress.py --check \
+	    && printf '  \033[1;32mok\033[0m    the progress chart matches the tracker\n' \
+	    || { printf '  \033[1;31mFAIL\033[0m  the progress chart is stale -- run `make progress`\n'; exit 1; }
 # The image builder still builds. It is behind a feature because the workspace
 # targets a machine with no `std`, and a tool nobody compiles is a tool that
 # has already stopped compiling.

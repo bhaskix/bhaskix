@@ -82,7 +82,8 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 >
 > [TRACKER.md](TRACKER.md) is the single source of truth for what is *proven* versus what merely
 > compiles, and it records the gaps rather than hiding them. This block is a summary of it; where
-> they disagree, TRACKER wins.
+> they disagree, TRACKER wins. **[docs/progress.md](docs/progress.md)** is the chart of it — every
+> RFC from draft to acceptance, generated, and gated so it cannot go stale.
 >
 > The design documents were written first, deliberately: kernel projects that begin with a clear
 > architecture evolve; those that begin with code rewrite.
