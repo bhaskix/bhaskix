@@ -867,6 +867,34 @@ machine, so no disk to mount`. Nothing has ever read that device through a
 translated controller. A green boot answered a question nobody asked, and
 saying so was a deliberate choice over closing the row.
 
+### 2026-08-25 (the new gate broke CI on its own first push)
+
+`13a7faf` added `docs/progress.md` and a gate that fails when it is stale. Run
+331 failed `project invariants`, which runs `make gates` — **and this one was
+not a flake.** It was the gate, failing on its own introduction, for a reason
+that was invisible on this machine.
+
+The chart dates each RFC from the commit that added its file
+(`git log --diff-filter=A`). `actions/checkout` fetches **one commit** by
+default. So CI computed different start dates from every full clone, generated
+a different chart, and reported it stale — a failure with nothing to do with
+the change under test, and a diff of forty changed dates to read before anyone
+would see why.
+
+Two fixes, because one of them is the cause and the other is the legibility:
+
+- The `project invariants` job now checks out with `fetch-depth: 0`. **Proven**
+  rather than assumed: a `--depth 1` clone of this repo fails `--check`, and
+  the same clone after `git fetch --unshallow` passes it.
+- `tools/progress.py` detects a shallow clone and says so — *"this is a shallow
+  clone, so no RFC start date can be computed"* — instead of printing "stale".
+  A tool that reports the wrong cause costs more than one that reports nothing.
+
+**A gate that depends on repository history is a gate with an environment
+dependency**, and this one shipped without anybody asking what CI's checkout
+looks like. It is the same shape as everything else this week: it worked on the
+machine it was written on.
+
 ### 2026-08-25 (main went red on a commit that changed only Markdown)
 
 `f0e336b` touched `TRACKER.md`, `docs/rfc/0049` and `docs/security.md` and

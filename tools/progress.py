@@ -426,7 +426,30 @@ def render() -> str:
     return "\n".join(out) + "\n"
 
 
+def shallow() -> bool:
+    """Whether this clone has been truncated, which breaks every start date.
+
+    **The failure mode this exists to name.** Start dates come from the commit
+    that added each RFC file, so a shallow clone -- which is what
+    `actions/checkout` produces by default -- computes different dates from a
+    full one and makes `--check` fail with a diff that has nothing to do with
+    the change under test. That happened on `13a7faf`. CI now fetches full
+    history; this says so out loud when it does not, instead of leaving
+    somebody to work it out from a wall of changed dates.
+    """
+    return run("git", "rev-parse", "--is-shallow-repository") == "true"
+
+
 def main() -> int:
+    if shallow():
+        print(
+            "this is a shallow clone, so no RFC start date can be computed.\n"
+            "  `docs/progress.md` dates each RFC from the commit that added its\n"
+            "  file; fetch full history (`fetch-depth: 0`, or `git fetch\n"
+            "  --unshallow`) before generating or checking it.",
+            file=sys.stderr,
+        )
+        return 1
     text = render()
     if "--check" in sys.argv:
         if not OUT.exists():

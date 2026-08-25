@@ -37,7 +37,15 @@ jobs:
     name: project invariants
     runs-on: ubuntu-latest
     steps:
+      # **Full history, on purpose.** `make gates` checks that
+      # `docs/progress.md` still matches the tracker, and that chart dates each
+      # RFC from the commit that added its file. `actions/checkout` fetches a
+      # single commit by default, so the tool would compute different dates
+      # here than anywhere else and the gate would fail for a reason that has
+      # nothing to do with the change under test. It did, on `13a7faf`.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Containment, vendor strings, SPDX, unsafe budgets, dependencies
         run: make gates
 
