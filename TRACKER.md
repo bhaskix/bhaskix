@@ -996,6 +996,62 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-25 (a fix that made a one-in-thirty flake into a certainty, and the comment that had already said so)
+
+**Two more intermittents, found by a 30-boot sweep, and one attempted fix
+reverted the same hour.**
+
+The sweep that was meant to date the TCP flake found two failures, not one.
+
+**Run 8 settled the TCP question.** `bin/tcpc started` at **19,623.935 ms**
+against 17,636–18,510 ms for all twenty-nine others — 1.1 s later than the
+slowest passing run — and the open row's independent measurement puts guest
+reachability at **19.62 s**. So the act **started late**; it did not merely run
+long. It then also ran long (10.35 s against a near-constant 8.23 s), which is
+the wait it caused. The instrument added an hour earlier is what made the
+difference readable, and the earlier reading — that a boot four seconds slower
+missed the rung — is now confirmed as *effect and cause together*, with the late
+start the part that matters.
+
+**Run 28 was something else entirely.** Normal timings, 154 segments, served —
+and `personality FAILED`, with `late-refusal false` the **only** false condition
+of six. One in thirty.
+
+The self-test waits for all eight of the probe's foreign calls and then asserts
+that re-tagging the domain Native is refused *because a thread exists*. The
+eighth call is the probe's own `exit`. So the question lands exactly while the
+thread is being torn down, and when the reap wins, the domain has zero threads
+and the re-tag is **correctly** allowed. The kernel is right at every instant;
+the test's expectation straddles the transition.
+
+**The obvious fix is wrong, and the source already said so.** Probing at the
+*first* call instead — the earliest moment a thread is known to exist — was
+implemented, compiled, and watched red, and then `make test` failed on the
+`uefi` lane with `not all eight foreign calls arrived`. At first-call arrival
+the thread count can still read zero, so the re-tag **succeeds**, the probe runs
+native from then on, and the remaining calls never come. That turns one failure
+in thirty into a failure every time.
+
+The comment directly above that code records this exact outcome from an earlier
+attempt — *"arrival (threads still zero), successfully re-tagged the domain
+Native — and then watched its own probe run native and call the check a
+failure"* — and it was read as advice about the **destroy** rather than about
+the probe. Reverted, with the reason now written where the next attempt will hit
+it: whatever fixes this has to make the thread's existence unambiguous at the
+moment of asking, not merely choose a different moment.
+
+**The log-retention fix earned itself inside an hour.** That `uefi` failure was
+caught because the harness now keeps a failing run's serial log and prints its
+path — an hour earlier the same failure would have left nothing, exactly as the
+`test-placements` one did.
+
+**And one thing found and deliberately not fixed.** `kernel/src/lib.rs` held
+**eight raw `ESC` bytes** in string literals where every other one of 533 uses
+the `\x1b` escape — invisible in an editor, and they defeated a textual search
+during this very session. Normalised. `user/shell/src/main.rs` has the same
+mixture (12 raw against 7 escaped) in **byte** literals; it is outside this
+change and is recorded here rather than swept up.
+
 ### 2026-08-25 (a flake that was never reproduced, reproduced three times — and the number that looked like the cause is printed too late to be one)
 
 **It was found by accident, twice, while doing something else.** The `iommu`

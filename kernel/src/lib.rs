@@ -3263,13 +3263,13 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
 
     let stop = || -> ! { sched::exit() };
     let Ok(file) = vfs::open(GO_PROGRAM) else {
-        println!("[93m    go corpus      absent: no bin/go-hello in the image[0m");
+        println!("\x1b[93m    go corpus      absent: no bin/go-hello in the image\x1b[0m");
         stop()
     };
     let bytes = file.bytes();
     if bytes.is_empty() {
         println!(
-            "[93m    go corpus      skipped: bin/go-hello is empty, which means this              machine had no Go toolchain when the image was built[0m"
+            "\x1b[93m    go corpus      skipped: bin/go-hello is empty, which means this              machine had no Go toolchain when the image was built\x1b[0m"
         );
         stop()
     }
@@ -3279,7 +3279,7 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     // The program headers, before the load, because the auxiliary vector
     // must tell the runtime where they are *in its own space*.
     let Ok(parsed) = elf::parse(bytes) else {
-        println!("[91m    go corpus      FAILED: the loader refused the binary[0m");
+        println!("\x1b[91m    go corpus      FAILED: the loader refused the binary\x1b[0m");
         stop()
     };
     let entry = parsed.entry;
@@ -3307,7 +3307,7 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
         .map(|segment| segment.address + (phoff - segment.file_offset) as u64)
         .unwrap_or(0);
     if elf::load_into(&parsed, bytes, &mut space, hhdm_base).is_err() {
-        println!("[91m    go corpus      FAILED: the segments would not map[0m");
+        println!("\x1b[91m    go corpus      FAILED: the segments would not map\x1b[0m");
         stop()
     }
     let Some(stack) = VirtRange::from_pages(VirtAddr(GO_STACK_AT), GO_STACK_PAGES) else {
@@ -7429,7 +7429,7 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         wait_millis(5);
     }
     if !spoke {
-        println!("[91m    personality    FAILED: no foreign calls arrived[0m");
+        println!("\x1b[91m    personality    FAILED: no foreign calls arrived\x1b[0m");
         return false;
     }
 
@@ -7437,6 +7437,22 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // half-run under one ABI and finished under another is not a state.
     // `Err` is the live refusal; `None` means the domain already ended,
     // which is a different way of being too late and proves the same rule.
+    //
+    // **This is timing-dependent and it is known to be**: the eighth call is
+    // the probe's own `exit`, so the question lands while the thread is being
+    // torn down, and when the reap wins the domain has zero threads and the
+    // re-tag is correctly allowed. Measured at **one boot in thirty** on an
+    // idle machine, 2026-08-25.
+    //
+    // **Probing earlier is not the fix, and was tried the same day.** Waiting
+    // for the *first* call instead makes it worse, not better: at that instant
+    // the thread count can still read zero, the re-tag **succeeds**, the probe
+    // then runs native and stops making foreign calls, and the self-test fails
+    // outright rather than one time in thirty. The comment above records that
+    // failure from an earlier attempt; it was reintroduced on 2026-08-25 by
+    // somebody who read it as advice about the destroy. Whatever fixes this
+    // has to make the thread's existence unambiguous at the moment of asking,
+    // not merely pick a different moment.
     let late = domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Native)
     });
