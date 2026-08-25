@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-08-23, all five steps done 2026-08-24 — including a boot on the SR550 where translation came up for the first time on physical hardware — awaiting the project lead's acceptance.** Opened the day the first readable hardware boot showed that RFC 0012 has never run on real hardware. The unit's tables are separable from any device's window; **unresolved question 1 is ANSWERED: pass-through, chosen by the project lead 2026-08-24**, and steps 3–4 are built and gated. Steps 1–2 landed 2026-08-23; step 5 — the watched boot on the SR550 — is the one that remains. ~~unresolved question 1 — refuse, identity-map, or pass-through — is still the project lead's to answer, but it is no longer blocked on a document.** The Intel VT-d specification was read on 2026-08-24: the context-entry translation-type field is at **bits 3:2**, pass-through is **`10b`**, `ECAP.PT` is bit 6, and pass-through carries a second obligation the RFC had not known — `AW` must be set to the largest AGAW the hardware supports. Steps 2–5 wait on the decision, not on the layout |
+| **Status** | ✅ **ACCEPTED 2026-08-25 — all five steps built, and translation came up on physical hardware for the first time in this project's life.** Unresolved question 1 — refuse, identity-map, or pass through — **answered by the project lead 2026-08-24: pass-through**, built and gated the same day, with the VT-d layout *read* rather than recalled (`TT` at bits 3:2, `10b`, `ECAP.PT` bit 6, and the obligation this RFC had not known: `AW` must be the largest AGAW the hardware supports). **Accepted with six limits recorded here rather than left to be inferred.** *(1)* **Its headline was narrower than it read.** Step 5 said an IOMMU was enabled on physical hardware; it was enabled on **one unit of the four** that machine describes, and the unit governing the PCH was not among them — so most of that machine's devices stayed untranslated while the report called them contained. [RFC 0049](0049-every-unit-the-firmware-named.md), accepted 2026-08-25, is what made the claim true. *(2)* **Question 2 is open**: functions behind a bridge have their requester ids rewritten and no machine here has one, so nothing is done about it and nothing is tested. *(3)* **Question 3 is unchanged**: `iommu=off` is still the only escape hatch, and it disables the *drivers* too, which is by design and also means it cannot be used to ask whether translation is what broke a device. *(4)* **Question 4 is NOT answered.** The BMC's emulated CD is read entirely *before* translation comes up — the image is an initrd the loader places in memory, and that machine reports `no block service on this machine, so no disk to mount` — so nothing has ever read it through a translated controller, and a boot that survives is not evidence that it would. *(5)* **This is a deliberate loosening on the emulator**, stated in §Security: two endpoints went from *blocked* to reaching all of memory. *(6)* On the SR550 it leaves **105 endpoints passed through by name and uncontained**, against **2 translated** — which is the honest shape of the win |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | `kernel/iommu`, `kernel/lib.rs` bring-up |
 | **Milestone** | Phase 2. It does not add a feature; it makes an existing one true off the emulator |
@@ -280,6 +280,17 @@ that it says what it did about each of them. Whether translation may safely be
 should be one somebody is watching.
 
 ## Unresolved questions
+
+**Where these stand at acceptance (2026-08-25).** Question 1 is **answered** —
+pass-through, chosen by the project lead on 2026-08-24, built and gated the
+same day. Questions 2 and 3 are **still open** and nothing here addresses
+them. Question 4 is **still open too, and the reason is worth stating**: the
+machine boots fine with translation on, and that is not evidence, because the
+BMC's CD is read entirely *before* the IOMMU comes up. The image is an initrd
+the loader places in memory, and the SR550 reports `no block service on this
+machine, so no disk to mount` — so nothing has ever read that device through a
+translated controller. A green boot answers a question nobody asked.
+
 
 1. **Identity-map, or pass through?** Refusing is eliminated (step 2). Both
    remaining answers give an undriven endpoint everything it already had; they
