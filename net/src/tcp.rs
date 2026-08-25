@@ -17,6 +17,7 @@
 //! Building it first is what proves that prerequisite is actually met, rather
 //! than met in a document.
 
+pub mod cookie;
 pub mod isn;
 pub mod segment;
 pub mod state;

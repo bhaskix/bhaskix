@@ -62,7 +62,7 @@ pub const TICK_NANOS: u64 = 4_000;
 /// keeps the hash input's length out of the attacker's hands. The second
 /// family arrived exactly where the old comment promised it would — this
 /// constant, this function — and nowhere else in the file.
-const ENCODED: usize = 38;
+pub(crate) const ENCODED: usize = 38;
 
 /// The tag for an IPv4 address slot in the encoding.
 const FAMILY_V4: u8 = 4;
@@ -104,7 +104,7 @@ pub fn initial_sequence(key: &Key, connection: FourTuple, now: u64) -> Sequence 
 /// sixteen-byte address slot (v4 in the first four bytes, the rest zero, the
 /// family byte making the padding unambiguous), and the port — so no two
 /// distinct tuples, same-family or cross-family, encode to the same bytes.
-fn encode(connection: FourTuple) -> [u8; ENCODED] {
+pub(crate) fn encode(connection: FourTuple) -> [u8; ENCODED] {
     // Ports in network order, which is the order they are seen in on the wire.
     let mut out = [0u8; ENCODED];
     encode_end(&mut out[0..19], connection.local, connection.local_port);

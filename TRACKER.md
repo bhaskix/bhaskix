@@ -867,6 +867,51 @@ machine, so no disk to mount`. Nothing has ever read that device through a
 translated controller. A green boot answered a question nobody asked, and
 saying so was a deliberate choice over closing the row.
 
+### 2026-08-25 (RFC 0048 step 2: a handshake that allocates nothing)
+
+**The arithmetic that makes step 1 stop mattering.** RFC 0048 shortened how
+long one `SYN` can wedge a listener — 242 seconds to 14 — and said in its own
+text that this is a reduction and not a fix: one `SYN` every fourteen seconds
+still owns the single accepted slot. Step 2 is the part that removes the trade
+instead of repricing it.
+
+`net/src/tcp/cookie.rs`: on a `SYN` nothing is allocated, and the initial
+sequence number *is* the state. The layout is the standard one — an 8-bit
+counter, a 3-bit MSS index, a 21-bit keyed hash over the four-tuple — built on
+the SipHash and the `RDRAND`-drawn key RFC 0021 already provides. **The counter
+and the MSS index are inside the hash**, not merely beside it in the clear:
+without that, a captured cookie can be aged backwards into validity or have its
+segment size raised to something the peer never offered. Both attacks have a
+test, and both tests were watched red.
+
+Twelve host tests, **six mutations each watched red** — the counter uncovered,
+the MSS uncovered, the age check skipped, the hash check skipped, the counter's
+eight-bit wrap compared without wrapping, and the MSS rounding the wrong way.
+One attempted mutation was *not* a mutation and is recorded as such:
+`saturating_sub` in place of `wrapping_sub` makes the age check **more**
+permissive, so nothing failed, and a stricter one had to be written to prove
+the wrap handling is load-bearing.
+
+A `tcp_cookie` fuzz target joins the fifteen already here, and it was watched
+red the same way: breaking `verify` in the permissive direction made it fail in
+seconds. It asserts two things that pull against each other — **soundness**,
+that nothing this key minted is ever refused inside its window, and
+**consistency**, that any acknowledgement it *does* accept behaves like its own
+cookie. It deliberately does not assert that a forged number is never accepted:
+the hash is twenty-one bits, so one draw in two million genuinely is a
+forgery, and a target asserting otherwise would be asserting against arithmetic
+this project chose on purpose.
+
+**Two costs are in the module's own documentation rather than left to be
+found.** Twenty-one bits gives a blind attacker one guess in 2²¹ per `ACK`. And
+three bits of MSS rounds the peer's announced size **down** to one of eight, so
+it is honoured approximately — down always, because a segment smaller than the
+peer can accept is delivered and one larger is not.
+
+**Steps 3 and 4 are not built**, and the open row above stays open until they
+are: `bin/tcpd` still births a connection from a `SYN`. This step is the
+arithmetic, proved on the host, with nothing on the wire using it yet.
+
 ### 2026-08-25 (the new gate broke CI on its own first push)
 
 `13a7faf` added `docs/progress.md` and a gate that fails when it is stale. Run

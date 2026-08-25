@@ -265,7 +265,21 @@ surviving a flood the harness *can* produce.
 1. **The split budget**, `MAX_SYNACK_RETRANSMITS`, with both host tests and all
    three mutations watched red. ✅ **Done 2026-08-24.**
 2. The cookie's arithmetic in `bhaskix-net`: encode, verify, expire. Pure,
-   `forbid(unsafe_code)`, fuzzed.
+   `forbid(unsafe_code)`, fuzzed. ✅ **Done 2026-08-25** — `net/src/tcp/cookie.rs`.
+   Twelve host tests, **six mutations each watched red**, and a `tcp_cookie`
+   fuzz target that was itself watched red by breaking `verify` in the
+   permissive direction. The layout is the standard one: an 8-bit counter, a
+   3-bit MSS index and a 21-bit keyed hash, with the counter and the index
+   **inside** the hash rather than merely beside it — otherwise a captured
+   cookie can be aged backwards into validity or have its segment size raised
+   to something the peer never offered, and both attacks have a test.
+
+   **Two costs are written into the module rather than left to be discovered.**
+   Twenty-one bits of hash gives a blind attacker one guess in 2²¹ per `ACK`;
+   that is the construction's number and it is not large. And three bits of MSS
+   means the peer's announced size is rounded **down** to one of eight, so the
+   value is honoured approximately — down, always, because a segment smaller
+   than the peer can accept is delivered and one larger is not.
 3. `bin/tcpd` builds the connection from a verified `ACK` rather than from a
    `SYN`.
 4. The gate: the wedge attempted, and survived.

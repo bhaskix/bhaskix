@@ -148,6 +148,15 @@ bench = false
 # RFC 0020 step 3, and the only target here whose subject remembers anything.
 # The other nine answer one question about one buffer; this one drives a
 # sequence of events into a control block that carries state across all of them,
+# A cookie is the one place here where an attacker chooses the input to a
+# security decision, which is why RFC 0048 step 2 asks for this by name.
+[[bin]]
+name = "tcp_cookie"
+path = "fuzz_targets/tcp_cookie.rs"
+test = false
+doc = false
+bench = false
+
 # so what it is searching for is an *order* rather than a malformed input.
 [[bin]]
 name = "tcp_state"
