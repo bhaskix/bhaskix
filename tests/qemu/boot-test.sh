@@ -92,13 +92,27 @@ FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
 # build machine also meant minutes of dead waiting per case. Polling separates
 # the two -- a healthy boot finishes in seconds and the timeout goes back to
 # being an upper bound rather than the running cost.
+#
+# **How long it took is recorded in `BOOT_ELAPSED_MS`, on every run.** Until
+# 2026-08-25 the only run whose duration anyone learned was one that had
+# already blown the budget, and a timeout that fires tells you nothing about
+# how close the runs that passed were. That is the wrong way round: a boot
+# creeping from a third of its budget to nine tenths is the thing worth seeing,
+# and it is invisible right up to the moment it stops being a warning and
+# becomes a red lane on somebody else's machine.
 run_until() {
     local logfile="$1" marker="$2" limit="$3"; shift 3
     : > "$logfile"
+    local started; started=$(date +%s%3N)
+    BOOT_ELAPSED_MS=0
     timeout "$limit" qemu-system-x86_64 "$@" >/dev/null 2>&1 &
     local pid=$! waited=0
     while kill -0 "$pid" 2>/dev/null; do
         if grep -qF -- "$marker" "$logfile" 2>/dev/null; then
+            # Stamped *before* the settle sleep below, so the figure is time to
+            # the marker and not time to the marker plus a constant this
+            # harness chose.
+            BOOT_ELAPSED_MS=$(( $(date +%s%3N) - started ))
             # Let the last few lines land before stopping the machine.
             sleep 1
             break
@@ -107,6 +121,7 @@ run_until() {
         waited=$((waited + 1))
         [[ $waited -gt $((limit * 4)) ]] && break
     done
+    [[ $BOOT_ELAPSED_MS -eq 0 ]] && BOOT_ELAPSED_MS=$(( $(date +%s%3N) - started ))
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
     return 0
@@ -396,7 +411,7 @@ status=0
 # when the actual cause was a second QEMU holding the disk image or a loaded
 # host. One accurate line is worth more than thirty misleading ones.
 if ! grep -qF "Nothing left to do at this milestone" "$LOG"; then
-    fail "the machine did not finish booting within ${TIMEOUT}s"
+    fail "the machine did not finish booting within ${TIMEOUT}s (gave up after $((BOOT_ELAPSED_MS / 1000)).$(printf '%03d' $((BOOT_ELAPSED_MS % 1000)))s)"
     if [[ ! -s "$LOG" ]]; then
         echo "        the serial log is empty -- qemu may not have started at all" >&2
         echo "        (a second run holding build/initrd.tar is the usual cause)" >&2
@@ -407,6 +422,27 @@ if ! grep -qF "Nothing left to do at this milestone" "$LOG"; then
     echo "--- serial log ---" >&2
     cat "$LOG" >&2
     exit 1
+fi
+
+# **What fraction of its own budget this boot used.** Reported, never asserted:
+# a wall-clock threshold here would be a test of whichever machine is running
+# it, which is the objection this file makes to performance budgets elsewhere
+# and means here too. What it buys is that the margin becomes visible on runs
+# that *pass* -- so a lane drifting toward its limit is a number somebody can
+# watch, instead of a red boot on a machine nobody can reproduce.
+#
+# It is the answer this harness could not give when two CI boot lanes went red
+# on 2026-08-25 and seven local runs would not reproduce either: local boots
+# here take 32-39s of a 120s budget, and whether CI's take 40 or 115 was
+# unknown and unknowable, because nothing measured a passing run.
+elapsed_s="$((BOOT_ELAPSED_MS / 1000)).$(printf '%03d' $((BOOT_ELAPSED_MS % 1000)))"
+used_pct=$(( BOOT_ELAPSED_MS / (TIMEOUT * 10) ))
+if [[ $used_pct -ge 50 ]]; then
+    printf '\033[1;33mnote\033[0m  booted in %ss, which is %s%% of the %ss budget -- close enough to the limit to be worth saying\n' \
+        "$elapsed_s" "$used_pct" "$TIMEOUT"
+else
+    printf '\033[2mnote\033[0m  booted in %ss, %s%% of the %ss budget\n' \
+        "$elapsed_s" "$used_pct" "$TIMEOUT"
 fi
 
 if grep -qF "$EXPECT_GREETING" "$LOG"; then

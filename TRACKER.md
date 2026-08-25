@@ -996,6 +996,72 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-25 (the boot harness could measure how close it came only after it had already lost)
+
+**A candidate for the two red boot lanes, and an instrument that can settle it
+on a run that passes.** Not a diagnosis — read the limits at the end.
+
+`boot-test.sh` gives a boot 120 seconds. What nobody had measured is how much
+of that a **passing** boot uses, because the figure was printed only by the
+failure path. Measured now, on this machine:
+
+| lane | to services up | wall clock | of a 120s budget |
+|---|---:|---:|---:|
+| bios | 30.1 s | 32.6 s | 25% |
+| uefi | 37.1 s | 39.4 s | 33% |
+| iommu | 26.2 s | — | — |
+| iommu-off | 30.1 s | — | — |
+
+A GitHub-hosted runner is four shared vCPUs, and **neither machine uses KVM** —
+there is no `-accel` or `-enable-kvm` anywhere in `QEMU_ARGS`, so both sides
+are TCG software emulation and that asymmetry is out. What is left is raw
+speed: a runner three times slower than this machine puts the `uefi` lane at
+118 seconds of a 120-second budget. That is not a prediction, it is the size of
+the margin.
+
+**A framing in the entry below is narrower than the evidence, and it is what
+kept this candidate out of view.** It reads *"Not the build, not installing
+QEMU: a gate went red."* The step that failed is `Boot and assert on serial
+output` — and the **did-not-finish-booting** path exits from that same step,
+with the same non-zero status and the same step name. "A gate went red" is one
+of two readings and was written as if it were the only one. The other reading
+was never considered, and it is the one the clock happens to favour.
+
+**What changed.** `run_until` stamps the moment the completion marker lands and
+records it in `BOOT_ELAPSED_MS`; every run now prints what fraction of its
+budget it used, dimmed under half and in yellow at or above it. **It is not a
+gate**, deliberately — a wall-clock threshold would be a test of whichever
+machine ran it, which is this file's standing objection to performance budgets
+and applies most where the machine is somebody else's. The failure line names
+the elapsed time too, so `within 120s` stops being the only number a timeout
+reports. All three paths were watched: normal (`25% of the 120s budget`),
+near-limit (`61%` under a 50 s budget) and the timeout itself (`gave up after
+5.055s`).
+
+**And the budgets rise in CI, where raising them is free.** 120 s was tuned
+when waiting out the timeout was the running cost of *every* case; polling
+ended that, and `run_until`'s own comment says so — a healthy boot stops the
+machine the moment the marker lands, so the limit is reached only by a boot
+that genuinely hangs. `BOOT_TEST_TIMEOUT: 300`, `SHELL_TEST_TIMEOUT: 600`,
+`FAULT_TEST_TIMEOUT: 300`, each with the reasoning written beside it. Local
+defaults are unchanged: a developer wants a hang to fail fast, and an
+unattended runner wants a slow machine to pass.
+
+**The limits, since this is a hypothesis wearing a fix's clothes:**
+
+- **Nothing is proven.** No CI log for runs 328 or 330 was ever read, so
+  whether either was a timeout or a gate is still unknown. If the next red lane
+  is a gate at 30% of budget, this entry was wrong and says so here first.
+- **It cannot be disproved by these runs either.** Raising the timeout removes
+  a suspect without identifying the culprit; if the lanes go quiet, that is
+  consistent with the timeout *and* with the flake simply not recurring.
+- The measurement is on `boot-test.sh` only. `shell-test.sh` — which is the
+  third red lane, run 324 — got the larger budget but not the instrument.
+- **The QEMU version gap is untouched**: 4.2.1 here against 8.2.2 there, and
+  the boot lanes have still never been run on the emulator CI uses. That
+  remains the better explanation of a *gate* failing, and this one only
+  competes for the other reading.
+
 ### 2026-08-25 (main went red on a commit that changed only Markdown)
 
 `f0e336b` touched `TRACKER.md`, `docs/rfc/0049` and `docs/security.md` and

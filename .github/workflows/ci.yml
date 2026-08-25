@@ -120,6 +120,19 @@ jobs:
       - name: Boot and assert on serial output
         env:
           QEMU_CPU: ${{ matrix.cpu }}
+          # **A limit that costs nothing until it is needed.** 120s was tuned
+          # back when waiting for the timeout was the running cost of every
+          # case, pass or fail. Polling ended that: `run_until` stops the
+          # machine the moment the completion marker lands, so on a healthy
+          # boot this number is never reached and raising it is free. It is
+          # paid only by a boot that genuinely hangs, and 300s of a hung lane
+          # is a cheaper mistake than a red lane on a slow runner.
+          #
+          # The margin, measured: a boot here takes 32-39s. A runner needing
+          # seven times that still passes. The harness now prints what
+          # fraction of the budget each run actually used, so this figure can
+          # be argued with from data instead of adjusted by feel.
+          BOOT_TEST_TIMEOUT: 300
           # A known path, so the failure artifact below can carry it. Without
           # this the harness writes to `mktemp` and the one file that says
           # *which gate went red* dies with the runner.
@@ -171,6 +184,11 @@ jobs:
       # given a capability for -- is a claim about what happens when someone
       # types at it.
       - name: Type at both shells and assert on their replies
+        env:
+          # Same reasoning as the boot lane's budget above, and the same
+          # evidence: this job has gone red once (run 324) without being
+          # reproducible locally.
+          SHELL_TEST_TIMEOUT: 600
         run: make test-shell
 
   faults:
@@ -192,4 +210,8 @@ jobs:
           make -C boot/limine/limine
 
       - name: Every exception reports rather than triple-faulting
+        env:
+          # Seven machines booted in sequence, each waiting for one exception
+          # to be reported. Same reasoning as the boot lane's budget above.
+          FAULT_TEST_TIMEOUT: 300
         run: make test-faults
