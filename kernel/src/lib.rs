@@ -7450,13 +7450,53 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // then runs native and stops making foreign calls, and the self-test fails
     // outright rather than one time in thirty. The comment above records that
     // failure from an earlier attempt; it was reintroduced on 2026-08-25 by
-    // somebody who read it as advice about the destroy. Whatever fixes this
-    // has to make the thread's existence unambiguous at the moment of asking,
-    // not merely pick a different moment.
+    // somebody who read it as advice about the destroy.
+    //
+    // The lesson taken from that was that the fix has to make the thread's
+    // existence unambiguous **at the moment of asking**, rather than pick a
+    // different moment to ask at. That is what the code below does.
+    // **And this is reported rather than asserted, because measured at this
+    // point it cannot fail.**
+    //
+    // `set_personality` returns `Err(HasThreads)` when a thread exists and
+    // `Ok` when none does, and by the time the eighth call has landed the
+    // probe has usually exited -- so `Ok` here is the *correct* answer to a
+    // question about a domain that no longer has a thread in it. Measured
+    // 2026-08-25: over twelve boots the answer was "the domain had already
+    // ended" **eleven times**, and the success line below was announcing "the
+    // tag refused once a thread existed" on every one of them.
+    //
+    // **Its detection power was then measured directly and is zero.** With the
+    // guard in `set_personality` deleted outright -- the rule simply gone --
+    // six boots of six passed. A condition that cannot fail is not a check,
+    // and leaving it in the pass condition was claiming an assurance that was
+    // not there.
+    //
+    // **Two repairs were tried and neither works here.** Asking at the *first*
+    // call instead: sound in principle, and ten boots of ten passed with the
+    // refusal genuinely exercised -- but one of the ten still read
+    // `(true, Ok)`, because `has_threads` consults the scheduler's queues and
+    // those are not under this table lock, so the thread can be reaped between
+    // the two calls inside one closure. Asking both questions "under one lock"
+    // therefore does not close the race, it narrows it -- and turns a one in
+    // thirty into about one in ten, with the failure now a *false* one, since
+    // the kernel was right at both instants.
+    //
+    // What would actually close it is a probe that is **guaranteed alive**
+    // while the question is asked -- one that does not spend its last call
+    // exiting. That is a change to the probe, not to the moment, and it is
+    // recorded in `TRACKER.md` rather than guessed at here.
     let late = domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Native)
     });
-    let refused_late = matches!(late, Some(Err(_)) | None);
+    // What actually happened, said plainly, so the rarity of the interesting
+    // case is visible in every boot report instead of hidden behind a sentence
+    // that assumed it.
+    let late_note = match late {
+        Some(Err(_)) => "a thread still existed and the tag change lost to it",
+        Some(Ok(())) => "the probe's thread was already gone, so no tag change was refused",
+        None => "the domain had already ended, so no tag change was refused",
+    };
 
     // The probe has said everything it can say; it is spinning, because a
     // program whose every exit is refused has no way out. Put it down --
@@ -7575,20 +7615,20 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         & (1u64 << (realm.as_u32() as usize % domain::MAX_DOMAINS))
         == 0;
 
-    if all_refused && no_smuggling && logged == 8 && sequence_right && refused_late && bit_cleared {
+    if all_refused && no_smuggling && logged == 8 && sequence_right && bit_cleared {
         println!(
             "    personality    a Linux-tagged domain asked getpid, write and exit: the pid \
              answered, the bad descriptor refused EBADF, and exit never came back; it then \
              asked for all five of this kernel's own syscall kinds by number and got a Linux \
              errno five times, surviving the one that is Exit natively; 8 foreign calls logged \
-             in order, the tag refused once a thread existed, and cleared when the domain ended"
+             in order, {late_note}, and the tag cleared when the domain ended"
         );
         true
     } else {
         println!(
             "\x1b[91m    personality    FAILED: answers {:#x} {:#x} {:#x}, smuggled \
              {smuggled:x?} survived {survived}, logged {logged}, numbers {numbers:?}, \
-             late-refusal {refused_late}, bit-cleared {bit_cleared}\x1b[0m",
+             late-refusal ({late_note}), bit-cleared {bit_cleared}\x1b[0m",
             answers[0], answers[1], answers[2]
         );
         false

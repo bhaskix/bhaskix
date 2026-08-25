@@ -1232,6 +1232,30 @@ impl Domain {
         self.personality
     }
 
+    /// Whether a thread exists in this domain.
+    ///
+    /// Both thread counts, because they answer at different moments: the
+    /// table's own field counts RFC 0017 `START`ed programs, and the
+    /// scheduler's atomic counts every spawned thread from the instant of its
+    /// spawn -- including kernel-spawned test threads, which is exactly what
+    /// the first version of [`Domain::set_personality`]'s guard missed. A tag
+    /// change must lose to a thread that merely *exists*, not only to one that
+    /// has registered.
+    ///
+    /// **Not public, and there is a story in that.** It was made public on
+    /// 2026-08-25 so a self-test could ask the same question
+    /// `set_personality` asks, under the same table lock, in the same instant
+    /// -- and that does not work: this consults the **scheduler's** queues,
+    /// which that lock does not cover, so the answer can change between two
+    /// calls inside one closure. Measured: one boot in ten read "a thread
+    /// exists" and then had the tag change accepted. Private again, because an
+    /// accessor whose only purpose was an approach that failed is an invitation
+    /// to try it again.
+    #[must_use]
+    fn has_threads(&self) -> bool {
+        self.threads > 0 || crate::sched::threads_in_domain(self.id) > 0
+    }
+
     /// Sets the dialect — refused once the domain has a thread, because a
     /// program half-run under one ABI and finished under another is not a
     /// state anyone can reason about. The bitmask the syscall entry reads
@@ -1239,16 +1263,11 @@ impl Domain {
     ///
     /// # Errors
     ///
-    /// [`DomainError::HasThreads`] if a thread already exists.
+    /// [`DomainError::HasThreads`] if a thread already exists — which is
+    /// exactly [`Domain::has_threads`], so a caller can ask what this will
+    /// answer before it answers.
     pub fn set_personality(&mut self, personality: Personality) -> Result<(), DomainError> {
-        // Both thread counts, because they answer at different moments: the
-        // table's own field counts RFC 0017 `START`ed programs, and the
-        // scheduler's atomic counts every spawned thread from the instant of
-        // its spawn -- including kernel-spawned test threads, which is
-        // exactly what the first version of this guard missed. A tag change
-        // must lose to a thread that merely *exists*, not only to one that
-        // has registered.
-        if self.threads > 0 || crate::sched::threads_in_domain(self.id) > 0 {
+        if self.has_threads() {
             return Err(DomainError::HasThreads);
         }
         self.personality = personality;

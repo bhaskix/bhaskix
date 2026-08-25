@@ -356,11 +356,24 @@ status=0
 # not a hypothetical: it did, when the wake-up was removed to check that this
 # test could fail. Only the conversation counts.
 SESSION="$(mktemp)"
-if [[ -n ${BHASKIX_SHELL_LOG:-} ]]; then
-    trap 'rm -f "$FIFO" "$SESSION"' EXIT
-else
-    trap 'rm -f "$LOG" "$FIFO" "$SESSION"' EXIT
-fi
+# **The log survives a failing run, named or not** -- the same change
+# `boot-test.sh` got on 2026-08-25, and for the same reason: deleting the
+# record of a failure at the moment it becomes worth having is how three
+# separate intermittents this week went undiagnosed. It earned itself within
+# the hour there, and this harness went red the same evening with its log
+# already gone.
+cleanup_session() {
+    local outcome=$?
+    rm -f "$FIFO" "$SESSION"
+    if [[ -n ${BHASKIX_SHELL_LOG:-} ]]; then
+        :
+    elif [[ $outcome -ne 0 ]]; then
+        printf '\033[2mnote\033[0m  the serial log of this failing run is kept at %s\n' "$LOG" >&2
+    else
+        rm -f "$LOG"
+    fi
+}
+trap cleanup_session EXIT
 sed -n "/$started/,\$p" "$LOG" > "$SESSION"
 
 # Each check is a *reply* to something typed, not an echo of it. The shell
