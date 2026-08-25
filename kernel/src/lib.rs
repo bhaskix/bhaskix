@@ -12421,10 +12421,31 @@ fn start_tcp_client_domain(
     .map_err(|_| "the tcp client would not spawn")?;
 
     TCPC_REPORT.store(report.as_u64(), Ordering::Release);
-    println!(
-        "    tcp client     bin/tcpc started: four rings and two wakes its domain owns, a badged capability to \
-         the service, and nothing wired between them by the kernel"
-    );
+    // **The uptime, because `boot cost` is printed after this act and cannot
+    // date it.**
+    //
+    // The host-side inbound connection lands on one of slirp's SYN-retransmit
+    // rungs, and the tracker's measurement puts the shipped configuration about
+    // a tenth of a second inside one. Whether a boot misses the rung is
+    // therefore a question about *when this line happens*, and until 2026-08-25
+    // nothing in the report could answer it: the only uptime figure is `boot
+    // cost`, printed after the act and so containing it. A sweep of 14 boots
+    // found the one failing run reaching `boot cost` 3.9 s later than any
+    // passing run and could not say whether that was the cause or the wait it
+    // caused -- the failing run did *less* work (63 segments against 155) in
+    // more time, which is what an effect looks like.
+    match crate::time::now_nanos() {
+        Some(nanos) => println!(
+            "    tcp client     bin/tcpc started at {}.{:03} ms: four rings and two wakes its domain owns, \
+             a badged capability to the service, and nothing wired between them by the kernel",
+            nanos / 1_000_000,
+            nanos % 1_000_000 / 1_000,
+        ),
+        None => println!(
+            "    tcp client     bin/tcpc started (no clock yet): four rings and two wakes its domain owns, \
+             a badged capability to the service, and nothing wired between them by the kernel"
+        ),
+    }
     Ok(())
 }
 

@@ -2145,8 +2145,13 @@ unsafe fn report_ports(base: usize, parameters: &Parameters) {
         }
     }
 
+    // **"after the search" is in the line, not left to be inferred.** The
+    // numbers mean something different depending on when they were taken, and
+    // a reader who does not know when cannot use them -- which is how this
+    // line came to contradict the one below it for a fortnight.
     crate::println!(
-        "    xhci ports     {} of {} powered, {connected} with something attached, {quiet} quiet",
+        "    xhci ports     [after the search] {} of {} powered, {connected} with something \
+         attached, {quiet} quiet",
         powered,
         parameters.ports,
     );
@@ -2646,15 +2651,31 @@ unsafe fn address_a_device<W: Wait>(
 ) -> Attached {
     let mut attached = Attached::default();
 
+    // **The search first, and the survey after it.**
+    //
+    // These two lines used to be the other way round, and on a real machine
+    // they contradicted each other. `find_connected_port` debounces for up to
+    // two seconds waiting for a port to report a connection steadily; a survey
+    // taken *before* that is a snapshot of the instant after `HCRST`, when the
+    // root hub has not finished re-detecting anything. On an SR550 the report
+    // read `26 of 26 powered, 0 with something attached, 26 quiet` and the very
+    // next line addressed a device on port 1. Both were true when printed and
+    // together they were unreadable.
+    //
+    // Taken afterwards, the survey describes the state the driver actually
+    // acted on -- and when nothing is found it is the far more useful fact,
+    // because "nothing appeared in two seconds of looking" and "nothing was
+    // there the moment we glanced" are different findings and this line could
+    // not tell them apart.
     // SAFETY: the caller's obligation.
-    // What the ports say, before deciding none of them has anything. Printed
-    // whether or not a device is found, because the interesting case is the
-    // one where the answer is "none" and the reason is invisible.
+    let found = unsafe { find_connected_port(commander.base, parameters, wait) };
+
+    // Printed whether or not a device was found, because the interesting case
+    // is the one where the answer is "none" and the reason is invisible.
     // SAFETY: the caller's obligation.
     unsafe { report_ports(commander.base, parameters) };
 
-    // SAFETY: the caller's obligation.
-    let Some(found) = (unsafe { find_connected_port(commander.base, parameters, wait) }) else {
+    let Some(found) = found else {
         attached.stopped = Some("no port has a device on it");
         return attached;
     };

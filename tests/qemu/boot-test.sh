@@ -28,10 +28,26 @@ TIMEOUT="${BOOT_TEST_TIMEOUT:-120}"
 #
 # The log is kept when the caller named it: they asked for it, so deleting it
 # on the way out would be answering a different question.
+#
+# **And kept when the run failed, named or not.** Deleting the log of a failing
+# boot destroys the only record of *why* at exactly the moment it becomes worth
+# having -- and an intermittent is precisely the failure you cannot ask to
+# happen again. It cost a real one on 2026-08-25: `make test-placements` went
+# red on the `bios` lane, passed on re-run, and its log had already been
+# removed, so which gate went red is unknown and unknowable. The path is
+# printed, because a file kept in `mktemp` that nobody is told about is the
+# same as no file.
 restore_image() { :; }
 cleanup() {
+    local outcome=$?
     restore_image
-    [[ -n ${BHASKIX_BOOT_LOG:-} ]] || rm -f "$LOG"
+    if [[ -n ${BHASKIX_BOOT_LOG:-} ]]; then
+        :
+    elif [[ $outcome -ne 0 ]]; then
+        printf '\033[2mnote\033[0m  the serial log of this failing run is kept at %s\n' "$LOG" >&2
+    else
+        rm -f "$LOG"
+    fi
 }
 trap cleanup EXIT
 
