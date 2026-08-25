@@ -1000,6 +1000,50 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-26 (the progress gate failed on a commit nobody could have made correctly — its second defect in three days)
+
+**CI run 345 went red on `project invariants`.** Not a boot lane, not a
+flake, and not reproducible locally — because it could not be. The gate was
+asking for something the author could not supply.
+
+`docs/progress.md` carried a `Newest commit` row and, more importantly, ended
+**every open RFC's bar** at `git log -1 --date=short`. Commit `67b2cba` was the
+first commit after midnight. Its chart was regenerated before it existed and so
+said `2026-08-25`; the gate regenerated the chart *at* that commit, got
+`2026-08-26`, and called the file stale. Correctly, and uselessly: **the field
+is self-referential**, and no amount of care lets somebody write down the date
+of a commit they have not made yet. Every first-commit-of-a-day would have
+failed, for ever.
+
+The next commit passed for the wrong reason — by then the working copy had been
+regenerated with HEAD already on the 26th — which is how a bug like this stays
+hidden: it looks like a flake that fixed itself.
+
+**Fixed by taking the date from the tracker instead of from git.** The chart is
+generated from `TRACKER.md`; its horizon should come from there too. `latest` is
+now the newest **dated changelog heading** or RFC acceptance — both records of
+something that happened, both moving only in the commit that records them, so
+"regenerate when the tracker changes" becomes a rule a person can obey.
+
+**And the first version of that fix was wrong in an instructive way.** Sweeping
+up every `20xx-xx-xx` in the tracker returned **2026-11-29** — the planned first
+release — which would have drawn every open bar four months into the future. A
+heading and an acceptance record work; a *plan* records an intention, and this
+file draws only what happened. Caught by looking at the output rather than at
+the diff.
+
+Proven rather than assumed: HEAD's date appears **zero** times in the generated
+file, `--check` passes, regeneration is idempotent, and the script no longer
+calls `git log -1` for a date at all.
+
+**This is the second defect in this gate in three days**, and the pair rhyme.
+The first broke CI on its own introduction — `git log --diff-filter=A` against a
+shallow clone, fixed with `fetch-depth: 0`. Both are the same mistake: a
+generator that reads *the repository's state at generation time* and a checker
+that reads it again somewhere else, with no thought for how those two contexts
+differ. A gate is a claim about what an author must do, and a claim they cannot
+satisfy is worse than no gate, because it teaches people that red means nothing.
+
 ### 2026-08-25 (the boot lanes finally ran on the emulator CI uses, and it was never a limit — only a belief)
 
 **`TRACKER.md` has said, in several places and correctly, that the boot lanes

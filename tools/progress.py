@@ -265,6 +265,30 @@ def bar(rfc: Rfc, today: str) -> str | None:
     return f"    {label} :active, {ident}, {rfc.started}, {max(today, rfc.started)}"
 
 
+def newest_recorded(tracker: str, rfcs: list["Rfc"]) -> str:
+    """The newest date `TRACKER.md` and the RFC headers actually record.
+
+    Used as the right-hand end of every *open* RFC bar, and reported as the
+    chart's own high-water mark. Deliberately not the wall clock and not
+    `HEAD`'s date -- see the note in `render`.
+
+    Falls back to the project start when nothing is found, which keeps a
+    malformed tracker from producing a chart with no time axis at all.
+    """
+    # **Dated changelog headings and RFC acceptances, and nothing else.**
+    #
+    # Not every date in the file: the first draft of this swept up *every*
+    # `20xx-xx-xx` in the tracker and came back with **2026-11-29**, which is
+    # the planned first release -- a date recording an intention, not work. It
+    # would have drawn every open bar four months into the future. A heading
+    # and an acceptance are both records of something that happened; a plan is
+    # not, and this file draws only what happened.
+    dates = re.findall(r"(?m)^###\s+(20\d\d-[01]\d-[0-3]\d)", tracker)
+    dates += [r.accepted for r in rfcs if r.accepted]
+    real = [d for d in dates if d]
+    return max(real) if real else PROJECT_START
+
+
 def render() -> str:
     tracker = TRACKER.read_text(encoding="utf-8")
     every = read_rfcs()
@@ -272,7 +296,26 @@ def render() -> str:
     annexes = [r for r in every if r.annex]
     milestones = read_milestones(tracker)
     bullets = read_phase_bullets(tracker)
-    today = run("git", "log", "-1", "--format=%ad", "--date=short") or PROJECT_START
+    # **The open bars end at the newest date the *tracker* records, not at the
+    # newest commit.**
+    #
+    # It used to be `git log -1 --date=short`, and that made this file
+    # unsatisfiable for the first commit of any day. Every open RFC's bar ends
+    # at this date, so the chart legitimately changes the moment HEAD's date
+    # changes -- and an author cannot regenerate a chart containing their own
+    # commit's date *before* that commit exists. The gate then fails on a
+    # commit nobody could have made correctly. It did, on run 345: `67b2cba`
+    # was the first commit after midnight, its chart said 2026-08-25, the gate
+    # regenerated 2026-08-26, and called it stale. Correctly, and uselessly.
+    #
+    # A date out of `TRACKER.md` has neither problem. It moves only when the
+    # tracker records a new one, which happens in the same commit that
+    # regenerates this file -- so the rule "regenerate when the tracker
+    # changes" becomes something a person can actually obey. And it keeps this
+    # file's own promise that no date here is invented: wall-clock time would
+    # have fixed the gate by inventing exactly the kind of date the header
+    # refuses to draw.
+    latest = newest_recorded(tracker, every)
 
     accepted = [r for r in rfcs if r.state == "accepted"]
     openish = [r for r in rfcs if r.state == "open"]
@@ -318,7 +361,7 @@ def render() -> str:
     add(f"| Milestone rows done | **{done_total} of {all_total}** |")
     finished = sum(1 for _, ok, _ in bullets if ok)
     add(f"| Phase 2 bullets done | **{finished} of {len(bullets)}** |")
-    add(f"| Newest commit | {today} |")
+    add(f"| Newest dated entry | {latest} |")
     add("")
 
     add("## Timeline")
@@ -342,7 +385,7 @@ def render() -> str:
 
     order = [n for n, _ in THEMES] + ["Kernel"]
     for name in sorted(sections, key=lambda n: order.index(n) if n in order else 99):
-        rows = [bar(r, today) for r in sorted(sections[name], key=lambda r: r.number)]
+        rows = [bar(r, latest) for r in sorted(sections[name], key=lambda r: r.number)]
         rows = [r for r in rows if r]
         if not rows:
             continue

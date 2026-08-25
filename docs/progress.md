@@ -15,7 +15,7 @@
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
-| Newest commit | 2026-08-26 |
+| Newest dated entry | 2026-08-26 |
 
 ## Timeline
 
