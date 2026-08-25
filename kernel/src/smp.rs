@@ -484,7 +484,6 @@ fn native_start(handoff: &bhaskix_boot::Handoff) -> u32 {
         };
         started += 1;
 
-        let before = percpu::online_count();
         mailbox.store(stack.top, Ordering::Release);
         // INIT takes the processor to wait-for-SIPI; the settle delay is
         // the protocol's, ten milliseconds; STARTUP releases it into the
@@ -524,7 +523,22 @@ fn native_start(handoff: &bhaskix_boot::Handoff) -> u32 {
         // Claimed: some processor is on its way through the kernel's own
         // bring-up. Under emulation that walk can take seconds, so the
         // arrival deadline is generous where the claim deadline was not.
-        wait_until_online(before + 1, 4 * WAIT_NANOS);
+        //
+        // **Waited on *this* processor, not on the count going up.** It used
+        // to be `wait_until_online(before + 1)`, and a count is not an
+        // identity: a processor from an *earlier* iteration arriving late
+        // satisfies it, the wait returns, `is_online_lapic(lapic)` is still
+        // false, and this prints that `lapic` never reported in -- about a
+        // processor that is on its way and does arrive. The symptom was a
+        // warning on **every** boot of the native-loader lane, sometimes twice,
+        // on a machine that then reported `4 online of 4`. Both statements were
+        // true and together they were nonsense.
+        //
+        // A false alarm printed every time is worse than no alarm: it was read
+        // as a real bring-up defect and sent one investigation looking for a
+        // shared stack that does not exist -- each offer gets its own slot,
+        // a few lines above.
+        wait_for(|| percpu::is_online_lapic(lapic), 4 * WAIT_NANOS);
         if !percpu::is_online_lapic(lapic) {
             println!(
                 "\x1b[93m    smp              lapic {lapic} claimed a stack and never reported in\x1b[0m"
