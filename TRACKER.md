@@ -796,6 +796,32 @@ A task cannot be `DONE` with any of these failing. Each becomes active at the mi
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-25 (main went red on a commit that changed only Markdown)
+
+`f0e336b` touched `TRACKER.md`, `docs/rfc/0049` and `docs/security.md` and
+nothing else. CI run 328 failed. Markdown cannot affect a boot, so this is a
+flake — but "so this is a flake" is exactly the sentence that let CI stay red
+for sixteen commits in August, so it was checked rather than assumed:
+
+- Failing job **and step**: `boot (uefi, qemu64) -- Boot and assert on serial
+  output`. Not the build, not installing QEMU: a gate went red.
+- The same lane, same CPU model, run locally: **3 passes out of 3**
+  (`QEMU_CPU=qemu64 tests/qemu/boot-test.sh uefi`).
+- **Which gate flaked is not known**, and cannot be without the run's log.
+  Recorded as unknown rather than guessed.
+
+**And the step name was free the whole time.** `tools/ci-status.sh` existed
+because the recorded blocker — *"reading Actions logs needs authentication"* —
+had been read as "so nothing is available", when job-level pass/fail was
+unauthenticated all along. The same belief hid one more level: **step**
+conclusions come back on the same request, and the tool did not ask for them
+until today. "The boot lane failed" and "the boot lane failed while asserting
+on serial output" are different amounts of diagnosis, and the second was
+already paid for.
+
+The tool now prints the step. What authentication still buys is the log line,
+which is the last mile.
+
 ### 2026-08-25 (RFC 0049 ACCEPTED: the containment claim was narrower than the report said, on every multi-unit machine)
 
 **Accepted the day it was measured, and the correction it forces is larger than

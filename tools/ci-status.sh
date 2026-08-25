@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# What CI thinks of `main`, and which job says so.
+# What CI thinks of `main`, and which job -- and which step of it -- says so.
 #
 # Usage:  tools/ci-status.sh [count]        # default 12 pushes
 #
@@ -23,10 +23,18 @@
 # `TRACKER.md` recorded a blocker: *"Reading Actions logs needs authentication;
 # unauthenticated API gives 60 requests/hour and only pass/fail."* Both halves
 # are true and the conclusion drawn from them was wrong. Pass/fail is available
-# **per job**, unauthenticated, and the name of the failing job is nearly all of
-# the diagnosis: `clippy` red and every other job green points at one command a
-# developer can run locally in seconds. What authentication buys is the *log*,
-# which is the last mile, not the first.
+# **per job and per step**, unauthenticated, and the name of the failing job is
+# nearly all of the diagnosis: `clippy` red and every other job green points at
+# one command a developer can run locally in seconds. What authentication buys
+# is the *log*, which is the last mile, not the first.
+#
+# **The step names were free too, and this tool did not ask for them until
+# 2026-08-25.** The same belief that hid the job names one level up hid the
+# steps one level down: a docs-only commit turned `boot (uefi, qemu64)` red, and
+# "the boot lane failed" does not say whether it failed building, installing
+# QEMU, or asserting on serial output -- three different problems. It failed
+# asserting, which is the one that means "a gate went red", and the lane then
+# passed three times out of three locally.
 #
 # So this script asks for exactly what is free, and says plainly when the answer
 # is rate-limited rather than printing an empty table and letting silence read as
@@ -120,7 +128,21 @@ try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-bad = [j["name"] for j in data.get("jobs", []) if j.get("conclusion") not in ("success", None)]
+# The failing job, **and the step inside it that failed**. Step conclusions
+# come back on the same unauthenticated request the job names do -- one more
+# notch of diagnosis for free. A job name says "the boot lane"; a step name
+# says whether it failed building, installing QEMU, or asserting on serial
+# output, and those are three different problems.
+bad = []
+for j in data.get("jobs", []):
+    if j.get("conclusion") in ("success", None):
+        continue
+    steps = [
+        s.get("name", "?")
+        for s in (j.get("steps") or [])
+        if s.get("conclusion") not in ("success", "skipped", None)
+    ]
+    bad.append(j["name"] + (" -- " + "; ".join(steps) if steps else ""))
 print(", ".join(bad))
 ')"
         if [[ -n "$names" ]]; then
