@@ -76,7 +76,21 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > domain id, a device reaches only the frames it was given, revoking a mapping is enforced against
 > the hardware, and interrupt remapping is **on by default** — so a device cannot raise an interrupt
 > it was never programmed to raise, which is what retires [RFC 0011](rfc/0011-irq-handler.md)'s
-> residual risk. The boot says which world the machine is in:
+> residual risk.
+>
+> **That last sentence is true of one remapping unit, and a platform may have several.**
+> Corrected 2026-08-25 on accepting [RFC 0049](rfc/0049-every-unit-the-firmware-named.md), which
+> made translation reach every unit the firmware names and **deliberately left interrupt remapping
+> where it was**: `enable_interrupt_remapping` programs the first programmed unit and no other. On
+> the SR550 — four units — that means devices governed by the other three can raise interrupts this
+> kernel never issued them, so RFC 0011's residual risk is retired **for the devices under unit
+> zero and for no others**. It is a smaller claim than the paragraph above made for three weeks,
+> and it is smaller than the fix that shipped beside it: translation was widened to every unit
+> because there was evidence forcing it, and remapping was not, because there was none. Widening it
+> needs a machine that routes an interrupt through a unit this kernel does not program, and that
+> measurement has not been made.
+>
+> The boot says which world the machine is in:
 >
 > ```
 >     iommu window   00:03.0 39-bit, 3 levels, 0 reserved pages mapped, 0 refused
