@@ -242,6 +242,12 @@ else
     qemu_device_list disks
 fi
 
+# **Stamped before the machine starts, for the reason `boot-test.sh` gives.**
+# This lane has gone red in CI once (run 324) without reproducing locally, and
+# how much of its budget a *passing* run uses was never measured -- so nobody
+# could say whether it was near the limit or nowhere near it.
+SHELL_STARTED_MS=$(date +%s%3N)
+PROMPT_MS=0
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -M "$MACHINE" -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M \
     "${IOMMU_ARGS[@]}" \
@@ -279,6 +285,10 @@ await() {
 # "'bhaskix$ help' never appeared" on a loaded host, with every later command
 # echoing correctly because by then the shell was reading.
 if await "$started" && await "$prompt"; then
+    # Time to the prompt, not to the end of the conversation: the typing after
+    # this is paced by the machine's own replies, so folding it in would
+    # measure the test rather than the boot.
+    PROMPT_MS=$(( $(date +%s%3N) - SHELL_STARTED_MS ))
     first=1
     while IFS= read -r -d $'\r' line; do
         printf '%s\r' "$line" >&3
@@ -312,6 +322,26 @@ if await "$started" && await "$prompt"; then
     # The last command's reply is the signal that everything before it landed.
     await "nosuchcommand: not a command"
     sleep 0.5
+fi
+
+# Reported, never asserted -- a wall-clock threshold here would be a test of
+# whichever machine ran it, which is the objection `boot-test.sh` makes to
+# performance budgets and means as much on this lane.
+if [[ $PROMPT_MS -gt 0 ]]; then
+    shell_elapsed="$((PROMPT_MS / 1000)).$(printf '%03d' $((PROMPT_MS % 1000)))"
+    shell_pct=$(( PROMPT_MS / (TIMEOUT * 10) ))
+    if [[ $shell_pct -ge 50 ]]; then
+        printf '\033[1;33mnote\033[0m  reached the prompt in %ss, which is %s%% of the %ss budget -- close enough to the limit to be worth saying\n' \
+            "$shell_elapsed" "$shell_pct" "$TIMEOUT"
+    else
+        printf '\033[2mnote\033[0m  reached the prompt in %ss, %s%% of the %ss budget\n' \
+            "$shell_elapsed" "$shell_pct" "$TIMEOUT"
+    fi
+    [[ -n ${GITHUB_ACTIONS:-} ]] && \
+        echo "::notice title=Shell budget::reached the prompt in ${shell_elapsed}s, ${shell_pct}% of the ${TIMEOUT}s budget"
+else
+    printf '\033[1;33mnote\033[0m  the prompt was never reached, after %ss of a %ss budget\n' \
+        "$(( ($(date +%s%3N) - SHELL_STARTED_MS) / 1000 ))" "$TIMEOUT"
 fi
 
 exec 3>&-

@@ -1166,6 +1166,29 @@ unattended runner wants a slow machine to pass.
   remains the better explanation of a *gate* failing, and this one only
   competes for the other reading.
 
+**Two corrections to this entry, made the same day it was written.**
+
+**One: the instrument was blind exactly where the question is.** The whole
+argument above is that the margin should be visible on runs that *pass* — and
+on CI it was visible to nobody. A job's log needs authentication to fetch, and
+the boot log is uploaded `if: failure()`, so a passing lane's figure existed
+only in a log nothing here can read. Fixed by emitting the measurement as a
+workflow `::notice::`, which becomes an annotation on the run itself. Whether
+*that* is readable without a token is a separate question and is checked rather
+than assumed.
+
+**Two: the shell lane's numbers argue against this explanation for run 324.**
+`shell-test.sh` now measures the same way, and locally it reaches the prompt in
+**24.978 s (10%)** and **13.375 s (5%)** of its 240 s budget. A timeout there
+needs a ten-fold slowdown, which is a much larger claim than the boot lanes'
+three-fold. So for that lane the hypothesis above is weak, and the raised budget
+is insurance rather than a candidate fix. Recorded because a hypothesis that
+only ever accumulates supporting evidence is not being tested.
+
+`fault-test.sh` got the larger budget and **not** the instrument: it boots seven
+machines in sequence and measuring each would be noise, and that lane has never
+gone red. Said here so the gap is a decision rather than an oversight.
+
 ### 2026-08-25 (main went red on a commit that changed only Markdown)
 
 `f0e336b` touched `TRACKER.md`, `docs/rfc/0049` and `docs/security.md` and

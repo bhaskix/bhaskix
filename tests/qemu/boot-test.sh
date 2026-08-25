@@ -444,6 +444,16 @@ else
     printf '\033[2mnote\033[0m  booted in %ss, %s%% of the %ss budget\n' \
         "$elapsed_s" "$used_pct" "$TIMEOUT"
 fi
+# **And said again where it can be read without a token.**
+#
+# The measurement above was added so the margin would be visible on runs that
+# *pass* -- and on CI it was visible to nobody, because a job's log needs
+# authentication to fetch and the boot log is uploaded only `if: failure()`.
+# The instrument answered the question everywhere except the one place the
+# question was asked. A workflow `::notice::` becomes an annotation on the run,
+# which is the one channel here that survives both.
+[[ -n ${GITHUB_ACTIONS:-} ]] && \
+    echo "::notice title=Boot budget ($MODE)::booted in ${elapsed_s}s, ${used_pct}% of the ${TIMEOUT}s budget"
 
 if grep -qF "$EXPECT_GREETING" "$LOG"; then
     pass "greeting present"
