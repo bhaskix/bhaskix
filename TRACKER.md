@@ -1040,6 +1040,32 @@ runs on it. What is left is the runner's hardware, and rarity. The gap is
 narrower and still open, and it is now narrower by measurement rather than by
 argument.
 
+**The shell lane too, and it is the more pointed one**: run 324 — `interactive
+shell` — is the third unexplained CI red, and unlike the boot lanes CI runs all
+four of its modes. Two can run here: `user` **7/7, 21 gates** and `iommu`
+**7/7, 52 gates** on 8.2.2. The other two, `kernel` and `disk`, rebuild the
+image with a different command line and so need a Rust toolchain this container
+does not carry; adding one would change the compiler as well as the emulator and
+answer a different question, so they are **not offered** rather than offered and
+quietly broken. Run 324 is not reproduced.
+
+**And the tool produced a false result on its first day, kept here as a
+warning.** The networked shell mode failed **4 of 4** in the container while
+passing locally — the exact shape of the discovery the tool exists to make. It
+was not one. Docker's default seccomp profile stops QEMU's slirp calling
+`fork_exec`; slirp says so once, quietly, in the middle of a serial log, and
+everything after it fails in **this project's own vocabulary** — `tcp client
+FAILED at step 4: connected, stream still in flight`, `lending FAILED: the
+arrangement could not be built` — so the failure arrives wearing the costume of
+a kernel bug found on CI's emulator. One flag fixes it, no added capabilities,
+and the mode passes 7/7.
+
+The lesson is not "add the flag", which is done. It is that **a tool which
+changes the environment in order to reproduce a bug can manufacture bugs of its
+own**, and that the first dramatic result out of a new instrument deserves to be
+doubted before it is written down. It was doubted, and it was checked, which is
+the only reason this paragraph is a warning rather than a correction.
+
 `tools/boot-on-ci-emulator.sh` keeps the capability instead of leaving it as an
 afternoon's shell history. Deliberately **not** in `make test` and not a gate: it
 needs a network, a Docker daemon and a few hundred megabytes of image, and a

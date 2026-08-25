@@ -4,8 +4,9 @@
 # Runs the boot lanes on **the emulator CI actually uses**, not the one this
 # machine happens to have.
 #
-# Usage:  tools/boot-on-ci-emulator.sh [lane] [count]   # default: all four, once
+# Usage:  tools/boot-on-ci-emulator.sh [lane] [count]   # default: all cells, once
 #         tools/boot-on-ci-emulator.sh bios 6
+#         tools/boot-on-ci-emulator.sh shell 4
 #
 # # Why this exists
 #
@@ -28,6 +29,21 @@
 # disprove a version-specific cause -- those were roughly two failures in
 # fifteen pushes, and twenty-four clean runs is evidence against a determinism,
 # not against a rare race. What it removes is the excuse for never having looked.
+#
+# # The false result this tool produced on its first day, kept as a warning
+#
+# The networked shell mode failed **4 of 4** here and passed locally, which is
+# the exact shape of the discovery this tool was built to make. It was not one.
+# Docker's default seccomp profile stops QEMU's slirp calling `fork_exec`; slirp
+# says so once, quietly, and everything after it fails in *this project's* own
+# words -- `tcp client FAILED at step 4: connected, stream still in flight` --
+# so the failure arrives wearing the costume of a kernel bug. One flag fixes it
+# and the mode passes.
+#
+# The lesson is not "add the flag", which is done below. It is that a tool which
+# changes the environment to reproduce a bug can manufacture bugs of its own,
+# and that the first dramatic result from a new instrument should be doubted
+# before it is written down.
 #
 # # What it deliberately is not
 #
@@ -92,21 +108,51 @@ echo "${DIM}  $version${RESET}"
 echo "${DIM}  the image was built on this machine; only the emulator is CI's${RESET}"
 echo
 
+# **The shell lane is here because it is one of the three CI jobs that has gone
+# red**, and only two of its four modes can run: `kernel` and `disk` rebuild the
+# image with a different command line, which needs a Rust toolchain this image
+# does not carry. Adding one would change the compiler as well as the emulator
+# and answer a different question, so those two are simply not offered rather
+# than offered and quietly broken.
 case "$LANE" in
-    all) cells=("bios max" "bios qemu64" "uefi max" "uefi qemu64") ;;
-    *)   cells=("$LANE max" "$LANE qemu64") ;;
+    all)   cells=("bios max" "bios qemu64" "uefi max" "uefi qemu64") ;;
+    shell) cells=("shell user" "shell iommu") ;;
+    *)     cells=("$LANE max" "$LANE qemu64") ;;
 esac
 
 status=0
 for cell in "${cells[@]}"; do
     read -r lane cpu <<< "$cell"
     for ((i = 1; i <= COUNT; i++)); do
-        out="$(docker run --rm -v "$REPO_ROOT:/repo" -w /repo \
-            -e BHASKIX_BOOT_LOG=/tmp/lane.log \
-            -e BOOT_TEST_TIMEOUT="${BOOT_TEST_TIMEOUT:-300}" \
-            -e QEMU_CPU="$cpu" \
+        if [[ "$lane" == "shell" ]]; then
+            script="tests/qemu/shell-test.sh $cpu"
+            envs=(-e BHASKIX_SHELL_LOG=/tmp/lane.log
+                  -e SHELL_TEST_TIMEOUT="${SHELL_TEST_TIMEOUT:-300}")
+        else
+            script="tests/qemu/boot-test.sh $lane"
+            envs=(-e BHASKIX_BOOT_LOG=/tmp/lane.log
+                  -e BOOT_TEST_TIMEOUT="${BOOT_TEST_TIMEOUT:-300}"
+                  -e QEMU_CPU="$cpu")
+        fi
+        # **`seccomp=unconfined`, and it is not laziness.** Under Docker's
+        # default profile QEMU's slirp cannot `fork_exec`, and says so once, in
+        # the middle of a serial log:
+        #
+        #     Slirp: fork_exec: Failed to close file descriptor for child
+        #     process (Operation not permitted)
+        #
+        # Everything downstream then fails in the vocabulary of *this project* --
+        # `tcp client FAILED at step 4: connected, stream still in flight` --
+        # which reads exactly like a kernel bug found on CI's emulator and is
+        # nothing of the sort. Measured: the networked shell mode failed 4 of 4
+        # with the default profile and passes with this one flag, no added
+        # capabilities. A diagnostic tool that manufactures its own failures is
+        # worse than no tool, and this comment exists so nobody re-derives that
+        # from a false result the way it was derived here.
+        out="$(docker run --rm --security-opt seccomp=unconfined \
+            -v "$REPO_ROOT:/repo" -w /repo "${envs[@]}" \
             "$IMAGE" bash -c \
-            "tests/qemu/boot-test.sh $lane > /tmp/out.txt 2>&1; \
+            "$script > /tmp/out.txt 2>&1; \
              printf '%s|%s|' \"\$?\" \"\$(grep -acE '^.\[1;32mok' /tmp/out.txt)\"; \
              grep -aE 'FAIL' /tmp/out.txt | sed 's/\x1b\[[0-9;]*m//g' | head -2 | tr '\n' ';'" \
             2>/dev/null | tail -1)"
