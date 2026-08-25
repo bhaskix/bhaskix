@@ -267,9 +267,10 @@ surviving a flood the harness *can* produce.
 2. The cookie's arithmetic in `bhaskix-net`: encode, verify, expire. Pure,
    `forbid(unsafe_code)`, fuzzed. ✅ **Done 2026-08-25** — `net/src/tcp/cookie.rs`.
    Twelve host tests, **six mutations each watched red**, and a `tcp_cookie`
-   fuzz target that was itself watched red by breaking `verify` in the
-   permissive direction. The layout is the standard one: an 8-bit counter, a
-   3-bit MSS index and a 21-bit keyed hash, with the counter and the index
+   fuzz target — **163,665,094 executions clean** — that was itself watched red
+   by breaking `verify` in the permissive direction. The layout is the standard
+   one: an 8-bit counter, a 3-bit MSS index and a 21-bit keyed hash, with the
+   counter and the index
    **inside** the hash rather than merely beside it — otherwise a captured
    cookie can be aged backwards into validity or have its segment size raised
    to something the peer never offered, and both attacks have a test.

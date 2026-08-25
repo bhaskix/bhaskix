@@ -195,7 +195,7 @@ fairness within 2% for two equal-weight workloads.
 | M4-09 | Sleeping, wait queues, blocking | ✅ `DONE` | `Blocked` state, `WaitQueue`, cross-CPU wake. Ring self-test over 4 CPUs. **Negative-tested**: disabling `wake` gives laps `[1,1,1,0]`, 0 wakeups. |
 | M4-09b | Reschedule IPI on wake | ✅ `DONE` | Required by M4-10: a tickless CPU can only be woken by an interrupt. Ring throughput rose from 84 to 736 laps. |
 | M4-10 | Tickless idle, one-shot timers | ✅ `DONE` | One-shot APIC timer, per-CPU deadlines, `sleep_micros`, reschedule IPI. **0 ticks over 400 ms idle vs 320–483 busy**; negative-testable as a ratio. |
-| M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape. ~~There is no network stack.~~ **There is one as of 2026-08-13**, and [RFC 0019](docs/rfc/0019-time-and-timers.md) is where the workload comes from: TCP will want a timer per connection. The wheel is still not built, and now it can be designed against something. **And against a number, as of 2026-08-14**: RFC 0019 step 4 measured a deadline as late by `C − d` with `C ≈ 325 ms`, which is to say the wake instant does not depend on the deadline at all, because nothing re-programs the timer when one is armed. |
+| M4-10b | Hierarchical timer wheel, TSC-deadline, HPET fallback | ⬜ `TODO` | A wheel needs a many-short-timers workload to have a shape. ~~There is no network stack.~~ **There is one as of 2026-08-13**, and [RFC 0019](docs/rfc/0019-time-and-timers.md) is where the workload comes from: TCP will want a timer per connection. The wheel is still not built, and now it can be designed against something. ~~**And against a number, as of 2026-08-14**: RFC 0019 step 4 measured a deadline as late by `C − d` with `C ≈ 325 ms`, which is to say the wake instant does not depend on the deadline at all, because nothing re-programs the timer when one is armed.~~ **Stale, and wrong by three orders of magnitude — corrected 2026-08-25.** That defect was fixed: `time::arm_no_later_than` brings an already-armed timer forward when a nearer deadline arrives, and every boot has been printing the proof while this row went on describing the bug. `RFC 0019` §4 and this file's own changelog both say **"`C − d` is gone"**; only this cell did not, so the tracker disagreed with itself. What the machine actually reports, on every lane: `deadline  armed for 20 ms, woke after 20.35 ms, never early and late by 0.35 ms`, and `deadline arms  3 brought this cpu's next interrupt forward`. **The wheel is still not built and this row stays `TODO`** — what changed is that whoever designs it must design against a timer that already re-arms, not against one that never does. **And the measurement is now gated**, two ways and both structural rather than timed: a deadline is never honoured *early*, and the brought-forward counter is non-zero. Neither is a threshold, for the reason `boot-test.sh` gives about performance budgets; both were watched red. The two are **not** equally new, and the changelog entry of 2026-08-25 says which is which: the early check is the positive half of a kernel self-test whose `FAILED` was already fatal, while `time::hastened()` was read by nothing at all and a zero there would have passed every lane. |
 | M4-11 | TLB shootdown | ✅ `DONE` | IPI to all-but-self, sender waits for every acknowledgement. **Negative-tested**: disabling the receiving handler turns 8 completions into 8 timeouts. |
 | M4-12 | Per-CPU frame reserve for the fault path | ✅ `DONE` | Lock-free per-CPU reserve; the fault path no longer touches the allocator. **Negative-tested**: emptying the reserve makes a fault under the lock report `no frame in this cpu's reserve`. |
 
@@ -867,6 +867,61 @@ machine, so no disk to mount`. Nothing has ever read that device through a
 translated controller. A green boot answered a question nobody asked, and
 saying so was a deliberate choice over closing the row.
 
+### 2026-08-25 (the tracker disagreed with itself about a bug that was fixed eleven days ago)
+
+**M4-10b's row said the timer never re-arms. Every boot since 2026-08-14 has
+printed the proof that it does.**
+
+The row justified the timer wheel with a measurement: *"RFC 0019 step 4
+measured a deadline as late by `C − d` with `C ≈ 325 ms`, which is to say the
+wake instant does not depend on the deadline at all, because nothing
+re-programs the timer when one is armed."* That was true when written and was
+fixed the same week by `time::arm_no_later_than`. RFC 0019 §4 says **"`C − d`
+is gone"**. This file's own changelog says **"`C − d` is gone"**. The milestone
+row, in the same file, went on stating the defect for eleven days.
+
+What the machine reports. This is the `bios` lane, verbatim, today:
+
+    deadline       armed for 20 ms, woke after 20.394 ms, never early and late by 0.394 ms
+    deadline arms  3 brought this cpu's next interrupt forward, 313 were already soon enough
+
+All four lanes were run to get that rather than one and a generalisation, and
+they agree: lateness **0.331–0.446 ms**, and the brought-forward count 3 on
+`bios`, `uefi` and `iommu-off`, 4 on `iommu`. Under half a millisecond, not
+325 — wrong by three orders of magnitude, and wrong in the direction that would
+misdirect anyone designing the wheel.
+
+**And half of it was asserting nothing.** Two gates now, both **structural and
+neither a threshold** — but they are not the same size, and the difference is
+the interesting part:
+
+- a deadline is **never honoured early**. This is the *positive* half of a check
+  the kernel already makes: `deadline_self_test` prints `FAILED` on an early
+  fire and on more than 25 ms of lateness, and `boot-test.sh`'s `FAILED` marker
+  has been fatal since 2026-08-11 — so a return of the 325 ms defect **would**
+  have been caught. What would not have been caught is that self-test quietly
+  ceasing to run, which is exactly the distinction that file's marker comment
+  draws. Before today the word `deadline` appeared nowhere in it.
+- the brought-forward counter is **non-zero**. This one is genuinely new.
+  `time::hastened()` is printed on every boot and, until today, read by
+  **nothing** — no kernel-side refusal, no gate. If nothing ever re-programs a
+  CPU's timer that figure is zero, and zero would have gone by in silence. The
+  same shape as `iommu::faulted` having no callers.
+
+**This entry's own first draft was wrong and is not being tidied.** It said the
+measurement was "asserted by nothing" and that the fix "could have regressed in
+silence" — true of the counter, false of the lateness. Reading the caller of
+`deadline_self_test` before committing is what found the difference. An
+overstated *gap* in a changelog is the same error as an overstated capability,
+and gets the same treatment.
+
+`boot-test.sh` argues against timing thresholds in its own words — *"a flaky
+test wearing a performance budget's clothes"* — and that argument is worth more
+today than usual, with two CI boot lanes flaking on machines four QEMU major
+versions away from this one. Both gates were watched red: neutering the counter
+fails the second alone, and changing "never early" fails the first alone. The
+`bios` lane goes 107 → 109.
+
 ### 2026-08-25 (RFC 0048 step 2: a handshake that allocates nothing)
 
 **The arithmetic that makes step 1 stop mattering.** RFC 0048 shortened how
@@ -892,9 +947,10 @@ One attempted mutation was *not* a mutation and is recorded as such:
 permissive, so nothing failed, and a stricter one had to be written to prove
 the wrap handling is load-bearing.
 
-A `tcp_cookie` fuzz target joins the fifteen already here, and it was watched
-red the same way: breaking `verify` in the permissive direction made it fail in
-seconds. It asserts two things that pull against each other — **soundness**,
+A `tcp_cookie` fuzz target joins the fifteen already here — **163,665,094
+executions clean in twenty minutes** — and it was watched red the same way:
+breaking `verify` in the permissive direction made it fail in seconds. It
+asserts two things that pull against each other — **soundness**,
 that nothing this key minted is ever refused inside its window, and
 **consistency**, that any acknowledgement it *does* accept behaves like its own
 cookie. It deliberately does not assert that a forged number is never accepted:

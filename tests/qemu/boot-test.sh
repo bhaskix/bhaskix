@@ -998,6 +998,50 @@ else
     status=1
 fi
 
+# A deadline is never honoured *early*, and the re-arm path actually runs.
+#
+# **Two structural assertions, and deliberately no threshold.** RFC 0019 step 4
+# measured this system waking at the same instant whatever deadline was asked
+# for -- `lateness ≈ C − d` with `C` about 325 ms -- because nothing brought a
+# CPU's already-armed timer forward when a nearer deadline arrived.
+# `arm_no_later_than` fixed it. These two gates are **not the same size**, and
+# saying so is worth more than letting them look alike:
+#
+#   * **never early** is the *positive* half of a check the kernel already
+#     makes. `deadline_self_test` prints `FAILED` on an early fire and on more
+#     than 25 ms of lateness, and the `FAILED` marker above has been fatal
+#     since 2026-08-11 -- so a return of the 325 ms defect was already caught.
+#     What was not caught is that self-test **ceasing to run at all**, which is
+#     precisely the distinction the marker's own comment draws. Until
+#     2026-08-25 the word "deadline" appeared nowhere in this script.
+#   * **the counter moved** is a new assertion. `time::hastened()` is printed
+#     on every boot and, before today, read by **nothing** -- no kernel-side
+#     refusal, no gate here. If nothing ever re-programs a CPU's timer that
+#     figure is zero, which is the original defect's shape, and zero would have
+#     gone by in silence. It reads 3 on `bios`, `uefi` and `iommu-off` and 4 on
+#     `iommu`; the gate asks only for **non-zero**, because how many is a
+#     property of a particular boot and not of the mechanism.
+#
+# What neither asserts is how late the wake was. A millisecond budget here
+# would be a test of whichever machine CI runs on -- the same objection the
+# round-trip gate below makes, and this file means it. The kernel owns the one
+# loose bound there is, at 25 ms, and says in place why it is loose.
+if grep -qF "never early" "$LOG"; then
+    pass "a deadline is honoured and never fires early"
+else
+    fail "the deadline measurement is missing, or a wake came early"
+    grep -aE "deadline" "$LOG" | sed 's/^/      /'
+    status=1
+fi
+
+if grep -qE "deadline arms +[1-9][0-9]* brought this cpu's next interrupt forward" "$LOG"; then
+    pass "a nearer deadline brings an armed timer forward"
+else
+    fail "no timer was ever brought forward -- the re-arm path did not run"
+    grep -aE "deadline arms" "$LOG" | sed 's/^/      /'
+    status=1
+fi
+
 # Sleeping. Three things have to be true at once, and each hides a different
 # way of passing without working: laps prove no wakeup was lost (the ring stops
 # dead if one is), sleeps prove the threads actually blocked rather than spun,
