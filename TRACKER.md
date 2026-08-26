@@ -1775,8 +1775,30 @@ no unit has no records to read.
 **Left undone deliberately.** Roughly forty labels came back unmatched and were
 not gated. Most describe rather than claim; a few — `net echo`, `ipd state`,
 `spawn retry`, `notifications`, `dma devices` — are counters that could plausibly
-go quiet the same way, and are recorded here as a list somebody can work through
+go quiet the same way, and were recorded as a list somebody could work through
 rather than a gate written in a hurry against a line nobody has thought about.
+
+**Worked through 2026-08-26, and the list is spent.** Two of the five are gated
+by *content* rather than label, which is why the label sweep missed them:
+`spawn retry`'s claim is matched as *"declined preemption"* (four times over) and
+`net echo`'s as *"echo replies"*. Of the three genuinely unasserted:
+
+- **`notifications … 0 stranded`** is not the invariant it looks like. Stranding
+  is a waiter woken because the notification it blocked on was destroyed — the
+  documented, *correct* behaviour, counted so it is *"a fact worth seeing rather
+  than discovering"*. Non-zero is not a bug, so a gate demanding zero would
+  forbid a future test from ever destroying a notification with a waiter on it.
+- **`ipd state 0xf`** is implied by the gates already there: the lanes that print
+  it also assert TCP and UDP round trips, which cannot pass with a half-configured
+  service.
+- **`dma devices`** counts vary by machine, and RFC 0043's containment claim is
+  already gated where it belongs.
+
+So the audit's yield was **two real gaps out of forty labels**, both found and
+both fixed — `time::hastened()` and the IOMMU fault report. The rest are covered
+or are not invariants. Written down so the next person does not re-run this
+expecting treasure: the sweep is a way of *generating suspects*, and most
+suspects are innocent.
 The `xhci ports` survey is a known one and is not a missing gate but a wrong
 line: it is printed **before** the two-second attach debounce that follows it, so
 on an SR550 it said *"0 with something attached, 26 quiet"* and the next line
