@@ -1030,20 +1030,42 @@ device to look for a boot device and may well have left it running."*
 
 **The instrument that settles it.** `DCBAAP` and `CRCR` are those pointers, and
 the reset in bring-up clears them — so the moment before the halt is the last
-instant they can be read at all. They are now printed on every boot:
+instant they can be read at all. They are now printed on every boot. On QEMU:
 
     xhci firmware  left it RUNNING; its device-context array at 0xffdfd80,
                    command ring at 0xffdfc01
 
-That is QEMU, and it is already informative: **OVMF also hands over a running
-controller with its pointers set**, so this is a general handover property and
-not an SR550 quirk. On the SR550 the same line will say whether firmware's
-pointers land near `0xaa95f000`. **If either does, the question is answered; if
-neither does, a second theory is dead**, which is worth as much and is why the
-line prints the values rather than a verdict.
+**And on the SR550, one boot later — it is proven.**
 
-It needs one boot of a live cluster node to read, and that is not taken without
-saying so.
+    xhci firmware  left it halted; its device-context array at 0xaa95d000,
+                   command ring at 0x8
+    iommu fault    [during bring-up] unit 3: 00:14.0 was refused a read of 0xaa95f000
+
+| | |
+|---|---|
+| firmware's device-context array | **`0xaa95d000`** |
+| the refused read | **`0xaa95f000`** |
+| offset | **`0x2000` — two pages, 8 KiB** |
+
+A Device Context Base Address Array holds up to 2048 entries of eight bytes —
+**16 KiB** — so eight KiB in is *inside firmware's own array*. The controller was
+reading firmware's device-context structures, exactly as suspected, and the
+address that had resisted explanation for two days is an offset into a pointer
+this kernel can now print.
+
+**Two things fall out of it.**
+
+The fault is **containment working**, not a defect. Firmware's structures are
+deliberately unmapped for that device — both declared reserved regions were
+refused for overlapping the kernel — so a stale access to them is refused. The
+IOMMU did the one thing it is there to do, and the only thing missing was
+somebody able to read the receipt.
+
+And **this machine hands over a *halted* controller**, where OVMF hands over a
+running one. So a halted controller still performed a DMA read of its
+device-context array during takeover. Which step provokes it — the `USBLEGSUP`
+handoff and its SMI, or the reset written a few lines later — is **not**
+established, and is a smaller question than the one just closed.
 
 ### 2026-08-26 (the tag guard asked a question that could answer "no" when it could not see, and it is fixed)
 
@@ -2075,7 +2097,10 @@ the first unit only, which is narrower than its name; **it has exactly one
 witness**, because no emulator here describes more than one unit, so both new
 gates pin the *single*-unit path and the path the RFC exists for cannot be
 gated at all; it does not fix the xHCI's port 1; and the DMA refusal it made
-visible (`00:14.0` refused a read of `0xaa95f000`) is explained but not proven.
+visible (`00:14.0` refused a read of `0xaa95f000`) is ~~explained but not
+proven~~ **proven 2026-08-26** — firmware's device-context array sits at
+`0xaa95d000`, two pages below the refused read, so the controller was reading
+firmware's own array and the refusal is containment working.
 
 That third limit is the uncomfortable one and is stated plainly rather than
 softened: **the change that matters here is exercised by one machine in one
