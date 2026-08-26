@@ -225,6 +225,14 @@ SR550.
    deadline, or both, each with its own arithmetic to get wrong. It is the
    project lead's call, and it should be its own RFC.
 
+   **It became its own RFC, and it is closed.**
+   [RFC 0048](0048-a-listener-that-cannot-be-wedged.md), accepted in full on
+   2026-08-26. Neither of the two options guessed at above is what shipped:
+   both would have *bounded* the half-open state, and SYN cookies remove it —
+   the sequence number carries what the connection needs, so a `SYN` allocates
+   nothing and there is no queue to size. The instinct that this deserved its
+   own document was right; the two designs it named were not the answer.
+
 2. **Does the reset need a rate limit?** Every stack that answers this way
    eventually grows one, because a reset is a reply an unauthenticated peer can
    ask for. Deferred with a trigger: when this service faces anything that is
