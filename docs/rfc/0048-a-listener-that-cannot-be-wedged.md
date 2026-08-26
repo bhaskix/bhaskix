@@ -233,6 +233,14 @@ surviving a flood the harness *can* produce.
 
 ## Unresolved questions
 
+**Where these stand at acceptance (2026-08-26). All three are closed**, which is
+unusual and worth saying plainly rather than leaving a reader to scan for it.
+Question 1 was answered **against this RFC** by reading RFC 1122 — the deviation
+is real and deliberate — and then stopped mattering when steps 2–4 removed the
+state it governed. Question 2 is answered **always-on**, for a reason narrower
+than the question assumed, and carries a **trigger** that reopens it. Question 3
+went **moot**, which is what it hoped for.
+
 1. ~~**What floor does RFC 1122 set for `R2` on a `SYN`?**~~ **ANSWERED
    2026-08-24, by reading it, and answered against this RFC.** §4.2.3.5:
    *"However, the values of R1 and R2 may be different for SYN and data
@@ -250,15 +258,60 @@ surviving a flood the harness *can* produce.
    back to conformance and it wants an interface on `LISTEN`. And steps 2–4
    dissolve the question: cookies allocate nothing, so there is no half-open
    connection whose `R2` could be short.
-2. **Do cookies become the always-on path, or a fallback under pressure?**
-   Always-on is simpler to reason about and loses the options a `SYN` carried;
-   a fallback keeps the fast path and adds a mode. Deferred to step 2, where
-   the encoding will say which is affordable.
-3. **Should `bin/tcpd`'s silent `SlotBusy` refusal stay silent once cookies
-   land?** [RFC 0047](0047-refusing-a-connection-to-a-port-nobody-holds.md)
-   kept it silent because *busy* is not *shut*. With cookies there is no busy
-   slot to speak of, and the answer may become moot — which is the good kind of
-   unresolved question.
+2. ~~**Do cookies become the always-on path, or a fallback under pressure?**~~
+   **ANSWERED 2026-08-26 by step 3: always-on**, and the reason is narrower and
+   better than the one this question assumed.
+
+   The fear behind "a fallback keeps the fast path" is the standard objection to
+   cookies: a cookie has ~32 bits of room, and a `SYN` can carry window scaling,
+   selective acknowledgement and timestamps that will not fit, so a listener
+   that always answers with a cookie silently loses them. **That objection does
+   not apply to this stack, because this stack understands exactly one option.**
+   `parse_options` in `net/src/tcp/segment.rs` recognises `MSS` and walks past
+   everything else; `Emit` can carry `MSS` and nothing else. There is no window
+   scale to lose, no `SACK` to lose, no timestamp to lose. The one option that
+   exists is the one the cookie encodes — approximately, three bits, rounded
+   down, as step 2 wrote down.
+
+   So there is no fast path to keep. A mode would have bought the ability to
+   preserve options this stack cannot parse, and cost a second code path through
+   the accept logic that only runs under attack — which is the path least likely
+   to be exercised and most likely to be wrong.
+
+   **This answer has a trigger, and it should be honoured rather than
+   rediscovered.** The day any of window scaling, `SACK` or timestamps is
+   implemented, this question reopens *on that day*, because from then on
+   always-on cookies do lose something real — a receive window capped at 65535
+   bytes is the first casualty, and on a fast path that is a throughput ceiling,
+   not a nicety. The usual remedy elsewhere is to borrow room from the timestamp
+   option, which only works if the peer sent one and echoes it; that is a
+   direction to investigate and **not a design this project has read the
+   specification for**. Whoever implements the first of those three options owns
+   reopening this.
+3. ~~**Should `bin/tcpd`'s silent `SlotBusy` refusal stay silent once cookies
+   land?**~~ **MOOT as of 2026-08-26, which is what this question hoped for** —
+   but it is worth writing down *how* it became moot, because "the case
+   disappeared" and "the case was renamed" look identical from outside.
+
+   `SlotBusy` is gone from `Unmatched`. It described one situation: a `SYN`
+   arriving while the single accepted slot was held by a **half-open**
+   connection. Step 3 removed half-open connections, so the situation it named
+   cannot occur, and the variant was deleted rather than kept for symmetry. What
+   replaced it, `Cookied`, is not a refusal at all — the `SYN` was answered.
+
+   **A busy slot still exists**, and it is now a different thing: the slot is
+   held by a peer that completed a handshake and is being served. `accept_cookie`
+   returns `None` in that case and stays silent, and RFC 0047's reasoning —
+   *busy is not shut* — still governs it, unchanged and now on a case that
+   deserves it. The peer will retransmit its `ACK`, and the cookie stays valid
+   for its whole window, so silence costs a retransmit rather than a connection.
+   Both facts are in the comment at that `return None`, where somebody deleting
+   the silence will read them.
+
+   The honest remainder is that the slot is still **one**. A single served peer
+   excludes others until it finishes. That is a capacity limit — it costs an
+   attacker a real connection they must complete and hold — and it is a
+   different problem from the wedge, which cost one packet.
 
 ## Implementation plan
 
