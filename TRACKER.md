@@ -1067,15 +1067,36 @@ the same defect before anyone could notice.
 where the origin cancels — but its doc no longer claims otherwise, which is
 what let this hide.
 
+**And the rest of the tree was searched for the same class**, because "right on
+the emulator, wrong on hardware" is a shape rather than an incident. Every
+`time::now()` caller is a deadline or a span (`virtio`, `xhci`, `sock::wait`,
+`linuxd`), where the origin cancels; the two direct `tsc::to_nanos` calls
+outside this file convert **durations** — a worst-case span and a loop's ticks —
+not instants. **One instance, now fixed, and none other.** Recorded so the
+search is not repeated from scratch the next time a hardware number looks odd.
+
 **A shell self-test fails on this machine and passes on every emulator lane**:
 `shell FAILED: draining after the wake found the bytes (14 of 5 bytes, 1
 interrupts, 0 of 15 commands wrong)`. Fourteen bytes where five were expected,
 with no command wrong. Filed rather than guessed at.
 
-**Also worth an eyebrow, and not chased**: `local apic  enabled, timer
-calibrated to 1.558 MHz`, against 62.564 MHz under QEMU. The deadline numbers
-above are excellent, so whatever that figure means it is not making the timer
-wrong — but it is not obviously right either.
+~~**Also worth an eyebrow, and not chased**: `local apic  enabled, timer
+calibrated to 1.558 MHz`, against 62.564 MHz under QEMU... it is not obviously
+right either.~~ **Chased, and it is exactly right — corrected here rather than
+left standing.** The kernel programs divide-by-16 and reports the *divided*
+rate, so the implied bus clock is `1.558 × 16 = ` **24.93 MHz**, which is the
+standard ~25 MHz Intel reference. The same arithmetic on QEMU's 62.564 MHz gives
+**1000.0 MHz** — an emulated 1 GHz APIC bus, exactly. Two different machines,
+two textbook answers, one formula.
+
+The deadline test cannot corroborate this, and it is worth saying why: it arms
+and measures through the *same* calibration, so a wrong rate would cancel and
+still read 20 ms. What does corroborate it is the other half of the same
+measurement window — the TSC — whose figure produced `boot cost` of **18.28
+hours** on a cluster node that had plausibly been up about that long. A
+calibration window wrong enough to misread the APIC would have misread the TSC
+too, and that number landed somewhere believable. **Flagging it was right;
+leaving it flagged would not have been.**
 
 **Procedure note.** The machine was restored: image unmounted, one-time boot
 override self-cleared, `PowerState` back to `On` and `Health` `OK`, and the
