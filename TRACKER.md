@@ -1059,6 +1059,24 @@ one that forgot would make every later report wait the full bound. All seven
 injected faults still report: `every injected fault was reported, none
 triple-faulted`.
 
+**A fourth suspect, refuted with the others.** *"Jumped to a near-null address"*
+suggests a context restored from a `Thread` that was reaped mid-switch. It is
+guarded, and thoroughly: the switch takes `&raw const thread.context` under the
+queue lock, sets `queue.current = next` **before** releasing it — so
+`reap_finished`, which skips `current`, cannot take the target — and a
+`switching` flag stops another CPU stealing from a queue mid-switch. The module
+header states the three rules and why each is invisible when broken: *"Removing
+the `switching` test corrupts a thread only when the timing lines up … not
+something a boot test can be relied on to provoke, so they are unit-tested
+instead."* Reaping cannot race the switch on the same CPU either, because that
+CPU is the one switching.
+
+**Where this leaves the fault.** Four mechanisms refuted, two blind sleeps that
+widened the window removed, and the reporter fixed so the next specimen is
+readable rather than spliced. The next step is genuinely to **wait for a
+readable one** — not to guess a fifth mechanism from a report that was
+demonstrably describing two machines at once.
+
 **The lesson is the session's own, arrived at the hard way.** An instrument that
 garbles itself under the exact conditions it exists to describe is worse than no
 instrument, because it does not fail — it answers, fluently, with something that
