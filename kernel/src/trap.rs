@@ -684,11 +684,70 @@ fn dump_frame_window(frame: &TrapFrame) {
 /// report is the most valuable thing this kernel produces when something goes
 /// wrong, and it should not get thinner because the fault turned out to be
 /// survivable.
+/// Whether some CPU is part-way through an exception report.
+///
+/// **Not a lock, and deliberately not one.** `enter_fatal` below takes the
+/// console *out* of its lock so a report reaches the wire even if another CPU
+/// wedged holding it — run-80's report stopped at its fifth line for exactly
+/// that reason, and re-introducing a lock here would undo it.
+///
+/// The cost of that choice is that two CPUs faulting together interleave, and
+/// the cost of *interleaving* is a specimen nobody can read: a real one from
+/// 2026-08-26 spliced two reports into `cpu 4244635648 thread Some(12)`, a CPU
+/// id that does not exist, and an hour went into diagnosing a machine that was
+/// never in that state. A garbled report is worse than a late one.
+///
+/// So this is a **bounded turnstile**: a second CPU waits its turn, and then
+/// prints anyway. It can never suppress a report, it cannot deadlock against a
+/// nested fault on the same CPU, and it needs no per-CPU state — which matters,
+/// because the reason for the fault may be that per-CPU state is exactly what
+/// is broken.
+static REPORT_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// How long a second CPU waits for the first to finish before printing anyway.
+///
+/// Long enough for a thirty-line report on a slow emulator, short enough that a
+/// CPU which will never release does not take the other's report with it.
+const REPORT_TURNSTILE_SPINS: u64 = 20_000_000;
+
+/// Releases the turnstile however [`report_exception`] leaves — it has two
+/// early returns, and a report that forgot to release would silently make every
+/// later one wait the full bound.
+struct Turnstile;
+
+impl Drop for Turnstile {
+    fn drop(&mut self) {
+        REPORT_BUSY.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
 fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
+    let mut spins = 0u64;
+    while REPORT_BUSY
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        spins += 1;
+        if spins >= REPORT_TURNSTILE_SPINS {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    let _turnstile = Turnstile;
+
     // From here on the machine is being reported dead, and every print
     // must reach the wire even if another CPU wedged holding the console
     // lock -- run-80's report stopped at its fifth line for exactly that.
     crate::console::enter_fatal();
+    if spins >= REPORT_TURNSTILE_SPINS {
+        println!("  (another cpu is still reporting; this one waited and is printing anyway)");
+    }
     println!();
     println!("==================================================================");
     match exception_name(frame.vector) {

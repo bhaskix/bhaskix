@@ -1002,6 +1002,68 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-26 (three suspects refuted, one hour lost to a rendering artefact, and the reporter fixed so it cannot happen again)
+
+**Chasing the kernel page fault into the code refuted three mechanisms and
+produced one instrument.** The refutations are the useful part, because each is
+the first thing the next person would try.
+
+**Stack reuse — no.** The obvious reading of *"the frame changed under the
+handler"* is two threads on one stack. Thread stacks are allocated as
+`stack::allocate(hhdm, thread_id + 1)`, the id comes from a monotonic
+`NEXT_THREAD`, and there is **no free path at all** — so slots are never reused
+and two threads never share a stack. (The frames *are* in the stack area:
+`STACK_AREA_BASE` is `0xffff_a000_0000_0000` and the faulting frames were
+`0xffffa000000ede60` and `0xffffa000000fe2b0`.)
+
+**A zeroed `GS` base from a GDT reload — no.** `percpu::current()` reads
+`gs:[0]`, and the module says plainly that *"loading any selector into `GS` —
+including the null selector, which is exactly what reloading the GDT does —
+resets `GS.base` to zero"*. But the GDT is loaded only at bring-up:
+`gdt::init()` once on the bootstrap CPU and `gdt::init_cpu` per AP. Nothing
+reloads it during teardown.
+
+**A `swapgs` imbalance — no.** The natural successor, and the module docs kill
+it in one line: *"`swapgs` is programmed but not yet exercised … the kernel base
+is written directly to `IA32_GS_BASE` today."*
+
+**One design weakness is worth noting even though it is not this bug.**
+`percpu::current()` guards a **per-CPU** precondition with a **global** flag,
+`ANY_INSTALLED`, and its comment argues both that a zero base reads address zero
+*"which is unmapped in every address space"* and that *"the null test catches
+it"* — which cannot both be load-bearing, since an unmapped read faults rather
+than returning a value to test. Recorded, not touched.
+
+**And an hour went into a diagnosis of a machine that was never in that
+state.** The specimen contains `cpu 4244635648 thread Some(12)` and an error
+code of `0xffffffff8330485a`, and I read those as garbage registers — which
+pointed convincingly at a broken per-CPU base. They are not garbage. They are
+**two CPUs' reports spliced together**: `report_exception` calls
+`console::enter_fatal()`, which takes the console *out* of its lock on purpose
+so a report reaches the wire even if another CPU wedged holding it. The price of
+that correct decision is that two simultaneous reports interleave, and an
+interleaved report invents values that no register ever held.
+
+The line that survives the splice is coherent and says something different from
+what I first read: `error 0x10 cr2 0xbf8`, and the report's own decoding, *"page
+not present while reading in kernel mode, **on an instruction fetch**"*. That is
+the CPU **jumping** to a near-null address — a corrupted return address or a
+stale indirect call — not dereferencing one.
+
+**Fixed so the next specimen is readable.** A **bounded turnstile**, not a lock:
+a second reporting CPU waits its turn and then prints anyway, saying so. It
+cannot suppress a report, cannot deadlock against a nested fault, and needs no
+per-CPU state — which matters precisely when per-CPU state is the suspect. The
+release is a `Drop` guard, because `report_exception` has two early returns and
+one that forgot would make every later report wait the full bound. All seven
+injected faults still report: `every injected fault was reported, none
+triple-faulted`.
+
+**The lesson is the session's own, arrived at the hard way.** An instrument that
+garbles itself under the exact conditions it exists to describe is worse than no
+instrument, because it does not fail — it answers, fluently, with something that
+was never true.
+
 ### 2026-08-26 (the migration test waits for its migrants instead of sleeping over them)
 
 **Every phase transition in the scheduler self-tests was a fixed sleep and a
