@@ -7751,6 +7751,21 @@ seen on **2026-08-21**, before any of it. A shifted timing that surfaced a pre-e
 still be worth knowing, and four clean re-runs on the changed tree are the evidence against it —
 not proof, and said as such.
 
+**A sharper question for whoever takes it, from reading `/bin/execed`.** The program is
+hand-assembled and does exactly three things: `getpid`, `write(1, …, 13)`, `exit_group(0)` — with
+**no instruction between the write and the exit**. So the interesting question is not whether the
+write happened but **what the write is allowed to return before**: if the payload is read out of the
+caller's memory *after* the syscall returns, or the bytes are queued rather than delivered, a
+program that prints and exits in consecutive instructions is exactly the program that would lose its
+last line — and that is a defect for *any* hosted workload, not a quirk of this test. The gate greps
+the whole log, so ordering is not the issue; the line is genuinely absent.
+
+**What would settle it, cheaply:** put one instruction between the write and the exit — a second
+`getpid` would do — and see whether the intermittent survives. If it vanishes, the write is
+returning before the bytes are safe, and the test has found a real one. If it persists, the loss is
+downstream of the adapter and the search moves to the console service. Either answer is worth more
+than another sighting.
+
 It is the **second** unexplained intermittent of the day, after the 494 ms spawn, and they are not
 obviously related — one is scheduler timing, this one is a lost console byte on a dying domain.
 Both are written down with their evidence rather than re-run until green and forgotten.
