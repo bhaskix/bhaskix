@@ -7760,11 +7760,30 @@ program that prints and exits in consecutive instructions is exactly the program
 last line — and that is a defect for *any* hosted workload, not a quirk of this test. The gate greps
 the whole log, so ordering is not the issue; the line is genuinely absent.
 
-**What would settle it, cheaply:** put one instruction between the write and the exit — a second
-`getpid` would do — and see whether the intermittent survives. If it vanishes, the write is
-returning before the bytes are safe, and the test has found a real one. If it persists, the loss is
-downstream of the adapter and the search moves to the console service. Either answer is worth more
-than another sighting.
+~~**What would settle it, cheaply:** put one instruction between the write and the exit…~~
+**Settled by reading instead, and the hypothesis is dead.** `linuxd`'s `WRITE` handler does
+`copy_in(request.domain, buffer, …)` into **its own** buffer and then puts every byte to the console
+through a synchronous `INVOKE`/`PUT` — all of it *before the syscall returns*. The write is fully
+synchronous in both halves, so a program that prints and exits in consecutive instructions **cannot**
+lose its line that way. No boots were needed, and the experiment above is not worth running.
+
+**A second candidate died with it.** `copy_in` reads the *caller's* domain, and this program has just
+changed domain (`kept='3 2 3'` — domain 2 became 3), so a stale view there was the natural successor.
+But `request.domain` is what the **kernel** reports as the calling domain at call time, not something
+the adapter caches, so it cannot lag behind an exec that has already completed.
+
+**What reading did find, and it is worth more than the flake.** If that `copy_in` ever fails the
+handler returns `EFAULT` — and `/bin/execed` is hand-assembled and **never checks the return value**,
+as most programs do not for a write to stdout. So a failed console write from a hosted program is
+**completely silent today**: no line, and no trace of why. Whatever this intermittent turns out to
+be, that silence is a real gap, and it is why two rounds of hypothesis had nothing to test against.
+
+**The instrument that would end it** is a record in the adapter's report page for a refused console
+write — the same shape as `trace_file` and `faults_seen`, which exist for exactly this purpose. It
+was **not** built here: it needs a new slot in `personality`'s shared report layout and a reader in
+the kernel, and starting a change to a layout guarded by `const` assertions, for a twice-seen
+intermittent, is not a trade to make unasked. Recorded as the next step, with the reason it was not
+taken.
 
 It is the **second** unexplained intermittent of the day, after the 494 ms spawn, and they are not
 obviously related — one is scheduler timing, this one is a lost console byte on a dying domain.
