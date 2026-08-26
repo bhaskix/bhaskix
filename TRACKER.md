@@ -1002,6 +1002,50 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-26 (the shell's command names, audited against the standing directive — and mostly already right)
+
+**The user directive of 2026-08-21 asks that names be *near Linux*:** *"A person
+who knows Linux should guess the name and be right … not an invented
+vocabulary."* Nobody had checked the shell against it. Checked now, by reading
+what each command **does** rather than what it is called.
+
+**The user-mode shell**: `help`, `dmesg`, `echo`, `ls`, `cat`, `exit`, `net`,
+`pkg install|list|run` — all Linux-guessable, and `pkg` matches both BSD and the
+`apt install` shape.
+
+The seven that are not — `open`, `held`, `release`, `ask`, `caps`, `map`, `irq`
+— **are right as they are, and the directive is why.** They are not utilities;
+they are demonstrations of capability mechanics. `open` resolves *one* name in
+the directory this program holds, with no paths and no `..`, and maps the page
+the service lends. `map` **maps** memory the program holds and is refused what it
+does not. The nearest Linux words would be `pmap` and `open(2)` semantics, and
+both would describe something this system does not do — which is precisely the
+line the directive draws: *"If a familiar name would imply a guarantee this
+system does not offer, pick another name rather than lie with a familiar one."*
+`caps` is already the near-Linux choice, next to `capsh` and `getcap`.
+
+**The kernel's fallback shell** is where the exceptions are, and there are three,
+each with an exact Linux analogue rather than an approximate one:
+
+| today | does | Linux name for it |
+|---|---|---|
+| `elf <path>` | describes an ELF file | **`readelf`** |
+| `mem` | memory statistics | **`free`** |
+| `disk` | the block device | **`lsblk`** |
+
+`ps` in that shell already shows *threads* under the Linux name, so the project
+does make this trade deliberately; these three simply have not been looked at.
+
+**Not renamed here.** They are user-facing names, the choice between `lsblk` and
+`df` is taste rather than correctness, and an interface is not something to
+change while nobody is looking. Recorded as a proposal with the evidence
+attached.
+
+**The finding worth keeping is the negative one**: the directive is largely
+already honoured, and the places it is not are places where honouring it
+literally would misdescribe the system. An audit that returns "this is mostly
+fine, and here is why the exceptions are exceptions" is a result.
+
 ### 2026-08-26 (the `0xaa95f000` refusal has a suspect and an instrument that will convict or clear it)
 
 **One theory died and a better one took its place, from evidence already in the
