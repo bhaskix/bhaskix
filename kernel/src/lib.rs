@@ -7420,6 +7420,84 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // is its last call, so a test that stopped waiting earlier would destroy
     // the domain in the middle of the smuggle sequence and read a report
     // half written. This said `+ 3` while the probe made three calls.
+    // **The refusal is probed at the first call.** The rule is "too late once a
+    // thread exists", and the first call is the earliest moment one provably
+    // does -- something just made a syscall. Asking after the *eighth* asks at
+    // the worst instant available, because the eighth call is the probe's own
+    // `exit`.
+    //
+    // The difference is not subtle and was measured rather than argued: over
+    // twelve boots, asking late found a live thread to refuse **once**; asking
+    // early found one **eight times in ten**. Same question, same rule, ten
+    // times the chance of actually putting it to the test.
+    //
+    // Asking early was once blamed for breaking this self-test and that blame
+    // was withdrawn: re-applied and run ten times, zero failures. See
+    // `TRACKER.md`, 2026-08-25.
+    let mut arrived = false;
+    for _ in 0..400 {
+        if syscall::FOREIGN_CALLS.load(Ordering::Relaxed) > calls_before {
+            arrived = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    if !arrived {
+        println!("\x1b[91m    personality    FAILED: no foreign calls arrived\x1b[0m");
+        return false;
+    }
+    //
+    // **And it puts back what it changed.** A probe that alters the thing it is
+    // observing is not a probe. When no thread exists at that instant the
+    // re-tag *succeeds* -- correctly -- and the domain is then Native, so the
+    // rest of the sequence runs in the wrong dialect and stops making foreign
+    // calls at all. Measured before the restore was added: **1 boot in 10**
+    // failed with `not all eight foreign calls arrived`, which is precisely the
+    // failure an older comment here described and which was wrongly dismissed
+    // as unrelated on 2026-08-25. It is related, and it is rare, and rare is
+    // what made it look like something else.
+    //
+    // The restore runs inside the same `domain::with`, so it is under the same
+    // table lock as the change it undoes.
+    // **How many calls had landed when the question was asked**, because
+    // without it an `Ok` is ambiguous and the two readings are very different.
+    //
+    // This loop polls every 5 ms and the probe's eight syscalls take
+    // microseconds, so "the first call has arrived" can mean *all eight* have.
+    // If the count is 1, a thread was demonstrably mid-sequence and an `Ok`
+    // would mean a live thread went uncounted -- a hole in a guard that exists
+    // to stop a program being re-tagged mid-flight. If the count is 8, the
+    // probe had simply finished and gone, and `Ok` is the correct answer to a
+    // question about an empty domain.
+    //
+    // One boot in twenty-seven answers `Ok` here. Which of those two it is
+    // decides whether there is a defect, so the report carries the number
+    // rather than leaving it to be argued.
+    let calls_at_probe = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - calls_before;
+    // **And whether the run-queue scan could see, because that is the suspect.**
+    //
+    // `sched::threads_in_domain` takes each queue with `try_lock` and its own
+    // comment says a skipped queue counts as empty -- *"tolerable here, every
+    // caller polls in a loop, so a blinded pass is corrected by the next"*, and
+    // it names `exit` as deliberately not using it for that reason.
+    // `set_personality` **does not poll**: it asks once and decides, and the
+    // decision is a security rule. So a blinded scan there would read as "no
+    // threads" and let a tag change win against a live one.
+    //
+    // That is a hypothesis with a mechanism, not a conclusion. The delta is
+    // recorded so the next occurrence settles it instead of being argued about.
+    let skips_before = sched::domain_scan_skips();
+    let late = domain::with(realm, |owner| {
+        let outcome = owner.set_personality(domain::Personality::Native);
+        if outcome.is_ok() {
+            let _ = owner.set_personality(domain::Personality::Linux);
+        }
+        outcome
+    });
+
+    // And *then* wait for all eight, which is what the destroy below needs: the
+    // probe's own exit is its last call, so tearing the domain down earlier
+    // would read a report half written.
     let mut spoke = false;
     for _ in 0..400 {
         if syscall::FOREIGN_CALLS.load(Ordering::Relaxed) >= calls_before + 8 {
@@ -7429,7 +7507,7 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         wait_millis(5);
     }
     if !spoke {
-        println!("\x1b[91m    personality    FAILED: no foreign calls arrived\x1b[0m");
+        println!("\x1b[91m    personality    FAILED: not all eight foreign calls arrived\x1b[0m");
         return false;
     }
 
@@ -7482,19 +7560,24 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // thirty into about one in ten, with the failure now a *false* one, since
     // the kernel was right at both instants.
     //
-    // What would actually close it is a probe that is **guaranteed alive**
+    // What would close it **completely** is a probe that is guaranteed alive
     // while the question is asked -- one that does not spend its last call
-    // exiting. That is a change to the probe, not to the moment, and it is
-    // recorded in `TRACKER.md` rather than guessed at here.
-    let late = domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Native)
-    });
+    // exiting. Moving the moment raises the odds from about one in twelve to
+    // about eight in ten; only changing the probe makes it certain, and that
+    // is recorded in `TRACKER.md` rather than guessed at here.
+    //
     // What actually happened, said plainly, so the rarity of the interesting
     // case is visible in every boot report instead of hidden behind a sentence
     // that assumed it.
     let late_note = match late {
         Some(Err(_)) => "a thread still existed and the tag change lost to it",
-        Some(Ok(())) => "the probe's thread was already gone, so no tag change was refused",
+        Some(Ok(())) if calls_at_probe >= 8 => {
+            "the probe had already made all eight calls and gone, so there was no tag to refuse"
+        }
+        Some(Ok(())) => {
+            "A TAG CHANGE WON WHILE THE PROBE WAS MID-SEQUENCE -- a live thread went uncounted"
+        }
+        // (the blinded-scan count for this window is printed beside the note)
         None => "the domain had already ended, so no tag change was refused",
     };
 
@@ -7621,7 +7704,9 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
              answered, the bad descriptor refused EBADF, and exit never came back; it then \
              asked for all five of this kernel's own syscall kinds by number and got a Linux \
              errno five times, surviving the one that is Exit natively; 8 foreign calls logged \
-             in order, {late_note}, and the tag cleared when the domain ended"
+             in order, {late_note} (asked after {calls_at_probe} of 8 calls, \
+             {} run-queue scans blinded), and the tag cleared when the domain ended",
+            sched::domain_scan_skips().saturating_sub(skips_before)
         );
         true
     } else {
