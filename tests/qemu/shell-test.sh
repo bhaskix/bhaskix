@@ -97,7 +97,7 @@ printf '\033[2m      image %s, built %s\033[0m\n' \
 if [[ "$MODE" == "kernel" ]]; then
     started="a shell. 'help' lists"
     prompt="bhaskix> "
-    commands=$'help\r'$'ls /\r'$'cat etc/hostname\r'$'elf bin/probe\r'$'disk\r'$'nosuchcommand\r'
+    commands=$'help\r'$'ls /\r'$'cat etc/hostname\r'$'readelf bin/probe\r'$'lsblk\r'$'nosuchcommand\r'
 else
     started="a user-mode shell. 'help' lists"
     prompt="bhaskix$ "
@@ -384,10 +384,10 @@ if [[ "$MODE" == "kernel" ]]; then
         "the shell started:a shell\. .help. lists"
         "the prompt appeared:bhaskix> "
         "a typed command was echoed and run:bhaskix> help"
-        "help listed its commands:elf <path>"
+        "help listed its commands:readelf <path>"
         "ls read the filesystem:hello.txt"
         "cat read a file's contents:^bhaskix.?$"
-        "elf parsed the user program:entry 0x10000000, 3 segments"
+        "readelf parsed the user program:entry 0x10000000, 3 segments"
         "an unknown command was refused:nosuchcommand: not a command"
     )
 else

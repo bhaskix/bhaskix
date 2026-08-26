@@ -97,12 +97,12 @@ pub fn run(line: &[u8]) -> Outcome {
         b"echo" => echo(arguments),
         b"ls" => list(arguments),
         b"cat" => concatenate(arguments),
-        b"elf" => describe_elf(arguments),
-        b"mem" => memory(),
+        b"readelf" => describe_elf(arguments),
+        b"free" => memory(),
         b"ps" => threads(),
         b"uptime" => uptime(),
         b"input" => input_statistics(),
-        b"disk" => disk(),
+        b"lsblk" => disk(),
         unknown => {
             println!("{}: not a command. Try 'help'.", Text(unknown));
             Outcome::Unknown
@@ -156,17 +156,27 @@ impl core::fmt::Display for Body<'_> {
 }
 
 fn help() -> Outcome {
+    // **The names a Linux user would guess**, which is the standing rule for
+    // every surface here: `readelf`, `free` and `lsblk` were `elf`, `mem` and
+    // `disk` until 2026-08-26. Each has an exact analogue rather than an
+    // approximate one, which is why these three moved and the capability
+    // commands in the user-mode shell did not -- `map` there is not `pmap`,
+    // and calling it that would describe something this system does not do.
+    //
+    // `ps` was already named this way, and shows *threads*: the closest Linux
+    // gets is `ps -T`, and the line says "by cpu" rather than pretending
+    // otherwise.
     println!("  commands");
     println!("    help              this list");
     println!("    echo <words>      print the arguments");
     println!("    ls [path]         list a directory in the initrd");
     println!("    cat <path>        print a file");
-    println!("    elf <path>        what the ELF loader makes of a file");
-    println!("    mem               physical memory and the kernel heap");
+    println!("    readelf <path>    what the ELF loader makes of a file");
+    println!("    free              physical memory and the kernel heap");
     println!("    ps                threads, by cpu");
     println!("    uptime            time since the kernel started");
     println!("    input             console input statistics");
-    println!("    disk              the block device, if there is one");
+    println!("    lsblk             the block device, if there is one");
     println!();
     println!("  this shell is the kernel: it holds no capability and asks");
     println!("  permission for nothing. m6-05's user-mode shell will.");

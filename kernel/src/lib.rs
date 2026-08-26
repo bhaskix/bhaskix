@@ -18743,13 +18743,13 @@ fn shell_self_test() -> bool {
         (shell::run(b"cat etc/hostname"), shell::Outcome::Ran),
         (shell::run(b"cat ../etc/hostname"), shell::Outcome::Failed),
         (shell::run(b"cat nothing"), shell::Outcome::Failed),
-        (shell::run(b"elf bin/probe"), shell::Outcome::Ran),
-        (shell::run(b"elf hello.txt"), shell::Outcome::Failed),
-        (shell::run(b"mem"), shell::Outcome::Ran),
+        (shell::run(b"readelf bin/probe"), shell::Outcome::Ran),
+        (shell::run(b"readelf hello.txt"), shell::Outcome::Failed),
+        (shell::run(b"free"), shell::Outcome::Ran),
         (shell::run(b"ps"), shell::Outcome::Ran),
         (shell::run(b"uptime"), shell::Outcome::Ran),
         (shell::run(b"input"), shell::Outcome::Ran),
-        (shell::run(b"disk"), shell::Outcome::Ran),
+        (shell::run(b"lsblk"), shell::Outcome::Ran),
         (shell::run(b"nosuchcommand"), shell::Outcome::Unknown),
     ];
     let commands = outcomes.len();
