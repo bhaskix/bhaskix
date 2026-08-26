@@ -4042,10 +4042,53 @@ pub fn threads_in_domain(domain: u32) -> usize {
             // polls in a loop, so a blinded pass is corrected by the next —
             // and counted, so the domain-test capture can report it. The
             // last-thread decision in `exit` deliberately does NOT use this
-            // function for exactly this reason.
+            // function for exactly this reason, and neither does
+            // `Domain::set_personality` any more: see
+            // [`threads_in_domain_exact`].
             DOMAIN_SCAN_SKIPS.fetch_add(1, Ordering::Relaxed);
             continue;
         };
+        total += queue
+            .threads
+            .iter()
+            .flatten()
+            .filter(|thread| thread.domain == domain && thread.state != State::Finished)
+            .count();
+    }
+    total
+}
+
+/// Like [`threads_in_domain`], but **blocks** for each queue rather than
+/// skipping one it cannot take.
+///
+/// # Why both exist
+///
+/// `threads_in_domain` takes each run queue with `try_lock` and counts a
+/// skipped queue as **empty**. Its own comment calls that tolerable *"because
+/// every caller polls in a loop, so a blinded pass is corrected by the next"* —
+/// and names `exit` as deliberately not using it for that reason.
+///
+/// A caller that asks **once** and decides is not the caller that comment
+/// describes. `Domain::set_personality` is exactly such a caller: it refuses a
+/// tag change while a thread exists, once, and a blinded scan there reads as
+/// "no threads" and lets the change through. Measured on 2026-08-26 at about
+/// **one attempt in twenty**, with the probe demonstrably mid-syscall — and
+/// retryable, so a caller in a loop defeated the rule at will.
+///
+/// # Lock order
+///
+/// `Rank::Domains` is **6** and `Rank::SchedRunqueue` is **10**, so taking a
+/// run queue while holding the domain table is the sanctioned direction and
+/// blocking here is sound. It would not be sound from a caller already holding
+/// a run queue — the rank detector reports that, and the boot gate that asserts
+/// no lock-order violation anywhere in bring-up is what proves this change did
+/// not introduce one.
+#[must_use]
+pub fn threads_in_domain_exact(domain: u32) -> usize {
+    let online = percpu::online_count() as usize;
+    let mut total = 0;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let queue = queue.lock();
         total += queue
             .threads
             .iter()

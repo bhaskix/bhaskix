@@ -1253,7 +1253,15 @@ impl Domain {
     /// to try it again.
     #[must_use]
     fn has_threads(&self) -> bool {
-        self.threads > 0 || crate::sched::threads_in_domain(self.id) > 0
+        // **The exact scan, not the `try_lock` one.** `threads_in_domain`
+        // counts a queue it could not take as empty, which is safe for a
+        // caller that polls and wrong for one that decides. This decides.
+        //
+        // And it is the whole guard in practice: `self.threads` counts RFC
+        // 0017 `START`ed programs, a counter `syscall.rs` records as reading
+        // "zero for every domain" outside one self-test -- so the scan is not
+        // a second opinion, it is the only one.
+        self.threads > 0 || crate::sched::threads_in_domain_exact(self.id) > 0
     }
 
     /// Sets the dialect — refused once the domain has a thread, because a

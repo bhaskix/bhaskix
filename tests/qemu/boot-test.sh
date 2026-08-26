@@ -93,7 +93,27 @@ FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
                  # kept. This catches a test that ran and failed; a positive
                  # gate also catches one that never ran at all, which is the
                  # quieter failure and the one that survives a refactor.
-                 "FAILED")
+                 "FAILED"
+                 # **A tag change that won while a thread was mid-syscall.**
+                 #
+                 # Not a self-test's verdict but a statement of fact, and the
+                 # fact is a bug by construction: the probe had made fewer than
+                 # its eight calls, so a thread demonstrably existed in that
+                 # domain, and `set_personality` allowed the change anyway. The
+                 # rule is that it must lose to a thread that exists.
+                 #
+                 # Measured at about one boot in twenty until 2026-08-26, when
+                 # `has_threads` stopped asking the `try_lock` scan -- which
+                 # counts a queue it could not take as *empty* -- and asked the
+                 # blocking one. 30 boots after: zero.
+                 #
+                 # **Honest about what was watched.** The marker's wiring was
+                 # proven by printing this string from the kernel deliberately
+                 # and watching the lane go red. The *condition* was not: it
+                 # needs the bug back and one boot in twenty of patience, and a
+                 # marker for a fact that is a bug by construction does not need
+                 # the bug to be worth having.
+                 "A TAG CHANGE WON WHILE THE PROBE WAS MID-SEQUENCE")
 # Note: "timed out" is deliberately NOT a marker. The success message reads
 # "none timed out" and a substring match on it fails every passing run --
 # which is exactly what happened when it was added. The positive assertion
