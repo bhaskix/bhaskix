@@ -20424,13 +20424,19 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     let races_before = sched::races();
 
     const NAMES: [&str; 4] = ["ring-0", "ring-1", "ring-2", "ring-3"];
+    // Kept so this test can wait for its own workers rather than sleeping over
+    // them -- see the retirement below.
+    let mut spawned = [0u32; NAMES.len()];
     for (id, name) in NAMES.iter().enumerate() {
         // Placed by load, so the ring spans CPUs and the wakeups are genuinely
         // cross-processor. A ring confined to one CPU would never exercise the
         // window this test exists for.
-        if let Err(error) = sched::spawn(name, ring_station, id as u64, hhdm_base) {
-            println!("\x1b[91m    wait queues    FAILED to spawn {name}: {error:?}\x1b[0m");
-            return false;
+        match sched::spawn(name, ring_station, id as u64, hhdm_base) {
+            Ok(thread) => spawned[id] = thread,
+            Err(error) => {
+                println!("\x1b[91m    wait queues    FAILED to spawn {name}: {error:?}\x1b[0m");
+                return false;
+            }
         }
     }
 
@@ -20449,10 +20455,17 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     let fastest = laps.iter().copied().max().unwrap_or(0);
     let total: u64 = laps.iter().sum();
 
-    // Retire the ring: publish the phase, then wake, in that order.
+    // Retire the ring: publish the phase, then wake, in that order -- and then
+    // **wait for them**, rather than sleeping 200 ms and hoping.
+    //
+    // These threads *block*, so the wake is what lets them re-read the phase at
+    // all; the ordering comment above is about that and is load-bearing. What
+    // was missing is the other half: nothing checked they had actually gone.
+    // The class phase that follows measures CPU shares, and a ring station
+    // still runnable is a competitor it never accounted for.
     PHASE.store(PHASE_WAIT + 1, Ordering::Release);
     RING.wake_all();
-    wait_millis(200);
+    let ring_retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
 
     let mut ok = true;
 
@@ -20498,6 +20511,15 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         println!(
             "\x1b[91m    wait queues    FAILED: {} sleepers overflowed the queue\x1b[0m",
             RING.overflowed()
+        );
+        ok = false;
+    }
+
+    if !ring_retired {
+        println!(
+            "\x1b[91m    wait queues    FAILED: {} ring stations did not retire, so the class \
+             phase would measure a machine they are still competing on\x1b[0m",
+            sched::threads_present_exact(&spawned)
         );
         ok = false;
     }
@@ -20831,14 +20853,49 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
 
     ok &= wait_queue_self_test(hhdm_base);
 
+    // The ring is retired **by the test that spawned it**, which waits for its
+    // stations rather than sleeping over them -- see the note there. The store
+    // is kept as a belt: it is idempotent, and this sequence still reads as
+    // "phase advances here" to anyone following it downwards.
     PHASE.store(PHASE_CLASS, Ordering::Release);
-    wait_millis(200);
 
     ok &= class_self_test(hhdm_base, cpus);
     ok &= rt_latency_self_test(hhdm_base, cpus);
 
+    // Retire the class **burners** and wait for them. They spin and poll the
+    // phase, so they go promptly; the domain phase that follows measures
+    // envelopes and CPU share, and a burner still running is a competitor it
+    // never accounted for.
+    //
+    // **Only the burners.** The `rt-probe` spawned beside them is *blocked* on
+    // `RT_GATE`, and its retirement is deliberately split: the wake that lets
+    // it re-read the phase comes two tests later, after `shared_memory`. That
+    // split is in the code on purpose -- a blocked thread competes for nothing
+    // -- so it is left alone rather than tidied into a shape that would need
+    // the wake moved. `CLASS_IDS` is the array those tests already publish
+    // into, and `u64::MAX` is its "never filled" sentinel.
     PHASE.store(PHASE_DOMAIN, Ordering::Release);
-    wait_millis(200);
+    let mut burners = [0u32; 2];
+    let mut burner_count = 0usize;
+    for slot in CLASS_IDS.iter().take(2) {
+        let id = slot.load(Ordering::Relaxed);
+        if id != u64::MAX {
+            burners[burner_count] = id as u32;
+            burner_count += 1;
+        }
+    }
+    if !wait_until(
+        || sched::threads_present_exact(&burners[..burner_count]) == 0,
+        4_000,
+    ) {
+        println!(
+            "\x1b[91m    sched classes  FAILED: {} class burners still running, so the domain \
+             phase would measure a machine they are on\x1b[0m",
+            sched::threads_present_exact(&burners[..burner_count])
+        );
+        ok = false;
+    }
+
     ok &= domain_self_test(hhdm_base, cpus);
     ok &= shared_memory_self_test(hhdm_base);
 

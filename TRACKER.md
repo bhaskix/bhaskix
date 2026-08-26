@@ -1139,12 +1139,35 @@ workers by id and fails loudly if they are still running, watched red the same
 way: `threads  FAILED: 4 pinning workers still running, so the migration phase
 would measure a machine they are on`.
 
-**Three more transitions still sleep**, and are left alone deliberately:
-`PHASE_CLASS` and `PHASE_DOMAIN` at 200 ms each, and two in the tickless path.
-The same shape, no fault traced to them, and each needs its own test to keep the
-ids it spawns. Recorded as a known pattern rather than swept up in a change made
-for a different reason — the two that were fixed are the two with evidence
-behind them.
+~~**Three more transitions still sleep**, and are left alone deliberately~~ —
+**two of them were done afterwards, and the third turned out to be structural.**
+
+**The wait-queue ring** (`PHASE_CLASS`) already did the hard half correctly:
+*"publish the phase, then wake, in that order"*, because those threads **block**
+and the wake is what lets them re-read the phase at all. What was missing was the
+other half — nothing checked they had gone. It now waits for its four stations,
+and the class phase that follows measures CPU shares, where a still-runnable ring
+station is a competitor it never accounted for. Watched red: `wait queues
+FAILED: 4 ring stations did not retire`.
+
+**The class burners** (`PHASE_DOMAIN`) likewise, using `CLASS_IDS` — the array
+those tests already publish into, with `u64::MAX` as its never-filled sentinel.
+Watched red: `sched classes  FAILED: 2 class burners still running`.
+
+**The third is not an oversight and is left as it is.** `rt-probe` is spawned
+beside the burners but **blocks** on `RT_GATE`, and its retirement is
+deliberately split: the wake that lets it re-read the phase comes *two tests
+later*, after `shared_memory`. A blocked thread competes for nothing, so the
+split is sound — and folding it in would mean moving that wake earlier, which is
+a change to what the intervening tests measure, made for tidiness. Recorded with
+its reason so the asymmetry does not read as something forgotten.
+
+**A hazard found on the way, and avoided.** The obvious move was to have
+`class_self_test` retire its own workers the way the migration test does. It
+would have broken the next test: `burner` and `rt_probe` both exit on
+`PHASE > PHASE_CLASS`, and `rt_latency_self_test` runs **after** the class test —
+so advancing the phase inside it would have made the rt probe exit before doing
+any work. Checked before writing, not after.
 
 ### 2026-08-26 (the kernel page fault is not lane-specific, and it lives just after the migration self-test)
 
@@ -7715,6 +7738,18 @@ moment before its domain ends.
 captured for the copy measurement all carry `execed pid 3`. The shape suggests a race between the
 child's console write and its domain ending rather than anything about the exec, but that is a
 reading of one sample and is recorded as such.
+
+~~**Not reproduced**~~ — **it recurred 2026-08-26**, five days later, on the UEFI lane, with the
+**identical** text down to `kept='3 2 3', console says ''`. Four consecutive UEFI lanes afterwards
+were clean, exactly as the three were in August. So it is a genuine intermittent rather than a
+one-off, and *"a race between the child's console write and its domain ending"* now rests on two
+samples that agree rather than one.
+
+**It is not today's changes**, and the check matters because that day removed several
+`wait_millis` sleeps from the scheduler phases and so shifted boot timing: this failure was first
+seen on **2026-08-21**, before any of it. A shifted timing that surfaced a pre-existing race would
+still be worth knowing, and four clean re-runs on the changed tree are the evidence against it —
+not proof, and said as such.
 
 It is the **second** unexplained intermittent of the day, after the 494 ms spawn, and they are not
 obviously related — one is scheduler timing, this one is a lost console byte on a dying domain.
