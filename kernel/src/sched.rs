@@ -1560,6 +1560,27 @@ pub fn describe(thread: u32) -> Option<(&'static str, u64)> {
     None
 }
 
+/// Whether `thread` is parked rather than runnable.
+///
+/// `None` if there is no such thread.
+///
+/// **Written for the clone probe's gate, and the distinction it draws is the
+/// whole reason it exists.** `syscall::BLOCKED` counts threads the adapter told
+/// the kernel to park, and it is incremented *before* `notify::wait` actually
+/// parks one — so a watcher waiting on that counter alone can act in the window
+/// where the thread has been counted and is still running. This answers the
+/// question the counter cannot: has the park landed?
+#[must_use]
+pub fn is_blocked(thread: u32) -> Option<bool> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        if let Some(found) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return Some(found.state == State::Blocked);
+        }
+    }
+    None
+}
+
 /// Whether `thread` may never be moved to another CPU.
 ///
 /// `None` if there is no such thread.

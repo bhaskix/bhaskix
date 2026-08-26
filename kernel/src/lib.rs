@@ -3889,7 +3889,7 @@ const CLONE_REPORT_AT: u64 = 0x0000_0000_6002_0000;
 /// in the same address space *and* the futex wait/wake pair actually
 /// blocks and releases — which is the half step 6 could not prove with one
 /// thread, and the half Go's scheduler lives on.
-const CLONE_CODE: [u8; 240] = [
+const CLONE_CODE: [u8; 233] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page (shared, both threads)
     0x4c, 0x89, 0xfe, // mov rsi, r15
     0x48, 0x81, 0xc6, 0x00, 0x08, 0x00, 0x00, // add rsi, 0x800        ; child stack top
@@ -3906,15 +3906,27 @@ const CLONE_CODE: [u8; 240] = [
     0x4d, 0x89, 0xf8, // mov r8, r15           ; tls = the shared page, which
     //                                   this personality hands the child in
     //                                   rdi (see cloned_thread)
-    0x4c, 0x8d, 0x0d, 0x6d, 0x00, 0x00, 0x00, // lea r9, [rip+child]   ; the entry
-    //                                   (0x6d, and it has moved twice: the
-    //                                   parent's tail grew a wait for the
+    0x4c, 0x8d, 0x0d, 0x75, 0x00, 0x00, 0x00, // lea r9, [rip+child]   ; the entry
+    //                                   (0x75, and it has moved three times:
+    //                                   the parent's tail grew a wait for the
     //                                   test's word at step 9 and a futex
-    //                                   park at step 10, and this
-    //                                   displacement reaches past both)
+    //                                   park at step 10, and on 2026-08-26 the
+    //                                   parent grew an eight-byte announcement
+    //                                   below. Recomputed with the array
+    //                                   disassembled rather than counted:
+    //                                   `objdump` reads `lea r9,[rip+0x75]`
+    //                                   and resolves it to 0x9c, which is
+    //                                   where `child:` now begins)
     0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56           ; clone
     0x0f, 0x05, // syscall
     0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax      ; the tid the parent got
+    // **"I am about to wait", for the test to read.** One of the two witnesses
+    // that let the kernel hold the child back until the parent is genuinely
+    // asleep; see the gate in `child:` below. It is written here, *before*
+    // `test rax, rax`, so that the `js` and its target move together and its
+    // `rel8` needs no recomputing -- the displacement past the child does, and
+    // did.
+    0x49, 0xc7, 0x47, 0x30, 0x01, 0x00, 0x00, 0x00, // mov qword [r15+48], 1
     0x48, 0x85, 0xc0, // test rax, rax
     0x78, 0x24, // js parent_done        ; refused: stop here
     0x4c, 0x89, 0xff, // mov rdi, r15
@@ -3958,18 +3970,33 @@ const CLONE_CODE: [u8; 240] = [
     0x0f, 0x05, // syscall
     0xeb, 0xfe, // jmp $                 ; only if the park ever returns
     0x49, 0x89, 0xff, // child: mov r15, rdi   ; the page, as handed over
-    // Let the parent reach its sleep first. Without this the child wins the
-    // race, the parent's WAIT sees a word that already changed and returns
-    // EAGAIN -- correct behaviour, and a test that never exercises the
-    // sleeping path. Yielding twice is enough on an emulated machine and
-    // costs nothing if it is not.
-    0xb8, 0x18, 0x00, 0x00, 0x00, // mov eax, 24           ; sched_yield
-    0x0f, 0x05, // syscall
-    0xb8, 0x18, 0x00, 0x00, 0x00, // mov eax, 24
-    0x0f, 0x05, // syscall
-    0xb9, 0x00, 0x00, 0x40, 0x00, // mov ecx, 0x400000     ; and a short spin
-    0x48, 0xff, 0xc9, // spin: dec rcx
-    0x75, 0xfb, // jnz spin
+    // **The child waits to be let go, and is let go by the only party that can
+    // know.** Until 2026-08-26 this was `sched_yield` twice and a spin of four
+    // million -- an attempt to lose a race on purpose, which worked until it
+    // did not. When the child won anyway, the parent's `FUTEX_WAIT` saw a word
+    // that had already changed and returned `EAGAIN`: correct behaviour, and a
+    // run that never exercised the sleeping path this test exists to prove.
+    //
+    // Retrying was tried first and measured: three attempts, and on
+    // 2026-08-26 the attempts were shown **not to be independent draws** --
+    // the per-attempt loss rate was about 1 in 30 on this lane, which predicts
+    // three-of-three at 1 in 27,000, and three-of-three was seen at 1 in 40.
+    // Three orders of magnitude apart. When the machine is in a state where
+    // the child wins, it wins again, so a fourth retry is a placebo.
+    //
+    // The old comment said the alternative was impossible: *"no amount of
+    // user-mode delay can guarantee the parent is asleep, because the only
+    // thing that knows is the kernel and the probe cannot ask it without a
+    // syscall invented for the test."* Both halves are true and the conclusion
+    // does not follow. **The kernel is running this test.** It does not need
+    // to be asked, and it does not need a syscall: it watches for the parent's
+    // announcement at `[r15+48]` together with its own count of hosted threads
+    // parked by a `BLOCK_ON` reply, and only then writes the word below. The
+    // same two witnesses the exit phase of this test has always used, applied
+    // to the rendezvous that had been left to luck.
+    0x49, 0x8b, 0x47, 0x48, // gate: mov rax, [r15+72]
+    0x48, 0x85, 0xc0, //       test rax, rax
+    0x74, 0xf7, //             jz gate
     0xb8, 0xba, 0x00, 0x00, 0x00, // mov eax, 186          ; gettid
     0x0f, 0x05, // syscall
     0x49, 0x89, 0x47, 0x20, // mov [r15+32], rax     ; the child's own tid
@@ -4060,47 +4087,28 @@ fn clone_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // that did not conclude.
     let foreign_before = syscall::FOREIGN_CALLS.load(Ordering::Relaxed);
 
-    // **Attempts, because the rendezvous this proves is a race the probe
-    // can lose without anything being wrong.** The child yields twice and
-    // spins to let the parent reach its `FUTEX_WAIT` first, but on a loaded
-    // emulated machine the parent can be delayed past that. When it is, the
-    // child's write lands before the parent evaluates the wait's condition,
-    // the parent correctly does not sleep at all, and the child's `WAKE`
-    // correctly finds nobody: `wait 0, woke 0` is *right*, and it is not the
-    // thing this test exists to demonstrate, which is that a wait **blocks**
-    // and a wake **releases** it.
+    // **One run, because the race it used to retry around is gone.** The child
+    // no longer guesses when the parent is asleep: it waits on a word the
+    // kernel writes once it has seen the parent park, so the rendezvous cannot
+    // be lost. See the gate in `CLONE_CODE`'s `child:`.
     //
-    // Retrying is the honest fix, and the alternative was considered and
-    // rejected: no amount of user-mode delay can *guarantee* the parent is
-    // asleep, because the only thing that knows is the kernel and the probe
-    // cannot ask it without a syscall invented for the test. So the race is
-    // detected -- `woke == 0` with a wait that returned 0 -- and run again.
-    // Seen once in a full suite on 2026-08-19, at which point the gate
-    // failed on a machine whose kernel had done nothing wrong.
-    for attempt in 1..=3u32 {
-        match clone_rendezvous_attempt(hhdm_base, CPU, foreign_before, attempt) {
-            Some(outcome) => return outcome,
-            None => continue,
-        }
-    }
-    println!(
-        "\x1b[91m    linux clone    FAILED: three attempts and the child won the race every \
-         time, so the sleeping path was never exercised\x1b[0m"
-    );
-    false
+    // Three attempts stood here until 2026-08-26, and they were measured
+    // rather than removed on taste: the per-attempt loss rate on this lane was
+    // about 1 in 30, which predicts three-of-three at 1 in 27,000, and
+    // three-of-three was observed at 1 in 40. The attempts were **correlated**,
+    // so a fourth would have lost too. The detector below is kept, now as a
+    // failure rather than a retry: with the gate in place, a lost rendezvous
+    // means the gate did not hold, and that is worth a red lane.
+    clone_rendezvous_attempt(hhdm_base, CPU, foreign_before)
 }
 
-/// One clone-and-rendezvous attempt.
+/// The clone-and-rendezvous run.
 ///
-/// Answers `None` when the attempt *raced* — the parent never slept, so
-/// there was nothing for the child to wake — and `Some` with the verdict
-/// otherwise. See [`clone_self_test`] for why that distinction exists.
-fn clone_rendezvous_attempt(
-    hhdm_base: u64,
-    cpu: u32,
-    foreign_before: u64,
-    attempt: u32,
-) -> Option<bool> {
+/// Returned `Option<bool>` until 2026-08-26, where `None` meant *the attempt
+/// raced, run it again*. The race is gone — the kernel holds the child until
+/// it has seen the parent park — so there is nothing to signal and nothing to
+/// retry.
+fn clone_rendezvous_attempt(hhdm_base: u64, cpu: u32, foreign_before: u64) -> bool {
     use core::sync::atomic::Ordering;
 
     // Each attempt builds its own space and republishes the report page, so
@@ -4108,7 +4116,7 @@ fn clone_rendezvous_attempt(
     CLONE_REPORT_PA.store(0, Ordering::Release);
     let Ok(realm) = domain::create("clone", domain::ResourceEnvelope::new()) else {
         println!("\x1b[91m    linux clone    FAILED: no domain\x1b[0m");
-        return Some(false);
+        return false;
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
@@ -4116,22 +4124,67 @@ fn clone_rendezvous_attempt(
     .is_none()
     {
         println!("\x1b[91m    linux clone    FAILED: the tag would not set\x1b[0m");
-        return Some(false);
+        return false;
     }
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
-    if sched::spawn_on_with(cpu, "clone", ring3_clone, hhdm_base, hhdm_base, options).is_err() {
+    // **Before the probe exists**, so that only parks this probe causes can
+    // move it. The gate below opens on this counter rising *and* the parent's
+    // own announcement, which is the pair that says "the parent is asleep in
+    // the futex" rather than merely "somebody blocked".
+    let parked_before_rendezvous = syscall::BLOCKED.load(Ordering::Relaxed);
+    let Ok(parent_thread) =
+        sched::spawn_on_with(cpu, "clone", ring3_clone, hhdm_base, hhdm_base, options)
+    else {
         println!("\x1b[91m    linux clone    FAILED: the probe would not spawn\x1b[0m");
-        return Some(false);
-    }
+        return false;
+    };
 
     const MARKER: u64 = u64::from_le_bytes(*b"ETUFXKHB");
     let mut answers = [0u64; 5];
     let mut marked = false;
+    // **Whether the child was ever let go.** Distinguishes "the rendezvous
+    // failed" from "the parent never parked, so the gate never opened", which
+    // are different bugs and used to look identical from out here.
+    let mut released = false;
     for _ in 0..600 {
         let report_pa = CLONE_REPORT_PA.load(Ordering::Acquire);
         if report_pa != 0 {
+            // **The gate.** The child is spinning on `[report + 72]` and will
+            // not touch the futex word until this is written. It opens on two
+            // witnesses that cannot both be wrong: the parent's own
+            // announcement at `[report + 48]`, written from ring 3 after
+            // `clone` returned and before the wait, and the kernel's count of
+            // hosted threads parked by a `BLOCK_ON` reply. Neither alone would
+            // do -- the announcement says the parent *reached* the wait, not
+            // that it is in it, and the counter says *somebody* parked.
+            //
+            // **And a third, because two were not enough.** The first version
+            // opened on those two alone, mirroring the exit phase below, and
+            // the placements lane caught it: `syscall::BLOCKED` is incremented
+            // in `syscall.rs` *before* `notify::wait` parks the thread, so a
+            // watcher acting on the counter can act in the window where the
+            // parent has been counted and is still running. `sched::is_blocked`
+            // answers the question the counter cannot -- has the park landed --
+            // and it is only meaningful *after* the counter has moved, because
+            // this thread is `Blocked` during every foreign call it makes.
+            if !released {
+                // SAFETY: a frame the probe's space owns, through the direct
+                // map, while the domain is alive.
+                let announced =
+                    unsafe { core::ptr::read_volatile((hhdm_base + report_pa + 48) as *const u64) };
+                if announced == 1
+                    && syscall::BLOCKED.load(Ordering::Relaxed) > parked_before_rendezvous
+                    && sched::is_blocked(parent_thread) == Some(true)
+                {
+                    // SAFETY: as above.
+                    unsafe {
+                        core::ptr::write_volatile((hhdm_base + report_pa + 72) as *mut u64, 1);
+                    }
+                    released = true;
+                }
+            }
             // SAFETY: a frame the probe's space owns, through the direct map.
             let (marker, words) = unsafe {
                 (
@@ -4214,17 +4267,40 @@ fn clone_rendezvous_attempt(
     // set, the child's own tid, and how many the child's wake found.
     let [parent_saw, wait_answer, word, child_tid, woke] = answers;
 
-    // The race, before the verdict. Everything went right *except* that the
-    // parent never had to sleep, so the wake had nobody to find. Reported
-    // and retried rather than passed: a run in which nothing blocked has not
-    // shown what this test claims to show.
+    // **The detector is kept and its verdict inverted.** Everything went right
+    // *except* that the parent never had to sleep, so the wake had nobody to
+    // find. That used to mean "the child won the race, try again". With the
+    // gate in place the child cannot win it, so this now means the gate did
+    // not hold, and the right answer is a red lane rather than another roll.
     if marked && wait_answer == 0 && word == 42 && woke == 0 {
         println!(
-            "\x1b[93m    linux clone    attempt {attempt}: the child won the race, so the \
-             parent never slept and the wake found nobody -- correct, and not the proof \
-             wanted; trying again\x1b[0m"
+            "\x1b[91m    linux clone    FAILED: wait {}, word {}, woke {}, parent saw {}, child \
+             tid {}, child {}, parked before {} now {}\x1b[0m",
+            wait_answer as i64,
+            word,
+            woke as i64,
+            parent_saw as i64,
+            child_tid as i64,
+            if released {
+                "released"
+            } else {
+                "never released"
+            },
+            parked_before_rendezvous,
+            syscall::BLOCKED.load(Ordering::Relaxed)
         );
-        return None;
+        return false;
+    }
+
+    // The gate never opened, and the run below would be describing a probe
+    // that never got past its spin. Said separately because "the parent did
+    // not park" and "the rendezvous failed" are different faults.
+    if !released {
+        println!(
+            "\x1b[91m    linux clone    FAILED: the parent never parked, so the child was \
+             never let go -- no announcement at report+48, or no BLOCK_ON park\x1b[0m"
+        );
+        return false;
     }
 
     let right = marked
@@ -4241,10 +4317,10 @@ fn clone_rendezvous_attempt(
             "    linux clone    a Linux program cloned a thread (tid {parent_saw}, which the \
              child agrees is its own), then the two met through a futex: the parent slept, the \
              child set the word to 42 and woke {woke}, and the parent came back; the parent \
-             then parked in a futex and the child's exit_group ended them both (attempt \
-             {attempt})"
+             then parked in a futex and the child's exit_group ended them both. The child was \
+             held until the parent was seen parked, so nothing here was raced for"
         );
-        Some(true)
+        true
     } else {
         let foreign = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - foreign_before;
         println!(
@@ -4259,7 +4335,7 @@ fn clone_rendezvous_attempt(
             parked,
             group_ended
         );
-        Some(false)
+        false
     }
 }
 

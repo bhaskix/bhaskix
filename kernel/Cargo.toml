@@ -532,7 +532,13 @@ asm_budget = 10
 # reader for `bin/linuxd`'s fault log walks the report page like the six readers
 # beside it. None of it can be safe code: each is a physical frame reached
 # through the direct map, which is a raw pointer by construction.
-unsafe_budget = 1864
+# 1868 for the clone probe's gate: the kernel reads the parent's announcement
+# out of the probe's report page and writes the word the child is spinning on,
+# which is what removed the rendezvous race rather than retrying it. Two windows
+# through the direct map into a frame the probe's space owns, in the shape the
+# same function already uses for the exit phase beside it. Neither can be safe
+# code: the page is reached by physical address, which is a raw pointer.
+unsafe_budget = 1868
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
