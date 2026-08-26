@@ -18666,12 +18666,35 @@ fn shell_self_test() -> bool {
     const TYPED: &[u8] = b"ls /\r";
 
     let port = SerialPort::new(COM1);
+
+    // **Drain the devices as well as the rings, and *then* take the
+    // baselines.**
+    //
+    // This used to drain `input::try_read()` alone — the rings — and leave the
+    // hardware behind them holding whatever it held. `input::service()` below
+    // pulls from **three** sources at once (the UART, the i8042 keyboard and a
+    // USB one), so anything already sitting in any of them arrives counted as
+    // this test's own bytes.
+    //
+    // On an emulator all three are empty and nothing notices. On an SR550 with
+    // a BMC KVM attached the i8042 is not, and the test read **14 bytes where
+    // it typed 5** — reported as `draining after the wake found the bytes
+    // (14 of 5 bytes ... 0 of 15 commands wrong)`, a failure whose own counters
+    // said nothing was wrong except the count. Right on the emulator, wrong on
+    // hardware, again.
+    //
+    // The baselines move after the drain rather than before it, so counters
+    // disturbed by draining cannot be charged to the test.
+    for _ in 0..8 {
+        input::service();
+        if input::try_read().is_none() && !input::pending() {
+            break;
+        }
+        while input::try_read().is_some() {}
+    }
+
     let (delivered_before, _, _) = irq::statistics();
     let (signals_before, _, _) = notify::statistics();
-
-    // Drain anything already waiting, so what is counted below is what this
-    // test produced.
-    while input::try_read().is_some() {}
 
     // SAFETY: COM1 is initialised, and the port is put back below on every
     // path out of this function.
