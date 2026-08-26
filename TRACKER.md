@@ -1035,6 +1035,65 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-26 (the isolation table audited row by row, because one of its claims had just been found false)
+
+**Why the pass was run.** The unzeroed-frames disclosure existed because a
+sentence in `security.md` §6 asserted a property nothing checked. That is a
+class, not an incident, so the rest of the table was read the same way: for each
+row, is there a mechanism, and does anything prove it? Seven rows. **Five are
+sound and two were not true as written.**
+
+**Sound, verified rather than assumed — read, not taken on the table's word.**
+*Memory* — each domain records its own `space_root`, so the page tables really
+are separate, and mapping a shared object resolves a capability with rights out
+of the calling domain's own CSpace. *IPC* — `cap::lookup` takes a CSpace and a
+slot index; there is no lookup by name anywhere to enumerate. *CPU* — the `ResourceEnvelope`'s
+`cpu_shares` really is enforced: `thread_weight()` divides the share by the
+thread count so spawning threads is not a way around it, `add_thread` reweights
+**every** thread in the domain rather than just the new one, and the scheduler's
+`Policy::Fair { weight }` consumes it in its virtual-time accounting. *Devices*,
+*a domain that holds another*, and *IPC* rest on RFC 0043/0049, RFC 0032 and the
+capability system, all gated.
+
+**Row 7, Time, was false.** It read *"Coarse time is free; fine-grained timers
+are rate-limited per domain (side-channel hygiene)"*. **There is no rate limiter
+anywhere in this kernel.** The finest clock on the machine is `rdtsc`, and
+`arch/x86_64/src/tsc.rs` says the position in its own words — *"readable at every
+privilege level unless `CR4.TSD` is set, which this kernel never sets"* — while
+`syscall.rs` says it from the other side, explaining that arming a deadline is
+worth a syscall because a program *"can already read the clock, since `rdtsc` is
+unprivileged here"*. **The document contradicted itself**: §1 already lists
+microarchitectural side channels as out of scope with mitigation deferred to
+Phase 3 and marked *"Documented gap until then"*, which is the honest position.
+Corrected to say what is true, with the `CR4.TSD` decision named as the project
+lead's rather than implied by a table.
+
+**Row 3, Physical memory, was two claims and both are weaker than written.**
+
+*The field is dead.* `Frame::owner` exists, `FrameDb::set_owner` exists, and
+**`set_owner` is called from nowhere in the tree** — not in the kernel, not in a
+test. Nothing reads `Frame::owner` either. Every frame in the machine holds
+`NO_OWNER`. `memory.md` §2 listed three things this ownership gives "for free":
+exact per-domain telemetry (not available — the database cannot attribute a
+frame), teardown by walking the frame database (the outcome is achieved, by
+walking the object arena and the region map instead), and per-domain limits.
+
+*And the limit does not limit.* `domain::charge_frames` is real and refuses
+rather than exceeding — with **exactly one real caller, `shared::create`**. So
+`memory_frames` bounds shared objects and **not a domain's own memory**:
+`map_anonymous` charges nothing, and the fault path that commits a lazy
+reservation charges nothing. The eager mapping syscall is bounded per *call* by
+`MAX_SUPERVISED_PAGES`; the lazy path is not bounded even per call. A domain can
+hold more physical memory than its envelope allows.
+
+**Not fixed here, deliberately.** Charging every allocation is a design change
+with a question attached that this project has deferred: what happens to a
+domain that reaches its limit, when reclaim is Phase 3 and the OOM policy is an
+RFC of its own. The field is left in place rather than deleted for the same
+reason — it marks the decision better than a silence would. Both are recorded in
+`memory.md` §2 and `security.md` §6 in the present tense, where a reader looking
+for the guarantee will meet the correction instead of the claim.
+
 ### 2026-08-26 (a shared object arrived carrying the previous tenant's memory, and `security.md` said it could not)
 
 **`shared::create` allocated frames and never zeroed them.** Every memory object

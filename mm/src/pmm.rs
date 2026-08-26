@@ -90,6 +90,17 @@ pub struct Frame {
     pub refcount: u32,
     /// Which domain is charged for this frame, for per-domain limits and
     /// exact accounting (`docs/memory.md` §2).
+    ///
+    /// **Never written as of 2026-08-26, and the sentence above describes an
+    /// intent rather than a state.** Nothing calls [`FrameDb::set_owner`] and
+    /// nothing reads this field, so it holds [`NO_OWNER`] for every frame in
+    /// the machine. What actually happens instead: per-domain memory limits
+    /// are charged by `domain::charge_frames` against the `ResourceEnvelope`,
+    /// and domain teardown frees memory by walking the object arena and the
+    /// address space's region map -- neither of which consults this. Left in
+    /// place rather than deleted because wiring it is a real design question
+    /// (every allocation site would have to name an owner), and a field that
+    /// says what it is for is a better marker for that than a silence.
     pub owner: u32,
     /// Next frame on the same free list, or [`NONE`].
     next: Pfn,
@@ -523,6 +534,10 @@ impl Pmm {
     }
 
     /// Records which domain a frame is charged to.
+    ///
+    /// **Called from nowhere.** See [`Frame::owner`]: the per-frame ownership
+    /// this offers is not wired up, and the limits and teardown that
+    /// `docs/memory.md` §2 attributes to it are done by other means.
     ///
     /// # Errors
     ///

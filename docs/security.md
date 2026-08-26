@@ -556,11 +556,11 @@ target before it gets merged, not after.
 |---|---|
 | Memory | Separate page tables; no shared mappings without an explicit shared-memory capability |
 | CPU | `ResourceEnvelope` enforced by the scheduler ([scheduler.md](scheduler.md) §3) |
-| Physical memory | Per-frame `owner: DomainId`, enforced at allocation ([memory.md](memory.md) §2) |
+| Physical memory | **Weaker than this row claimed.** The per-frame `owner: DomainId` exists and is never written; the envelope (`domain::charge_frames`) bounds **shared objects only**, not a domain's own address space — [memory.md](memory.md) §2 |
 | Devices | Per-device IOMMU domain; a device is reachable only via capability |
 | A domain that holds another | A supervisor reaches into a domain **only** through a `Domain` capability carrying `WRITE`, and only into domains it was given one for — [RFC 0032](rfc/0032-a-supervisor-interface.md). Revoking that capability ends the reach before the call returns. The reach is one-directional: the held domain gains nothing, and its CSpace stays empty |
 | IPC | Endpoints are capabilities; there is no global name service to enumerate |
-| Time | Coarse time is free; fine-grained timers are rate-limited per domain (side-channel hygiene) |
+| Time | **Not a boundary today.** Coarse *and* fine-grained time are both free to every domain: `rdtsc` is unprivileged and `CR4.TSD` is never set. See the correction below |
 
 **Frames are zeroed on allocation, not on free.** Zero-on-free is a common choice and it is the
 wrong one: it puts the cost on the freeing path (often latency-sensitive teardown) and it can be
@@ -588,6 +588,30 @@ depends on it. A frame never reaches a domain carrying another domain's data.
 > canonical kernel-half address and a plausible user address. The policy itself is now written down
 > in [memory.md](memory.md) §2, which is where the code had been citing a section that did not
 > contain it.
+
+**The Time row said "fine-grained timers are rate-limited per domain (side-channel hygiene)" until
+2026-08-26, and no such limit has ever existed.** There is no rate limiter anywhere in this kernel,
+per domain or otherwise. The finest-grained clock on the machine is `rdtsc`, and `arch/x86_64`'s own
+comment states the position: *"`rdtsc` is readable at every privilege level unless `CR4.TSD` is set,
+which this kernel never sets."* `syscall.rs` says the same from the other side, explaining why
+arming a deadline is a service worth having — a program *"can already read the clock, since `rdtsc`
+is unprivileged here."* So every domain has cycle-resolution timing, unrestricted, and the row
+described a mitigation rather than a mechanism.
+
+**The two halves of this document disagreed with each other.** §1 already lists microarchitectural
+side channels as **out of scope**, with mitigation deferred to Phase 3 and marked *"Documented gap
+until then"* — which is the honest position and the one the project has taken elsewhere. The
+isolation table then claimed, in the present tense, that a timing mitigation was in place. A reader
+checking whether this system defends against timing attacks would have found the answer twice and
+got two different ones.
+
+**What is true.** Deadlines (RFC 0019) are capabilities like everything else, so a domain can arm
+only as many as it holds notification capabilities for, bounded by `max_capabilities` in its
+envelope. That is a bound on how many, not on how often, and it is not a side-channel measure — it
+is the ordinary capability accounting that applies to every object. Whether to set `CR4.TSD` is a
+real decision with real costs (hosted Linux programs read the TSC directly, and so does this
+kernel's own measurement code), and it is the project lead's to make rather than something to be
+implied by a table.
 
 ### A Linux compatibility domain is a domain, and nothing in this table changes for it
 

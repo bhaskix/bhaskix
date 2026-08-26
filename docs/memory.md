@@ -126,11 +126,32 @@ looks like a driver bug for weeks.
 
 ### Ownership and accounting
 
-Every allocated frame records its owning `DomainId`. This gives us, for free:
+Every allocated frame **has a field for** its owning `DomainId`. The three things below were written
+as consequences of it, in the present tense, and they are corrected here because **as of 2026-08-26
+that field has never been written**: nothing calls `FrameDb::set_owner`, nothing reads `Frame::owner`,
+and it holds `NO_OWNER` for every frame in the machine.
 
-- Per-domain memory limits enforced at allocation time (the `ResourceEnvelope`).
-- Exact accounting for the telemetry plane — no sampling, no estimation.
-- Correct cleanup on domain teardown: walk the frame database, free everything owned.
+- ~~Per-domain memory limits enforced at allocation time (the `ResourceEnvelope`).~~ **Partly true,
+  by a different mechanism, and the part that is missing is the important one.** `domain::charge_frames`
+  charges the envelope and refuses rather than exceeding — and it has exactly one real caller,
+  `shared::create`. So the envelope bounds **shared objects** and does not bound a domain's own
+  memory: `AddressSpace::map_anonymous` charges nothing, and the demand-paging fault path that
+  commits a lazy reservation charges nothing. A domain's address space is bounded per *call*
+  (`MAX_SUPERVISED_PAGES`, and only on the eager path) and is not bounded in aggregate at all. A
+  domain can therefore hold more physical memory than `memory_frames` allows. Whether to fix that by
+  charging every allocation — and what should happen to a domain that hits the limit, given reclaim
+  is deferred — is a design question and not a missing line of code.
+- ~~Exact accounting for the telemetry plane — no sampling, no estimation.~~ **Not available from
+  the frame database**, which cannot attribute a single frame to a domain.
+- ~~Correct cleanup on domain teardown: walk the frame database, free everything owned.~~ **The
+  outcome is achieved and the mechanism is not this one.** Teardown frees memory by walking the
+  object arena (`shared::destroy_owned_by`, where the *object* records its owner) and the address
+  space's own region map. The frame-leak gate proves the outcome on every boot; nothing walks the
+  frame database by owner.
+
+The field is left in place rather than deleted, because wiring it is a real design question — every
+allocation site would have to name an owner — and a field that says what it is for is a better
+marker for that decision than a silence.
 
 ---
 
