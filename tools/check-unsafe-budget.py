@@ -36,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import pathlib
 import re
 import sys
@@ -260,10 +261,45 @@ def self_test() -> int:
     return 0
 
 
+
+# The crates the kernel binary links, and therefore the `unsafe` that runs in
+# ring 0. Derived rather than listed: `cargo tree` answers it from the actual
+# dependency graph, so a crate that starts or stops being linked moves the
+# number without anybody remembering to.
+#
+# `docs/security.md` T9 quotes this share. It read "2,740 of them (66%) in ring
+# 0" with no derivation anywhere in the tree -- computed by hand once, with an
+# unstated set of crates, and stale by 2026-08-26. A figure in a security
+# document that nobody can reproduce is the same defect as a claim nobody
+# checks, so it is computed here now.
+def kernel_linked() -> set[str] | None:
+    try:
+        out = subprocess.run(
+            ["cargo", "tree", "-p", "bhaskix-kernel", "--target",
+             "x86_64-unknown-none", "--prefix", "none", "--no-dedupe"],
+            cwd=REPO, capture_output=True, text=True, timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    linked = set()
+    for line in out.stdout.splitlines():
+        name = line.split(" ")[0].strip()
+        if name.startswith("bhaskix"):
+            linked.add(name)
+    return linked or None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", action="store_true", help="print the table, always exit 0")
     parser.add_argument("--self-test", action="store_true", help="check the scanner itself")
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help="also print how much of the tree's unsafe is linked into the kernel",
+    )
     args = parser.parse_args()
     if args.self_test:
         return self_test()
@@ -320,6 +356,18 @@ def main() -> int:
         colour = GREEN if headroom >= 0 else RED
         print(f"  {name:<24} {total:>7} {budget:>7}   {colour}{headroom:+d}{RESET}")
     print()
+
+    if args.share:
+        linked = kernel_linked()
+        total = sum(count for _, count, _ in rows)
+        if linked is None:
+            print("  could not ask cargo which crates the kernel links")
+        else:
+            in_kernel = sum(count for name, count, _ in rows if name in linked)
+            percent = (100 * in_kernel / total) if total else 0.0
+            print(f"  {total} unsafe lines in tree, {in_kernel} of them "
+                  f"({percent:.0f}%) in the kernel binary")
+            print(f"  the kernel links {len(linked)} of this workspace's crates")
 
     if status == 0 and not args.report:
         print(f"{GREEN}ok{RESET}    unsafe budgets and SAFETY comments")

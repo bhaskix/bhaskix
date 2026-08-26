@@ -157,6 +157,7 @@ Read in this order:
 | [docs/ai-native.md](docs/ai-native.md) | Telemetry plane, policy hooks, where inference runs — and what we refuse to build |
 | [docs/coding-style.md](docs/coding-style.md) | Engineering rules. Read before your first PR. |
 | [docs/roadmap.md](docs/roadmap.md) | Milestones and their verifiable exit criteria |
+| [docs/prior-art.md](docs/prior-art.md) | Neighbouring systems, dated and sourced — including where this project is behind |
 
 ## The book
 

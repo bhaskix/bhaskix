@@ -1035,6 +1035,39 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-26 (a prior-art document, opened by the multikernel Linux tree)
+
+**`docs/prior-art.md` exists**, and the first entry is Linux `7.0-mk2` —
+multikernel: a host kernel that carves CPUs, memory and PCI devices into pools
+and `kexec`s an independent Linux into each, *"nothing emulated and nothing
+trapped"*. Read from a news report on 2026-08-26; **the tree itself has not been
+read**, and the entry says so wherever it matters.
+
+**Why a document rather than an opinion.** A project that refuses things has to
+be able to say what it refuses relative to what other people build, and to say
+it in a form that survives the week it was thought about. The file opens with
+four rules for its own entries: cite the source and the date it was read;
+separate quotation from inference, and inference-from-code from
+inference-from-summary; **state where Bhaskix is behind**; and say what would
+change our mind. Rule 3 is the load-bearing one — every system in there is
+further along than this one in some direction, usually the one a user cares
+about.
+
+**The finding, in a line.** Multikernel isolates by *replication* and Bhaskix by
+*reduction*, so replication does not shrink the trusted computing base — it
+multiplies it, and buys blast radius at coarse granularity while leaving
+everything inside an instance untouched. Where Bhaskix is behind is not close:
+they run real workloads on real hardware with the whole Linux ecosystem, and
+this system has no libc, one physical machine booted, and no disk found on it.
+
+**One thing recorded so it is not rediscovered as new.** `security.md` T5 treats
+a hypervisor as the way to run a guest kernel and lists VMX/SVM and EPT/NPT as
+nonexistent. Multikernel demonstrates a second way that needs no virtualisation
+extensions at all — `kexec` onto dedicated cores, untrapped — and it is
+**declined**, because it works by giving a foreign kernel ring 0 on real
+hardware, which is the property this system exists to refuse. Considered and
+declined beats rediscovered later.
+
 ### 2026-08-26 (the isolation table audited row by row, because one of its claims had just been found false)
 
 **Why the pass was run.** The unzeroed-frames disclosure existed because a

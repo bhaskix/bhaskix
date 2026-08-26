@@ -2879,10 +2879,20 @@ else
     status=1
 fi
 
-# Domains and the resource envelope. `docs/security.md` T10 says the envelope
-# is enforced at allocation time, not by best effort, and §3 says a domain's
-# CPU share holds regardless of how many threads it spawns — the second being
-# the one a per-thread weight silently gets wrong.
+# Domains and the resource envelope. §3 says a domain's CPU share holds
+# regardless of how many threads it spawns, and that half this gate really does
+# prove: the self-test puts one thread and three threads on the same CPU and
+# checks the shares hold, which is the property and not merely the arithmetic.
+#
+# **The memory half is weaker than it reads, and saying so here is the point.**
+# `docs/security.md` T10 said the envelope is enforced at allocation time, and
+# the kernel line below is produced by calling `domain::charge_frames`
+# *directly* -- eight frames against a cap of eight, then a ninth, and the
+# refusal is required. That tests the accounting function. It does not test that
+# anything allocating memory calls it, and as of 2026-08-26 almost nothing does:
+# `shared::create` is the only real caller, so a domain's own address space is
+# uncharged. This gate was green throughout. A gate that exercises the mechanism
+# rather than the property will pass while the property is absent.
 if grep -qE "domains +[0-9]+ created; envelope refuses past its cap; shares divided" "$LOG"; then
     pass "domains: envelope enforced, CPU share independent of thread count"
 else
