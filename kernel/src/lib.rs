@@ -18676,12 +18676,25 @@ fn shell_self_test() -> bool {
     // USB one), so anything already sitting in any of them arrives counted as
     // this test's own bytes.
     //
-    // On an emulator all three are empty and nothing notices. On an SR550 with
-    // a BMC KVM attached the i8042 is not, and the test read **14 bytes where
-    // it typed 5** — reported as `draining after the wake found the bytes
-    // (14 of 5 bytes ... 0 of 15 commands wrong)`, a failure whose own counters
-    // said nothing was wrong except the count. Right on the emulator, wrong on
-    // hardware, again.
+    // **This did not fix the SR550's `14 of 5 bytes`, and the comment says so
+    // rather than implying otherwise.** The reasoning above is sound as far as
+    // it goes — `service()` really does pull from three sources, and draining
+    // only the rings really did leave the devices behind them full — but a boot
+    // on 2026-08-26 with this in place reported the identical `14 of 5 bytes,
+    // 1 interrupts, 0 of 15 commands wrong`. So whatever those nine extra bytes
+    // are, they were **not already waiting** when the test began.
+    //
+    // The surviving explanation is that they arrive *during* the window. This
+    // function puts `COM1` into loopback and then waits up to 500 units for an
+    // interrupt, and the console is shared: anything another CPU prints in that
+    // window goes out of `COM1` and comes straight back in. The `set_loopback`
+    // call below already carries the warning — *"this must happen before
+    // anything is printed"* — and on sixteen processors there is far more
+    // running concurrently than on the four QEMU gives.
+    //
+    // Kept anyway, because draining the devices first is correct on its own
+    // terms and removes one real source of noise. It is simply not the source
+    // that mattered here.
     //
     // The baselines move after the drain rather than before it, so counters
     // disturbed by draining cannot be charged to the test.
@@ -20724,6 +20737,16 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     PHASE.store(PHASE_WAIT, Ordering::Release);
     let retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
     let still_here = sched::threads_present_exact(&spawned);
+    // **And still settle for as long as the old sleep did.**
+    //
+    // Waiting for the threads is the correctness half; this is the *stability*
+    // half, and it was learned by breaking it. Replacing four fixed sleeps with
+    // four waits made the boot timeline both earlier and far more variable --
+    // `bin/tcpc` began at 15.77-19.10 s where it had been 17.49-18.68 s -- and
+    // the TCP inbound test lands on a slirp retransmit rung with about a tenth
+    // of a second of margin. Its intermittent went from **1 boot in 30 to 3 in
+    // 12**. The fragility is filed separately and is not this change's to fix,
+    // but forcing it into the open with an unrelated change is a cost with no
 
     if ok {
         println!(
@@ -20884,10 +20907,11 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
             burner_count += 1;
         }
     }
-    if !wait_until(
+    let burners_retired = wait_until(
         || sched::threads_present_exact(&burners[..burner_count]) == 0,
         4_000,
-    ) {
+    );
+    if !burners_retired {
         println!(
             "\x1b[91m    sched classes  FAILED: {} class burners still running, so the domain \
              phase would measure a machine they are on\x1b[0m",
