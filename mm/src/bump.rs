@@ -152,7 +152,7 @@ impl BumpAllocator {
     ///
     /// The frame is **not** zeroed. This crate is `forbid(unsafe_code)` and
     /// cannot write physical memory; zeroing is the caller's responsibility,
-    /// and `docs/memory.md` §6 requires it on allocation rather than on free.
+    /// and `docs/memory.md` §2 requires it on allocation rather than on free.
     ///
     /// # Errors
     ///

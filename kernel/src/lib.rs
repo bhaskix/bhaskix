@@ -380,6 +380,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("\x1b[91m    supervisor write  FAILED\x1b[0m");
     }
 
+    // **The disclosure staged, on every boot.** `shared::create` allocated
+    // frames without zeroing them until 2026-08-26, so an object handed to a
+    // ring 3 service carried whatever its frames held before. This writes a
+    // pattern, frees it, and asks what the next owner sees. It runs here
+    // because it needs the heap and nothing else, and the sooner a hygiene
+    // failure is said the less of the boot has to be read to find it.
     let secondaries = smp::start_secondaries(handoff);
     smp::report(handoff);
     let _ = secondaries;
@@ -401,6 +407,27 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     } else {
         println!("\x1b[91m    scheduler      FAILED\x1b[0m");
     }
+
+    // **After `scheduling_self_test`, and that is not an aesthetic choice.**
+    // `shared::set_hhdm` is called from exactly one place in this kernel --
+    // inside `shared_memory_self_test`, which that test runs -- so before this
+    // point `shared` has no direct map base and cannot touch a frame at all.
+    // Placed earlier, this test printed nothing whatsoever: it returned false
+    // from a guard, and the caller's own FAILED line was the only evidence.
+    // A domain of its own, like every other self-test that needs one: `create`
+    // charges the owner's envelope first, and at this point in the boot there
+    // is no current domain to charge -- which is why the first version of this
+    // printed nothing at all rather than failing.
+    match domain::create("hygiene", domain::ResourceEnvelope::new()) {
+        Ok(owner) => {
+            if !shared::zeroed_self_test(owner) {
+                println!("\x1b[91m    memory hygiene FAILED\x1b[0m");
+            }
+            domain::destroy(owner);
+        }
+        Err(_) => println!("\x1b[91m    memory hygiene FAILED: no domain to charge\x1b[0m"),
+    }
+
     // Immediately, and before anything measures this machine. A stopped
     // scheduler is not a quiet one: `needs_preemption_tick` reads a stopped
     // queue as "not started yet" — early boot, keep ticking to prove the timer
@@ -3421,8 +3448,13 @@ fn adapter_file_record() -> (i64, i64, u64) {
     if page == u64::MAX {
         return (0, 0, 0);
     }
-    // Past the eight `mmap` records, the scratch area and the exec record:
-    // 256 + 1,024 + 24. `bin/linuxd` places it there and says so.
+    // Where `personality::report` says, which since 2026-08-21 is the only
+    // place either ring computes it. The arithmetic that used to be spelled
+    // out here -- "256 + 1,024 + 24" -- put the scratch *before* the records
+    // and sized it at 1,024, and both halves stopped being true when the
+    // layout moved the scratch last and widened it. A comment that recomputes
+    // a shared constant is a second derivation of exactly the kind that module
+    // exists to prevent.
     const FIRST_WORD: usize = bhaskix_personality::report::FILE_AT / 8;
     let object = shared::MemoryId::from_u64(page);
     let mut record = [0u64; 3];
@@ -3628,11 +3660,12 @@ fn personality_boundary_report() {
         // than for consumption: it reads from the start every time, so an
         // offset is walked rather than resumed.
         //
-        // The scratch area matters and cost two boots: it begins at 256, which
+        // The scratch area matters and cost two boots: it began at 256, which
         // is where this record first sat, so every `copy_in` after the exec
-        // overwrote it and the kernel printed the tail of a path as a pid.
-        // 1,280 = 256 of `mmap` records + 1,024 of scratch, which is where
-        // `bin/linuxd` puts it and says so.
+        // overwrote it and the kernel printed the tail of a path as a pid. The
+        // fix was `personality::report`, which is why no offset is computed
+        // here any more -- the "1,280 = 256 + 1,024" this comment used to give
+        // was itself out of date by the time anyone read it.
         const EXEC_RECORD_BYTE: usize = bhaskix_personality::report::EXEC_AT;
         const EXEC_RECORD_WORD: usize = EXEC_RECORD_BYTE / 8;
         let taken = shared::drain_into(object, EXEC_RECORD_BYTE + 24, &mut |chunk: &[u8]| {
@@ -3668,6 +3701,28 @@ fn personality_boundary_report() {
             "    linux fault    {handed} faults handed to the personality in ring 3, {resumed} \
              resumed, {crowded} found no free slot"
         );
+        // **And where**, from the adapter's own record. The counts above are
+        // the kernel's view of the exchange; these are the addresses the
+        // program in ring 3 was told about, and they are the only evidence
+        // that exists when a hosted program dies before it can print.
+        //
+        // **How many entries to believe is the kernel's own count, not a
+        // non-zero test.** The first version of this filtered out entries
+        // reading as two zero words, and that is wrong twice: a fault in slot
+        // 0 at address 0 is a real record it would hide, and -- until
+        // `shared::create` was fixed the same day -- an entry nobody had
+        // written could hold the previous tenant's bytes and be printed as a
+        // fault. It did: two junk entries appeared beside the true one, which
+        // is how the unzeroed pages were found. `handed` is exact.
+        let log = adapter_fault_log();
+        let recorded = (handed as usize).min(log.len());
+        if recorded > 0 {
+            print!("    linux fault    the adapter logged {recorded}:");
+            for (slot, at) in log.iter().take(recorded) {
+                print!(" slot {slot} at {at:#x};");
+            }
+            println!();
+        }
     }
     // What the reply that *blocks* did — RFC 0032 step 10. Printed because a
     // boot log is where this project's claims are checked, and "the futex
@@ -6662,8 +6717,8 @@ fn report_supervised_copy() {
     if page == u64::MAX {
         return;
     }
-    // Past the mmap records, the scratch, and the exec, file, fork and wait
-    // records: 256 + 1,024 + 24 + 24 + 16 + 16.
+    // Where `personality::report` says. The arithmetic once written here was
+    // stale in the same way `adapter_file_record`'s was.
     const FIRST_WORD: usize = bhaskix_personality::report::COPY_AT / 8;
     let object = shared::MemoryId::from_u64(page);
     let mut record = [0u64; 2];
@@ -6714,13 +6769,67 @@ fn report_supervised_copy() {
     );
 }
 
+/// The four fault records `bin/linuxd` writes, which nothing read until now.
+///
+/// **This slot was written on every fault handover and never printed.** The
+/// layout module says so in as many words -- *"nothing noticed because the
+/// kernel never reads the fault log"* -- as an aside about an old bug, and the
+/// aside stayed true afterwards: the kernel reads six of the eight records in
+/// this page and has never read this one. `bin/linuxd`'s own comment claimed
+/// the opposite, *"in the report page the kernel reads"*, which was true of the
+/// page and false of the record.
+///
+/// It matters because the adapter has no console. When a hosted program faults,
+/// the slot and the address are the only thing that says *where* -- and a
+/// hosted program that dies before its first `write` leaves nothing else at
+/// all. That is the shape of the `execve` intermittent filed on 2026-08-21:
+/// `console says ''`, with no evidence available to say whether the child
+/// printed nothing or never reached the instruction.
+///
+/// Four entries because the adapter stores four and drops the rest; the *total*
+/// is the kernel's own `fault::statistics`, which is why the two are printed
+/// together. A zeroed entry is one never written.
+fn adapter_fault_log() -> [(u64, u64); 4] {
+    let mut log = [(0u64, 0u64); 4];
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return log;
+    }
+    const FIRST_WORD: usize = bhaskix_personality::report::FAULT_LOG_AT / 8;
+    const WORDS: usize = 8;
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; WORDS];
+    let mut at = 0usize;
+    let taken = shared::drain_into(object, (FIRST_WORD + WORDS) * 8, &mut |chunk: &[u8]| {
+        for word in chunk.as_chunks::<8>().0 {
+            if at >= FIRST_WORD + WORDS {
+                break;
+            }
+            if at >= FIRST_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    if taken.is_none() {
+        return log;
+    }
+    for (entry, pair) in log.iter_mut().zip(record.as_chunks::<2>().0) {
+        *entry = (pair[0], pair[1]);
+    }
+    log
+}
+
 fn adapter_fork_record() -> (u64, u64) {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
         return (0, 0);
     }
-    // Past the `mmap` records, the scratch area, the exec record and the file
-    // record: 256 + 1,024 + 24 + 24.
+    // Where `personality::report` says. The arithmetic once written here was
+    // stale in the same way `adapter_file_record`'s was.
     const FIRST_WORD: usize = bhaskix_personality::report::FORK_AT / 8;
     let object = shared::MemoryId::from_u64(page);
     let mut record = [0u64; 2];
@@ -20755,16 +20864,24 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     PHASE.store(PHASE_WAIT, Ordering::Release);
     let retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
     let still_here = sched::threads_present_exact(&spawned);
-    // **And still settle for as long as the old sleep did.**
+    // **There was a settle here, and its removal is the point.**
     //
-    // Waiting for the threads is the correctness half; this is the *stability*
-    // half, and it was learned by breaking it. Replacing four fixed sleeps with
-    // four waits made the boot timeline both earlier and far more variable --
-    // `bin/tcpc` began at 15.77-19.10 s where it had been 17.49-18.68 s -- and
-    // the TCP inbound test lands on a slirp retransmit rung with about a tenth
-    // of a second of margin. Its intermittent went from **1 boot in 30 to 3 in
-    // 12**. The fragility is filed separately and is not this change's to fix,
-    // but forcing it into the open with an unrelated change is a cost with no
+    // Waiting for the threads is the correctness half. A second half was added
+    // beside it -- sleep on afterwards for as long as the old fixed sleep did
+    // -- because replacing four sleeps with four waits appeared to make the TCP
+    // inbound test far flakier, from about one boot in thirty to three in
+    // twelve. It was a misattribution. The control, this tree with none of
+    // these changes, failed **ten times in twelve** on the same host boot: the
+    // machine underneath had rebooted mid-investigation and is a KVM guest
+    // reporting five figures of steal time. The rate had moved for reasons
+    // nothing here touched.
+    //
+    // So the settle was removed, because a compensation for a regression that
+    // was never caused is just a sleep with a story attached. **The lesson is
+    // kept where the mistake was made**: a rate measured before and after a
+    // change says nothing unless both were measured on the same boot of the
+    // host, and this instrument exists precisely so the boot stops depending
+    // on how fast the machine happens to be.
 
     if ok {
         println!(

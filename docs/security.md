@@ -567,6 +567,28 @@ wrong one: it puts the cost on the freeing path (often latency-sensitive teardow
 skipped by a crash. Zero-on-allocation cannot be skipped, because the receiving domain's correctness
 depends on it. A frame never reaches a domain carrying another domain's data.
 
+> **This paragraph was not true of shared memory objects until 2026-08-26, and the correction stands
+> here rather than only in the changelog.** The last sentence was written as a property of the system
+> and was a property of one path: `AddressSpace::map_anonymous` zeroed, and `shared::create` did not.
+> Objects created by the nucleus and handed to ring 3 services — the Linux adapter's report page, the
+> telemetry rings, the network rings, a lent page — arrived carrying whatever the previous tenant of
+> those frames had left. Measured on one boot before the fix: **40 of the frames behind 12 objects
+> were non-zero, and the worst page carried 3,546 non-zero bytes.** With the fix reverted on purpose
+> the staging gate reports the full 4,096.
+>
+> **What it was and what it was not.** It is an information disclosure across the domain boundary
+> this table exists to describe, and it reached real ring 3 services on every boot. It is **not**
+> remotely triggerable and never was: no system call creates a shared object, so an attacker could
+> not ask for frames and read them — every caller of `shared::create` is in the nucleus, and what a
+> service received was whatever the allocator happened to hand back. That bounds it; it does not
+> excuse it, because the boundary is the claim this document makes.
+>
+> It was found by a reader that assumed the paragraph above was true: the kernel began printing the
+> Linux adapter's fault log, whose unwritten entries should read zero, and two of them held a
+> canonical kernel-half address and a plausible user address. The policy itself is now written down
+> in [memory.md](memory.md) §2, which is where the code had been citing a section that did not
+> contain it.
+
 ### A Linux compatibility domain is a domain, and nothing in this table changes for it
 
 Every boundary above applies to a hosted Linux workload unchanged, and it is worth saying why

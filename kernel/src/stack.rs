@@ -104,7 +104,7 @@ pub unsafe fn allocate(hhdm_base: u64, index: u64) -> Result<GuardedStack, VmErr
 
             // SAFETY: freshly allocated, so unaliased, and reachable through
             // the direct map. Zeroing on allocation is required by
-            // `docs/memory.md` §6.
+            // `docs/memory.md` §2.
             unsafe {
                 core::ptr::write_bytes((hhdm_base + physical) as *mut u8, 0, FRAME_SIZE as usize);
             }

@@ -522,7 +522,17 @@ asm_budget = 10
 # it could be safe code: every one of them is a pointer the controller reads by
 # DMA, and the array index is a slot number the controller chose. The
 # arithmetic that decides *whether* to recover is safe code beside it.
-unsafe_budget = 1857
+# 1864 for zeroing a shared object's frames at creation, staging the disclosure
+# that proved it, and reading the adapter's fault log. `shared::create` allocated
+# frames and handed them to ring 3 services without wiping them, so an object
+# arrived carrying the previous tenant's memory -- measured at 3,546 non-zero
+# bytes in the worst page. The write is one `write_bytes` per frame through the
+# direct map; the self-test that gates it needs two more windows, one to dirty a
+# page on purpose and one to read what the next owner sees; and the kernel's
+# reader for `bin/linuxd`'s fault log walks the report page like the six readers
+# beside it. None of it can be safe code: each is a physical frame reached
+# through the direct map, which is a raw pointer by construction.
+unsafe_budget = 1864
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

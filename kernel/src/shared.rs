@@ -302,6 +302,56 @@ pub fn create(owner: DomainId, length: u64) -> Result<MemoryId, MemoryError> {
         taken += 1;
     }
 
+    // **Zero on allocation, and this is where a shared object gets it.**
+    //
+    // `map_anonymous` has always done this for a domain's own pages and states
+    // the policy: zero on allocation, never on free, because the receiving
+    // domain's correctness depends on it and a zero-on-free scheme can be
+    // skipped by a crash. `create` allocated frames and did not apply it, and
+    // the frames come from `frames::take`, whose contract says in as many
+    // words that they are **not** zeroed and the caller decides.
+    //
+    // So every object created before 2026-08-26 arrived carrying whatever the
+    // previous tenant of those frames had left, and these objects are mapped
+    // into ring 3: the adapter's report page, the telemetry rings, the network
+    // rings, a lent page. Measured on one boot before the fix: **40 of the
+    // frames behind 12 objects were non-zero, the worst page carrying 3,546
+    // non-zero bytes of somebody else's memory.**
+    //
+    // It was found by a reader that assumed the opposite -- the kernel began
+    // printing `bin/linuxd`'s fault log, whose empty entries should read zero,
+    // and two of them held a canonical kernel-half address and a plausible
+    // user address instead.
+    //
+    // `create` never makes a device object -- `device` is `None` below and the
+    // device path is elsewhere -- so there is no MMIO window here that zeroing
+    // would write into.
+    {
+        let hhdm = hhdm();
+        // **Refuse rather than hand out an unzeroed object.** The direct map
+        // base arrives through `set_hhdm`, which is called from exactly one
+        // place -- inside `shared_memory_self_test` -- and every `create` in
+        // this kernel happens after it. That ordering is real and it is not
+        // written down anywhere it would be checked, so this depends on it out
+        // loud: with no base there is no way to reach the frames, and zeroing
+        // through a null base would write over the low physical memory the
+        // direct map has not been established for.
+        if hhdm == 0 {
+            for frame in frames.iter().take(taken) {
+                free_frame(*frame);
+            }
+            crate::domain::release_frames(owner, pages);
+            return Err(MemoryError::OutOfMemory);
+        }
+        for frame in frames.iter().take(taken) {
+            // SAFETY: just allocated and owned by nobody else yet, and
+            // reachable through the direct map for a whole frame.
+            unsafe {
+                core::ptr::write_bytes((hhdm + *frame) as *mut u8, 0, FRAME_SIZE as usize);
+            }
+        }
+    }
+
     let claimed = {
         let mut arena = ARENA.lock();
         match arena.objects.iter().position(|object| !object.live) {
@@ -343,6 +393,75 @@ pub fn create(owner: DomainId, length: u64) -> Result<MemoryId, MemoryError> {
 
     CREATED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(id)
+}
+
+/// A frame is dirtied on purpose, freed, and the next object over it must
+/// read as zero.
+///
+/// **The weak version of this test is worthless.** Creating one object and
+/// finding it zero proves nothing: a machine that has just booted has plenty of
+/// frames nobody has written, so the test would pass on the broken code most of
+/// the time. This writes a pattern over every byte of an object, destroys it so
+/// the frames go back to the allocator, and then asks what the *next* object
+/// over them reads — which is precisely the disclosure, staged.
+///
+/// It is not a guarantee that the same frames come back; the allocator decides.
+/// A run that gets different frames reads zero for the boring reason and still
+/// passes. That is why the pattern is written and the result reported rather
+/// than merely asserted: the number of bytes that came back non-zero is the
+/// evidence, and it was **3,546 in the worst page** before `create` zeroed.
+#[must_use]
+pub fn zeroed_self_test(owner: DomainId) -> bool {
+    const PATTERN: u8 = 0xa5;
+    let hhdm = hhdm();
+    if hhdm == 0 {
+        return false;
+    }
+
+    let Ok(dirty) = create(owner, FRAME_SIZE) else {
+        return false;
+    };
+    let Some((frames, count)) = frames_of(dirty) else {
+        destroy(dirty);
+        return false;
+    };
+    for frame in frames.iter().take(count) {
+        // SAFETY: the object owns these frames until it is destroyed, and the
+        // direct map covers a whole frame at each.
+        unsafe { core::ptr::write_bytes((hhdm + *frame) as *mut u8, PATTERN, FRAME_SIZE as usize) };
+    }
+    destroy(dirty);
+
+    let Ok(fresh) = create(owner, FRAME_SIZE) else {
+        return false;
+    };
+    let Some((frames, count)) = frames_of(fresh) else {
+        destroy(fresh);
+        return false;
+    };
+    let mut left = 0usize;
+    for frame in frames.iter().take(count) {
+        // SAFETY: as above, for the object just created.
+        let page = unsafe {
+            core::slice::from_raw_parts((hhdm + *frame) as *const u8, FRAME_SIZE as usize)
+        };
+        left += page.iter().filter(|byte| **byte != 0).count();
+    }
+    destroy(fresh);
+
+    if left == 0 {
+        crate::println!(
+            "    memory hygiene a page written full of 0x{PATTERN:02x} and freed comes back \
+             zeroed to its next owner"
+        );
+        true
+    } else {
+        crate::println!(
+            "\x1b[91m    memory hygiene FAILED: {left} bytes of the previous owner's memory \
+             survived into a freshly created object\x1b[0m"
+        );
+        false
+    }
 }
 
 /// Destroys an object, freeing its frames and releasing its charge.

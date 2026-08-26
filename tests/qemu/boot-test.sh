@@ -450,7 +450,22 @@ if ! grep -qF "Nothing left to do at this milestone" "$LOG"; then
     fail "the machine did not finish booting within ${TIMEOUT}s (gave up after $((BOOT_ELAPSED_MS / 1000)).$(printf '%03d' $((BOOT_ELAPSED_MS % 1000)))s)"
     if [[ ! -s "$LOG" ]]; then
         echo "        the serial log is empty -- qemu may not have started at all" >&2
-        echo "        (a second run holding build/initrd.tar is the usual cause)" >&2
+        # **The usual cause, named rather than guessed at.** `devices.sh` fixes
+        # the two `hostfwd` host ports because the driver below must know them,
+        # and says a second QEMU with the same profile "would fail to start,
+        # loudly, rather than silently sharing". It failed to start; it was not
+        # loud. The message here blamed a held `initrd.tar` instead, and on
+        # 2026-08-26 that sent an investigation looking at disk images for
+        # several minutes when the actual cause was a boot sweep in another
+        # working tree holding 45557. So ask the port.
+        if { exec 3<>/dev/tcp/127.0.0.1/45557; } 2>/dev/null; then
+            exec 3<&- 3>&-
+            echo "        127.0.0.1:45557 is already bound: another QEMU with this device" >&2
+            echo "        profile is running, and two cannot share the forwarded ports." >&2
+            echo "        Wait for it, or run this lane on its own." >&2
+        else
+            echo "        (a second run holding build/initrd.tar is the usual cause)" >&2
+        fi
     else
         echo "        it got as far as:" >&2
         tail -5 "$LOG" | sed 's/^/          /' >&2
@@ -541,6 +556,20 @@ if grep -qF "self test      passed, no frames leaked" "$LOG"; then
     pass "buddy allocator: no frames leaked"
 else
     fail "physical allocator self test did not pass"
+    status=1
+fi
+
+# **A page freed by one owner must not reach the next one carrying its bytes.**
+# `shared::create` allocated frames and never zeroed them until 2026-08-26, so
+# every object the kernel handed to a ring 3 service -- the adapter's report
+# page, the telemetry and network rings, a lent page -- arrived holding whatever
+# the previous tenant had left. Measured before the fix: 40 of the frames behind
+# 12 objects were non-zero and the worst page carried 3,546 non-zero bytes; with
+# the zeroing removed again on purpose, this gate reports the full 4,096.
+if grep -qF "memory hygiene a page written full of 0xa5 and freed comes back zeroed" "$LOG"; then
+    pass "memory hygiene: a freed page reaches its next owner zeroed"
+else
+    fail "a freed page reached its next owner still carrying the previous owner's bytes"
     status=1
 fi
 

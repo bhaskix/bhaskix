@@ -1003,6 +1003,155 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-26 (60 boots hunting the page fault with its suspected trigger restored, and nothing caught)
+
+**The experiment, and what it does not show.** The intermittent kernel page
+fault was localised to just after the migration self-test, and the mechanism
+hypothesised from the code was four migrant threads exiting simultaneously
+across four CPUs while the boot carried on over them. The test was changed to
+wait for them. To hunt a **readable** specimen — the reporter was fixed the same
+day, so a fresh one would no longer be spliced from two CPUs — a worktree was
+built with that wait reverted and the fixed reporter kept: the suspected trigger
+back, on a tree that can describe it. **60 boots of the BIOS lane: zero
+specimens.**
+
+**That is not evidence the wait fixed anything, and it is recorded so nobody
+reads it as such.** The historical rate is roughly two sightings in a hundred
+and twenty-odd boots — call it 1.7% — and 60 boots at that rate expect one. Zero
+is an ordinary outcome for a fault that is entirely still there. A bound worth
+having needs a few hundred boots, and even then it is a bound rather than an
+explanation.
+
+**And the net may have been in the wrong water.** Both sightings were on other
+lanes — `test-boot-native-full` and `shell-test.sh kernel` — and this swept
+`bios`. The claim that the fault is not lane-specific rests on those two
+sightings being on two different lanes, which is a good reason to believe it is
+not tied to one loader and a poor reason to assume every lane provokes it
+equally.
+
+**One boot in the sixty failed** a gate while booting cleanly through to the
+shell prompt, with no fault and no halt. Which gate is unknown: the sweep kept
+the serial log and discarded the harness's own stdout, which is where the verdict
+is printed. A sweep that cannot say why a run failed is worth less than one that
+can, and the next one should keep both.
+
+### 2026-08-26 (a shared object arrived carrying the previous tenant's memory, and `security.md` said it could not)
+
+**`shared::create` allocated frames and never zeroed them.** Every memory object
+the nucleus creates and hands to a ring 3 service — the Linux adapter's report
+page, the telemetry rings, the network rings, a lent page — arrived holding
+whatever the previous tenant of those frames had left. **Measured, not inferred:
+40 of the frames behind 12 objects were non-zero on one boot, and the worst page
+carried 3,546 non-zero bytes.** With the fix reverted on purpose, the new gate
+reports the full **4,096**.
+
+**`docs/security.md` §6 asserted the opposite** — *"A frame never reaches a
+domain carrying another domain's data"* — and that sentence is a property of one
+path, not of the system: `map_anonymous` zeroed and `create` did not. Corrected
+where it stands, with what was measured, per the standing rule that a wrong
+claim is fixed in the record and not only in conversation.
+
+**The policy was applied in four places and written down in none.**
+`AddressSpace::map_anonymous`, the demand-paging fault path, `stack.rs` and
+`mm/bump.rs` all zero on allocation, and all four cite **`docs/memory.md` §6**.
+§6 is "Memory pressure and reclaim", and that document did not contain the word
+**zero** anywhere. So the rule was genuinely known and consistently followed —
+which makes `shared::create` a single missed site rather than a missing
+convention — and every statement of it pointed at a section that did not hold
+it, so there was nothing a fifth author could be checked against. It is now §2
+of `memory.md` under its own heading, with `frames::take`'s deliberate exception
+named, and the four citations point at it.
+
+**How it was found is the argument for the instrument that found it.** The
+kernel had just started printing the adapter's fault log — a record written on
+every fault handover since RFC 0032 step 6 and read by nobody. Its unwritten
+entries should read as zero. Two of them held `0xffff800000000000`, a canonical
+kernel-half address, and `0x10001000`. Nothing in `bin/linuxd` writes a slot
+number that large; every writer to that page is bounded and was checked one by
+one before the page itself was suspected.
+
+**What it is and what it is not.** It is an information disclosure across the
+domain boundary, reaching real services on every boot. It is **not** remotely
+triggerable: no system call creates a shared object, so nothing untrusted could
+ask for frames and read them — every caller of `shared::create` is in the
+nucleus. That bounds the severity and does not change the defect.
+
+**Gated, and the weak version of the gate was refused.** Creating one object and
+finding it zero proves nothing on a freshly booted machine full of untouched
+frames. The test writes `0xa5` over an object, destroys it so the frames go back
+to the allocator, and asks what the *next* object over them reads. It does not
+guarantee the same frames come back — the allocator decides — so it reports the
+surviving byte count as evidence rather than merely asserting. Watched red:
+**4,096 bytes survived**, and the two junk fault-log entries reappeared with it,
+which is the same defect seen from the other end.
+
+**Two smaller things fixed on the way in.** `create` now **refuses** rather than
+handing out an unzeroed object if the direct map base is unset — the base
+arrives through `set_hhdm`, which is called from exactly one place in this
+kernel, inside `shared_memory_self_test`, and every `create` happens after it.
+That ordering is real, was written down nowhere, and the zeroing depends on it,
+so it now depends on it out loud. And the fault-log line counts entries by the
+kernel's own `handed` rather than by testing for non-zero words: a fault in slot
+0 at address 0 is a real record — one appears on every boot — and the non-zero
+test would have hidden it while printing stale bytes as faults.
+
+### 2026-08-26 (a record written on every fault handover and read by nobody, and two comments that disagreed about it)
+
+**The adapter's fault log has been written since RFC 0032 step 6 and never
+read.** `bin/linuxd`'s `faults_seen` writes the slot and the address of every
+fault handed to it in ring 3, into the report page. The kernel reads **six** of
+the eight records in that page — exec, file, fork, wait, copy, lend — and has
+never read this one. Every address was discarded at the end of every boot.
+
+**Two comments said opposite things and neither was checked.** `faults_seen`
+says it records *"in the report page the kernel reads"*, which was true of the
+page and false of the record. `personality`'s layout module says, as an aside
+about an unrelated 2026-08-21 bug, *"nothing noticed because the kernel never
+reads the fault log"* — an accurate sentence, written about the past, that had
+quietly stayed true. Neither was wrong enough to fail anything, which is why
+both survived.
+
+**Why it matters is the `execve` intermittent filed 2026-08-21.** That failure
+is `kept='3 2 3', console says ''`: the exec record proves the exec happened and
+the pid survived, and the child's own console line is missing. Two rounds of
+hypothesis died by reading — the write is synchronous in both halves, and
+`request.domain` cannot lag an exec — and the note left behind said the gap was
+that *a failed console write is completely silent*. That was true and it was not
+the whole gap. **The larger silence was that a child which faults before
+reaching its `write` at all leaves a record, and the record was thrown away.**
+
+The kernel now reads it and prints it beside `fault::statistics`: the kernel's
+own counts say how many handovers happened, the adapter's log says **where**.
+The adapter stores four and drops the rest, so the line says how many it has,
+and the total remains the kernel's.
+
+**The instrument the 2026-08-25 note proposed is not the one built.** That note
+proposed a *new slot* for a refused console write, and priced it as a change to
+a layout guarded by `const` assertions — declining it as disproportionate for a
+twice-seen intermittent. Reading the write path first says why that trade was
+worse than it looked in both directions. It is **smaller** than priced, because
+the record already exists and only a reader was missing; and the thing it would
+have measured is close to **unreachable**: `PUT` can fail only on a bad
+capability or a missing `WRITE` right, and either would mean *no* hosted output
+ever appeared, which every gate would catch on the first boot. A refused console
+write is not a plausible intermittent. A child dying before it writes is.
+
+**Three kernel comments were recomputing the old broken layout.** The readers
+for the file, fork and copy records each spelled out arithmetic of the form
+`256 + 1,024 + 24` — the scratch area *before* the records and 1,024 bytes wide.
+Since 2026-08-21 the scratch is 3,584 bytes and sits **last**, and
+`personality::report` exists precisely so neither ring derives these offsets for
+itself. The constants were right; the comments beside them described the layout
+whose second derivation caused the bug that module was created to prevent.
+
+**And the harness now names the collision it always claimed would be loud.**
+`devices.sh` fixes two `hostfwd` host ports and says a second QEMU with the same
+profile *"would fail to start, loudly, rather than silently sharing"*. It failed
+to start and it was **not** loud: an empty serial log, and a message blaming a
+held `build/initrd.tar`. That cost several minutes today, chasing disk images,
+when the cause was a boot sweep in another working tree holding 45557. The empty
+log branch now asks the port and says so. Watched red with a sweep running.
+
 ### 2026-08-26 (RFC 0048 accepted in full: the listener cannot be wedged, because there is nothing to wedge)
 
 **The project lead accepted steps 3 and 4, and they are built.** `bin/tcpd`

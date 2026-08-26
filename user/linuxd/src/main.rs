@@ -653,6 +653,13 @@ const SCRATCH_BYTES: u64 = report::SCRATCH_BYTES as u64;
 /// The adapter has no console; this is how it says anything at all. Two words
 /// — the slot and the address — are enough to prove the exchange happened and
 /// to say where, which is what this step is for.
+///
+/// **"The report page the kernel reads" was true of the page and false of this
+/// record until 2026-08-26.** The kernel read six of the eight records here and
+/// never this one, so every address written below was discarded at the end of
+/// every boot. It is read now, and printed beside `fault::statistics` — the
+/// kernel counts the handovers and this says where they were, which is the only
+/// evidence that exists when a hosted program dies before it can print.
 fn faults_seen(slot: u64, address: u64) {
     let seen = FAULTS_TAKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if seen >= 4 {

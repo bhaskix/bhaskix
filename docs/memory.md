@@ -134,6 +134,36 @@ Every allocated frame records its owning `DomainId`. This gives us, for free:
 
 ---
 
+### Zero on allocation, never on free
+
+**A frame is zeroed when it is given out, not when it is given back.** Every path that hands memory
+to a domain — `AddressSpace::map_anonymous`, `shared::create` — writes zeroes over the frame first.
+
+Two reasons, in this order:
+
+1. **Zero-on-free can be skipped by a crash.** A domain that dies badly, a panic between the free
+   and the wipe, a reclaim path that takes a shortcut: each leaves a dirty frame in the allocator
+   that the next owner receives. Zero-on-allocation has no such window, because the write happens on
+   the path that hands the memory over.
+2. **The receiving domain's correctness depends on it.** A ring buffer whose head and tail must
+   start at zero, a record page whose empty slots must read as empty: these are ordinary assumptions
+   and they are correct only if the policy holds.
+
+`frames::take` is the deliberate exception and says so: it hands out frames **unzeroed** for callers
+that are about to overwrite every byte, such as a copy-on-write copy, where zeroing first would be a
+measurable cost on the fault path for no gain.
+
+**This policy was stated only in a code comment until 2026-08-26, and that comment cited §6 of this
+document — which is about reclaim and has never mentioned zeroing.** In the meantime `shared::create`
+did not apply it: it allocated frames, mapped the object into a ring 3 service, and handed over
+whatever the previous tenant had left. On one boot, 40 of the frames behind 12 objects arrived
+non-zero and the worst page carried **3,546 non-zero bytes**. The objects affected are the ones the
+nucleus gives to services — the Linux adapter's report page, the telemetry rings, the network rings,
+a lent page. It is fixed, and a boot gate now stages the disclosure: a page is written full of
+`0xa5`, freed, and the next object over those frames must read as zero.
+
+---
+
 ### Per-CPU frame reserves for the fault path
 
 **Implemented at M4-12.** Servicing a page fault means allocating — a frame for the page, sometimes

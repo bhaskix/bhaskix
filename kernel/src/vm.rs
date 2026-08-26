@@ -178,9 +178,14 @@ impl AddressSpace {
                 };
                 let physical = u64::from(pfn) * FRAME_SIZE;
 
-                // Zero on allocation, never on free (`docs/memory.md` §6): the
-                // receiving domain's correctness depends on it, and a
-                // zero-on-free scheme can be skipped by a crash.
+                // Zero on allocation, never on free (`docs/memory.md` §2,
+                // "Zero on allocation, never on free"): the receiving domain's
+                // correctness depends on it, and a zero-on-free scheme can be
+                // skipped by a crash. This comment cited §6 until 2026-08-26 --
+                // which is about reclaim, and the document did not contain the
+                // word "zero" anywhere. The policy was real and this was its
+                // only statement of it, which is how `shared::create` came to
+                // hand out unzeroed frames without contradicting anything.
                 // SAFETY: the frame was just allocated, so nothing else refers
                 // to it, and it is reachable through the direct map.
                 unsafe {
@@ -1190,7 +1195,7 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
         None => {
             // SAFETY: taken from this CPU's reserve and unaliased, reachable
             // through the direct map. Zeroing is required by
-            // `docs/memory.md` §6 -- a frame must never reach a consumer
+            // `docs/memory.md` §2 -- a frame must never reach a consumer
             // carrying another domain's data -- and unlike the copy above,
             // nothing here is about to overwrite it.
             unsafe {
