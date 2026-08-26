@@ -4058,6 +4058,48 @@ pub fn threads_in_domain(domain: u32) -> usize {
     total
 }
 
+/// How many of `ids` are still held by some run queue.
+///
+/// **Blocks for each queue rather than skipping one it cannot take**, for the
+/// reason [`threads_in_domain_exact`] gives at length: [`cpu_of`] answers with
+/// `try_lock` and a queue it cannot take reads as *not holding the thread*, so
+/// a caller waiting for a thread to disappear would be told it had, early and
+/// wrongly. A caller that polls can live with that; a caller deciding *"they
+/// are all gone, carry on"* cannot.
+///
+/// **`Finished` does not count as present**, and the first version of this got
+/// that wrong: a thread that has called `sched::exit` keeps its slot until its
+/// CPU makes another scheduling decision, and a CPU with nothing to run may
+/// simply not make one. Waiting for the slot to be freed therefore waited for
+/// something an idle machine need never do — measured, four workers of four
+/// still "present" four seconds after they had all exited.
+///
+/// What a caller actually wants to know is whether these threads are still
+/// *running*, because a spinner is what invalidates the next measurement. A
+/// finished thread is not spinning. `threads_in_domain` filters the same way,
+/// for the same reason.
+///
+/// # Lock order
+///
+/// Takes `Rank::SchedRunqueue` and nothing else, so it is sound from any caller
+/// holding nothing or holding something outer. Not from one already holding a
+/// run queue.
+#[must_use]
+pub fn threads_present_exact(ids: &[u32]) -> usize {
+    let online = percpu::online_count() as usize;
+    let mut present = 0;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let queue = queue.lock();
+        present += queue
+            .threads
+            .iter()
+            .flatten()
+            .filter(|thread| ids.contains(&thread.id) && thread.state != State::Finished)
+            .count();
+    }
+    present
+}
+
 /// Like [`threads_in_domain`], but **blocks** for each queue rather than
 /// skipping one it cannot take.
 ///

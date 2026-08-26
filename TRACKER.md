@@ -1002,6 +1002,52 @@ dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
 
+### 2026-08-26 (the migration test waits for its migrants instead of sleeping over them)
+
+**Every phase transition in the scheduler self-tests was a fixed sleep and a
+hope**, and one of those hopes was load-bearing:
+
+    PHASE.store(PHASE_WAIT, Ordering::Release);
+    wait_millis(300);
+
+Four `migrant` threads spin until the phase advances and then all call
+`sched::exit()` **at once, across four CPUs, at least one of them having been
+stolen from another's run queue**. The test never waited for them — it slept 300
+milliseconds and let the boot carry on. The intermittent kernel page fault lands
+in exactly that window, on two lanes, naming exactly those threads.
+
+**The test now retires its own workers and waits for them.** It keeps the ids it
+spawns (they were discarded), advances the phase itself, and waits until none of
+them is still running — reporting `4 of its 4 workers retired before the next
+phase`, and failing loudly if not. `wait_until` bounds it at four seconds, so a
+hang is a red lane rather than a stall.
+
+This does **not** fix a teardown that races. What it removes is the *other party*
+to the race: the rest of the boot no longer proceeds while four threads are
+mid-exit. And it turns a guess into an observation, which is the part that
+survives a machine getting faster or slower.
+
+**The instrument earned its place inside one boot, by being wrong in a way a
+sleep could not have been.** The first version waited for the threads' *slots* to
+be freed and reported **0 of 4 retired** after four seconds. They had all
+exited — but `sched::exit` leaves a thread `Finished` and holding its slot until
+its CPU makes another scheduling decision, and **a CPU with nothing to run need
+never make one**. So the first version waited for something an idle machine is
+entitled never to do. Counting only threads that are *not* `Finished` is both
+correct and what the caller actually wants to know, since a finished thread is
+not a spinner and it is spinners that invalidate the next phase.
+`threads_in_domain` filters the same way, for the same reason — the convention
+was already there to be followed.
+
+**`threads_present_exact` blocks for each queue** rather than skipping one it
+cannot take. `cpu_of` answers with `try_lock`, and a queue it cannot take reads
+as *not holding the thread* — so a caller waiting for threads to disappear would
+be told they had, early and wrongly, reinstating the very race being removed.
+That is the third time today this distinction has mattered.
+
+Watched red: with the migrants made never to retire, the lane reports `0 of its
+4 workers retired ... SOME ARE STILL RUNNING` and fails.
+
 ### 2026-08-26 (the kernel page fault is not lane-specific, and it lives just after the migration self-test)
 
 **A second sighting, and it turned a rare mystery into a localised one.**

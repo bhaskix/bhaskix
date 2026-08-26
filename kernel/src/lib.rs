@@ -20599,10 +20599,17 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let steals_before = sched::steals();
 
     const NAMES: [&str; 3] = ["migrant-0", "migrant-1", "migrant-2"];
+    // **Kept, because this test has to be able to wait for them.** The ids
+    // were discarded until 2026-08-26, which is why the only way to retire
+    // these threads was to advance the phase and sleep.
+    let mut spawned = [0u32; NAMES.len() + 1];
     for (id, name) in NAMES.iter().enumerate() {
-        if let Err(error) = sched::spawn_on(0, name, migrant, id as u64, hhdm_base) {
-            println!("\x1b[91m    migration      FAILED to spawn on cpu 0: {error:?}\x1b[0m");
-            return false;
+        match sched::spawn_on(0, name, migrant, id as u64, hhdm_base) {
+            Ok(thread) => spawned[id] = thread,
+            Err(error) => {
+                println!("\x1b[91m    migration      FAILED to spawn on cpu 0: {error:?}\x1b[0m");
+                return false;
+            }
         }
     }
 
@@ -20611,7 +20618,10 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // before anything runs, so this measures the placement decision rather
     // than whatever balancing happens afterwards.
     let placed = match sched::spawn("placed", migrant, PLACED_SLOT, hhdm_base) {
-        Ok(id) => id,
+        Ok(id) => {
+            spawned[NAMES.len()] = id;
+            id
+        }
         Err(error) => {
             println!("\x1b[91m    migration      FAILED to place a thread: {error:?}\x1b[0m");
             return false;
@@ -20667,14 +20677,50 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
         ok = false;
     }
 
+    // **Retire the workers here, and *wait* for them to be gone.**
+    //
+    // This test used to leave four spinning threads behind for its caller to
+    // dispose of by advancing the phase and sleeping 300 ms. A fixed sleep is
+    // a guess about how long a teardown takes, and the guess was load-bearing:
+    // an intermittent kernel page fault -- near-null `cr2`, two threads at
+    // once, the exception frame overwritten under the handler -- landed
+    // **immediately after this line** on two different lanes, both naming
+    // threads 12 and 13, which are these.
+    //
+    // Four threads that spin until a phase advances and then all call
+    // `sched::exit()` at once, across four CPUs, **at least one of them having
+    // been stolen from another CPU's run queue**, is the narrowest description
+    // of the window. Waiting for them does not fix a teardown that races; it
+    // stops the rest of the boot from being the other party to the race, and
+    // it turns a fixed sleep into an observation.
+    //
+    // `threads_present_exact` blocks for each queue rather than skipping one
+    // it cannot take, because the whole point is deciding *"they are gone"*
+    // once, and a scan that answers early would reinstate the very race this
+    // removes. A thread is present until reaped, so zero means teardown
+    // finished.
+    PHASE.store(PHASE_WAIT, Ordering::Release);
+    let retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
+    let still_here = sched::threads_present_exact(&spawned);
+
     if ok {
         println!(
             "    migration      {steals} threads stolen; {moved} of 3 ran off their creating cpu; placement chose cpu {}",
             placed_on.unwrap_or(u32::MAX)
         );
+        println!(
+            "    migration      {} of its {} workers retired before the next phase{}",
+            spawned.len() - still_here,
+            spawned.len(),
+            if retired {
+                ""
+            } else {
+                " -- SOME ARE STILL RUNNING, and the next phase measures a machine they are on"
+            }
+        );
     }
 
-    ok
+    ok && retired
 }
 
 /// Spawns one worker per CPU and checks each ran on the CPU it was created on.
@@ -20747,12 +20793,15 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
 
     ok &= migration_self_test(hhdm_base, cpus);
 
-    // Retire the migration workers before the wait-queue phase. They never
-    // sleep, so leaving them spinning would let the ring make progress by
-    // being preempted onto rather than by being woken -- which is the one
-    // thing that phase is trying to distinguish.
+    // The migration workers are retired **by the test that spawned them**, and
+    // it waits for them rather than sleeping over them -- see the note there.
+    // They never sleep, so leaving them spinning would let the ring make
+    // progress by being preempted onto rather than by being woken, which is the
+    // one thing the next phase is trying to distinguish.
+    //
+    // The store is kept as a belt: it is idempotent, and it means this sequence
+    // still reads as "phase advances here" for anyone following it downwards.
     PHASE.store(PHASE_WAIT, Ordering::Release);
-    wait_millis(300);
 
     ok &= wait_queue_self_test(hhdm_base);
 
