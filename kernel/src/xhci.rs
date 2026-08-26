@@ -793,11 +793,42 @@ pub unsafe fn bring_up<B: Bus, W: Wait>(
     let interrupter =
         unsafe { Interrupter::<B>::new(base + parameters.runtime + interrupter_zero) };
 
+    // **What firmware left behind, read before any of it is overwritten.**
+    //
+    // On the SR550 a single DMA fault appears in every boot -- `00:14.0 was
+    // refused a read of 0xaa95f000` -- and it is filed as explained but not
+    // proven. What is known: translation is already on when drivers start, and
+    // the fault report taken *before* them records **none**, so this is not
+    // firmware DMA ticking away in the background. It appears in the window
+    // that contains this function.
+    //
+    // The suspect is therefore the takeover itself: a controller still holding
+    // firmware's pointers, doing one read off them before they are replaced.
+    // `DCBAAP` and `CRCR` are those pointers, and the reset a few lines below
+    // clears them -- so this is the last instant they can be read at all. If
+    // either lands near the faulting address, the question is answered; if
+    // neither does, a theory is dead and that is worth as much.
+    //
+    // Printed on every machine because it costs two register reads and says
+    // whether firmware handed over a running controller, which is a fact about
+    // the machine worth having either way.
+    let firmware_running = operational::UsbCommand(operational_bank.usbcmd.read()).run_stop();
+    crate::println!(
+        "    xhci firmware  left it {}; its device-context array at {:#x}, command ring at {:#x}",
+        if firmware_running {
+            "RUNNING"
+        } else {
+            "halted"
+        },
+        operational_bank.dcbaap.read(),
+        operational_bank.crcr.read(),
+    );
+
     // --- 1. halt, then reset ------------------------------------------------
     //
     // Resetting a running controller is undefined. Firmware enumerated this
     // device to look for a boot device and may well have left it running.
-    if operational::UsbCommand(operational_bank.usbcmd.read()).run_stop() {
+    if firmware_running {
         let stopped = operational::UsbCommand(operational_bank.usbcmd.read()).with_run_stop(false);
         operational_bank.usbcmd.write(stopped.0);
         if !wait.until(&mut || operational::UsbStatus(operational_bank.usbsts.read()).hc_halted()) {
