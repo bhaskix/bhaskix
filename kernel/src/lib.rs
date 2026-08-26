@@ -13007,10 +13007,17 @@ fn report_tcp_domain(hhdm: u64) {
     if count == 0 {
         return;
     }
-    let mut words = [0u64; 7];
+    let mut words = [0u64; 8];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // seven little-endian words the service wrote there.
-    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 56) };
+    // **eight** little-endian words the service wrote there.
+    //
+    // The count and the array have to move together, and they did not: adding
+    // the cookie word to the array while this still said `56` made the loop
+    // index `bytes[56..64]` of a 56-byte slice, and the boot died before
+    // printing anything at all. Written as `words.len() * 8` so the next word
+    // cannot repeat it.
+    let bytes =
+        unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, words.len() * 8) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -13039,6 +13046,17 @@ fn report_tcp_domain(hhdm: u64) {
         "    tcpd           state {:#x} (attached/keyed/configured/serving), outcome {}: {}; \
          {} segments in, {} out, {} refused, machine ended in state {}",
         words[1], words[2], outcome, words[3], words[4], words[5], words[6]
+    );
+    // **RFC 0048 step 3, and the number that says the design is the one
+    // running.** A connection built from a verified cookie is one for which no
+    // state was held while the peer was unproven — so a `SYN` from an address
+    // that need not exist can no longer take the accepted slot and hold it.
+    // Zero here on a boot that accepted a connection would mean something
+    // older served it.
+    println!(
+        "    tcpd cookies   {} connection(s) built from a verified SYN cookie; no state is held \
+         for a peer that has proved nothing",
+        words[7]
     );
 }
 

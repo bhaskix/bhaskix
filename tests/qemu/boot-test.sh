@@ -2200,6 +2200,39 @@ if grep -qE "tcp client +did everything outcome 9 says" "$LOG" \
     status=1
 fi
 
+# **RFC 0048 step 4: the wedge cannot be attempted, because there is nothing to
+# wedge.**
+#
+# What this asserts is the *invariant* that removes the attack rather than a
+# staged attack, and the distinction is worth stating rather than glossing.
+# Until 2026-08-26 a single `SYN` -- from an address that need not exist,
+# needing no authority -- allocated `bin/tcpd`'s one accepted slot and held it
+# until the half-open connection gave up: **242 seconds**, and 14 after RFC
+# 0048 step 1 shortened the retransmission budget. Every later connection was
+# refused silently in the meantime.
+#
+# With cookies the `SYN` allocates nothing at all: the sequence number *is* a
+# keyed hash over the four-tuple, and the slot is taken only when an `ACK`
+# carries it back and verifies. So this gate asserts that the connection the
+# machine served was **built from a verified cookie** -- which is exactly the
+# statement that no state was ever held for an unproven peer, and therefore
+# that there was no half-open slot for a vanished one to occupy.
+#
+# **What it does not do is send a bare `SYN` and walk away.** That needs a raw
+# socket this harness has no way to open -- `/dev/tcp` completes a handshake,
+# which is the legitimate busy case and not the wedge. Staging the attack would
+# be better; asserting the property that makes it impossible is what is
+# available, and saying which is which is the point.
+if grep -qE "tcp client +did everything outcome 9 says" "$LOG"; then
+    if grep -qE "tcpd cookies +[1-9][0-9]* connection\(s\) built from a verified SYN cookie" "$LOG"; then
+        pass "every accepted connection was built from a verified SYN cookie, so no state is held for an unproven peer"
+    else
+        fail "a connection was served without a verified cookie -- the SYN path allocated state"
+        grep -aE "tcpd" "$LOG" | sed 's/^/      /'
+        status=1
+    fi
+fi
+
 # RFC 0029 step 5 raised the terminal: after both v4 directions, the same
 # program opens a v6 connection to [::1], accepts it with its own listener,
 # and echoes itself through the loopback -- the whole machine, both roles,

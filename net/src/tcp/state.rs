@@ -554,6 +554,63 @@ impl Tcb {
         }
     }
 
+    /// An **established** control block, rebuilt from a verified SYN cookie.
+    ///
+    /// RFC 0048 step 3. With cookies there is no `SynReceived` state to
+    /// advance out of: the handshake's middle is a number the peer carried
+    /// back, and the first this stack knows of the connection is the `ACK`
+    /// that proves it. So this constructs what the three-way handshake would
+    /// have produced, from what the `ACK` and the cookie together establish.
+    ///
+    /// - `cookie` is the sequence this stack chose and the peer echoed, so
+    ///   `snd_una` and `snd_nxt` are one past it — the `SYN` occupied it.
+    /// - `irs` is the peer's initial sequence, one below the number its `ACK`
+    ///   is at, and `rcv_nxt` is that number.
+    /// - `mss` comes out of the cookie rather than the segment, because the
+    ///   `ACK` does not carry the option and the cookie is where the `SYN`'s
+    ///   announcement was stored. It is the *rounded* value, which is the
+    ///   documented cost of three bits.
+    ///
+    /// **`snd_avail` is `snd_nxt`, not zero.** A control block whose available
+    /// sequence sits behind what has been sent claims the whole sequence space
+    /// as unsent — the failure `unsent` below documents at length, reached
+    /// here by a different road.
+    #[must_use]
+    pub fn from_cookie(
+        connection: FourTuple,
+        cookie: Sequence,
+        irs: Sequence,
+        peer_window: u16,
+        capacity: u16,
+        mss: u16,
+    ) -> Self {
+        let iss = cookie;
+        let next = iss.wrapping_add(1);
+        Self {
+            state: State::Established,
+            connection,
+            snd_una: next,
+            snd_nxt: next,
+            snd_avail: next,
+            snd_wnd: peer_window,
+            iss,
+            fin_seq: None,
+            fin_queued: false,
+            rcv_nxt: irs.wrapping_add(1),
+            rcv_wnd: capacity,
+            rcv_capacity: capacity,
+            irs,
+            fin_received: false,
+            mss,
+            srtt_us: None,
+            rttvar_us: 0,
+            rto_us: INITIAL_RTO_US,
+            timing: None,
+            retransmits: 0,
+            since_ack: 0,
+        }
+    }
+
     /// Bytes the program has supplied that have not been sent yet.
     ///
     /// **Zero rather than a wrap** when `snd_avail` is behind `snd_nxt`. On a
@@ -997,6 +1054,47 @@ fn arrived(tcb: &mut Tcb, actions: &mut Actions, segment: &Segment<'_>, now: u64
         State::SynSent => syn_sent_arrival(tcb, actions, segment, now),
         _ => synchronised_arrival(tcb, actions, segment, now),
     }
+}
+
+/// The `SYN·ACK` for an incoming `SYN`, built **without a control block**.
+///
+/// RFC 0048 step 3: with SYN cookies there is no connection yet when this reply
+/// goes out — that is the whole point. The initial sequence number *is* the
+/// cookie, and the peer proves it received this segment by echoing
+/// `cookie + 1` in its `ACK`. Nothing is allocated until then, so a `SYN` from
+/// a peer that never answers costs this stack one reply and no state at all.
+///
+/// The shape mirrors [`reset_for`], and for the same reason: the arithmetic
+/// belongs in this crate, which is fuzzed and `forbid`s `unsafe`, while
+/// `bin/tcpd` owns only the tuple swap and the ring.
+///
+/// `None` for anything that is not a bare connection request — a segment
+/// carrying `RST`, or one that already acknowledges something, is not a `SYN`
+/// this can answer.
+///
+/// The `ACK` flag is not set here. `segment::write` derives it from whether an
+/// acknowledgement is present, and setting it as well would be two sources for
+/// one bit — the note `reset_for` makes, meant the same way.
+#[must_use]
+pub fn synack_for(segment: &Segment<'_>, cookie: Sequence, window: u16, mss: u16) -> Option<Emit> {
+    if !segment.flags.contains(Flags::SYN)
+        || segment.flags.contains(Flags::RST)
+        || segment.acknowledgement.is_some()
+    {
+        return None;
+    }
+    Some(Emit {
+        flags: Flags::SYN,
+        sequence: cookie,
+        // The peer's `SYN` occupies one number, so this acknowledges it and
+        // nothing else. `sequence_length` is deliberately *not* used: a bare
+        // `SYN` carries no payload, and a `SYN` that carried one would be
+        // acknowledged for data this stack has not accepted.
+        acknowledgement: Some(segment.sequence.wrapping_add(1)),
+        window,
+        length: 0,
+        mss: Some(mss),
+    })
 }
 
 /// The `RST` that answers a segment naming no connection here, or `None` when
@@ -2589,6 +2687,132 @@ mod tests {
         assert!(emit.flags.contains(Flags::RST));
         assert_eq!(emit.sequence, Sequence(ISS.0 + 41));
         assert_eq!(emit.acknowledgement, None);
+    }
+
+    /// RFC 0048 step 3: the reply that costs no state.
+    #[test]
+    fn a_synack_acknowledges_the_syn_and_carries_the_cookie() {
+        let syn = from_peer(IRS.0, None, Flags::SYN, 0, &[]);
+        let emit = synack_for(&syn, Sequence(0xdead_beef), 4096, 1460).expect("a SYN is answered");
+        assert!(emit.flags.contains(Flags::SYN), "it is a SYN");
+        assert_eq!(
+            emit.sequence,
+            Sequence(0xdead_beef),
+            "the cookie is the ISN"
+        );
+        assert_eq!(
+            emit.acknowledgement,
+            Some(IRS.wrapping_add(1)),
+            "the peer's SYN occupies one number and this acknowledges exactly it"
+        );
+        assert_eq!(emit.window, 4096);
+        assert_eq!(
+            emit.mss,
+            Some(1460),
+            "the option the peer needs to hear back"
+        );
+        assert_eq!(emit.length, 0, "a SYN-ACK carries no payload");
+        // The ACK flag is derived by `segment::write` from the acknowledgement
+        // being present. Setting it here as well would be two sources for one
+        // bit, and this asserts the choice rather than leaving it to be
+        // rediscovered.
+        assert!(
+            !emit.flags.contains(Flags::ACK),
+            "the flag is derived, not set"
+        );
+
+        // **A `SYN` carrying data is acknowledged for the `SYN` only.**
+        //
+        // This case exists because without it the assertion above cannot fail:
+        // `sequence_length()` of a bare `SYN` is 1, so acknowledging the
+        // segment's whole length and acknowledging just its `SYN` are the same
+        // number, and a mutation swapping one for the other stayed green.
+        // A `SYN` with a payload is the input that tells them apart — and the
+        // answer matters, since this stack has accepted no data at this point.
+        let with_data = from_peer(IRS.0, None, Flags::SYN, 0, b"early");
+        let emit = synack_for(&with_data, Sequence(7), 4096, 1460).expect("still a SYN");
+        assert_eq!(
+            emit.acknowledgement,
+            Some(IRS.wrapping_add(1)),
+            "the SYN alone, not the five bytes riding with it"
+        );
+    }
+
+    /// The three shapes that are **not** a connection request.
+    ///
+    /// Each is a separate guard, and a fix that dropped one would still pass a
+    /// test that only tried another — the argument
+    /// `reset_for_answers_a_reset_with_silence_on_both_its_branches` makes,
+    /// applied to three branches instead of two.
+    #[test]
+    fn a_synack_is_offered_only_for_a_bare_syn() {
+        assert!(
+            synack_for(&from_peer(IRS.0, None, Flags::ACK, 0, &[]), ISS, 4096, 1460).is_none(),
+            "no SYN flag"
+        );
+        assert!(
+            synack_for(
+                &from_peer(IRS.0, None, Flags::SYN.with(Flags::RST), 0, &[]),
+                ISS,
+                4096,
+                1460
+            )
+            .is_none(),
+            "a SYN carrying RST"
+        );
+        assert!(
+            synack_for(
+                &from_peer(IRS.0, Some(ISS.0), Flags::SYN.with(Flags::ACK), 0, &[]),
+                ISS,
+                4096,
+                1460
+            )
+            .is_none(),
+            "a SYN that already acknowledges something is not a fresh request"
+        );
+    }
+
+    /// RFC 0048 step 3: what a verified cookie rebuilds.
+    #[test]
+    fn a_cookie_rebuilds_an_established_control_block() {
+        let tcb = Tcb::from_cookie(connection(), Sequence(1000), Sequence(500), 8192, 4096, 536);
+        assert_eq!(
+            tcb.state,
+            State::Established,
+            "there is no SynReceived to sit in"
+        );
+        assert_eq!(tcb.iss, Sequence(1000), "the cookie is this end's ISS");
+        assert_eq!(
+            (tcb.snd_una, tcb.snd_nxt),
+            (Sequence(1001), Sequence(1001)),
+            "the SYN occupied the cookie's own number, so sending resumes one past it"
+        );
+        assert_eq!(tcb.irs, Sequence(500));
+        assert_eq!(tcb.rcv_nxt, Sequence(501), "one past the peer's SYN");
+        assert_eq!(tcb.snd_wnd, 8192, "the peer's window");
+        assert_eq!((tcb.rcv_wnd, tcb.rcv_capacity), (4096, 4096));
+        assert_eq!(tcb.mss, 536, "the rounded value the cookie carried");
+    }
+
+    /// **`snd_avail` must not sit behind `snd_nxt`.**
+    ///
+    /// Its own field documents what that costs: `unsent` on a control block
+    /// whose available sequence is behind what has been sent claims the whole
+    /// sequence space. Asserted here rather than trusted, because this
+    /// constructor sets the two fields on adjacent lines and a zero would look
+    /// entirely reasonable there.
+    #[test]
+    fn a_rebuilt_control_block_has_nothing_unsent() {
+        let tcb = Tcb::from_cookie(connection(), Sequence(1000), Sequence(500), 8192, 4096, 536);
+        // **The field, not just `unsent()`.** Asserting only the helper cannot
+        // fail: `unsent` answers zero both when nothing is pending *and* when
+        // `snd_avail` sits behind `snd_nxt`, which is the very mistake this
+        // guards against — a zeroed `snd_avail` passed it unchanged.
+        assert_eq!(
+            tcb.snd_avail, tcb.snd_nxt,
+            "available and next are the same point; behind is the failure `unsent` documents"
+        );
+        assert_eq!(tcb.unsent(), 0, "and so nothing is waiting to be sent");
     }
 
     #[test]

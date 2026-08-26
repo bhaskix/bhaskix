@@ -52,7 +52,7 @@ gantt
     RFC 0020 TCP as a state machine that can be tested... :done, r0020, 2026-08-14, 2026-08-16
     RFC 0029 IPv6 — the second family the first one was... :done, r0029, 2026-08-18, 1d
     RFC 0047 refusing a connection to a port nobody holds :done, r0047, 2026-08-24, 1d
-    RFC 0048 a listener that cannot be wedged :done, r0048, 2026-08-24, 1d
+    RFC 0048 a listener that cannot be wedged :done, r0048, 2026-08-24, 2026-08-26
     section Drivers & IOMMU
     RFC 0011 IrqHandler — who may receive an interrupt :done, r0011, 2026-08-04, 1d
     RFC 0012 The IOMMU and what a device is allowed to reach :done, r0012, 2026-08-04, 1d

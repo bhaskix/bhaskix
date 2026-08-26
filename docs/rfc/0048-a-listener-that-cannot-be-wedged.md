@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-08-24 — step 1 only, and accepted *as a deliberate deviation from a MUST*.** One `SYN` from a peer that vanishes held `bin/tcpd`'s single accepted slot for **242 seconds**, refusing every later connection **silently**; `MAX_SYNACK_RETRANSMITS` takes that to **14 seconds**, measured both times by driving the state machine. **The question this document said should block its acceptance was answered, and answered against it.** RFC 1122 §4.2.3.5: *"R2 for a SYN segment MUST be set large enough to provide retransmission of the segment for at least 3 minutes."* Fourteen seconds is not 180, and the old compliant value is exactly what made the listener wedgeable. **The project lead accepted with the deviation recorded rather than hidden**: availability over the letter, taken knowingly. ~~Steps 2–4 — SYN cookies — are specified and **not built**~~ — **step 2 was built 2026-08-25** (`net/src/tcp/cookie.rs`: mint, verify, expire; twelve host tests, six mutations each watched red, a fuzz target at 163,665,094 executions clean), and this line went on saying otherwise for a day. **Steps 3–4 remain, and until they land nothing on the wire uses the cookie** — the arithmetic exists and `bin/tcpd` still builds a connection from a `SYN`, so the denial of service is repriced and not removed. **Acceptance is still step 1 only, on purpose**: step 3 changes what this system puts on the wire, and widening an acceptance is the project lead's call and not the implementer's. They are what removes the trade rather than repricing it: with no state allocated for a peer that has proved nothing, there is no half-open connection for `R2` to govern |
+| **Status** | ✅ **ACCEPTED IN FULL 2026-08-26 — all four steps.** The listener cannot be wedged: `bin/tcpd` allocates **nothing** on a `SYN`, and the accepted slot is taken only when an `ACK` carries a verified cookie back. A peer that sends one packet and vanishes now costs this stack one reply and no state, where it used to own the only accepted slot for **242 seconds**. Gated on every networked boot and watched red. **The RFC 1122 §4.2.3.5 deviation recorded below stops mattering rather than being resolved**: 14 seconds is still not 180, but with no half-open connection there is nothing for `R2` to govern — which is what steps 2–4 were always for. **What acceptance does not claim:** the accepted slot is still *one*, so a peer that completes a handshake and holds it excludes others — a capacity limit that costs an attacker a real connection, not a wedge that costs one packet; the step-4 gate asserts the **invariant** rather than staging the attack, because a bare `SYN` needs a raw socket the harness cannot open, and its comment says so; and the three-bit MSS still rounds the peer's announcement **down** to one of eight, which is the documented cost of carrying state in a sequence number. The step-1 history follows, unchanged. ~~**ACCEPTED 2026-08-24 — step 1 only, and accepted *as a deliberate deviation from a MUST*.**~~ One `SYN` from a peer that vanishes held `bin/tcpd`'s single accepted slot for **242 seconds**, refusing every later connection **silently**; `MAX_SYNACK_RETRANSMITS` takes that to **14 seconds**, measured both times by driving the state machine. **The question this document said should block its acceptance was answered, and answered against it.** RFC 1122 §4.2.3.5: *"R2 for a SYN segment MUST be set large enough to provide retransmission of the segment for at least 3 minutes."* Fourteen seconds is not 180, and the old compliant value is exactly what made the listener wedgeable. **The project lead accepted with the deviation recorded rather than hidden**: availability over the letter, taken knowingly. ~~Steps 2–4 — SYN cookies — are specified and **not built**~~ — **step 2 was built 2026-08-25** (`net/src/tcp/cookie.rs`: mint, verify, expire; twelve host tests, six mutations each watched red, a fuzz target at 163,665,094 executions clean), and this line went on saying otherwise for a day. **Steps 3–4 remain, and until they land nothing on the wire uses the cookie** — the arithmetic exists and `bin/tcpd` still builds a connection from a `SYN`, so the denial of service is repriced and not removed. **Acceptance is still step 1 only, on purpose**: step 3 changes what this system puts on the wire, and widening an acceptance is the project lead's call and not the implementer's. They are what removes the trade rather than repricing it: with no state allocated for a peer that has proved nothing, there is no half-open connection for `R2` to govern |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — Core Operating System |
@@ -281,5 +281,22 @@ surviving a flood the harness *can* produce.
    value is honoured approximately — down, always, because a segment smaller
    than the peer can accept is delivered and one larger is not.
 3. `bin/tcpd` builds the connection from a verified `ACK` rather than from a
-   `SYN`.
-4. The gate: the wedge attempted, and survived.
+   `SYN`. ✅ **Done 2026-08-26.** `accept_syn` allocates nothing and answers
+   with `state::synack_for` — a `SYN·ACK` built without a control block, the
+   shape `reset_for` established for RFC 0047 — whose sequence number is
+   `cookie::mint` over the four-tuple. `accept_cookie` verifies the returning
+   `ACK` and builds the connection with `Tcb::from_cookie`, which constructs
+   what the three-way handshake would have produced. Four host tests in the
+   fuzzed crate, **each watched red** — and two of them were holes on the first
+   attempt: a bare `SYN`'s `sequence_length` is 1, so acknowledging the segment
+   and acknowledging its `SYN` are the same number and the mutation stayed
+   green; and `unsent()` answers zero both when nothing is pending and when
+   `snd_avail` sits *behind* `snd_nxt`, so a zeroed field passed unnoticed. Both
+   tests were sharpened until they could fail.
+4. The gate: the wedge attempted, and survived. ✅ **Done 2026-08-26**, with one
+   honest qualification. The gate asserts the **invariant** — every accepted
+   connection was built from a verified cookie, so no state was ever held for an
+   unproven peer — rather than staging the attack. Sending a bare `SYN` and
+   walking away needs a raw socket this harness cannot open; `/dev/tcp`
+   completes a handshake, which is the legitimate busy case and not the wedge.
+   The gate says which it is, in its own comment.

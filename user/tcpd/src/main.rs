@@ -46,7 +46,7 @@
 use bhaskix_abi::{method, rights, ring, status, syscall, tcp};
 use bhaskix_net::siphash::Key;
 use bhaskix_net::tcp::{
-    FourTuple, isn,
+    FourTuple, cookie, isn,
     segment::{self, Segment},
     state::{self, Action, Event, Tcb, Timer},
 };
@@ -526,6 +526,13 @@ struct Service {
     sent: u64,
     /// Entries refused before they reached the machine.
     refused: u64,
+    /// Connections built from a verified SYN cookie — RFC 0048 step 3.
+    ///
+    /// Reported because it is the difference between a stack that answers a
+    /// `SYN` with state and one that answers it with a number: if this reads
+    /// zero on a boot where a connection was accepted, the cookie path did not
+    /// run and something older did.
+    cookies_accepted: u64,
     connections: [Option<Connection>; MAX_CONNECTIONS],
     listener: Option<Listener>,
 }
@@ -786,18 +793,27 @@ fn drain_forward(service: &mut Service) {
             Some(index) => index,
             None => match accept_syn(service, &parsed, source, destination) {
                 Ok(index) => index,
-                Err(unmatched) => {
-                    // RFC 0047: a `SYN` for a port no listener holds is
-                    // *answered*, not dropped. Every other unmatched segment
-                    // keeps the silence it has always had -- including the one
-                    // deliberate case, a busy accepted slot, whose comment in
-                    // `accept_syn` says why the peer's retry is the answer.
-                    if matches!(unmatched, Unmatched::NoListener) {
-                        refuse(service, &parsed, source, destination);
+                // **RFC 0048 step 3: a segment that names no connection may be
+                // a cookie coming home.** `accept_syn` answers a `SYN` and
+                // allocates nothing, so the `ACK` that completes the handshake
+                // arrives here naming a connection that does not exist yet —
+                // which is the whole design, not an oversight. It is tried
+                // before the refusals below, because an `ACK` reaches them as
+                // `NotOurs` and would be counted as refused when it is the
+                // opposite.
+                Err(unmatched) => match accept_cookie(service, &parsed, source, destination) {
+                    Some(index) => index,
+                    None => {
+                        // RFC 0047: a `SYN` for a port no listener holds is
+                        // *answered*, not dropped. Every other unmatched
+                        // segment keeps the silence it has always had.
+                        if matches!(unmatched, Unmatched::NoListener) {
+                            refuse(service, &parsed, source, destination);
+                        }
+                        service.refused += 1;
+                        continue;
                     }
-                    service.refused += 1;
-                    continue;
-                }
+                },
             },
         };
         // What the machine takes, it reports as a count; the bytes behind the
@@ -885,26 +901,6 @@ fn accept_syn(
     if parsed.destination != Port(listener.port) {
         return Err(Unmatched::NoListener);
     }
-    // TIME_WAIT holds the tuple, not the slot — the same reclamation the
-    // outbound slot got, for the same reason: the machine there absorbs
-    // stragglers for its own four-tuple, and this SYN names a new one.
-    if let Some(held) = service.connections[ACCEPTED].as_ref()
-        && matches!(
-            held.tcb.state,
-            state::State::Closed | state::State::TimeWait
-        )
-    {
-        service.connections[ACCEPTED] = None;
-    }
-    if service.connections[ACCEPTED].is_some() {
-        // The one accepted slot is taken. `CONGESTED` is the table's word
-        // for this, and the refusal is silent at this layer -- the peer
-        // retries its `SYN`, and if the slot has freed by then, it lands.
-        // RFC 0047 deliberately did **not** make this one a `RST`: a reset
-        // here would tell a peer the port is shut when it is merely busy for
-        // a moment, and the retry is the better answer.
-        return Err(Unmatched::SlotBusy);
-    }
     let connection = FourTuple {
         // The address the SYN was sent to, not an assumption about which
         // of ours that was — what makes the same listener serve both
@@ -914,26 +910,162 @@ fn accept_syn(
         remote: source,
         remote_port: parsed.source,
     };
-    let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
+
+    // **RFC 0048 step 3: nothing is allocated here.**
+    //
+    // This used to take the one accepted slot on the `SYN` and refuse every
+    // later connection with `SlotBusy` until the half-open one gave up — 242
+    // seconds before step 1, and 14 after it, from a single packet that needed
+    // no authority and an address that need not exist. Step 1 repriced that
+    // attack; this removes it. The initial sequence number *is* a cookie over
+    // this four-tuple, so the state the connection needs is carried in the
+    // number the peer must echo, and a peer that never answers costs this
+    // stack one reply.
+    //
+    // The slot is taken in `accept_cookie`, when an `ACK` proves the peer
+    // received something only it could have received.
+    let announced = parsed.options.mss.unwrap_or(state::DEFAULT_MSS);
+    let cookie = cookie::mint(
+        &service.key,
+        connection,
+        announced,
+        now_nanos(service.hertz),
+    );
+    answer_with_cookie(service, parsed, source, destination, cookie);
+    Err(Unmatched::Cookied)
+}
+
+/// Sends the `SYN·ACK` whose sequence number is the cookie, allocating nothing.
+///
+/// The plumbing half of RFC 0048 step 3: `state::synack_for` does the
+/// arithmetic in the crate that is fuzzed and `forbid`s `unsafe`, and what is
+/// here is the tuple swap and the ring — the division [`refuse`] already makes,
+/// for the same reason.
+fn answer_with_cookie(
+    service: &mut Service,
+    parsed: &Segment<'_>,
+    source: Address,
+    destination: Address,
+    cookie: bhaskix_net::tcp::Sequence,
+) {
+    let Some(emit) = state::synack_for(parsed, cookie, WINDOW, state::DEFAULT_MSS) else {
+        return;
+    };
+    // The four-tuple, swapped: this end is the address the `SYN` arrived at and
+    // the port it asked for.
+    let back = FourTuple {
+        local: destination,
+        local_port: parsed.destination,
+        remote: source,
+        remote_port: parsed.source,
+    };
+    let built = emit.segment(back, &[]);
+    let mut bytes = [0u8; segment::MAX_HEADER];
+    let Ok(written) = segment::write(&mut bytes, &built, destination, source) else {
+        return;
+    };
+    // SAFETY: the back ring, mapped writable at `BACK_AT` -- the same ring
+    // every other segment this program sends leaves through.
+    let sent = unsafe { send_entry(destination, source, &bytes[..written]) };
+    if sent {
+        service.sent += 1;
+    }
+}
+
+/// Builds the accepted connection from an `ACK` that carries a cookie home.
+///
+/// RFC 0048 step 3, the other half. The peer's acknowledgement is
+/// `cookie + 1`, and only this stack's key could have produced the cookie over
+/// this four-tuple — so an `ACK` that verifies proves the peer received a
+/// segment only it could have received, which is exactly what the three-way
+/// handshake proves and the only thing the half-open slot was ever holding.
+///
+/// `None` for anything that is not one: a segment with no acknowledgement, one
+/// carrying `SYN` (that is a fresh request, not a completion), one for a port
+/// nothing listens on, one whose number this key did not mint, and one that
+/// arrives when the single accepted slot is genuinely occupied by a live
+/// connection.
+fn accept_cookie(
+    service: &mut Service,
+    parsed: &Segment<'_>,
+    source: Address,
+    destination: Address,
+) -> Option<usize> {
+    use bhaskix_net::tcp::segment::Flags;
+
+    if parsed.flags.contains(Flags::SYN) || parsed.flags.contains(Flags::RST) {
+        return None;
+    }
+    let acknowledgement = parsed.acknowledgement?;
+    let ours = destination == Address::V4(service.me) || destination == LOOPBACK6;
+    if !ours {
+        return None;
+    }
+    let listener = service.listener.as_ref()?;
+    if parsed.destination != Port(listener.port) {
+        return None;
+    }
+
+    // TIME_WAIT holds the tuple, not the slot — the same reclamation the
+    // outbound slot got, and it moved here with the allocation it guards.
+    if let Some(held) = service.connections[ACCEPTED].as_ref()
+        && matches!(
+            held.tcb.state,
+            state::State::Closed | state::State::TimeWait
+        )
+    {
+        service.connections[ACCEPTED] = None;
+    }
+    if service.connections[ACCEPTED].is_some() {
+        // Still one accepted connection at a time. **This is not the wedge**:
+        // the slot is held by a peer that completed a handshake and is being
+        // served, not by one that sent a packet and vanished. A peer whose
+        // cookie arrives now will retransmit its `ACK`, and the cookie stays
+        // valid for its whole window.
+        return None;
+    }
+
+    let connection = FourTuple {
+        local: destination,
+        local_port: Port(listener.port),
+        remote: source,
+        remote_port: parsed.source,
+    };
+    let accepted = cookie::verify(
+        &service.key,
+        connection,
+        acknowledgement,
+        now_nanos(service.hertz),
+    )?;
+
+    // The peer's initial sequence is one below where its `ACK` sits: byte `k`
+    // of its stream is `irs + 1 + k`, so the number this segment is at *is*
+    // `irs + 1`.
+    let irs = bhaskix_net::tcp::Sequence(parsed.sequence.0.wrapping_sub(1));
     service.connections[ACCEPTED] = Some(Connection {
-        tcb: Tcb::new(connection),
+        tcb: Tcb::from_cookie(
+            connection,
+            accepted.sequence,
+            irs,
+            parsed.window,
+            WINDOW,
+            accepted.mss,
+        ),
         deadlines: Deadlines::new(),
         sendr_at: listener.sendr_at,
         recvr_at: listener.recvr_at,
         delivered: 0,
         handle: tcp::handle(ACCEPTED as u32, 1, false),
         notify_slot: listener.notify_slot,
-        wake_owed: false,
+        // **Owed from birth.** `drive_at` rings the caller's wake when a step
+        // *changes* the state, and a connection rebuilt from a cookie is born
+        // `Established` — so the transition that used to be the news never
+        // happens, and whoever is waiting to accept would never be told. The
+        // connection coming into existence is the news; this says so.
+        wake_owed: true,
     });
-    drive_at(
-        service,
-        ACCEPTED,
-        Event::Listen {
-            iss,
-            window: WINDOW,
-        },
-    );
-    Ok(ACCEPTED)
+    service.cookies_accepted += 1;
+    Some(ACCEPTED)
 }
 
 /// Why a segment that named no connection could not become one.
@@ -945,9 +1077,16 @@ enum Unmatched {
     /// Nothing holds that port. RFC 793 §3.4's case, and the one this service
     /// owes an answer to.
     NoListener,
-    /// A listener holds the port and its one accepted slot is taken. Silent on
-    /// purpose -- see the comment at the check itself.
-    SlotBusy,
+    /// A listener holds the port and the `SYN` was **answered with a cookie**,
+    /// allocating nothing — RFC 0048 step 3. Not a failure: the connection is
+    /// built when the peer's `ACK` brings the cookie back, in `accept_cookie`.
+    ///
+    /// ~~`SlotBusy`~~ used to live here: a `SYN` arriving while the one accepted
+    /// slot was held by a *half-open* connection was refused silently, and one
+    /// packet from a peer that vanished could hold that slot for 242 seconds.
+    /// There is no half-open connection any more, so there is nothing for that
+    /// case to describe.
+    Cookied,
     /// Not a `SYN`, already acknowledging something, or addressed to somebody
     /// this machine is not. Nothing to answer, and nothing new here: this is
     /// the silence every unmatched segment had before RFC 0047.
@@ -1388,8 +1527,18 @@ fn serve_handover_only(dark: u64) -> ! {
 /// Stamps the cycle counter into report word `index`, first time only.
 ///
 /// Leaves the findings where the kernel granted memory for them.
-fn report(state_bits: u64, outcome: u64, taken: u64, sent: u64, refused: u64, tcb_state: u64) {
-    let words = [MARKER, state_bits, outcome, taken, sent, refused, tcb_state];
+fn report(
+    state_bits: u64,
+    outcome: u64,
+    taken: u64,
+    sent: u64,
+    refused: u64,
+    tcb_state: u64,
+    cookies: u64,
+) {
+    let words = [
+        MARKER, state_bits, outcome, taken, sent, refused, tcb_state, cookies,
+    ];
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.
@@ -1440,7 +1589,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     }
     let mut bits = state_bits::ATTACHED;
     let networked = attach(BACK, BACK_AT, 1) && attach(CONFIG, CONFIG_AT, 0);
-    report(bits, outcome::PENDING, 0, 0, 0, 0);
+    report(bits, outcome::PENDING, 0, 0, 0, 0, 0);
 
     // **The refusal, before anything else.** A 128-bit secret from the
     // hardware, or nothing: `Key::draw` returns `None` if either half is
@@ -1454,11 +1603,11 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // exact bug the no-network arm below had already found and fixed.
         // The handover needs no key; only a sequence number does, and the
         // minted connection says so when asked.
-        report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0);
+        report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::NO_ENTROPY)
     };
     bits |= state_bits::KEYED;
-    report(bits, outcome::PENDING, 0, 0, 0, 0);
+    report(bits, outcome::PENDING, 0, 0, 0, 0, 0);
 
     if !networked {
         // No rings to a protocol service means no network, which is a state
@@ -1467,7 +1616,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // and mint connections — the handover needs no wire, and exiting
         // here would leave the endpoint dead with every caller queued
         // against it for ever.
-        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0);
+        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::UNREACHABLE)
     }
 
@@ -1498,7 +1647,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         }
     }
     if me == Ipv4Addr::UNSPECIFIED {
-        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0);
+        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::UNREACHABLE)
     }
     bits |= state_bits::CONFIGURED;
@@ -1516,6 +1665,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         taken: 0,
         sent: 0,
         refused: 0,
+        cookies_accepted: 0,
         connections: [None, None],
         listener: None,
     };
@@ -1555,6 +1705,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             service.connections[OUTBOUND]
                 .as_ref()
                 .map_or(0, |connection| state_number(&connection.tcb)),
+            service.cookies_accepted,
         );
 
         declare_gift_slot(&connect_handover, &listen_handover);

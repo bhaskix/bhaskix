@@ -69,4 +69,10 @@ asm_budget = 5
 # brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
 # charged the outer block's body to this crate. See the changelog; the
 # scanner now walks from the block's own brace and has a self-test.
-unsafe_budget = 104
+# 105 for RFC 0048 step 3's `answer_with_cookie`: one `send_entry` call, the
+# same single `unsafe` line `refuse` spends to put a reply on the back ring.
+# There is no way to send a segment without it, and the arithmetic that decides
+# *what* to send lives in `bhaskix-net`, which `forbid`s `unsafe` and is fuzzed
+# -- so the whole cookie handshake costs exactly one line here, and it is the
+# line every other outbound segment already crosses.
+unsafe_budget = 105
