@@ -20736,12 +20736,22 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
     let cpus = bhaskix_arch::percpu::online_count().min(WORK.len() as u32);
     const NAMES: [&str; 4] = ["worker-0", "worker-1", "worker-2", "worker-3"];
 
+    // Kept for the same reason the migration test keeps its own: a generation
+    // of workers that nothing can wait for can only be retired by sleeping.
+    let mut spawned = [0u32; WORK.len()];
+    let mut spawned_count = 0usize;
     for id in 0..cpus {
-        if let Err(error) =
-            sched::spawn_on(id, NAMES[id as usize], worker, u64::from(id), hhdm_base)
-        {
-            println!("\x1b[91m    threads        FAILED to spawn on cpu {id}: {error:?}\x1b[0m");
-            return false;
+        match sched::spawn_on(id, NAMES[id as usize], worker, u64::from(id), hhdm_base) {
+            Ok(thread) => {
+                spawned[spawned_count] = thread;
+                spawned_count += 1;
+            }
+            Err(error) => {
+                println!(
+                    "\x1b[91m    threads        FAILED to spawn on cpu {id}: {error:?}\x1b[0m"
+                );
+                return false;
+            }
         }
     }
 
@@ -20784,12 +20794,28 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
         );
     }
 
-    // Retire the pinning workers before measuring migration. They are pinned
-    // only by circumstance -- one per CPU, so no CPU is ever idle enough to
-    // steal -- and leaving them running would mean the migration phase found
-    // a perfectly balanced machine and correctly did nothing.
+    // Retire the pinning workers before measuring migration, and **wait for
+    // them** rather than sleeping over them. They are pinned only by
+    // circumstance -- one per CPU, so no CPU is ever idle enough to steal --
+    // and leaving them running would mean the migration phase found a
+    // perfectly balanced machine and correctly did nothing.
+    //
+    // That is not a small failure mode: it would make the *next* test measure
+    // the opposite of what it means to, and pass. A fixed 300 ms was the only
+    // thing standing between here and there.
     PHASE.store(PHASE_MIGRATION, Ordering::Release);
-    wait_millis(300);
+    let pinning_retired = wait_until(
+        || sched::threads_present_exact(&spawned[..spawned_count]) == 0,
+        4_000,
+    );
+    if !pinning_retired {
+        println!(
+            "\x1b[91m    threads        FAILED: {} pinning workers still running, so the \
+             migration phase would measure a machine they are on\x1b[0m",
+            sched::threads_present_exact(&spawned[..spawned_count])
+        );
+        ok = false;
+    }
 
     ok &= migration_self_test(hhdm_base, cpus);
 

@@ -1048,6 +1048,24 @@ That is the third time today this distinction has mattered.
 Watched red: with the migrants made never to retire, the lane reports `0 of its
 4 workers retired ... SOME ARE STILL RUNNING` and fails.
 
+**And the generation *before* it got the same treatment, for a reason of its
+own.** The pinning workers are retired immediately before the migration test,
+and that comment already said why it matters: *"leaving them running would mean
+the migration phase found a perfectly balanced machine and correctly did
+nothing."* That is not a small failure mode — it would make the next test
+**measure the opposite of what it means to, and pass**. A fixed `wait_millis(300)`
+was the only thing standing between here and there. It now waits for those
+workers by id and fails loudly if they are still running, watched red the same
+way: `threads  FAILED: 4 pinning workers still running, so the migration phase
+would measure a machine they are on`.
+
+**Three more transitions still sleep**, and are left alone deliberately:
+`PHASE_CLASS` and `PHASE_DOMAIN` at 200 ms each, and two in the tickless path.
+The same shape, no fault traced to them, and each needs its own test to keep the
+ids it spawns. Recorded as a known pattern rather than swept up in a change made
+for a different reason — the two that were fixed are the two with evidence
+behind them.
+
 ### 2026-08-26 (the kernel page fault is not lane-specific, and it lives just after the migration self-test)
 
 **A second sighting, and it turned a rare mystery into a localised one.**
