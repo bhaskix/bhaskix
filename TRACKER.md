@@ -715,6 +715,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 | **The TCP inbound gate fails intermittently (filed 2026-08-24) — root-caused 2026-08-24, and the fix is [RFC 0047](docs/rfc/0047-refusing-a-connection-to-a-port-nobody-holds.md); one mechanism behind it is fixed and a second, worse one is not.** ~~The guest reaches the line before it — `tcp client did everything outcome 9 says, then opened a v6 connection` — so the guest's side completes and the host-side client is what comes away empty.~~ **That sentence was wrong and is corrected rather than deleted.** The guest reports **outcome 10, `NOBODY`** — `tcp client  echoed outbound, listened, and nobody called` — so the guest's side does *not* complete and it never received a connection at all. What is true: `$INBOUND_VERDICT` stays absent and the gate reports *"the ring handover or the stream through it did not complete"*, every AHCI gate passes, and the boot takes 28 s of its 120 s budget. **RFC 0046 is not convicted**: the margin it is accused of eating was always about a tenth of a second wide. | **Measured, not argued.** *(1)* The host driver **never retried**: instrumented, 20 boots of 20 opened one connection at t≈1.5 s and blocked in a single read for 18.2 s — it retries only when `connect` fails, and slirp's `hostfwd` always accepts. *(2)* Delivery is therefore on slirp's SYN-retransmit ladder, measured by a delayed-start sweep as a fixed offset from when the **host** opens, not from when the guest is ready: opens 1.54 s → served 19.64 s; 5.52 → 23.72; 10.51 → 28.77; 14.52 → 20.81. Rungs at ≈T+6.3 s and ≈T+18.2 s. *(3)* The guest becomes reachable at **19.62 s**, measured directly by hammering a port nothing holds through a whole boot. The shipped configuration lands on the 19.64 s rung — **≈0.1 s of margin**. *(4)* `bin/tcpd` could not refuse: `send_entry` had one caller, inside `Action::Emit`, which needs a control block. **Fixed by RFC 0047**, gated, and the gate watched red. **What is NOT fixed, and is the more serious half — see the row below.** A synthetic anti-phase (`BHASKIX_DRIVER_DELAY=11`, a temporary harness knob, reverted) fails 3/3 where delay 0 passes 3/3, and with the refusal reasons temporarily separated it read **one `SlotBusy` and zero `NoListener`** — the connection reached the guest and was refused because the single accepted slot was already wedged. ~~**The filed flake was never reproduced on an idle machine in 33 runs**~~ — **reproduced 2026-08-25**, three times on an idle machine, twice by accident during unrelated work and once inside a deliberate 14-boot sweep (1 failure in 14). The failure is exactly this row's: outcome 10 `NOBODY`, `tcp client echoed outbound, listened, and nobody called`, and no `tcp measure6`. **Which of the two mechanisms it is remains unproven**, and one field that looked like a discriminator is not: `refused` read **0 on all 14 runs including the 13 that passed**. What separated them cleanly was time to `boot cost` — 29,730 / 29,880 ms on failures against 25,838–26,917 ms across every pass, no overlap — **but that figure cannot carry the weight**: it is printed *after* the TCP act and therefore contains it, and the failing run did **less** work in more time (63 segments in against 155), which is what an effect looks like rather than a cause. A timestamp taken before the act was added the same day; 16 further boots put `bin/tcpc started` at **17.49–18.68 s** with the act itself a near-constant **8.23 s**, and all 16 served, so the decisive sample is still owed. Reproduce the ladder with `tests/qemu/boot-test.sh iommu` on an idle machine; at roughly one in fifteen it does not take long. | unassigned |
 | **CI warns on every job: `actions/checkout@v4` targets Node.js 20, which is deprecated (noticed 2026-08-25).** *"The following actions target Node.js 20 but are being forced to run on Node.js 24"* — one `warning` annotation per job, on all ten. | Noticed while reading annotations for something else, and **deliberately not fixed**: bumping to `@v5` is a one-word change to a file that decides whether anything is checked out at all, made for a reason nothing in this project asked for. It is being forced onto Node 24 already, so nothing is broken today; it will break on the day the forcing stops. Recorded so that day is not a surprise. | unassigned |
 | **`linux clone`'s sleeping path is asserted by winning a race (filed 2026-08-25; measured the same day).** `make test-shell` went red with `linux clone FAILED: three attempts and the child won the race every time, so the sleeping path was never exercised`. The test forks a hosted thread and wants the **parent** to block in `futex` so the child's wake can be proven; when the child finishes first the path is not taken, and the test already retries **three** times before giving up. | The message is exact and self-diagnosing, which is to its credit. But the gate's outcome is decided by which side of a race lands, and it passes because one side is usual rather than because anything makes it so. **~~Frequency unknown~~ — measured 2026-08-25, and it is lane-dependent by an order of magnitude.** The boot report already carries `(attempt N)` on success and a yellow line on a loss, so the rate was recoverable from logs already on disk at no cost — nobody had counted. Across **102 boots** of the `iommu` boot lane: **one** lost attempt. Across **8 runs** of `shell-test.sh kernel` — the mode that went red: **one** lost attempt, an order of magnitude more often. **Three attempts was not chosen from either number**, and neither existed when it was chosen. What the data does *not* settle: at p≈1/8 per attempt, three consecutive losses is about 1 in 500, and one was seen inside roughly ten suite runs — which is either a 2% coincidence or evidence that the losses are **correlated** rather than independent, in which case more attempts would not help at all. One occurrence cannot tell those apart, and the difference decides whether raising the count is a fix or a placebo. The real fix remains making the parent's sleep **guaranteed**; the source already records why the obvious ways cannot — *"no amount of user-mode delay can guarantee the parent is asleep, because the only thing that knows is the kernel and the probe cannot ask it without a syscall invented for the test."* | unassigned |
+| **A shell self-test fails on the SR550 and on no emulator lane (filed 2026-08-26).** `shell  FAILED: draining after the wake found the bytes (14 of 5 bytes, 1 interrupts, 0 of 15 commands wrong)` — and a second line, `every byte arrived, in order`, with the same counts. Fourteen bytes arrived where five were expected, one interrupt, and **no command was wrong**. | Seen on the hardware boot of 2026-08-26 and on none of the five QEMU lanes, which pass this gate every run. The counts are the interesting part: nothing was *wrong*, there was simply **more** than expected, so the likely reading is that the real UART delivered bytes an emulated one does not — a firmware banner, a stale FIFO, or the BMC's own redirection — and the check counts bytes rather than matching them. Not investigated: it needs another boot of a live cluster node, and the boot it was found on was spent on the xHCI question. | unassigned |
 | **A domain's ABI tag can be changed while a thread is running in it (filed 2026-08-26).** The rule `set_personality` enforces — *"refused once the domain has a thread, because a program half-run under one ABI and finished under another is not a state anyone can reason about"* — **fails about one boot in twenty**. Measured directly: the personality probe was **mid-sequence**, four to seven of its eight syscalls made, demonstrably alive inside the domain, and `set_personality(Native)` returned `Ok`. 1 occurrence in 20 boots, and consistent with 1 in 27 seen the same evening on an earlier build. | **A mechanism, with the codebase's own words against the current use.** The guard is `self.threads > 0 \|\| sched::threads_in_domain(id) > 0`. `threads_in_domain` takes each run queue with **`try_lock`**, and its own comment says: *"A skipped queue counts as empty. Tolerable here — every caller polls in a loop, so a blinded pass is corrected by the next... The last-thread decision in `exit` deliberately does NOT use this function for exactly this reason."* **`set_personality` does not poll.** It asks once and decides, and the decision is a security rule, so a queue that was momentarily busy reads as a domain with no threads. **Not yet proven**: the failing boots predate the instrument, so no blinded-scan count was captured for one. Every boot now prints `asked after N of 8 calls, M run-queue scans blinded`, so the next occurrence settles it. **Deliberately not fixed here**: failing closed on a blinded scan is the right shape, but the *initial* tagging goes through the same call with no threads to find, so a spurious refusal would break domain creation instead. That trade is the project lead's, not the implementer's. | unassigned |
 | **A kernel page fault halts the native-loader lane, intermittently (filed 2026-08-25).** `make test-boot-native-full` — the lane that boots through `bhaskixboot.efi` with the kernel doing its own INIT-SIPI — did not finish in 120 s. Three `#PF` reports on **two CPUs at once** (cpu 1 thread 12, cpu 2 thread 13), `cr2` at `0x0`, `0x2` and `0x67d499c8a`, `cr3` the same on both, and the handler itself reporting **`THE FRAME CHANGED UNDER THE HANDLER: dispatched as vector 2684`** — so the exception frame was overwritten while being read. The kernel halted itself, correctly: *"a fault in the kernel is the kernel's own bug"*. | **Not reproduced**: 4 further runs of the same lane on the same tree all passed with zero exceptions. The serial log **survives** — the first failure to benefit from the log-retention change made hours earlier the same day — and is the only artifact. What it shows: the faults land immediately after `threads  183 preemptions across 4 cpus` and `migration  1 threads stolen; 1 of 3 ran off their creating cpu; placement chose cpu 2`, so the faulting threads are the work-stealing self-test's. **One promising line was checked and is not the cause**: `smp  lapic N claimed a stack and never reported in` appeared on the faulting boot — and on **all four passing boots too**, twice on one of them. It was filed separately rather than blamed, and turned out to be a **false alarm in the warning itself**, fixed 2026-08-26; it says nothing about this fault either way. **The fault is now bounded rather than explained**: 19 further runs of this lane, all clean, so it is rarer than about one in twenty. Which of the two CPUs faulted first is not recoverable: the reports interleave. | unassigned |
 | ~~**On the native-loader lane an AP claims a stack and never reports in, every boot (filed 2026-08-25).**~~ **CLOSED 2026-08-26 — the warning was false, and nothing was wrong with the bring-up.** | **The message counted instead of identifying.** After starting a processor, the code waited with `wait_until_online(before + 1)` — for the online *count* to rise by one — and then asked whether **this** lapic was online. A processor from an *earlier* iteration arriving late satisfies that count, the wait returns, this lapic is legitimately still on its way, and the warning is printed about a processor that does arrive. Hence a warning on every boot of a lane that then reported `4 online of 4`: both statements true, and together nonsense. Fixed by waiting on `is_online_lapic(lapic)` — the processor that was just started — rather than on an aggregate. Measured: **5 boots of 5 warned before, 6 of 6 warn not-at-all after**, with `4 online of 4` throughout. Watched red by shortening the arrival deadline 400,000-fold, which makes it fire again, so the alarm still works. **Two claims in the original filing were wrong** and are corrected rather than deleted: there was no failing first INIT-SIPI, and no stack was abandoned — each offer gets its own slot and a *claimed* stack is used, while only an *unclaimed* one is leaked deliberately. | closed |
@@ -1000,6 +1001,85 @@ Two fixes, because one of them is the cause and the other is the legibility:
 dependency**, and this one shipped without anybody asking what CI's checkout
 looks like. It is the same shape as everything else this week: it worked on the
 machine it was written on.
+
+### 2026-08-26 (the SR550 answered the question the recovery was written for, and the answer was no)
+
+**The xHCI recovery ran on real hardware, correctly, twice — and port 1 still
+does not answer.** That is the result this boot existed to get, and it is a
+negative one, which is worth more than another QEMU pass.
+
+    xhci recover   the slot was released and taken again 2 time(s): xHCI 1.2 §4.6.5's
+                   recovery for a refused addressing, which this driver did not perform
+                   until 2026-08-25
+    xhci device    not addressed on port 1 at speed 3 after a reset after 3 attempt(s):
+                   the controller would not address the device (usb transaction error --
+                   the device did not answer, code 4); portsc 0x00220e03
+
+Same completion code and the same `PORTSC` as before the recovery existed. So
+the specification's prescribed remedy for this exact completion code —
+*"issue a Disable Slot Command for the Device Slot then an Enable Slot Command"*
+— is now performed, and it changes nothing here. **That materially strengthens
+the standing reading**: the device on that port is the BMC's own emulated
+peripheral, and what it does after its port is reset is the BMC's business, not
+this driver's. It is no longer a reading with an untried remedy behind it.
+
+**Six things were confirmed on hardware for the first time.**
+
+1. **The port survey no longer contradicts the search.** It read
+   `26 of 26 powered, 0 with something attached, 26 quiet` on the last hardware
+   boot while the next line addressed a device on port 1. It now reads
+   `[after the search] 26 of 26 powered, **1** with something attached, 25 quiet`.
+   The fix was made for this machine and this is the machine it was wrong on.
+2. **The deadline gate, and hardware is sixty times tighter than the emulator**:
+   `armed for 20 ms, woke after 20.006 ms, never early and late by 0.006 ms`,
+   against 0.331–0.446 ms across the QEMU lanes. `deadline arms  2 brought this
+   cpu's next interrupt forward`, so the counter gate holds too.
+3. **The IOMMU fault instrument** reported at both moments, which is the gate
+   added on the 25th doing its job on a machine that has real faults:
+   `[before drivers] none recorded by any programmed unit`, and during bring-up
+   the familiar refusal of `0xaa95f000` by unit 3 — still open, still recurring.
+4. **The personality instrument answered its own question.** It reported
+   `the domain had already ended ... (asked after 8 of 8 calls, 0 run-queue
+   scans blinded)` — the **benign** case, correctly identified as benign,
+   because the number that distinguishes it was there to be read.
+5. All four VT-d units programmed; **16 CPUs online of 16**.
+6. The whole boot completed: `M6 in progress. Nothing left to do at this
+   milestone.`
+
+**And it found two defects that QEMU cannot show.**
+
+**`boot cost` was reading eighteen hours.** `boot cost 65800320.845 ms to
+services up`, for a boot of about two minutes. `time::now_nanos()` returned
+`tsc::to_nanos(tsc::read())` — the **raw** counter — while its own doc comment
+said *"monotonic time since boot"*. A warm restart does not zero the TSC, so on
+a server that had been up for a day the figure was time since the machine was
+last powered on. On an emulator every run gets a fresh machine and the two
+numbers are the same, which is why it survived: **right on QEMU, silently wrong
+on hardware, and the documentation had said the right thing all along.**
+
+Fixed with a boot baseline recorded first thing in `kernel_main`. It matters
+beyond the report: `uptime` is a **shell command a person types**, and it was
+answering with the machine's power-on time. The third caller was the
+`bin/tcpc started at` instrument added the same morning, which had inherited
+the same defect before anyone could notice.
+
+`now()` keeps returning the raw counter — every caller uses it for differences,
+where the origin cancels — but its doc no longer claims otherwise, which is
+what let this hide.
+
+**A shell self-test fails on this machine and passes on every emulator lane**:
+`shell FAILED: draining after the wake found the bytes (14 of 5 bytes, 1
+interrupts, 0 of 15 commands wrong)`. Fourteen bytes where five were expected,
+with no command wrong. Filed rather than guessed at.
+
+**Also worth an eyebrow, and not chased**: `local apic  enabled, timer
+calibrated to 1.558 MHz`, against 62.564 MHz under QEMU. The deadline numbers
+above are excellent, so whatever that figure means it is not making the timer
+wrong — but it is not obviously right either.
+
+**Procedure note.** The machine was restored: image unmounted, one-time boot
+override self-cleared, `PowerState` back to `On` and `Health` `OK`, and the
+HTTP server stopped. Nothing persistent was changed on it.
 
 ### 2026-08-26 (the tag guard has a hole, and moving one probe found it)
 

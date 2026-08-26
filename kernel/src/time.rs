@@ -194,17 +194,49 @@ pub fn arm_reasons(cpu: u32) -> (u64, u64, u64) {
         })
 }
 
-/// Monotonic time since boot, in TSC units.
+/// The TSC value this kernel started at, so that [`now_nanos`] can mean what
+/// its name says.
+///
+/// Zero until [`mark_boot`] runs, and zero is the old behaviour, so a kernel
+/// that never marks its start is no worse off than before.
+static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// Records the instant this kernel began, once.
+///
+/// **The TSC is not zeroed by a warm restart.** On an emulator each run gets a
+/// fresh machine, so the raw counter and "time since this kernel started" are
+/// the same number and nothing notices the difference. On a server that has
+/// been up for a day and is then rebooted into this kernel, they are not: the
+/// first boot report off an SR550 that printed it read
+/// `boot cost 65800320.845 ms to services up` -- **eighteen hours**, for a boot
+/// that took about two minutes. Same code, right on QEMU, silently wrong on
+/// hardware.
+pub fn mark_boot() {
+    let _ = BOOT_TSC.compare_exchange(0, tsc::read(), Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// The raw timestamp counter, in TSC units.
+///
+/// **Not zeroed at boot**, and the name does not pretend otherwise any more:
+/// this said "monotonic time since boot" while returning a counter that a warm
+/// restart leaves running. Every caller uses it for *differences* -- deadlines
+/// and elapsed spans -- where the origin cancels, which is why the wrong
+/// description survived. [`now_nanos`] is the one that needed fixing.
 #[must_use]
 pub fn now() -> u64 {
     tsc::read()
 }
 
-/// Monotonic time since boot in nanoseconds, or `None` without a calibrated
-/// TSC.
+/// Nanoseconds since this kernel started, or `None` without a calibrated TSC.
+///
+/// Since the kernel started, not since the counter did -- see [`mark_boot`].
+/// Its three callers all print it as an elapsed time: the shell's `uptime`, the
+/// boot report's cost, and the instant `bin/tcpc` starts. All three were wrong
+/// on real hardware and right on the emulator, which is the worst way for a
+/// number to be wrong.
 #[must_use]
 pub fn now_nanos() -> Option<u64> {
-    tsc::to_nanos(tsc::read())
+    tsc::to_nanos(tsc::read().saturating_sub(BOOT_TSC.load(Ordering::Acquire)))
 }
 
 /// Converts a duration in microseconds to TSC units.

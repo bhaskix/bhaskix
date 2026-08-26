@@ -115,6 +115,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Does not panic. A malformed handoff is reported and halts, because a panic
 /// this early would have nowhere useful to print to.
 pub fn kernel_main(handoff: &Handoff) -> ! {
+    // **The instant this kernel began, before anything else.** The TSC is not
+    // zeroed by a warm restart, so without this every "since boot" figure is
+    // "since the machine was last powered on" -- which on an emulator is the
+    // same thing and on a server is not. Free, and it has to be first or it is
+    // measuring from somewhere else.
+    time::mark_boot();
     // Serial first, before anything else can go wrong. It is the only sink
     // that works with no framebuffer, no memory manager, and a corrupt heap.
     let serial_present = console::init_serial(COM1);
