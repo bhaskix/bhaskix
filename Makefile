@@ -875,6 +875,22 @@ gates:
 	else \
 	    printf '  \033[1;32mok\033[0m    the placement check reports both faults in a malformed table\n'; \
 	fi
+# **And what it did not check**, because a green `gates` has twice been read as
+# a green tree and is not one.
+#
+# `gates` is the fast target and therefore the one usually run; `fmt`, `clippy`,
+# `test-host` and the boot lanes are its *siblings* under `test`, not its
+# children. `main` was red for three separate clippy errors nobody noticed
+# because of exactly this, and §6's table claimed `clippy -D warnings` had been
+# active since M1 -- true of CI, and not of the command a developer types.
+#
+# Moving them in here was considered on 2026-08-24 and refused for a good
+# reason: it would widen a developer-facing gate as a side effect of an
+# unrelated change, and `gates` earns its place by being quick. So it stays
+# quick and stops implying otherwise.
+	@printf '\n  \033[2mnote\033[0m  gates checks invariants only. It does not run `cargo fmt --check`,\n'
+	@printf '        `cargo clippy`, the host tests, or any boot lane -- `make test` runs\n'
+	@printf '        all of them, and CI runs `make test`.\n'
 
 # Builds the filesystem image tool, for a developer who wants an image.
 mkfs:
