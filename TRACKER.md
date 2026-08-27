@@ -1123,6 +1123,23 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-27 (a third CI red on a docs-only commit, and the job list settled it again)
+
+**Run 394 failed `boot (uefi, max)` on a commit that changed four markdown
+files** — `TRACKER.md`, `docs/progress.md`, RFC 0053's status line and
+`security.md`. No code at all. Run **393 passed with identical code** one push
+earlier, and the lane passes 3 of 3 locally.
+
+So it is an intermittent on CI's emulator, and the argument is the same one that
+settled run 378: **a commit that changes only prose cannot break a boot.** The
+job list is enough to say so without a token and without guessing, which is what
+`tools/ci-status.sh` was built for.
+
+**Recorded rather than re-run quietly**, because three CI reds in one day on this
+project is worth a line even when two of them were mine and this one is not. The
+lane most likely responsible is the TCP inbound gate, whose environmental
+flakiness already has its own row.
+
 ### 2026-08-27 (RFC 0053: input a domain was given — the console narrowing survives, and the nucleus enforces it)
 
 **The project lead chose option 2**: a hosted domain gets an input authority of
