@@ -73,6 +73,7 @@ gantt
     RFC 0036 A relocatable program in ring 3 — the other half... :active, r0036, 2026-08-21, 2026-08-27
     RFC 0039 Pingala — a native web server and what "secure... :active, r0039, 2026-08-22, 2026-08-27
     RFC 0042 Reading the boot report back :done, r0042, 2026-08-23, 1d
+    RFC 0051 a shell that can ask what arrived :active, r0051, 2026-08-27, 2026-08-27
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-08-27
@@ -144,17 +145,11 @@ gantt
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
 | 0050 | a console line that arrives whole | 2026-08-27 |
-| 0051 | a shell that can ask what arrived | — |
+| 0051 | a shell that can ask what arrived | 2026-08-27 |
 
 ## Annexes
 
 Companion documents that share an RFC's number. Counted here rather than as RFCs of their own.
 
 - RFC 0040 — step 1 — the libcrux inspection
-
-## Undated
-
-No commit adding these files was found, so they have no start date and are not on the chart.
-
-- RFC 0051 — a shell that can ask what arrived
 

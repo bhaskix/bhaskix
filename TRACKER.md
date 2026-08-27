@@ -1035,6 +1035,32 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-27 (the same chart mistake twice in one day, so it stopped being a comment and became a warning)
+
+**Run 377 and run 383, identical.** `make gates` passed locally and the project
+invariants job went red, because the progress chart dates each RFC from the
+commit that added its file and the chart was generated while the RFC was still
+untracked. CI regenerates it with the file committed, finds a date, and the gate
+correctly says the chart does not match.
+
+**The first time, a note was written on `first_commit_date` saying to commit the
+RFC first. Nine commits later the same mistake was made again** — the chart was
+generated in the same command that staged the file, so `make progress` ran before
+`git add`. A comment on the function is not read by somebody typing a command,
+and the feedback arrived ten minutes later from CI rather than at the moment of
+the mistake.
+
+**So `tools/progress.py` now says it itself**, on `stderr`, naming the file and
+what to do:
+
+    note  0051-a-shell-that-can-ask-what-arrived.md is not committed yet, so it has no
+          date and this chart will not match the one CI generates.
+          Commit the RFC first, then run `make progress` again.
+
+Verified by dropping an untracked RFC into `docs/rfc/` and watching it fire.
+**The gate was right both times**; what was missing was anything telling the
+person before the push.
+
 ### 2026-08-27 (the ring 3 shell can ask what arrived — RFC 0051)
 
 **The gap, stated as the day found it.** A machine whose keyboard seems dead

@@ -92,6 +92,29 @@ def first_commit_date(path: Path) -> str | None:
     return out.split("\n")[-1] if out else None
 
 
+def warn_if_untracked(path: Path, when: str | None) -> None:
+    """Says so, loudly, when an RFC has no commit date yet.
+
+    **A comment was tried first and did not work.** `first_commit_date` has
+    carried a note since earlier on 2026-08-27 saying to commit the RFC before
+    generating this chart, and the same mistake was made again nine commits
+    later: the chart was generated in the same command that staged the file, so
+    the RFC was still untracked and got a dash. CI regenerates it with the file
+    committed, finds a date, and the invariants job goes red on a change with
+    nothing wrong with it -- twice in one day, ten minutes each time.
+
+    So the tool now says it at the moment it happens, where the person is
+    looking, instead of leaving it to a gate a push away.
+    """
+    if when is None:
+        print(
+            f"  note  {path.name} is not committed yet, so it has no date and this "
+            "chart will not match the one CI generates.\n"
+            "        Commit the RFC first, then run `make progress` again.",
+            file=sys.stderr,
+        )
+
+
 def status_row(text: str) -> str:
     for line in text.split("\n"):
         if line.startswith("| **Status**"):
@@ -209,13 +232,15 @@ def read_rfcs() -> list[Rfc]:
         else:
             state = "open"
 
+        started = first_commit_date(path)
+        warn_if_untracked(path, started)
         found.append(
             Rfc(
                 annex=is_annex,
                 number=number,
                 title=title,
                 subsystem=theme(field(text, "Subsystem"), title),
-                started=first_commit_date(path),
+                started=started,
                 accepted=accepted,
                 state=state,
             )
