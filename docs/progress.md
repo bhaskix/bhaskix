@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **33** |
-| RFCs open | 15 |
+| RFCs open | 16 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -142,10 +142,17 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
+| 0050 | a console line that arrives whole | — |
 
 ## Annexes
 
 Companion documents that share an RFC's number. Counted here rather than as RFCs of their own.
 
 - RFC 0040 — step 1 — the libcrux inspection
+
+## Undated
+
+No commit adding these files was found, so they have no start date and are not on the chart.
+
+- RFC 0050 — a console line that arrives whole
 

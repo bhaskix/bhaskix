@@ -263,6 +263,50 @@ pub fn init_framebuffer(fb: Framebuffer) -> bool {
     }
 }
 
+/// Puts a run of bytes with the console held **once** — RFC 0050.
+///
+/// # Why this exists
+///
+/// [`_print`] takes the console lock for the whole of one `write_fmt`, so a
+/// kernel line is atomic against everything. A hosted program's `write` was not:
+/// `bin/linuxd` put one byte per `INVOKE`, each taking and releasing this lock,
+/// so any other CPU printing between two of them split the line. It did, and the
+/// specimen is in a preserved log of 2026-08-26:
+///
+/// ```text
+/// e    linux exec     a Linux program execed: its own domain ended ...
+/// xeced pid 3
+/// ```
+///
+/// The program wrote `execed pid 3`. The `e` got out; a kernel report took the
+/// lock; the rest followed.
+///
+/// # What it is not
+///
+/// It is not a different authority and it is not different rendering. A byte is
+/// put exactly as [`crate::syscall`]'s `PUT` puts one — as a scalar value, or
+/// `?` if it is not one — so a run of *n* bytes is *n* `PUT`s and nothing else.
+/// What it removes is the gap between them.
+pub fn put_run(bytes: &[u8]) {
+    if FATAL.load(core::sync::atomic::Ordering::Acquire) {
+        // The fatal path cannot block on this lock and must not start now. One
+        // byte at a time is exactly what it did before, and a report racing a
+        // dying machine has bigger problems than an interleaved line.
+        for byte in bytes {
+            write_fatal(format_args!("{}", char::from(*byte)));
+        }
+        return;
+    }
+    let mut console = CONSOLE.lock();
+    for byte in bytes {
+        // The same rendering `PUT` performs, and deliberately not `str`
+        // conversion: this path has never promised UTF-8 and a run that
+        // refused to print because one byte was not a scalar would lose the
+        // line it exists to keep whole.
+        let _ = console.write_fmt(format_args!("{}", char::from(*byte)));
+    }
+}
+
 /// Writes formatted output to every available sink.
 ///
 /// Not intended to be called directly; use [`print!`](crate::print) and
@@ -330,6 +374,65 @@ macro_rules! println {
     ($($arg:tt)*) => {
         $crate::console::_print(::core::format_args!("{}\n", ::core::format_args!($($arg)*)))
     };
+}
+
+#[cfg(test)]
+mod put_run_tests {
+    use super::{put_run, recorded, recorded_at};
+
+    /// The console is a global and cargo runs tests in parallel, so the two
+    /// tests here take it in turns. `notify`'s tests learned this the same way.
+    static CONSOLE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Reads back everything the recorder has kept since `from`.
+    ///
+    /// `recorded()` answers `(kept, refused)` and **not** a range: reading the
+    /// second number as a position is why the first version of these tests saw
+    /// an empty console and said the run had been lost.
+    fn kept_since(from: usize) -> std::vec::Vec<u8> {
+        let (end, _) = recorded();
+        let mut out = std::vec::Vec::new();
+        let mut at = from;
+        while at < end {
+            let eight = recorded_at(at);
+            let room = (end - at).min(8);
+            out.extend_from_slice(&eight[..room]);
+            at += room;
+        }
+        out
+    }
+
+    #[test]
+    fn every_byte_of_a_run_is_put_in_order() {
+        let _alone = CONSOLE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (before, _) = recorded();
+        put_run(b"execed pid 3\n");
+        assert_eq!(
+            kept_since(before),
+            b"execed pid 3\n",
+            "a run must arrive whole and in order -- losing or reordering one byte is the \
+             defect this exists to remove"
+        );
+    }
+
+    #[test]
+    fn a_byte_that_is_not_a_scalar_is_rendered_the_way_put_renders_it() {
+        let _alone = CONSOLE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (before, _) = recorded();
+        // 0xff is not a printable scalar; `PUT` renders such a byte rather than
+        // refusing, and a run must not do something different -- a run that
+        // dropped the line because one byte was odd would lose exactly what it
+        // exists to keep.
+        put_run(&[b'a', 0xff, b'b']);
+        let kept = kept_since(before);
+        assert_eq!(kept.len(), 4, "three bytes in, and 0xff renders as two");
+        assert_eq!(kept[0], b'a');
+        assert_eq!(kept[kept.len() - 1], b'b');
+    }
 }
 
 #[cfg(test)]

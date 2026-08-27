@@ -157,6 +157,7 @@ const _: () = {
     assert!(Status::InsufficientRights as u64 == bhaskix_abi::status::INSUFFICIENT_RIGHTS);
     assert!(Status::SlotUnavailable as u64 == bhaskix_abi::status::SLOT_UNAVAILABLE);
     assert!(method::PUT == bhaskix_abi::method::PUT);
+    assert!(method::PUT_RUN == bhaskix_abi::method::PUT_RUN);
     assert!(method::TAKE == bhaskix_abi::method::TAKE);
     assert!(method::POLL == bhaskix_abi::method::POLL);
     assert!(method::RECORD_SIZE == bhaskix_abi::method::RECORD_SIZE);
@@ -320,6 +321,13 @@ pub mod method {
     ///
     /// Only on a `Console` capability. `arg0` = the character.
     pub const PUT: u64 = 39;
+    /// Put a run of bytes with the console held once — RFC 0050.
+    ///
+    /// Only on a `Console` capability, and it needs the same `WRITE` right
+    /// `PUT` does. `arg0` = the address in the caller's space, `arg1` = how
+    /// many. This is *n* `PUT`s minus the gap between them, into which a kernel
+    /// line could land and did.
+    pub const PUT_RUN: u64 = 69;
     /// Take a byte that was typed, waiting until there is one.
     ///
     /// Only on a `Console` capability. Blocks, which is why a holder that
@@ -1400,7 +1408,12 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     if kind == Some(Kind::Invoke)
         && matches!(
             frame.method,
-            method::PUT | method::TAKE | method::POLL | method::RECORD_SIZE | method::RECORD
+            method::PUT
+                | method::PUT_RUN
+                | method::TAKE
+                | method::POLL
+                | method::RECORD_SIZE
+                | method::RECORD
         )
     {
         let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Console) {
@@ -1419,7 +1432,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         // *weaker* authority than taking one: the record is what the kernel
         // said, and the Linux adapter -- the one holder given `WRITE` alone --
         // still cannot ask for it.
-        let wanted = if frame.method == method::PUT {
+        let wanted = if frame.method == method::PUT || frame.method == method::PUT_RUN {
             crate::cap::Rights::WRITE
         } else {
             crate::cap::Rights::READ
@@ -1434,10 +1447,76 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 // kernel's job is the device; deciding that an escape
                 // sequence must not reach it is policy, and policy is what
                 // was moved out.
+                //
+                // **"A character at a time is what a `Console` confers" was
+                // half right, and the other half cost an intermittent.** The
+                // *authority* is to put bytes to a console and nothing else,
+                // and that is unchanged. Saying how many at once was never part
+                // of it -- and because each `PUT` takes and releases the
+                // console lock on its own, a caller putting a line one byte at
+                // a time could have a kernel report land in the middle of it.
+                // It did. `PUT_RUN` below is the same authority with the gap
+                // removed; RFC 0050 has the specimen.
                 let character = char::from_u32(frame.arg0 as u32).unwrap_or('?');
                 crate::print!("{character}");
                 crate::service::counted(1, 0);
                 Outcome::ok(0)
+            }
+            // **A run of bytes, put with the console held once — RFC 0050.**
+            //
+            // The same authority as `PUT` and the same rendering; what it
+            // removes is the gap between one byte and the next, into which a
+            // kernel line could land and did. The bytes are read out of the
+            // *caller's* address space, which is the one thing `PUT` never did:
+            // the same page-by-page translation `copy_across` performs, with
+            // `frame_for_read`, so a lazily-mapped page is refused rather than
+            // committed by printing.
+            method::PUT_RUN => {
+                let (address, length) = (frame.arg0, frame.arg1);
+                let Ok(length) = usize::try_from(length) else {
+                    return Outcome::err(Status::WrongObject);
+                };
+                if length == 0 {
+                    return Outcome::ok(0);
+                }
+                // The kernel's bound and not the caller's: the console lock is
+                // held for the whole run, so how long that is may not be
+                // something a domain chooses. A longer line is more calls, and
+                // those calls can interleave with each other -- RFC 0050 says
+                // so rather than leaving it to be found.
+                if length > MAX_CONSOLE_RUN || address.checked_add(length as u64).is_none() {
+                    return Outcome::err(Status::WrongObject);
+                }
+                let Some(root) =
+                    crate::sched::current_domain().and_then(crate::domain::space_root_of)
+                else {
+                    return Outcome::err(Status::NoDomain);
+                };
+                let hhdm = crate::shared::hhdm();
+                let mut buffer = [0u8; MAX_CONSOLE_RUN];
+                let mut taken = 0usize;
+                while taken < length {
+                    let at = address + taken as u64;
+                    let page = at & !(bhaskix_mm::FRAME_SIZE - 1);
+                    let within = (at - page) as usize;
+                    let room = (bhaskix_mm::FRAME_SIZE as usize - within).min(length - taken);
+                    let Some(frame_pa) = crate::vm::frame_for_read(root, page) else {
+                        return Outcome::err(Status::WrongObject);
+                    };
+                    // SAFETY: a frame this space maps, reached through the
+                    // direct map, and `room` stays inside it by construction.
+                    let source = unsafe {
+                        core::slice::from_raw_parts(
+                            (hhdm + frame_pa + within as u64) as *const u8,
+                            room,
+                        )
+                    };
+                    buffer[taken..taken + room].copy_from_slice(source);
+                    taken += room;
+                }
+                crate::console::put_run(&buffer[..taken]);
+                crate::service::counted(taken as u64, 0);
+                Outcome::ok(taken as u64)
             }
             method::TAKE => {
                 // Blocks. A holder waiting here is not answering anything
@@ -3256,6 +3335,13 @@ fn copy_across(
 /// own call the machine's longest. Larger transfers are more calls, and more
 /// calls are interruptible.
 const MAX_SUPERVISED_COPY: usize = bhaskix_mm::FRAME_SIZE as usize;
+
+/// The longest run `PUT_RUN` will put under one lock — RFC 0050.
+///
+/// `bin/linuxd`'s own `WRITE_BYTES`, so a hosted `write` of a line is a single
+/// invocation. It is the kernel's number rather than the caller's because the
+/// console lock is held for the whole run.
+const MAX_CONSOLE_RUN: usize = 256;
 
 /// The most pages one `MAP_AT` will map.
 ///

@@ -314,6 +314,19 @@ pub mod method {
     ///
     /// Only on a `Console` capability. `arg0` = the character.
     pub const PUT: u64 = 39;
+    /// Put a run of bytes on the console, **without anything getting between
+    /// them** — RFC 0050.
+    ///
+    /// Only on a `Console` capability, and it needs the same `WRITE` right
+    /// `PUT` does: this is *n* `PUT`s, minus the opportunity for another CPU's
+    /// line to land in the middle of a word. `arg0` = the address of the bytes
+    /// in the **caller's** address space, `arg1` = how many. Returns how many
+    /// were put.
+    ///
+    /// It exists because a hosted program's line was arriving in halves: one
+    /// byte per invocation, and `console::_print` locks per call, so a kernel
+    /// report could and did print between `e` and `xeced pid 3`.
+    pub const PUT_RUN: u64 = 69;
     /// Take a byte that was typed, waiting until there is one.
     ///
     /// Only on a `Console` capability, and it blocks: a holder waiting here is

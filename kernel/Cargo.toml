@@ -543,7 +543,15 @@ asm_budget = 10
 # child and the marker by the parent, and reading on the marker alone read a word
 # whose writer had not run. One more window through the direct map into the same
 # frame the four beside it already read.
-unsafe_budget = 1869
+# 1875 for RFC 0050's `PUT_RUN`: the console can now put a run of bytes with the
+# lock held once, and to do it the kernel reads the run out of the *caller's*
+# address space -- the same page-by-page translation `copy_across` performs, with
+# `frame_for_read` so a lazily-mapped page is refused rather than committed by
+# printing. One window per page through the direct map. It could not be safe
+# code: the source is a physical frame reached through the direct map, which is a
+# raw pointer by construction. What it buys is a hosted program's line arriving
+# whole instead of in halves around an unrelated kernel report.
+unsafe_budget = 1875
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

@@ -1074,20 +1074,36 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
             if !copy_in(request.domain, buffer, &mut bytes[..take]) {
                 return Answer::error(-14); // EFAULT
             }
-            // A character at a time, because that is what a `Console`
-            // capability confers: the authority to put one. The cost is real
-            // and is priced by the boundary instrument like everything else
-            // here -- and it is the honest cost of a console that is a
-            // capability rather than a kernel function this program may call.
-            for byte in &bytes[..take] {
-                call(
-                    syscall::INVOKE,
-                    CONSOLE,
-                    method::PUT,
-                    [u64::from(*byte), 0, 0, 0],
-                );
+            // **One invocation, because a line has to arrive whole** --
+            // RFC 0050.
+            //
+            // This was a character at a time, and the comment here called that
+            // *"the honest cost of a console that is a capability rather than a
+            // kernel function this program may call"*. The cost was honest and
+            // the correctness was not: `console::_print` locks per call, so
+            // each `PUT` took and released the console on its own and any CPU
+            // printing in between split the line. It did. A preserved log of
+            // 2026-08-26 has a program's `execed pid 3` arriving as `e`, then a
+            // whole kernel report, then `xeced pid 3` -- which is the
+            // `exec`/pid intermittent filed on 2026-08-21, and why two rounds
+            // of hypothesis about a *failing* write found nothing. The write
+            // never failed. It arrived in two pieces.
+            //
+            // `PUT_RUN` is the same authority -- `WRITE` on a `Console`, the
+            // same right `PUT` needs -- and the same rendering, byte by byte.
+            // What it removes is the gap. It is also thirteen crossings fewer
+            // per line, which the boundary instrument will show and which is a
+            // side effect rather than the reason.
+            let put = call(
+                syscall::INVOKE,
+                CONSOLE,
+                method::PUT_RUN,
+                [bytes.as_ptr() as u64, take as u64, 0, 0],
+            );
+            if put.status != status::OK {
+                return Answer::error(-5); // EIO
             }
-            Answer::ok(take as u64)
+            Answer::ok(put.args[0])
         }
         // The thread-local base. Per *thread*, because the register holding
         // it is per *CPU*: a value written straight to the MSR is gone at the

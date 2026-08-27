@@ -1035,6 +1035,88 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-27 (the exec/pid intermittent has a specimen, and it is the console splitting a hosted program's line)
+
+**Filed 2026-08-21, seen twice, two hypotheses killed by reading, and the cause
+was in a log the whole time.** The failure is
+`FAIL the exec did not keep its pid across the domain change: kept='3 2 3',
+console says ''` — the adapter's record proves the `execve` happened and the pid
+survived, and the child's own line, `execed pid 3`, is missing.
+
+**The specimen**, from a preserved log of 2026-08-26:
+
+    e    linux exec     a Linux program execed: its own domain ended and the program it became ran in another
+    xeced pid 3
+
+The hosted program wrote `execed pid 3\n`. **The `e` landed. Then a kernel
+`println!` took the console lock and emitted an entire line. Then `xeced pid 3`
+followed.** The string never appears intact, so the gate's `grep` finds nothing
+and reports `console says ''`.
+
+**The mechanism, read rather than guessed.** `console::_print` takes
+`CONSOLE.lock()` for the whole of one `write_fmt`, so a kernel line is atomic.
+But a hosted `write` reaches the console through `bin/linuxd`, which loops
+`INVOKE`/`PUT` **one character at a time** — *"because that is what a `Console`
+capability confers: the authority to put one"* — and each `PUT` takes and
+releases that lock on its own. Thirteen bytes are thirteen separate locked
+writes, and any CPU printing in between splits the line.
+
+**Why two rounds of hypothesis found nothing.** Both were about the write
+failing: that it might be asynchronous, and that `copy_in` might read a stale
+domain after the exec. Both were killed by reading, correctly — the write is
+synchronous in both halves and `request.domain` cannot lag. **The write never
+failed. It succeeded completely and arrived in two pieces.** A third hypothesis,
+that a refused console write was silent, prompted the instrument that reads the
+adapter's fault log; that instrument is worth having and was not what this
+needed either.
+
+**It is not only a test's problem.** Any hosted program's output can be split by
+any kernel line, on any boot. A restatement of the standing user
+directive: output is supposed to be well-formatted, and a program's line
+arriving in two pieces around an unrelated kernel report is not. The test is
+merely the thing that notices.
+
+**Fixed, and the shape was the project lead's call: a bulk put.**
+[RFC 0050](rfc/0050-a-console-line-that-arrives-whole.md), drafted and built the
+same day. `PUT_RUN` puts a run of bytes with the console lock held **once**:
+`arg0` the address in the caller's space, `arg1` how many, the same
+`Rights::WRITE` that `PUT` needs and no new authority, bounded at 256 bytes —
+`bin/linuxd`'s own `WRITE_BYTES`, so a hosted `write` is one invocation.
+
+**The alternatives are recorded in the RFC rather than lost.** Packing bytes into
+the four message registers needs no access to the caller's memory at all and was
+rejected because twenty-four bytes still splits an eighty-column line — it would
+have made `execed pid 3` pass and left the defect. Line-buffering per writer
+inside the console needs no ABI change and was rejected because it puts
+buffering **policy** in the nucleus, which is what this project moved out, and
+holds a program's output until a newline nobody promised.
+
+**Two deliberate comments were amended rather than quietly rewritten.** `PUT`'s
+*"a character at a time, because that is what a `Console` capability confers"*
+was half right: the **authority** is to put bytes and nothing else, and that is
+unchanged; saying how many at once was never part of it. And `bin/linuxd`'s
+*"the honest cost of a console that is a capability rather than a kernel function
+this program may call"* — the cost was honest and the correctness was not.
+
+**Proven at the byte level, not at the gate.** `console::put_run` has two host
+tests and **both mutations were watched red** — dropping a byte and reversing
+the order. The tests were wrong first and the record says so: `recorded()`
+answers `(kept, refused)` and not a range, so reading the second number as a
+position made an empty console look like a lost run. What is **not** proven by a
+gate is that nothing can interleave: the existing `execed pid 3`, `through a
+pipe` and `copied!` gates require a hosted line to arrive intact and so are this
+test in weak form — they fail only when a split happens to land, which is what
+made this a five-day intermittent. Provoking one deliberately needs a hosted
+program writing a long line while another CPU prints, and that is a self-test of
+its own.
+
+**And a claim in the RFC was corrected before it shipped.** Its performance
+section said the boundary instrument would show the crossings drop. It will not:
+that line counts *foreign syscall* crossings, and `service::counted` accumulates
+**bytes**, not invocations. Nothing in the tree counts console invocations, so
+the saving is asserted from the code and not measured — which is a side effect
+anyway. The reason is that the line arrives whole.
+
 ### 2026-08-27 (the clone rendezvous is no longer a race, because the kernel now decides when the child may run)
 
 **The failure it removes.** `linux clone` reported *"three attempts and the
