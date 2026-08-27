@@ -1005,15 +1005,18 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // from a source file in this tree. BusyBox is somebody else's binary,
     // unmodified: what it asks for is not a thing anybody here chose, and the
     // numbers it is refused are the L1 work queue.
-    // **`busybox=sh` runs it interactively and gives its domain the keyboard**
-    // — RFC 0053's lane. Off by default and it has to be: an interactive shell
-    // blocks reading, so every ordinary boot would stop here waiting for a key
-    // nobody is going to press. The lane that sets it is the one that types.
-    let busybox_shell = handoff
-        .cmdline
-        .split_ascii_whitespace()
-        .any(|word| word == "busybox=sh");
-    BUSYBOX_INTERACTIVE.store(busybox_shell, core::sync::atomic::Ordering::Release);
+    // **This pass is never the interactive one**, and that is a boot-order fact
+    // rather than a preference: the console's serial line is not claimed until
+    // bring-up is nearly over, so *here* there is no input path at all — no
+    // interrupt, no port to drain, nothing a `read` could ever return. An
+    // interactive BusyBox started at this point waits for a key that cannot
+    // arrive.
+    //
+    // `busybox=sh` therefore arms [`BUSYBOX_INTERACTIVE`] much later, just
+    // before the machine's own shell, and runs the corpus a second time. This
+    // was found by measurement: the first version armed it here, the typing
+    // lane failed exactly as it had before, and the boot report's own ordering
+    // said why — `linux domain` at report line 161 and the serial claim at 181.
     if !corpus_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -1292,6 +1295,42 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         && !iommu_memory_self_test(found, handoff, handoff.hhdm_base.as_u64())
     {
         println!("\x1b[91m    iommu memory   FAILED\x1b[0m");
+    }
+
+    // **The interactive BusyBox, for the lane that types** — RFC 0053's gate.
+    //
+    // Here and not with the corpus above, because here the console can be read:
+    // the line is claimed, its notification exists, and the adapter has been
+    // handed the capability to park a hosted reader on it. The domain gets the
+    // keyboard, `sh` runs until somebody types `exit`, and the grant goes back
+    // with the domain — after which the machine starts its own shell, which is
+    // the lane's last assertion and the one that says the keyboard was
+    // *borrowed*.
+    //
+    // Off unless asked, and it has to be: an interactive shell blocks reading,
+    // so every ordinary boot would stop here waiting for a key nobody is going
+    // to press.
+    if input_ready
+        && handoff
+            .cmdline
+            .split_ascii_whitespace()
+            .any(|word| word == "busybox=sh")
+    {
+        BUSYBOX_INTERACTIVE.store(true, core::sync::atomic::Ordering::Release);
+        if !corpus_self_test(
+            handoff.hhdm_base.as_u64(),
+            bhaskix_arch::percpu::online_count(),
+            true,
+        ) {
+            println!("\x1b[91m    busybox        FAILED\x1b[0m");
+        }
+        BUSYBOX_INTERACTIVE.store(false, core::sync::atomic::Ordering::Release);
+        // **Printed here and not with the other personality counters**, which
+        // run before the console's line is even claimed and so could only ever
+        // report zero for this. A refused park loses a wake and answers
+        // `EAGAIN` for a reason that is not the caller's -- at a shell that is
+        // a line abandoned mid-word, which looks like a lost byte and is not.
+        park_refusals_report();
     }
 
     // Which shell the machine boots to. The user-mode one by default, because
@@ -3885,6 +3924,20 @@ fn personality_boundary_report() {
              named, and none in the nucleus"
         );
     }
+    // **And every park that did not happen** — RFC 0054. A refused park loses a
+    // wake and answers `EAGAIN` for a reason that is not the caller's, which at
+    // a shell is a byte missing from a typed line. That is indistinguishable
+    // from a driver bug until something counts it, so this counts it.
+    let ungranted = syscall::PARK_UNGRANTED.load(core::sync::atomic::Ordering::Relaxed);
+    let unnamed = syscall::PARK_UNNAMED.load(core::sync::atomic::Ordering::Relaxed);
+    let refused = syscall::PARK_REFUSED.load(core::sync::atomic::Ordering::Relaxed);
+    if ungranted + unnamed + refused > 0 {
+        println!(
+            "\x1b[93m    linux park     {} parks refused: {ungranted} for a domain with no \
+             grant, {unnamed} naming an empty slot, {refused} by the notification itself\x1b[0m",
+            ungranted + unnamed + refused
+        );
+    }
     // **What each hosted program was told its pid is** — RFC 0033 step 4, and
     // the claim is one a coincidence cannot satisfy: two programs that ran in
     // *the same domain slot* were given **different** pids. Under the scheme
@@ -3947,6 +4000,92 @@ fn personality_boundary_report() {
 /// the ones this personality could not answer named. Whether the program
 /// reaches `main` is the headline; what it asked for on the way is the work
 /// queue.
+/// Hands the adapter slot 24: the console's own notification — RFC 0054 step 3.
+///
+/// # Why this is a function of its own, called late
+///
+/// The adapter is started before the Linux self-tests, because they are its
+/// first callers, and the console's serial line is claimed near the end of
+/// bring-up. So there is no notification to name when its other slots are
+/// filled, and a grant attempted there silently installs nothing: the park
+/// falls through to `EAGAIN` and a hosted shell exits on an empty console. That
+/// is not hypothetical — it is what the first version of this did, and the
+/// typing lane failed identically to before with nothing in the report to say
+/// why.
+///
+/// # What is conferred, and what is not
+///
+/// **`READ`, where the futex pool is `WRITE`.** There the adapter wakes
+/// sleepers and must never become one; here it parks hosted threads on a
+/// notification the *hardware* signals, and `WRITE` would let it invent a
+/// keystroke — waking a reader that finds nothing and parks again. Waiting is
+/// the whole authority: taking the byte is still `POLL_INPUT` on the domain,
+/// which the nucleus refuses without the input grant, and `syscall::may_park_on`
+/// refuses the park itself on the same terms.
+///
+/// # Errors
+///
+/// A string naming what would not be built. Survivable: without it a hosted
+/// `read` answers `EAGAIN` exactly as it did before RFC 0054.
+///
+/// Returns the slot it went in, so the boot report can name it.
+/// What the reply that *parks* refused, and why — RFC 0054.
+fn park_refusals_report() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let ungranted = syscall::PARK_UNGRANTED.load(Relaxed);
+    let unnamed = syscall::PARK_UNNAMED.load(Relaxed);
+    let refused = syscall::PARK_REFUSED.load(Relaxed);
+    let parked = syscall::BLOCKED.load(Relaxed);
+    if ungranted + unnamed + refused == 0 {
+        println!("    input park     {parked} parked on the console, none refused");
+        return;
+    }
+    println!(
+        "\x1b[93m    input park     {parked} parked, {} refused: {ungranted} for a domain with \
+         no grant, {unnamed} naming an empty slot, {refused} by the notification itself -- a \
+         refusal loses a wake and answers EAGAIN\x1b[0m",
+        ungranted + unnamed + refused
+    );
+}
+
+fn grant_console_wake() -> Result<usize, &'static str> {
+    /// The slot it goes in, and the assertion that nothing else may have it.
+    ///
+    /// **A comment would not have caught the bug this replaces.** The slot was
+    /// 22, chosen by reading the fixed grants `start_linux_domain` makes and
+    /// stopping there — which missed the root directory, granted from a
+    /// different place entirely. It overwrote it, and a hosted `open` answered
+    /// `-ENOENT` for a directory that no longer existed. The full suite found
+    /// it; nothing else would have.
+    const CONSOLE_WAKE_SLOT: usize = 24;
+    const _: () = assert!(
+        CONSOLE_WAKE_SLOT < syscall::ADAPTER_SLOT_FLOOR,
+        "the console wake must sit below the floor hosted-domain handles are \
+         allocated from, or the allocator will hand this slot out"
+    );
+
+    let adapter = syscall::ADAPTER_DOMAIN.load(core::sync::atomic::Ordering::Acquire);
+    if adapter == u32::MAX {
+        // No adapter on this boot. Nothing to grant to, and not a failure.
+        return Ok(CONSOLE_WAKE_SLOT);
+    }
+    let Some(console_input) = input::notification() else {
+        return Err("the console has no notification to name");
+    };
+    let named = crate::notify::name(console_input)
+        .ok()
+        .and_then(|root| cap::with_arena(|arena| arena.derive(root, cap::Rights::READ, 1).ok()))
+        .ok_or("the console's notification would not be named")?;
+    let realm = domain::DomainId::from_u32(adapter);
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(CONSOLE_WAKE_SLOT, named).is_ok()
+    }) != Some(true)
+    {
+        return Err("it would not install in the adapter's slot 24");
+    }
+    Ok(CONSOLE_WAKE_SLOT)
+}
+
 fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
     // Which program the loader thread should open. Set before the spawn and
     // read once at the top of it; the two corpus runs are sequential.
@@ -10909,6 +11048,11 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     if domain::with(realm, |owner| owner.cspace.install_at(20, control).is_ok()) != Some(true) {
         return Err("the adapter's DomainControl would not install");
     }
+
+    // **Slot 22 is granted later**, by `grant_console_wake`, and not here: the
+    // console's notification does not exist yet. This program is started before
+    // the Linux self-tests, and the serial line is claimed near the end of
+    // bring-up.
 
     let options = sched::SpawnOptions::new()
         .pinned()
@@ -19039,6 +19183,21 @@ fn console_input(handoff: &Handoff) -> bool {
             return false;
         }
     };
+
+    // The line exists now, so the adapter can be given the means to *wait* on
+    // it -- RFC 0054 step 3, and it could not have been given it any earlier.
+    // **Said out loud either way.** A grant that silently did not happen is
+    // indistinguishable from a hosted program that cannot read its input --
+    // which is exactly the boot this line was added after: the slot collided
+    // with the root directory, the install failed, and the only symptom was a
+    // shell that exited without reading.
+    match grant_console_wake() {
+        Ok(slot) => println!(
+            "    console wake   the adapter holds it at slot {slot}, read-only: it may park a \
+             hosted reader on the console and cannot signal it"
+        ),
+        Err(reason) => println!("\x1b[91m    console wake   FAILED: {reason}\x1b[0m"),
+    }
 
     // Read the entry back. A write to a memory-mapped register that is never
     // read is a write that may have gone into a cache line, into the wrong

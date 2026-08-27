@@ -94,6 +94,14 @@ const CONSOLE: u64 = 3;
 /// them — where a notification shared by every sleeper on one word could only
 /// wake all or none.
 const WAKE_SLOT: u64 = 4;
+/// The console's own notification, for a hosted `read` that must wait.
+///
+/// Granted at boot beside the futex pool and **`READ` where those are `WRITE`**
+/// — RFC 0054. This program may park a hosted thread on it and may not signal
+/// it, which is the difference between waiting for a keystroke and inventing
+/// one. Taking the byte is still `POLL_INPUT` on the domain, which the nucleus
+/// refuses without the input grant.
+const INPUT_WAKE: u64 = 24;
 const WAKES: usize = 16;
 
 /// One hosted thread asleep in a futex: whose memory, which word, and which
@@ -761,10 +769,10 @@ fn answer_brk(request: &PersonalityCall) -> Answer {
 /// refused with `EIO` rather than told the console is empty: a program told
 /// "nothing yet" asks again for ever, and a shell would spin on a keyboard it
 /// is never going to be allowed to read.
-fn read_console(request: &PersonalityCall) -> Answer {
+fn read_console(request: &PersonalityCall) -> (u64, Answer) {
     let (buffer, count) = (request.second(), request.third());
     if count == 0 {
-        return Answer::ok(0);
+        return (REPLY_VALUE, Answer::ok(0));
     }
     // **`POLL_INPUT` and not `TAKE_INPUT`, and the reason is this program's
     // shape.** `TAKE_INPUT` blocks in the nucleus until somebody types — on the
@@ -775,12 +783,14 @@ fn read_console(request: &PersonalityCall) -> Answer {
     // sat in BusyBox, and the boot only moved on when the corpus timed out and
     // killed the domain.
     //
-    // So this asks whether a byte is *already* waiting and answers `EAGAIN`
-    // when none is. That is honest and it is not enough: a shell wants to
-    // **wait**, and waiting properly means parking the caller and waking it
-    // when input arrives — a `BLOCK_ON` reply against a notification the
-    // console signals, which is RFC 0053's remaining work rather than
-    // something to fake here.
+    // So this asks whether a byte is *already* waiting, and when none is it
+    // parks **the caller** — RFC 0054. `BLOCK_ON_RETRY` naming
+    // [`INPUT_WAKE`]: the nucleus blocks the hosted thread on the console's own
+    // notification, this program returns to its receive loop and keeps serving
+    // every other domain, and when a key arrives the same `read` is asked
+    // again. The retry shape and not `BLOCK_ON`, for the reason written at its
+    // declaration: a woken read must come back with *bytes*, and the zero a
+    // woken futex is answered with would be end of file.
     //
     // `call` rather than `invoke`, because the byte is the *value* and `invoke`
     // keeps only whether the call worked.
@@ -791,16 +801,19 @@ fn read_console(request: &PersonalityCall) -> Answer {
         [0, 0, 0, 0],
     );
     if taken.status != status::OK {
-        return Answer::error(-5); // EIO
+        return (REPLY_VALUE, Answer::error(-5)); // EIO
     }
     if taken.args[0] == NOTHING {
-        return Answer::error(-11); // EAGAIN: nothing typed yet
+        // **Park, do not spin.** An ungranted domain never reaches here — its
+        // `POLL_INPUT` is refused above with `EIO` — so this is a granted
+        // reader with an empty console, which is what waiting is for.
+        return (REPLY_BLOCK_ON_RETRY, Answer::ok(INPUT_WAKE));
     }
     let byte = [taken.args[0] as u8];
     if !copy_out(request.domain, buffer, &byte) {
-        return Answer::error(-14); // EFAULT
+        return (REPLY_VALUE, Answer::error(-14)); // EFAULT
     }
-    Answer::ok(1)
+    (REPLY_VALUE, Answer::ok(1))
 }
 
 /// `getcwd(buffer, size)` — where relative paths resolve from.
@@ -1059,7 +1072,7 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
             // somebody decided it should, and a compromise of this program does
             // not change that.
             if request.first() == 0 {
-                return (REPLY_VALUE, read_console(request));
+                return read_console(request);
             }
             // **Routed by what the descriptor *is*.** A pipe may have to park
             // the caller, which is a reply shape rather than a value, so the
@@ -1917,7 +1930,7 @@ const LENT_AT: u64 = 0x0000_0000_1C00_0000;
 
 /// The slots open files are held in, allocated **downward** from the top.
 ///
-/// The kernel allocates hosted-domain handles *upward* from slot 24, and this
+/// The kernel allocates hosted-domain handles *upward* from slot 25, and this
 /// allocates from 127 down, so the two cannot meet: sixty-four domains and
 /// thirty-two open files is ninety-six of a hundred and twenty-eight. Written
 /// as a pair of directions rather than as two ranges, because a range is a

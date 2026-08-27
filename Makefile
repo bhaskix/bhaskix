@@ -548,7 +548,7 @@ run-uefi: $(ISO)
 # seconds rather than after a QEMU boot.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-native test-boot-native-full test-placements test-shell \
-      test-keyboard test-usb-keyboard test-faults
+      test-keyboard test-usb-keyboard test-busybox test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -601,6 +601,15 @@ test-placements:
 # input could be UART-only for so long without a single test noticing.
 test-keyboard: $(ISO)
 	tests/qemu/keyboard-test.sh
+
+# Types at a *hosted* shell -- RFC 0053's gate, made passable by RFC 0054.
+#
+# Its own harness and not a case in `test-shell`, because the two cannot share
+# a boot: a console has one keyboard, and the input grant gives it to one
+# domain at a time precisely so that "who is being typed at" has a single
+# answer. This one boots with `busybox=sh`, and puts the image back afterwards.
+test-busybox: $(ISO)
+	tests/qemu/busybox-test.sh
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios

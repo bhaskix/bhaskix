@@ -140,6 +140,15 @@ static KEYBOARD: Ring = Ring::new();
 /// Times the handler ran.
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 
+/// Set while the UART is being emptied — see [`service`].
+///
+/// **A flag and not a `SpinLock`, deliberately.** A rank is a claim about lock
+/// *ordering*, and this has no order to declare: nothing is acquired while it
+/// is set, and nobody ever waits for it — a CPU that finds it set returns.
+/// Giving it a rank would put a lie in `sync::Rank`, whose innermost entry says
+/// the console is innermost and means it.
+static DRAINING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// I/O port of the UART the handler drains, or zero if there is none.
 ///
 /// A port number rather than a `SerialPort`, so the handler can read it with
@@ -266,7 +275,34 @@ fn drain() -> usize {
 /// a console that stops responding under fast typing and nothing at all in
 /// testing.
 pub fn service() -> usize {
-    let taken = drain();
+    // **A try-lock, and a second CPU that finds it held does nothing.**
+    //
+    // Until RFC 0054 every caller of this was in the kernel and there was one
+    // of them. A hosted thread parked on the console notification is woken by
+    // the same interrupt and drains through `take_or_service`, so two CPUs can
+    // now arrive here at once. The UART pops each byte exactly once, so nothing
+    // is duplicated -- what two drains would lose is the *order* they reach the
+    // ring in, which is a line typed at a shell coming out shuffled.
+    //
+    // Doing nothing is right rather than merely cheap: the CPU that holds the
+    // lock is collecting those bytes, and the one that waited would find them
+    // already pushed.
+    // **Only the UART drain is guarded**, and the early version of this
+    // returned from the whole function instead. That would have skipped the
+    // acknowledge -- leaving the line masked when the *other* CPU had already
+    // acknowledged for a drain that did not include this wake -- and skipped
+    // the keyboard and xHCI below, which are different sources and have their
+    // own bytes waiting.
+    let taken = if DRAINING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let took = drain();
+        DRAINING.store(false, Ordering::Release);
+        took
+    } else {
+        0
+    };
     let raw = HANDLER.load(Ordering::Acquire);
     if raw != u64::MAX {
         let _ = crate::irq::acknowledge(crate::irq::handler_from_raw(raw));
@@ -304,6 +340,44 @@ pub fn keyboard_produced(bytes: &[u8]) {
 #[must_use]
 pub fn try_read() -> Option<u8> {
     SERIAL.take().or_else(|| KEYBOARD.take())
+}
+
+/// Services the sources, **then** takes a byte if there is one.
+///
+/// # Why this exists beside `try_read`
+///
+/// The interrupt handler signals the notification and does not read the UART:
+/// draining is the waker's job. Every waker used to be in the kernel, so
+/// `try_read` could assume somebody else had already moved the bytes.
+///
+/// A hosted thread parked on the console notification (RFC 0054) is not in the
+/// kernel. Without a service here the wake is a deadlock in two moves — the
+/// byte sits in the UART, the ring stays empty, and the thread woken to collect
+/// it parks again for a byte that has already arrived.
+///
+/// # Why unconditionally, and not only when the rings are empty
+///
+/// **`service` is also what unmasks the line.** The handler masks its source
+/// and [`crate::irq::acknowledge`] unmasks it, so the rule the whole path rests
+/// on is *every wake is followed by a service* — which [`read`] keeps by
+/// servicing after each wait, and skips on a ring hit only because a wake
+/// already serviced.
+///
+/// A hosted reader wakes in the nucleus instead, and its retry can hit the ring
+/// directly. The first version of this serviced only on a miss, and so a drain
+/// that pulled two bytes at once left the second one to be taken with no
+/// service and no unmask: the line stayed masked, no further interrupt ever
+/// arrived, and the next park slept for a keystroke that could not wake it. It
+/// presented as a shell that echoed six characters of a typed line and stopped
+/// — which looks like a lost byte and is a masked interrupt.
+///
+/// Servicing first costs one drain and one unmask per hosted read. That is a
+/// path only a granted domain reaches, one byte at a time, across a full
+/// round trip through ring 3.
+#[must_use]
+pub fn take_or_service() -> Option<u8> {
+    service();
+    try_read()
 }
 
 /// Whether anything is waiting to be read.

@@ -167,10 +167,23 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > is still true; what changed is that a *domain* can be granted input, and the adapter holds a
 > handle to each domain it hosts. So a compromised adapter can take keystrokes **while a granted
 > domain is running, and for no other domain** — the check is in the nucleus and it cannot lift it,
-> the grant is one domain at a time, and it is released when that domain ends. On a boot where
-> nothing is granted, which is every boot today, it reaches no keystroke at all. That bound is why
+> the grant is one domain at a time, and it is released when that domain ends. That bound is why
 > this shape was chosen over giving the adapter console `READ`, which would have reached every
-> keystroke for ever. It is not
+> keystroke for ever.
+>
+> **[RFC 0054](rfc/0054-a-hosted-read-that-waits.md) added waiting, on 2026-08-28, and one
+> capability with it**: `READ` on the console's own notification, so the adapter can park a hosted
+> thread until a key arrives. It confers waiting and **not reading** — `READ` where the futex pool
+> is `WRITE`, so the adapter cannot signal it and cannot invent a keystroke, and taking the byte is
+> still the grant-checked call above. It also *closes* a denial of service rather than opening one:
+> that notification takes one waiter, so an adapter free to park anything on it could hold the
+> console's only waiter slot and the Bhaskix shell would never wake for a keypress. The nucleus
+> refuses the park unless the calling domain holds the input grant, on the same terms as the read,
+> and counts every refusal in the boot report.
+>
+> "Every boot today" stopped being true on 2026-08-28: a boot with `busybox=sh` grants the console
+> to the BusyBox domain, and it is the only one. Every other boot grants nothing and reaches no
+> keystroke at all. It is not
 > nothing — an adapter compromise is a compromise of every hosted process — and this note says so
 > rather than rounding it to "contained".
 >

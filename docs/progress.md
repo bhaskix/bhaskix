@@ -11,11 +11,11 @@
 | | |
 |---|---|
 | RFCs accepted | **37** |
-| RFCs open | 15 |
+| RFCs open | 16 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
-| Newest dated entry | 2026-08-27 |
+| Newest dated entry | 2026-08-28 |
 
 ## Timeline
 
@@ -31,8 +31,8 @@ gantt
     RFC 0025 Four-level paging on purpose :done, r0025, 2026-08-15, 2026-08-16
     RFC 0028 bhaskixboot.efi — the machine enters through our... :done, r0028, 2026-08-17, 2026-08-18
     section Filesystem & storage
-    RFC 0003 Storage architecture :active, r0003, 2026-08-03, 2026-08-27
-    RFC 0006 Kosh — unified storage from one node to many :active, r0006, 2026-08-03, 2026-08-27
+    RFC 0003 Storage architecture :active, r0003, 2026-08-03, 2026-08-28
+    RFC 0006 Kosh — unified storage from one node to many :active, r0006, 2026-08-03, 2026-08-28
     RFC 0015 A filesystem that can be written to and a... :done, r0015, 2026-08-06, 1d
     RFC 0046 A driver for hardware that exists — AHCI :done, r0046, 2026-08-24, 1d
     section Capabilities & IPC
@@ -45,8 +45,8 @@ gantt
     RFC 0019 Time and a deadline a program can be woken by :done, r0019, 2026-08-13, 2026-08-14
     RFC 0032 A supervisor interface — the authority to hold a... :done, r0032, 2026-08-19, 2026-08-20
     RFC 0033 What a hosted process is — identity in ring 3... :done, r0033, 2026-08-20, 1d
-    RFC 0044 Revocation that reaches the mapping :active, r0044, 2026-08-23, 2026-08-27
-    RFC 0045 One adapter per workload and the three failures... :active, r0045, 2026-08-23, 2026-08-27
+    RFC 0044 Revocation that reaches the mapping :active, r0044, 2026-08-23, 2026-08-28
+    RFC 0045 One adapter per workload and the three failures... :active, r0045, 2026-08-23, 2026-08-28
     RFC 0053 input a domain was given :done, r0053, 2026-08-27, 1d
     section Networking
     RFC 0018 A network stack outside the kernel and a socket... :done, r0018, 2026-08-12, 2026-08-13
@@ -58,37 +58,38 @@ gantt
     RFC 0011 IrqHandler — who may receive an interrupt :done, r0011, 2026-08-04, 1d
     RFC 0012 The IOMMU and what a device is allowed to reach :done, r0012, 2026-08-04, 1d
     RFC 0014 The driver framework and what the second driver... :done, r0014, 2026-08-06, 1d
-    RFC 0037 A keyboard on real hardware :active, r0037, 2026-08-22, 2026-08-27
-    RFC 0038 Vendoring the xHCI definitions :active, r0038, 2026-08-22, 2026-08-27
+    RFC 0037 A keyboard on real hardware :active, r0037, 2026-08-22, 2026-08-28
+    RFC 0038 Vendoring the xHCI definitions :active, r0038, 2026-08-22, 2026-08-28
     RFC 0041 A USB keyboard :done, r0041, 2026-08-22, 2026-08-23
     RFC 0043 An IOMMU on a machine with no virtio :done, r0043, 2026-08-23, 2026-08-25
     RFC 0050 a console line that arrives whole :done, r0050, 2026-08-27, 1d
     section Memory & scheduling
     RFC 0024 Preemption on wake :crit, r0024, 2026-08-15, 1d
     section Userspace & personality
-    RFC 0005 Linux ABI compatibility as a domain personality :active, r0005, 2026-08-03, 2026-08-27
+    RFC 0005 Linux ABI compatibility as a domain personality :active, r0005, 2026-08-03, 2026-08-28
     RFC 0027 A sockets API worth the name :done, r0027, 2026-08-17, 1d
     RFC 0030 Packages — authority made reviewable :done, r0030, 2026-08-18, 2026-08-19
-    RFC 0031 Linux compatibility as an adapter and the... :active, r0031, 2026-08-19, 2026-08-27
-    RFC 0035 A system that repairs itself — supervision... :active, r0035, 2026-08-20, 2026-08-27
-    RFC 0036 A relocatable program in ring 3 — the other half... :active, r0036, 2026-08-21, 2026-08-27
-    RFC 0039 Pingala — a native web server and what "secure... :active, r0039, 2026-08-22, 2026-08-27
+    RFC 0031 Linux compatibility as an adapter and the... :active, r0031, 2026-08-19, 2026-08-28
+    RFC 0035 A system that repairs itself — supervision... :active, r0035, 2026-08-20, 2026-08-28
+    RFC 0036 A relocatable program in ring 3 — the other half... :active, r0036, 2026-08-21, 2026-08-28
+    RFC 0039 Pingala — a native web server and what "secure... :active, r0039, 2026-08-22, 2026-08-28
     RFC 0042 Reading the boot report back :done, r0042, 2026-08-23, 1d
     RFC 0051 a shell that can ask what arrived :done, r0051, 2026-08-27, 1d
     RFC 0052 a line that waits for its newline :done, r0052, 2026-08-27, 1d
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
-    RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-08-27
+    RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-08-28
     RFC 0026 The telemetry plane :done, r0026, 2026-08-17, 1d
-    RFC 0034 The adoption case and the claims it would commit... :active, r0034, 2026-08-23, 2026-08-27
-    RFC 0040 Where cryptography comes from :active, r0040, 2026-08-22, 2026-08-27
+    RFC 0034 The adoption case and the claims it would commit... :active, r0034, 2026-08-23, 2026-08-28
+    RFC 0040 Where cryptography comes from :active, r0040, 2026-08-22, 2026-08-28
     section Kernel
     RFC 0002 Project name — Bhaskix :done, r0002, 2026-08-03, 1d
-    RFC 0004 Operational technology as the first target... :active, r0004, 2026-08-03, 2026-08-27
+    RFC 0004 Operational technology as the first target... :active, r0004, 2026-08-03, 2026-08-28
     RFC 0021 A source of unpredictability and the discovery... :done, r0021, 2026-08-14, 1d
     RFC 0022 A capability in a call :done, r0022, 2026-08-15, 2026-08-16
     RFC 0023 A wake for a connection :done, r0023, 2026-08-15, 2026-08-16
     RFC 0049 every unit the firmware named :done, r0049, 2026-08-25, 1d
+    RFC 0054 a hosted read that waits :active, r0054, 2026-08-28, 2026-08-28
 ```
 
 `done` is accepted, `active` is open, `crit` is closed without shipping.
@@ -146,6 +147,7 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
+| 0054 | a hosted read that waits | 2026-08-28 |
 
 ## Annexes
 

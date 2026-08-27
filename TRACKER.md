@@ -1123,6 +1123,89 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-28 (BusyBox read a line somebody typed, and two faults were found on the way)
+
+**RFC 0054 (draft): a hosted `read` that waits.** `tests/qemu/busybox-test.sh`
+**passes** and is in `make test`. BusyBox's `sh` reaches `/ #`, reads a line
+typed at the machine, runs it, and the machine reaches its own shell afterwards
+— which is what says the keyboard was borrowed rather than taken.
+
+**How it waits.** The adapter answers `BLOCK_ON_RETRY` naming the console's own
+notification, which it holds in slot 22 with **`READ`** — the futex pool's
+mirror image, `WRITE` there because the adapter wakes sleepers and must never
+become one, `READ` here because it parks hosted threads on a notification the
+hardware signals and must not be able to invent a keystroke. The nucleus parks
+the caller and re-asks the same question when a key arrives; **the adapter does
+not block**, which is the whole point — it is single-threaded and serves every
+hosted domain from one loop.
+
+**Refused unless the domain holds the input grant**, in the nucleus, for both
+reply shapes. Not about the hosted program, which cannot name a capability: an
+adapter free to park anything on that notification could hold the console's only
+waiter slot and the Bhaskix shell would never wake for a keypress. Every refusal
+is counted and printed.
+
+**Watched red twice, each at its own assertion.** Removing the service from the
+poll path: *"BusyBox never saw what was typed at it"*. Answering `EAGAIN`
+instead of parking: *"the Bhaskix shell had already prompted"*.
+
+**A masked interrupt that presented as a lost byte.** The poll path serviced the
+sources only when the rings were empty — a ring with bytes in it needs no drain.
+But `service` is also what **unmasks the line**: the handler masks its source and
+`irq::acknowledge` unmasks it. So a drain that pulled two bytes at once left the
+second to be taken with no service and no unmask; the line stayed masked, no
+further interrupt arrived, and the next park slept for a keystroke that could not
+wake it. It looked exactly like a dropped byte. The rule it broke — *every wake
+is followed by a service* — is now written where the function is.
+
+**A slot collision that answered `-ENOENT`.** The notification went into slot
+22, chosen by reading the fixed grants `start_linux_domain` makes and stopping
+there — which missed the **root directory**, granted from somewhere else. Whichever
+ran second lost the slot, and a hosted `open` answered `-ENOENT` for a directory
+that was no longer there. The lane could not have found it; it does not open
+files. `make test` did. The handle floor moved 24 → 25, the notification took 24,
+and a **compile-time assertion** now ties them together — the thing that failed
+here was a comment.
+
+**Two lessons about reverting a mutation, both mine.** Restoring mutation B by
+replacing the string `Answer::error(-11)` hit the **first** occurrence in the
+file, which was in `clone`'s failed-`SPAWN_THREAD` path, and left `read_console`
+answering `EAGAIN`. So `clone` was made to park and the read was made not to —
+two bugs from one careless revert, and half an hour spent proving the adapter was
+"stale" when it was exactly as I had written it. Revert from git, or match on
+unique context.
+
+**One run in eight abandoned the typed line mid-word** (`^C`, which BusyBox
+prints when a read comes back wrong) and has not recurred in the seven since. It
+is recorded rather than explained: **the instrument that would have diagnosed it
+did not exist on that run.** Every refused park is counted, and a refusal answers
+`EAGAIN`, which is exactly what would produce it — but the counters were printed
+with the personality figures, which run before the console line is claimed and
+could only read zero. They print at the end of the interactive corpus now, and
+every run since reports parks and no refusals.
+
+**And a byte this BusyBox discards, which is not ours.** `0x70`, lowercase `p`,
+alone of every byte in `a-z`, `A-Z` and `0-9`, is read from standard input and
+never reaches the line BusyBox builds. Chased to the end before it was
+attributed: the nucleus was instrumented to log every byte `POLL_INPUT` hands
+out and logged all five `p`s of `echo ppqpprp busybox`; no park and no refused
+copy happened for any of them; and substituting `0x71` for `0x70` in the adapter
+made every one land, echo and print (`qqqqqrq busybox`). The delivery path is
+proved correct and the discard is in the program. The lane types a phrase with no
+`p` and says why, in the file, so nobody later "fixes" it back.
+
+**Two assertions of my own were wrong before this one was right.** The first
+compared the reply against the corpus summary — but the check runs while BusyBox
+is still alive, so the only summary in the log is the *earlier* non-interactive
+pass, and it failed a passing machine. The assertion is now that no `bhaskix`
+prompt precedes the reply: a prompt that has not happened cannot be raced.
+
+**Boot order was the third fault and the first one found.** The interactive
+corpus ran with the other self-tests, where the serial line is not claimed yet —
+no interrupt, no port to drain, nothing a read could return. It now runs late,
+just before the machine's own shell. The boot report's own ordering is what said
+so: `linux domain` at report line 161, the serial claim at 181.
+
 ### 2026-08-27 (the typing lane, which fails on purpose and has already earned its place twice)
 
 **`tests/qemu/busybox-test.sh` boots with `busybox=sh`, grants the corpus domain

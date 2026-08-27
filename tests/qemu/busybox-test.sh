@@ -23,6 +23,22 @@
 # twice: it found the blocking stall, and it caught its own first assertion
 # passing while the wrong shell answered.
 #
+# # One unexplained run, recorded rather than forgotten
+#
+# On 2026-08-28 one run in eight abandoned the typed line mid-word: BusyBox
+# echoed `echo` and then `^C`, which is what its line editor prints when a read
+# comes back wrong, and read the rest as a fresh command. It has not recurred in
+# the seven runs since.
+#
+# **The instrument that would have diagnosed it did not exist on that run.**
+# Every way a park can be refused is counted in the nucleus, and a refusal
+# answers `EAGAIN` -- which is exactly what would produce this. Those counters
+# were printed with the other personality figures, which run before the console
+# line is even claimed, so they could only ever have read zero. They are printed
+# at the end of the interactive corpus now (`input park`), and every run since
+# reports parks and **no** refusals. If this returns, that line is where to look
+# first.
+#
 # # Why this is its own harness
 #
 # Every other lane types at the *Bhaskix* shell. This one types at a **hosted
@@ -124,14 +140,43 @@ fi
 # So the reply must arrive **while BusyBox still holds the console**, which is
 # before the corpus prints its summary and long before the Bhaskix shell greets
 # anybody. Position is what tells the two apart, and nothing else here can.
-printf 'echo typed at busybox\r' >&3
-if await "typed at busybox"; then
-    replied=$(grep -an 'typed at busybox' "$LOG" | head -1 | cut -d: -f1)
-    corpus=$(grep -an 'busybox      ' "$LOG" | head -1 | cut -d: -f1)
-    if [[ -n "$replied" && -n "$corpus" && "$replied" -lt "$corpus" ]]; then
+# **No `p` in this line, and that is a measured working-around of the program
+# rather than a stylistic choice.** This BusyBox binary does not put byte 0x70
+# from its standard input into the line it is building: `p` alone, of every
+# byte in a-z, A-Z and 0-9, is read and discarded. The delivery path was proved
+# correct before the phrase was changed -- the nucleus was instrumented to log
+# every byte `POLL_INPUT` hands out (all five `p`s of `echo ppqpprp busybox`
+# appeared), no park and no refused copy occurred, and substituting 0x71 for
+# 0x70 in the adapter made every one of them land and print. See TRACKER's
+# entry for 2026-08-28. Typing a `p` here would fail this lane for a fault
+# that is not the machine's.
+printf 'echo keyed at busybox\r' >&3
+if await "keyed at busybox"; then
+    replied=$(grep -an 'keyed at busybox' "$LOG" | head -1 | cut -d: -f1)
+    # **Nothing had prompted `bhaskix` yet**, which is what says BusyBox
+    # answered and not the shell that starts after it.
+    #
+    # `echo` is a command *both* shells understand, so the reply alone proves
+    # nothing: the first version of this assertion passed on a run where
+    # BusyBox never read a byte, exited, and the Bhaskix shell ran the line --
+    # the log said `bhaskix$ echo typed at busybox` and the lane called it a
+    # success.
+    #
+    # Comparing against the corpus summary was the second attempt and was wrong
+    # for a subtler reason: this runs the moment the reply appears, while
+    # BusyBox is still alive, so the interactive corpus has not printed its
+    # summary yet and the only one in the log is the *earlier* non-interactive
+    # pass. The check compared against a line printed long before anything was
+    # typed and failed a passing machine.
+    #
+    # A prompt that has not happened cannot be raced: the Bhaskix shell greets
+    # and prompts before it can echo anything, so if no `bhaskix` prompt
+    # precedes the reply, it was not the one that answered.
+    greeted=$(head -n "$replied" "$LOG" | grep -acE 'bhaskix[$>] ' || true)
+    if [[ -n "$replied" && "$greeted" -eq 0 ]]; then
         pass "a hosted program read a line typed at the machine and ran it"
     else
-        fail "the reply came after BusyBox was done -- the Bhaskix shell answered, not BusyBox"
+        fail "the Bhaskix shell had already prompted, so it answered and BusyBox did not"
         status=1
     fi
 else

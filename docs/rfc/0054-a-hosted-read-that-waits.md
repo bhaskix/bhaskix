@@ -176,6 +176,24 @@ slept for a keystroke that could not wake it. It looked exactly like a dropped
 byte. The rule it broke is written down now where the function is: *every wake
 is followed by a service*.
 
+**A slot collision that answered `-ENOENT`.** The notification was put in slot
+22, chosen by reading the fixed grants `start_linux_domain` makes and stopping
+there — which missed the **root directory**, granted from somewhere else
+entirely. `install_at` refuses an occupied slot, so whichever ran second lost,
+and a hosted `open` answered `-ENOENT` for a directory that was no longer there.
+The full suite found it; the lane could not, because the lane does not open
+files. The floor hosted-domain handles are allocated from moved from 24 to 25,
+the notification took 24, and the two are now tied together by a **compile-time
+assertion** rather than by a comment — a comment is what failed here.
+
+**And the grant now says so out loud, either way.** A grant that silently did not
+happen is indistinguishable from a hosted program that cannot read its input.
+The boot report names the slot and what it confers, and a second line
+(`input park`) reports at the end of the interactive corpus how many hosted
+threads parked and how many parks were refused — printed *there* because the
+personality counters run before the console's line is claimed and could only
+ever have read zero for this.
+
 **A byte this BusyBox discards, which is not ours.** Byte `0x70` — lowercase
 `p`, alone of every byte in `a-z`, `A-Z` and `0-9` — is read from standard input
 and never appears in the line BusyBox builds. This was chased to the end before

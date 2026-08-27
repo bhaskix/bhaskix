@@ -2316,6 +2316,10 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
             // waiter, which is what makes an exact wake count possible in ring 3
             // and what `notify::wait`'s single-waiter rule wants anyway.
             crate::fault::reply::BLOCK_ON_RETRY => {
+                if !may_park_on(answer.1, call.domain) {
+                    PARK_UNGRANTED.fetch_add(1, Ordering::Relaxed);
+                    return Some(-11i64 as u64); // EAGAIN
+                }
                 // **Park, and then ask the same question again** -- RFC 0033 step
                 // 7. The difference from `BLOCK_ON` is what the caller gets when it
                 // wakes: a `futex` is answered zero, which is what Linux's futex
@@ -2323,15 +2327,20 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                 // So this shape resumes the call rather than completing it, and the
                 // adapter answers the second time with the bytes that woke it.
                 let Some(notification) = adapter_notification(answer.1) else {
+                    PARK_UNNAMED.fetch_add(1, Ordering::Relaxed);
                     return Some(-11i64 as u64); // EAGAIN
                 };
                 BLOCKED.fetch_add(1, Ordering::Relaxed);
                 if crate::notify::wait(notification).is_err() {
+                    PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
                     return Some(-11i64 as u64);
                 }
                 continue;
             }
             crate::fault::reply::BLOCK_ON => {
+                if !may_park_on(answer.1, call.domain) {
+                    return Some(-11i64 as u64); // EAGAIN
+                }
                 let Some(notification) = adapter_notification(answer.1) else {
                     // The adapter named something that is not a notification it
                     // holds. That is the adapter being wrong, not the caller, and
@@ -2560,10 +2569,22 @@ pub static ADAPTER_DOMAIN: core::sync::atomic::AtomicU32 =
 /// have run out of.
 ///
 /// Now the kernel takes the lowest free slot at or above this floor and
-/// **tells the adapter which** ([`HANDLE_METHOD`]). The floor is above the
-/// fixed grants `start_linux_domain` makes — the endpoint, two pages, the
-/// console and the futex pool — so an allocation can never collide with one.
-const ADAPTER_SLOT_FLOOR: usize = 24;
+/// **tells the adapter which** ([`HANDLE_METHOD`]). The floor is above every
+/// fixed grant the adapter is given — the endpoint, two pages, the console,
+/// the futex pool, the root directory, the lent page, and the console's own
+/// notification — so an allocation can never collide with one.
+///
+/// **It moved from 24 to 25 on 2026-08-28**, when RFC 0054 added the last of
+/// those, and the collision it prevents was a real one: slot 22 was picked for
+/// the notification by reading the fixed grants `start_linux_domain` makes and
+/// stopping there, which missed the root directory granted elsewhere. A hosted
+/// `open` then answered `-ENOENT` for a directory that had been overwritten.
+///
+/// It is a compile-time constant for a second reason: the notification is
+/// granted late, after the serial line is claimed, and by then hosted programs
+/// have run and been given handles. A floor raised at boot would find the slot
+/// already taken; raised here, the allocator never offers it.
+pub const ADAPTER_SLOT_FLOOR: usize = 25;
 
 /// The method that says "your `Domain` capability for this domain is in this
 /// slot".
@@ -2631,6 +2652,44 @@ fn adapter_notification(index: u64) -> Option<crate::notify::NotificationId> {
         (object.id >> 32) as u32,
     ))
 }
+
+/// Whether the adapter may park a thread of `domain` on the notification in
+/// `slot` — RFC 0054 step 4.
+///
+/// Everything the adapter was granted at boot is fair game **except the
+/// console's own notification**, which is allowed only for a domain holding the
+/// input grant, exactly as `POLL_INPUT` is.
+///
+/// # Why this is not about the hosted program
+///
+/// A hosted process holds no capabilities and cannot name one, so it could not
+/// ask for this if it wanted to. The check is about the **adapter**. That
+/// notification takes one waiter, and an adapter free to park any thread on it
+/// could hold the console's single waiter slot for ever: the Bhaskix shell
+/// would never wake for a keypress, from a program whose console capability is
+/// `WRITE` alone precisely so that it cannot touch input. Refusing here bounds
+/// it to a domain somebody chose to grant, and the adapter cannot lift it.
+fn may_park_on(slot: u64, domain: u32) -> bool {
+    let Some(console_input) = crate::input::notification() else {
+        return true;
+    };
+    match adapter_notification(slot) {
+        Some(named) if named == console_input => crate::domain::may_read_input(domain),
+        _ => true,
+    }
+}
+
+/// Parks refused because the caller's domain was not granted what it named.
+pub static PARK_UNGRANTED: AtomicU64 = AtomicU64::new(0);
+/// Parks refused because the adapter named a slot holding no notification.
+pub static PARK_UNNAMED: AtomicU64 = AtomicU64::new(0);
+/// Parks that reached [`crate::notify::wait`] and were refused by it — a second
+/// waiter on a notification that takes one, or one that has gone.
+///
+/// **Every one of these loses a wake**, and the caller is told `EAGAIN` for a
+/// reason that is not its own. Counted rather than assumed: a byte that goes
+/// missing from a typed line looks like a driver bug and may be this.
+pub static PARK_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Hosted threads parked on a notification by an adapter's `BLOCK_ON`.
 pub static BLOCKED: AtomicU64 = AtomicU64::new(0);
@@ -3104,7 +3163,11 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             return Some(Outcome::err(Status::InsufficientRights));
         }
         return Some(if frame.method == method::POLL_INPUT {
-            match crate::input::try_read() {
+            // **`take_or_service` and not `try_read`** -- RFC 0054 step 2. A
+            // hosted reader parked on the console notification is woken by the
+            // interrupt and comes back through here, and nothing else has
+            // drained the UART for it: the handler signals and does not read.
+            match crate::input::take_or_service() {
                 Some(byte) => Outcome::ok(u64::from(byte)),
                 None => Outcome::ok(bhaskix_abi::method::NOTHING),
             }
