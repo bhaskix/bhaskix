@@ -1035,6 +1035,38 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-27 (two red CI runs, one my fault and one not, and the difference was readable without guessing)
+
+**Run 377 — mine, and a trap this project has already documented.** `make gates`
+passed locally and the **project invariants** job went red. The progress chart
+dates each RFC from the commit that added its file; generating it while RFC 0050
+was still untracked wrote a dash, and CI — full history, file committed —
+regenerates the row with a date and finds the chart does not match. Regenerated
+with the file tracked and the lesson written on `first_commit_date`, where the
+next person about to do it will read it: **commit the RFC, then `make progress`,
+then commit the chart.** The gate was doing its job.
+
+**Run 378 — not mine, and the evidence is in the job list.** The **interactive
+shell** job went red on a commit that changed `docs/progress.md` and one
+docstring. Before blaming the console change, the obvious question: **377 carried
+`PUT_RUN` and its shell job passed.** The same code, the same lane, green one
+push earlier. A chart and a comment cannot break a shell test.
+
+**And it was nearly misattributed anyway.** The reflex was that `PUT_RUN` holds
+the console lock for up to 256 bytes where it used to hold it for one, and that a
+slower emulator would feel it. That is a real concern and it was measured rather
+than argued: worst console lock hold went **135 µs to 154 µs**, and both figures
+are attributed to `xhci.rs`, not to `put_run`. Then fifteen local shell runs
+(three modes, five rounds) passed, and the shell lane passed **4 of 4** on
+QEMU 8.2.2 — the emulator CI actually uses — through
+`tools/boot-on-ci-emulator.sh`.
+
+**What the reproduction could not cover, stated rather than glossed.** That tool
+runs the `user` and `iommu` shell cells; `kernel` and `disk` rebuild the image
+and need a Rust toolchain the container does not carry. So "passed on CI's
+emulator" here means two of the four modes CI runs. The argument that 378 is not
+the console change does not rest on that reproduction — it rests on 377.
+
 ### 2026-08-27 (the exec/pid intermittent has a specimen, and it is the console splitting a hosted program's line)
 
 **Filed 2026-08-21, seen twice, two hypotheses killed by reading, and the cause
