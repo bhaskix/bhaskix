@@ -3443,8 +3443,16 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     // far, and is BusyBox working rather than failing. `echo` is asked for here
     // because its output is unmistakable and it needs nothing from a
     // filesystem.
+    //
+    // **`sh -c` rather than an interactive `sh`, and the reason is a boundary
+    // rather than a shortcoming.** An interactive shell reaches its prompt --
+    // `/ #` -- and then cannot read a key: the adapter holds the console with
+    // `Rights::WRITE` alone, on purpose, so that *"the adapter cannot take a
+    // byte somebody typed at the shell"*. A hosted program reading stdin needs
+    // an input authority of its own, which is a decision and not a syscall.
+    // `-c` is what can be gated today: it runs, it prints, and it ends.
     let args: &[&[u8]] = if busybox {
-        &[b"echo", b"hello from busybox"]
+        &[b"sh", b"-c", b"echo hi from sh"]
     } else {
         &[b"go-hello"]
     };

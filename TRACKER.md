@@ -1123,6 +1123,46 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-27 (BusyBox's `sh` runs a command, and interactive input turns out to be a decision rather than a syscall)
+
+    hi from sh
+
+**BusyBox's shell, parsing `-c`, running `echo` and printing** — twenty-nine
+calls through the adapter, none interpreted by the nucleus. **Gated**, and
+watched red by changing what the shell is asked to print: the gate matches
+BusyBox's output and not this project's, because a gate on a line we printed
+proves nothing about compatibility.
+
+**Interactive `sh` gets further than expected and stops somewhere specific.** It
+starts, degrades gracefully where it must, and reaches a correct prompt:
+
+    sh: can't access tty; job control turned off
+    / #
+
+`getcwd` was added for that prompt, which read `(unknown) #` before it. It
+answers **`/`** and that is the truth rather than a placeholder: a hosted process
+resolves every relative path against the one directory capability it holds, has
+no `chdir` and could not have a meaningful one, so the directory it resolves
+against *is* its root. It deliberately does **not** answer the host path of that
+directory, which would leak where in a larger tree this process's world sits.
+
+**What stops interactive input is a decision, and the decision is written down.**
+The adapter holds the console with `Rights::WRITE` alone, and `syscall.rs` says
+why at the grant: *"a hosted program's `write` reaches the console, and the
+adapter cannot take a byte somebody typed at the shell. Without this the
+narrowing would be a comment rather than a mechanism."* So `read(0)` cannot
+return a keystroke, and `poll` on stdin would have nothing true to say — which is
+why `poll` was **not** added. A call that can only ever answer "never readable"
+would make a shell spin, and adding it to silence an error message is the wrong
+trade.
+
+**Three ways forward, and the choice is the project lead's**: grant the adapter
+console `READ`, which reverses that narrowing and lets any hosted program take
+keystrokes meant for the Bhaskix shell; give a hosted **domain** its own input
+authority, granted per domain so only one explicitly given it can read, which
+keeps the principle and is a real piece of work; or leave it, and have `sh -c`
+be what L1 claims. **Nothing here should quietly pick the first.**
+
 ### 2026-08-27 (`hello from busybox` — a program nobody here wrote produced correct output)
 
     hello from busybox

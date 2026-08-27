@@ -2882,6 +2882,19 @@ else
     status=1
 fi
 
+# **L1: a program nobody here wrote, running its own shell.** BusyBox's `sh`
+# parses `-c`, runs `echo` as a builtin and prints -- twenty-nine calls through
+# the adapter, none of them interpreted by the nucleus.
+#
+# The string is BusyBox's output and not the kernel's, which is the whole point:
+# a gate on a line this project printed would prove nothing about compatibility.
+if grep -qF "hi from sh" "$LOG"; then
+    pass "L1: BusyBox's sh ran a command and printed its own output"
+else
+    fail "BusyBox's sh did not run -- the L1 corpus is absent or refused"
+    status=1
+fi
+
 # Domains and the resource envelope. §3 says a domain's CPU share holds
 # regardless of how many threads it spawns, and that half this gate really does
 # prove: the self-test puts one thread and three threads on the same CPU and

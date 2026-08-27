@@ -754,6 +754,35 @@ fn answer_brk(request: &PersonalityCall) -> Answer {
     Answer::ok(wanted)
 }
 
+/// `getcwd(buffer, size)` — where relative paths resolve from.
+///
+/// **Always `/`, and that is the truth rather than a placeholder.** A hosted
+/// process resolves every relative path against the one directory capability it
+/// was given, and it has no way to change that: there is no `chdir` here, and
+/// there could not be a meaningful one, because moving "up" out of a directory
+/// capability is the thing capabilities exist to make impossible. So the
+/// directory it resolves against *is* its root, and `/` is what a program
+/// asking where it stands should be told.
+///
+/// **Not the host path of that directory**, which would be a leak: the name the
+/// filesystem service knows it by says where in a larger tree this process's
+/// world sits, and nothing in this process is entitled to that.
+///
+/// BusyBox's `sh` printed `sh: getcwd: Function not implemented` and then a
+/// prompt reading `(unknown) #` before this existed.
+fn answer_getcwd(request: &PersonalityCall) -> Answer {
+    const PATH: &[u8] = b"/\0";
+    let (buffer, size) = (request.first(), request.second());
+    if size < PATH.len() as u64 {
+        return Answer::error(-34); // ERANGE, which is what Linux says
+    }
+    if !copy_out(request.domain, buffer, PATH) {
+        return Answer::error(-14); // EFAULT
+    }
+    // Linux answers the length *including* the terminator.
+    Answer::ok(PATH.len() as u64)
+}
+
 /// `access(path, mode)` — may this process reach that name.
 ///
 /// **Answered by trying, not by reading a mode bit.** This adapter holds a
@@ -1255,6 +1284,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // because nothing here reads it to decide anything. See `GETUID`.
         GETEUID => Answer::ok(0),
         ACCESS => answer_access(request),
+        GETCWD => answer_getcwd(request),
         WRITEV => answer_writev(request),
         // The parent this process was forked from.
         //
@@ -1661,6 +1691,8 @@ const ACCESS: u64 = 21;
 const WRITEV: u64 = 20;
 /// `tgkill(tgid, tid, signal)` — how a libc raises a signal at itself.
 const TGKILL: u64 = 234;
+/// `getcwd(buffer, size)`.
+const GETCWD: u64 = 79;
 /// How much address space a `brk` heap is reserved, lazily.
 ///
 /// **Reserved once and grown into**, rather than extended a page at a time:
