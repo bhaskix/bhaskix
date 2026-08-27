@@ -160,7 +160,17 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > bug in the *translator* is now a bug in a ring 3 program that holds: one endpoint, three pages,
 > a **write-only** console capability (it can print; it cannot read what somebody typed at the
 > shell), sixteen notifications it may signal and may not wait on, and a supervisor handle to each
-> domain it hosts. That is authority over hosted processes and over nothing else. It is not
+> domain it hosts. That is authority over hosted processes and over nothing else.
+>
+> **And, since [RFC 0053](rfc/0053-input-a-domain-was-given.md) on 2026-08-27, the console input of
+> a domain that was granted it.** The console capability above is still write-only and that sentence
+> is still true; what changed is that a *domain* can be granted input, and the adapter holds a
+> handle to each domain it hosts. So a compromised adapter can take keystrokes **while a granted
+> domain is running, and for no other domain** — the check is in the nucleus and it cannot lift it,
+> the grant is one domain at a time, and it is released when that domain ends. On a boot where
+> nothing is granted, which is every boot today, it reaches no keystroke at all. That bound is why
+> this shape was chosen over giving the adapter console `READ`, which would have reached every
+> keystroke for ever. It is not
 > nothing — an adapter compromise is a compromise of every hosted process — and this note says so
 > rather than rounding it to "contained".
 >

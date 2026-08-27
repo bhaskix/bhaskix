@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| RFCs accepted | **36** |
-| RFCs open | 16 |
+| RFCs accepted | **37** |
+| RFCs open | 15 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -47,7 +47,7 @@ gantt
     RFC 0033 What a hosted process is — identity in ring 3... :done, r0033, 2026-08-20, 1d
     RFC 0044 Revocation that reaches the mapping :active, r0044, 2026-08-23, 2026-08-27
     RFC 0045 One adapter per workload and the three failures... :active, r0045, 2026-08-23, 2026-08-27
-    RFC 0053 input a domain was given :active, r0053, 2026-08-27, 2026-08-27
+    RFC 0053 input a domain was given :done, r0053, 2026-08-27, 1d
     section Networking
     RFC 0018 A network stack outside the kernel and a socket... :done, r0018, 2026-08-12, 2026-08-13
     RFC 0020 TCP as a state machine that can be tested... :done, r0020, 2026-08-14, 2026-08-16
@@ -146,7 +146,6 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
-| 0053 | input a domain was given | 2026-08-27 |
 
 ## Annexes
 
