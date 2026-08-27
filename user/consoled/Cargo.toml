@@ -42,11 +42,23 @@ opt-level = "s"
 # requires, the `syscall` sequence where the program carries its own rather than
 # taking `bhaskix-sock`'s, and the `ud2` in its panic handler, which stops where
 # the kernel can see it. Plus the syscall stub a console service needs.
-asm_budget = 3
+# 4 since 2026-08-27: a second `syscall` stub for RFC 0050's `PUT_RUN`, which
+# carries an address *and* a length where every method this program used before
+# carried one argument. The alternative was widening the existing stub, which
+# would make every other call site pass a zero that means nothing.
+asm_budget = 4
 # Two blocks, sixteen lines: the `syscall` instruction with its operand list
 # -- every argument register is an output, because the kernel writes the frame
 # back -- and the `ud2` a
 # panic ends at. Fewer than the filesystem's placement needs, because this one
 # is handed no memory -- every byte it moves goes through a system call, which
 # is slower and is the whole of what a console capability permits.
-unsafe_budget = 20
+# 31 for RFC 0050's second half: a native program's line was still arriving in
+# pieces because this service put one byte per invocation, so `put_run` sends a
+# whole chunk at once -- and that needs a second `syscall` stub, because every
+# method this program used until now carried one argument and a run needs an
+# address and a length. Eleven more lines, all of them one operand list: the
+# same shape as the block above it, declared separately rather than by widening
+# the existing call, which would have every other site pass a zero that means
+# nothing.
+unsafe_budget = 31

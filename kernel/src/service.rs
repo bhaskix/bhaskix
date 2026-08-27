@@ -292,6 +292,13 @@ fn console_ports() -> Ports {
             crate::print!("{character}");
             counted(1, 0);
         },
+        // RFC 0050 for native programs. Counted the same way -- one per byte --
+        // so the boundary figure means what it always did and the two
+        // placements stay comparable.
+        put_run: |bytes| {
+            crate::console::put_run(bytes);
+            counted(bytes.len() as u64, 0);
+        },
         read: || {
             let byte = crate::input::read();
             counted(0, 1);

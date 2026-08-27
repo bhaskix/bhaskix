@@ -69,6 +69,37 @@ fn call(kind: u64, capability: u64, method: u64, arg0: u64) -> (u64, u64) {
     (status, value)
 }
 
+/// The same call with a second argument, for `PUT_RUN` — RFC 0050.
+///
+/// `call` above carries one, which was every method this service used until a
+/// run of bytes needed an address *and* a length. Kept separate rather than
+/// widening the one above, because every other call site would then pass a zero
+/// that means nothing.
+fn call2(kind: u64, capability: u64, method: u64, arg0: u64, arg1: u64) -> (u64, u64) {
+    let status: u64;
+    let mut value = arg0;
+    // SAFETY: as `call` above, and for the same reasons -- every argument
+    // register is an output because the kernel writes the whole frame back.
+    // The address in `arg0` is this program's own buffer and the kernel reads
+    // it through this program's page tables; nothing is dereferenced here.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") kind => status,
+            inlateout("rdi") capability => _,
+            inlateout("rsi") method => _,
+            inlateout("rdx") value,
+            inlateout("r10") arg1 => _,
+            lateout("r8") _,
+            lateout("r9") _,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    (status, value)
+}
+
 /// Where the program actually starts.
 #[unsafe(no_mangle)]
 extern "C" fn consoled_main() -> ! {
@@ -77,6 +108,18 @@ extern "C" fn consoled_main() -> ! {
         Ports {
             put: |character| {
                 let _ = call(syscall::INVOKE, CONSOLE, method::PUT, character as u64);
+            },
+            // RFC 0050 for every program that talks to this service, not just
+            // the Linux adapter. One invocation per chunk instead of one per
+            // byte, so a kernel line cannot land inside a chunk's bytes.
+            put_run: |bytes| {
+                let _ = call2(
+                    syscall::INVOKE,
+                    CONSOLE,
+                    method::PUT_RUN,
+                    bytes.as_ptr() as u64,
+                    bytes.len() as u64,
+                );
             },
             read: || {
                 let (status, byte) = call(syscall::INVOKE, CONSOLE, method::TAKE, 0);

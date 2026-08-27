@@ -23,6 +23,19 @@ use bhaskix_service::{Reply, Request, Service, StartError};
 pub struct Ports {
     /// Puts one character on the machine's console.
     pub put: fn(char),
+    /// Puts a run of already-filtered bytes with the console held once.
+    ///
+    /// RFC 0050 gave the nucleus `PUT_RUN` and only the Linux adapter used it,
+    /// so a *native* program's line could still arrive in pieces — `bin/sup`'s
+    /// `sup: starting ch` has been seen with a kernel report inside it. Every
+    /// caller of this service now goes through one invocation per chunk instead
+    /// of one per byte.
+    ///
+    /// **Already filtered**, and that is the caller's job rather than this
+    /// port's: `write` maps each byte through the same substitution it always
+    /// did before handing the run over, so a program still cannot put an escape
+    /// sequence on the kernel's console.
+    pub put_run: fn(&[u8]),
     /// Waits for a byte to be typed, and returns it.
     pub read: fn() -> u8,
     /// Takes a byte if one is already waiting, without blocking.
@@ -99,14 +112,23 @@ fn write(ports: &Ports, args: &[u64; 4]) -> [u64; 4] {
     // here could clear the screen, move the cursor, or print a line that looks
     // like it came from the kernel. Newline and tab pass through, because
     // without them nothing can be laid out.
-    for byte in chunk.bytes() {
-        let character = match byte {
-            b if b.is_ascii_graphic() || *b == b' ' => *byte as char,
-            b'\n' | b'\t' => *byte as char,
-            _ => '?',
+    // **Filtered into a buffer, then put in one go.** The filtering is
+    // unchanged and still happens here; what changed on 2026-08-27 is that the
+    // whole chunk crosses in a single invocation, so a kernel line printed on
+    // another CPU cannot land between two of its bytes.
+    //
+    // **A chunk and not a line**, which is the honest limit: `CHUNK_BYTES` is
+    // 16, so a longer write is several messages and they can still be
+    // separated. What this removes is the fifteen gaps *inside* each of them.
+    let mut filtered = [0u8; bhaskix_abi::CHUNK_BYTES];
+    for (out, byte) in filtered.iter_mut().zip(chunk.bytes()) {
+        *out = match byte {
+            b if b.is_ascii_graphic() || *b == b' ' => *byte,
+            b'\n' | b'\t' => *byte,
+            _ => b'?',
         };
-        (ports.put)(character);
     }
+    (ports.put_run)(&filtered[..chunk.len()]);
 
     [chunk.len() as u64, 0, 0, 0]
 }
@@ -194,6 +216,15 @@ mod tests {
     fn ports() -> Ports {
         Ports {
             put: |character| held(&PUT).push(character),
+            // Through the same recorder, so the filtering test below still sees
+            // what a caller managed to put -- and it is one call now, which is
+            // the point of the change it is testing.
+            put_run: |bytes| {
+                let mut put = held(&PUT);
+                for byte in bytes {
+                    put.push(char::from(*byte));
+                }
+            },
             read: || held(&TYPED).remove(0),
             try_read: || {
                 let mut typed = held(&TYPED);

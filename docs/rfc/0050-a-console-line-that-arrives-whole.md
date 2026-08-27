@@ -161,9 +161,33 @@ is a side effect in any case. The reason is that the line arrives whole.
    `PUT_RUN` and keeping both is two paths to maintain. Keeping it for now: the
    shell and the console service both use it, and removing a method is a
    separate change with its own blast radius.
-2. **Should the console service, when it is the one in a domain, get the same
-   method?** It holds a `Console` capability like anything else, so it inherits
-   `PUT_RUN` for free; whether `bin/consoled` should *use* it is a question about
+2. ~~**Should the console service, when it is the one in a domain, get the same
+   method?**~~ **ANSWERED 2026-08-27 by the project lead: yes.** Every program
+   that talks to the console service now crosses once per *chunk* instead of once
+   per byte — the service filters into a buffer and puts the run, in both
+   placements. The filtering is unchanged and still happens in the service, and
+   the test that a caller cannot put an escape sequence on the kernel's console
+   now covers the bulk path; removing the filter fails it.
+
+   **What this does not do, and the number is the point.** `CHUNK_BYTES` is
+   **16**, so a write longer than that is several messages and they can still be
+   separated by a kernel line. This removes the fifteen gaps *inside* each chunk
+   and leaves the ones between them: the exposure shrinks by a factor of sixteen
+   rather than going to zero. `bin/sup`'s `sup: starting ch` was seen split
+   before this, and it is longer than sixteen bytes.
+
+   **Making a native program's whole *line* atomic is a different change**, and
+   it is not this one. The service would have to hold a partial line per caller —
+   keyed by badge, since two domains can interleave between messages — and flush
+   it on a newline, on a bound, and **on a read**, because a shell prints a
+   prompt without a newline and then waits for a key. That last flush point is
+   what makes it a terminal discipline rather than a buffer, and it is the part
+   most likely to be got wrong. It belongs in the service, where policy belongs;
+   it wants its own RFC and its own gates.
+
+   *(The original question, for the record:)* It holds a `Console` capability
+   like anything else, so it inherits `PUT_RUN` for free; whether `bin/consoled`
+   should *use* it is a question about
    that service and not about this method.
 
 ## Implementation plan

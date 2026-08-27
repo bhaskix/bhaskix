@@ -1035,6 +1035,36 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-27 (native programs get `PUT_RUN` too, and the win is a factor of sixteen rather than a fix)
+
+**RFC 0050's unresolved question 2, answered by the project lead: yes.** Only the
+Linux adapter used `PUT_RUN`, so a *native* program's line could still arrive in
+pieces — `bin/sup`'s `sup: starting ch` has been seen with a kernel report inside
+it. The console service now filters a chunk into a buffer and puts the run in one
+invocation, in **both placements**: the in-nucleus one calls `console::put_run`
+directly, and `bin/consoled` invokes the nucleus method, which needed a
+two-argument `call` because every method it used until now carried one.
+
+**The filtering did not move.** A caller still cannot put an escape sequence on
+the kernel's console: the substitution happens in the service exactly where it
+did, before the run is handed over. The existing test for it now covers the bulk
+path, and removing the filter fails it — checked.
+
+**The honest size of the win.** `CHUNK_BYTES` is **16**, so a write longer than
+that is several messages and they can still be separated. This removes the
+fifteen gaps *inside* each chunk and leaves the ones between them: the exposure
+falls by a factor of sixteen and does not reach zero. Saying "native programs are
+fixed" would be wrong, and `sup: starting ch` is longer than sixteen bytes.
+
+**What a real fix would be, recorded rather than half-built.** A native
+program's whole *line* becomes atomic only if the service holds a partial line
+per caller — keyed by badge, since two domains interleave between messages — and
+flushes on a newline, on a bound, **and on a read**, because a shell prints a
+prompt without a newline and then waits for a key. That last flush point is what
+makes it a terminal discipline rather than a buffer, and it is the part most
+likely to be got wrong. It belongs in the service, where policy belongs, and it
+wants its own RFC and its own gates.
+
 ### 2026-08-27 (the same chart mistake twice in one day, so it stopped being a comment and became a warning)
 
 **Run 377 and run 383, identical.** `make gates` passed locally and the project
