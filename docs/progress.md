@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| RFCs accepted | **33** |
-| RFCs open | 17 |
+| RFCs accepted | **35** |
+| RFCs open | 15 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -61,7 +61,7 @@ gantt
     RFC 0038 Vendoring the xHCI definitions :active, r0038, 2026-08-22, 2026-08-27
     RFC 0041 A USB keyboard :done, r0041, 2026-08-22, 2026-08-23
     RFC 0043 An IOMMU on a machine with no virtio :done, r0043, 2026-08-23, 2026-08-25
-    RFC 0050 a console line that arrives whole :active, r0050, 2026-08-27, 2026-08-27
+    RFC 0050 a console line that arrives whole :done, r0050, 2026-08-27, 1d
     section Memory & scheduling
     RFC 0024 Preemption on wake :crit, r0024, 2026-08-15, 1d
     section Userspace & personality
@@ -73,7 +73,7 @@ gantt
     RFC 0036 A relocatable program in ring 3 — the other half... :active, r0036, 2026-08-21, 2026-08-27
     RFC 0039 Pingala — a native web server and what "secure... :active, r0039, 2026-08-22, 2026-08-27
     RFC 0042 Reading the boot report back :done, r0042, 2026-08-23, 1d
-    RFC 0051 a shell that can ask what arrived :active, r0051, 2026-08-27, 2026-08-27
+    RFC 0051 a shell that can ask what arrived :done, r0051, 2026-08-27, 1d
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-08-27
@@ -144,8 +144,6 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
-| 0050 | a console line that arrives whole | 2026-08-27 |
-| 0051 | a shell that can ask what arrived | 2026-08-27 |
 
 ## Annexes
 
