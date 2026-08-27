@@ -342,6 +342,17 @@ pub mod method {
     /// byte, so scancodes moving while the keyboard column does not says the
     /// i8042 is delivering and the decoder is swallowing.
     pub const INPUT_STATS: u64 = 70;
+    /// Take a byte typed at the console **for the domain this capability
+    /// names** — RFC 0053. Blocks until there is one.
+    ///
+    /// On a `Domain` capability with `READ`, and refused with
+    /// `INSUFFICIENT_RIGHTS` unless that domain has been granted input. The
+    /// adapter's console capability stays `WRITE` alone: this names the
+    /// *domain's* authority, so a compromised adapter reads keystrokes for
+    /// granted domains and no others.
+    pub const TAKE_INPUT: u64 = 71;
+    /// The same without blocking: a byte, or [`NOTHING`].
+    pub const POLL_INPUT: u64 = 72;
     /// Take a byte that was typed, waiting until there is one.
     ///
     /// Only on a `Console` capability, and it blocks: a holder waiting here is

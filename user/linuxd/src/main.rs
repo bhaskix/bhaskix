@@ -754,6 +754,36 @@ fn answer_brk(request: &PersonalityCall) -> Answer {
     Answer::ok(wanted)
 }
 
+/// Reads standard input for a domain that was granted it — RFC 0053.
+///
+/// One byte per call, because that is what the console confers and because a
+/// line editor wants them one at a time anyway. A domain with no grant is
+/// refused with `EIO` rather than told the console is empty: a program told
+/// "nothing yet" asks again for ever, and a shell would spin on a keyboard it
+/// is never going to be allowed to read.
+fn read_console(request: &PersonalityCall) -> Answer {
+    let (buffer, count) = (request.second(), request.third());
+    if count == 0 {
+        return Answer::ok(0);
+    }
+    // `call` rather than `invoke`, because the byte is the *value* and `invoke`
+    // keeps only whether the call worked.
+    let taken = call(
+        syscall::INVOKE,
+        handle_of(request.domain),
+        method::TAKE_INPUT,
+        [0, 0, 0, 0],
+    );
+    if taken.status != status::OK {
+        return Answer::error(-5); // EIO
+    }
+    let byte = [taken.args[0] as u8];
+    if !copy_out(request.domain, buffer, &byte) {
+        return Answer::error(-14); // EFAULT
+    }
+    Answer::ok(1)
+}
+
 /// `getcwd(buffer, size)` — where relative paths resolve from.
 ///
 /// **Always `/`, and that is the truth rather than a placeholder.** A hosted
@@ -1002,6 +1032,16 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
             );
         }
         READ => {
+            // **Standard input is the domain's, not this program's** — RFC
+            // 0053. The console capability this adapter holds is `WRITE` alone
+            // and stays that way; a byte somebody typed is taken through the
+            // *domain* capability, and the nucleus refuses unless that domain
+            // was granted input. So a hosted program reads keystrokes only if
+            // somebody decided it should, and a compromise of this program does
+            // not change that.
+            if request.first() == 0 {
+                return (REPLY_VALUE, read_console(request));
+            }
             // **Routed by what the descriptor *is*.** A pipe may have to park
             // the caller, which is a reply shape rather than a value, so the
             // choice has to be made here rather than inside an answer.

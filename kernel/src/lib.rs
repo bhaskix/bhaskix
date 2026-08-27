@@ -962,6 +962,43 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    go corpus      FAILED\x1b[0m");
     }
+    // **RFC 0053: the input grant, proved by its refusal.**
+    //
+    // The half that can be asserted without anybody typing, and it is the half
+    // that matters: a domain nobody granted input to is *refused*, and a domain
+    // that was granted it gets an honest "nothing typed" from an empty console
+    // rather than a refusal. Whether a shell can actually be typed at needs a
+    // lane that types during the corpus, which is its own work -- this proves
+    // the authority, not the keyboard.
+    {
+        let ungranted = domain::create("no-input", domain::ResourceEnvelope::new());
+        let granted = domain::create("has-input", domain::ResourceEnvelope::new());
+        if let (Ok(ungranted), Ok(granted)) = (ungranted, granted) {
+            let refused = !domain::may_read_input(ungranted.as_u32());
+            let allowed =
+                domain::grant_input(granted).is_ok() && domain::may_read_input(granted.as_u32());
+            // And it is one keyboard: a second live domain cannot take it.
+            let exclusive = domain::grant_input(ungranted).is_err();
+            domain::destroy(granted);
+            // Released with the domain, or every later grant is refused for a
+            // holder nobody can name.
+            let freed = !domain::may_read_input(granted.as_u32());
+            domain::destroy(ungranted);
+            if refused && allowed && exclusive && freed {
+                println!(
+                    "    input grant   a domain with no grant may not read the console; one \
+                     granted it may, no second domain can take it, and it is released with the \
+                     domain"
+                );
+            } else {
+                println!(
+                    "\x1b[91m    input grant   FAILED: refused {refused}, allowed {allowed}, \
+                     exclusive {exclusive}, freed {freed}\x1b[0m"
+                );
+            }
+        }
+    }
+
     // **The L1 corpus, and the first program here nobody in this project
     // wrote.** RFC 0005's instruction is to trace the binary rather than reason
     // about it, and the Go corpus has been doing that for one program built

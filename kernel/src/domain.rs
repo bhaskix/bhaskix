@@ -355,6 +355,64 @@ pub enum Personality {
 /// fails to build instead.
 pub static LINUX_DOMAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Which domain, if any, may read what somebody types — RFC 0053.
+///
+/// **One at a time, because a console has one keyboard.** This is not a mask
+/// like [`LINUX_DOMAINS`] but a single domain id, and that is the design rather
+/// than a simplification: two domains reading one keyboard is exactly the
+/// muddle the adapter's `WRITE`-only console was narrowed to prevent, and
+/// letting two hold the grant would reintroduce it one level up.
+///
+/// `u32::MAX` means nobody, which is every boot that does not ask.
+static INPUT_GRANTED_TO: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Gives `id` the authority to read console input, if nobody else holds it.
+///
+/// # Errors
+///
+/// [`DomainError::NoSuchDomain`] if there is no such domain, and
+/// [`DomainError::HasThreads`] — reused for "somebody else has it" — if another
+/// live domain already holds the grant. **Refused rather than transferred**: a
+/// grant that silently moved would take the keyboard from a program that is
+/// blocked reading it, and that program would wait for a key that now goes
+/// somewhere else.
+pub fn grant_input(id: DomainId) -> Result<(), DomainError> {
+    if with(id, |_| ()).is_none() {
+        return Err(DomainError::NoSuchDomain);
+    }
+    let holder = INPUT_GRANTED_TO.load(core::sync::atomic::Ordering::Acquire);
+    if holder != u32::MAX && holder != id.as_u32() && live_id(holder) {
+        return Err(DomainError::HasThreads);
+    }
+    INPUT_GRANTED_TO.store(id.as_u32(), core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Whether `domain` may read what somebody types.
+#[must_use]
+pub fn may_read_input(domain: u32) -> bool {
+    INPUT_GRANTED_TO.load(core::sync::atomic::Ordering::Acquire) == domain
+}
+
+/// Takes the grant back, if `domain` holds it.
+///
+/// Called when a domain ends, so the keyboard is not held by something that is
+/// gone — which would refuse every later grant for a domain nobody can name.
+pub fn release_input(domain: u32) {
+    let _ = INPUT_GRANTED_TO.compare_exchange(
+        domain,
+        u32::MAX,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Whether a domain with this raw id is live, for the grant's own check.
+fn live_id(raw: u32) -> bool {
+    with(DomainId::from_u32(raw), |_| ()).is_some()
+}
+
 // One bit per domain, or the mask aliases and a dialect is applied to the
 // wrong program. See `LINUX_DOMAINS`.
 const _: () = {
@@ -1064,6 +1122,11 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
     let objects = crate::shared::destroy_owned_by(id);
     let _ = objects;
 
+    // The keyboard, if this domain held it -- RFC 0053. A grant left behind by
+    // a domain that is gone refuses every later one for a holder nobody can
+    // name, which is a console that stops working for the rest of the boot.
+    release_input(id.as_u32());
+
     // Interrupt handlers next, and for the same reason: a handler outlives its
     // owner as a masked line and a spent vector, which nothing later can claim
     // and nobody can explain. RFC 0011 step 5 -- destroying a domain is
@@ -1386,6 +1449,21 @@ pub fn live() -> usize {
 mod tests {
     use super::*;
 
+    /// Held by the tests that touch the **global** input grant, one at a time.
+    ///
+    /// RFC 0053's grant is a single domain id for the whole machine, because a
+    /// console has one keyboard — so two tests exercising it in parallel take
+    /// it from each other. Caught the way these always are: the pair passed
+    /// alone and failed together. `notify` and the console service each learned
+    /// this and each wrote it down; this is the third.
+    static KEYBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn holds_the_keyboard() -> std::sync::MutexGuard<'static, ()> {
+        KEYBOARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn domain(envelope: ResourceEnvelope) -> Domain {
         let mut domain = Domain::empty();
         domain.envelope = envelope;
@@ -1502,5 +1580,47 @@ mod tests {
         let domain = domain(ResourceEnvelope::new().cpu_shares(512));
         assert_eq!(domain.threads(), 0);
         assert_eq!(domain.thread_weight(), 512);
+    }
+
+    /// RFC 0053: the grant is one domain's at a time, and a dead holder does
+    /// not keep it.
+    #[test]
+    fn input_is_granted_to_one_domain_and_released_with_it() {
+        let _keyboard = holds_the_keyboard();
+        let first = create("input-a", ResourceEnvelope::new()).expect("a domain");
+        let second = create("input-b", ResourceEnvelope::new()).expect("another");
+
+        assert!(grant_input(first).is_ok(), "nobody held it");
+        assert!(may_read_input(first.as_u32()));
+        assert!(
+            !may_read_input(second.as_u32()),
+            "and only the one that has it"
+        );
+
+        // **Refused rather than transferred.** A grant that silently moved would
+        // take the keyboard from a program blocked reading it.
+        assert!(
+            grant_input(second).is_err(),
+            "the first still holds it and is still alive"
+        );
+
+        // Ending the holder gives it back, or the console stops working for the
+        // rest of the boot: every later grant would be refused for a holder
+        // nobody can name.
+        destroy(first);
+        assert!(!may_read_input(first.as_u32()));
+        assert!(grant_input(second).is_ok(), "the keyboard is free again");
+        assert!(may_read_input(second.as_u32()));
+        destroy(second);
+    }
+
+    /// Granting it twice to the same domain is not a refusal.
+    #[test]
+    fn a_domain_may_be_granted_input_it_already_has() {
+        let _keyboard = holds_the_keyboard();
+        let only = create("input-c", ResourceEnvelope::new()).expect("a domain");
+        assert!(grant_input(only).is_ok());
+        assert!(grant_input(only).is_ok(), "idempotent, not a second holder");
+        destroy(only);
     }
 }

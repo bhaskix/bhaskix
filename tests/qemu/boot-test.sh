@@ -2882,6 +2882,17 @@ else
     status=1
 fi
 
+# **RFC 0053: input is a domain's, and the refusal is the half that can be
+# asserted without anybody typing.** A hosted program reads a keystroke only if
+# somebody granted its domain input; the adapter's own console capability is
+# still `WRITE` alone, so a compromise of it does not change that.
+if grep -qF "a domain with no grant may not read the console" "$LOG"; then
+    pass "RFC 0053: input is refused without a grant, exclusive, and released with the domain"
+else
+    fail "the input grant did not behave: an ungranted domain could read, or a grant outlived its domain"
+    status=1
+fi
+
 # **L1: a program nobody here wrote, running its own shell.** BusyBox's `sh`
 # parses `-c`, runs `echo` as a builtin and prints -- twenty-nine calls through
 # the adapter, none of them interpreted by the nucleus.

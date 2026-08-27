@@ -159,6 +159,8 @@ const _: () = {
     assert!(method::PUT == bhaskix_abi::method::PUT);
     assert!(method::PUT_RUN == bhaskix_abi::method::PUT_RUN);
     assert!(method::INPUT_STATS == bhaskix_abi::method::INPUT_STATS);
+    assert!(method::TAKE_INPUT == bhaskix_abi::method::TAKE_INPUT);
+    assert!(method::POLL_INPUT == bhaskix_abi::method::POLL_INPUT);
     assert!(method::TAKE == bhaskix_abi::method::TAKE);
     assert!(method::POLL == bhaskix_abi::method::POLL);
     assert!(method::RECORD_SIZE == bhaskix_abi::method::RECORD_SIZE);
@@ -334,6 +336,16 @@ pub mod method {
     /// Only on a `Console` capability, and it needs `READ` — the right a holder
     /// must already have to take a typed byte. It counts without consuming.
     pub const INPUT_STATS: u64 = 70;
+    /// Take a byte typed at the console, **for the domain this capability
+    /// names** — RFC 0053. Blocks until there is one.
+    ///
+    /// On a `Domain` capability with `READ`, and refused unless that domain has
+    /// been granted input. The adapter's *console* capability is still `WRITE`
+    /// alone: this is the domain's authority, not the console's.
+    pub const TAKE_INPUT: u64 = 71;
+    /// The same without blocking: a byte if one is already waiting, or
+    /// [`bhaskix_abi::method::NOTHING`]'s value.
+    pub const POLL_INPUT: u64 = 72;
     /// Take a byte that was typed, waiting until there is one.
     ///
     /// Only on a `Console` capability. Blocks, which is why a holder that
@@ -3067,6 +3079,32 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
     // domain to have an address space before it can map a page into it, and
     // every other way to get one is to be a thread inside the domain — which
     // there is not one of yet, and cannot be until its pages exist.
+    // **Input, for a domain somebody granted it** — RFC 0053.
+    //
+    // The authority is named on the *domain* rather than on the console, which
+    // is what lets the adapter's console capability stay `WRITE` alone: it can
+    // put a byte on its own account and can take one only for a domain a
+    // grant names. A compromised adapter therefore reads keystrokes for granted
+    // domains and no others, and the check is here rather than in it.
+    if frame.method == method::TAKE_INPUT || frame.method == method::POLL_INPUT {
+        if !rights.contains(crate::cap::Rights::READ) {
+            return Some(Outcome::err(Status::InsufficientRights));
+        }
+        if !domain::may_read_input(target.as_u32()) {
+            // Not "no byte" but "not yours": a caller told the console was
+            // merely empty would ask again for ever.
+            return Some(Outcome::err(Status::InsufficientRights));
+        }
+        return Some(if frame.method == method::POLL_INPUT {
+            match crate::input::try_read() {
+                Some(byte) => Outcome::ok(u64::from(byte)),
+                None => Outcome::ok(bhaskix_abi::method::NOTHING),
+            }
+        } else {
+            Outcome::ok(u64::from(crate::input::read()))
+        });
+    }
+
     if frame.method == method::MAKE_SPACE {
         if domain::space_root_of(target).is_some() {
             // Already has one. Replacing it would unmap whatever is running in

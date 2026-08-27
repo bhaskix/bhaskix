@@ -1123,6 +1123,44 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-27 (RFC 0053: input a domain was given — the console narrowing survives, and the nucleus enforces it)
+
+**The project lead chose option 2**: a hosted domain gets an input authority of
+its own, rather than the adapter getting console `READ`. The difference is what a
+compromise reaches — an adapter with console `READ` reads every keystroke for
+ever; an adapter with this reads keystrokes **only for a domain somebody granted
+input to**, and the check is in the nucleus, so the adapter cannot lift it.
+
+**The authority is named on the *domain*, not the console.** The adapter already
+holds a `Domain` capability per hosted process, so `TAKE_INPUT` and `POLL_INPUT`
+live there, need `Rights::READ` on it, and are refused unless the grant names
+that domain. **The console grant is untouched**: still `WRITE` alone, and the
+sentence explaining why is still true word for word.
+
+**One holder at a time, because a console has one keyboard.** The grant is a
+single domain id rather than a mask, and a second live domain asking is
+**refused rather than served**: transferring it silently would take the keyboard
+from a program blocked reading it, which would then wait for a key that now goes
+elsewhere. It is released when the holder ends — a grant left behind by a domain
+that is gone would refuse every later one for a holder nobody can name, which is
+a console that stops working for the rest of the boot.
+
+**Gated, and the first watched-red attempt was worthless.** Hardcoding one of
+the four conditions to `true` changed nothing, because it was already true — the
+mutation has to break the *property*. Making `may_read_input` answer `true` for
+everybody does: `an ungranted domain could read` and the lane goes red. Two host
+tests cover the grant itself, and they arrived flaky for the third time today —
+two tests sharing one global, passing alone and failing together — so the module
+has a serialising guard now, as `notify` and the console service each learned
+before it.
+
+**What is built and what is not.** The authority works and is proved: refused
+without a grant, exclusive, released with the domain. The adapter's `read(0)`
+goes through it. **What is not proved is that a shell can be typed at** — that
+needs a lane which types *during* the corpus, because the boot harness types at
+the Bhaskix shell and two readers of one keyboard is the muddle this exists to
+prevent. Stated rather than implied: this proves the authority, not the keyboard.
+
 ### 2026-08-27 (BusyBox's `sh` runs a command, and interactive input turns out to be a decision rather than a syscall)
 
     hi from sh
