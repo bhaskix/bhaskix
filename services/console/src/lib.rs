@@ -66,26 +66,142 @@ pub struct Ports {
 // above are all done *by* the placement, so the placement counts them, and the
 // count means the same thing wherever the service runs.
 
+/// How much of one caller's line is held before it goes out regardless.
+///
+/// `MAX_CONSOLE_RUN`, so a flush is always a single `PUT_RUN` and never two.
+const LINE_BYTES: usize = 256;
+
+/// How many callers can have a partial line held at once.
+///
+/// Four, and a fifth writes straight through — RFC 0052. Falling back to
+/// unbuffered is the same behaviour this service had before the discipline
+/// existed, which makes the overflow case degraded rather than broken.
+const LINE_HOLDERS: usize = 4;
+
+/// One caller's partial line.
+#[derive(Clone, Copy)]
+struct Line {
+    /// The badge that owns it. Zero means free: a badge of zero is refused
+    /// everywhere in this system, so it cannot collide with a real caller.
+    badge: u64,
+    used: usize,
+    bytes: [u8; LINE_BYTES],
+}
+
+/// Partial lines, one per caller — RFC 0052.
+///
+/// **Keyed by badge, and that is the whole of why this is safe.** The kernel
+/// stamps `Request::badge` from the capability the caller used and the caller
+/// cannot choose it, so two domains writing at once cannot be spliced into each
+/// other's lines — which would be a worse fault than the one being fixed.
+pub struct Lines {
+    held: [Line; LINE_HOLDERS],
+}
+
+impl Lines {
+    const fn new() -> Self {
+        Self {
+            held: [Line {
+                badge: 0,
+                used: 0,
+                bytes: [0; LINE_BYTES],
+            }; LINE_HOLDERS],
+        }
+    }
+
+    /// The slot for `badge`, claiming a free one if it has none.
+    ///
+    /// `None` when every slot belongs to somebody else — the fifth caller,
+    /// which writes straight through.
+    fn slot(&mut self, badge: u64) -> Option<&mut Line> {
+        let existing = self.held.iter().position(|line| line.badge == badge);
+        let index = match existing {
+            Some(index) => index,
+            None => {
+                let free = self.held.iter().position(|line| line.badge == 0)?;
+                self.held[free].badge = badge;
+                self.held[free].used = 0;
+                free
+            }
+        };
+        self.held.get_mut(index)
+    }
+
+    /// Puts everything held for `badge`, if anything is.
+    fn flush(&mut self, ports: &Ports, badge: u64) {
+        let Some(index) = self.held.iter().position(|line| line.badge == badge) else {
+            return;
+        };
+        let line = &mut self.held[index];
+        if line.used > 0 {
+            (ports.put_run)(&line.bytes[..line.used]);
+            line.used = 0;
+        }
+        // The slot is given back, so a program that writes once and goes away
+        // does not hold one for ever against callers that are still here.
+        line.badge = 0;
+    }
+
+    /// Appends `bytes`, putting whole lines as their newlines arrive.
+    fn append(&mut self, ports: &Ports, badge: u64, bytes: &[u8]) {
+        let Some(line) = self.slot(badge) else {
+            // No slot: this caller is not buffered at all, which is exactly
+            // what every caller got before RFC 0052.
+            (ports.put_run)(bytes);
+            return;
+        };
+        for byte in bytes {
+            line.bytes[line.used] = *byte;
+            line.used += 1;
+            // A newline ends a line; a full buffer ends one whether the caller
+            // meant it to or not, so that a program writing without newlines
+            // gets its output in pieces rather than never.
+            if *byte == b'\n' || line.used == LINE_BYTES {
+                (ports.put_run)(&line.bytes[..line.used]);
+                line.used = 0;
+            }
+        }
+    }
+}
+
+impl Default for Lines {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The console.
 pub struct Console;
 
 impl Service for Console {
     type Context = Ports;
 
-    /// Nothing. The console's state is the hardware's, and the hardware is on
-    /// the far side of [`Ports`].
-    type State = ();
+    /// Partial lines, one per caller — RFC 0052.
+    ///
+    /// This was `()` until 2026-08-27, on the grounds that *"the console's state
+    /// is the hardware's"*. That is still true of the hardware; what is held
+    /// here is a decision about *when* to hand bytes to it, which is policy and
+    /// belongs in the service rather than the nucleus.
+    type State = Lines;
 
     const NAME: &'static str = "console";
 
     fn start(_ports: Self::Context) -> Result<Self::State, StartError> {
-        Ok(())
+        Ok(Lines::new())
     }
 
-    fn handle((): &mut Self::State, ports: &Self::Context, request: Request<'_>) -> Reply {
+    fn handle(lines: &mut Self::State, ports: &Self::Context, request: Request<'_>) -> Reply {
         match request.method {
-            console::WRITE => Reply::new(write(ports, request.args)),
-            console::READ => Reply::new(read(ports)),
+            console::WRITE => Reply::new(write(lines, ports, request.badge, request.args)),
+            // **Flush before reading, and this is the flush that matters.** A
+            // shell writes `bhaskix$ ` with no newline and then waits for a
+            // key: a discipline that only flushed on newlines would swallow
+            // every prompt on the machine. It is what makes this a terminal
+            // discipline rather than a buffer.
+            console::READ => {
+                lines.flush(ports, request.badge);
+                Reply::new(read(ports))
+            }
             console::RECORD_SIZE => Reply::new([(ports.record_size)() as u64, 0, 0, 0]),
             console::RECORD => Reply::new(record(ports, request.args)),
             // **Three words in one reply, because a shell asking "did anything
@@ -104,7 +220,7 @@ impl Service for Console {
 }
 
 /// Prints a caller's bytes, and says how many were accepted.
-fn write(ports: &Ports, args: &[u64; 4]) -> [u64; 4] {
+fn write(lines: &mut Lines, ports: &Ports, badge: u64, args: &[u64; 4]) -> [u64; 4] {
     let chunk = Chunk::unpack(args);
 
     // Filtered, exactly as the kernel shell filters what it prints. This is
@@ -128,7 +244,11 @@ fn write(ports: &Ports, args: &[u64; 4]) -> [u64; 4] {
             _ => b'?',
         };
     }
-    (ports.put_run)(&filtered[..chunk.len()]);
+    // Into the caller's held line rather than straight out -- RFC 0052. The
+    // filtering above is unchanged and still happens *before* anything is held,
+    // so a program cannot get an escape sequence onto the kernel's console by
+    // splitting it across two writes.
+    lines.append(ports, badge, &filtered[..chunk.len()]);
 
     [chunk.len() as u64, 0, 0, 0]
 }
@@ -191,7 +311,7 @@ mod tests {
     use bhaskix_abi::{outcome, outcome_of};
     use bhaskix_service::{Request, Service};
 
-    use super::{Chunk, Console, Ports, console};
+    use super::{Chunk, Console, LINE_BYTES, Lines, Ports, console};
 
     /// What the fake console has been shown, and what it will hand back.
     ///
@@ -200,6 +320,21 @@ mod tests {
     /// wired up the way the kernel is rather than a more convenient way.
     static PUT: Mutex<String> = Mutex::new(String::new());
     static TYPED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    /// Held by every test that touches the globals below, one at a time.
+    ///
+    /// **Added 2026-08-27, after writing a test that failed once and passed on
+    /// the re-run.** `PUT` and `TYPED` are process-wide and cargo runs these in
+    /// parallel: a test that clears `PUT` and then asserts on its contents is
+    /// racing every other test that writes to it. The tests that existed before
+    /// had the same hazard and had not been caught by it, which is how a race
+    /// waits. `notify`'s test module learned this the same way and its comment
+    /// says so.
+    static SERIALISE: Mutex<()> = Mutex::new(());
+
+    fn alone() -> MutexGuard<'static, ()> {
+        SERIALISE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     /// A poisoned lock is recovered rather than unwrapped: the workspace
     /// denies `unwrap` everywhere including tests, and here that lint is
@@ -254,8 +389,122 @@ mod tests {
         }
     }
 
+    /// The same, from a named caller — RFC 0052 keys held lines by badge.
+    fn request_from(badge: u64, method: u64, args: &[u64; 4]) -> Request<'_> {
+        Request {
+            method,
+            args,
+            badge,
+        }
+    }
+
+    /// Writes `text` as one caller, through the discipline.
+    fn write_as(lines: &mut Lines, badge: u64, text: &[u8]) {
+        let (chunk, _) = Chunk::take(text);
+        Console::handle(
+            lines,
+            &ports(),
+            request_from(badge, console::WRITE, &chunk.pack(0)),
+        );
+    }
+
+    /// **A partial line is held, and a newline sends it.**
+    ///
+    /// The defect this exists for: a native program's line reached the console
+    /// one 16-byte chunk at a time, and a kernel line printed on another CPU
+    /// could land between two of them.
+    #[test]
+    fn a_line_without_a_newline_is_held_until_it_has_one() {
+        let _alone = alone();
+        held(&PUT).clear();
+        let mut lines = Lines::new();
+
+        write_as(&mut lines, 7, b"sup: star");
+        assert!(
+            held(&PUT).is_empty(),
+            "a partial line must not reach the console, or there was nothing to fix"
+        );
+
+        write_as(&mut lines, 7, b"ting\n");
+        assert_eq!(
+            *held(&PUT),
+            "sup: starting\n",
+            "the newline sends everything held, in one piece and in order"
+        );
+    }
+
+    /// **Two callers do not join each other's lines**, which would be a worse
+    /// fault than the interleaving being fixed.
+    #[test]
+    fn two_callers_hold_their_lines_apart() {
+        let _alone = alone();
+        held(&PUT).clear();
+        let mut lines = Lines::new();
+
+        write_as(&mut lines, 7, b"first");
+        write_as(&mut lines, 9, b"second\n");
+        assert_eq!(
+            *held(&PUT),
+            "second\n",
+            "the caller that finished its line is the only one that appears"
+        );
+
+        write_as(&mut lines, 7, b"\n");
+        assert_eq!(
+            *held(&PUT),
+            "second\nfirst\n",
+            "and the other follows, whole"
+        );
+    }
+
+    /// **A caller that never writes a newline is not held for ever.**
+    #[test]
+    fn a_full_line_goes_out_without_waiting_for_a_newline() {
+        let _alone = alone();
+        held(&PUT).clear();
+        let mut lines = Lines::new();
+
+        // `Chunk` carries sixteen bytes, so this takes several writes.
+        let mut sent = 0;
+        while sent < LINE_BYTES {
+            write_as(&mut lines, 7, &[b'x'; 16]);
+            sent += 16;
+        }
+        assert_eq!(
+            held(&PUT).len(),
+            LINE_BYTES,
+            "a full buffer must go out on its own, or a program with no newlines is silent"
+        );
+    }
+
+    /// **A read flushes the reader's own line**, which is what keeps a prompt
+    /// visible: a shell writes `bhaskix$ ` with no newline and then waits.
+    #[test]
+    fn a_read_flushes_the_readers_prompt_and_nobody_elses() {
+        let _alone = alone();
+        held(&PUT).clear();
+        held(&TYPED).push(b'k');
+        let mut lines = Lines::new();
+
+        write_as(&mut lines, 7, b"bhaskix$ ");
+        write_as(&mut lines, 9, b"other");
+        assert!(held(&PUT).is_empty(), "neither has a newline yet");
+
+        Console::handle(
+            &mut lines,
+            &ports(),
+            request_from(7, console::READ, &[0; 4]),
+        );
+        assert_eq!(
+            *held(&PUT),
+            "bhaskix$ ",
+            "the reader's prompt appears, and the other caller's line stays held"
+        );
+    }
+
     #[test]
     fn a_caller_cannot_put_an_escape_sequence_on_the_kernels_console() {
+        let _alone = alone();
         // The reason the filter exists: this is the kernel's console, and a
         // program that could emit an escape could clear the screen or print a
         // line that looks like the kernel printed it. Before the extraction
@@ -263,7 +512,7 @@ mod tests {
         held(&PUT).clear();
         let (chunk, _) = bhaskix_abi::Chunk::take(b"\x1b[2J\x07ok\n");
         let accepted = Console::handle(
-            &mut (),
+            &mut Lines::new(),
             &ports(),
             request(bhaskix_abi::console::WRITE, &chunk.pack(0)),
         );
@@ -278,12 +527,13 @@ mod tests {
 
     #[test]
     fn a_read_takes_what_is_waiting_and_stops() {
+        let _alone = alone();
         // One round trip per keystroke would be correct and slow, so a read
         // drains what is already there -- and must stop at the end of it
         // rather than blocking again on a byte nobody typed.
         *held(&TYPED) = b"hi".to_vec();
         let reply = Console::handle(
-            &mut (),
+            &mut Lines::new(),
             &ports(),
             request(bhaskix_abi::console::READ, &[0; 4]),
         );
@@ -295,15 +545,17 @@ mod tests {
 
     #[test]
     fn an_unknown_method_is_answered_rather_than_fatal() {
+        let _alone = alone();
         // RFC 0013's fourth rule. A service is reachable by anything holding
         // its capability, so "the caller sent nonsense" has to be an outcome.
-        let reply = Console::handle(&mut (), &ports(), request(0xdead_beef, &[0; 4]));
+        let reply = Console::handle(&mut Lines::new(), &ports(), request(0xdead_beef, &[0; 4]));
         assert_eq!(outcome_of(reply.args[0]), outcome::WRONG_KIND);
     }
 
     /// The boot report, served back a chunk at a time. RFC 0042.
     #[test]
     fn the_record_is_served_a_chunk_at_a_time_and_ends_where_it_ends() {
+        let _alone = alone();
         {
             let mut record = held(&RECORD);
             record.clear();
@@ -314,7 +566,11 @@ mod tests {
 
         // The size is asked before anything is read, because a zero byte is a
         // byte somebody could have printed and cannot mean "the end".
-        let reply = Console::handle(&mut (), &ports, request(console::RECORD_SIZE, &[0; 4]));
+        let reply = Console::handle(
+            &mut Lines::new(),
+            &ports,
+            request(console::RECORD_SIZE, &[0; 4]),
+        );
         assert_eq!(reply.args[0] as usize, size);
 
         // Reassembled a chunk at a time, exactly as a caller would.
@@ -322,7 +578,7 @@ mod tests {
         let mut offset = 0usize;
         while offset < size {
             let args = [offset as u64, 0, 0, 0];
-            let reply = Console::handle(&mut (), &ports, request(console::RECORD, &args));
+            let reply = Console::handle(&mut Lines::new(), &ports, request(console::RECORD, &args));
             let chunk = Chunk::unpack(&reply.args);
             assert!(
                 !chunk.bytes().is_empty(),
@@ -336,7 +592,7 @@ mod tests {
         // Past the end is empty rather than an error, so a caller that trusted
         // the chunks alone stops where one that trusted the size does.
         let args = [size as u64, 0, 0, 0];
-        let reply = Console::handle(&mut (), &ports, request(console::RECORD, &args));
+        let reply = Console::handle(&mut Lines::new(), &ports, request(console::RECORD, &args));
         assert!(Chunk::unpack(&reply.args).bytes().is_empty());
     }
 
@@ -350,9 +606,14 @@ mod tests {
     /// doubt.
     #[test]
     fn stats_asks_for_each_word_and_returns_them_in_order() {
+        let _alone = alone();
         // No guard: this port is a pure function of its selector and touches
         // none of the shared state the other tests take turns over.
-        let reply = Console::handle(&mut (), &ports(), request(console::STATS, &[0; 4]));
+        let reply = Console::handle(
+            &mut Lines::new(),
+            &ports(),
+            request(console::STATS, &[0; 4]),
+        );
         assert_eq!(
             [reply.args[0], reply.args[1], reply.args[2]],
             [0x1000, 0x1001, 0x1002],

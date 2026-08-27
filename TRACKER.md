@@ -1035,6 +1035,54 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-27 (a line that waits for its newline — RFC 0052, built)
+
+**The last sixteen bytes of the console problem.** RFC 0050 made a *chunk*
+atomic and left the gaps between chunks: `CHUNK_BYTES` is 16, so a native
+program's longer line is several messages and a kernel line can land between
+them. `bin/consoled` now holds each caller's partial line and puts it in one
+`PUT_RUN` when it ends.
+
+**Keyed by the badge**, which the kernel stamps from the capability used and the
+caller cannot choose — so two domains writing at once cannot be spliced into
+each other's lines, which would be a worse fault than the one being fixed.
+
+**Three flush points, and the third is the one that matters.** A newline. A full
+buffer, at `LINE_BYTES` = 256 so a flush is always one invocation and a program
+that never writes newlines is not silent. And **that caller reading**: a shell
+writes `bhaskix$ ` with no newline and then waits for a key, so a discipline that
+only flushed on newlines would swallow every prompt on the machine. That is what
+makes it a terminal discipline rather than a buffer.
+
+**Buffering is policy, and this is where policy goes.** RFC 0050 rejected
+line-buffering *inside the nucleus* citing `PUT`'s own comment — *"policy is what
+was moved out"*. The console service is a ring 3 program in the domain placement,
+and it is also the only place that can see `console::READ`, which is the flush
+point that keeps prompts working. The nucleus could not have done this.
+
+**Five host tests and three mutations, each caught by the right test.** Flushing
+on every write fails the holding test, the two-callers test and the prompt test;
+removing the flush-on-read fails **only** the prompt test; ignoring the badge
+fails the two-callers test. All three shell lanes pass, which is the test that
+cannot be faked — a wrong flush-on-read hangs every one of them at a prompt
+nobody can see.
+
+**A flake introduced and removed on the way.** The first version of these tests
+failed once and passed on the re-run: `PUT` and `TYPED` are process-wide and
+cargo runs tests in parallel. The tests that existed *before* had the same hazard
+and had not been caught by it, which is how a race waits. A module-wide guard now
+serialises them, in the shape `notify`'s tests already used — and adding it
+carelessly **deadlocked the suite**, because it went in twice in one test and the
+lock is not reentrant. Fifteen consecutive clean runs afterwards.
+
+**What is held and therefore not visible**, stated rather than discovered: a
+caller that writes a partial line and then neither newlines, nor fills the
+buffer, nor reads, leaves those bytes held until it does one of the three. Bounded
+at `4 × 256` bytes, and the console can be one partial line behind per caller.
+Ordering between callers changes too — a caller that finishes its line appears
+before one that has not — which is the cost every line-buffered terminal pays and
+is the point.
+
 ### 2026-08-27 (native programs get `PUT_RUN` too, and the win is a factor of sixteen rather than a fix)
 
 **RFC 0050's unresolved question 2, answered by the project lead: yes.** Only the
