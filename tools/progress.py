@@ -72,7 +72,20 @@ def run(*args: str) -> str:
 
 
 def first_commit_date(path: Path) -> str | None:
-    """When this file entered the tree, which is when the work became real."""
+    """When this file entered the tree, which is when the work became real.
+
+    **`None` for a file that is not committed yet, and that is a trap worth
+    knowing about.** Generating this chart while a new RFC is still untracked
+    dates it `-`; committing the RFC and the chart together then leaves a
+    `docs/progress.md` that CI regenerates differently, and the invariants job
+    goes red on a change that had nothing wrong with it. It did on 2026-08-27,
+    for RFC 0050.
+
+    So: **commit the RFC file first, then `make progress`, then commit the
+    chart** -- or run `make progress` a second time after committing and amend.
+    The gate is doing its job either way; this note exists so the next person
+    spends a minute rather than a CI round trip working out why.
+    """
     out = run(
         "git", "log", "--diff-filter=A", "--format=%ad", "--date=short", "--", str(path)
     )

@@ -61,6 +61,7 @@ gantt
     RFC 0038 Vendoring the xHCI definitions :active, r0038, 2026-08-22, 2026-08-27
     RFC 0041 A USB keyboard :done, r0041, 2026-08-22, 2026-08-23
     RFC 0043 An IOMMU on a machine with no virtio :done, r0043, 2026-08-23, 2026-08-25
+    RFC 0050 a console line that arrives whole :active, r0050, 2026-08-27, 2026-08-27
     section Memory & scheduling
     RFC 0024 Preemption on wake :crit, r0024, 2026-08-15, 1d
     section Userspace & personality
@@ -142,17 +143,11 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
-| 0050 | a console line that arrives whole | — |
+| 0050 | a console line that arrives whole | 2026-08-27 |
 
 ## Annexes
 
 Companion documents that share an RFC's number. Counted here rather than as RFCs of their own.
 
 - RFC 0040 — step 1 — the libcrux inspection
-
-## Undated
-
-No commit adding these files was found, so they have no start date and are not on the chart.
-
-- RFC 0050 — a console line that arrives whole
 
