@@ -1123,6 +1123,20 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-27 (a test of mine demanded that nothing else print)
+
+`console::put_run_tests::every_byte_of_a_run_is_put_in_order` failed once in a
+full suite and passed alone. The module guard added earlier serialises the two
+tests that share `PUT`; it cannot serialise the other two hundred and
+forty-five, **any of which may print**, and the recorder they print into is the
+one this test reads back. It asserted **equality** with what it had just put.
+
+The property was never "nothing else printed". It is that the run arrives
+**whole and in order**, which containment states exactly and interleaving cannot
+break. Both tests assert containment now, and the mutation still catches a
+dropped byte — checked, because a weakened assertion that no longer fails is the
+obvious way to "fix" a flake and the wrong one.
+
 ### 2026-08-27 (a third CI red on a docs-only commit, and the job list settled it again)
 
 **Run 394 failed `boot (uefi, max)` on a commit that changed four markdown

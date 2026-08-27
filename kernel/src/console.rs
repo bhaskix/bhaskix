@@ -443,11 +443,17 @@ mod put_run_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (before, _) = recorded();
         put_run(b"execed pid 3\n");
-        assert_eq!(
-            kept_since(before),
-            b"execed pid 3\n",
+        // **Contained, not equal**, and the difference is a flake this test had.
+        // The recorder is the machine's, and any of the other two hundred tests
+        // that prints adds bytes to it — the module guard above serialises the
+        // two tests that share `PUT`, and cannot serialise the whole suite. The
+        // property was never "nothing else printed"; it is that the run arrives
+        // **whole and in order**, which containment says exactly.
+        let kept = kept_since(before);
+        assert!(
+            kept.windows(13).any(|window| window == b"execed pid 3\n"),
             "a run must arrive whole and in order -- losing or reordering one byte is the \
-             defect this exists to remove"
+             defect this exists to remove; kept {kept:?}"
         );
     }
 
@@ -462,10 +468,15 @@ mod put_run_tests {
         // dropped the line because one byte was odd would lose exactly what it
         // exists to keep.
         put_run(&[b'a', 0xff, b'b']);
+        // Contained rather than equal, for the reason above. `0xff` renders as
+        // two bytes, so the run is four: `a`, the two of the replacement, `b`.
         let kept = kept_since(before);
-        assert_eq!(kept.len(), 4, "three bytes in, and 0xff renders as two");
-        assert_eq!(kept[0], b'a');
-        assert_eq!(kept[kept.len() - 1], b'b');
+        assert!(
+            kept.windows(4)
+                .any(|window| window[0] == b'a' && window[3] == b'b'),
+            "the run must arrive whole with the odd byte rendered rather than dropped; \
+             kept {kept:?}"
+        );
     }
 }
 
