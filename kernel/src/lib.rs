@@ -1060,6 +1060,20 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             });
         }
 
+        let (dirty, which) = futex_wakes_left_dirty();
+        if dirty > 0 {
+            println!(
+                "\x1b[93m    futex wakes    {dirty} of {} notifications still hold bits nobody \
+                 took (mask {which:#x}); the next sleeper in those slots takes them as its own \
+                 wake\x1b[0m",
+                FUTEX_WAKES
+            );
+        } else {
+            println!(
+                "    futex wakes    none of {FUTEX_WAKES} notifications was left holding bits \
+                 nobody took"
+            );
+        }
         let (signals, unwaited, stranded) = notify::statistics();
         print!(
             "    notifications  {signals} signalled, {unwaited} found no waiter, {stranded} stranded;"
@@ -3889,7 +3903,7 @@ const CLONE_REPORT_AT: u64 = 0x0000_0000_6002_0000;
 /// in the same address space *and* the futex wait/wake pair actually
 /// blocks and releases — which is the half step 6 could not prove with one
 /// thread, and the half Go's scheduler lives on.
-const CLONE_CODE: [u8; 233] = [
+const CLONE_CODE: [u8; 241] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page (shared, both threads)
     0x4c, 0x89, 0xfe, // mov rsi, r15
     0x48, 0x81, 0xc6, 0x00, 0x08, 0x00, 0x00, // add rsi, 0x800        ; child stack top
@@ -4008,6 +4022,21 @@ const CLONE_CODE: [u8; 233] = [
     0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202
     0x0f, 0x05, // syscall
     0x49, 0x89, 0x47, 0x28, // mov [r15+40], rax     ; how many it woke
+    // **The child says it has finished writing, and this is the actual bug the
+    // "clone race" was.** The marker at `[r15+56]` is the *parent's* last
+    // store, and the test read all five words the moment it appeared -- but
+    // `[r15+40]` above is written by the **child**, on another CPU, with
+    // nothing ordering the two. So a run where the parent was woken, wrote its
+    // three words and set the marker before the child was scheduled again read
+    // `woke` as **0** and called it a lost race. It was a lost race: the test
+    // racing its own probe, not the child racing the parent.
+    //
+    // Every number in the failing run says so. `wait 0` means the parent's
+    // `FUTEX_WAIT` *returned*, not `EAGAIN`, so it really did sleep; `word 42`
+    // means the child really did set it; `0 futex notifications dirty` rules
+    // out a latched bit waking the parent spuriously. The only word that
+    // disagreed was the one written by the thread that had not run yet.
+    0x49, 0xc7, 0x47, 0x50, 0x01, 0x00, 0x00, 0x00, // mov qword [r15+80], 1
     // The child waits for the test's word and then ends the group -- with the
     // parent parked in a futex it will never be woken from.
     0x49, 0x8b, 0x47, 0x68, // cwait: mov rax, [r15+104]
@@ -4198,7 +4227,15 @@ fn clone_rendezvous_attempt(hhdm_base: u64, cpu: u32, foreign_before: u64) -> bo
                     ],
                 )
             };
-            if marker == MARKER {
+            // **Both writers, not just the parent.** The marker is the
+            // parent's last store; `woke` is the child's. Reading on the
+            // marker alone reads a word whose writer may not have run yet,
+            // which is what produced `woke 0` on a run where everything else
+            // was right. The child sets `[report + 80]` after storing it.
+            // SAFETY: as above.
+            let child_done =
+                unsafe { core::ptr::read_volatile((hhdm_base + report_pa + 80) as *const u64) };
+            if marker == MARKER && child_done != 0 {
                 answers = words;
                 marked = true;
                 break;
@@ -4288,6 +4325,20 @@ fn clone_rendezvous_attempt(hhdm_base: u64, cpu: u32, foreign_before: u64) -> bo
             },
             parked_before_rendezvous,
             syscall::BLOCKED.load(Ordering::Relaxed)
+        );
+        // **The evidence, on the line, because this is rare and the last two
+        // sightings were argued about rather than read.** A notification
+        // holding bits nobody took would explain a wait that returned without
+        // its waker: `notify::wait` swaps the pending word, so a bit latched
+        // earlier is taken as this wait's own wake. That hypothesis was
+        // measured on a passing boot and **found nothing** -- no futex
+        // notification was left dirty -- so it is not the explanation unless
+        // this line says otherwise on a failing one.
+        let (dirty, which) = futex_wakes_left_dirty();
+        let (signals, unwaited, stranded) = notify::statistics();
+        println!(
+            "\x1b[91m    linux clone    at the failure: {dirty} futex notifications dirty (mask \
+             {which:#x}); {signals} signals, {unwaited} found no waiter, {stranded} stranded\x1b[0m"
         );
         return false;
     }
@@ -10476,6 +10527,33 @@ const LINUXD_PROGRAM: &[u8] = b"bin/linuxd";
 const FUTEX_WAKE_SLOT: usize = 4;
 const FUTEX_WAKES: usize = 16;
 
+/// The futex wake notifications, by identity, for the end-of-boot check below.
+static FUTEX_WAKE_IDS: [core::sync::atomic::AtomicU64; FUTEX_WAKES] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; FUTEX_WAKES];
+
+/// How many futex wake notifications still hold bits nobody took, and which.
+///
+/// **Non-destructive**, deliberately: `notify::poll` takes the word, and a
+/// check that consumed the evidence would clear the very thing it is reporting
+/// and change the next boot's behaviour while measuring it.
+fn futex_wakes_left_dirty() -> (usize, u64) {
+    let mut dirty = 0;
+    let mut which = 0u64;
+    for (index, id) in FUTEX_WAKE_IDS.iter().enumerate() {
+        let raw = id.load(core::sync::atomic::Ordering::Acquire);
+        if raw == u64::MAX {
+            continue;
+        }
+        let notification =
+            crate::notify::NotificationId::from_parts(raw as u32, (raw >> 32) as u32);
+        if crate::notify::peek(notification) != 0 {
+            dirty += 1;
+            which |= 1 << index;
+        }
+    }
+    (dirty, which)
+}
+
 fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     // **An envelope that allows children**, which is what `execve` needs — RFC
     // 0033 step 5. A hosted process that execs becomes a *new* domain, and the
@@ -10591,8 +10669,26 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     // its size is a fixed limit: this many hosted threads may sleep in a futex
     // at once, and the adapter refuses the next with EAGAIN rather than
     // silently losing it.
-    for index in 0..FUTEX_WAKES {
+    for (index, recorded) in FUTEX_WAKE_IDS.iter().enumerate() {
         let wake = crate::notify::create().map_err(|_| "a futex wake would not be created")?;
+        // **Kept so the boot can ask whether any of them was left dirty.** A
+        // notification latches the bits a signal sets and holds them until a
+        // waiter takes them -- RFC 0010, and `notify`'s own test asserts it. If
+        // a sleeper were signalled and then never parked, the bit would stay,
+        // and the *next* hosted thread in that slot would take it as its own
+        // wake.
+        //
+        // That was a hypothesis about the `linux clone` intermittent on
+        // 2026-08-27, and measuring it before building on it is the only reason
+        // it is known to be **wrong**: no futex notification has ever been found
+        // dirty, on a passing boot or on a failing one. The cause was elsewhere
+        // -- the test read the child's word before the child had written it.
+        // The check stays because it costs nothing and rules out a whole class
+        // in one glance.
+        recorded.store(
+            u64::from(wake.generation()) << 32 | u64::from(wake.index()),
+            core::sync::atomic::Ordering::Release,
+        );
         let handed = crate::notify::name(wake)
             .ok()
             .and_then(|root| {

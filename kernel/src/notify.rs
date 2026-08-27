@@ -559,6 +559,17 @@ pub fn has_bound(thread: u32) -> bool {
     })
 }
 
+/// Reads the pending word **without taking it**. Zero means nothing is pending.
+///
+/// [`poll`] is the taking read, and every caller that wants the bits should use
+/// it. This exists for a check that must not change what it measures: a
+/// notification left holding bits nobody took is a defect, and a report that
+/// cleared them while counting them would fix the next boot and hide the fault.
+#[must_use]
+pub fn peek(id: NotificationId) -> u64 {
+    resolve(id).map_or(0, |slot| slot.pending.load(Ordering::Acquire))
+}
+
 /// Takes the pending word without blocking. Zero means nothing is pending.
 #[must_use]
 pub fn poll(id: NotificationId) -> u64 {
