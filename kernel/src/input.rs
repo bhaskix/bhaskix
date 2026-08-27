@@ -343,6 +343,36 @@ pub fn read() -> u8 {
     }
 }
 
+/// The same counters, **kept apart** — serial, then the keyboard ring.
+///
+/// # Why the sum was not enough
+///
+/// [`statistics`] adds the two rings together, and a total cannot answer the
+/// question somebody actually has on a machine whose keyboard seems dead:
+/// *did anything arrive from the keyboard at all?* On the SR550 that question
+/// could not be answered from a boot log on 2026-08-27 — the report said
+/// `keyboard i8042 present, irq 1 -> vector 0xfc` and never said whether a key
+/// had followed. Serial-over-LAN cannot be typed at on that machine (the BMC
+/// redirects COM2, which Bhaskix uses for output only), so the shell command
+/// that reads these counters needs a working keyboard to run, which is
+/// precisely what is in doubt.
+///
+/// Returns `(serial received, serial dropped, keyboard received, keyboard
+/// dropped)`. The *scancode* count behind the keyboard ring is
+/// [`crate::keyboard::scancodes`], and the two differ on purpose: a key release
+/// and a modifier are scancodes that emit no byte, so `scancodes > 0` with
+/// `keyboard received == 0` says the i8042 is delivering and the decoder is
+/// swallowing, which is a different fault from silence.
+#[must_use]
+pub fn per_source() -> (u64, u64, u64, u64) {
+    (
+        SERIAL.received.load(Ordering::Relaxed),
+        SERIAL.dropped.load(Ordering::Relaxed),
+        KEYBOARD.received.load(Ordering::Relaxed),
+        KEYBOARD.dropped.load(Ordering::Relaxed),
+    )
+}
+
 /// How much has arrived, been dropped, and how many interrupts delivered it.
 #[must_use]
 pub fn statistics() -> (u64, u64, u64) {

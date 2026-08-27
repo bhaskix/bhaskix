@@ -1060,6 +1060,33 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             });
         }
 
+        // **Where each byte came from, and not just how many.** A total
+        // cannot answer the question somebody has when a keyboard seems dead:
+        // did anything arrive from it at all? On the SR550 on 2026-08-27 that
+        // could not be answered from a boot log — the report said `keyboard
+        // i8042 present, irq 1 -> vector 0xfc` and never said whether a key had
+        // followed — and the shell command that reads these counters needs a
+        // working keyboard to run, which is the thing in doubt. That machine
+        // cannot be typed at over serial either: the BMC redirects COM2, which
+        // this kernel uses for output only.
+        //
+        // **Scancodes are reported beside bytes because they are different
+        // facts.** A key release and a modifier are scancodes that emit no
+        // byte, so `scancodes` moving while `keyboard` stays at zero says the
+        // i8042 is delivering and the decoder is swallowing — a different
+        // fault from silence, and indistinguishable in a sum.
+        let (serial_in, serial_lost, keys_in, keys_lost) = input::per_source();
+        let scancodes = keyboard::scancodes();
+        println!(
+            "    input by src   serial {serial_in} ({serial_lost} dropped); keyboard {keys_in} \
+             from {scancodes} i8042 scancodes ({keys_lost} dropped){}",
+            if scancodes == 0 {
+                " -- nothing typed yet, which is expected: this prints before anyone can"
+            } else {
+                ""
+            }
+        );
+
         let (dirty, which) = futex_wakes_left_dirty();
         if dirty > 0 {
             println!(

@@ -1035,6 +1035,42 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-27 (input counters by source, and a one-shot notice that had to be taken back out)
+
+**The question the SR550 could not answer.** Its boot report says
+`keyboard i8042 present, irq 1 -> vector 0xfc` and then never says whether a key
+followed, so *"is the keyboard working?"* had no answer in a log. The counters
+existed all along — `input` keeps a `SERIAL` ring and a `KEYBOARD` ring, each
+with `received` and `dropped`, and `keyboard::scancodes()` has counted raw codes
+since it was written and **was called from nowhere**, the second dead accessor
+found this week.
+
+**What was added.** `input::per_source()` returns the two rings apart; the boot
+report prints `input by src`; and the kernel shell's `input` command breaks its
+line out the same way. Scancodes are reported *beside* bytes because they are
+different facts: a key release and a modifier are scancodes that emit no byte,
+so scancodes moving while the keyboard column stays at zero says the i8042 is
+delivering and the decoder is swallowing — a different fault from silence, and
+invisible in a sum.
+
+**What was tried and taken back out, which is the part worth recording.** A
+one-shot line on the first scancode — *"first key seen, it is delivering"* —
+would answer the question without anything being read back. It was built, and it
+broke the keyboard lane immediately: the notice prints when the first scancode
+arrives, which is **between the prompt and the shell's echo of that key**, so it
+splits the very line the person is typing. That is precisely the defect the whole
+day was spent removing from the console, reintroduced by the instrument meant to
+help. Removed.
+
+**And the counters cannot be read where the question is asked.** The SR550 boots
+to the **ring 3** shell, which holds capabilities rather than kernel statistics,
+so `input` is not one of its commands — a gate written against it failed with
+`input: not a command`, correctly. The boot line prints before anyone can type,
+and that machine cannot be typed at over serial at all. **So what shipped is a
+baseline and a breakdown, not a live answer on that machine**, and saying so is
+better than implying otherwise: the report now shows what had arrived by the
+time it printed, and a `shell=kernel` boot can show the live split.
+
 ### 2026-08-27 (the SR550's `14 of 5 bytes` reproduced on QEMU, and the convention that was supposed to prevent it became a mechanism)
 
 **The third console bug of the day, and the same shape as the other two.**

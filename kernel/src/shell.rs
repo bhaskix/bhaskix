@@ -385,6 +385,17 @@ fn disk() -> Outcome {
 fn input_statistics() -> Outcome {
     let (received, dropped, interrupts) = crate::input::statistics();
     println!("  {received} bytes in {interrupts} interrupts, {dropped} dropped");
+    // **Broken out, because the total cannot say whether the keyboard works.**
+    // A machine whose keys do nothing needs to know which half is silent, and
+    // the scancode count is a third thing again: a key release and a modifier
+    // are scancodes that emit no byte, so scancodes without bytes means the
+    // i8042 is delivering and the decoder is swallowing.
+    let (serial, serial_lost, keys, keys_lost) = crate::input::per_source();
+    let scancodes = crate::keyboard::scancodes();
+    println!(
+        "  serial {serial} ({serial_lost} dropped), keyboard {keys} from {scancodes} scancodes \
+         ({keys_lost} dropped)"
+    );
     Outcome::Ran
 }
 
