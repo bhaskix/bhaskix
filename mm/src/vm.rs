@@ -261,6 +261,104 @@ impl RangeMap {
         }
     }
 
+    /// Gives `[start, start + pages)` a new protection, **splitting** the
+    /// region it falls inside if it is only part of one.
+    ///
+    /// # Why this is here and not in `AddressSpace::protect`
+    ///
+    /// Splitting a live range is the part with the failure modes, and it is
+    /// pure: it moves entries in a sorted array and touches no page table. Kept
+    /// here it can be tested on a host without a machine, which is what the rest
+    /// of `protect` cannot be. `MAP_AT`'s own comment called this *"a different
+    /// piece of work with its own failure modes"* and deferred it; these are
+    /// the failure modes, handled where they can be watched.
+    ///
+    /// # What it refuses
+    ///
+    /// A range that is not wholly inside **one** region. Spanning two is a
+    /// different operation — the regions may differ in backing, and merging that
+    /// question into this one is how a caller silently reprotects memory it did
+    /// not name.
+    ///
+    /// # Why the reserve comes first
+    ///
+    /// A split turns one region into as many as three, so the array may need to
+    /// grow twice. **Growing after the original is removed is the bug this
+    /// ordering exists to prevent**: an allocation failure there would leave the
+    /// map with a hole where a live mapping used to be, and the page tables
+    /// still pointing at it — memory that is mapped and that the map says is
+    /// free. So the space is reserved while the map is still whole, and a
+    /// refusal happens before anything is disturbed.
+    ///
+    /// Answers the range whose pages the caller must now reprotect, which is
+    /// the middle piece.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeMapError::NotFound`] if no single region holds the whole range,
+    /// [`RangeMapError::OutOfMemory`] if the array cannot make room.
+    pub fn reprotect(
+        &mut self,
+        start: VirtAddr,
+        pages: u64,
+        protection: Protection,
+    ) -> Result<VirtRange, RangeMapError> {
+        let Some(wanted) = VirtRange::from_pages(start, pages) else {
+            return Err(RangeMapError::NotFound);
+        };
+        let region = *self.find(start).ok_or(RangeMapError::NotFound)?;
+        // Wholly inside, and `contains` is not enough on its own: a range that
+        // starts inside and ends past the end is the spanning case above.
+        if wanted.start.as_u64() < region.range.start.as_u64()
+            || wanted.end.as_u64() > region.range.end.as_u64()
+        {
+            return Err(RangeMapError::NotFound);
+        }
+
+        let head = (wanted.start.as_u64() > region.range.start.as_u64())
+            .then(|| {
+                VirtRange::from_pages(
+                    region.range.start,
+                    (wanted.start.as_u64() - region.range.start.as_u64()) / crate::FRAME_SIZE,
+                )
+            })
+            .flatten();
+        let tail = (wanted.end.as_u64() < region.range.end.as_u64())
+            .then(|| {
+                VirtRange::from_pages(
+                    wanted.end,
+                    (region.range.end.as_u64() - wanted.end.as_u64()) / crate::FRAME_SIZE,
+                )
+            })
+            .flatten();
+
+        // Before anything is removed. See above.
+        let extra = usize::from(head.is_some()) + usize::from(tail.is_some());
+        self.regions
+            .try_reserve(extra)
+            .map_err(|_| RangeMapError::OutOfMemory)?;
+
+        self.remove(region.range.start)?;
+        // Every piece keeps the original's backing and flags; only the middle's
+        // protection changes. A head or tail that lost its backing would be a
+        // region the fault handler could not service.
+        let mut middle = region;
+        middle.range = wanted;
+        middle.protection = protection;
+        self.insert(middle)?;
+        if let Some(head) = head {
+            let mut piece = region;
+            piece.range = head;
+            self.insert(piece)?;
+        }
+        if let Some(tail) = tail {
+            let mut piece = region;
+            piece.range = tail;
+            self.insert(piece)?;
+        }
+        Ok(wanted)
+    }
+
     /// Number of regions.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -430,6 +528,124 @@ mod tests {
             Protection::ReadWrite,
             Backing::Anonymous,
         )
+    }
+
+    const PAGE: u64 = crate::FRAME_SIZE;
+
+    /// The middle of a region becomes its own, and the two ends survive.
+    ///
+    /// **This is what glibc's start-up needs.** A static-PIE binary re-protects
+    /// its RELRO segment, which is a sub-range of a larger one it was loaded
+    /// into; `protect` refused it because it required the range to be exactly a
+    /// whole region, and BusyBox printed *"cannot apply additional memory
+    /// protection after relocation"* and gave up.
+    #[test]
+    fn reprotecting_the_middle_splits_the_region_in_three() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 8)).expect("room");
+
+        let changed = map
+            .reprotect(VirtAddr(0x1000 + 2 * PAGE), 3, Protection::ReadOnly)
+            .expect("the middle is inside the region");
+        assert_eq!(changed.start.as_u64(), 0x1000 + 2 * PAGE);
+        assert_eq!(map.len(), 3, "head, middle and tail");
+
+        let head = map.find(VirtAddr(0x1000)).expect("head");
+        let middle = map.find(VirtAddr(0x1000 + 2 * PAGE)).expect("middle");
+        let tail = map.find(VirtAddr(0x1000 + 5 * PAGE)).expect("tail");
+        assert_eq!(
+            head.protection,
+            Protection::ReadWrite,
+            "the head is untouched"
+        );
+        assert_eq!(
+            middle.protection,
+            Protection::ReadOnly,
+            "the middle changed"
+        );
+        assert_eq!(
+            tail.protection,
+            Protection::ReadWrite,
+            "the tail is untouched"
+        );
+        // Every piece keeps what the fault handler needs to service it. A head
+        // that lost its backing is a region that faults and cannot be helped.
+        assert_eq!(head.backing, Backing::Anonymous);
+        assert_eq!(tail.backing, Backing::Anonymous);
+        // And the three cover exactly what the one did, with no gap and no
+        // overlap -- a gap here is memory that is mapped and that the map
+        // believes is free.
+        assert_eq!(head.range.end.as_u64(), middle.range.start.as_u64());
+        assert_eq!(middle.range.end.as_u64(), tail.range.start.as_u64());
+        assert_eq!(tail.range.end.as_u64(), 0x1000 + 8 * PAGE);
+    }
+
+    /// A range at either end splits in two, not three.
+    #[test]
+    fn reprotecting_an_edge_leaves_two_regions() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 4)).expect("room");
+        map.reprotect(VirtAddr(0x1000), 1, Protection::ReadOnly)
+            .expect("the first page is inside");
+        assert_eq!(map.len(), 2, "no empty head is inserted");
+
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 4)).expect("room");
+        map.reprotect(VirtAddr(0x1000 + 3 * PAGE), 1, Protection::ReadOnly)
+            .expect("the last page is inside");
+        assert_eq!(map.len(), 2, "no empty tail is inserted");
+    }
+
+    /// The whole region keeps the old behaviour and does not split.
+    #[test]
+    fn reprotecting_a_whole_region_changes_it_in_place() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 4)).expect("room");
+        map.reprotect(VirtAddr(0x1000), 4, Protection::ReadOnly)
+            .expect("exactly the region");
+        assert_eq!(map.len(), 1, "nothing to split");
+        assert_eq!(
+            map.find(VirtAddr(0x1000)).expect("region").protection,
+            Protection::ReadOnly
+        );
+    }
+
+    /// A range that leaves the region is refused, and **nothing moves**.
+    ///
+    /// Spanning two regions is a different operation: they may differ in
+    /// backing, and answering it here is how a caller reprotects memory it did
+    /// not name. The map must be exactly as it was.
+    #[test]
+    fn a_range_that_runs_past_the_region_is_refused_and_changes_nothing() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 4)).expect("room");
+        map.insert(region(0x1000 + 4 * PAGE, 4)).expect("room");
+
+        let refused = map.reprotect(VirtAddr(0x1000 + 2 * PAGE), 4, Protection::ReadOnly);
+        assert!(refused.is_err(), "it runs into the second region");
+        assert_eq!(map.len(), 2, "and the map is untouched");
+        assert_eq!(
+            map.find(VirtAddr(0x1000)).expect("first").protection,
+            Protection::ReadWrite
+        );
+        assert_eq!(
+            map.find(VirtAddr(0x1000 + 4 * PAGE))
+                .expect("second")
+                .protection,
+            Protection::ReadWrite
+        );
+    }
+
+    /// A range in no region at all is refused.
+    #[test]
+    fn a_range_in_no_region_is_refused() {
+        let mut map = RangeMap::new();
+        map.insert(region(0x1000, 2)).expect("room");
+        assert!(
+            map.reprotect(VirtAddr(0x9000), 1, Protection::ReadOnly)
+                .is_err()
+        );
+        assert_eq!(map.len(), 1);
     }
 
     #[test]

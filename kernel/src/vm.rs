@@ -748,17 +748,24 @@ impl AddressSpace {
         pages: u64,
         protection: Protection,
     ) -> Result<(), VmError> {
-        let region = *self
+        // **A sub-range splits the region rather than being refused** — the
+        // map does that part, where it is pure and testable. This required the
+        // range to be *exactly* a whole region until 2026-08-27, and a static
+        // glibc binary re-protects the RELRO **sub-range** of the larger segment
+        // it was loaded into: BusyBox printed *"cannot apply additional memory
+        // protection after relocation"* and gave up, which is what that refusal
+        // looked like from the far side.
+        //
+        // The map is asked first and answers the range to reprotect, so nothing
+        // is written to a page table for a split that could not be recorded.
+        let changed = self
             .regions
-            .find(start)
-            .ok_or(VmError::Region(RangeMapError::NotFound))?;
-        if region.range.start != start || region.range.pages() != pages {
-            return Err(VmError::Region(RangeMapError::NotFound));
-        }
+            .reprotect(start, pages, protection)
+            .map_err(VmError::Region)?;
 
         let root = self.root;
         let hhdm = self.hhdm_base;
-        for page in region.range.pages_iter() {
+        for page in changed.pages_iter() {
             let flags = Self::entry_flags(protection, page.as_u64());
             // SAFETY: `root` is this space's PML4, and a page the region
             // covers. A page with no mapping yet is left alone by
@@ -767,10 +774,8 @@ impl AddressSpace {
             let _ = unsafe { paging::protect_page(root, page.as_u64(), flags, hhdm) };
         }
 
-        self.regions.remove(region.range.start)?;
-        let mut updated = region;
-        updated.protection = protection;
-        self.regions.insert(updated)?;
+        // The map was updated before the page tables were touched, so there is
+        // nothing to put back here.
         Ok(())
     }
 

@@ -3436,10 +3436,21 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     let mut entropy = [0u8; 16];
     entropy[..8].copy_from_slice(&random[0].to_le_bytes());
     entropy[8..].copy_from_slice(&random[1].to_le_bytes());
-    let args: [&[u8]; 1] = [b"go-hello"];
+    // **The corpus's own name, and for BusyBox a name it answers to.** BusyBox
+    // is a multi-call binary: it reads `argv[0]` and runs the applet with that
+    // name, so a program handed `go-hello` looks the name up, does not find it,
+    // and says so -- which is exactly what it did on the first boot it got this
+    // far, and is BusyBox working rather than failing. `echo` is asked for here
+    // because its output is unmistakable and it needs nothing from a
+    // filesystem.
+    let args: &[&[u8]] = if busybox {
+        &[b"echo", b"hello from busybox"]
+    } else {
+        &[b"go-hello"]
+    };
     let env: [&[u8]; 0] = [];
     let builder = Builder::new(
-        &args,
+        args,
         &env,
         ProcessInfo {
             entry,

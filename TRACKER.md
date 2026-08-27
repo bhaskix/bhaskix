@@ -1123,6 +1123,73 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-27 (`hello from busybox` — a program nobody here wrote produced correct output)
+
+    hello from busybox
+
+**BusyBox's `echo` applet, on Bhaskix, in sixteen calls.** The full trace:
+`geteuid, getuid, getgid, getegid, arch_prctl, brk, brk, arch_prctl, uname,
+readlink, brk, brk, mprotect, prctl, getuid, write`. It loads through this
+kernel's own ELF loader into a Linux-tagged domain, glibc relocates itself,
+BusyBox reads `argv[0]`, finds the applet and prints.
+
+**Region splitting is what unblocked it.** `AddressSpace::protect` required the
+range to be **exactly one whole region**, and a static-PIE glibc re-protects the
+RELRO **sub-range** of the larger segment it was loaded into. That refusal is
+what BusyBox reported as *"cannot apply additional memory protection after
+relocation"*.
+
+**The split lives in `RangeMap`, not in `AddressSpace`, and that is the point.**
+Splitting a live range is the half with the failure modes and it is *pure* — it
+moves entries in a sorted array and touches no page table — so it can be tested
+on a host without a machine, which the rest of `protect` cannot. Five host tests:
+the middle splits in three with head and tail keeping their backing and the three
+covering exactly what the one did; an edge splits in two rather than inserting an
+empty piece; a whole region still changes in place; a range running past its
+region is refused **and the map is unchanged**; a range in no region is refused.
+
+**The ordering inside it is the safety property.** The array may have to grow
+twice, and growing *after* the original is removed is the bug the ordering
+prevents: an allocation failure there would leave a hole where a live mapping
+used to be, with the page tables still pointing at it — memory that is mapped and
+that the map believes is free. So the space is reserved while the map is whole,
+and a refusal happens before anything is disturbed. The map is also updated
+before any page table is touched, so nothing is written for a split that could
+not be recorded.
+
+**One step before that, `argv[0]` was the whole problem, and BusyBox was right.**
+The corpus harness passed `go-hello` to every program, so BusyBox — a multi-call
+binary that runs the applet named by `argv[0]` — looked it up, did not find it,
+and printed `go-hello: applet not found`. That is BusyBox **working**. The
+harness now asks for `echo` when it is loading BusyBox.
+
+**What this is not.** One applet, with argv chosen by the harness. No shell, no
+filesystem breadth, and `readlink("/proc/self/exe")` is still refused — BusyBox
+carries on without it. L1's row says so.
+
+### 2026-08-27 (a 250-boot soak that proves nothing, because I rebuilt the image under it)
+
+**Started to hunt a specimen of either open intermittent** — the kernel page
+fault after the migration self-test, or the per-CPU hold-count underflow, both of
+which are instrumented and waiting for one. It reported **89 of 250 boots
+failed**, and every failure is `vfs FAILED: a listing shows what is directly
+under a directory`: the `bin == 17` count, which I changed to 18 partway through
+by adding `bin/busybox` and rebuilding.
+
+**So the run is void as a measurement**, and the reason is mine: a soak boots
+whatever image is on disk, and I rebuilt that image repeatedly while it ran. This
+project has already written the rule down twice — *"a reproduction that reuses a
+cached build is not a reproduction"*, and the shell harness's note that *"a `make`
+running beside a suite left a torn image"* and made a failure "reproduce" three
+times. Recorded rather than quietly re-run, because an invalid experiment
+reported as data is worse than no experiment.
+
+**What it does say, for what little it is worth:** all 250 preserved logs were
+scanned for the signatures both open defects arm — `kernel's own bug`,
+`FRAME CHANGED`, `COUNT UNDERFLOW`, `BLOCK HOLDING`, `SAVED COUNT` — and **none
+appears in any of them**. That is not a bound on either rate, because the boots
+were not all of one build.
+
 ### 2026-08-27 (BusyBox runs, prints and exits on Bhaskix — L1's first program that nobody here wrote)
 
 **`no BusyBox has run` is no longer true.** A static BusyBox 1.30.1 is in the
