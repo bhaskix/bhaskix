@@ -79,6 +79,14 @@ HELLO_BPK    := build/hello.bpk
 # boot test says the corpus is absent rather than failing.
 GO           := $(shell command -v go 2>/dev/null)
 GO_HELLO     := build/go-hello
+# The L1 corpus: a real static BusyBox, the first program in this project's
+# history that somebody else wrote, built by somebody else, for Linux. Taken
+# from the build machine if it has one and *statically linked* -- a dynamic one
+# would need the interpreter L2 is about, and would fail for that reason rather
+# than for anything this adapter does. Absent is reported, not fatal, exactly as
+# the Go corpus is.
+BUSYBOX_SRC  := $(shell for c in /bin/busybox /usr/bin/busybox; do                    if [ -x "$$c" ] && file -L "$$c" 2>/dev/null | grep -q 'statically linked';                    then echo "$$c"; break; fi; done)
+BUSYBOX      := build/busybox
 GREEDY_BPK   := build/greedy.bpk
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 USER_SUP     := $(SUP_DIR)/target/$(TARGET)/release/sup
@@ -266,13 +274,14 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(GO_HELLO)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(GO_HELLO) $(BUSYBOX)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
 	    --file bin/go-hello=$(GO_HELLO) \
+	    --file bin/busybox=$(BUSYBOX) \
 	    \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
 	./$(MKIMAGE) $@.again $(INITRD_ROOT).again --root . --static $(INITRD_DIR) \
@@ -280,6 +289,7 @@ $(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | 
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
 	    --file bin/go-hello=$(GO_HELLO) \
+	    --file bin/busybox=$(BUSYBOX) \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
 	cmp $@ $@.again
 	@rm -rf $@.again $(INITRD_ROOT).again
@@ -317,6 +327,18 @@ $(HELLO): $(HELLO_DIR)/src/main.rs $(HELLO_DIR)/link.ld $(HELLO_DIR)/Cargo.toml 
 
 # The Go corpus program. `-ldflags -s -w` strips it: the loader does not
 # read symbols and the image does not need 400 KiB of them.
+# The BusyBox corpus, copied rather than built: this is deliberately somebody
+# else's binary, unmodified, so that what it asks for is not a thing this
+# project chose.
+$(BUSYBOX):
+	@mkdir -p $(dir $@)
+	@if [ -n "$(BUSYBOX_SRC)" ]; then \
+	    cp $(BUSYBOX_SRC) $@ && echo "staged $@ from $(BUSYBOX_SRC) ($$(stat -c%s $@) bytes)"; \
+	else \
+	    : > $@; \
+	    echo "no static busybox on this machine: $@ left empty, the corpus gate will say so"; \
+	fi
+
 $(GO_HELLO): corpus/hello.go
 	@mkdir -p $(dir $@)
 	@if [ -n "$(GO)" ]; then \

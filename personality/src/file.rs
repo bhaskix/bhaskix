@@ -597,14 +597,30 @@ pub const UTSNAME_BYTES: usize = UTSNAME_FIELD * 6;
 /// Linux, and the two fields below say so in the place a reader of `uname -a`
 /// will actually look.
 ///
-/// **`release` is deliberately not a plausible Linux version.** Programs gate
-/// features on it — glibc refuses to start below a minimum, and runtimes pick
-/// syscalls by it — so reporting `6.x` would promise a syscall surface this
-/// adapter does not have and turn a clean refusal into an `ENOSYS` in a
-/// corner. A program that declines to run against `0.0.0` has refused
-/// *loudly*, which is the better failure. **The trigger for revisiting is the
-/// first program observed to refuse for this reason**, and the number it
-/// needs; until then this is a claim this system can defend.
+/// **`release` was `0.0.0-bhaskix`, and the trigger written here for changing
+/// it fired on 2026-08-27.** The reasoning was: programs gate features on this
+/// field — glibc refuses to start below a minimum, and runtimes pick syscalls
+/// by it — so reporting `6.x` would promise a syscall surface this adapter does
+/// not have. A program that declined to run against `0.0.0` would refuse
+/// *loudly*, which is the better failure. **The trigger for revisiting was the
+/// first program observed to refuse for this reason, and the number it needs.**
+///
+/// **BusyBox is that program.** Statically linked against glibc, it started on
+/// this machine, called `uname`, and printed `FATAL: kernel too old` through
+/// `writev` before raising a signal at itself. The number it needs is in its own
+/// ELF note: *for GNU/Linux 3.2.0*.
+///
+/// So the field is **3.2.0-bhaskix** — the least version that lets the first
+/// observed program start, and deliberately not a modern one. The original
+/// worry stands and decides the digits: claiming `6.x` would promise things
+/// this adapter has not got. What claiming `0.0.0` also did, and the earlier
+/// reasoning missed, is promise *nothing* — while this adapter answers
+/// `openat`, `pipe2`, `dup3` and `getdents64`, none of which existed before
+/// 2.6.27. A version below every syscall it implements is not the cautious
+/// claim it looks like.
+///
+/// The version field below still says what this is, in the place a reader of
+/// `uname -a` looks.
 pub fn write_utsname(out: &mut [u8]) -> Result<(), i64> {
     if out.len() < UTSNAME_BYTES {
         return Err(errno::EINVAL);
@@ -614,8 +630,9 @@ pub fn write_utsname(out: &mut [u8]) -> Result<(), i64> {
         // The ABI, which is the question being asked.
         "Linux",
         "bhaskix",
-        // Not a Linux version, on purpose. See above.
-        "0.0.0-bhaskix",
+        // The least version a glibc program will start against, and not one
+        // digit more. See above for why both halves matter.
+        "3.2.0-bhaskix",
         "Bhaskix, a capability system; Linux is the ABI and not the kernel",
         "x86_64",
         // No NIS domain, which Linux itself reports as this exact string
@@ -876,9 +893,18 @@ mod tests {
         // `sysname` above has become a plain lie.
         assert!(field(3).contains("Bhaskix"), "version: {}", field(3));
         assert!(field(2).contains("bhaskix"), "release: {}", field(2));
-        // **Not a plausible Linux version**, deliberately: a program that
-        // gates on it should refuse loudly rather than proceed into ENOSYS.
-        assert!(field(2).starts_with("0."), "release: {}", field(2));
+        // **The least version a glibc program starts against, and not one
+        // digit more.** This asserted `0.` until 2026-08-27, on the reasoning
+        // that a program gating on the field should refuse loudly rather than
+        // proceed into `ENOSYS`. BusyBox refused loudly -- `FATAL: kernel too
+        // old` -- which was the trigger `write_utsname` wrote down for changing
+        // it, and 3.2.0 is the number its own ELF note asks for.
+        //
+        // Pinned at both ends on purpose. Below 3.2 a glibc program will not
+        // start; at 4 or above this would be promising a syscall surface the
+        // adapter has not got, which is the worry the original comment had and
+        // which has not gone away.
+        assert!(field(2).starts_with("3.2."), "release: {}", field(2));
     }
 
     #[test]

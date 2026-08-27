@@ -1953,8 +1953,49 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
 
 /// How many foreign (Linux-dialect) system calls have been refused.
 pub static FOREIGN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// The first eight foreign syscall numbers seen, for the boot report — the
-/// self-test asserts the exact sequence its probe issued.
+/// The domain whose foreign calls are being recorded, or `u32::MAX` for none.
+///
+/// **Because [`FOREIGN_SEEN`] never showed what the corpus asked.** That table
+/// is indexed by the *global* call counter, so it holds the first thirty-two
+/// foreign calls of the whole boot — and the corpus runs long after the
+/// eightieth. The line that reads `N calls, first asked: …` has therefore been
+/// printing the boot's opening calls under a corpus's name since it was
+/// written, which two corpus runs printing **identical** lists is the proof of.
+///
+/// This records one domain's calls, in order, from the moment it is armed.
+pub static TRACED_DOMAIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// The numbers that domain asked for, in order.
+pub static TRACED_SEEN: [core::sync::atomic::AtomicU64; 64] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 64];
+
+/// How many it has asked, which may exceed what [`TRACED_SEEN`] holds.
+pub static TRACED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Starts recording `domain`'s foreign calls, discarding any previous run.
+pub fn trace_domain(domain: u32) {
+    use core::sync::atomic::Ordering;
+    TRACED_CALLS.store(0, Ordering::Relaxed);
+    for slot in TRACED_SEEN.iter() {
+        slot.store(u64::MAX, Ordering::Relaxed);
+    }
+    TRACED_DOMAIN.store(domain, Ordering::Release);
+}
+
+/// Stops recording, and answers how many calls were seen.
+pub fn stop_tracing() -> u64 {
+    use core::sync::atomic::Ordering;
+    TRACED_DOMAIN.store(u32::MAX, Ordering::Release);
+    TRACED_CALLS.load(Ordering::Relaxed)
+}
+
+/// The first foreign syscall numbers of the **boot**, for the boot report —
+/// the self-test asserts the exact sequence its probe issued.
+///
+/// Indexed by the global call counter, so it holds the opening calls of the
+/// machine and not of any one program. [`TRACED_SEEN`] is the per-domain
+/// answer, and exists because this one was read as though it were.
 pub static FOREIGN_SEEN: [core::sync::atomic::AtomicU64; 32] =
     [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 32];
 
@@ -2052,6 +2093,14 @@ fn foreign_call(frame: &mut SyscallFrame) {
     let count = FOREIGN_CALLS.fetch_add(1, Ordering::Relaxed);
     if let Some(slot) = FOREIGN_SEEN.get(count as usize) {
         slot.store(number, Ordering::Relaxed);
+    }
+    // And this caller's own, if somebody is watching it -- see `TRACED_DOMAIN`
+    // for why the table above cannot answer that question.
+    if call.domain == TRACED_DOMAIN.load(Ordering::Acquire) {
+        let at = TRACED_CALLS.fetch_add(1, Ordering::Relaxed);
+        if let Some(slot) = TRACED_SEEN.get(at as usize) {
+            slot.store(number, Ordering::Relaxed);
+        }
     }
     let mut event = [0u8; 16];
     event[..8].copy_from_slice(&number.to_le_bytes());

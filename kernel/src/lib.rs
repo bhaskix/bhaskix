@@ -955,11 +955,25 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux clone    FAILED\x1b[0m");
     }
-    if !go_corpus_self_test(
+    if !corpus_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
+        false,
     ) {
         println!("\x1b[91m    go corpus      FAILED\x1b[0m");
+    }
+    // **The L1 corpus, and the first program here nobody in this project
+    // wrote.** RFC 0005's instruction is to trace the binary rather than reason
+    // about it, and the Go corpus has been doing that for one program built
+    // from a source file in this tree. BusyBox is somebody else's binary,
+    // unmodified: what it asks for is not a thing anybody here chose, and the
+    // numbers it is refused are the L1 work queue.
+    if !corpus_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+        true,
+    ) {
+        println!("\x1b[91m    busybox        FAILED\x1b[0m");
     }
     personality_boundary_report();
     frames_report();
@@ -3319,6 +3333,20 @@ const GO_STACK_AT: u64 = 0x0000_7ffe_0000_0000;
 const GO_STACK_PAGES: u64 = 8;
 /// The corpus program, in the image.
 const GO_PROGRAM: &[u8] = b"bin/go-hello";
+/// The L1 corpus: a real static BusyBox, in the image.
+///
+/// **The first program here that nobody in this project wrote.** The Go corpus
+/// was built from a source file in `corpus/`; this is somebody else's binary,
+/// unmodified, so what it asks for is not a thing this project chose.
+const BUSYBOX_PROGRAM: &[u8] = b"bin/busybox";
+
+/// Which corpus program the next `ring3_corpus` thread should load.
+///
+/// A static rather than an argument because the entry point's signature is
+/// `extern "C" fn(u64) -> !` and the `u64` is already the direct map base. Set
+/// before the spawn and read once at the top; the two corpus tests run one
+/// after the other, never at once.
+static CORPUS_PROGRAM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// The thread that becomes RFC 0005 step 7's Tier 0 attempt: a **real static
 /// Go binary**, loaded by this kernel's own fuzz-hardened ELF loader into a
@@ -3336,14 +3364,20 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     use vm::AddressSpace;
 
     let stop = || -> ! { sched::exit() };
-    let Ok(file) = vfs::open(GO_PROGRAM) else {
-        println!("\x1b[93m    go corpus      absent: no bin/go-hello in the image\x1b[0m");
+    let busybox = CORPUS_PROGRAM.load(core::sync::atomic::Ordering::Acquire) == 1;
+    let (program, label) = if busybox {
+        (BUSYBOX_PROGRAM, "busybox")
+    } else {
+        (GO_PROGRAM, "go corpus")
+    };
+    let Ok(file) = vfs::open(program) else {
+        println!("\x1b[93m    {label}      absent from the image\x1b[0m");
         stop()
     };
     let bytes = file.bytes();
     if bytes.is_empty() {
         println!(
-            "\x1b[93m    go corpus      skipped: bin/go-hello is empty, which means this              machine had no Go toolchain when the image was built\x1b[0m"
+            "\x1b[93m    {label}      skipped: the staged file is empty, which means this              machine had no Go toolchain when the image was built\x1b[0m"
         );
         stop()
     }
@@ -3353,7 +3387,7 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     // The program headers, before the load, because the auxiliary vector
     // must tell the runtime where they are *in its own space*.
     let Ok(parsed) = elf::parse(bytes) else {
-        println!("\x1b[91m    go corpus      FAILED: the loader refused the binary\x1b[0m");
+        println!("\x1b[91m    {label}      FAILED: the loader refused the binary\x1b[0m");
         stop()
     };
     let entry = parsed.entry;
@@ -3381,7 +3415,7 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
         .map(|segment| segment.address + (phoff - segment.file_offset) as u64)
         .unwrap_or(0);
     if elf::load_into(&parsed, bytes, &mut space, hhdm_base).is_err() {
-        println!("\x1b[91m    go corpus      FAILED: the segments would not map\x1b[0m");
+        println!("\x1b[91m    {label}      FAILED: the segments would not map\x1b[0m");
         stop()
     }
     let Some(stack) = VirtRange::from_pages(VirtAddr(GO_STACK_AT), GO_STACK_PAGES) else {
@@ -3838,18 +3872,25 @@ fn personality_boundary_report() {
 /// the ones this personality could not answer named. Whether the program
 /// reaches `main` is the headline; what it asked for on the way is the work
 /// queue.
-fn go_corpus_self_test(hhdm_base: u64, cpus: u32) -> bool {
+fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
+    // Which program the loader thread should open. Set before the spawn and
+    // read once at the top of it; the two corpus runs are sequential.
+    CORPUS_PROGRAM.store(u8::from(busybox), core::sync::atomic::Ordering::Release);
+    let label = if busybox { "busybox" } else { "go corpus" };
     use core::sync::atomic::Ordering;
 
     if cpus < 2 {
-        println!("\x1b[93m    go corpus      skipped, needs a second cpu\x1b[0m");
+        println!("\x1b[93m    {label}      skipped, needs a second cpu\x1b[0m");
         return true;
     }
     const CPU: u32 = 3;
 
     let before = syscall::FOREIGN_CALLS.load(Ordering::Relaxed);
-    let Ok(realm) = domain::create("go", domain::ResourceEnvelope::new()) else {
-        println!("\x1b[91m    go corpus      FAILED: no domain\x1b[0m");
+    let Ok(realm) = domain::create(
+        if busybox { "busybox" } else { "go" },
+        domain::ResourceEnvelope::new(),
+    ) else {
+        println!("\x1b[91m    {label}      FAILED: no domain\x1b[0m");
         return false;
     };
     if domain::with(realm, |owner| {
@@ -3857,14 +3898,26 @@ fn go_corpus_self_test(hhdm_base: u64, cpus: u32) -> bool {
     })
     .is_none()
     {
-        println!("\x1b[91m    go corpus      FAILED: the tag would not set\x1b[0m");
+        println!("\x1b[91m    {label}      FAILED: the tag would not set\x1b[0m");
         return false;
     }
+    // Record what *this* domain asks for, which is the L1 work queue: the
+    // numbers a program somebody else wrote needs and this adapter refuses.
+    syscall::trace_domain(realm.as_u32());
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
-    if sched::spawn_on_with(CPU, "go", ring3_go, hhdm_base, hhdm_base, options).is_err() {
-        println!("\x1b[91m    go corpus      FAILED: the loader thread would not spawn\x1b[0m");
+    if sched::spawn_on_with(
+        CPU,
+        if busybox { "busybox" } else { "go" },
+        ring3_go,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    {label}      FAILED: the loader thread would not spawn\x1b[0m");
         return false;
     }
 
@@ -3890,7 +3943,7 @@ fn go_corpus_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     if made == 0 {
         println!(
-            "\x1b[93m    go corpus      the binary made no system calls: it is absent, empty, \
+            "\x1b[93m    {label}      the binary made no system calls: it is absent, empty, \
              or it faulted before its first one\x1b[0m"
         );
         return true;
@@ -3898,9 +3951,16 @@ fn go_corpus_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     // The histogram, in the order the runtime asked. Truncated to what the
     // table holds, and it says so rather than implying it saw everything.
-    print!("    go corpus      {made} calls, first asked:");
+    // **This program's calls, in the order it asked** — and until 2026-08-27
+    // this read `syscall::FOREIGN_SEEN`, which is indexed by the *global* call
+    // counter and so holds the first thirty-two foreign calls of the whole
+    // boot. The corpus runs long after the eightieth, so the line printed the
+    // machine's opening calls under a corpus's name. Two corpus runs printing
+    // **identical** lists is what showed it.
+    let made = syscall::stop_tracing().max(made);
+    print!("    {label}      {made} calls, asked:");
     let mut shown = 0;
-    for slot in syscall::FOREIGN_SEEN.iter() {
+    for slot in syscall::TRACED_SEEN.iter() {
         let number = slot.load(Ordering::Relaxed);
         if number == u64::MAX {
             break;
@@ -19236,8 +19296,13 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             // `bin/traced`, `bin/tcpc` and `bin/tcpd` before them.
             // **Seventeen** as of 2026-08-24 -- `bin/ahcid`, RFC 0046 step 3b's
             // AHCI driver -- and it caught that one too, on the first boot.
+            // **Eighteen** as of 2026-08-27: `bin/busybox`, the L1 corpus, and
+            // the first entry here that nobody in this project wrote *or*
+            // built -- the Go corpus is compiled from a source file in
+            // `corpus/`, and this is somebody else's shipped binary. It caught
+            // that one on the first boot too, which is eighteen for eighteen.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 17,
+            entries >= 3 && bin == 18,
         ),
         (
             "the user program is an ELF the loader accepts",

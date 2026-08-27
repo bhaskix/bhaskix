@@ -1123,6 +1123,68 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-27 (BusyBox runs, prints and exits on Bhaskix — L1's first program that nobody here wrote)
+
+**`no BusyBox has run` is no longer true.** A static BusyBox 1.30.1 is in the
+image at `bin/busybox`, loaded by this kernel's own ELF loader into a
+Linux-tagged domain, and it runs to `exit_group`. Its output on the console is
+its own:
+
+    : error while loading shared libraries: cannot apply additional memory
+      protection after relocation: Invalid argument
+
+That is glibc's static-PIE start-up, printed through `writev`, and it is the
+**next** blocker rather than this one.
+
+**The gap was measured, not guessed — and the guess was wrong.** An `strace` of
+BusyBox on this build machine predicted the list; the machine's own trace
+disagreed, because BusyBox takes different paths when the calls it tries first
+are refused. RFC 0005's instruction is *"trace the binary, do not reason about
+it"*, and this is what that is for. Ten calls were added, all of them measured
+as needed: `stat`, `lstat`, `getuid`, `geteuid`, `getppid`, `prctl`, `access`,
+`writev`, `tgkill`, and **`brk`**.
+
+**`brk` is the only new mechanism.** A hosted heap: reserved once, lazily, from
+the process's own mapping base — the same `advance_mapping` an `mmap` uses, so a
+heap and a mapping cannot be drawn over each other — and the break then moves as
+arithmetic, with no call into the nucleus and nothing charged until a page is
+touched. It is bounded at 4 MiB and a request past it is refused **by answering
+the break the caller still has**, which is what Linux answers on failure and what
+a libc checks; an errno there is the classic way to make a working allocator
+believe it succeeded.
+
+**`stat` and `lstat` are `newfstatat`, not a second copy of it** — the body was
+extracted so whatever one refuses, all three refuse. **`writev` is `write`**, one
+vector at a time through the same dispatcher, so a pipe is a pipe and a read-only
+file is still `EROFS` in one place.
+
+**And an instrument was found lying.** The corpus line has always read
+`N calls, first asked: …` out of `syscall::FOREIGN_SEEN`, which is indexed by the
+**global** call counter and therefore holds the first thirty-two foreign calls of
+the whole *boot* — the corpus runs long after the eightieth. The proof was two
+corpus runs printing **identical** lists. It now records per domain, armed on the
+corpus's own, so the line finally says what the program asked.
+
+**`uname`'s release changed, and the comment there had written its own trigger.**
+It read *"the trigger for revisiting is the first program observed to refuse for
+this reason, and the number it needs"*. BusyBox refused for exactly that reason —
+`FATAL: kernel too old` — and its ELF note asks for 3.2.0. So the field is
+`3.2.0-bhaskix`: the least version that lets a glibc program start, and
+deliberately not a modern one. What the original reasoning missed is that
+`0.0.0` promised *nothing* while this adapter answers `openat`, `pipe2`, `dup3`
+and `getdents64`, none of which existed before 2.6.27 — a version below every
+syscall it implements is not the cautious claim it looks like.
+
+**What stops it now, named rather than guessed.** `AddressSpace::protect`
+requires the range to be **exactly one whole region**; glibc re-protects the
+RELRO **sub-range** of a larger segment and is refused. Splitting a region is
+already called out in `MAP_AT`'s own comment as *"a different piece of work with
+its own failure modes"*, and it is the next piece.
+
+**Two gates caught the new file on the first boot, in two files, exactly as one
+of them says it will**: the kernel's listing check (`bin == 18`) and the boot
+harness's grep for the same line. Eighteen for eighteen.
+
 ### 2026-08-27 (the same chart mistake twice in one day, so it stopped being a comment and became a warning)
 
 **Run 377 and run 383, identical.** `make gates` passed locally and the project

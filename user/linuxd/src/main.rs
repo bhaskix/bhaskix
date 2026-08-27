@@ -697,6 +697,193 @@ fn write_scratch(value: u64) {
     unsafe { core::ptr::write_volatile((REPORT_AT + SCRATCH_AT_OFFSET) as *mut u64, value) };
 }
 
+/// `brk(address)` — reports or moves the break.
+///
+/// **The heap every C program starts with**, and the last mechanism BusyBox
+/// needed that this adapter did not have. A libc calls `brk(0)` to learn where
+/// its heap begins and then `brk(higher)` to grow it; BusyBox does exactly that
+/// four times before it prints anything.
+///
+/// # The shape, and what it is not
+///
+/// The region is **reserved once**, lazily, from this process's own mapping
+/// base -- the same `advance_mapping` an `mmap` uses, so a heap and a mapping
+/// cannot be drawn over each other. Moving the break is then arithmetic: no
+/// call into the nucleus, and nothing charged until the program touches a page.
+///
+/// It is **not** an unbounded heap. Linux grows the break until memory runs
+/// out; this reserves [`BRK_BYTES`] and refuses past it. A refusal answers with
+/// the break the caller still has, which is what Linux answers on failure and
+/// what a libc checks for -- returning an errno here would be the wrong shape
+/// and is the classic way to make a working allocator think it succeeded.
+fn answer_brk(request: &PersonalityCall) -> Answer {
+    let wanted = request.first();
+    let domain = handle_of(request.domain);
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(memory::errno::ENOMEM);
+    };
+
+    if process.brk_base == 0 {
+        let Some(base) = advance_mapping(request.domain, BRK_BYTES) else {
+            return Answer::error(memory::errno::ENOMEM);
+        };
+        // Re-fetch: `advance_mapping` takes the record too, and holding one
+        // reference across it would be two live borrows of the same static.
+        let pages = BRK_BYTES / memory::PAGE;
+        if !map_at(domain, base, pages, PROT_READ_WRITE, MAP_LAZY) {
+            return Answer::error(memory::errno::ENOMEM);
+        }
+        let Some(process) = process_for(request.domain) else {
+            return Answer::error(memory::errno::ENOMEM);
+        };
+        process.brk_base = base;
+        process.brk_current = base;
+    }
+
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(memory::errno::ENOMEM);
+    };
+    let (base, current) = (process.brk_base, process.brk_current);
+    // `brk(0)` is the question rather than a move, and a request below the
+    // base or past the reservation is refused *by answering the current
+    // break* -- see the note above on why this is not an errno.
+    if wanted < base || wanted > base + BRK_BYTES {
+        return Answer::ok(current);
+    }
+    process.brk_current = wanted;
+    Answer::ok(wanted)
+}
+
+/// `access(path, mode)` — may this process reach that name.
+///
+/// **Answered by trying, not by reading a mode bit.** This adapter holds a
+/// directory capability and no permission table; the only honest way to say
+/// whether a name is reachable is to reach for it. So the file is opened and
+/// closed again, and whatever `open` would have said is what `access` says --
+/// `ENOENT` for a name that is not there, and nothing invented for one that is.
+///
+/// `W_OK` is refused without looking. The directory capability this program
+/// holds carries no `WRITE` right (RFC 0033), so a writable answer would be a
+/// lie that a program acts on -- it would go on to open the file for writing
+/// and fail there instead, further from the cause.
+fn answer_access(request: &PersonalityCall) -> Answer {
+    const W_OK: u64 = 2;
+    if request.second() & W_OK != 0 {
+        return Answer::error(-13); // EACCES
+    }
+    let opened = open_the_file(request, request.first(), 0);
+    if opened.is_error() {
+        return opened;
+    }
+    // Closed again, or `access` leaks a descriptor per call and a program that
+    // checks many names stops after thirty-two of them.
+    let mut closing = *request;
+    closing.args[0] = opened.value;
+    let _ = answer_close(&closing);
+    Answer::ok(0)
+}
+
+/// `writev(fd, iov, iovcnt)` — one write from several buffers.
+///
+/// **Through `write` rather than beside it.** Each vector is handed to the same
+/// call, so a pipe is a pipe and a read-only file is still `EROFS`, and there is
+/// one place that decides what a descriptor means. Writing this out separately
+/// would be a second descriptor table's worth of rules to keep in step.
+///
+/// It is what BusyBox's error path uses, and its absence is why BusyBox
+/// **aborted** on this machine: it wrote its complaint with `writev`, was told
+/// `ENOSYS`, and raised a signal at itself -- the `getpid, gettid, tgkill`
+/// tail its own trace ends with, twice.
+///
+/// # Short writes are the caller's to notice
+///
+/// A vector that writes short stops the loop, and the total so far is returned.
+/// That is what `writev` promises: it does not promise all of it.
+fn answer_writev(request: &PersonalityCall) -> Answer {
+    /// `struct iovec` is two words: base, then length.
+    const IOVEC_BYTES: usize = 16;
+    /// How many vectors are read in one call. Linux allows 1024; this reads
+    /// what a bounded buffer holds and says so by refusing more, rather than
+    /// silently writing a prefix.
+    const MAX_VECTORS: usize = 16;
+
+    let (fd, iov_at, count) = (request.first(), request.second(), request.third());
+    let Ok(vectors) = usize::try_from(count) else {
+        return Answer::error(-22); // EINVAL
+    };
+    if vectors == 0 {
+        return Answer::ok(0);
+    }
+    if vectors > MAX_VECTORS {
+        return Answer::error(-22); // EINVAL
+    }
+    let mut raw = [0u8; MAX_VECTORS * IOVEC_BYTES];
+    let wanted = vectors * IOVEC_BYTES;
+    if !copy_in(request.domain, iov_at, &mut raw[..wanted]) {
+        return Answer::error(-14); // EFAULT
+    }
+
+    let mut written = 0u64;
+    for vector in raw[..wanted].chunks_exact(IOVEC_BYTES) {
+        let mut base = [0u8; 8];
+        let mut length = [0u8; 8];
+        base.copy_from_slice(&vector[..8]);
+        length.copy_from_slice(&vector[8..]);
+        let (base, length) = (u64::from_le_bytes(base), u64::from_le_bytes(length));
+        if length == 0 {
+            continue;
+        }
+        let mut one = *request;
+        one.number = WRITE;
+        one.args = [fd, base, length, 0, 0, 0];
+        let (_, answer) = answer(&one);
+        if answer.is_error() {
+            // Nothing written yet means the error is the answer; something
+            // written means the caller is told how much, which is what a
+            // partial `writev` is.
+            return if written == 0 { answer } else { Answer::ok(written) };
+        }
+        written += answer.value;
+        if answer.value < length {
+            break;
+        }
+    }
+    Answer::ok(written)
+}
+
+/// `tgkill(tgid, tid, signal)` — a libc raising a signal at itself.
+///
+/// **Only at itself, and only the ones that end it.** This personality has no
+/// signal delivery: RFC 0033 gave hosted processes `rt_sigaction` so a runtime
+/// can install handlers it will never be called with, and that gap is written
+/// down rather than papered over. What `abort()` needs is not delivery -- it
+/// needs the process to *stop*, which this can do honestly.
+///
+/// So a fatal signal aimed at the caller's own thread ends its domain, with the
+/// signal recorded as the reason. Anything else is refused: a program that
+/// signalled another process and was told it worked would be lied to, and there
+/// is no other process here to signal.
+fn answer_tgkill(request: &PersonalityCall) -> (u64, Answer) {
+    const SIGABRT: u64 = 6;
+    const SIGKILL: u64 = 9;
+    const SIGSEGV: u64 = 11;
+
+    let (tid, signal) = (request.second(), request.third());
+    let itself = u32::try_from(tid).is_ok_and(|tid| tid == request.thread);
+    let fatal = matches!(signal, SIGABRT | SIGKILL | SIGSEGV);
+    if itself && fatal {
+        note_exit(
+            request.domain,
+            Exit::Signalled {
+                signal: signal as u8,
+                core: false,
+            },
+        );
+        return (REPLY_END_DOMAIN, Answer::ok(0));
+    }
+    (REPLY_VALUE, bhaskix_personality::call::ENOSYS)
+}
+
 /// Maps `pages` lazily at `address` in a hosted domain.
 ///
 /// Lazily, because a hosted `mmap` is a *reservation*: a runtime that asks for
@@ -829,6 +1016,12 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
             note_exit(request.domain, Exit::Status(request.first() as u8));
             return (REPLY_END_DOMAIN, Answer::ok(0));
         }
+        // Beside `exit_group` because it is the same act by another name: a
+        // libc's `abort()` raises a fatal signal at its own thread, and what
+        // that has to do here is end the process. It lives in *this* dispatcher
+        // and not the one below because only this one can answer
+        // `REPLY_END_DOMAIN`.
+        TGKILL => return answer_tgkill(request),
         // `wait4(pid, status, options, rusage)`.
         WAIT4 => return answer_wait(request),
         _ => {}
@@ -1039,6 +1232,58 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // whose high half the kernel stamps with the calling thread — a
         // caller cannot supply one, which is why it can be believed.
         GETTID => Answer::ok(u64::from(request.thread)),
+        // **The two older `stat` forms, mapped onto the one path resolution.**
+        // BusyBox's `sh` stats `.` and `/tmp` before it does anything else, and
+        // `ls` stats every name it lists. Both are `newfstatat` with `AT_FDCWD`
+        // and a flag, so they are that call rather than a second copy of it.
+        STAT => stat_at(request, AT_FDCWD, request.first(), request.second(), 0),
+        LSTAT => stat_at(
+            request,
+            AT_FDCWD,
+            request.first(),
+            request.second(),
+            AT_SYMLINK_NOFOLLOW,
+        ),
+        // **A number every program reads and nothing here acts on.** RFC 0031:
+        // Linux UID 0 is not Bhaskix authority. Programs compare against it --
+        // BusyBox's `sh` calls it before its first prompt -- and what a hosted
+        // process may actually do is what its domain holds, which this does not
+        // change. Refusing it stops shells for no gain in safety.
+        GETUID => Answer::ok(0),
+        BRK => answer_brk(request),
+        // The effective uid, which is the real one: nothing here can change it,
+        // because nothing here reads it to decide anything. See `GETUID`.
+        GETEUID => Answer::ok(0),
+        ACCESS => answer_access(request),
+        WRITEV => answer_writev(request),
+        // The parent this process was forked from.
+        //
+        // **Zero when there is none, and Linux would say 1.** Linux reparents
+        // an orphan to init and answers `1`; there is no init here to name, and
+        // answering `1` would point at a process that does not exist. The record
+        // already means "no parent" by zero, so that is what is passed on --
+        // a shell reading `$PPID` sees a number it can print and cannot signal,
+        // which is true rather than convenient.
+        GETPPID => match process_for(request.domain) {
+            Some(process) => Answer::ok(u64::from(process.ppid)),
+            None => Answer::error(-3), // ESRCH
+        },
+        // **Accepted for the one option that is advisory, refused otherwise.**
+        // `PR_SET_NAME` is how a program labels its own thread and BusyBox sets
+        // it to `busybox` at start-up; Linux itself treats it as a hint. It is
+        // accepted and **not acted on**, which is the honest shape: this
+        // personality has no name to set that anything here would read. Every
+        // other option is refused rather than answered `0`, because a program
+        // that asked to change its own behaviour and was told "done" would be
+        // lied to.
+        PRCTL => {
+            const PR_SET_NAME: u64 = 15;
+            if request.first() == PR_SET_NAME {
+                Answer::ok(0)
+            } else {
+                bhaskix_personality::call::ENOSYS
+            }
+        }
         // The one call a hosted program needs before it can say anything.
         // Only the two standard streams, and only to this machine's console: a
         // hosted program writing to a descriptor it never opened is asking for
@@ -1390,6 +1635,42 @@ const NEWFSTATAT: u64 = 262;
 const GETDENTS64: u64 = 217;
 /// `uname(buf)`.
 const UNAME: u64 = 63;
+/// `stat(path, buf)` — the older form BusyBox emits, not the `at` one.
+const STAT: u64 = 4;
+/// `lstat(path, buf)` — `stat` that does not follow a final symlink.
+const LSTAT: u64 = 6;
+/// `getuid()`.
+///
+/// **Answered, and the answer carries no authority** — [RFC 0031](../../../docs/rfc/0031-linux-compatibility-as-an-adapter.md)
+/// is explicit that Linux UID 0 is not Bhaskix authority. A hosted program is
+/// told it is uid 0 because that is what the programs expect to see and what
+/// they compare against; nothing in this system reads it to decide anything,
+/// and what a hosted process may do is what its domain holds.
+const GETUID: u64 = 102;
+/// `getppid()`.
+const GETPPID: u64 = 110;
+/// `prctl(option, ...)`.
+const PRCTL: u64 = 157;
+/// `brk(address)` — the oldest way a program grows its heap.
+const BRK: u64 = 12;
+/// `geteuid()` — the effective uid, which here is the real one.
+const GETEUID: u64 = 107;
+/// `access(path, mode)`.
+const ACCESS: u64 = 21;
+/// `writev(fd, iov, iovcnt)` — one write from several buffers.
+const WRITEV: u64 = 20;
+/// `tgkill(tgid, tid, signal)` — how a libc raises a signal at itself.
+const TGKILL: u64 = 234;
+/// How much address space a `brk` heap is reserved, lazily.
+///
+/// **Reserved once and grown into**, rather than extended a page at a time:
+/// the region is mapped `MAP_LAZY`, so nothing is charged until the program
+/// touches it, and the break moving is then arithmetic rather than a system
+/// call into the nucleus. Four mebibytes because BusyBox's `sh` wants about
+/// 140 KiB of it and this is the first hosted heap in the project's history --
+/// a program that wants more is refused, and told so by `brk` answering with
+/// the break it still has, which is what Linux does on failure.
+const BRK_BYTES: u64 = 4 * 1024 * 1024;
 /// `fcntl(fd, command, argument)`.
 const FCNTL: u64 = 72;
 /// `ioctl(fd, request, argument)`.
@@ -1477,6 +1758,12 @@ fn release_socket_slot(slot: u64) {
 /// Read from this machine's `/usr/include/linux/fcntl.h`, not recalled, as
 /// was [`AT_FDCWD`](answer_newfstatat)'s `-100` beside it.
 const AT_EMPTY_PATH: u64 = 0x1000;
+/// `AT_FDCWD` — resolve against the current directory rather than a descriptor.
+///
+/// At module scope since 2026-08-27, because `stat` and `lstat` name it too.
+const AT_FDCWD: u64 = (-100i64) as u64;
+/// `AT_SYMLINK_NOFOLLOW` — what makes `lstat` different from `stat`.
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const OPEN: u64 = 2;
 /// `read(fd, buffer, count)`.
 const READ: u64 = 0;
@@ -2521,12 +2808,29 @@ fn answer_fstat(request: &PersonalityCall) -> Answer {
 /// trigger for a `dir::STAT_AT` method is the first program that stats in a
 /// loop while holding its table full.
 fn answer_newfstatat(request: &PersonalityCall) -> Answer {
-    let (dirfd, path_at, out_at, flags) = (
+    stat_at(
+        request,
         request.first(),
         request.second(),
         request.third(),
         request.fourth(),
-    );
+    )
+}
+
+/// `newfstatat`'s body, with its four arguments passed rather than read.
+///
+/// **So that `stat` and `lstat` are this call and not a second copy of it.**
+/// BusyBox emits the two older forms — `stat(path, buf)` is
+/// `newfstatat(AT_FDCWD, path, buf, 0)` and `lstat` the same with
+/// `AT_SYMLINK_NOFOLLOW` — and a personality that reimplemented them would have
+/// two path resolutions to keep in step. Whatever this refuses, they refuse.
+fn stat_at(
+    request: &PersonalityCall,
+    dirfd: u64,
+    path_at: u64,
+    out_at: u64,
+    flags: u64,
+) -> Answer {
     let mut name = [0u8; MAX_NAME];
     if !copy_in(request.domain, path_at, &mut name) {
         return Answer::error(-14); // EFAULT
@@ -2558,7 +2862,6 @@ fn answer_newfstatat(request: &PersonalityCall) -> Answer {
     // resolving a relative path against the wrong directory is how a program
     // reads a file it did not ask for, and this system has no second
     // directory to resolve against yet.
-    const AT_FDCWD: u64 = (-100i64) as u64;
     if dirfd != AT_FDCWD && !name.starts_with(b"/") {
         return Answer::error(-38); // ENOSYS
     }

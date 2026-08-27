@@ -123,6 +123,14 @@ pub struct Process {
     pub generation: u32,
     /// Linux's credentials: numbers, for Linux's own arithmetic.
     pub credentials: Credentials,
+    /// Where this process's `brk` heap starts, or zero before it has one.
+    ///
+    /// **Drawn on the first `brk`, not at `execve`**, so a program that never
+    /// calls it -- every probe in this machine's self-tests -- pays nothing.
+    pub brk_base: u64,
+    /// Where its break currently sits. Between [`Self::brk_base`] and
+    /// `brk_base + BRK_BYTES`.
+    pub brk_current: u64,
     /// Where this process's next `mmap` lands.
     ///
     /// **Per process, and drawn rather than shared** — `security.md` §1 gap 3.
@@ -244,6 +252,10 @@ impl Process {
             // here rather than the floor, so a record that never got one is
             // visible as a refusal instead of quietly using a fixed address.
             mmap_next: 0,
+            // Drawn on the first `brk`, not here -- a program that never calls
+            // it pays nothing, and every probe in this machine is one.
+            brk_base: 0,
+            brk_current: 0,
             cwd: 0,
             root: 0,
             descriptors: Table::new(),
@@ -396,6 +408,8 @@ impl Process {
             domain,
             generation,
             credentials: self.credentials,
+            brk_base: 0,
+            brk_current: 0,
             cwd: self.cwd,
             root: self.root,
             descriptors: self.descriptors,

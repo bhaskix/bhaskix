@@ -1216,7 +1216,10 @@ fi
 # and this checks that the kernel said so out loud -- but it means adding a
 # program fails twice, in two files, which is worth knowing before it happens
 # rather than after. Seventeen since `bin/ahcid` joined, 2026-08-24.
-if grep -qE "vfs +[0-9]+ entries in /, 17 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+# **Eighteen** since `bin/busybox` joined, 2026-08-27 -- the L1 corpus, and the
+# first entry that nobody here wrote or built. It failed twice in two files
+# exactly as this comment said it would, which is the comment earning its place.
+if grep -qE "vfs +[0-9]+ entries in /, 18 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
