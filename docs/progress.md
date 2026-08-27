@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| RFCs accepted | **35** |
-| RFCs open | 16 |
+| RFCs accepted | **36** |
+| RFCs open | 15 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -74,7 +74,7 @@ gantt
     RFC 0039 Pingala — a native web server and what "secure... :active, r0039, 2026-08-22, 2026-08-27
     RFC 0042 Reading the boot report back :done, r0042, 2026-08-23, 1d
     RFC 0051 a shell that can ask what arrived :done, r0051, 2026-08-27, 1d
-    RFC 0052 a line that waits for its newline :active, r0052, 2026-08-27, 2026-08-27
+    RFC 0052 a line that waits for its newline :done, r0052, 2026-08-27, 1d
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-08-27
@@ -145,7 +145,6 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
-| 0052 | a line that waits for its newline | 2026-08-27 |
 
 ## Annexes
 
