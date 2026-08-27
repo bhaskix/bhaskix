@@ -19008,21 +19008,40 @@ fn shell_self_test() -> bool {
     let (delivered_before, _, _) = irq::statistics();
     let (signals_before, _, _) = notify::statistics();
 
-    // SAFETY: COM1 is initialised, and the port is put back below on every
-    // path out of this function.
-    unsafe { port.set_loopback(true) };
-    for byte in TYPED {
-        // SAFETY: as above.
-        unsafe { port.write_byte(*byte) };
-    }
+    // **The console is held for the whole window, and that is the fix for the
+    // SR550's `14 of 5 bytes`.**
+    //
+    // This function's own comment has always said *"nothing is printed while
+    // the port is looped back"*, and until 2026-08-27 nothing enforced it. The
+    // console's serial sink is this very port: anything another CPU printed
+    // here went out of `COM1` and came straight back in, and was counted as a
+    // byte this test had typed. On QEMU's four processors nothing happened to
+    // print in the window; on sixteen, something did, every boot.
+    //
+    // Holding rather than suppressing: other CPUs wait and then print, so no
+    // line is lost. Nothing inside the window may print -- see
+    // `console::with_output_held` -- and nothing here does: writing a byte is
+    // port I/O, and `wait_until` spins on an atomic.
+    let arrived = console::with_output_held(|| {
+        // SAFETY: COM1 is initialised, and the port is put back below on every
+        // path out of this closure.
+        unsafe { port.set_loopback(true) };
+        for byte in TYPED {
+            // SAFETY: as above.
+            unsafe { port.write_byte(*byte) };
+        }
 
-    // Wait for the *interrupt*, not for the bytes. Since RFC 0011 the handler
-    // does one thing -- mask the source and signal a notification -- so
-    // nothing reaches the ring until a reader drains the UART. Waiting on the
-    // ring here would be waiting for work this test has not done yet.
-    let arrived = wait_until(|| irq::statistics().0 > delivered_before, 500);
-    // SAFETY: as above -- and this must happen before anything is printed.
-    unsafe { port.set_loopback(false) };
+        // Wait for the *interrupt*, not for the bytes. Since RFC 0011 the
+        // handler does one thing -- mask the source and signal a notification
+        // -- so nothing reaches the ring until a reader drains the UART.
+        // Waiting on the ring here would be waiting for work this test has not
+        // done yet.
+        let arrived = wait_until(|| irq::statistics().0 > delivered_before, 500);
+        // SAFETY: as above. It must happen before anything is printed, and now
+        // it provably does: nothing else can print until this closure returns.
+        unsafe { port.set_loopback(false) };
+        arrived
+    });
 
     // Now do what a reader does: drain the device, *then* acknowledge it. That
     // order is the rule an edge-triggered source makes load-bearing

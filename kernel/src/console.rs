@@ -263,6 +263,40 @@ pub fn init_framebuffer(fb: Framebuffer) -> bool {
     }
 }
 
+/// Runs `f` with the console **held**, so no other CPU can print while it does.
+///
+/// # Why this exists
+///
+/// `shell_self_test` puts `COM1` into loopback and waits for the interrupt its
+/// own five bytes cause. While the port is looped back, **anything printed goes
+/// out of it and comes straight back in** — and the console's serial sink *is*
+/// that port. Its doc comment has always said *"nothing is printed while the
+/// port is looped back"*, and until 2026-08-27 that was a convention with
+/// nothing enforcing it: on QEMU's four processors nothing happened to print in
+/// the window, and on the SR550's sixteen something did. The test reported
+/// **`14 of 5 bytes`** there, on every boot, with no command wrong — nine bytes
+/// that were never typed.
+///
+/// Holding the lock turns the convention into a mechanism. Other CPUs wait and
+/// then print; nothing is lost and nothing is dropped, which is what separates
+/// this from suppressing output across the window.
+///
+/// # The rule for callers
+///
+/// **`f` must not print.** This is a plain spin lock and it is not reentrant, so
+/// a `println!` inside `f` — directly, or from anything it calls — deadlocks the
+/// machine. Interrupts stay enabled, deliberately, because the caller is waiting
+/// for one; the handlers on that path do not print, which is why this is safe
+/// where a general-purpose "hold the console" would not be.
+///
+/// A **panic or an exception inside `f` still reports**: the fatal path sets
+/// `FATAL` and writes without taking this lock, which is exactly what it was
+/// built for.
+pub fn with_output_held<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = CONSOLE.lock();
+    f()
+}
+
 /// Puts a run of bytes with the console held **once** — RFC 0050.
 ///
 /// # Why this exists
