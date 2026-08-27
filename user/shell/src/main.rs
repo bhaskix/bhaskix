@@ -439,6 +439,49 @@ fn write_padded(value: u64, width: usize) {
     write_number(value);
 }
 
+/// What has arrived on the input path, and from which source — RFC 0051.
+///
+/// **The command this shell could not have.** The counters live in the nucleus;
+/// this program holds capabilities and not kernel statistics, so `input` was
+/// *"not a command"* here while the kernel shell had it. That gap had a cost:
+/// on 2026-08-27 the SR550's keyboard appeared dead and nothing on the machine
+/// could say whether a key had reached it — the boot report prints before
+/// anyone can type, and that machine's serial line is output-only, so every
+/// other way of reading these needed the keyboard that was in doubt.
+///
+/// **Scancodes are printed beside bytes because they are different facts.** A
+/// key release and a modifier are scancodes that emit no byte, so scancodes
+/// moving while the keyboard column stays at zero says the i8042 is delivering
+/// and the decoder is swallowing — which is a different fault from silence and
+/// invisible in a total.
+fn input_statistics() {
+    let reply = call(CONSOLE, console::STATS, [0; 4]);
+    if !reply.delivered() {
+        write(b"  input: the console service did not answer\n");
+        return;
+    }
+    let high = |word: u64| word >> 32;
+    let low = |word: u64| word & 0xffff_ffff;
+
+    write(b"  serial    ");
+    write_number(high(reply.args[0]));
+    write(b" bytes, ");
+    write_number(low(reply.args[0]));
+    write(b" dropped\n");
+
+    write(b"  keyboard  ");
+    write_number(high(reply.args[1]));
+    write(b" bytes from ");
+    write_number(high(reply.args[2]));
+    write(b" i8042 scancodes, ");
+    write_number(low(reply.args[1]));
+    write(b" dropped\n");
+
+    write(b"  interrupts ");
+    write_number(low(reply.args[2]));
+    write(b" delivered the above\n");
+}
+
 /// Reads whatever has been typed, blocking until something has.
 fn read(buffer: &mut [u8; CHUNK_BYTES]) -> usize {
     let reply = call(CONSOLE, console::READ, [0; 4]);
@@ -536,6 +579,7 @@ fn help() {
     write(b"    ask               ask the block service for a capability, and be\n");
     write(b"                      refused it until a slot is declared for it\n");
     write(b"    caps              what this program is allowed to do\n");
+    write(b"    input             what arrived on the console, and from where\n");
     write(b"    irq               wait for a signal, and report the badge it carried\n");
     write(b"    net <host>        speak to a host through the network service\n");
     write(
@@ -2168,6 +2212,7 @@ fn run(line: &[u8]) {
             }
         }
         b"caps" => capabilities(),
+        b"input" => input_statistics(),
         b"map" => map(),
         b"irq" => signals(),
         b"net" => network(rest),

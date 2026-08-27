@@ -1035,6 +1035,48 @@ the serial log and discarded the harness's own stdout, which is where the verdic
 is printed. A sweep that cannot say why a run failed is worth less than one that
 can, and the next one should keep both.
 
+### 2026-08-27 (the ring 3 shell can ask what arrived — RFC 0051)
+
+**The gap, stated as the day found it.** A machine whose keyboard seems dead
+should be able to say whether a key reached it. The counters existed; every way
+of reading them needed the keyboard in doubt. The boot report prints before
+anyone can type; the kernel shell's `input` needs a `shell=kernel` boot *and* a
+keyboard; the SR550 cannot be typed at over serial at all; and the ring 3 shell
+it actually boots to holds capabilities rather than kernel statistics, so `input`
+there answered **`not a command`**.
+
+**[RFC 0051](rfc/0051-a-shell-that-can-ask-what-arrived.md), drafted and built
+the same day.** `method::INPUT_STATS` on the nucleus `Console`, requiring
+`Rights::READ` — the right a holder must already have to *take* a typed byte, so
+no new authority: it counts without consuming. `console::STATS` in the service
+protocol. `bin/shell` grows `input`, named as the kernel shell's already is.
+
+    bhaskix$ input
+      serial    29 bytes, 0 dropped
+      keyboard  0 bytes from 0 i8042 scancodes, 0 dropped
+      interrupts 6 delivered the above
+
+**A draft corrected by the code written against it.** The RFC specified *three
+reply words* and the type said otherwise: `Outcome` carries a status and one
+value, and the four-word `args` array belongs to IPC messages rather than
+`INVOKE` returns. So the nucleus answers **one word per call**, chosen by `arg0`
+— which is the shape `RECORD` beside it already uses, and the aggregation moved
+to the **service**, which has a four-word reply and asks the nucleus three times.
+No caller has to ask three times, and the nucleus idiom is unchanged.
+
+**Both gates were written and both were watched red.** The user-mode shell lane
+requires the **serial** column to be non-zero, because that harness types every
+command over the serial line; the keyboard lane requires the **keyboard** column
+to be non-zero after typing at the i8042, which is the assertion that could not
+be written before this. Returning zeros from the service failed both.
+
+**And one correction the gates earned.** `shell-test.sh`'s `await` matches with
+`grep -F`, so the first attempt's character class was matched *literally* and
+never found — a gate that would have failed for a reason unrelated to the thing
+it tests. The count cannot be hard-coded, since it changes whenever a command is
+added to that list, so the assertion is a `grep -E` placed after the line that
+proves the whole list ran.
+
 ### 2026-08-27 (input counters by source, and a one-shot notice that had to be taken back out)
 
 **The question the SR550 could not answer.** Its boot report says

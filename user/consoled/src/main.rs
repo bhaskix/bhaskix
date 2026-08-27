@@ -112,6 +112,14 @@ extern "C" fn consoled_main() -> ! {
                     [0; 8]
                 }
             },
+            // RFC 0051. Zero on refusal, like the record above: a shell asking
+            // what arrived should be told nothing arrived rather than handed an
+            // error it cannot act on, and a console this program cannot read is
+            // a fault its own boot would already have reported.
+            input_stats: |which| {
+                let (status, packed) = call(syscall::INVOKE, CONSOLE, method::INPUT_STATS, which);
+                if status == status::OK { packed } else { 0 }
+            },
         },
     )
 }

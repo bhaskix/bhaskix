@@ -327,6 +327,21 @@ pub mod method {
     /// byte per invocation, and `console::_print` locks per call, so a kernel
     /// report could and did print between `e` and `xeced pid 3`.
     pub const PUT_RUN: u64 = 69;
+    /// How much input has arrived, and from which source — RFC 0051.
+    ///
+    /// Only on a `Console` capability, and it needs `READ`: the right a holder
+    /// must already have to *take* a typed byte. This counts without consuming.
+    ///
+    /// **One word per call**, chosen by `arg0`, because a system call returns
+    /// one — `RECORD` beside this has its caller walk an offset for the same
+    /// reason. Each word is a saturating pair of `u32`s, high half first:
+    /// `0` is serial received and dropped, `1` the keyboard ring's received and
+    /// dropped, `2` i8042 scancodes and input interrupts. Anything else reads
+    /// zero rather than failing. Scancodes sit
+    /// beside bytes because they are different facts — a key release emits no
+    /// byte, so scancodes moving while the keyboard column does not says the
+    /// i8042 is delivering and the decoder is swallowing.
+    pub const INPUT_STATS: u64 = 70;
     /// Take a byte that was typed, waiting until there is one.
     ///
     /// Only on a `Console` capability, and it blocks: a holder waiting here is
@@ -580,6 +595,17 @@ pub mod console {
     ///
     /// Replies with a [`crate::Chunk`]. Short at the end, empty past it.
     pub const RECORD: u64 = 4;
+    /// What has arrived on the input path, by source — RFC 0051.
+    ///
+    /// The service asks the nucleus and hands the three words back without
+    /// interpreting them, as it does for [`RECORD`]. See
+    /// [`crate::method::INPUT_STATS`] for the packing.
+    ///
+    /// It exists because a ring 3 shell could not answer *"is the keyboard
+    /// working?"*: the counters are in the nucleus, the boot report prints
+    /// before anyone can type, and on the machine that asked the question the
+    /// serial line is output-only.
+    pub const STATS: u64 = 5;
 }
 
 /// Methods the filesystem service answers.

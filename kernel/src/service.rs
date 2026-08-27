@@ -299,6 +299,24 @@ fn console_ports() -> Ports {
         },
         record_size: || crate::console::recorded().0,
         record_at: crate::console::recorded_at,
+        // RFC 0051, and the same packing the nucleus method uses -- reading the
+        // counters directly here rather than through a system call, because in
+        // this placement the service *is* the thing keeping them.
+        input_stats: |which| {
+            let (serial_in, serial_lost, keys_in, keys_lost) = crate::input::per_source();
+            let (_, _, interrupts) = crate::input::statistics();
+            let scancodes = crate::keyboard::scancodes();
+            let pair = |high: u64, low: u64| {
+                (u64::from(u32::try_from(high).unwrap_or(u32::MAX)) << 32)
+                    | u64::from(u32::try_from(low).unwrap_or(u32::MAX))
+            };
+            match which {
+                0 => pair(serial_in, serial_lost),
+                1 => pair(keys_in, keys_lost),
+                2 => pair(scancodes, interrupts),
+                _ => 0,
+            }
+        },
         try_read: || {
             let byte = crate::input::try_read();
             if byte.is_some() {

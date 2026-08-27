@@ -158,6 +158,7 @@ const _: () = {
     assert!(Status::SlotUnavailable as u64 == bhaskix_abi::status::SLOT_UNAVAILABLE);
     assert!(method::PUT == bhaskix_abi::method::PUT);
     assert!(method::PUT_RUN == bhaskix_abi::method::PUT_RUN);
+    assert!(method::INPUT_STATS == bhaskix_abi::method::INPUT_STATS);
     assert!(method::TAKE == bhaskix_abi::method::TAKE);
     assert!(method::POLL == bhaskix_abi::method::POLL);
     assert!(method::RECORD_SIZE == bhaskix_abi::method::RECORD_SIZE);
@@ -328,6 +329,11 @@ pub mod method {
     /// many. This is *n* `PUT`s minus the gap between them, into which a kernel
     /// line could land and did.
     pub const PUT_RUN: u64 = 69;
+    /// How much input has arrived, and from which source — RFC 0051.
+    ///
+    /// Only on a `Console` capability, and it needs `READ` — the right a holder
+    /// must already have to take a typed byte. It counts without consuming.
+    pub const INPUT_STATS: u64 = 70;
     /// Take a byte that was typed, waiting until there is one.
     ///
     /// Only on a `Console` capability. Blocks, which is why a holder that
@@ -1410,6 +1416,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             frame.method,
             method::PUT
                 | method::PUT_RUN
+                | method::INPUT_STATS
                 | method::TAKE
                 | method::POLL
                 | method::RECORD_SIZE
@@ -1432,6 +1439,8 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         // *weaker* authority than taking one: the record is what the kernel
         // said, and the Linux adapter -- the one holder given `WRITE` alone --
         // still cannot ask for it.
+        // `INPUT_STATS` falls through to `READ`, deliberately: it reads the
+        // input side, which is what `TAKE` and `POLL` need the right for.
         let wanted = if frame.method == method::PUT || frame.method == method::PUT_RUN {
             crate::cap::Rights::WRITE
         } else {
@@ -1517,6 +1526,35 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 crate::console::put_run(&buffer[..taken]);
                 crate::service::counted(taken as u64, 0);
                 Outcome::ok(taken as u64)
+            }
+            // **What arrived, and from where — RFC 0051.** Counts without
+            // consuming, which is the whole difference from `TAKE`.
+            //
+            // Packed as `u32` pairs and **saturating**, which is stated on the
+            // ABI constant too: these are boot-lifetime counters and four
+            // billion bytes is not a session, but a counter that *wrapped*
+            // would read as a working keyboard that had gone quiet — the one
+            // answer this must never give.
+            method::INPUT_STATS => {
+                let (serial_in, serial_lost, keys_in, keys_lost) = crate::input::per_source();
+                let (_, _, interrupts) = crate::input::statistics();
+                let scancodes = crate::keyboard::scancodes();
+                let pair = |high: u64, low: u64| {
+                    (u64::from(u32::try_from(high).unwrap_or(u32::MAX)) << 32)
+                        | u64::from(u32::try_from(low).unwrap_or(u32::MAX))
+                };
+                // **One word per call, selected by `arg0`**, because a system
+                // call returns one: `Outcome` carries a status and a value, and
+                // `RECORD` beside this already has its caller walk an offset
+                // for the same reason. Out-of-range asks read zero rather than
+                // failing -- a reader that adds a fourth pair later should get
+                // "nothing here" and not a refusal it has to special-case.
+                return Outcome::ok(match frame.arg0 {
+                    0 => pair(serial_in, serial_lost),
+                    1 => pair(keys_in, keys_lost),
+                    2 => pair(scancodes, interrupts),
+                    _ => 0,
+                });
             }
             method::TAKE => {
                 // Blocks. A holder waiting here is not answering anything

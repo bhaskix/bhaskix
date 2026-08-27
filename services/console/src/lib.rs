@@ -35,6 +35,13 @@ pub struct Ports {
     /// domain placement, and the placement is what this abstraction exists to
     /// hide. The service asks twice per chunk.
     pub record_at: fn(usize) -> [u8; 8],
+    /// One packed pair of input counters, chosen by the selector — RFC 0051.
+    ///
+    /// The nucleus answers one word per call because a system call returns one;
+    /// this service asks three times and hands all three back in a single reply,
+    /// which is the same shape `record_at` uses and for the same reason. The
+    /// selector and the packing are `bhaskix_abi::method::INPUT_STATS`'s.
+    pub input_stats: fn(u64) -> u64,
 }
 
 // There is deliberately no counter here.
@@ -68,6 +75,16 @@ impl Service for Console {
             console::READ => Reply::new(read(ports)),
             console::RECORD_SIZE => Reply::new([(ports.record_size)() as u64, 0, 0, 0]),
             console::RECORD => Reply::new(record(ports, request.args)),
+            // **Three words in one reply, because a shell asking "did anything
+            // arrive?" should not have to ask three times.** The nucleus limit
+            // is one word per call; a reply carries four, so the aggregation
+            // belongs here rather than in every caller.
+            console::STATS => Reply::new([
+                (ports.input_stats)(0),
+                (ports.input_stats)(1),
+                (ports.input_stats)(2),
+                0,
+            ]),
             _ => Reply::new([with_outcome(0, outcome::WRONG_KIND), 0, 0, 0]),
         }
     }
@@ -182,6 +199,9 @@ mod tests {
                 let mut typed = held(&TYPED);
                 (!typed.is_empty()).then(|| typed.remove(0))
             },
+            // Distinguishable per selector, so a test can tell "the three words
+            // came back in order" from "three words came back".
+            input_stats: |which| 0x1000 + which,
             record_size: || held(&RECORD).len(),
             record_at: |offset| {
                 let record = held(&RECORD);
@@ -287,5 +307,25 @@ mod tests {
         let args = [size as u64, 0, 0, 0];
         let reply = Console::handle(&mut (), &ports, request(console::RECORD, &args));
         assert!(Chunk::unpack(&reply.args).bytes().is_empty());
+    }
+
+    /// RFC 0051: the service's only job here is asking three times and putting
+    /// all three in one reply, and this is that job.
+    ///
+    /// **In order, and that is the assertion.** The nucleus answers one word
+    /// per call because a system call returns one; a caller that got the three
+    /// words shuffled would read the keyboard's count as the serial's and
+    /// conclude the opposite of the truth about a machine whose keyboard is in
+    /// doubt.
+    #[test]
+    fn stats_asks_for_each_word_and_returns_them_in_order() {
+        // No guard: this port is a pure function of its selector and touches
+        // none of the shared state the other tests take turns over.
+        let reply = Console::handle(&mut (), &ports(), request(console::STATS, &[0; 4]));
+        assert_eq!(
+            [reply.args[0], reply.args[1], reply.args[2]],
+            [0x1000, 0x1001, 0x1002],
+            "each word must come from its own selector, in order"
+        );
     }
 }

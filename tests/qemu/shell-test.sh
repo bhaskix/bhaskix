@@ -123,7 +123,11 @@ else
     # pager, not at a prompt), so the send loop waits out its ten seconds before
     # carrying on. That is the cost of testing a pager with a harness that paces
     # itself on echoes, and it is cheaper than not testing it.
-    commands=$'help\r'$'dmesg\r'$'q\r'$'caps\r'$'map\r'$'irq\r'$'open greeting\r'
+    # `input` is RFC 0051's whole point: this shell holds capabilities and not
+    # kernel statistics, so until 2026-08-27 it answered `input: not a command`
+    # and a machine whose keyboard seemed dead had no way to say whether a key
+    # had reached it.
+    commands=$'help\r'$'dmesg\r'$'q\r'$'caps\r'$'input\r'$'map\r'$'irq\r'$'open greeting\r'
     commands+=$'open sub/inner\r'$'open ..\r'$'open inner\r'$'ls /\r'$'cat etc/hostname\r'
     if [[ "$MODE" == "iommu" ]]; then
         # `ask` was called `lend` until 2026-08-21, when the name was found to
@@ -321,6 +325,23 @@ if await "$started" && await "$prompt"; then
     done <<< "$commands"
     # The last command's reply is the signal that everything before it landed.
     await "nosuchcommand: not a command"
+
+    # **RFC 0051: the ring 3 shell can ask what arrived, and the serial column
+    # must have moved.** A gate that accepted zero would pass on a machine where
+    # nothing worked -- and this harness types every command above over the
+    # serial line, so by the time `input` ran those bytes were counted.
+    #
+    # `grep -E` and not `await`, which matches fixed strings: the count depends
+    # on how much has been typed and changes whenever a command is added to the
+    # list, so the number cannot be written down here. What must be true is that
+    # it is not zero. Placed after the line above, which is what proves the
+    # whole command list ran.
+    if grep -qE 'serial +[1-9][0-9]* bytes' "$LOG" 2>/dev/null; then
+        pass "the ring 3 shell asked what arrived, and the serial column had moved"
+    else
+        fail "the shell's input command did not report serial bytes it demonstrably received"
+        status=1
+    fi
     sleep 0.5
 fi
 

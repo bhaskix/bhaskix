@@ -173,6 +173,25 @@ if [[ $status -eq 0 ]]; then
         status=1
     fi
 
+    # **And ask the machine what it counted — RFC 0051.** This is the assertion
+    # that could not be written before it: the counters live in the nucleus, and
+    # the shell this lane types at runs in ring 3, so `input` answered *"not a
+    # command"* here until 2026-08-27. The SR550's keyboard appeared dead that
+    # day and nothing on the machine could say whether a key had reached it.
+    #
+    # The keyboard column must be **non-zero**, which is the whole point: keys
+    # demonstrably arrived above, so a counter reading zero would mean the
+    # count is not wired to the thing it claims to count -- exactly how
+    # `set_owner` sat unwritten for a milestone.
+    mark=$(wc -l < "$LOG")
+    monitor "sendkey i" "sendkey n" "sendkey p" "sendkey u" "sendkey t" "sendkey ret"
+    if await_after 'keyboard +[1-9][0-9]* bytes from [1-9][0-9]* i8042 scancodes' "$mark"; then
+        pass "the input counters attribute what was typed to the keyboard"
+    else
+        fail "the keyboard's own counter did not move for keys that demonstrably arrived"
+        status=1
+    fi
+
     # Shift, because the modifier state is held between two scancodes and is
     # the part of the translation a table alone cannot get right.
     mark=$(wc -l < "$LOG")
