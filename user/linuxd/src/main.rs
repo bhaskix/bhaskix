@@ -766,16 +766,35 @@ fn read_console(request: &PersonalityCall) -> Answer {
     if count == 0 {
         return Answer::ok(0);
     }
+    // **`POLL_INPUT` and not `TAKE_INPUT`, and the reason is this program's
+    // shape.** `TAKE_INPUT` blocks in the nucleus until somebody types — on the
+    // *calling* thread, which is this one. This adapter is single-threaded and
+    // serves every hosted domain from one receive loop, so a blocking take
+    // stops the whole personality until a key arrives. It was written that way
+    // first and the typing lane found it: BusyBox sat in `read`, the adapter
+    // sat in BusyBox, and the boot only moved on when the corpus timed out and
+    // killed the domain.
+    //
+    // So this asks whether a byte is *already* waiting and answers `EAGAIN`
+    // when none is. That is honest and it is not enough: a shell wants to
+    // **wait**, and waiting properly means parking the caller and waking it
+    // when input arrives — a `BLOCK_ON` reply against a notification the
+    // console signals, which is RFC 0053's remaining work rather than
+    // something to fake here.
+    //
     // `call` rather than `invoke`, because the byte is the *value* and `invoke`
     // keeps only whether the call worked.
     let taken = call(
         syscall::INVOKE,
         handle_of(request.domain),
-        method::TAKE_INPUT,
+        method::POLL_INPUT,
         [0, 0, 0, 0],
     );
     if taken.status != status::OK {
         return Answer::error(-5); // EIO
+    }
+    if taken.args[0] == NOTHING {
+        return Answer::error(-11); // EAGAIN: nothing typed yet
     }
     let byte = [taken.args[0] as u8];
     if !copy_out(request.domain, buffer, &byte) {
@@ -4423,6 +4442,9 @@ fn handle_of(domain: u32) -> u64 {
 
 /// A slot index no CSpace has, so an invocation on it is refused.
 const NO_HANDLE: u64 = u64::MAX;
+
+/// What `POLL_INPUT` answers when nobody has typed — out of a byte's range.
+const NOTHING: u64 = 0x100;
 
 /// `MAP_AT`'s lazy flag: record the region, take no frame until it is touched.
 const MAP_LAZY: u64 = 1;

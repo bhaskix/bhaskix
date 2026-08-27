@@ -1005,6 +1005,15 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // from a source file in this tree. BusyBox is somebody else's binary,
     // unmodified: what it asks for is not a thing anybody here chose, and the
     // numbers it is refused are the L1 work queue.
+    // **`busybox=sh` runs it interactively and gives its domain the keyboard**
+    // — RFC 0053's lane. Off by default and it has to be: an interactive shell
+    // blocks reading, so every ordinary boot would stop here waiting for a key
+    // nobody is going to press. The lane that sets it is the one that types.
+    let busybox_shell = handoff
+        .cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == "busybox=sh");
+    BUSYBOX_INTERACTIVE.store(busybox_shell, core::sync::atomic::Ordering::Release);
     if !corpus_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -3385,6 +3394,14 @@ const BUSYBOX_PROGRAM: &[u8] = b"bin/busybox";
 /// after the other, never at once.
 static CORPUS_PROGRAM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// Whether the BusyBox corpus should be an **interactive** shell — RFC 0053.
+///
+/// Set from `busybox=sh` on the command line. Off by default, because an
+/// interactive shell blocks reading and an ordinary boot has nobody to type at
+/// it: the machine would stop in the middle of its own self-tests.
+static BUSYBOX_INTERACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// The thread that becomes RFC 0005 step 7's Tier 0 attempt: a **real static
 /// Go binary**, loaded by this kernel's own fuzz-hardened ELF loader into a
 /// Linux-tagged domain, entered on an initial process image built by
@@ -3488,10 +3505,12 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     // byte somebody typed at the shell"*. A hosted program reading stdin needs
     // an input authority of its own, which is a decision and not a syscall.
     // `-c` is what can be gated today: it runs, it prints, and it ends.
-    let args: &[&[u8]] = if busybox {
-        &[b"sh", b"-c", b"echo hi from sh"]
-    } else {
-        &[b"go-hello"]
+    let interactive = BUSYBOX_INTERACTIVE.load(core::sync::atomic::Ordering::Acquire);
+    let args: &[&[u8]] = match (busybox, interactive) {
+        // The lane that types. `sh` with no `-c` reads until end of input.
+        (true, true) => &[b"sh"],
+        (true, false) => &[b"sh", b"-c", b"echo hi from sh"],
+        _ => &[b"go-hello"],
     };
     let env: [&[u8]; 0] = [];
     let builder = Builder::new(
@@ -3960,6 +3979,22 @@ fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
     // Record what *this* domain asks for, which is the L1 work queue: the
     // numbers a program somebody else wrote needs and this adapter refuses.
     syscall::trace_domain(realm.as_u32());
+    // **The keyboard, for the lane that types** — RFC 0053. Granted to this
+    // domain and to no other, and released when the domain ends, so the
+    // Bhaskix shell that starts afterwards gets it back. Only the interactive
+    // lane asks: a corpus running `sh -c` never reads, and granting it input it
+    // will not use would take the keyboard from the shell for nothing.
+    if busybox && BUSYBOX_INTERACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        match domain::grant_input(realm) {
+            Ok(()) => println!(
+                "    busybox input  this domain was granted the console: it may read what is \
+                 typed, and nothing else may while it holds it"
+            ),
+            Err(error) => {
+                println!("\x1b[91m    busybox input  FAILED to grant the console: {error:?}\x1b[0m")
+            }
+        }
+    }
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());

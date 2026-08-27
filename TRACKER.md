@@ -1123,6 +1123,42 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-27 (the typing lane, which fails on purpose and has already earned its place twice)
+
+**`tests/qemu/busybox-test.sh` boots with `busybox=sh`, grants the corpus domain
+the console, and types at BusyBox.** It is **not** in `make test`, because it
+**fails**, and the failure is the true state of the machine rather than a broken
+test.
+
+**What passes**: the domain is granted the console; BusyBox's `sh` reaches `/ #`;
+and after it exits the machine finishes booting — which is what says the keyboard
+was *returned* rather than taken.
+
+**What fails**: *"the reply came after BusyBox was done — the Bhaskix shell
+answered, not BusyBox."*
+
+**It found a real flaw before it found anything else.** `TAKE_INPUT` blocks in
+the nucleus on the **calling** thread, and the caller is `bin/linuxd`, which is
+single-threaded and serves every hosted domain from one receive loop. So a
+blocking take stops the whole personality until somebody types: BusyBox sat in
+`read`, the adapter sat in BusyBox, and the boot only moved on when the corpus
+timed out and killed the domain. The adapter now uses `POLL_INPUT` and answers
+`EAGAIN`, which cannot stall anything and is not enough for a shell.
+
+**And it caught its own first assertion passing for the wrong reason.**
+`echo typed at busybox` is a command *both* shells understand. The first version
+waited for the reply and passed — on a run where BusyBox never read a byte,
+exited, and the **Bhaskix** shell answered. The log said
+`bhaskix$ echo typed at busybox` and the lane called it a success. The assertion
+is positional now: the reply must arrive **before** the corpus prints its
+summary, because position is the only thing here that can tell the two shells
+apart.
+
+**What is left, named**: waiting properly means parking the caller and waking it
+when input arrives — a `BLOCK_ON` reply against a notification the console
+signals. That is RFC 0053's remaining work, and this lane is what will say when
+it is done.
+
 ### 2026-08-27 (a test of mine demanded that nothing else print)
 
 `console::put_run_tests::every_byte_of_a_run_is_put_in_order` failed once in a

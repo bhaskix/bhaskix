@@ -1151,6 +1151,14 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 | method::SPAWN_THREAD
                 | method::SET_TLS
                 | method::MAKE_SPACE
+                // RFC 0053. **This list is why the arm in `domain_supervise`
+                // was unreachable on the first attempt**: the methods are
+                // whitelisted here as well as handled there, and a method
+                // handled in only one of the two places is answered by the
+                // fall-through instead — which reads, from the caller, exactly
+                // like a refusal it has no way to tell apart.
+                | method::TAKE_INPUT
+                | method::POLL_INPUT
         )
         && let Some(outcome) = domain_supervise(frame)
     {
