@@ -1123,6 +1123,41 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-28 (confirmed on the SR550: five of this week's gates, on real hardware)
+
+**`98447d2` booted on the Lenovo SR550 and reached its user-mode shell**, with
+**zero failure markers** in 56 KiB of serial-over-LAN output. Sixteen processors
+online of sixteen reported. The machine was found powered off, so nothing was
+interrupted; it was returned powered off, the image unmounted and the one-time
+boot override self-cleared. The persistent boot order was not touched.
+
+**What it confirms**, each printed by the machine itself:
+
+- `linux poll` — a hosted Linux program asked **`ppoll` and `select`** about
+  standard input; both reported it ready, `ppoll` with `POLLERR` because that
+  domain was granted no console, and `select` refused a descriptor nobody has
+  with `EBADF` (RFC 0055).
+- `two sources` — a parked thread woke **by the signal** when one came and **by
+  the deadline** when none did, and the deadline that lost the race was still
+  armed while the one that won had cleared itself (RFC 0057).
+- `parked wake` — a thread parked on a notification was woken by **its domain
+  ending**, gave the notification back, and was reaped; `0 wakes dropped`
+  (RFC 0054's unresolved question 1, and the cap removed with it).
+- `console wake` — the adapter holds it at slot 24, **read-only** (RFC 0054).
+- `input grant` — the grant is exclusive and released with its domain
+  (RFC 0053).
+
+**What it cannot confirm, and said so itself rather than passing quietly:**
+`linux socket poll`, `linux socket` and `datagram wake` all printed *skipped: no
+network this machine can drive*. There is no protocol service on it — no virtio
+NIC and no IOMMU for one — so RFC 0056's and RFC 0058's socket work has still
+run only on the emulator. **And no shell was typed at**: serial-over-LAN is
+output-only here, so the BusyBox typing lane remains QEMU-only.
+
+**The `datagram bell` line is absent, which is correct**: `bin/ipd` does not run
+on a machine with no network, so there is no domain to grant the bell to and
+nothing to report. A boot that printed the line here would have been the bug.
+
 ### 2026-08-28 (the parked wake proved — and the one crate the linter did not cover)
 
 **RFC 0058's Part B was half built, and I said it was whole.** Its accepted
