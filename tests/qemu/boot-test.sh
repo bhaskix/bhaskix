@@ -2855,6 +2855,24 @@ else
     status=1
 fi
 
+# `bin/ipd` rings a bell when a datagram lands -- RFC 0058 Part B.
+#
+# Read by peeking the notification rather than taking it: nothing waits on this
+# bell on a boot with no hosted poller, so the bit stays set and is exactly the
+# proof that the service rang it. Asserted after the probe that sends, because
+# before it the bell has had nothing to announce -- which is where this check
+# was placed first, and it reported a truth about the wrong moment.
+if grep -qF "datagram bell  bin/ipd rang it" "$LOG"; then
+    pass "the service rang its bell when a datagram arrived"
+elif grep -qF "datagram bell  granted and never rung: no network" "$LOG"; then
+    pass "no network this machine can drive, so no datagram bell to ring"
+elif ! grep -qF "datagram bell" "$LOG"; then
+    pass "no datagram bell on this machine"
+else
+    fail "the datagram bell was granted and never rung"
+    status=1
+fi
+
 # `poll` on a socket, and the assertion that asking did not empty it --
 # RFC 0056.
 #

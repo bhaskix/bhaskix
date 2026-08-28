@@ -8300,6 +8300,34 @@ fn lending_self_test(hhdm: u64) -> bool {
     ok
 }
 
+/// Whether `bin/ipd` rang the datagram bell — RFC 0058 Part B's gate.
+fn datagram_bell_report() {
+    // **Whether this machine could have rung it at all.** `bin/ipd` starts on
+    // every lane, so the bell is granted on every lane -- but a machine whose
+    // network device gets no DMA window has nothing to deliver, and an unrung
+    // bell there is the truth rather than a fault. Printed red only where a
+    // datagram actually moved; the bios lane spent a suite run failing for
+    // having no network, which is the same distinction `socket_self_test`
+    // already draws and this borrowed without borrowing its condition.
+    let could_have = network_endpoint_capability().is_some()
+        && NET_CONTAINED.load(core::sync::atomic::Ordering::Acquire);
+    match (datagram_bell_rung(), could_have) {
+        (None, _) => {}
+        (Some(true), _) => println!(
+            "    datagram bell  bin/ipd rang it: a datagram arriving now wakes a hosted program \
+             parked waiting for one"
+        ),
+        (Some(false), false) => println!(
+            "    datagram bell  granted and never rung: no network this machine can drive, so no \
+             datagram has arrived to announce"
+        ),
+        (Some(false), true) => println!(
+            "\x1b[91m    datagram bell  granted and never rung on a machine that moved a \
+             datagram -- a hosted poll on a socket would wait for a wake nobody sends\x1b[0m"
+        ),
+    }
+}
+
 /// RFC 0056's witness: `poll` asks a socket and does not empty it.
 ///
 /// Runs only where there is a network to ask, on the same two-way distinction
@@ -10235,6 +10263,39 @@ static IP_INBOX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 const IP_TCP_BADGE: u64 = 1 << 2;
 const TCP_TIMER_BADGE: u64 = 1 << 0;
 const TCP_FRAME_BADGE: u64 = 1 << 1;
+/// The bit `bin/ipd` rings the datagram bell with — RFC 0058 Part B.
+///
+/// One bit, and not zero: `notify::signal` **or**s the badge into the pending
+/// word, so a zero badge sets nothing and the waiter is never woken.
+const DATAGRAM_BADGE: u64 = 1 << 0;
+
+/// The datagram bell, by identity, so the boot can ask whether it was rung.
+static DATAGRAM_BELL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether `bin/ipd` has rung the datagram bell, **without taking the bit**.
+///
+/// `notify::peek` and not `poll`, for the reason `futex_wakes_left_dirty` gives:
+/// a check that consumed the evidence would clear the very thing it reports and
+/// change what the next waiter sees. Nothing waits on this bell on a boot with
+/// no hosted poller, so the bit stays set and is exactly the proof that the
+/// service rang it.
+fn datagram_bell_rung() -> Option<bool> {
+    let raw = DATAGRAM_BELL.load(core::sync::atomic::Ordering::Acquire);
+    if raw == u64::MAX {
+        return None;
+    }
+    let id = crate::notify::NotificationId::from_parts(raw as u32, (raw >> 32) as u32);
+    Some(crate::notify::peek(id) != 0)
+}
+
+/// Which domain `bin/ipd` runs in, or `u32::MAX` before it starts.
+static IP_DOMAIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `bin/ipd`'s domain, once it has one.
+fn ip_domain() -> Option<domain::DomainId> {
+    let raw = IP_DOMAIN.load(core::sync::atomic::Ordering::Acquire);
+    (raw != u32::MAX).then(|| domain::DomainId::from_u32(raw))
+}
 
 /// Bytes in the ring between `bin/netd` and `bin/ipd`.
 ///
@@ -11143,6 +11204,9 @@ fn start_ip_domain(
 ) -> Result<(), &'static str> {
     let realm = domain::create("ip", domain::ResourceEnvelope::new())
         .map_err(|_| "the ip domain would not be created")?;
+    // Remembered, because the adapter's datagram bell is granted much later in
+    // boot and has no other way to name this domain -- RFC 0058 Part B.
+    IP_DOMAIN.store(realm.as_u32(), core::sync::atomic::Ordering::Release);
 
     // The ring is owned by `net-keeper` rather than by either side of it. Both
     // domains die independently and the ring must outlive whichever goes
@@ -16921,6 +16985,65 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
                  carry bytes\x1b[0m"
             ),
         }
+
+        // **And a bell, at slot 95** -- RFC 0058 Part B. Slot 90 first, which
+        // is the *first* of the adapter's six socket slots: a hosted `bind`
+        // then answered `EADDRINUSE` because `expect_socket` could not declare
+        // a slot a notification already held. The pool gave up its last slot
+        // instead, which costs nothing -- `bin/ipd` serves four sockets in
+        // total, so five was already one more than it can fill. `bin/ipd` rings it when
+        // a datagram is delivered to a socket, so a hosted program parked
+        // waiting for one can be woken; without it a `poll` naming only sockets
+        // cannot wait at all, which is what RFC 0056 left open.
+        //
+        // **`READ` here and `WRITE` there**, exactly as RFC 0054 split the
+        // console's: the adapter may wait for a datagram and may not claim one
+        // arrived. A program that could ring this could wake a poller that
+        // finds nothing, over and over.
+        if let Some(ip) = ip_domain() {
+            match crate::notify::create() {
+                Ok(bell) => {
+                    let for_ip = crate::notify::name(bell).ok().and_then(|root| {
+                        cap::with_arena(|arena| {
+                            arena.derive(root, cap::Rights::WRITE, DATAGRAM_BADGE).ok()
+                        })
+                    });
+                    let for_adapter = crate::notify::name(bell).ok().and_then(|root| {
+                        cap::with_arena(|arena| {
+                            arena.derive(root, cap::Rights::READ, DATAGRAM_BADGE).ok()
+                        })
+                    });
+                    match (for_ip, for_adapter) {
+                        (Some(ringer), Some(waiter))
+                            if domain::with(ip, |d| d.cspace.install_at(10, ringer).is_ok())
+                                == Some(true)
+                                && domain::with(owner, |d| {
+                                    d.cspace.install_at(95, waiter).is_ok()
+                                }) == Some(true) =>
+                        {
+                            DATAGRAM_BELL.store(
+                                u64::from(bell.generation()) << 32 | u64::from(bell.index()),
+                                core::sync::atomic::Ordering::Release,
+                            );
+                            println!(
+                                "    linux domain   a datagram bell: bin/ipd rings it, the \
+                                 adapter waits on it and cannot ring it"
+                            )
+                        }
+                        _ => {
+                            crate::notify::destroy(bell);
+                            println!(
+                                "\x1b[93m    linux domain   no datagram bell; a hosted poll on \
+                                 a socket cannot wait\x1b[0m"
+                            )
+                        }
+                    }
+                }
+                Err(_) => {
+                    println!("\x1b[93m    linux domain   no datagram bell could be created\x1b[0m")
+                }
+            }
+        }
     }
 
     match network_endpoint_capability() {
@@ -17430,6 +17553,10 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     if !socket_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux socket   FAILED\x1b[0m");
     }
+    // **After the probe that sends**, and not before it. Placed above at first,
+    // where it reported a bell that had had nothing to announce yet: the check
+    // was right and its position made it a lie.
+    datagram_bell_report();
 
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
     println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");

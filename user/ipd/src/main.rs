@@ -85,6 +85,26 @@ const TCP_FWD: u64 = 7;
 const TCP_BACK: u64 = 8;
 /// Slot: the doorbell that wakes `bin/tcpd`.
 const TCP_BELL: u64 = 9;
+/// The bell rung when a datagram is delivered to a UDP socket — RFC 0058.
+///
+/// Write-only here, and `bin/linuxd` holds the same notification with `READ`:
+/// the adapter may wait for a datagram and may not claim one arrived. Unchecked
+/// when it rings, exactly as [`DOORBELL`] is: a machine that granted none has
+/// an empty slot, the invocation is refused, and a bell nobody hung is not an
+/// error — it is a poller that will have to ask again instead of being told.
+const DATAGRAM_BELL: u64 = 10;
+
+/// Rings the datagram bell. Called wherever a datagram becomes readable.
+fn ring_datagram_bell() {
+    DATAGRAMS_ANNOUNCED.store(
+        DATAGRAMS_ANNOUNCED.load(core::sync::atomic::Ordering::Relaxed) + 1,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    call(syscall::INVOKE, DATAGRAM_BELL, method::SIGNAL, [0; 4]);
+}
+
+/// How many times the datagram bell has been rung.
+static DATAGRAMS_ANNOUNCED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Where this program maps what it holds.
 const RING_AT: u64 = 0x2100_0000;
@@ -1110,6 +1130,7 @@ fn drain_ring(
             let take = datagram.payload.len().min(DATAGRAM);
             socket.held[..take].copy_from_slice(&datagram.payload[..take]);
             socket.length = take as u16;
+            ring_datagram_bell();
             socket.from = Address::V6(header6.source);
             socket.from_port = datagram.source.0;
             DELIVERED.store(
@@ -1164,6 +1185,7 @@ fn drain_ring(
         let take = datagram.payload.len().min(DATAGRAM);
         socket.held[..take].copy_from_slice(&datagram.payload[..take]);
         socket.length = take as u16;
+        ring_datagram_bell();
         socket.from = Address::V4(header.source);
         socket.from_port = datagram.source.0;
         // **Counted, because nothing counted it.** Every number this program
@@ -1416,6 +1438,7 @@ fn serve(
                         let take = length.min(DATAGRAM);
                         target.held[..take].copy_from_slice(&payload[..take]);
                         target.length = take as u16;
+                        ring_datagram_bell();
                         target.from = Address::V6(LOOPBACK6);
                         target.from_port = from_port;
                         DELIVERED.store(

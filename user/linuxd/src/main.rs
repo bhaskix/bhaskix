@@ -1853,7 +1853,6 @@ fn timeval_at(request: &PersonalityCall, at: u64) -> Result<Wait, i64> {
 }
 
 fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (u64, Answer) {
-    use bhaskix_personality::file::Kind;
     use bhaskix_personality::poll::{self, Condition};
 
     if count == 0 {
@@ -2420,12 +2419,28 @@ const PAYLOAD: u64 = 89;
 const PAYLOAD_AT: u64 = 0x0000_0000_1B00_0000;
 /// Where a hosted socket's capability lands: 90 up to 95, six of them.
 const SOCKET_SLOT: u64 = 90;
+/// The datagram bell — RFC 0058 Part B, `READ` so this program may wait for a
+/// datagram and cannot claim one arrived.
+///
+/// Slot 95, the one the socket pool gave up. There was no gap: 0–24 are fixed
+/// grants, 25 upward is where the kernel allocates a handle per hosted domain,
+/// 88 and 89 are the network and its page, 90 up is the socket pool and 96 up
+/// is the file pool counting down from 127.
+const DATAGRAM_BELL: u64 = 95;
 /// How many sockets one machine's hosted programs may hold at once.
 ///
-/// Six, because six is what the CSpace has left — and a limit met as `EMFILE`
+/// Five, because five is what the CSpace has left — and a limit met as `EMFILE`
 /// is a limit a program can act on, which is why it is checked rather than
 /// discovered by an `install_at` failing somewhere less legible.
-const SOCKETS: usize = 6;
+///
+/// **Six until 2026-08-28**, when RFC 0058's datagram bell took slot 95. It
+/// costs nothing real: `bin/ipd` serves four sockets in total, so five slots
+/// here were already one more than the service can fill. The bell was put at
+/// 90 first — the *first* of these — and the collision presented as a hosted
+/// `bind` answering `EADDRINUSE`, which is the third slot collision in this
+/// CSpace in one day and the second found by a boot rather than by reading the
+/// map.
+const SOCKETS: usize = 5;
 
 /// Which socket slots are taken.
 static mut SOCKET_HELD: [bool; SOCKETS] = [false; SOCKETS];
@@ -3966,8 +3981,16 @@ fn answer_bind(request: &PersonalityCall) -> Answer {
             trace_file(i64::from(descriptor), STAGE_SOCKET, u64::from(port));
             Answer::ok(0)
         }
-        Err(_) => {
-            trace_file(-98, STAGE_NOT_BOUND, u64::from(port));
+        Err(refusal) => {
+            // **The refusal's own word, not just the port** -- RFC 0058. Every
+            // failed bind answers `EADDRINUSE` because that is the only errno
+            // this can honestly guess at, and RFC 0056 recorded that the error
+            // therefore names the wrong thing. The *trace* need not guess: it
+            // carries what the service or the kernel actually said, which is
+            // the difference between "that port is taken" and "there are no
+            // sockets left" -- and the second is what a boot spent looking
+            // like the first.
+            trace_file(-98, STAGE_NOT_BOUND, refusal.word() << 16 | u64::from(port));
             release_socket_slot(slot);
             Answer::error(-98) // EADDRINUSE
         }
@@ -4411,6 +4434,28 @@ fn note_exit(domain: u32, exit: Exit) {
     // holding one leaks a slot from a pool of thirty-two rather than a
     // service's scarce table. Recorded as a difference rather than made
     // uniform, because the two pools are not the same size or the same kind.
+    release_sockets_of(domain);
+
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let processes = processes();
+    let _ = processes.ended(pid, exit);
+    wake_waiter(parent);
+}
+
+/// Gives back every socket a domain still holds.
+///
+/// Called from both ways a hosted process can stop mattering: `note_exit`, for
+/// one that exits, and the `FORGET` message, for one killed from outside. It
+/// was inside `note_exit` alone until RFC 0058, which is why a killed domain
+/// kept its socket.
+///
+/// **The last holder only.** A descriptor duplicated by `dup` names the same
+/// capability, and releasing on the first of them would take the socket from
+/// the second.
+fn release_sockets_of(domain: u32) {
+    let Some(process) = process_for(domain) else {
+        return;
+    };
     for descriptor in 0..bhaskix_personality::file::MAX_DESCRIPTORS {
         let Ok(number) = i32::try_from(descriptor) else {
             break;
@@ -4423,13 +4468,23 @@ fn note_exit(domain: u32, exit: Exit) {
             && process.descriptors.holders(entry.handle) == 1
         {
             release_socket_slot(entry.handle);
+            // **Forgotten as well as released, or the second caller releases it
+            // again.** This runs from two places now -- `note_exit` when a
+            // process exits, and `FORGET` when its slot is reused -- and a
+            // record that survives the first is walked again by the second. The
+            // slot is reused between them, so the second release closes a
+            // socket belonging to whoever holds it now: a live program losing
+            // its network because a dead one was cleaned up twice.
+            //
+            // Found by the socket probe answering `EADDRINUSE` on the boot
+            // after this function gained its second caller.
+            if let Some(process) = process_for(domain)
+                && let Some(entry) = process.descriptors.get_mut(number)
+            {
+                entry.handle = u64::MAX;
+            }
         }
     }
-
-    // SAFETY: single-threaded by construction, as elsewhere here.
-    let processes = processes();
-    let _ = processes.ended(pid, exit);
-    wake_waiter(parent);
 }
 
 /// Wakes a process parked in `wait4`, if that is where it is.
@@ -5265,6 +5320,18 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
             continue;
         }
         if received.method == FORGET_METHOD {
+            // **And its sockets** -- RFC 0058 Part A. `note_exit` releases them
+            // for a process that *exits*; a domain killed from outside reaches
+            // neither `exit_group` nor a fatal fault, so this message is the
+            // only thing that ever learns of it. `bin/ipd` holds four sockets
+            // and one held by a domain nobody can name refuses every later
+            // bind -- which showed up as a *different* program losing its
+            // network, the failure shape a shared adapter produces.
+            //
+            // Late rather than never: this arrives when the slot is reused, so
+            // a socket held by a domain killed and not replaced stays held.
+            // That bound is stated in RFC 0058 rather than rounded to "fixed".
+            release_sockets_of(received.badge as u32);
             *dispositions_of(received.badge as u32) = Dispositions::new();
             // And whatever it left asleep. A sleeper keyed by a domain id
             // that now names somebody else would let a `WAKE` from the new

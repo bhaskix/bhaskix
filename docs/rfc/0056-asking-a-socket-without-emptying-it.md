@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. Gated on the lane that has a network. A hosted Linux program polls a UDP socket (quiet), sends to itself, polls again (`POLLIN`), and then **receives all four bytes** — which is what says asking took nothing. Watched red by making the peek consume: `received -11, payload 0x0`, exactly the failure this exists to prevent. **What this does not claim.** *(1)* A socket becoming readable still does not wake a parked poller — unresolved question 1 below. *(2)* TCP is refused at `socket()`, so there is nothing to report for one. *(3)* It found an older defect it deliberately does not fix: a hosted process that ends without closing leaks its socket in `bin/ipd`, whose whole supply is four |
+| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. Gated on the lane that has a network. A hosted Linux program polls a UDP socket (quiet), sends to itself, polls again (`POLLIN`), and then **receives all four bytes** — which is what says asking took nothing. Watched red by making the peek consume: `received -11, payload 0x0`, exactly the failure this exists to prevent. **What this does not claim.** *(1)* A socket becoming readable still does not wake a parked poller — unresolved question 1 below. *(2)* TCP is refused at `socket()`, so there is nothing to report for one. *(3)* It found an older defect it deliberately does not fix — **and this description of it was wrong, corrected 2026-08-28 by [RFC 0058](0058-what-a-service-learns-without-being-called.md)**: a process that *exits* already has its sockets released by `note_exit`, and what leaks is one **killed from outside**, which the adapter learns about only when the domain slot is reused |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — Core Operating System (L1) |
@@ -137,16 +137,22 @@ One service call per socket named in a `poll`, which is the same cost as the
 
 ## What was found while building it
 
-**A hosted process that ends leaks its socket, and nothing notices.** The probe
-was written to bind, poll, send and receive, and then simply end — its domain
-killed like every other probe's. The *next* test on that boot, the socket probe
+**A hosted process that is *killed* leaks its socket, and nothing notices.**
+*(This paragraph said "ends" until 2026-08-28. That was wrong: a process that
+`exit_group`s, faults fatally or kills itself reaches `note_exit`, which already
+releases its sockets. What leaks is one killed from outside — see
+[RFC 0058](0058-what-a-service-learns-without-being-called.md), which corrects it
+and bounds it.)* The probe was written to bind, poll, send and receive, and then
+simply end — its domain killed like every other probe's. The *next* test on that boot, the socket probe
 that has passed since RFC 0005 step 9, was then refused its own `bind` and the
 adapter reported `EADDRINUSE` on a port nobody else held.
 
 The cause is written down in `bin/linuxd` already, in the comment on
 `release_socket_slot`: *"`bin/ipd` holds four sockets in a table of its own, and
-nothing tells it a client has stopped caring."* Ending a domain releases the
-descriptor table and the capability; it does not tell the service. Four sockets
+nothing tells it a client has stopped caring."* What that comment does **not**
+say, and what was missed when this was written, is that `note_exit` already
+acts on it for every process that exits. The gap is narrower and more specific:
+a domain killed from outside reaches neither. Four sockets
 is the whole supply, and the error every failed bind is flattened to is
 `EADDRINUSE`, which named a port that was not the problem.
 
