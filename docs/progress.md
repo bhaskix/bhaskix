@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| RFCs accepted | **39** |
-| RFCs open | 16 |
+| RFCs accepted | **40** |
+| RFCs open | 15 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -54,7 +54,7 @@ gantt
     RFC 0029 IPv6 — the second family the first one was... :done, r0029, 2026-08-18, 1d
     RFC 0047 refusing a connection to a port nobody holds :done, r0047, 2026-08-24, 1d
     RFC 0048 a listener that cannot be wedged :done, r0048, 2026-08-24, 2026-08-26
-    RFC 0056 asking a socket whether anything arrived without... :active, r0056, 2026-08-28, 2026-08-28
+    RFC 0056 asking a socket whether anything arrived without... :done, r0056, 2026-08-28, 1d
     section Drivers & IOMMU
     RFC 0011 IrqHandler — who may receive an interrupt :done, r0011, 2026-08-04, 1d
     RFC 0012 The IOMMU and what a device is allowed to reach :done, r0012, 2026-08-04, 1d
@@ -149,7 +149,6 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
-| 0056 | asking a socket whether anything arrived without emptying it | 2026-08-28 |
 
 ## Annexes
 

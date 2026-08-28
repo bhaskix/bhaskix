@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📝 **DRAFT 2026-08-28** — built and gated on the lane that has a network. A hosted Linux program polls a UDP socket (quiet), sends to itself, polls again (`POLLIN`), and then **receives all four bytes** — which is what says asking took nothing. Watched red by making the peek consume: `received -11, payload 0x0`, exactly the failure this exists to prevent. **What this does not claim.** *(1)* A socket becoming readable still does not wake a parked poller — unresolved question 1 below. *(2)* TCP is refused at `socket()`, so there is nothing to report for one. *(3)* It found an older defect it deliberately does not fix: a hosted process that ends without closing leaks its socket in `bin/ipd`, whose whole supply is four |
+| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. Gated on the lane that has a network. A hosted Linux program polls a UDP socket (quiet), sends to itself, polls again (`POLLIN`), and then **receives all four bytes** — which is what says asking took nothing. Watched red by making the peek consume: `received -11, payload 0x0`, exactly the failure this exists to prevent. **What this does not claim.** *(1)* A socket becoming readable still does not wake a parked poller — unresolved question 1 below. *(2)* TCP is refused at `socket()`, so there is nothing to report for one. *(3)* It found an older defect it deliberately does not fix: a hosted process that ends without closing leaks its socket in `bin/ipd`, whose whole supply is four |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — Core Operating System (L1) |
