@@ -5251,6 +5251,20 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         true
     } else {
+        // **All zeros means the program never reported, not that it answered
+        // wrongly**, and those are different failures with different places to
+        // look. Seen twice in three hundred boots on 2026-08-28: the probe
+        // faulted at null and its domain was ended, and the `linux fault` line
+        // saying so sits immediately above this one — but this line invited a
+        // reader to go hunting a futex bug that was not there.
+        if answers.iter().all(|answer| *answer == 0) {
+            println!(
+                "\x1b[91m    linux futex    FAILED: the probe reported nothing at all, so it \
+                 never ran to its first answer -- look at the line above this one, not at the \
+                 futex\x1b[0m"
+            );
+            return false;
+        }
         println!(
             "\x1b[91m    linux futex    FAILED: tid {}, pid {}, yield {}, stale-wait {}, \
              empty-wake {}, shared {}, clone {}, arch_prctl {}, fs:[0] {:#x}, write {}\x1b[0m",
