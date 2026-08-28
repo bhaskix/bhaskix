@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📝 **DRAFT 2026-08-28** — built and gated. `two sources` on every boot lane proves both directions and the take-back; the typing lane proves the arm, by hanging without it, and shows the shape in use. **What this does not claim.** *(1)* Only `poll`/`select` naming the **console** use it; a socket still wakes nobody, which is RFC 0056's question and needs a notification the service signals. *(2)* The nucleus's own disarm has no lane that would catch its removal — the timed park's deadline usually fires by itself — so what proves the take-back is the self-test, on the primitive both paths use. *(3)* `clock_nanosleep` keeps the wake pool: it waits on a deadline alone and has no event to race |
+| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. Built and gated. `two sources` on every boot lane proves both directions and the take-back; the typing lane proves the arm, by hanging without it, and shows the shape in use. **What this does not claim.** *(1)* Only `poll`/`select` naming the **console** use it; a socket still wakes nobody, which is RFC 0056's question and needs a notification the service signals. *(2)* The nucleus's own disarm has no lane that would catch its removal — the timed park's deadline usually fires by itself — so what proves the take-back is the self-test, on the primitive both paths use. *(3)* `clock_nanosleep` keeps the wake pool: it waits on a deadline alone and has no event to race |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel |
 | **Milestone** | Phase 2 — Core Operating System (L1) |
