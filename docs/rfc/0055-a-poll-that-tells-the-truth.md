@@ -179,6 +179,14 @@ duration this machine cannot name is treated as **unbounded** — which for a
 `poll` naming the console means waiting for a key, which is what the caller
 wanted.
 
+**A terminal that did not answer a question it was asked.** Once `poll` worked,
+BusyBox's line editor began completing the handshake a terminal is expected to:
+it writes `ESC [ 6 n` and waits to be told the cursor's row and column. Nothing
+replied, so the next thing typed was consumed as the reply and the command never
+arrived — which presents as "BusyBox never saw what was typed" and is really
+"the terminal ignored it". The lane answers it now, conditionally, because the
+harness *is* the terminal on this machine.
+
 **The report was crying wolf.** `notify::wait` answers `Gone` both for a
 notification that has been destroyed and for a thread that has been told to
 stop, and the second is the ordinary end of a domain. Counted together, killing

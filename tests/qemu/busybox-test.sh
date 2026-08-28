@@ -109,6 +109,19 @@ await() {
     return 0
 }
 
+# `await` without the complaint: a pattern that never arrives is an answer here
+# rather than a failure, because whether BusyBox asks for the cursor position
+# depends on what it believes about the terminal.
+await_quiet() {
+    local tries=0
+    while ((tries < 30)); do
+        grep -qa -- "$1" "$LOG" 2>/dev/null && return 0
+        sleep 0.5
+        ((tries++))
+    done
+    return 1
+}
+
 # The grant first: if the keyboard was not handed over there is no point typing,
 # and the failure is a different one worth naming.
 if await "this domain was granted the console"; then
@@ -150,6 +163,22 @@ fi
 # 0x70 in the adapter made every one of them land and print. See TRACKER's
 # entry for 2026-08-28. Typing a `p` here would fail this lane for a fault
 # that is not the machine's.
+# **Answer the cursor-position report first, because this harness is the
+# terminal.** Once `poll` was answered (RFC 0055), BusyBox's line editor began
+# doing the handshake a terminal is expected to complete: it writes `ESC [ 6 n`
+# and waits to be told the cursor's row and column. Nothing replied, so the next
+# thing typed was consumed as the reply and the command never arrived -- which
+# presents as "BusyBox never saw what was typed" and is really "the terminal did
+# not answer a question it was asked".
+#
+# Conditional, because typing this when nothing asked for it would put five
+# stray bytes on the command line. Row 1, column 3, which is where the cursor
+# actually is after `/ # `.
+if await_quiet $'\033\[6n'; then
+    printf '\033[1;3R' >&3
+    sleep 1
+fi
+
 printf 'echo keyed at busybox\r' >&3
 if await "keyed at busybox"; then
     replied=$(grep -an 'keyed at busybox' "$LOG" | head -1 | cut -d: -f1)
@@ -182,6 +211,19 @@ if await "keyed at busybox"; then
 else
     fail "BusyBox never saw what was typed at it"
     status=1
+fi
+
+# **And it was never told a lie about `poll`** -- RFC 0055.
+#
+# Asserted after the typing rather than before, because the interesting calls
+# are the ones a shell makes *while reading a line*: BusyBox polled once per
+# keystroke and printed this once per keystroke. A machine that answers `poll`
+# says nothing here at all.
+if grep -aq 'poll: Function not implemented' "$LOG"; then
+    fail "BusyBox was told poll is not implemented, once per keystroke"
+    status=1
+else
+    pass "poll was answered, so nothing complained about it"
 fi
 
 # And give it back. `exit` ends the shell, its domain ends, and the grant is

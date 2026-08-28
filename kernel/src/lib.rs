@@ -4036,15 +4036,20 @@ fn park_refusals_report() {
     let unnamed = syscall::PARK_UNNAMED.load(Relaxed);
     let refused = syscall::PARK_REFUSED.load(Relaxed);
     let parked = syscall::BLOCKED.load(Relaxed);
+    let ended = syscall::PARK_ENDED.load(Relaxed);
     if ungranted + unnamed + refused == 0 {
-        println!("    input park     {parked} parked on the console, none refused");
+        println!(
+            "    input park     {parked} parked on the console, none refused ({ended} ended with \
+             their domain)"
+        );
         return;
     }
     println!(
         "\x1b[93m    input park     {parked} parked, {} refused: {ungranted} for a domain with \
-         no grant, {unnamed} naming an empty slot, {refused} by the notification itself -- a \
-         refusal loses a wake and answers EAGAIN\x1b[0m",
-        ungranted + unnamed + refused
+         no grant, {unnamed} naming an empty slot, {refused} by the notification itself \
+         (last slot {slot}) -- a refusal loses a wake and answers EAGAIN\x1b[0m",
+        ungranted + unnamed + refused,
+        slot = syscall::PARK_REFUSED_SLOT.load(Relaxed) as i64
     );
 }
 

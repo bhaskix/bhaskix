@@ -165,7 +165,18 @@ asm_budget = 3
 # and the number went to 84; taking the counter from `bhaskix-sock`, which owns
 # that read already, brought it back to 76. The gate reported both, before
 # either was committed.
-unsafe_budget = 83
+# 86 as of 2026-08-28, for RFC 0055: the store of the timestamp counter's
+# frequency at entry, the accessor that reads it, and one more accessor for the
+# table that tells a first `poll` from the retry after its deadline. Three
+# lines, one per static plus the single write, which is this crate's own
+# convention -- one accessor per table, making the single-threaded promise once
+# instead of restating it wherever the table is wanted.
+#
+# It was **89** first. The extra three were a locally written `rdtsc`, and the
+# note below records that exact mistake being made and taken back out once
+# already: `bhaskix-sock` owns that read. Reading this file before raising the
+# number is what caught it -- the gate would have accepted 89 just as readily.
+unsafe_budget = 86
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

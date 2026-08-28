@@ -161,6 +161,7 @@ const _: () = {
     assert!(method::INPUT_STATS == bhaskix_abi::method::INPUT_STATS);
     assert!(method::TAKE_INPUT == bhaskix_abi::method::TAKE_INPUT);
     assert!(method::POLL_INPUT == bhaskix_abi::method::POLL_INPUT);
+    assert!(method::PEEK_INPUT == bhaskix_abi::method::PEEK_INPUT);
     assert!(method::TAKE == bhaskix_abi::method::TAKE);
     assert!(method::POLL == bhaskix_abi::method::POLL);
     assert!(method::RECORD_SIZE == bhaskix_abi::method::RECORD_SIZE);
@@ -346,6 +347,8 @@ pub mod method {
     /// The same without blocking: a byte if one is already waiting, or
     /// [`bhaskix_abi::method::NOTHING`]'s value.
     pub const POLL_INPUT: u64 = 72;
+    /// Whether a byte is waiting — 1 or 0, taking nothing. RFC 0055.
+    pub const PEEK_INPUT: u64 = 73;
     /// Take a byte that was typed, waiting until there is one.
     ///
     /// Only on a `Console` capability. Blocks, which is why a holder that
@@ -1159,6 +1162,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 // like a refusal it has no way to tell apart.
                 | method::TAKE_INPUT
                 | method::POLL_INPUT
+                | method::PEEK_INPUT
         )
         && let Some(outcome) = domain_supervise(frame)
     {
@@ -2332,7 +2336,20 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                 };
                 BLOCKED.fetch_add(1, Ordering::Relaxed);
                 if crate::notify::wait(notification).is_err() {
-                    PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    // **A caller that is being killed is not a refusal.**
+                    // `notify::wait` answers `Gone` both for a notification
+                    // that has been destroyed and for a thread that has been
+                    // told to stop, and the second is the ordinary end of a
+                    // domain somebody ended. Counting them together made the
+                    // report cry wolf on a boot where the corpus killed a
+                    // parked BusyBox: one yellow line about a lost wake, for a
+                    // thread that was going away anyway.
+                    if crate::sched::should_die() {
+                        PARK_ENDED.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+                        PARK_REFUSED_SLOT.store(answer.1, Ordering::Relaxed);
+                    }
                     return Some(-11i64 as u64);
                 }
                 continue;
@@ -2683,6 +2700,16 @@ fn may_park_on(slot: u64, domain: u32) -> bool {
 pub static PARK_UNGRANTED: AtomicU64 = AtomicU64::new(0);
 /// Parks refused because the adapter named a slot holding no notification.
 pub static PARK_UNNAMED: AtomicU64 = AtomicU64::new(0);
+/// Parks that ended because the calling thread was being killed — the ordinary
+/// end of a domain, and not a defect.
+pub static PARK_ENDED: AtomicU64 = AtomicU64::new(0);
+
+/// The slot named by the most recent refusal, so the report can say *which*
+/// notification would not take a waiter. A count alone cannot: the adapter
+/// parks on the console for a blocking read and on a wake slot for a deadline,
+/// and those two fail for entirely different reasons.
+pub static PARK_REFUSED_SLOT: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// Parks that reached [`crate::notify::wait`] and were refused by it — a second
 /// waiter on a notification that takes one, or one that has gone.
 ///
@@ -3153,7 +3180,10 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
     // put a byte on its own account and can take one only for a domain a
     // grant names. A compromised adapter therefore reads keystrokes for granted
     // domains and no others, and the check is here rather than in it.
-    if frame.method == method::TAKE_INPUT || frame.method == method::POLL_INPUT {
+    if frame.method == method::TAKE_INPUT
+        || frame.method == method::POLL_INPUT
+        || frame.method == method::PEEK_INPUT
+    {
         if !rights.contains(crate::cap::Rights::READ) {
             return Some(Outcome::err(Status::InsufficientRights));
         }
@@ -3161,6 +3191,12 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             // Not "no byte" but "not yours": a caller told the console was
             // merely empty would ask again for ever.
             return Some(Outcome::err(Status::InsufficientRights));
+        }
+        // **Asking takes nothing** -- RFC 0055. `poll` must be able to report
+        // that a byte is waiting and leave it waiting; built on `POLL_INPUT` it
+        // would eat a keystroke every time a program asked about one.
+        if frame.method == method::PEEK_INPUT {
+            return Some(Outcome::ok(u64::from(crate::input::peek_or_service())));
         }
         return Some(if frame.method == method::POLL_INPUT {
             // **`take_or_service` and not `try_read`** -- RFC 0054 step 2. A

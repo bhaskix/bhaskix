@@ -1123,6 +1123,94 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-28 (poll answered, and a measurement that its own fix invalidated)
+
+**RFC 0055 (draft): a poll that tells the truth about a descriptor.** BusyBox no
+longer prints `sh: poll: Function not implemented` once per keystroke, and still
+reads a line typed at the machine. Both are asserted by the lane, and both were
+watched red — removing the `poll` arm brings the complaint back, and making the
+peek *consume* loses every keystroke it reports.
+
+**RFC 0053's unresolved question 3 is answered.** It offered two bad options —
+refusing, which makes a shell spin, and "never readable", which is a lie a shell
+believes. The third is **`POLLERR`** for a console the domain was not granted:
+there is an error condition on that descriptor, and a `read` of it returns `EIO`
+by a nucleus check the adapter cannot lift. A caller that polls, sees `POLLERR`,
+reads and is refused has been told the truth twice.
+
+**The readiness table is a pure function in `bhaskix-personality`**, host-tested
+with nine tests and three mutations — an ungranted console answering a quiet
+zero, a pipe hanging up before its ring is drained, and a read-only file
+claiming writability — each caught by exactly one test.
+
+**A peek that takes nothing** is the one new nucleus method: `PEEK_INPUT`,
+behind the same `Rights::READ` and the same grant as `POLL_INPUT`. It exists
+because `POLL_INPUT` **consumes**, and a `poll` built on it would lose a
+keystroke every time a program asked whether one was waiting.
+
+**The measurement that justified building no timer was invalidated by the fix it
+justified.** `poll`'s arguments were measured on a machine where `poll` did not
+work: every call was `timeout = 0` or `-1`, so a timed wait looked like
+speculation and was deliberately left out. The moment `poll` *worked*, BusyBox
+took a different path — it wrote a cursor-position query, polled for the answer
+with a **positive** timeout, and called `clock_nanosleep`. Both were
+unimplemented and the shell gave up at its first prompt.
+
+The reasoning was sound and the conclusion was wrong, which is worth writing
+down: **a measurement of behaviour under the bug does not predict behaviour
+after the fix.** The timed wait and `clock_nanosleep` are here because of that
+boot, not because they were foreseen.
+
+**Neither needed anything new from the nucleus.** `method::ARM` already sets a
+deadline on a `Notification` and needs `WRITE`, which the adapter holds on its
+sixteen wake notifications — so a hosted thread parks on an armed wake slot and
+the console's own notification stays `READ` and unarmable, exactly as RFC 0054
+left it. A program that could set a timer on the keyboard could fake a
+keystroke's wake, and none can.
+
+**A `saturating_mul` became a fifteen-second hang.** Converting a duration to an
+absolute counter value saturated, on the reasoning that a huge duration should
+become a huge deadline; what it produced was `u64::MAX / 10⁹` ticks — about
+fifteen seconds, *whatever* was asked for. A `poll` with a timeout of days
+waited fifteen seconds. BusyBox sat at its first prompt until the corpus lost
+patience and killed the domain. The overflow is a refusal now, and a duration
+this machine cannot name is treated as **unbounded** — which for a `poll` naming
+the console means waiting for a key, which is what the caller wanted.
+
+**A harness defect found while mis-blaming my own change.** `make test` reported
+the RFC 0051 input-statistics gate as `FAIL` on the `kernel` shell lane — and
+passed. `shell-test.sh` initialised `status=0` *after* the typing phase, which
+is after the only assertion in that phase, so that gate could fail and have its
+result wiped before anything read it. It had been red and ignored since RFC 0051
+shipped, for a second reason underneath the first: the pattern matched
+`serial N bytes`, which is what `bin/sh` prints, and the kernel's shell prints
+`serial N (0 dropped)`, which it could never match.
+
+Both are fixed — the initialisation is at the top, and the pattern depends on
+which shell the lane runs — and the repaired gate was watched red to prove it
+now *can* fail the build. **A failure that cannot fail is worse than no test: it
+is a green tick over a broken thing**, and this one nearly cost more than it
+should have, because when a real regression appeared beside it I attributed both
+to the same change.
+
+**And a mutation revert that silently did nothing, for the second time in two
+days.** The peek was mutated to *consume* as a watched-red check, and the revert
+replaced an exact string that `cargo fmt` had since reformatted — so the
+`replace` matched nothing, changed nothing, and reported nothing. The machine
+then lost every second byte of a typed line, which is exactly what a consuming
+peek does, and I spent a boot hunting a phantom regression in the clock. The
+first instance of this, on 2026-08-28, hit `clone` and `read_console` at once.
+Reverts are asserted now; the rule that would have caught both is to revert from
+git rather than by string.
+
+**And the boot report was crying wolf.** `notify::wait` answers `Gone` both for a
+notification that has been destroyed and for a thread that has been told to
+stop, and the second is the ordinary end of a domain somebody killed. Counted
+together, killing a parked program printed a yellow line about a lost wake. They
+are counted apart now. The counters that found all of this are the ones RFC 0054
+added the day before, which is why each fault took one boot rather than a round
+of hypothesis.
+
 ### 2026-08-28 (BusyBox read a line somebody typed, and two faults were found on the way)
 
 **RFC 0054, accepted the day it was drafted: a hosted `read` that waits.** `tests/qemu/busybox-test.sh`

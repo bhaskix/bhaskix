@@ -37,6 +37,15 @@ LOG="${BHASKIX_SHELL_LOG:-$(mktemp)}"
 TIMEOUT="${SHELL_TEST_TIMEOUT:-240}"
 MODE="${1:-user}"
 
+# **Initialised here, at the top, and not half way down.** It used to be set to
+# zero after the typing phase, which is *after* the only assertion in that phase
+# -- so RFC 0051's input-statistics gate could print `FAIL` and set this, and
+# have it wiped before anything read it. `make test` passed with that gate red
+# on the `kernel` lane, and it took a boot being blamed on the wrong change to
+# notice. A failure that cannot fail is worse than no test: it is a green tick
+# over a broken thing.
+status=0
+
 fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2; }
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 
@@ -336,10 +345,23 @@ if await "$started" && await "$prompt"; then
     # list, so the number cannot be written down here. What must be true is that
     # it is not zero. Placed after the line above, which is what proves the
     # whole command list ran.
-    if grep -qE 'serial +[1-9][0-9]* bytes' "$LOG" 2>/dev/null; then
-        pass "the ring 3 shell asked what arrived, and the serial column had moved"
+    #
+    # **The pattern depends on which shell this lane runs**, because the two
+    # print the count differently: `bin/sh` writes `serial N bytes` and the
+    # kernel's writes `serial N (0 dropped)`. Written for the first only, this
+    # could never match on the `kernel` lane -- and did not, silently, because
+    # of the second bug fixed here.
+    if [[ "$MODE" == "kernel" ]]; then
+        counted='serial +[1-9][0-9]*'
+        whose="the kernel shell"
     else
-        fail "the shell's input command did not report serial bytes it demonstrably received"
+        counted='serial +[1-9][0-9]* bytes'
+        whose="the ring 3 shell"
+    fi
+    if grep -qE "$counted" "$LOG" 2>/dev/null; then
+        pass "$whose asked what arrived, and the serial column had moved"
+    else
+        fail "$whose's input command did not report serial bytes it demonstrably received"
         status=1
     fi
     sleep 0.5
@@ -368,8 +390,6 @@ fi
 exec 3>&-
 kill "$qemu" 2>/dev/null
 wait "$qemu" 2>/dev/null
-
-status=0
 
 # Everything before the shell started is the boot self-test, which runs the
 # same commands with no console input at all. Asserting against the whole log

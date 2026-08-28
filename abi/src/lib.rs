@@ -353,6 +353,18 @@ pub mod method {
     pub const TAKE_INPUT: u64 = 71;
     /// The same without blocking: a byte, or [`NOTHING`].
     pub const POLL_INPUT: u64 = 72;
+    /// **Is a byte waiting?** Answers 1 or 0, and takes nothing —
+    /// [RFC 0055](../../docs/rfc/0055-a-poll-that-tells-the-truth.md).
+    ///
+    /// The same `Rights::READ` on the same `Domain` capability as
+    /// [`POLL_INPUT`], refused by the same grant, and it confers no authority
+    /// those do not: a caller that may take a byte may certainly ask whether
+    /// there is one.
+    ///
+    /// It exists because `poll` must not consume. A `poll` built on
+    /// [`POLL_INPUT`] would lose a keystroke every time a program asked
+    /// whether one was waiting, which is the opposite of what `poll` is for.
+    pub const PEEK_INPUT: u64 = 73;
     /// Take a byte that was typed, waiting until there is one.
     ///
     /// Only on a `Console` capability, and it blocks: a holder waiting here is

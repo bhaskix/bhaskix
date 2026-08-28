@@ -380,6 +380,21 @@ pub fn take_or_service() -> Option<u8> {
     try_read()
 }
 
+/// Whether a byte is waiting, **servicing the sources first and taking
+/// nothing** — RFC 0055.
+///
+/// [`take_or_service`]'s question without its answer. It services for both of
+/// that function's reasons and they are worth repeating here, because a "just
+/// look" that skipped the drain would be wrong twice: the byte may be in the
+/// UART rather than the ring, so it would report "no" for input that has
+/// already arrived; and servicing is also what unmasks the line, so a caller
+/// that only ever peeked would eventually stop the interrupts.
+#[must_use]
+pub fn peek_or_service() -> bool {
+    service();
+    pending()
+}
+
 /// Whether anything is waiting to be read.
 #[must_use]
 pub fn pending() -> bool {

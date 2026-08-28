@@ -1122,6 +1122,17 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         // that has to do here is end the process. It lives in *this* dispatcher
         // and not the one below because only this one can answer
         // `REPLY_END_DOMAIN`.
+        // **In this dispatcher and not the one below**, for the same reason
+        // `read` is: only this one can answer a reply shape, and an infinite
+        // `poll` on the console has to park exactly as a blocking read does.
+        POLL => return answer_poll(request),
+        // `clock_nanosleep(clock, flags, request, remain)` -- RFC 0055.
+        //
+        // Answered because `poll` gave a shell a reason to ask: BusyBox's line
+        // editor sleeps between retries once it believes `poll` works, and a
+        // sleep refused with `ENOSYS` is what made it give up and exit.
+        CLOCK_NANOSLEEP => return answer_nanosleep(request),
+        NANOSLEEP => return answer_nanosleep_relative(request, request.first()),
         TGKILL => return answer_tgkill(request),
         // `wait4(pid, status, options, rusage)`.
         WAIT4 => return answer_wait(request),
@@ -1635,6 +1646,237 @@ const REPLY_BLOCK_ON: u64 = 7;
 /// What a blocking `read` needs: it must come back with *bytes*, and the zero
 /// a woken `futex` is answered with would be end of file.
 const REPLY_BLOCK_ON_RETRY: u64 = 8;
+
+/// `poll(fds, nfds, timeout)` — RFC 0055.
+const POLL: u64 = 7;
+/// How many descriptors one `poll` may name.
+///
+/// Every entry is copied in and back out through the report page's scratch
+/// area, so a bound is needed whatever the number is. Sixteen because the
+/// adapter holds thirty-two file slots and eight pipes, so a program cannot
+/// usefully poll more, and because the measured caller passes **one**.
+const POLL_MAX: u64 = 16;
+/// `struct pollfd` — `int fd`, `short events`, `short revents`.
+const POLLFD_BYTES: usize = 8;
+
+/// Answers `poll` for a hosted process — RFC 0055.
+///
+/// # What it waits for, and what it does not
+///
+/// `timeout == 0` is answered now, exactly. A **negative** timeout parks on the
+/// console notification when the set names the console for reading and the
+/// domain holds the input grant, and is otherwise answered now. A **positive**
+/// timeout is answered as if it were zero.
+///
+/// That last is a stated limit rather than an oversight. This machine cannot
+/// park a thread with a deadline: `BLOCK_ON_RETRY` carries a slot and no time.
+/// The caller this exists for was *measured* before the limit was accepted —
+/// every call it makes is one descriptor, `POLLIN` on standard input, with a
+/// timeout of either `0` or `-1` and never anything else. The failure a
+/// positive timeout can cause here is a caller that spins, not one that hangs.
+fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
+    use bhaskix_personality::poll::{self, Condition};
+    use bhaskix_personality::file::Kind;
+
+    let (at, count, timeout) = (request.first(), request.second(), request.third() as i64);
+    if count == 0 {
+        return (REPLY_VALUE, Answer::ok(0));
+    }
+    if count > POLL_MAX {
+        return (REPLY_VALUE, Answer::error(-22)); // EINVAL
+    }
+    let bytes = count as usize * POLLFD_BYTES;
+    let mut entries = [0u8; POLL_MAX as usize * POLLFD_BYTES];
+    let entries = &mut entries[..bytes];
+    if !copy_in(request.domain, at, entries) {
+        return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+    }
+
+    // Whether the console has a byte, asked **once** however many descriptors
+    // name it: it is a system call, and the answer cannot differ between two
+    // entries of one array.
+    let mut console_state: Option<(bool, bool)> = None;
+    let mut ready = 0u64;
+    let mut waits_on_console = false;
+
+    for index in 0..count as usize {
+        let entry = &entries[index * POLLFD_BYTES..(index + 1) * POLLFD_BYTES];
+        let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let events = u16::from_le_bytes([entry[4], entry[5]]);
+        let condition = match descriptor_row(request, fd as u64) {
+            None => Condition::Unknown,
+            Some((Kind::Console, ..)) => {
+                let (byte_waiting, granted) = match console_state {
+                    Some(known) => known,
+                    None => {
+                        let asked = call(
+                            syscall::INVOKE,
+                            handle_of(request.domain),
+                            method::PEEK_INPUT,
+                            [0, 0, 0, 0],
+                        );
+                        // A refusal here is the grant's refusal: the nucleus
+                        // answers `InsufficientRights` for a domain nobody gave
+                        // the console to, which is a different fact from "no
+                        // byte" and must not be flattened into one.
+                        let known = (asked.status == status::OK && asked.args[0] != 0,
+                                     asked.status == status::OK);
+                        console_state = Some(known);
+                        known
+                    }
+                };
+                if granted && events & poll::POLLIN != 0 {
+                    waits_on_console = true;
+                }
+                Condition::Console {
+                    byte_waiting,
+                    granted,
+                }
+            }
+            Some((Kind::File | Kind::Directory | Kind::Proc, ..)) => Condition::File,
+            Some((Kind::Pipe, handle, readable, writable)) => {
+                pipe_condition(handle, readable, writable)
+            }
+            Some((Kind::Socket | Kind::Epoll, ..)) => Condition::Unanswered,
+        };
+        let revents = poll::revents(events, condition);
+        entries[index * POLLFD_BYTES + 6] = revents as u8;
+        entries[index * POLLFD_BYTES + 7] = (revents >> 8) as u8;
+        if revents != 0 {
+            ready += 1;
+        }
+    }
+
+    if ready == 0 && timeout != 0 && !took_timed_wait(request.domain) {
+        // **A positive timeout waits, and does not return early.** The caller
+        // is parked on a deadline; a key arriving sooner does not cut it short,
+        // because a thread here waits on one notification and the deadline is
+        // on the other one. So this is at *least* as long as asked -- late,
+        // never early -- and the set is re-examined when it expires. Answering
+        // it instantly instead, which is what the first version did, tells a
+        // caller that the interval elapsed when no time passed at all, and
+        // turns its retry loop into a spin.
+        if timeout > 0
+            && let Some(slot) =
+                park_until(request.domain, (timeout as u64).saturating_mul(1_000_000))
+        {
+            return (REPLY_BLOCK_ON_RETRY, Answer::ok(slot));
+        }
+        // Everything else is an **unbounded** wait: a negative timeout, and
+        // equally one so long this machine cannot name the instant it ends. The
+        // second is not a special case to be clever about -- a program that
+        // asked to wait for days wants to be woken by what it is waiting for,
+        // not at an arbitrary earlier moment this program picked.
+        if waits_on_console {
+            // The console is the thing being waited for. Park and be asked
+            // again -- the same reply a blocking `read` gives, for the same
+            // reason: this program has one thread and must not be the one that
+            // sleeps.
+            return (REPLY_BLOCK_ON_RETRY, Answer::ok(INPUT_WAKE));
+        }
+        // Nothing here can be waited for. Answering now is a spin rather than a
+        // park on a wake that would never come, and RFC 0055 says so.
+    }
+    if !copy_out(request.domain, at, entries) {
+        return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+    }
+    (REPLY_VALUE, Answer::ok(ready))
+}
+
+/// What a pipe end is doing, for [`answer_poll`].
+///
+/// **Which end it is comes from the descriptor and not from the handle.** A
+/// pipe's handle is its ring's index and nothing else — both ends carry the
+/// same one — and `Entry::readable`/`writable` is what tells them apart. This
+/// was written first with the end packed into the handle's low bit, which
+/// compiled, and would have reported the write end's room as the read end's
+/// bytes on every second pipe.
+fn pipe_condition(
+    handle: u64,
+    readable_end: bool,
+    writable_end: bool,
+) -> bhaskix_personality::poll::Condition {
+    use bhaskix_personality::poll::Condition;
+
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    let pipes = pipes_held();
+    match pipes.get(handle as usize).and_then(Option::as_ref) {
+        Some(pipe) => Condition::Pipe {
+            bytes: pipe.held(),
+            room: pipe.room(),
+            readers: pipe.readers,
+            writers: pipe.writers,
+            readable_end,
+            writable_end,
+        },
+        // The descriptor named a pipe slot holding nothing, which is this
+        // program's own bookkeeping being wrong rather than the caller's.
+        None => Condition::Unknown,
+    }
+}
+
+/// A descriptor's kind, handle and directions — what [`answer_poll`] needs and
+/// [`descriptor_kind`] does not carry.
+fn descriptor_row(request: &PersonalityCall, fd: u64) -> Option<(Kind, u64, bool, bool)> {
+    let descriptor = i32::try_from(fd).ok()?;
+    let process = process_for(request.domain)?;
+    let entry = process.descriptors.get(descriptor)?;
+    Some((entry.kind, entry.handle, entry.readable, entry.writable))
+}
+
+/// `nanosleep(request, remain)`.
+const NANOSLEEP: u64 = 35;
+/// `clock_nanosleep(clock, flags, request, remain)`.
+const CLOCK_NANOSLEEP: u64 = 230;
+/// `TIMER_ABSTIME` — the requested time is a point, not a duration.
+const TIMER_ABSTIME: u64 = 1;
+
+/// `clock_nanosleep`, whose duration is its **third** argument.
+fn answer_nanosleep(request: &PersonalityCall) -> (u64, Answer) {
+    // An absolute deadline is refused rather than treated as a duration, which
+    // would sleep until roughly the epoch plus now. `EINVAL` is what Linux
+    // answers for an unsupported combination, and a caller can retry relative.
+    if request.second() & TIMER_ABSTIME != 0 {
+        return (REPLY_VALUE, Answer::error(-22)); // EINVAL
+    }
+    answer_nanosleep_relative(request, request.third())
+}
+
+/// The sleep both spellings share, given where each keeps its `timespec`.
+///
+/// # What it does not do
+///
+/// **It does not report the remaining time** in the caller's `remain` buffer.
+/// Nothing here interrupts a sleep — there are no signals delivered to a parked
+/// hosted thread — so a sleep either completes or its domain ends, and a
+/// remainder would always be zero. Writing a zero would be indistinguishable
+/// from a real short sleep, so nothing is written at all.
+fn answer_nanosleep_relative(request: &PersonalityCall, at: u64) -> (u64, Answer) {
+    // Already slept: this is the retry after the deadline fired.
+    if took_timed_wait(request.domain) {
+        return (REPLY_VALUE, Answer::ok(0));
+    }
+    let mut spec = [0u8; 16];
+    if !copy_in(request.domain, at, &mut spec) {
+        return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+    }
+    let seconds = u64::from_le_bytes(spec[0..8].try_into().unwrap_or([0; 8]));
+    let nanos = u64::from_le_bytes(spec[8..16].try_into().unwrap_or([0; 8]));
+    if nanos >= 1_000_000_000 {
+        return (REPLY_VALUE, Answer::error(-22)); // EINVAL
+    }
+    let total = seconds.saturating_mul(1_000_000_000).saturating_add(nanos);
+    if total == 0 {
+        return (REPLY_VALUE, Answer::ok(0));
+    }
+    match park_until(request.domain, total) {
+        Some(slot) => (REPLY_BLOCK_ON_RETRY, Answer::ok(slot)),
+        // No clock, or no slot left. Answering success without sleeping would
+        // be a lie a caller cannot detect; `EINTR` is the honest one -- the
+        // sleep did not complete, and a caller that cares retries.
+        None => (REPLY_VALUE, Answer::error(-4)), // EINTR
+    }
+}
 
 /// `wait4(pid, status, options, rusage)`.
 const WAIT4: u64 = 61;
@@ -4486,10 +4728,110 @@ fn protection_of(read: bool, write: bool, execute: bool) -> u64 {
     }
 }
 
+/// How fast the timestamp counter runs, from this program's start argument.
+///
+/// **Kept as of RFC 0055, having been ignored until then.** A `poll` with a
+/// positive timeout and a `clock_nanosleep` both have to turn a duration into
+/// the absolute counter value `method::ARM` wants, and neither can without
+/// this. Zero on a machine that did not measure one, which is answered by
+/// refusing to wait rather than by waiting a made-up length of time.
+static mut HERTZ: u64 = 0;
+
+fn hertz() -> u64 {
+    // SAFETY: written once at entry, read afterwards, single-threaded.
+    unsafe { HERTZ }
+}
+
+/// An absolute deadline `nanos` from now, or `None` if this machine cannot name
+/// that instant — no calibrated clock, or a duration too long to convert.
+///
+/// The counter comes from `bhaskix-sock`, which owns that read already, rather
+/// than being written here again. This crate's `unsafe` budget records the last
+/// time somebody wrote their own `rdtsc` in it and had to take it back out.
+///
+/// # Why the overflow is a refusal and not a saturation
+///
+/// It was `saturating_mul` first, on the reasoning that a huge duration should
+/// become a huge deadline. What it actually produced was `u64::MAX / 1_000_000_000`
+/// ticks — about **fifteen seconds** on this machine, whatever was asked for.
+/// A `poll` given a timeout of days therefore waited fifteen seconds and
+/// answered "nothing happened", and the boot that found it had BusyBox parked
+/// at its first prompt until the corpus lost patience and killed the domain.
+///
+/// A duration this cannot represent is *unbounded* as far as this program is
+/// concerned, and saying so lets the caller do the right thing with it —
+/// which, for a `poll` naming the console, is to wait for a key instead.
+fn deadline_in(nanos: u64) -> Option<u64> {
+    let hertz = hertz();
+    if hertz == 0 {
+        return None;
+    }
+    let ticks = nanos.checked_mul(hertz)? / 1_000_000_000;
+    bhaskix_sock::time::now().checked_add(ticks)
+}
+
+/// Who is parked on a deadline, and on which wake slot: `(domain, slot + 1)`.
+///
+/// **What tells a first call from the retry after it.** `BLOCK_ON_RETRY` asks
+/// the same question again, so a `poll` that armed a timer and parked would,
+/// on waking, arm another and park again — for ever. An entry here means this
+/// domain has already done its waiting, and the answer it gets now is the
+/// answer.
+///
+/// Four, matching `WAITERS` beside it and for the same reason: a fifth is
+/// answered without waiting rather than left unwoken.
+static mut TIMED: [(u32, u32); 4] = [(0, 0); 4];
+
+fn timed() -> &'static mut [(u32, u32); 4] {
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    unsafe { &mut *core::ptr::addr_of_mut!(TIMED) }
+}
+
+/// Takes this domain's finished timed wait, if it has one.
+fn took_timed_wait(domain: u32) -> bool {
+    let table = timed();
+    let Some(entry) = table.iter_mut().find(|entry| entry.0 == domain) else {
+        return false;
+    };
+    let slot = entry.1 - 1;
+    *entry = (0, 0);
+    release_wake(slot as usize);
+    true
+}
+
+/// Arms a wake slot `nanos` from now and records it, answering the slot to
+/// park on — or `None` if this machine cannot time it or has none left.
+///
+/// The wake pool is granted `WRITE`, which is exactly what `ARM` needs, so this
+/// asks the nucleus for nothing it was not already given. The console's own
+/// notification is `READ` and deliberately cannot be armed: a program that
+/// could set a timer on the keyboard could fake a keystroke's wake.
+fn park_until(domain: u32, nanos: u64) -> Option<u64> {
+    let deadline = deadline_in(nanos)?;
+    let table = timed();
+    let index = table.iter().position(|entry| entry.0 == 0)?;
+    let slot = claim_wake()?;
+    let armed = call(
+        syscall::INVOKE,
+        WAKE_SLOT + slot as u64,
+        method::ARM,
+        [deadline, 0, 0, 0],
+    );
+    if armed.status != status::OK {
+        release_wake(slot);
+        return None;
+    }
+    table[index] = (domain, slot as u32 + 1);
+    Some(WAKE_SLOT + slot as u64)
+}
+
 /// The entry point. `hertz` arrives as every packaged program's manifest
-/// declares; this one has nothing to time and ignores it.
+/// declares, and is kept: RFC 0055 gave this program two reasons to time
+/// something.
 #[unsafe(no_mangle)]
-extern "C" fn linuxd_main(_hertz: u64) -> ! {
+extern "C" fn linuxd_main(hertz: u64) -> ! {
+    // SAFETY: before anything else runs here, and single-threaded.
+    unsafe { HERTZ = hertz };
     // The report page, into this program's own space. If it will not map the
     // adapter still serves — a trace is a convenience and refusing to work
     // without one would be the wrong priority.
