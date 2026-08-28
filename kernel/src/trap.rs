@@ -549,6 +549,27 @@ const fn frame_field(offset: i64) -> &'static str {
     }
 }
 
+/// Where `address` sits in the kernel image, if it is in it at all.
+///
+/// The base is taken from the handoff the boot recorded, so this is the same
+/// number `kaslr=show` prints the slide of — and printing the *offset* rather
+/// than the base keeps the secret RFC 0042 asked to keep while giving up the
+/// one thing a reader of a preserved log actually needs.
+fn kernel_offset(address: u64) -> Option<u64> {
+    let base = KERNEL_IMAGE_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    if base == 0 || address < base {
+        return None;
+    }
+    Some(address - base)
+}
+
+/// Where this boot put the kernel image, for [`kernel_offset`].
+///
+/// Recorded rather than computed: the fault path cannot reach the handoff, and
+/// a fault handler that had to go looking for a structure is a fault handler
+/// that can fault.
+pub static KERNEL_IMAGE_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// What address family a qword belongs to — the classification the run-312
 /// and run-85 analyses did by hand, printed so the next specimen arrives
 /// pre-sorted.
@@ -851,6 +872,24 @@ fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
 
     println!();
     println!("  rip {:#018x}   cs  {:#06x}", frame.rip, frame.cs);
+    // **And where that is in the image, which is the number a person needs.**
+    //
+    // An absolute `rip` is unresolvable after the fact: KASLR slides the image
+    // by a fresh amount every boot, and RFC 0042 deliberately does not print the
+    // slide, so a preserved log names an address that existed only during the
+    // boot that produced it. The offset does not move, and `nm` on the ELF turns
+    // it straight into a function.
+    //
+    // It leaks nothing the report was hiding: the offset is a property of the
+    // build, which anyone holding the image already has. What KASLR conceals is
+    // *where the image sits*, and that is exactly what this does not say.
+    //
+    // Written after a specimen was finally caught -- one fault in a hundred and
+    // fifty boots -- and could not be turned into a function name without
+    // booting again and hoping.
+    if let Some(offset) = kernel_offset(frame.rip) {
+        println!("      = kernel+{offset:#x} in the image, whatever this boot slid it by");
+    }
     println!("  rsp {:#018x}   ss  {:#06x}", frame.rsp, frame.ss);
     println!(
         "  rflags {:#018x}  [{}]",

@@ -21712,6 +21712,12 @@ fn report_boot_state(
     // difference is the whole protection.
     const LINK_BASE: u64 = 0xffff_ffff_8000_0000;
     let slide = handoff.kernel_virt_base.as_u64().wrapping_sub(LINK_BASE);
+    // Told to the fault handler, so a report can name `kernel+offset` instead of
+    // an absolute address that only existed during this boot.
+    crate::trap::KERNEL_IMAGE_BASE.store(
+        handoff.kernel_virt_base.as_u64(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     if slide == 0 {
         println!("    kaslr           NOT APPLIED (image sits at its link-time base)");
     } else if handoff
