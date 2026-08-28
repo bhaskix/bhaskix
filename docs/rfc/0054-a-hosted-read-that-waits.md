@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📝 **DRAFT 2026-08-28** — all six steps built and gated. `tests/qemu/busybox-test.sh` passes and is in `make test`: BusyBox's `sh` reads a line typed at the machine, runs it, and the machine reaches its own shell afterwards. Watched red twice — removing the service from the poll path leaves the byte unfound, and answering `EAGAIN` instead of parking puts the reply back in the Bhaskix shell. **What this does not claim.** *(1)* `poll` is still unanswered, so BusyBox prints `poll: Function not implemented` once per read. *(2)* Unresolved question 1 is untested: nothing wakes a reader parked when its domain is killed. *(3)* The lane types no `p` — see the finding below, which is BusyBox's and not the machine's |
+| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. All six steps built and gated. `tests/qemu/busybox-test.sh` passes and is in `make test`: BusyBox's `sh` reads a line typed at the machine, runs it, and the machine reaches its own shell afterwards. Watched red twice — removing the service from the poll path leaves the byte unfound, and answering `EAGAIN` instead of parking puts the reply back in the Bhaskix shell. **What this does not claim.** *(1)* `poll` is still unanswered, so BusyBox prints `poll: Function not implemented` once per read. *(2)* Unresolved question 1 is untested: nothing wakes a reader parked when its domain is killed. *(3)* The lane types no `p` — see the finding below, which is BusyBox's and not the machine's |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel |
 | **Milestone** | Phase 2 — Core Operating System (L1) |
