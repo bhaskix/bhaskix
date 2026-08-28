@@ -1123,6 +1123,47 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-28 (the adapter's CSpace, stated once and checked by the compiler)
+
+**Three slot collisions in one day is a process, not an accident.** A
+notification put where the root directory was (a hosted `open` answered
+`-ENOENT`), one put where a hosted domain's handle is allocated, and one put on
+the first slot of the socket pool (a hosted `bind` answered `EADDRINUSE` on a
+port nobody held). **Two of the three were found by booting**, because there was
+nothing to read: the numbers lived as literals on the kernel's side and
+constants on the adapter's, agreeing only because somebody kept them agreeing,
+and `install_at`'s refusal is reported where it happens rather than where the
+mistake was made.
+
+**`bhaskix_abi::adapter` states the layout once**, and both sides now read it —
+the adapter's eighteen constants and the kernel's grants, its handle floor, and
+the futex pool's base and size. Two `const` blocks assert what the reader would
+otherwise have to check by eye: no fixed grant may sit where a pool allocates,
+no two grants may name the same slot, and the pools may not run into each other
+or off the end of a CSpace.
+
+**Watched red on the three collisions that actually happened**: moving the
+console wake onto the root directory, onto the first socket slot, and into the
+handle region each fails the build now, where each previously produced a boot
+that failed somewhere else.
+
+**What it does not catch, stated because I checked.** Pointing a *correct* slot
+constant at the *wrong* grant — using `ROOT_DIR` where `INPUT_WAKE` was meant —
+still compiles, because no assertion can see that a name is the wrong name. What
+the map catches is a layout that contradicts itself, which is what all three
+real collisions were: a **number** chosen without reading the map, not a name
+used wrongly.
+
+**And a capacity that was silent is now stated.** The handle region runs from
+slot 25 to the network endpoint at 88 — **sixty-three** hosted domains — while
+`MAX_DOMAINS` is sixty-four. A machine whose every domain slot held a hosted
+program would have found the last handle refused. It is `HANDLE_CAPACITY` now,
+with the note that raising it means moving four grants and belongs in an RFC.
+
+**No RFC for this one**, and the reason is in the change: no number moved, no
+capability was added or withdrawn, and nothing the two programs do differs. It
+is the same contract, written down where both can see it.
+
 ### 2026-08-28 (confirmed on the SR550: five of this week's gates, on real hardware)
 
 **`98447d2` booted on the Lenovo SR550 and reached its user-mode shell**, with

@@ -98,6 +98,145 @@ pub mod limits {
     /// indexes it by the domain id in a badge, which the kernel stamps and no
     /// caller can forge.
     pub const MAX_DOMAINS: usize = 64;
+
+    /// How many capability slots one domain's CSpace holds.
+    ///
+    /// Declared here as well as in the kernel because [`crate::adapter`] lays
+    /// out a CSpace and must know where it ends; the kernel asserts the two
+    /// agree, as it does for every other number both sides name.
+    pub const CSPACE_SLOTS: usize = 128;
+}
+
+/// **The Linux adapter's capability space, in one place** —
+/// [RFC 0031](../../docs/rfc/0031-linux-compatibility-as-an-adapter.md) I3.
+///
+/// # Why this module exists
+///
+/// These numbers are a contract between the kernel, which installs the
+/// capabilities, and `bin/linuxd`, which invokes them — and they lived as
+/// literals on one side and constants on the other, agreeing only because
+/// somebody kept them agreeing. **Three collisions happened in one day** on
+/// 2026-08-28: a notification put where the root directory was (a hosted `open`
+/// answered `-ENOENT`), one put where a hosted domain's handle is allocated,
+/// and one put on the first slot of the socket pool (a hosted `bind` answered
+/// `EADDRINUSE` on a port nobody held). Two of the three were found by booting
+/// rather than by reading, because there was nothing to read: no file stated
+/// the layout, and `install_at`'s refusal is reported where it happens rather
+/// than where the mistake was made.
+///
+/// So the layout is stated once, and the assertions at the end make an overlap
+/// a **build failure** instead of a boot report.
+pub mod adapter {
+    /// The endpoint foreign calls arrive on.
+    pub const ENDPOINT: usize = 0;
+    /// One page to report through.
+    pub const REPORT: usize = 1;
+    /// The page a hosted program's fault is handed over in.
+    pub const FAULTS: usize = 2;
+    /// The console, **write-only** — RFC 0032 step 10.
+    pub const CONSOLE: usize = 3;
+
+    /// The first futex wake notification.
+    pub const WAKES: usize = 4;
+    /// Sixteen of them: half the kernel's whole notification table.
+    pub const WAKE_COUNT: usize = 16;
+
+    /// The authority to create a domain — RFC 0033 step 5.
+    pub const CONTROL: usize = 20;
+    /// Where an `execve` holds the domain it is building, one at a time.
+    pub const CHILD: usize = 21;
+    /// The one directory a hosted process resolves every path through.
+    pub const ROOT_DIR: usize = 22;
+    /// Where a page lent by the filesystem service lands.
+    pub const LENT: usize = 23;
+    /// The console's own notification, **read-only** — RFC 0054.
+    pub const INPUT_WAKE: usize = 24;
+
+    /// The lowest slot a hosted domain's `Domain` capability may be put in.
+    ///
+    /// The kernel takes the lowest free slot at or above this — RFC 0033
+    /// step 3 — so the region grows with the number of hosted domains alive at
+    /// once and shrinks as they end.
+    pub const HANDLE_FLOOR: usize = 25;
+
+    /// The protocol service's endpoint.
+    pub const NETWORK: usize = 88;
+    /// A page of its own for datagram payloads.
+    pub const PAYLOAD: usize = 89;
+    /// The first socket slot.
+    pub const SOCKETS: usize = 90;
+    /// Five: what is left between the payload page and the datagram bell.
+    pub const SOCKET_COUNT: usize = 5;
+    /// The datagram bell, **read-only** — RFC 0058.
+    pub const DATAGRAM_BELL: usize = 95;
+
+    /// The highest slot an open file may take; they are allocated **downward**.
+    pub const FILE_TOP: usize = 127;
+    /// Thirty-two open files.
+    pub const FILE_COUNT: usize = 32;
+    /// The lowest slot a file may take, which is where that pool ends.
+    pub const FILE_FLOOR: usize = FILE_TOP + 1 - FILE_COUNT;
+
+    /// **How many hosted domains may hold a handle at once.**
+    ///
+    /// The handle region runs from [`HANDLE_FLOOR`] up to whatever sits above
+    /// it, which is [`NETWORK`]. That is **sixty-three**, and
+    /// [`crate::limits::MAX_DOMAINS`] is sixty-four — so a machine whose every
+    /// domain slot held a hosted program would find the last handle refused by
+    /// `install_at`.
+    ///
+    /// A stated capacity rather than a silent one. Raising it means moving the
+    /// four grants above it, which is a change to a contract two programs share
+    /// and belongs in an RFC rather than in a hurry.
+    pub const HANDLE_CAPACITY: usize = NETWORK - HANDLE_FLOOR;
+
+    /// Every fixed grant, for the checks below.
+    const FIXED: [usize; 11] = [
+        ENDPOINT, REPORT, FAULTS, CONSOLE, CONTROL, CHILD, ROOT_DIR, LENT, INPUT_WAKE, NETWORK,
+        PAYLOAD,
+    ];
+
+    /// Whether `slot` is one a pool allocates from.
+    const fn in_a_pool(slot: usize) -> bool {
+        (slot >= WAKES && slot < WAKES + WAKE_COUNT)
+            || (slot >= HANDLE_FLOOR && slot < NETWORK)
+            || (slot >= SOCKETS && slot < SOCKETS + SOCKET_COUNT)
+            || (slot >= FILE_FLOOR && slot <= FILE_TOP)
+            || slot == DATAGRAM_BELL
+    }
+
+    // **No fixed grant may sit where a pool allocates**, and no two may share a
+    // slot. This is the check that would have caught all three of
+    // 2026-08-28's collisions before the machine was ever booted.
+    const _: () = {
+        let mut index = 0;
+        while index < FIXED.len() {
+            assert!(
+                !in_a_pool(FIXED[index]),
+                "an adapter grant sits where a pool allocates from"
+            );
+            let mut other = index + 1;
+            while other < FIXED.len() {
+                assert!(
+                    FIXED[index] != FIXED[other],
+                    "two adapter grants name the same slot"
+                );
+                other += 1;
+            }
+            index += 1;
+        }
+    };
+
+    // And the pools may not run into each other or off the end.
+    const _: () = {
+        assert!(WAKES + WAKE_COUNT <= CONTROL);
+        assert!(HANDLE_FLOOR > INPUT_WAKE);
+        assert!(NETWORK > HANDLE_FLOOR);
+        assert!(SOCKETS > PAYLOAD);
+        assert!(SOCKETS + SOCKET_COUNT <= DATAGRAM_BELL);
+        assert!(DATAGRAM_BELL < FILE_FLOOR);
+        assert!(FILE_TOP < crate::limits::CSPACE_SLOTS);
+    };
 }
 
 /// Methods invoked on a capability, for the programs that need to name one.

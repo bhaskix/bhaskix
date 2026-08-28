@@ -54,7 +54,7 @@ use bhaskix_personality::thread::{self, ClonePlan};
 /// kernel. Not a console: this program is started before the console service
 /// exists, and every other service that must say something that early says it
 /// the same way.
-const REPORT: u64 = 1;
+const REPORT: u64 = bhaskix_abi::adapter::REPORT as u64;
 /// Where the report page is mapped in this program's own space.
 const REPORT_AT: u64 = 0x0000_0000_1E00_0000;
 
@@ -67,7 +67,7 @@ const REPORT_AT: u64 = 0x0000_0000_1E00_0000;
 /// somewhere to print, it holds nothing and the kernel reports on its behalf
 /// from the counters it keeps. That is better evidence anyway: what matters is
 /// that a hosted program got the right answer, not that this program said so.
-const ENDPOINT: u64 = 0;
+const ENDPOINT: u64 = bhaskix_abi::adapter::ENDPOINT as u64;
 
 /// The machine's console, **write-only** — RFC 0032 step 10.
 ///
@@ -79,7 +79,7 @@ const ENDPOINT: u64 = 0;
 /// The paragraph above [`ENDPOINT`] said "not even a console" and was true
 /// until this step; what made it stop being true is that `write` was the last
 /// Linux number the *nucleus* was printing on a hosted program's behalf.
-const CONSOLE: u64 = 3;
+const CONSOLE: u64 = bhaskix_abi::adapter::CONSOLE as u64;
 
 /// The first of the notifications a hosted `futex(WAIT)` parks on, and how
 /// many there are — RFC 0032 step 10.
@@ -93,7 +93,7 @@ const CONSOLE: u64 = 3;
 /// what makes `futex(WAKE, n)` exact — waking *n* means signalling *n* of
 /// them — where a notification shared by every sleeper on one word could only
 /// wake all or none.
-const WAKE_SLOT: u64 = 4;
+const WAKE_SLOT: u64 = bhaskix_abi::adapter::WAKES as u64;
 /// The console's own notification, for a hosted `read` that must wait.
 ///
 /// Granted at boot beside the futex pool and **`READ` where those are `WRITE`**
@@ -101,8 +101,8 @@ const WAKE_SLOT: u64 = 4;
 /// it, which is the difference between waiting for a keystroke and inventing
 /// one. Taking the byte is still `POLL_INPUT` on the domain, which the nucleus
 /// refuses without the input grant.
-const INPUT_WAKE: u64 = 24;
-const WAKES: usize = 16;
+const INPUT_WAKE: u64 = bhaskix_abi::adapter::INPUT_WAKE as u64;
+const WAKES: usize = bhaskix_abi::adapter::WAKE_COUNT;
 
 /// One hosted thread asleep in a futex: whose memory, which word, and which
 /// notification it is parked on.
@@ -2304,14 +2304,14 @@ const FORK_TRAMPOLINE_AT: u64 = 0x0000_0000_3000_0000;
 /// `execve(path, argv, envp)`.
 const EXECVE: u64 = 59;
 /// The authority to create a domain, granted at boot — RFC 0033 step 5.
-const CONTROL: u64 = 20;
+const CONTROL: u64 = bhaskix_abi::adapter::CONTROL as u64;
 /// Where the domain an `execve` is building is held, one at a time.
 ///
 /// This program has one thread, so no second exec can be in flight while the
 /// first is between its `SPAWN` and its reply. The handle is given back with
 /// `DELETE` either way — a slot left occupied would refuse the *next* exec for
 /// a reason that has nothing to do with it.
-const CHILD: u64 = 21;
+const CHILD: u64 = bhaskix_abi::adapter::CHILD as u64;
 /// The name the new domain is created under, packed as `SPAWN` wants it.
 const EXEC_NAME_LOW: u64 = u64::from_le_bytes(*b"execed\0\0");
 
@@ -2452,16 +2452,16 @@ const RECVFROM: u64 = 45;
 /// from 24 and open files fall from 127. Eighty-eight to ninety-five is the
 /// gap between them, and two attempts at tidier numbers were refused by
 /// `install_at` before this one.
-const NETWORK: u64 = 88;
+const NETWORK: u64 = bhaskix_abi::adapter::NETWORK as u64;
 /// One page of this program's own memory, which datagrams cross in.
 ///
 /// `SEND_TO` drains its payload from **offset zero** of a memory object, so
 /// the report page cannot serve: its first bytes are the `mmap` trace records.
-const PAYLOAD: u64 = 89;
+const PAYLOAD: u64 = bhaskix_abi::adapter::PAYLOAD as u64;
 /// Where that page is mapped while bytes are staged in it.
 const PAYLOAD_AT: u64 = 0x0000_0000_1B00_0000;
 /// Where a hosted socket's capability lands: 90 up to 95, six of them.
-const SOCKET_SLOT: u64 = 90;
+const SOCKET_SLOT: u64 = bhaskix_abi::adapter::SOCKETS as u64;
 /// The datagram bell — RFC 0058 Part B, `READ` so this program may wait for a
 /// datagram and cannot claim one arrived.
 ///
@@ -2469,7 +2469,7 @@ const SOCKET_SLOT: u64 = 90;
 /// grants, 25 upward is where the kernel allocates a handle per hosted domain,
 /// 88 and 89 are the network and its page, 90 up is the socket pool and 96 up
 /// is the file pool counting down from 127.
-const DATAGRAM_BELL: u64 = 95;
+const DATAGRAM_BELL: u64 = bhaskix_abi::adapter::DATAGRAM_BELL as u64;
 /// How many sockets one machine's hosted programs may hold at once.
 ///
 /// Five, because five is what the CSpace has left — and a limit met as `EMFILE`
@@ -2483,7 +2483,7 @@ const DATAGRAM_BELL: u64 = 95;
 /// `bind` answering `EADDRINUSE`, which is the third slot collision in this
 /// CSpace in one day and the second found by a boot rather than by reading the
 /// map.
-const SOCKETS: usize = 5;
+const SOCKETS: usize = bhaskix_abi::adapter::SOCKET_COUNT;
 
 /// Which socket slots are taken.
 static mut SOCKET_HELD: [bool; SOCKETS] = [false; SOCKETS];
@@ -2583,9 +2583,9 @@ static mut PIPE_WAITERS: [u32; PIPES] = [0; PIPES];
 ///
 /// `READ` and `DERIVE` and no `WRITE`, so a hosted program opening a file for
 /// writing is told `EROFS` rather than being lied to.
-const ROOT_DIR: u64 = 22;
+const ROOT_DIR: u64 = bhaskix_abi::adapter::ROOT_DIR as u64;
 /// Where a page lent by the filesystem service lands, one at a time.
-const LENT: u64 = 23;
+const LENT: u64 = bhaskix_abi::adapter::LENT as u64;
 /// Where a lent page is mapped in this program's own space while it is read.
 ///
 /// **Not `0x1D00_0000`, which is this program's own stack** — eight pages of
@@ -2602,8 +2602,8 @@ const LENT_AT: u64 = 0x0000_0000_1C00_0000;
 /// thirty-two open files is ninety-six of a hundred and twenty-eight. Written
 /// as a pair of directions rather than as two ranges, because a range is a
 /// number somebody will change on one side only.
-const FILE_SLOT_TOP: u64 = 127;
-const FILE_SLOTS: usize = 32;
+const FILE_SLOT_TOP: u64 = bhaskix_abi::adapter::FILE_TOP as u64;
+const FILE_SLOTS: usize = bhaskix_abi::adapter::FILE_COUNT;
 
 /// Which file slots are taken.
 static mut FILE_HELD: [bool; FILE_SLOTS] = [false; FILE_SLOTS];
@@ -2658,7 +2658,7 @@ const CLONE: u64 = 56;
 const RT_SIGRETURN: u64 = 15;
 
 /// Where the fault exchange page sits in this program's own space.
-const FAULTS: u64 = 2;
+const FAULTS: u64 = bhaskix_abi::adapter::FAULTS as u64;
 const FAULTS_AT: u64 = 0x0000_0000_1F00_0000;
 /// Bytes per fault slot, and how many faults were handed over.
 const FAULT_SLOT_BYTES: u64 = 512;

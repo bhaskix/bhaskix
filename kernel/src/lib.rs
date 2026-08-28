@@ -4311,7 +4311,7 @@ fn grant_console_wake() -> Result<usize, &'static str> {
     /// different place entirely. It overwrote it, and a hosted `open` answered
     /// `-ENOENT` for a directory that no longer existed. The full suite found
     /// it; nothing else would have.
-    const CONSOLE_WAKE_SLOT: usize = 24;
+    const CONSOLE_WAKE_SLOT: usize = bhaskix_abi::adapter::INPUT_WAKE;
     const _: () = assert!(
         CONSOLE_WAKE_SLOT < syscall::ADAPTER_SLOT_FLOOR,
         "the console wake must sit below the floor hosted-domain handles are \
@@ -12108,8 +12108,8 @@ const LINUXD_PROGRAM: &[u8] = b"bin/linuxd";
 /// ([`notify::MAX_NOTIFICATIONS`]) — half of it is as much as one personality
 /// may take. A seventeenth sleeper is refused with `EAGAIN`, which is a Linux
 /// answer a correct caller already retries.
-const FUTEX_WAKE_SLOT: usize = 4;
-const FUTEX_WAKES: usize = 16;
+const FUTEX_WAKE_SLOT: usize = bhaskix_abi::adapter::WAKES;
+const FUTEX_WAKES: usize = bhaskix_abi::adapter::WAKE_COUNT;
 
 /// The futex wake notifications, by identity, for the end-of-boot check below.
 static FUTEX_WAKE_IDS: [core::sync::atomic::AtomicU64; FUTEX_WAKES] =
@@ -12230,7 +12230,13 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
             .ok()
     })
     .ok_or("the adapter's console capability would not be created")?;
-    if domain::with(realm, |owner| owner.cspace.install_at(3, console).is_ok()) != Some(true) {
+    if domain::with(realm, |owner| {
+        owner
+            .cspace
+            .install_at(bhaskix_abi::adapter::CONSOLE, console)
+            .is_ok()
+    }) != Some(true)
+    {
         return Err("the adapter's console would not install");
     }
 
@@ -12312,7 +12318,13 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
             .ok()
     })
     .ok_or("the adapter's DomainControl would not be created")?;
-    if domain::with(realm, |owner| owner.cspace.install_at(20, control).is_ok()) != Some(true) {
+    if domain::with(realm, |owner| {
+        owner
+            .cspace
+            .install_at(bhaskix_abi::adapter::CONTROL, control)
+            .is_ok()
+    }) != Some(true)
+    {
         return Err("the adapter's DomainControl would not install");
     }
 
@@ -17356,7 +17368,10 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         match network_endpoint_capability() {
             Some(network)
                 if domain::with(domain::DomainId::from_u32(adapter), |owner| {
-                    owner.cspace.install_at(88, network).is_ok()
+                    owner
+                        .cspace
+                        .install_at(bhaskix_abi::adapter::NETWORK, network)
+                        .is_ok()
                 }) == Some(true) =>
             {
                 println!(
@@ -17385,8 +17400,12 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             .and_then(|page| shared::name(page).ok())
         {
             Some(named)
-                if domain::with(owner, |domain| domain.cspace.install_at(89, named).is_ok())
-                    == Some(true) => {}
+                if domain::with(owner, |domain| {
+                    domain
+                        .cspace
+                        .install_at(bhaskix_abi::adapter::PAYLOAD, named)
+                        .is_ok()
+                }) == Some(true) => {}
             _ => println!(
                 "\x1b[93m    linux domain   no page for datagrams; hosted sockets will not \
                  carry bytes\x1b[0m"
@@ -17425,7 +17444,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
                             if domain::with(ip, |d| d.cspace.install_at(10, ringer).is_ok())
                                 == Some(true)
                                 && domain::with(owner, |d| {
-                                    d.cspace.install_at(95, waiter).is_ok()
+                                    d.cspace
+                                        .install_at(bhaskix_abi::adapter::DATAGRAM_BELL, waiter)
+                                        .is_ok()
                                 }) == Some(true) =>
                         {
                             DATAGRAM_BELL.store(

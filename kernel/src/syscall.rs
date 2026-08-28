@@ -162,6 +162,11 @@ const _: () = {
     assert!(method::TAKE_INPUT == bhaskix_abi::method::TAKE_INPUT);
     assert!(method::POLL_INPUT == bhaskix_abi::method::POLL_INPUT);
     assert!(method::PEEK_INPUT == bhaskix_abi::method::PEEK_INPUT);
+    // The adapter's CSpace layout is stated in the ABI so both sides read one
+    // file -- see `bhaskix_abi::adapter`, and the three collisions in one day
+    // that put it there. Its own assertions check the layout; this checks that
+    // the size it lays out into is the size a CSpace actually has.
+    assert!(crate::cap::CSPACE_SLOTS == bhaskix_abi::limits::CSPACE_SLOTS);
     assert!(method::TAKE == bhaskix_abi::method::TAKE);
     assert!(method::POLL == bhaskix_abi::method::POLL);
     assert!(method::RECORD_SIZE == bhaskix_abi::method::RECORD_SIZE);
@@ -2661,7 +2666,7 @@ pub static ADAPTER_DOMAIN: core::sync::atomic::AtomicU32 =
 /// granted late, after the serial line is claimed, and by then hosted programs
 /// have run and been given handles. A floor raised at boot would find the slot
 /// already taken; raised here, the allocator never offers it.
-pub const ADAPTER_SLOT_FLOOR: usize = 25;
+pub const ADAPTER_SLOT_FLOOR: usize = bhaskix_abi::adapter::HANDLE_FLOOR;
 
 /// The method that says "your `Domain` capability for this domain is in this
 /// slot".
