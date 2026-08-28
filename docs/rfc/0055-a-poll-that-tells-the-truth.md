@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📝 **DRAFT 2026-08-28** — built and gated. BusyBox's `sh` no longer prints `poll: Function not implemented`, and still reads a line typed at the machine; the lane asserts both and was watched red two ways — removing the `poll` arm brings the complaint back, and making the peek *consume* loses every keystroke it reports. **What this does not claim.** *(1)* A positive timeout waits **at least** as long as asked and never returns early, because a thread here waits on one notification and the deadline is on another. *(2)* Sockets are answered nothing. *(3)* `ppoll` and `select` are unanswered. *(4)* `clock_nanosleep` does not report remaining time, because nothing here interrupts a sleep |
+| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. Built and gated. BusyBox's `sh` no longer prints `poll: Function not implemented`, and still reads a line typed at the machine; the lane asserts both and was watched red two ways — removing the `poll` arm brings the complaint back, and making the peek *consume* loses every keystroke it reports. **What this does not claim.** *(1)* A positive timeout waits **at least** as long as asked and never returns early, because a thread here waits on one notification and the deadline is on another. *(2)* Sockets are answered nothing. *(3)* `ppoll` and `select` are unanswered. *(4)* `clock_nanosleep` does not report remaining time, because nothing here interrupts a sleep |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel |
 | **Milestone** | Phase 2 — Core Operating System (L1) |

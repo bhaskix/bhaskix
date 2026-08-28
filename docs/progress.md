@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| RFCs accepted | **38** |
-| RFCs open | 16 |
+| RFCs accepted | **39** |
+| RFCs open | 15 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -90,7 +90,7 @@ gantt
     RFC 0023 A wake for a connection :done, r0023, 2026-08-15, 2026-08-16
     RFC 0049 every unit the firmware named :done, r0049, 2026-08-25, 1d
     RFC 0054 a hosted read that waits :done, r0054, 2026-08-28, 1d
-    RFC 0055 a poll that tells the truth about a descriptor :active, r0055, 2026-08-28, 2026-08-28
+    RFC 0055 a poll that tells the truth about a descriptor :done, r0055, 2026-08-28, 1d
 ```
 
 `done` is accepted, `active` is open, `crit` is closed without shipping.
@@ -148,7 +148,6 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
-| 0055 | a poll that tells the truth about a descriptor | 2026-08-28 |
 
 ## Annexes
 
