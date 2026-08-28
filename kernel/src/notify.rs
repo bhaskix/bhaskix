@@ -637,6 +637,18 @@ pub fn wait(id: NotificationId) -> Result<u64, NotifyError> {
     outcome
 }
 
+/// Which thread is registered as the single waiter, or zero for none.
+///
+/// A notification takes one waiter at a time, so this answers two questions a
+/// test needs and nothing else can: *has the thread parked yet* — asserting
+/// against a sleeper that has not slept proves nothing — and *was its claim
+/// released when it died*. A waiter left behind by a thread that has gone
+/// refuses every later waiter on that notification, for the rest of the boot.
+#[must_use]
+pub fn waiter_of(id: NotificationId) -> u32 {
+    resolve(id).map_or(0, |slot| slot.waiter.load(Ordering::Acquire))
+}
+
 /// Blocks once, and returns whatever is pending afterwards — possibly nothing.
 ///
 /// [`wait`] loops until the word is non-zero, which is what a caller with no

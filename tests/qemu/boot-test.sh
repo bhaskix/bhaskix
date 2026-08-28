@@ -701,6 +701,25 @@ else
     status=1
 fi
 
+# A reader parked on a notification must be woken when its domain is killed, and
+# must give the notification back -- RFC 0054's unresolved question 1.
+#
+# **The waiter is the point, not the thread.** A notification takes one waiter
+# at a time, so a thread that dies still holding that claim does not merely leak
+# itself: it refuses every later waiter on that notification for the rest of the
+# boot. On the console's own notification that is a keyboard that stops working,
+# and the only trace would be a park counted as refused.
+#
+# `0 wakes dropped` is asserted in the same line because the collection that
+# wakes them was, until this gate existed, sized for two hundred and fifty-six
+# sleepers on a machine that holds five hundred and twelve.
+if grep -qE "parked wake +a thread parked on a notification .* was woken by its domain ending, gave the notification back, and was reaped; 0 wakes dropped" "$LOG"; then
+    pass "a parked reader killed with its domain was woken and gave the notification back"
+else
+    fail "a parked reader's wake on death was not reported"
+    status=1
+fi
+
 # The counters behind it. `naming a thread that has gone` is the one that
 # matters and must be zero; the rest move with what the boot did.
 if grep -qE "endpoint queues [0-9]+ senders and [0-9]+ receivers queued, 0 naming a thread that has gone" "$LOG"; then

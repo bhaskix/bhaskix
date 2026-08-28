@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. All six steps built and gated. `tests/qemu/busybox-test.sh` passes and is in `make test`: BusyBox's `sh` reads a line typed at the machine, runs it, and the machine reaches its own shell afterwards. Watched red twice — removing the service from the poll path leaves the byte unfound, and answering `EAGAIN` instead of parking puts the reply back in the Bhaskix shell. **What this does not claim.** *(1)* `poll` is still unanswered, so BusyBox prints `poll: Function not implemented` once per read. *(2)* Unresolved question 1 is untested: nothing wakes a reader parked when its domain is killed. *(3)* The lane types no `p` — see the finding below, which is BusyBox's and not the machine's |
+| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. All six steps built and gated. `tests/qemu/busybox-test.sh` passes and is in `make test`: BusyBox's `sh` reads a line typed at the machine, runs it, and the machine reaches its own shell afterwards. Watched red twice — removing the service from the poll path leaves the byte unfound, and answering `EAGAIN` instead of parking puts the reply back in the Bhaskix shell. **What this does not claim.** *(1)* `poll` is still unanswered, so BusyBox prints `poll: Function not implemented` once per read. *(2)* Unresolved question 1 was untested at acceptance and is **closed as of 2026-08-28** — the wake was already correct and is now gated, and a silent cap on how many sleepers a dying domain wakes was found and removed. *(3)* The lane types no `p` — see the finding below, which is BusyBox's and not the machine's |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel |
 | **Milestone** | Phase 2 — Core Operating System (L1) |
@@ -206,10 +206,28 @@ no `p` in it and says why.
 
 ## Unresolved questions
 
-1. **What wakes a parked reader when the domain is killed?** Ending the domain
-   ends its threads, and `notify::wait` already refuses to park a dying thread —
-   but a thread parked *before* the kill is woken by the scheduler's path and
-   not by this one, and the lane does not test it.
+1. ~~**What wakes a parked reader when the domain is killed?**~~ **Answered
+   2026-08-28, and the answer was "it already worked, and nothing proved it".**
+   `sched::mark_domain_dying` wakes every blocked thread it marks, and
+   `notify::wait` releases the waiter on every way out including the one a dying
+   thread takes. What was missing was a gate — `parked wake` on every boot lane:
+   a thread parks on a notification, its domain is killed, and the assertions
+   are that it was woken, gave the notification **back**, and was reaped.
+   Watched red by marking sleepers dying without waking them.
+
+   The waiter is the point rather than the thread. A notification takes one
+   waiter, so a thread that dies still holding that claim refuses *every later
+   waiter* on it for the rest of the boot — on the console's own notification,
+   a keyboard that stops working, with a park counted as refused as the only
+   trace.
+
+   **And the wake was capped.** The collection that carries sleepers out of the
+   queue locks was sized `MAX_CPUS * 4` — two hundred and fifty-six — on a
+   machine that holds `MAX_CPUS * MAX_THREADS_PER_CPU`, five hundred and twelve,
+   and it dropped the excess with no word. A domain with more than two hundred
+   and fifty-six blocked threads would have marked them all dying and woken only
+   some. It is sized from the same two constants the thread table is now, and
+   the boot line asserts `0 wakes dropped`.
 2. **Should `poll` be answered on top of this?** BusyBox prints
    `poll: Function not implemented` once per read and carries on. RFC 0053's
    question 3 asks what `poll` says without a grant, and this RFC gives the

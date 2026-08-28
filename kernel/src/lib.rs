@@ -2929,6 +2929,100 @@ extern "C" fn queued_then_killed(endpoint: u64) -> ! {
 /// How far [`queued_then_killed`] got.
 static QUEUED_KILLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Parks on the notification it is given, and is killed there.
+extern "C" fn parked_then_killed(raw: u64) -> ! {
+    let id = notify::NotificationId::from_parts(raw as u32, (raw >> 32) as u32);
+    // Whatever comes back, this thread is finished: it is woken either by the
+    // signal it waited for or by its own domain ending, and only the second
+    // happens on this lane.
+    let _ = notify::wait(id);
+    sched::exit()
+}
+
+/// A reader parked on a notification is woken when its domain is killed, and
+/// gives the notification back — RFC 0054's unresolved question 1.
+///
+/// # Why this is a gate and not an argument
+///
+/// The mechanism was already right: `sched::mark_domain_dying` wakes every
+/// blocked thread it marks, and `notify::wait` releases the waiter on every way
+/// out including the one a dying thread takes. What was missing was anything
+/// that would notice if it stopped being right — and RFC 0054 said so, in the
+/// unresolved question this closes.
+///
+/// **What it would look like if it broke.** A notification takes one waiter. A
+/// thread that dies still registered as that waiter does not merely leak
+/// itself: it refuses *every later waiter* on that notification, for the rest
+/// of the boot. On the console's own notification that is a machine whose
+/// keyboard stops working, and the report would say only that a park had been
+/// refused.
+///
+/// **The precondition is asserted, not assumed.** Killing a thread that had not
+/// parked yet would pass this test while proving nothing, which is the failure
+/// the queue-cleanup gate above documents. So it waits for the notification to
+/// actually have a waiter before the kill, and says so if it never does.
+fn parked_waiter_released_on_death(cpu: u32, hhdm_base: u64) -> bool {
+    let Ok(notification) = notify::create() else {
+        println!("\x1b[91m    parked wake    FAILED to create a notification\x1b[0m");
+        return false;
+    };
+    let Ok(doomed) = domain::create("parked", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    parked wake    FAILED to create a domain\x1b[0m");
+        notify::destroy(notification);
+        return false;
+    };
+    let packed = u64::from(notification.generation()) << 32 | u64::from(notification.index());
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(doomed.as_u32());
+    if sched::spawn_on_with(
+        cpu,
+        "parked",
+        parked_then_killed,
+        packed,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    parked wake    FAILED to spawn the sleeper\x1b[0m");
+        domain::destroy(doomed);
+        notify::destroy(notification);
+        return false;
+    }
+
+    // **Parked, not merely spawned.**
+    if !wait_until(|| notify::waiter_of(notification) != 0, 4_000) {
+        println!("\x1b[91m    parked wake    FAILED: the sleeper never parked\x1b[0m");
+        domain::end(doomed, domain::Ending::Killed);
+        notify::destroy(notification);
+        return false;
+    }
+    let parked_as = notify::waiter_of(notification);
+
+    domain::end(doomed, domain::Ending::Killed);
+
+    let released = wait_until(|| notify::waiter_of(notification) == 0, 8_000);
+    let reaped = wait_until(|| sched::threads_counted_in(doomed.as_u32()) == 0, 8_000);
+    let dropped = sched::WAKES_DROPPED.load(core::sync::atomic::Ordering::Relaxed);
+    notify::destroy(notification);
+    domain::destroy(doomed);
+
+    if released && reaped && dropped == 0 {
+        println!(
+            "    parked wake    a thread parked on a notification (waiter {parked_as}) was woken \
+             by its domain ending, gave the notification back, and was reaped; 0 wakes dropped"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    parked wake    FAILED: released {released}, reaped {reaped}, \
+             {dropped} wakes dropped -- a waiter left behind refuses every later one\x1b[0m"
+        );
+        false
+    }
+}
+
 /// A thread killed while queued on an endpoint leaves no entry behind.
 ///
 /// # Why this is a scenario and not a unit test
@@ -16582,6 +16676,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // The check prints its own verdict, in detail. `FAILED` anywhere in the log
     // is what every harness here fails on, so there is nothing to accumulate.
     let _ = queue_entry_released_on_death(cpu, hhdm);
+    if !parked_waiter_released_on_death(cpu, hhdm) {
+        println!("\x1b[91m    parked wake    FAILED\x1b[0m");
+    }
 
     let (queued_senders, queued_receivers, dead) = ipc::stranded_entries();
     println!(

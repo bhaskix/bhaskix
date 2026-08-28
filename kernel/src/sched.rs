@@ -3856,6 +3856,9 @@ fn notify(cpu: u32) {
     }
 }
 
+/// Sleepers marked dying that could not be collected for waking. Always zero.
+pub static WAKES_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Tells every thread of `domain` to stop, and wakes the ones that are asleep.
 ///
 /// Returns how many were marked, including the caller if it belongs to that
@@ -3892,7 +3895,19 @@ pub fn mark_domain_dying(domain: u32) -> usize {
     // One queue at a time. Two would be two locks of the same rank, which have
     // no order relative to each other and could close a cycle -- the rule
     // `wake_with` states a few hundred lines below.
-    let mut asleep = [0u32; MAX_CPUS * 4];
+    // **Every thread the machine can hold**, so this cannot truncate.
+    //
+    // It was `MAX_CPUS * 4` — two hundred and fifty-six — against a machine
+    // that holds `MAX_CPUS * MAX_THREADS_PER_CPU`, five hundred and twelve. The
+    // `get_mut` below silently dropped anything past the end, so a domain with
+    // more than two hundred and fifty-six blocked threads would have marked
+    // them all dying and woken only some. The rest would sleep for ever holding
+    // whatever they were waiting on — and a notification takes one waiter, so
+    // each one left behind refuses every later waiter on it.
+    //
+    // Sized from the same two constants the thread table is, so the two cannot
+    // drift apart: two kilobytes of a sixty-four-kilobyte stack.
+    let mut asleep = [0u32; MAX_CPUS * MAX_THREADS_PER_CPU];
     let mut waiting = 0;
     let mut marked = 0;
 
@@ -3905,11 +3920,17 @@ pub fn mark_domain_dying(domain: u32) -> usize {
             }
             thread.dying = true;
             marked += 1;
-            if thread.state == State::Blocked
-                && let Some(slot) = asleep.get_mut(waiting)
-            {
-                *slot = thread.id;
-                waiting += 1;
+            if thread.state == State::Blocked {
+                if let Some(slot) = asleep.get_mut(waiting) {
+                    *slot = thread.id;
+                    waiting += 1;
+                } else {
+                    // Unreachable while the array is sized as above, and
+                    // counted rather than ignored because the thing it would
+                    // mean — a sleeper marked dying and never woken — is
+                    // invisible from anywhere else.
+                    WAKES_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
