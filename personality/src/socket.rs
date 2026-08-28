@@ -88,6 +88,21 @@ pub mod errno {
     pub const EAFNOSUPPORT: i64 = -97;
     /// Function not implemented.
     pub const ENOSYS: i64 = -38;
+    /// Input/output error — the call did not reach the service, or the
+    /// refusal is this program's own mistake rather than the caller's.
+    pub const EIO: i64 = -5;
+    /// Bad file descriptor: it named a socket that has been closed.
+    pub const EBADF: i64 = -9;
+    /// Too many open files **in the system** — the service is full.
+    ///
+    /// `ENFILE` and not `EMFILE`: the caller's own descriptors are fine, and a
+    /// program told it had too many of its own would go closing them to no
+    /// effect. Confirmed against this machine's `asm-generic/errno-base.h`.
+    pub const ENFILE: i64 = -23;
+    /// That address is already in use.
+    pub const EADDRINUSE: i64 = -98;
+    /// The network is down. Confirmed against `asm-generic/errno.h`.
+    pub const ENETDOWN: i64 = -100;
 }
 
 /// The bytes of a `struct sockaddr_in`. Confirmed against this machine's
@@ -277,8 +292,133 @@ pub fn plan_socket(domain: u64, socket_type: u64, protocol: u64) -> Result<Socke
     })
 }
 
+/// The socket service's outcome words, **mirrored** from `bhaskix_abi::socket`.
+///
+/// # Why mirrored rather than imported
+///
+/// `tools/check-deps.py` enforces `docs/architecture.md` §5: dependencies point
+/// strictly downward, and `bhaskix-abi` sits on this crate's own layer. So this
+/// crate cannot name it, and a table mapping the service's answers to Linux
+/// errnos has to hold both vocabularies somehow.
+///
+/// The copy is kept honest at the one place that legitimately speaks both:
+/// `bin/linuxd` asserts each of these equals its ABI original at compile time,
+/// which is the same idiom the nucleus uses for every method number both sides
+/// name. A drift is a build failure there, not a wrong errno here.
+pub mod outcome {
+    /// It worked.
+    pub const OK: u64 = 0;
+    /// That port is already bound.
+    pub const NO_PORT: u64 = 1;
+    /// The socket has been closed and its slot may be somebody else's.
+    pub const GONE: u64 = 2;
+    /// Nothing has arrived.
+    pub const EMPTY: u64 = 3;
+    /// The caller never said where a capability may land.
+    pub const NOWHERE: u64 = 4;
+    /// No device, or no window to drive one through.
+    pub const NO_NETWORK: u64 = 5;
+    /// A v4 call about a v6 socket, or the reverse.
+    pub const WRONG_FAMILY: u64 = 6;
+    /// The service has no socket left to give.
+    pub const NO_SOCKET: u64 = 7;
+}
+
+/// What a hosted program should be told when the socket service refuses.
+///
+/// # Why this exists
+///
+/// Every failed `bind` answered `EADDRINUSE` — the only errno the adapter could
+/// honestly guess at while the service had one word for several refusals. That
+/// guess **misdirected three separate investigations in one day**, twice
+/// pointing at a port number that had nothing to do with the failure: a
+/// capability slot collision, a service whose socket table was full, and a
+/// close whose answer had been thrown away. RFC 0056's status line recorded the
+/// conflation; `socket::NO_SOCKET` ended it on the service's side, and this is
+/// the other half.
+///
+/// A pure function over the outcome word, so the table is host-tested rather
+/// than read.
+#[must_use]
+pub fn errno_for(answer: u64) -> i64 {
+    use outcome as socket;
+
+    match answer {
+        // That port belongs to somebody. The one case the old guess was right
+        // about, and a caller can act on it -- pick another port.
+        socket::NO_PORT => errno::EADDRINUSE,
+        // The *service* is full. A system-wide limit, which is what `ENFILE`
+        // says and `EMFILE` does not: the caller's own descriptors are fine.
+        socket::NO_SOCKET => errno::ENFILE,
+        // The capability named a socket that has been closed. From the
+        // program's side that is a descriptor that no longer names anything.
+        socket::GONE => errno::EBADF,
+        // There is no network to bind on. `ENETDOWN` is exactly this, and it
+        // is what lets a program tell "nothing answered" from "there is
+        // nothing to answer" -- the distinction the service draws by name.
+        socket::NO_NETWORK => errno::ENETDOWN,
+        // A v4 call about a v6 socket or the reverse.
+        socket::WRONG_FAMILY => errno::EAFNOSUPPORT,
+        // The adapter did not declare where a capability could land. That is
+        // this program's bug and not the caller's, and `EIO` says so without
+        // inventing a reason the caller could act on.
+        socket::NOWHERE => errno::EIO,
+        // Anything else, including a refusal from the kernel rather than the
+        // service: the call did not arrive.
+        _ => errno::EIO,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_taken_port_and_a_full_service_are_different_answers() {
+        use outcome as socket;
+
+        // The whole point: one is the caller's to act on, the other is not.
+        assert_eq!(errno_for(socket::NO_PORT), errno::EADDRINUSE);
+        assert_eq!(errno_for(socket::NO_SOCKET), errno::ENFILE);
+        assert_ne!(errno_for(socket::NO_PORT), errno_for(socket::NO_SOCKET));
+    }
+
+    #[test]
+    fn no_network_is_not_a_busy_port() {
+        use outcome as socket;
+
+        // A machine with no network answering EADDRINUSE would have a program
+        // retrying other ports for ever.
+        assert_eq!(errno_for(socket::NO_NETWORK), errno::ENETDOWN);
+        assert_eq!(errno_for(socket::WRONG_FAMILY), errno::EAFNOSUPPORT);
+        assert_eq!(errno_for(socket::GONE), errno::EBADF);
+    }
+
+    #[test]
+    fn the_adapters_own_mistake_is_not_blamed_on_the_caller() {
+        use outcome as socket;
+
+        // `NOWHERE` means this program forgot to declare a landing slot.
+        assert_eq!(errno_for(socket::NOWHERE), errno::EIO);
+        // And anything unrecognised is EIO rather than a guess with a story.
+        assert_eq!(errno_for(9_999), errno::EIO);
+    }
+
+    #[test]
+    fn every_answer_is_a_refusal() {
+        use outcome as socket;
+
+        for answer in [
+            socket::NO_PORT,
+            socket::NO_SOCKET,
+            socket::GONE,
+            socket::NO_NETWORK,
+            socket::WRONG_FAMILY,
+            socket::NOWHERE,
+            12345,
+        ] {
+            assert!(errno_for(answer) < 0, "{answer} mapped to a success");
+        }
+    }
+
     use super::*;
 
     #[test]

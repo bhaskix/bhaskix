@@ -1122,6 +1122,19 @@ pub mod socket {
     /// socket or the reverse. Refused by name rather than mis-parsed,
     /// because the two shapes read the same four words differently.
     pub const WRONG_FAMILY: u64 = 6;
+    /// **This service has no socket left to give.**
+    ///
+    /// Distinct from [`NO_PORT`], which it was folded into until 2026-08-28.
+    /// One says *that port belongs to somebody*, the other says *this service
+    /// is full*, and a caller can act on the first and only wait on the
+    /// second — but a program told the first when the second was true goes
+    /// looking for the holder of a port nobody holds.
+    ///
+    /// That was not hypothetical: it misdirected three separate investigations
+    /// in one day, twice pointing at a port number that had nothing to do with
+    /// the failure. See RFC 0056's status line, which recorded the conflation
+    /// before this word existed to end it.
+    pub const NO_SOCKET: u64 = 7;
 
     /// Packs a socket's identity into the badge a capability carries.
     #[must_use]

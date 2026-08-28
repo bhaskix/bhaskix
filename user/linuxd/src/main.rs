@@ -2511,6 +2511,25 @@ fn claim_socket_slot() -> Option<u64> {
 /// failure shape a shared adapter produces (RFC 0031 I5). The first attempt at
 /// a fix reclaimed the slot without telling the service and changed nothing,
 /// which is how the difference between the two halves got noticed.
+/// **The mirrored outcome words must still match the ABI's.**
+///
+/// `bhaskix-personality` may not depend on `bhaskix-abi` — they share a layer
+/// and `tools/check-deps.py` enforces that dependencies point downward — so it
+/// keeps its own copy of the socket service's answers. This program legitimately
+/// speaks both, so it is where the two are held together: a drift is a build
+/// failure here rather than a wrong errno delivered to a hosted program.
+const _: () = {
+    use bhaskix_personality::socket::outcome;
+    assert!(outcome::OK == bhaskix_abi::socket::OK);
+    assert!(outcome::NO_PORT == bhaskix_abi::socket::NO_PORT);
+    assert!(outcome::GONE == bhaskix_abi::socket::GONE);
+    assert!(outcome::EMPTY == bhaskix_abi::socket::EMPTY);
+    assert!(outcome::NOWHERE == bhaskix_abi::socket::NOWHERE);
+    assert!(outcome::NO_NETWORK == bhaskix_abi::socket::NO_NETWORK);
+    assert!(outcome::WRONG_FAMILY == bhaskix_abi::socket::WRONG_FAMILY);
+    assert!(outcome::NO_SOCKET == bhaskix_abi::socket::NO_SOCKET);
+};
+
 /// Sockets this program could not persuade the service to close.
 ///
 /// Always zero. A non-zero value is a port held for the rest of the boot by a
@@ -4065,17 +4084,27 @@ fn answer_bind(request: &PersonalityCall) -> Answer {
             Answer::ok(0)
         }
         Err(refusal) => {
-            // **The refusal's own word, not just the port** -- RFC 0058. Every
-            // failed bind answers `EADDRINUSE` because that is the only errno
-            // this can honestly guess at, and RFC 0056 recorded that the error
-            // therefore names the wrong thing. The *trace* need not guess: it
-            // carries what the service or the kernel actually said, which is
-            // the difference between "that port is taken" and "there are no
-            // sockets left" -- and the second is what a boot spent looking
-            // like the first.
-            trace_file(-98, STAGE_NOT_BOUND, refusal.word() << 16 | u64::from(port));
+            // **The service's own word, turned into the truth.** Every failed
+            // bind used to answer `EADDRINUSE` because that was the only errno
+            // this could honestly guess at while `bin/ipd` had one word for
+            // several refusals. That guess misdirected three investigations in
+            // one day, twice pointing at a port number with nothing to do with
+            // the failure. The service distinguishes now, and this maps what it
+            // says rather than guessing -- `ENFILE` when it is full,
+            // `ENETDOWN` when there is no network, `EADDRINUSE` only when that
+            // port really does belong to somebody.
+            let errno = bhaskix_personality::socket::errno_for(match refusal {
+                bhaskix_sock::udp::Refusal::Service(word) => word,
+                // The call never reached the service, so it said nothing.
+                bhaskix_sock::udp::Refusal::Kernel(_) => u64::MAX,
+            });
+            trace_file(
+                errno,
+                STAGE_NOT_BOUND,
+                refusal.word() << 16 | u64::from(port),
+            );
             release_socket_slot(slot);
-            Answer::error(-98) // EADDRINUSE
+            Answer::error(errno)
         }
     }
 }

@@ -1123,6 +1123,40 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-28 (a bind that says what actually went wrong)
+
+**One word for several refusals is why three investigations went the wrong
+way.** `socket::NO_PORT` meant both *that port belongs to somebody* and *this
+service is full* — the service itself could not tell a caller which — so every
+failed `bind` answered `EADDRINUSE`, and twice this week that sent me hunting
+the holder of a port nobody held. The three were: a capability slot collision, a
+socket table with nothing left in it, and a close whose answer had been thrown
+away. **None of them was about a port.**
+
+**The service distinguishes now.** `socket::NO_SOCKET` says *the table is full*;
+`NO_PORT` keeps its narrower and truer meaning. `bin/ipd` answers each where it
+means it, which is two branches where there was one.
+
+**And the adapter maps what it is told rather than guessing**: `ENFILE` for a
+full service — system-wide, not the caller's own descriptors, which is what
+`ENFILE` says and `EMFILE` does not — `ENETDOWN` for no network, `EBADF` for a
+socket that has gone, `EAFNOSUPPORT` for the wrong family, `EIO` for the
+adapter's own mistake or a call that never arrived, and `EADDRINUSE` **only**
+when the port really is taken. Every number was read out of this machine's
+`asm-generic/errno*.h` rather than recalled.
+
+**A pure function, host-tested, three mutations** — a full service still blamed
+on the port, a downed network reported as a busy port, and an unknown answer
+reported as success — each caught by exactly one test.
+
+**And a layering rule refused the obvious shape, correctly.**
+`bhaskix-personality` cannot depend on `bhaskix-abi`: they share a layer and
+`tools/check-deps.py` enforces that dependencies point downward. So the outcome
+words are mirrored into `personality`, and `bin/linuxd` — which legitimately
+speaks both — holds the two together with a compile-time assertion per word.
+Watched red by drifting one: a build failure at the adapter, not a wrong errno
+delivered to a program.
+
 ### 2026-08-28 (RFC 0058 Part A gated — and the close whose answer was thrown away)
 
 **The gap its own status line named is closed.** One hosted program binds a port
@@ -1423,7 +1457,7 @@ observation without reading the path that already handled the other case.
 close. The socket probe that runs next was then refused its own `bind`, and the
 adapter reported `EADDRINUSE` on a port nobody held. **A hosted process that
 ends without closing leaks its socket in `bin/ipd`, whose whole supply is four**,
-and every failed bind is flattened to `EADDRINUSE` so the error names the wrong
+and every failed bind was flattened to `EADDRINUSE` (until 2026-08-28) so the error named the wrong
 thing. `bin/linuxd` already says why, on `release_socket_slot`: *"`bin/ipd` holds
 four sockets in a table of its own, and nothing tells it a client has stopped
 caring."* Ending a domain releases the descriptor table and the capability; it

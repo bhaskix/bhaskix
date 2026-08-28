@@ -156,7 +156,16 @@ never rung. It counts rings now: a count survives its own success.
 moment.** The bell's report ran before the probe that sends a datagram, so it
 reported a bell that had had nothing to announce yet. It is after it now.
 
-**`bind`'s error names the wrong thing, and now says so in the trace.** Every
+**`bind`'s error named the wrong thing — fixed 2026-08-28, after this was
+written.** The paragraph below is kept as it stood, because what it settled for
+turned out to be avoidable: the service had **one word for several refusals**,
+so `socket::NO_PORT` meant both *that port belongs to somebody* and *this
+service is full*, and no mapping above it could tell them apart. It gained
+`socket::NO_SOCKET`, and the adapter now maps what it is told — `ENFILE` for a
+full service, `ENETDOWN` for no network, `EADDRINUSE` only when the port really
+is taken. The guess had misdirected three investigations in one day.
+
+**As it was written:** Every
 failure answers `EADDRINUSE` because that is the only errno this can honestly
 guess at — RFC 0056 recorded that. The *trace* need not guess, and carries the
 service's or the kernel's own word now: the difference between "that port is

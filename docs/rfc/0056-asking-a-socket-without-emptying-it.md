@@ -153,7 +153,8 @@ nothing tells it a client has stopped caring."* What that comment does **not**
 say, and what was missed when this was written, is that `note_exit` already
 acts on it for every process that exits. The gap is narrower and more specific:
 a domain killed from outside reaches neither. Four sockets
-is the whole supply, and the error every failed bind is flattened to is
+is the whole supply, and — until 2026-08-28, when `socket::NO_SOCKET` was
+added to tell the two apart — the error every failed bind was flattened to was
 `EADDRINUSE`, which named a port that was not the problem.
 
 **This RFC closes its own probe's socket and does not fix that.** The leak is

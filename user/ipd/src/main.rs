@@ -1285,14 +1285,19 @@ fn serve(
                 continue;
             }
             let wanted = args[0] as u16;
-            let taken = sockets
-                .iter()
-                .position(|held| held.port == 0)
-                .filter(|_| wanted == 0 || sockets.iter().all(|held| held.port != wanted));
-            let Some(index) = taken else {
-                reply(socket::NO_PORT, 0, 0);
+            // **Two refusals, not one.** A free row and a free *port* are
+            // different things, and answering `NO_PORT` for both sent callers
+            // hunting the holder of a port nobody held -- three times in one
+            // day. The table being full is `NO_SOCKET`; the port being spoken
+            // for is `NO_PORT`.
+            let Some(index) = sockets.iter().position(|held| held.port == 0) else {
+                reply(socket::NO_SOCKET, 0, 0);
                 continue;
             };
+            if wanted != 0 && sockets.iter().any(|held| held.port == wanted) {
+                reply(socket::NO_PORT, 0, 0);
+                continue;
+            }
             // Zero means "assign me one", and the assignment is this service's
             // to make. Ports start above the well-known range.
             let port = if wanted == 0 {
