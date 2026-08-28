@@ -569,6 +569,13 @@ fn is_one_component(name: &[u8]) -> bool {
 /// A page of the memory object it holds, which the kernel can reach through
 /// the object's frames. The marker goes last and after a fence, so a kernel
 /// that sees the marker sees everything under it.
+// Eight numbers, one per thing this service counts, written into one page. A
+// struct here would be a struct with eight fields, built at the one call site
+// and taken apart immediately -- the same arguments in a different shape.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per counter reported"
+)]
 fn report(
     blocks: u64,
     entries: u64,

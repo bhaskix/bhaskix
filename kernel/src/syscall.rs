@@ -1342,6 +1342,9 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             resolved.object.id as u32,
             (resolved.object.id >> 32) as u32,
         );
+        if crate::datagram_bell_id() == Some(id) {
+            BELL_RINGS.fetch_add(1, Ordering::Relaxed);
+        }
         return match crate::notify::signal(id, resolved.badge) {
             Ok(()) => Outcome::ok(0),
             // A badge of zero is a capability that cannot say anything, which
@@ -2388,6 +2391,9 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                     PARK_UNNAMED.fetch_add(1, Ordering::Relaxed);
                     return Some(-11i64 as u64); // EAGAIN
                 };
+                if crate::datagram_bell_id() == Some(notification) {
+                    PARKED_ON_BELL.fetch_add(1, Ordering::Relaxed);
+                }
                 BLOCKED.fetch_add(1, Ordering::Relaxed);
                 if crate::notify::wait(notification).is_err() {
                     // **A caller that is being killed is not a refusal.**
@@ -2752,6 +2758,23 @@ fn may_park_on(slot: u64, domain: u32) -> bool {
 
 /// Parks refused because the caller's domain was not granted what it named.
 pub static PARK_UNGRANTED: AtomicU64 = AtomicU64::new(0);
+/// Times the datagram bell has been rung — RFC 0058 Part B.
+///
+/// **Counted rather than peeked.** The first version of this gate read the
+/// notification's latched bit, which worked only while nothing waited on it:
+/// once a poller actually parked there, waking took the bit and the check
+/// reported a bell that had just done its job as one that had never rung. A
+/// count survives its own success.
+pub static BELL_RINGS: AtomicU64 = AtomicU64::new(0);
+
+/// Parks on the datagram bell — RFC 0058 Part B.
+///
+/// Counted so a test can wait for a poller to actually *be* parked before
+/// sending it something. Without it, a sender that wins the race delivers a
+/// datagram the poller then finds waiting, and the test passes without the wake
+/// it exists to prove.
+pub static PARKED_ON_BELL: AtomicU64 = AtomicU64::new(0);
+
 /// Parks that named a deadline as well as a notification — RFC 0057.
 ///
 /// Counted because the reply shape is otherwise invisible: a boot where the

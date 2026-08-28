@@ -452,14 +452,14 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
                 0,
                 domain,
             );
-            return (
+            (
                 REPLY_VALUE,
                 if number == SENDTO {
                     answer_sendto(&request)
                 } else {
                     answer_recvfrom(&request)
                 },
-            );
+            )
         }
         CLONE => {
             let plan = thread::plan_clone(rdi, rsi, rdx, r10, r8);
@@ -915,7 +915,7 @@ fn answer_writev(request: &PersonalityCall) -> Answer {
     }
 
     let mut written = 0u64;
-    for vector in raw[..wanted].chunks_exact(IOVEC_BYTES) {
+    for vector in raw[..wanted].as_chunks::<IOVEC_BYTES>().0 {
         let mut base = [0u8; 8];
         let mut length = [0u8; 8];
         base.copy_from_slice(&vector[..8]);
@@ -932,7 +932,11 @@ fn answer_writev(request: &PersonalityCall) -> Answer {
             // Nothing written yet means the error is the answer; something
             // written means the caller is told how much, which is what a
             // partial `writev` is.
-            return if written == 0 { answer } else { Answer::ok(written) };
+            return if written == 0 {
+                answer
+            } else {
+                Answer::ok(written)
+            };
         }
         written += answer.value;
         if answer.value < length {
@@ -1821,10 +1825,12 @@ fn timespec_at(request: &PersonalityCall, at: u64) -> Result<Wait, i64> {
     if nanos >= 1_000_000_000 {
         return Err(-22); // EINVAL
     }
-    Ok(match seconds.saturating_mul(1_000_000_000).saturating_add(nanos) {
-        0 => Wait::Now,
-        total => Wait::For(total),
-    })
+    Ok(
+        match seconds.saturating_mul(1_000_000_000).saturating_add(nanos) {
+            0 => Wait::Now,
+            total => Wait::For(total),
+        },
+    )
 }
 
 /// Reads a `timeval` — `select`'s spelling, microseconds rather than nanos.
@@ -1874,16 +1880,20 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
     let mut console_state: Option<(bool, bool)> = None;
     let mut ready = 0u64;
     let mut waits_on_console = false;
+    let mut waits_on_socket = false;
 
     for index in 0..count as usize {
         let entry = &entries[index * POLLFD_BYTES..(index + 1) * POLLFD_BYTES];
         let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
         let events = u16::from_le_bytes([entry[4], entry[5]]);
         let condition = condition_of(request, fd as u64, &mut console_state);
-        if matches!(condition, Condition::Console { granted: true, .. })
-            && events & poll::POLLIN != 0
-        {
-            waits_on_console = true;
+        if events & poll::POLLIN != 0 {
+            if matches!(condition, Condition::Console { granted: true, .. }) {
+                waits_on_console = true;
+            }
+            if matches!(condition, Condition::Socket { .. }) {
+                waits_on_socket = true;
+            }
         }
         let revents = poll::revents(events, condition);
         entries[index * POLLFD_BYTES + 6] = revents as u8;
@@ -1908,11 +1918,20 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
         // positive timeout parked on a timer alone and a key pressed a
         // millisecond in was not noticed until the interval ended.
         if let Wait::For(nanos) = timeout
-            && waits_on_console
+            && (waits_on_console || waits_on_socket)
             && let Some(deadline) = deadline_for(request.domain, nanos)
         {
+            // The console wins a set naming both: only one notification can be
+            // parked on, and the interactive one is the one a person is waiting
+            // at. A datagram for such a set is noticed when the deadline
+            // expires, which RFC 0058 states rather than hides.
+            let bell = if waits_on_console {
+                INPUT_WAKE
+            } else {
+                DATAGRAM_BELL
+            };
             park_deadline(deadline);
-            return (REPLY_BLOCK_ON_UNTIL, Answer::ok(INPUT_WAKE));
+            return (REPLY_BLOCK_ON_UNTIL, Answer::ok(bell));
         }
         if let Wait::For(nanos) = timeout
             && let Some(slot) = park_until(request.domain, nanos)
@@ -1930,6 +1949,14 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
             // reason: this program has one thread and must not be the one that
             // sleeps.
             return (REPLY_BLOCK_ON_RETRY, Answer::ok(INPUT_WAKE));
+        }
+        // **A datagram is a thing to wait for too** -- RFC 0058 Part B, which
+        // granted this program the bell `bin/ipd` rings and then, until now,
+        // never waited on it. The constant sat unused and the compiler said so
+        // in as many words; it shipped because the adapter was the one crate
+        // `make clippy` did not cover.
+        if waits_on_socket {
+            return (REPLY_BLOCK_ON_RETRY, Answer::ok(DATAGRAM_BELL));
         }
         // Nothing here can be waited for. Answering now is a spin rather than a
         // park on a wake that would never come, and RFC 0055 says so.
@@ -2072,6 +2099,7 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
     let mut console_state: Option<(bool, bool)> = None;
     let mut ready = 0u64;
     let mut waits_on_console = false;
+    let mut waits_on_socket = false;
     for fd in 0..highest {
         let watched = Watched {
             read: watching(0, fd),
@@ -2089,13 +2117,19 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
             // thing twice.
             return (REPLY_VALUE, Answer::error(-9)); // EBADF
         }
-        if watched.read
-            && matches!(
+        if watched.read {
+            if matches!(
                 condition,
                 bhaskix_personality::poll::Condition::Console { granted: true, .. }
-            )
-        {
-            waits_on_console = true;
+            ) {
+                waits_on_console = true;
+            }
+            if matches!(
+                condition,
+                bhaskix_personality::poll::Condition::Socket { .. }
+            ) {
+                waits_on_socket = true;
+            }
         }
         for (which, set) in [out.read, out.write, out.except].iter().enumerate() {
             if *set {
@@ -2109,11 +2143,20 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
         // Both wake sources when the console is what is being waited for, as
         // `poll` does and for the same reason -- RFC 0057.
         if let Wait::For(nanos) = timeout
-            && waits_on_console
+            && (waits_on_console || waits_on_socket)
             && let Some(deadline) = deadline_for(request.domain, nanos)
         {
+            // The console wins a set naming both: only one notification can be
+            // parked on, and the interactive one is the one a person is waiting
+            // at. A datagram for such a set is noticed when the deadline
+            // expires, which RFC 0058 states rather than hides.
+            let bell = if waits_on_console {
+                INPUT_WAKE
+            } else {
+                DATAGRAM_BELL
+            };
             park_deadline(deadline);
-            return (REPLY_BLOCK_ON_UNTIL, Answer::ok(INPUT_WAKE));
+            return (REPLY_BLOCK_ON_UNTIL, Answer::ok(bell));
         }
         if let Wait::For(nanos) = timeout
             && let Some(slot) = park_until(request.domain, nanos)
@@ -2122,6 +2165,9 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
         }
         if waits_on_console {
             return (REPLY_BLOCK_ON_RETRY, Answer::ok(INPUT_WAKE));
+        }
+        if waits_on_socket {
+            return (REPLY_BLOCK_ON_RETRY, Answer::ok(DATAGRAM_BELL));
         }
     }
     forget_deadline(request.domain);
@@ -2181,10 +2227,7 @@ fn pipe_condition(
 /// the handle, then which end of a pipe it is, then a socket's family and port.
 /// Each arrived as one more element, and the fourth was where the tuple stopped
 /// being readable.
-fn descriptor_row(
-    request: &PersonalityCall,
-    fd: u64,
-) -> Option<bhaskix_personality::file::Entry> {
+fn descriptor_row(request: &PersonalityCall, fd: u64) -> Option<bhaskix_personality::file::Entry> {
     let descriptor = i32::try_from(fd).ok()?;
     let process = process_for(request.domain)?;
     process.descriptors.get(descriptor).copied()
@@ -3177,7 +3220,10 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
 /// which is what a program passes when it has lost track of its own path;
 /// treating that as the root would turn a bug into a successful listing.
 fn names_own_root(name: &[u8]) -> bool {
-    let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+    let end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
     let name = &name[..end];
     !name.is_empty() && (name == b"." || name.iter().all(|byte| *byte == b'/'))
 }
@@ -3496,7 +3542,11 @@ fn answer_lseek(request: &PersonalityCall) -> Answer {
 }
 
 /// Writes one `struct stat` describing `entry` into the caller's memory.
-fn stat_out(request: &PersonalityCall, entry: &bhaskix_personality::file::Entry, at: u64) -> Answer {
+fn stat_out(
+    request: &PersonalityCall,
+    entry: &bhaskix_personality::file::Entry,
+    at: u64,
+) -> Answer {
     use bhaskix_personality::file::{STAT_BYTES, stat_of, write_stat};
 
     let mut bytes = [0u8; STAT_BYTES];
@@ -3552,13 +3602,7 @@ fn answer_newfstatat(request: &PersonalityCall) -> Answer {
 /// `newfstatat(AT_FDCWD, path, buf, 0)` and `lstat` the same with
 /// `AT_SYMLINK_NOFOLLOW` — and a personality that reimplemented them would have
 /// two path resolutions to keep in step. Whatever this refuses, they refuse.
-fn stat_at(
-    request: &PersonalityCall,
-    dirfd: u64,
-    path_at: u64,
-    out_at: u64,
-    flags: u64,
-) -> Answer {
+fn stat_at(request: &PersonalityCall, dirfd: u64, path_at: u64, out_at: u64, flags: u64) -> Answer {
     let mut name = [0u8; MAX_NAME];
     if !copy_in(request.domain, path_at, &mut name) {
         return Answer::error(-14); // EFAULT
@@ -4120,18 +4164,18 @@ fn answer_sendto(request: &PersonalityCall) -> Answer {
         // The parser gives four bytes; the v4 service speaks the wire word.
         // Converted here and named, because getting it backwards sends every
         // datagram to a mirrored address and nothing says so.
-        (Endpoint::V4 { address, port: to }, false) => {
-            bhaskix_sock::udp::Socket::from_slot(entry.handle, port).send_to(
-                PAYLOAD,
-                u32::from_be_bytes(address),
-                to,
-                length,
-            )
-        }
-        (Endpoint::V6 { address, port: to, .. }, true) => {
-            bhaskix_sock::udp6::Socket6::from_slot(entry.handle, port)
-                .send_to(PAYLOAD, address, to, length)
-        }
+        (Endpoint::V4 { address, port: to }, false) => bhaskix_sock::udp::Socket::from_slot(
+            entry.handle,
+            port,
+        )
+        .send_to(PAYLOAD, u32::from_be_bytes(address), to, length),
+        (
+            Endpoint::V6 {
+                address, port: to, ..
+            },
+            true,
+        ) => bhaskix_sock::udp6::Socket6::from_slot(entry.handle, port)
+            .send_to(PAYLOAD, address, to, length),
         // A v6 address down a v4 socket, or the reverse. Linux answers this
         // rather than translating, and so does this.
         _ => {

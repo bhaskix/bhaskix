@@ -567,7 +567,14 @@ asm_budget = 10
 # because the two probes differ in what they map and where they report, and a
 # parameterised one would have been a third thing to get wrong in a path where
 # a mistake is a triple fault.
-unsafe_budget = 1939
+# 1978 for RFC 0058's pair of hosted programs, which prove a poller parked on
+# the datagram bell is woken by another program's datagram. Thirty-nine lines
+# for two probes, and **less than two of the previous ones**: the mapping,
+# copying, entry and report-reading live in one launcher the pair share, because
+# they differ only in their code, where it lives, which port they bind and
+# whether a second address is written for them. The socket-poll probe was cloned
+# from the socket probe and that showed; this one was not.
+unsafe_budget = 1978
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

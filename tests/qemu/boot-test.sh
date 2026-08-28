@@ -2855,14 +2855,33 @@ else
     status=1
 fi
 
+# A poller parked on the bell is woken by a datagram -- RFC 0058 Part B, and
+# the thing its own status line said was unproven.
+#
+# **Two programs, and the order is the assertion.** A probe that sends to itself
+# never parks: loopback delivery is synchronous inside `bin/ipd`, so by the time
+# it polls the datagram is already waiting, and it would pass while proving
+# nothing. So one binds and polls with no timeout, and the sender is not started
+# until the nucleus has counted a park *on the bell*. The count is the
+# precondition, observed rather than slept for.
+if grep -qE "datagram wake  a hosted program parked on the bell with no timeout, another sent it four bytes, and the first woke and read them" "$LOG"; then
+    pass "a poller parked on the datagram bell was woken by another program's datagram"
+elif grep -qF "datagram wake  skipped" "$LOG"; then
+    pass "no network this machine can drive, so no datagram can wake anybody"
+else
+    fail "the datagram wake did not conclude: $(grep -aoE 'datagram wake.*' "$LOG" | head -1)"
+    status=1
+fi
+
 # `bin/ipd` rings a bell when a datagram lands -- RFC 0058 Part B.
 #
-# Read by peeking the notification rather than taking it: nothing waits on this
-# bell on a boot with no hosted poller, so the bit stays set and is exactly the
-# proof that the service rang it. Asserted after the probe that sends, because
+# **A count, not the latched bit.** Peeking the notification worked only while
+# nothing waited on it: once a poller actually parked there -- which the gate
+# above now makes it do -- waking *took* the bit, and this reported a bell that
+# had just done its job as one that had never rung. Asserted after the probe that sends, because
 # before it the bell has had nothing to announce -- which is where this check
 # was placed first, and it reported a truth about the wrong moment.
-if grep -qF "datagram bell  bin/ipd rang it" "$LOG"; then
+if grep -qE "datagram bell  bin/ipd rang it [1-9][0-9]* times" "$LOG"; then
     pass "the service rang its bell when a datagram arrived"
 elif grep -qF "datagram bell  granted and never rung: no network" "$LOG"; then
     pass "no network this machine can drive, so no datagram bell to ring"

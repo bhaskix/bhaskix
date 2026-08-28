@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. Both parts built. Part B is gated: the bell is granted to both sides and the boot asserts `bin/ipd` **rang** it when a datagram arrived, read by peeking the notification rather than taking it, and watched red by removing the signal. **What this does not claim.** *(1)* **Part A has no lane of its own** — proving it needs a hosted domain killed while holding a socket and another taking the same slot afterwards, which no probe here arranges; it is reasoned from the code and the correction it rests on is stated above. *(2)* **The parked wake is unproven**: no lane shows a poller woken *by* a datagram, because a probe that sends to itself is served synchronously and never parks. *(3)* The leak is **bounded, not closed** — the message arrives on slot reuse. *(4)* One bell for every socket, so a poller wakes for datagrams that were not its own |
+| **Status** | ✅ **ACCEPTED 2026-08-28**, and **completed 2026-08-28 after acceptance**. *The status line accepted said "both parts built" and that was wrong*: Part B created, granted and rang the bell, and nothing ever waited on it — `bin/linuxd`'s constant for it was **never used**, which the compiler said in as many words and which shipped because the adapter was the one crate `make clippy` did not cover. The park is wired now and the wake is **proved**: a hosted program parks on the bell with no timeout, a second sends it four bytes, and the first wakes and reads them — the sender started only once the nucleus has counted a park *on the bell*, so the order is observed rather than slept for. Watched red both ways: no park (*"the poller never parked"*) and no ring (*"sent 4"*, parked, never woken). Part B is gated: the bell is granted to both sides and the boot asserts `bin/ipd` **rang** it when a datagram arrived, read by peeking the notification rather than taking it, and watched red by removing the signal. **What this does not claim.** *(1)* **Part A has no lane of its own** — proving it needs a hosted domain killed while holding a socket and another taking the same slot afterwards, which no probe here arranges; it is reasoned from the code and the correction it rests on is stated above. *(2)* ~~The parked wake is unproven~~ — **proved 2026-08-28**, see above. *(3)* The leak is **bounded, not closed** — the message arrives on slot reuse. *(4)* One bell for every socket, so a poller wakes for datagrams that were not its own |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — Core Operating System (L1) |
@@ -135,6 +135,23 @@ record that survived the first was walked again by the second — and the slot i
 reused between them, so the second release closes a socket belonging to whoever
 holds it *now*. The handle is cleared on release.
 
+**Part B was half built, and the compiler said so.** The bell was created,
+granted and rung, and `bin/linuxd` never waited on it: the constant naming its
+slot was dead, and `cargo` reported *"constant `DATAGRAM_BELL` is never used"*
+on every build. It shipped because **the adapter was the one crate `make clippy`
+did not cover** — `security.md` calls it the largest concentration of authority
+in the system, and it was the one place a warning could not fail the suite.
+`user/linuxd`, `user/udp6`, `user/fsd` and `user/hello` are in `make fmt` and
+`make clippy` now; the adapter had a formatting drift and two other lints
+waiting there as well.
+
+**And a gate that only worked while it was useless.** The bell's own check read
+the notification's *latched bit*, which is set by a signal and cleared by
+whoever waits. That was proof the service had rung it — for exactly as long as
+nothing waited on it. The moment a poller actually parked there, waking took the
+bit and the check reported a bell that had just done its job as one that had
+never rung. It counts rings now: a count survives its own success.
+
 **And a check placed where it could only tell the truth about the wrong
 moment.** The bell's report ran before the probe that sends a datagram, so it
 reported a bell that had had nothing to announce yet. It is after it now.
@@ -148,8 +165,17 @@ first while being the second.
 
 ## Unresolved questions
 
-1. **The parked wake is unproven**, as above. A second hosted program, or a
-   `clone`d thread inside the existing probe, would prove it.
+1. ~~**The parked wake is unproven.**~~ **Closed 2026-08-28**, with the second
+   hosted program this question named. What it needed beyond the two programs
+   was an *order*: a probe that sends to itself never parks, because loopback
+   delivery is synchronous inside `bin/ipd`, so the sender is not started until
+   the nucleus has counted a park on the bell. The count is the precondition,
+   observed rather than slept for.
+
+   It also needed two more sockets. `bin/ipd` served **four**, and this
+   machine's own boot already spends three — the DHCP client for the life of
+   the boot and the v6 round trip's two — so the pair's second bind was refused,
+   as `EADDRINUSE` on a port nobody held. Six now, at a cost of 768 bytes.
 2. **The leak is bounded rather than closed**, as above.
 3. **One bell for every socket.** A poller wakes for a datagram that was not
    theirs and re-examines; correct, and more work than a per-socket

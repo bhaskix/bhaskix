@@ -719,6 +719,9 @@ fmt:
 	cd $(PROBE_DIR) && $(CARGO) fmt --all --check
 	cd $(SHELL_DIR) && $(CARGO) fmt --all --check
 	cd $(VFSD_DIR) && $(CARGO) fmt --all --check
+	cd $(LINUXD_DIR) && $(CARGO) fmt --all --check
+	cd $(UDP6_DIR) && $(CARGO) fmt --all --check
+	cd $(HELLO_DIR) && $(CARGO) fmt --all --check
 	cd $(CONSOLED_DIR) && $(CARGO) fmt --all --check
 	cd $(BLKD_DIR) && $(CARGO) fmt --all --check
 	cd $(AHCID_DIR) && $(CARGO) fmt --all --check
@@ -765,6 +768,14 @@ clippy:
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(BOOTEFI_DIR) && $(CARGO) clippy --release --target x86_64-unknown-uefi -- -D warnings
 	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(LINUXD_DIR) && \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(UDP6_DIR) && \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(FSD_DIR) && \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(HELLO_DIR) && \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 
 # Installs the git hooks that refuse an AI-vendor attribution before the commit

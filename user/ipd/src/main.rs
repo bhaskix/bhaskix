@@ -723,7 +723,17 @@ fn refresh() {
 /// Fixed, like every other table this system exposes to something it does not
 /// control: a program that could make the service allocate without bound would
 /// hold a denial of service dressed as a feature.
-const SOCKETS: usize = 4;
+///
+/// **Six as of 2026-08-28, four before.** Four was one short of what this
+/// machine's own boot needs: the DHCP client holds one for the life of the
+/// boot, the v6 round-trip test holds two, and RFC 0058's gate needs *two at
+/// once* — a program parked in `poll` and another sending to it. The fifth bind
+/// was refused, and the failure arrived as `EADDRINUSE` on a port nobody else
+/// held, because that is the only errno a failed bind can honestly guess at.
+///
+/// The cost is two more [`DATAGRAM`] buffers, 768 bytes, in a service that
+/// already maps a page for its ring. The bound stays a bound.
+const SOCKETS: usize = 6;
 
 /// One bound socket.
 /// The largest datagram a socket will hold for its owner.

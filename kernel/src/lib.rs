@@ -8311,11 +8311,15 @@ fn datagram_bell_report() {
     // already draws and this borrowed without borrowing its condition.
     let could_have = network_endpoint_capability().is_some()
         && NET_CONTAINED.load(core::sync::atomic::Ordering::Acquire);
-    match (datagram_bell_rung(), could_have) {
+    let rings = syscall::BELL_RINGS.load(core::sync::atomic::Ordering::Relaxed);
+    match (
+        datagram_bell_rung().map(|latched| latched || rings > 0),
+        could_have,
+    ) {
         (None, _) => {}
         (Some(true), _) => println!(
-            "    datagram bell  bin/ipd rang it: a datagram arriving now wakes a hosted program \
-             parked waiting for one"
+            "    datagram bell  bin/ipd rang it {rings} times: a datagram arriving now wakes a \
+             hosted program parked waiting for one"
         ),
         (Some(false), false) => println!(
             "    datagram bell  granted and never rung: no network this machine can drive, so no \
@@ -8326,6 +8330,401 @@ fn datagram_bell_report() {
              datagram -- a hosted poll on a socket would wait for a wake nobody sends\x1b[0m"
         ),
     }
+}
+
+/// Where the waiting half of RFC 0058's pair runs, and where its partner does.
+const BELL_WAITER_AT: u64 = 0x0000_0000_1D00_0000;
+const BELL_SENDER_AT: u64 = 0x0000_0000_1F00_0000;
+static BELL_WAITER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BELL_SENDER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The port the waiter binds, and the sender aims at.
+const BELL_WAITER_PORT: u16 = 7779;
+/// The port the sender binds, because a socket must be bound to send.
+const BELL_SENDER_PORT: u16 = 7780;
+
+/// Binds a socket, **polls it with no timeout**, and reports what arrived.
+///
+/// The half that has to *park*: `poll` with an infinite timeout on a socket
+/// that has nothing waiting cannot answer, so the adapter parks it on the
+/// datagram bell and the nucleus counts that. Its partner is started only after
+/// that count moves — see [`bell_wakes_a_poller`].
+const BELL_WAITER_CODE: [u8; 179] = [
+    0x49, 0x89, 0xfc, // mov r12, rdi          ; report page
+    0x49, 0x89, 0xf6, // mov r14, rsi          ; its own address
+    0xbf, 0x0a, 0x00, 0x00, 0x00, // mov edi, 10           ; AF_INET6
+    0xbe, 0x02, 0x00, 0x00, 0x00, // mov esi, 2            ; SOCK_DGRAM
+    0x31, 0xd2, // xor edx, edx
+    0xb8, 0x29, 0x00, 0x00, 0x00, // mov eax, 41           ; socket
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x00, // mov [r12+0], rax
+    0x49, 0x89, 0xc5, // mov r13, rax
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0x4c, 0x89, 0xf6, // mov rsi, r14
+    0xba, 0x1c, 0x00, 0x00, 0x00, // mov edx, 28
+    0xb8, 0x31, 0x00, 0x00, 0x00, // mov eax, 49           ; bind
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x08, // mov [r12+8], rax
+    0x45, 0x89, 0x6c, 0x24, 0x40, // mov [r12+64], r13d    ; pollfd.fd
+    0x66, 0x41, 0xc7, 0x44, 0x24, 0x44, 0x01, 0x00, // mov word [r12+68], POLLIN
+    0x66, 0x41, 0xc7, 0x44, 0x24, 0x46, 0x00, 0x00, // mov word [r12+70], 0
+    0x49, 0x8d, 0x7c, 0x24, 0x40, // lea rdi, [r12+64]
+    0xbe, 0x01, 0x00, 0x00, 0x00, // mov esi, 1
+    0xba, 0xff, 0xff, 0xff, 0xff, // mov edx, -1           ; wait for ever
+    0xb8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7            ; poll
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x10, // mov [r12+16], rax     ; expected 1
+    0x41, 0x0f, 0xb7, 0x44, 0x24, 0x46, // movzx eax, word [r12+70]
+    0x49, 0x89, 0x44, 0x24, 0x18, // mov [r12+24], rax     ; expected POLLIN
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0x49, 0x8d, 0x74, 0x24, 0x70, // lea rsi, [r12+112]
+    0xba, 0x04, 0x00, 0x00, 0x00, // mov edx, 4
+    0x45, 0x31, 0xd2, // xor r10d, r10d
+    0x45, 0x31, 0xc0, // xor r8d, r8d
+    0x45, 0x31, 0xc9, // xor r9d, r9d
+    0xb8, 0x2d, 0x00, 0x00, 0x00, // mov eax, 45           ; recvfrom
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x20, // mov [r12+32], rax     ; expected 4
+    0x49, 0x8b, 0x44, 0x24, 0x70, // mov rax, [r12+112]
+    0x49, 0x89, 0x44, 0x24, 0x28, // mov [r12+40], rax     ; the payload
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3            ; close
+    0x0f, 0x05, // syscall
+    0x48, 0xff, 0xc0, // inc rax               ; success is not zero
+    0x49, 0x89, 0x44, 0x24, 0x30, // mov [r12+48], rax     ; the last word
+    0xeb, 0xfe, // done: jmp $
+];
+
+/// Binds a socket and sends four bytes to the waiter's port.
+///
+/// It must bind: a socket here sends only once `bind` has claimed a capability
+/// for it, so an ephemeral source port is not something this system offers yet.
+/// Its destination is written into its report page at offset 120 by the kernel,
+/// beside its own address, so neither is assembled by hand here.
+const BELL_SENDER_CODE: [u8; 124] = [
+    0x49, 0x89, 0xfc, // mov r12, rdi          ; report page
+    0x49, 0x89, 0xf6, // mov r14, rsi          ; its own address
+    0xbf, 0x0a, 0x00, 0x00, 0x00, // mov edi, 10
+    0xbe, 0x02, 0x00, 0x00, 0x00, // mov esi, 2
+    0x31, 0xd2, // xor edx, edx
+    0xb8, 0x29, 0x00, 0x00, 0x00, // mov eax, 41           ; socket
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x00, // mov [r12+0], rax
+    0x49, 0x89, 0xc5, // mov r13, rax
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0x4c, 0x89, 0xf6, // mov rsi, r14
+    0xba, 0x1c, 0x00, 0x00, 0x00, // mov edx, 28
+    0xb8, 0x31, 0x00, 0x00, 0x00, // mov eax, 49           ; bind
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x08, // mov [r12+8], rax
+    0x41, 0xc7, 0x44, 0x24, 0x60, 0x64, 0x75, 0x70, 0x30, // movl [r12+96], "dup0"
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0x49, 0x8d, 0x74, 0x24, 0x60, // lea rsi, [r12+96]
+    0xba, 0x04, 0x00, 0x00, 0x00, // mov edx, 4
+    0x45, 0x31, 0xd2, // xor r10d, r10d
+    0x4d, 0x8d, 0x44, 0x24, 0x78, // lea r8, [r12+120]     ; the waiter's address
+    0x41, 0xb9, 0x1c, 0x00, 0x00, 0x00, // mov r9d, 28
+    0xb8, 0x2c, 0x00, 0x00, 0x00, // mov eax, 44           ; sendto
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x10, // mov [r12+16], rax     ; expected 4
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3            ; close
+    0x0f, 0x05, // syscall
+    0x48, 0xff, 0xc0, // inc rax
+    0x49, 0x89, 0x44, 0x24, 0x18, // mov [r12+24], rax     ; the last word
+    0xeb, 0xfe, // done: jmp $
+];
+
+/// A `sockaddr_in6` for `[::1]` on `port`, laid out as `parse_endpoint` reads
+/// one: the family little-endian, the port **big-endian** four bytes away.
+fn loopback6_at(port: u16) -> [u8; 28] {
+    let mut address = [0u8; 28];
+    address[0..2].copy_from_slice(&10u16.to_le_bytes());
+    address[2..4].copy_from_slice(&port.to_be_bytes());
+    address[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    address
+}
+
+/// Maps and enters one of RFC 0058's two hosted programs.
+///
+/// One launcher rather than two more copies of the socket probe's scaffolding:
+/// the pair differ only in their code, where they live, which port they bind
+/// and whether they need a second address written for them.
+fn run_bell_program(
+    hhdm_base: u64,
+    code: &[u8],
+    code_at: u64,
+    report_pa: &core::sync::atomic::AtomicU64,
+    own_port: u16,
+    peer_port: Option<u16>,
+) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let buffer_at = code_at + bhaskix_mm::FRAME_SIZE;
+    let stack_at = code_at + 2 * bhaskix_mm::FRAME_SIZE;
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, pages, protection) in [
+        (code_at, 1, Protection::ReadExecute),
+        (buffer_at, 1, Protection::ReadWrite),
+        (stack_at, 2, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), pages) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let (Some(code_pa), Some(page_pa)) = (
+        space.translate(VirtAddr(code_at)),
+        space.translate(VirtAddr(buffer_at)),
+    ) else {
+        stop()
+    };
+    // SAFETY: freshly mapped frames this space owns, filled through the direct
+    // map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), (hhdm_base + code_pa) as *mut u8, code.len());
+        let own = loopback6_at(own_port);
+        core::ptr::copy_nonoverlapping(
+            own.as_ptr(),
+            (hhdm_base + code_pa + SOCKET_PROBE_ADDRESS_AT) as *mut u8,
+            own.len(),
+        );
+        if let Some(peer) = peer_port {
+            let peer = loopback6_at(peer);
+            core::ptr::copy_nonoverlapping(
+                peer.as_ptr(),
+                (hhdm_base + page_pa + 120) as *mut u8,
+                peer.len(),
+            );
+        }
+    }
+    report_pa.store(page_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
+    // SAFETY: the entry is the first byte of the read-execute page; `rdi` is the
+    // writable page it works in and `rsi` the address beside its code.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            code_at,
+            stack_at + 2 * 4096,
+            [buffer_at, code_at + SOCKET_PROBE_ADDRESS_AT],
+        )
+    }
+}
+
+extern "C" fn ring3_bell_waiter(hhdm_base: u64) -> ! {
+    run_bell_program(
+        hhdm_base,
+        &BELL_WAITER_CODE,
+        BELL_WAITER_AT,
+        &BELL_WAITER_PA,
+        BELL_WAITER_PORT,
+        None,
+    )
+}
+
+extern "C" fn ring3_bell_sender(hhdm_base: u64) -> ! {
+    run_bell_program(
+        hhdm_base,
+        &BELL_SENDER_CODE,
+        BELL_SENDER_AT,
+        &BELL_SENDER_PA,
+        BELL_SENDER_PORT,
+        Some(BELL_WAITER_PORT),
+    )
+}
+
+/// RFC 0058's witness: a poller **parked** on the bell is woken by a datagram.
+///
+/// # Why two programs, and why in this order
+///
+/// A probe that sends to itself never parks: loopback delivery is synchronous
+/// inside `bin/ipd`, so by the time it polls the datagram is already waiting.
+/// It would pass while proving nothing — the same false pass the typing lane
+/// caught once already.
+///
+/// So one program binds and polls with **no timeout**, and the sender is not
+/// started until the nucleus has counted a park **on the bell**. That count is
+/// the precondition, checked rather than assumed: without it the sender can win
+/// the race, the poller finds the datagram waiting, and the wake this exists to
+/// prove never happens.
+fn bell_wakes_a_poller(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 3 {
+        println!("\x1b[93m    datagram wake  skipped, needs a third cpu\x1b[0m");
+        return true;
+    }
+    /// `POLLIN`.
+    const IN: u64 = 0x001;
+    /// The four bytes the sender sends.
+    const PAYLOAD: u64 = 0x3070_7564;
+
+    let adapter = syscall::ADAPTER_DOMAIN.load(Ordering::Relaxed);
+    let machine_has_network =
+        network_endpoint_capability().is_some() && NET_CONTAINED.load(Ordering::Acquire);
+    let holds_network = adapter != u32::MAX
+        && domain::with(domain::DomainId::from_u32(adapter), |owner| {
+            owner.cspace.get(88).is_some() && owner.cspace.get(89).is_some()
+        }) == Some(true);
+    if !machine_has_network || datagram_bell_id().is_none() {
+        println!(
+            "    datagram wake  skipped: no network this machine can drive, so no datagram can \
+             arrive to wake anybody"
+        );
+        return true;
+    }
+    if !holds_network {
+        println!(
+            "\x1b[91m    datagram wake  FAILED: this machine has a network and the adapter was \
+             given none\x1b[0m"
+        );
+        return false;
+    }
+
+    let mut realms = [None, None];
+    let mut ok = true;
+    let parks_before = syscall::PARKED_ON_BELL.load(Ordering::Relaxed);
+    BELL_WAITER_PA.store(0, Ordering::Release);
+    BELL_SENDER_PA.store(0, Ordering::Release);
+
+    for (index, (name, cpu, entry)) in [
+        (
+            "bellwait",
+            3u32,
+            ring3_bell_waiter as extern "C" fn(u64) -> !,
+        ),
+        (
+            "bellsend",
+            2u32,
+            ring3_bell_sender as extern "C" fn(u64) -> !,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // **The sender waits for the poller to be parked.** Not a sleep: the
+        // nucleus counts parks on this bell, so the precondition is observed.
+        if index == 1
+            && !wait_until(
+                || syscall::PARKED_ON_BELL.load(Ordering::Relaxed) > parks_before,
+                20_000,
+            )
+        {
+            println!(
+                "\x1b[91m    datagram wake  FAILED: the poller never parked on the bell, so \
+                 nothing could have woken it\x1b[0m"
+            );
+            ok = false;
+            break;
+        }
+        let Ok(realm) = domain::create(name, domain::ResourceEnvelope::new()) else {
+            println!("\x1b[91m    datagram wake  FAILED: no domain for {name}\x1b[0m");
+            ok = false;
+            break;
+        };
+        realms[index] = Some(realm);
+        if domain::with(realm, |owner| {
+            owner.set_personality(domain::Personality::Linux)
+        })
+        .is_none()
+        {
+            println!("\x1b[91m    datagram wake  FAILED: the tag would not set\x1b[0m");
+            ok = false;
+            break;
+        }
+        let options = sched::SpawnOptions::new()
+            .pinned()
+            .in_domain(realm.as_u32());
+        if sched::spawn_on_with(cpu, name, entry, hhdm_base, hhdm_base, options).is_err() {
+            println!("\x1b[91m    datagram wake  FAILED: {name} would not spawn\x1b[0m");
+            ok = false;
+            break;
+        }
+    }
+
+    let mut answers = [0u64; 8];
+    if ok {
+        let woke = wait_until(
+            || {
+                let pa = BELL_WAITER_PA.load(Ordering::Acquire);
+                if pa == 0 {
+                    return false;
+                }
+                // SAFETY: a frame the waiter's own space owns, read through the
+                // direct map -- the idiom every probe's reader here uses.
+                unsafe {
+                    for (index, slot) in answers.iter_mut().enumerate() {
+                        *slot = core::ptr::read_volatile(
+                            (hhdm_base + pa + 8 * index as u64) as *const u64,
+                        );
+                    }
+                }
+                answers[6] != 0
+            },
+            30_000,
+        );
+        ok = woke;
+    }
+    for realm in realms.into_iter().flatten() {
+        domain::end(realm, domain::Ending::Killed);
+    }
+
+    // The sender's own report, because "the waiter heard nothing" and "the
+    // sender never sent" are the same observation from the waiter's side --
+    // which is the distinction `bin/ipd`'s own counters were added for.
+    let mut sent = [0u64; 4];
+    let sender_pa = BELL_SENDER_PA.load(Ordering::Acquire);
+    if sender_pa != 0 {
+        // SAFETY: a frame the sender's own space owns, through the direct map.
+        unsafe {
+            for (index, slot) in sent.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile(
+                    (hhdm_base + sender_pa + 8 * index as u64) as *const u64,
+                );
+            }
+        }
+    }
+    let parked = syscall::PARKED_ON_BELL.load(Ordering::Relaxed) - parks_before;
+    let [fd, bound, polled, revents, received, payload, closed, _] = answers;
+    ok = ok
+        && parked > 0
+        && (fd as i64) >= 0
+        && bound == 0
+        && polled == 1
+        && revents == IN
+        && received == 4
+        && payload == PAYLOAD
+        && closed == 1;
+    if ok {
+        println!(
+            "    datagram wake  a hosted program parked on the bell with no timeout, another \
+             sent it four bytes, and the first woke and read them -- {parked} park(s) on the bell"
+        );
+    } else {
+        println!(
+            "\x1b[91m    datagram wake  FAILED: parked {parked}, fd {}, bind {}, poll {polled} \
+             revents {revents:#x}, received {}, payload {payload:#x}, close {}; the sender: \
+             fd {}, bind {}, sent {}\x1b[0m",
+            fd as i64,
+            bound as i64,
+            received as i64,
+            closed as i64 - 1,
+            sent[0] as i64,
+            sent[1] as i64,
+            sent[2] as i64
+        );
+    }
+    ok
 }
 
 /// RFC 0056's witness: `poll` asks a socket and does not empty it.
@@ -10271,6 +10670,14 @@ const DATAGRAM_BADGE: u64 = 1 << 0;
 
 /// The datagram bell, by identity, so the boot can ask whether it was rung.
 static DATAGRAM_BELL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The datagram bell's identity, for the park counter — RFC 0058 Part B.
+#[must_use]
+pub fn datagram_bell_id() -> Option<crate::notify::NotificationId> {
+    let raw = DATAGRAM_BELL.load(core::sync::atomic::Ordering::Acquire);
+    (raw != u64::MAX)
+        .then(|| crate::notify::NotificationId::from_parts(raw as u32, (raw >> 32) as u32))
+}
 
 /// Whether `bin/ipd` has rung the datagram bell, **without taking the bit**.
 ///
@@ -17552,6 +17959,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     }
     if !socket_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux socket   FAILED\x1b[0m");
+    }
+    if !bell_wakes_a_poller(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    datagram wake  FAILED\x1b[0m");
     }
     // **After the probe that sends**, and not before it. Placed above at first,
     // where it reported a bell that had had nothing to announce yet: the check
