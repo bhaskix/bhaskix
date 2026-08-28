@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. Built and gated. BusyBox's `sh` no longer prints `poll: Function not implemented`, and still reads a line typed at the machine; the lane asserts both and was watched red two ways — removing the `poll` arm brings the complaint back, and making the peek *consume* loses every keystroke it reports. **What this does not claim.** *(1)* A positive timeout waits **at least** as long as asked and never returns early, because a thread here waits on one notification and the deadline is on another. *(2)* Sockets are answered nothing. *(3)* `ppoll` and `select` are unanswered. *(4)* `clock_nanosleep` does not report remaining time, because nothing here interrupts a sleep |
+| **Status** | ✅ **ACCEPTED 2026-08-28** — proposed, built and accepted the same day. Built and gated. BusyBox's `sh` no longer prints `poll: Function not implemented`, and still reads a line typed at the machine; the lane asserts both and was watched red two ways — removing the `poll` arm brings the complaint back, and making the peek *consume* loses every keystroke it reports. **What this does not claim.** *(1)* A positive timeout waits **at least** as long as asked and never returns early, because a thread here waits on one notification and the deadline is on another. *(2)* Sockets are answered nothing. *(3)* `ppoll`, `pselect6` and `select` were unanswered at acceptance and are **answered as of 2026-08-28**, gated by a hand-written hosted program because nothing here calls them; their signal masks are accepted and ignored, which is honest on a machine where nothing interrupts a parked thread. *(4)* `clock_nanosleep` does not report remaining time, because nothing here interrupts a sleep |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel |
 | **Milestone** | Phase 2 — Core Operating System (L1) |
@@ -201,8 +201,30 @@ rather than a hypothesis.
    answers nothing for one: a set containing only sockets and an infinite
    timeout answers now rather than waiting. No hosted program here opens a
    socket and polls it, and inventing an answer would be inventing a fact.
-2. **`ppoll` and `select`.** Neither is answered. Both need this table and
-   nothing else, so both are small once something asks.
+2. ~~**`ppoll` and `select`.**~~ **Answered 2026-08-28**, along with
+   `pselect6`. `ppoll` is this with a `timespec` and a signal mask that is
+   accepted and ignored — nothing wakes a parked hosted thread here except what
+   it waits for and its own domain ending, so a mask changes nothing and
+   pretending to honour it would be the lie. `select` is the same table with its
+   own rules on the way out, written as a second pure function over the first:
+   an error makes a descriptor ready for **reading and writing**, because
+   `select` cannot say "error" and a caller must be able to find out by acting;
+   a hangup makes it readable; `exceptfds` means urgent data, which nothing here
+   has, so nothing is ever reported in it.
+
+   **The one place they genuinely differ is a bad descriptor.** `poll` reports
+   `POLLNVAL` on the entry and answers the rest; `select` refuses the whole call
+   with `EBADF`. A shared implementation that forgot it would pass every other
+   assertion, so that is the one the gate names.
+
+   **Nothing on this machine asks for either**, which is measured rather than
+   assumed: the BusyBox corpus asks for `1 3 4 5 7 10 12 13 16 39 63 72 79 89
+   102 104 107 108 110 157 158 257`, and 23, 270 and 271 are not among them. So
+   the gate is a **hand-written hosted program** — this project's idiom for a
+   call with no caller — which asks `ppoll` and `select` about standard input
+   and about a descriptor nobody has, on every boot lane. Watched red twice:
+   an ungranted console reporting quiet instead of `POLLERR`, and `select`
+   treating a bad descriptor the way `poll` does.
 3. **A deadline a thread can park against.** The positive-timeout limit above,
    and the reply shape it would need.
 

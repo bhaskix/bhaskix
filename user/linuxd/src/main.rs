@@ -1126,6 +1126,9 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         // `read` is: only this one can answer a reply shape, and an infinite
         // `poll` on the console has to park exactly as a blocking read does.
         POLL => return answer_poll(request),
+        PPOLL => return answer_ppoll(request),
+        SELECT => return answer_select(request),
+        PSELECT6 => return answer_pselect(request),
         // `clock_nanosleep(clock, flags, request, remain)` -- RFC 0055.
         //
         // Answered because `poll` gave a shell a reason to ask: BusyBox's line
@@ -1649,6 +1652,12 @@ const REPLY_BLOCK_ON_RETRY: u64 = 8;
 
 /// `poll(fds, nfds, timeout)` — RFC 0055.
 const POLL: u64 = 7;
+/// `select(nfds, readfds, writefds, exceptfds, timeout)`.
+const SELECT: u64 = 23;
+/// `pselect6(nfds, readfds, writefds, exceptfds, timespec, sigmask)`.
+const PSELECT6: u64 = 270;
+/// `ppoll(fds, nfds, timespec, sigmask, sigsetsize)`.
+const PPOLL: u64 = 271;
 /// How many descriptors one `poll` may name.
 ///
 /// Every entry is copied in and back out through the report page's scratch
@@ -1674,11 +1683,98 @@ const POLLFD_BYTES: usize = 8;
 /// every call it makes is one descriptor, `POLLIN` on standard input, with a
 /// timeout of either `0` or `-1` and never anything else. The failure a
 /// positive timeout can cause here is a caller that spins, not one that hangs.
-fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
-    use bhaskix_personality::poll::{self, Condition};
-    use bhaskix_personality::file::Kind;
+/// How long a caller is prepared to wait.
+///
+/// Named rather than a signed number, because the three cases are decided by
+/// different arguments in `poll`, `ppoll` and `select` — milliseconds, a
+/// `timespec`, a `timeval`, and a null pointer meaning for ever — and the
+/// waiting underneath must not be written three times to find out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    /// Answer immediately, whatever the answer is.
+    Now,
+    /// Wait until something is ready.
+    Forever,
+    /// Wait this many nanoseconds.
+    For(u64),
+}
 
-    let (at, count, timeout) = (request.first(), request.second(), request.third() as i64);
+fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
+    // Milliseconds here, nanoseconds inside, because `ppoll` beside this one
+    // brings a `timespec` and the waiting has to be the same waiting.
+    let timeout = match request.third() as i64 {
+        negative if negative < 0 => Wait::Forever,
+        0 => Wait::Now,
+        milliseconds => Wait::For((milliseconds as u64).saturating_mul(1_000_000)),
+    };
+    poll_with(request, request.first(), request.second(), timeout)
+}
+
+/// `ppoll(fds, nfds, timespec, sigmask, sigsetsize)` — RFC 0055.
+///
+/// `poll` with a `timespec` instead of milliseconds and a signal mask this
+/// system has nothing to do with: **a parked hosted thread is not woken by a
+/// signal here**, so a mask that changes which signals would interrupt the wait
+/// changes nothing, and pretending to honour it would be the lie. The argument
+/// is accepted and ignored, and that is said here rather than left to be
+/// discovered.
+fn answer_ppoll(request: &PersonalityCall) -> (u64, Answer) {
+    let timeout = match timespec_at(request, request.third()) {
+        Err(errno) => return (REPLY_VALUE, Answer::error(errno)),
+        Ok(wait) => wait,
+    };
+    poll_with(request, request.first(), request.second(), timeout)
+}
+
+/// Reads a `timespec`, or [`Wait::Forever`] for a null pointer.
+fn timespec_at(request: &PersonalityCall, at: u64) -> Result<Wait, i64> {
+    if at == 0 {
+        return Ok(Wait::Forever);
+    }
+    let mut spec = [0u8; 16];
+    if !copy_in(request.domain, at, &mut spec) {
+        return Err(-14); // EFAULT
+    }
+    let seconds = u64::from_le_bytes(spec[0..8].try_into().unwrap_or([0; 8]));
+    let nanos = u64::from_le_bytes(spec[8..16].try_into().unwrap_or([0; 8]));
+    if nanos >= 1_000_000_000 {
+        return Err(-22); // EINVAL
+    }
+    Ok(match seconds.saturating_mul(1_000_000_000).saturating_add(nanos) {
+        0 => Wait::Now,
+        total => Wait::For(total),
+    })
+}
+
+/// Reads a `timeval` — `select`'s spelling, microseconds rather than nanos.
+fn timeval_at(request: &PersonalityCall, at: u64) -> Result<Wait, i64> {
+    if at == 0 {
+        return Ok(Wait::Forever);
+    }
+    let mut spec = [0u8; 16];
+    if !copy_in(request.domain, at, &mut spec) {
+        return Err(-14); // EFAULT
+    }
+    let seconds = u64::from_le_bytes(spec[0..8].try_into().unwrap_or([0; 8]));
+    let micros = u64::from_le_bytes(spec[8..16].try_into().unwrap_or([0; 8]));
+    if micros >= 1_000_000 {
+        return Err(-22); // EINVAL
+    }
+    Ok(
+        match seconds
+            .saturating_mul(1_000_000_000)
+            .saturating_add(micros.saturating_mul(1_000))
+        {
+            0 => Wait::Now,
+            total => Wait::For(total),
+        },
+    )
+}
+
+fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (u64, Answer) {
+    use bhaskix_personality::file::Kind;
+    use bhaskix_personality::poll::{self, Condition};
+
     if count == 0 {
         return (REPLY_VALUE, Answer::ok(0));
     }
@@ -1703,42 +1799,12 @@ fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
         let entry = &entries[index * POLLFD_BYTES..(index + 1) * POLLFD_BYTES];
         let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
         let events = u16::from_le_bytes([entry[4], entry[5]]);
-        let condition = match descriptor_row(request, fd as u64) {
-            None => Condition::Unknown,
-            Some((Kind::Console, ..)) => {
-                let (byte_waiting, granted) = match console_state {
-                    Some(known) => known,
-                    None => {
-                        let asked = call(
-                            syscall::INVOKE,
-                            handle_of(request.domain),
-                            method::PEEK_INPUT,
-                            [0, 0, 0, 0],
-                        );
-                        // A refusal here is the grant's refusal: the nucleus
-                        // answers `InsufficientRights` for a domain nobody gave
-                        // the console to, which is a different fact from "no
-                        // byte" and must not be flattened into one.
-                        let known = (asked.status == status::OK && asked.args[0] != 0,
-                                     asked.status == status::OK);
-                        console_state = Some(known);
-                        known
-                    }
-                };
-                if granted && events & poll::POLLIN != 0 {
-                    waits_on_console = true;
-                }
-                Condition::Console {
-                    byte_waiting,
-                    granted,
-                }
-            }
-            Some((Kind::File | Kind::Directory | Kind::Proc, ..)) => Condition::File,
-            Some((Kind::Pipe, handle, readable, writable)) => {
-                pipe_condition(handle, readable, writable)
-            }
-            Some((Kind::Socket | Kind::Epoll, ..)) => Condition::Unanswered,
-        };
+        let condition = condition_of(request, fd as u64, &mut console_state);
+        if matches!(condition, Condition::Console { granted: true, .. })
+            && events & poll::POLLIN != 0
+        {
+            waits_on_console = true;
+        }
         let revents = poll::revents(events, condition);
         entries[index * POLLFD_BYTES + 6] = revents as u8;
         entries[index * POLLFD_BYTES + 7] = (revents >> 8) as u8;
@@ -1747,7 +1813,7 @@ fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
         }
     }
 
-    if ready == 0 && timeout != 0 && !took_timed_wait(request.domain) {
+    if ready == 0 && timeout != Wait::Now && !took_timed_wait(request.domain) {
         // **A positive timeout waits, and does not return early.** The caller
         // is parked on a deadline; a key arriving sooner does not cut it short,
         // because a thread here waits on one notification and the deadline is
@@ -1756,9 +1822,8 @@ fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
         // it instantly instead, which is what the first version did, tells a
         // caller that the interval elapsed when no time passed at all, and
         // turns its retry loop into a spin.
-        if timeout > 0
-            && let Some(slot) =
-                park_until(request.domain, (timeout as u64).saturating_mul(1_000_000))
+        if let Wait::For(nanos) = timeout
+            && let Some(slot) = park_until(request.domain, nanos)
         {
             return (REPLY_BLOCK_ON_RETRY, Answer::ok(slot));
         }
@@ -1782,6 +1847,170 @@ fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
     }
     (REPLY_VALUE, Answer::ok(ready))
 }
+
+/// What one descriptor is doing, for `poll` and `select` alike.
+///
+/// `console` caches the console's answer across the descriptors of one call:
+/// asking is a system call, and it cannot honestly differ between two entries
+/// of one array.
+fn condition_of(
+    request: &PersonalityCall,
+    fd: u64,
+    console: &mut Option<(bool, bool)>,
+) -> bhaskix_personality::poll::Condition {
+    use bhaskix_personality::file::Kind;
+    use bhaskix_personality::poll::Condition;
+
+    match descriptor_row(request, fd) {
+        None => Condition::Unknown,
+        Some((Kind::Console, ..)) => {
+            let (byte_waiting, granted) = match *console {
+                Some(known) => known,
+                None => {
+                    let asked = call(
+                        syscall::INVOKE,
+                        handle_of(request.domain),
+                        method::PEEK_INPUT,
+                        [0, 0, 0, 0],
+                    );
+                    // A refusal here is the grant's refusal: the nucleus answers
+                    // `InsufficientRights` for a domain nobody gave the console
+                    // to, which is a different fact from "no byte" and must not
+                    // be flattened into one.
+                    let known = (
+                        asked.status == status::OK && asked.args[0] != 0,
+                        asked.status == status::OK,
+                    );
+                    *console = Some(known);
+                    known
+                }
+            };
+            Condition::Console {
+                byte_waiting,
+                granted,
+            }
+        }
+        Some((Kind::File | Kind::Directory | Kind::Proc, ..)) => Condition::File,
+        Some((Kind::Pipe, handle, readable, writable)) => {
+            pipe_condition(handle, readable, writable)
+        }
+        Some((Kind::Socket | Kind::Epoll, ..)) => Condition::Unanswered,
+    }
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)` — RFC 0055.
+fn answer_select(request: &PersonalityCall) -> (u64, Answer) {
+    let timeout = match timeval_at(request, request.fifth()) {
+        Err(errno) => return (REPLY_VALUE, Answer::error(errno)),
+        Ok(wait) => wait,
+    };
+    select_with(request, timeout)
+}
+
+/// `pselect6(nfds, readfds, writefds, exceptfds, timespec, sigmask)`.
+///
+/// `select` with a `timespec` and a signal mask, and the mask is ignored for
+/// the reason [`answer_ppoll`] gives: nothing wakes a parked hosted thread here
+/// except what it is waiting for and its own domain ending.
+fn answer_pselect(request: &PersonalityCall) -> (u64, Answer) {
+    let timeout = match timespec_at(request, request.fifth()) {
+        Err(errno) => return (REPLY_VALUE, Answer::error(errno)),
+        Ok(wait) => wait,
+    };
+    select_with(request, timeout)
+}
+
+/// The body both spellings share.
+///
+/// # Why the sets are read and written whole
+///
+/// `select` answers by **rewriting the caller's bitmaps in place**, so a
+/// descriptor left set that is not ready is a caller told to act on something
+/// that will block. Each set is therefore cleared as it is rebuilt, and written
+/// back even when nothing is ready — which is the case a careless
+/// implementation forgets, leaving yesterday's bits in place.
+fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
+    use bhaskix_personality::poll::{Watched, selected};
+
+    let highest = request.first();
+    let sets = [request.second(), request.third(), request.fourth()];
+    if highest > SELECT_MAX {
+        return (REPLY_VALUE, Answer::error(-22)); // EINVAL
+    }
+    let bytes = highest.div_ceil(8) as usize;
+    let mut held = [[0u8; SELECT_BYTES]; 3];
+    for (which, at) in sets.iter().enumerate() {
+        if *at != 0 && !copy_in(request.domain, *at, &mut held[which][..bytes]) {
+            return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+        }
+    }
+    let watching = |which: usize, fd: u64| {
+        sets[which] != 0 && held[which][(fd / 8) as usize] & (1 << (fd % 8)) != 0
+    };
+
+    let mut answer = [[0u8; SELECT_BYTES]; 3];
+    let mut console_state: Option<(bool, bool)> = None;
+    let mut ready = 0u64;
+    let mut waits_on_console = false;
+    for fd in 0..highest {
+        let watched = Watched {
+            read: watching(0, fd),
+            write: watching(1, fd),
+            except: watching(2, fd),
+        };
+        if !watched.read && !watched.write && !watched.except {
+            continue;
+        }
+        let condition = condition_of(request, fd, &mut console_state);
+        let out = selected(watched, condition);
+        if out.invalid {
+            // **The whole call, not the one descriptor.** This is where
+            // `select` and `poll` differ rather than merely spelling the same
+            // thing twice.
+            return (REPLY_VALUE, Answer::error(-9)); // EBADF
+        }
+        if watched.read
+            && matches!(
+                condition,
+                bhaskix_personality::poll::Condition::Console { granted: true, .. }
+            )
+        {
+            waits_on_console = true;
+        }
+        for (which, set) in [out.read, out.write, out.except].iter().enumerate() {
+            if *set {
+                answer[which][(fd / 8) as usize] |= 1 << (fd % 8);
+                ready += 1;
+            }
+        }
+    }
+
+    if ready == 0 && timeout != Wait::Now && !took_timed_wait(request.domain) {
+        if let Wait::For(nanos) = timeout
+            && let Some(slot) = park_until(request.domain, nanos)
+        {
+            return (REPLY_BLOCK_ON_RETRY, Answer::ok(slot));
+        }
+        if waits_on_console {
+            return (REPLY_BLOCK_ON_RETRY, Answer::ok(INPUT_WAKE));
+        }
+    }
+    for (which, at) in sets.iter().enumerate() {
+        if *at != 0 && !copy_out(request.domain, *at, &answer[which][..bytes]) {
+            return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+        }
+    }
+    (REPLY_VALUE, Answer::ok(ready))
+}
+
+/// The highest descriptor number `select` will look at.
+///
+/// `FD_SETSIZE`, which is what a Linux program's `fd_set` is, so a caller
+/// passing the conventional 1024 is answered rather than refused. Nothing here
+/// opens anything like that many; the cost is the bitmaps below.
+const SELECT_MAX: u64 = 1024;
+/// One `fd_set`, in bytes.
+const SELECT_BYTES: usize = (SELECT_MAX / 8) as usize;
 
 /// What a pipe end is doing, for [`answer_poll`].
 ///

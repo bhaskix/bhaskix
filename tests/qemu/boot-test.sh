@@ -701,6 +701,26 @@ else
     status=1
 fi
 
+# `ppoll` and `select`, asked by a hand-written Linux program -- RFC 0055's
+# unresolved question 2.
+#
+# **Hand-written because nothing here asks.** The BusyBox corpus was measured
+# and neither number is among the ones it uses, so there is no real caller to
+# gate from and the alternative was host tests of the arithmetic alone.
+#
+# The whole line is matched rather than a fragment, because each clause is a
+# separate decision: `POLLERR` for a console this domain was granted no access
+# to is RFC 0053's unresolved question 3, `select` reporting the same descriptor
+# *ready* is how a caller with no way to be told "error" finds out by acting,
+# and `EBADF` for a descriptor nobody has is where `select` differs from `poll`
+# rather than merely spelling it differently.
+if grep -qE "linux poll +a Linux program asked .ppoll. and .select. about standard input: both reported it ready, .ppoll. with POLLERR because this domain was granted no console, and .select. refused a descriptor nobody has with EBADF" "$LOG"; then
+    pass "a Linux program asked ppoll and select, and both told it the truth"
+else
+    fail "the ppoll/select probe did not report"
+    status=1
+fi
+
 # A reader parked on a notification must be woken when its domain is killed, and
 # must give the notification back -- RFC 0054's unresolved question 1.
 #

@@ -937,6 +937,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux signal   FAILED\x1b[0m");
     }
+    if !poll_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux poll     FAILED\x1b[0m");
+    }
     if !memory_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -5158,6 +5164,128 @@ const MEMORY_CODE: [u8; 116] = [
     0xeb, 0xfe, // done: jmp $
 ];
 
+/// Where [`POLL_CODE`] reports, in physical memory.
+static POLL_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+const POLL_CODE_AT: u64 = 0x0000_0000_4400_0000;
+const POLL_STACK_AT: u64 = 0x0000_0000_4401_0000;
+const POLL_REPORT_AT: u64 = 0x0000_0000_4402_0000;
+
+/// Asks `ppoll` and `select` about standard input, and about a descriptor
+/// nobody has — RFC 0055's unresolved question 2.
+///
+/// # Why this is hand-written and not a program somebody wrote
+///
+/// **Nothing on this machine asks for either call.** The BusyBox corpus was
+/// measured: the numbers it asks for are `1 3 4 5 7 10 12 13 16 39 63 72 79 89
+/// 102 104 107 108 110 157 158 257`, and 23, 270 and 271 are not among them. A
+/// boot lane therefore cannot gate them from a real caller, and a claim that
+/// they work would rest on host tests of the arithmetic alone.
+///
+/// So this asks. It uses the report page as its own scratch — the structures
+/// are built at fixed offsets in it — because a hosted program that has to
+/// arrange arguments on its stack is twice the machine code and twice the
+/// chances of a hand-assembly error.
+const POLL_CODE: [u8; 180] = [
+    0x49, 0x89, 0xff, // mov r15, rdi          ; report page
+    // A pollfd at +64: fd 0, events POLLIN, revents 0.
+    0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // movabs rax, 0x100000000
+    0x49, 0x89, 0x47, 0x40, // mov [r15+64], rax
+    // A zero timespec at +80: answer now, whatever the answer is.
+    0x49, 0xc7, 0x47, 0x50, 0x00, 0x00, 0x00, 0x00, // mov qword [r15+80], 0
+    0x49, 0xc7, 0x47, 0x58, 0x00, 0x00, 0x00, 0x00, // mov qword [r15+88], 0
+    0x49, 0x8d, 0x7f, 0x40, // lea rdi, [r15+64]     ; fds
+    0xbe, 0x01, 0x00, 0x00, 0x00, // mov esi, 1            ; nfds
+    0x49, 0x8d, 0x57, 0x50, // lea rdx, [r15+80]     ; timespec
+    0x45, 0x31, 0xd2, // xor r10d, r10d        ; sigmask NULL
+    0x41, 0xb8, 0x08, 0x00, 0x00, 0x00, // mov r8d, 8            ; sigsetsize
+    0xb8, 0x0f, 0x01, 0x00, 0x00, // mov eax, 271          ; ppoll
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x07, // mov [r15], rax        ; what ppoll answered
+    0x41, 0x0f, 0xb7, 0x47, 0x46, // movzx eax, word [r15+70] ; revents
+    0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax
+    // A readfds at +96 naming descriptor 0, and a zero timeval at +104.
+    0x49, 0xc7, 0x47, 0x60, 0x01, 0x00, 0x00, 0x00, // mov qword [r15+96], 1
+    0x49, 0xc7, 0x47, 0x68, 0x00, 0x00, 0x00, 0x00, // mov qword [r15+104], 0
+    0x49, 0xc7, 0x47, 0x70, 0x00, 0x00, 0x00, 0x00, // mov qword [r15+112], 0
+    0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1            ; nfds
+    0x49, 0x8d, 0x77, 0x60, // lea rsi, [r15+96]     ; readfds
+    0x31, 0xd2, // xor edx, edx          ; writefds NULL
+    0x45, 0x31, 0xd2, // xor r10d, r10d        ; exceptfds NULL
+    0x4d, 0x8d, 0x47, 0x68, // lea r8, [r15+104]     ; timeout
+    0xb8, 0x17, 0x00, 0x00, 0x00, // mov eax, 23           ; select
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x10, // mov [r15+16], rax     ; what select answered
+    0x49, 0x8b, 0x47, 0x60, // mov rax, [r15+96]     ; the rewritten set
+    0x49, 0x89, 0x47, 0x18, // mov [r15+24], rax
+    // And a descriptor nobody has: bit 40, so nfds is 41.
+    0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, // movabs rax, 1<<40
+    0x49, 0x89, 0x47, 0x60, // mov [r15+96], rax
+    0xbf, 0x29, 0x00, 0x00, 0x00, // mov edi, 41
+    0x49, 0x8d, 0x77, 0x60, // lea rsi, [r15+96]
+    0x31, 0xd2, // xor edx, edx
+    0x45, 0x31, 0xd2, // xor r10d, r10d
+    0x4d, 0x8d, 0x47, 0x68, // lea r8, [r15+104]
+    0xb8, 0x17, 0x00, 0x00, 0x00, // mov eax, 23           ; select
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x20, // mov [r15+32], rax     ; expected -EBADF
+    0xeb, 0xfe, // done: jmp $
+];
+
+/// The thread that runs [`POLL_CODE`].
+extern "C" fn ring3_poll(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, pages, protection) in [
+        (POLL_CODE_AT, 1, Protection::ReadExecute),
+        (POLL_STACK_AT, 2, Protection::ReadWrite),
+        (POLL_REPORT_AT, 1, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), pages) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let (Some(code_pa), Some(report_pa)) = (
+        space.translate(VirtAddr(POLL_CODE_AT)),
+        space.translate(VirtAddr(POLL_REPORT_AT)),
+    ) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the direct
+    // map; the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            POLL_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            POLL_CODE.len(),
+        );
+    }
+    POLL_REPORT_PA.store(report_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
+    // SAFETY: the entry is in the user-executable page just written, `rsp` one
+    // past two user-writable stack pages.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            POLL_CODE_AT,
+            POLL_STACK_AT + 2 * 4096,
+            [POLL_REPORT_AT, 0],
+        )
+    }
+}
+
 /// The thread that becomes RFC 0005 step 5's witness.
 extern "C" fn ring3_memory(hhdm_base: u64) -> ! {
     use bhaskix_boot::VirtAddr;
@@ -5217,6 +5345,103 @@ extern "C" fn ring3_memory(hhdm_base: u64) -> ! {
             [MEMORY_REPORT_AT, 0],
         )
     }
+}
+
+/// RFC 0055's unresolved question 2: `ppoll` and `select` answered, and asked.
+///
+/// # What it asserts, and why each one
+///
+/// *`ppoll` reports the console as an error rather than as quiet.* This domain
+/// is **not** granted input — no boot grants it except the interactive BusyBox
+/// lane — so standard input can never become readable for it, and `POLLERR` is
+/// the honest answer RFC 0053's unresolved question 3 settled on. Asserting the
+/// flag rather than merely a non-zero return is what makes this a test of that
+/// decision and not of the plumbing.
+///
+/// *`select` reports the same descriptor ready.* `select` has no way to say
+/// "error", so a caller learns by acting and can only act if it is told the
+/// descriptor is ready. The two calls disagreeing here would be the mapping
+/// between them being wrong in exactly the way that is easy to get wrong.
+///
+/// *`select` refuses a descriptor nobody has, and refuses the whole call.* This
+/// is where it genuinely differs from `poll`, which reports `POLLNVAL` on the
+/// one entry and answers the rest. `EBADF` is the difference, and a shared
+/// implementation that forgot it would pass every other assertion here.
+fn poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux poll     skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+    /// `POLLERR`.
+    const ERR: u64 = 0x008;
+    /// `-EBADF`, as the caller sees it.
+    const EBADF: u64 = -9i64 as u64;
+
+    let Ok(realm) = domain::create("poll", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux poll     FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_none()
+    {
+        println!("\x1b[91m    linux poll     FAILED: the tag would not set\x1b[0m");
+        domain::destroy(realm);
+        return false;
+    }
+    POLL_REPORT_PA.store(0, Ordering::Release);
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(CPU, "poll", ring3_poll, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux poll     FAILED: the probe would not spawn\x1b[0m");
+        domain::destroy(realm);
+        return false;
+    }
+
+    let mut answers = [0u64; 5];
+    let done = wait_until(
+        || {
+            let report_pa = POLL_REPORT_PA.load(Ordering::Acquire);
+            if report_pa == 0 {
+                return false;
+            }
+            // SAFETY: a frame the probe's space owns, read through the direct
+            // map -- the same idiom every probe's reader uses.
+            unsafe {
+                for (index, slot) in answers.iter_mut().enumerate() {
+                    *slot = core::ptr::read_volatile(
+                        (hhdm_base + report_pa + 8 * index as u64) as *const u64,
+                    );
+                }
+            }
+            // The last word written is the one that says it finished.
+            answers[4] != 0
+        },
+        20_000,
+    );
+    domain::end(realm, domain::Ending::Killed);
+
+    let [ppolled, revents, selected, set, bad] = answers;
+    let ok = done && ppolled == 1 && revents == ERR && selected == 1 && set == 1 && bad == EBADF;
+    if ok {
+        println!(
+            "    linux poll     a Linux program asked `ppoll` and `select` about standard input: \
+             both reported it ready, `ppoll` with POLLERR because this domain was granted no \
+             console, and `select` refused a descriptor nobody has with EBADF"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux poll     FAILED: finished {done}, ppoll {ppolled} revents \
+             {revents:#x}, select {selected} set {set:#x}, bad descriptor {}\x1b[0m",
+            bad as i64
+        );
+    }
+    ok
 }
 
 /// RFC 0005 step 5's witness: a Linux program maps memory, uses the page the

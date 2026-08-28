@@ -137,6 +137,76 @@ pub fn revents(requested: u16, condition: Condition) -> u16 {
     }
 }
 
+/// Which of `select`'s three sets a descriptor was named in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Watched {
+    /// Named in `readfds`.
+    pub read: bool,
+    /// Named in `writefds`.
+    pub write: bool,
+    /// Named in `exceptfds`.
+    pub except: bool,
+}
+
+/// Which of them it should be reported ready in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Ready {
+    /// Report it in `readfds`.
+    pub read: bool,
+    /// Report it in `writefds`.
+    pub write: bool,
+    /// Report it in `exceptfds`.
+    pub except: bool,
+    /// The descriptor names nothing, and **the whole call fails** with `EBADF`.
+    ///
+    /// This is where `select` and `poll` genuinely differ rather than merely
+    /// spelling the same thing twice: `poll` reports `POLLNVAL` on the one
+    /// entry and answers the rest normally, and `select` refuses the call
+    /// outright. A caller that watches eight descriptors and closes one gets a
+    /// per-descriptor flag from the first and nothing at all from the second.
+    pub invalid: bool,
+}
+
+/// What `select` should report for one descriptor.
+///
+/// **Built on [`revents`] rather than beside it**, so there is one table and
+/// not two that agree until somebody edits one. The mapping back out is where
+/// `select`'s own rules live:
+///
+/// - an error condition makes a descriptor ready for **reading and writing**,
+///   in whichever of those the caller asked about — because `select` has no way
+///   to say "error" and a caller must be able to find out by acting;
+/// - a hangup makes it ready for reading, for the same reason: the read that
+///   follows returns zero, which is how the caller learns;
+/// - `exceptfds` means urgent data here and nothing else, so nothing in this
+///   system is ever reported in it.
+#[must_use]
+pub fn selected(watched: Watched, condition: Condition) -> Ready {
+    let mut asked = 0;
+    if watched.read {
+        asked |= POLLIN;
+    }
+    if watched.write {
+        asked |= POLLOUT;
+    }
+    if watched.except {
+        asked |= POLLPRI;
+    }
+    let revents = revents(asked, condition);
+    if revents & POLLNVAL != 0 {
+        return Ready {
+            invalid: true,
+            ..Ready::default()
+        };
+    }
+    Ready {
+        read: watched.read && revents & (POLLIN | POLLERR | POLLHUP) != 0,
+        write: watched.write && revents & (POLLOUT | POLLERR) != 0,
+        except: watched.except && revents & POLLPRI != 0,
+        invalid: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +301,82 @@ mod tests {
     #[test]
     fn what_cannot_be_answered_claims_nothing() {
         assert_eq!(revents(POLLIN | POLLOUT, Condition::Unanswered), 0);
+    }
+
+    /// Every set asked about at once.
+    const ALL: Watched = Watched {
+        read: true,
+        write: true,
+        except: true,
+    };
+
+    #[test]
+    fn select_refuses_the_whole_call_for_a_descriptor_that_names_nothing() {
+        // The difference from `poll`, which reports it on the one entry and
+        // answers the rest.
+        let out = selected(ALL, Condition::Unknown);
+        assert!(out.invalid);
+        assert!(!out.read && !out.write && !out.except);
+    }
+
+    #[test]
+    fn select_reports_an_errored_console_ready_for_both_directions() {
+        // `select` cannot say "error", so a caller finds out by acting -- and
+        // it can only act if it is told the descriptor is ready. An ungranted
+        // console reported as *not* ready is a caller that waits for ever for
+        // permission it will never get.
+        let ungranted = Condition::Console {
+            byte_waiting: false,
+            granted: false,
+        };
+        let out = selected(ALL, ungranted);
+        assert!(out.read && out.write, "{out:?}");
+        assert!(!out.invalid);
+    }
+
+    #[test]
+    fn select_reports_only_the_sets_it_was_asked_about() {
+        let waiting = Condition::Console {
+            byte_waiting: true,
+            granted: true,
+        };
+        let read_only = Watched {
+            read: true,
+            write: false,
+            except: false,
+        };
+        let out = selected(read_only, waiting);
+        assert!(out.read);
+        assert!(!out.write, "a set nobody asked about must stay empty");
+    }
+
+    #[test]
+    fn select_reports_a_drained_pipe_whose_writers_have_gone_as_readable() {
+        // The hangup reaches the caller as readability, and the read that
+        // follows returns zero. Reporting it unready would hang a caller on a
+        // pipe that will never have anything again.
+        let out = selected(ALL, pipe(0, 16, 1, 0, true));
+        assert!(out.read, "{out:?}");
+    }
+
+    #[test]
+    fn select_never_reports_an_exceptional_condition() {
+        for condition in [
+            Condition::File,
+            Condition::Unanswered,
+            Condition::Console {
+                byte_waiting: true,
+                granted: true,
+            },
+            Condition::Console {
+                byte_waiting: false,
+                granted: false,
+            },
+            pipe(4, 12, 1, 1, true),
+            pipe(0, 16, 0, 1, false),
+        ] {
+            assert!(!selected(ALL, condition).except, "{condition:?}");
+        }
     }
 
     #[test]

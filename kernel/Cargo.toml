@@ -551,7 +551,15 @@ asm_budget = 10
 # code: the source is a physical frame reached through the direct map, which is a
 # raw pointer by construction. What it buys is a hosted program's line arriving
 # whole instead of in halves around an unrelated kernel report.
-unsafe_budget = 1875
+# 1897 for RFC 0055's `ppoll`/`select` probe: a hosted Linux program written by
+# hand, because the corpus asks for neither call and there is otherwise no
+# caller to gate them from. Twenty-two lines, and every one of them is the same
+# shape every other probe here has -- the machine code copied into a frame the
+# probe's own space owns, the space installed, the entry into ring 3, and the
+# volatile reads that take its answers back out of the report page. None of it
+# could be safe code: a probe's report is a physical frame reached through the
+# direct map, which is a raw pointer by construction.
+unsafe_budget = 1897
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
