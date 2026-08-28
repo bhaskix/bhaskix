@@ -1649,6 +1649,15 @@ const REPLY_BLOCK_ON: u64 = 7;
 /// What a blocking `read` needs: it must come back with *bytes*, and the zero
 /// a woken `futex` is answered with would be end of file.
 const REPLY_BLOCK_ON_RETRY: u64 = 8;
+/// Park the caller on a notification **and** a deadline — RFC 0057.
+///
+/// The slot in the first word and the deadline in the second, which the reply
+/// message has always had room for. The nucleus arms the deadline on the very
+/// notification the caller parks on, so a key and the timer arrive by the same
+/// door and whichever is first wins — and it arms it, rather than this program,
+/// because the console's notification is held here with `READ` precisely so a
+/// keystroke cannot be invented.
+const REPLY_BLOCK_ON_UNTIL: u64 = 9;
 
 /// `poll(fds, nfds, timeout)` — RFC 0055.
 const POLL: u64 = 7;
@@ -1683,6 +1692,78 @@ const POLLFD_BYTES: usize = 8;
 /// every call it makes is one descriptor, `POLLIN` on standard input, with a
 /// timeout of either `0` or `-1` and never anything else. The failure a
 /// positive timeout can cause here is a caller that spins, not one that hangs.
+/// The instant each domain's timed wait ends: `(domain, deadline)`.
+///
+/// **A wait that is retried is still one wait.** `BLOCK_ON_UNTIL` asks the
+/// question again when it wakes, and the first version computed a fresh
+/// deadline each time — so a caller that asked to wait fifty milliseconds
+/// waited fifty milliseconds *per retry*, for ever, until the nucleus's
+/// sixteen-retry backstop answered it `EAGAIN`. BusyBox printed
+/// `poll: Resource temporarily unavailable` and abandoned the line, and that
+/// backstop is the only reason it was a visible failure rather than a hang.
+///
+/// So the instant is recorded on the first park and consulted on every retry:
+/// past it, the wait is over and the answer is whatever is ready now; before
+/// it, the same deadline is named again.
+static mut UNTIL: [(u32, u64); 4] = [(0, 0); 4];
+
+fn until() -> &'static mut [(u32, u64); 4] {
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    unsafe { &mut *core::ptr::addr_of_mut!(UNTIL) }
+}
+
+/// The deadline this domain's timed wait ends at, starting one if `nanos` is
+/// given and none is running.
+///
+/// `None` means the wait is over — either it just expired, or this machine
+/// cannot time it.
+fn deadline_for(domain: u32, nanos: u64) -> Option<u64> {
+    let table = until();
+    if let Some(entry) = table.iter_mut().find(|entry| entry.0 == domain) {
+        if bhaskix_sock::time::now() >= entry.1 {
+            *entry = (0, 0);
+            return None;
+        }
+        return Some(entry.1);
+    }
+    let deadline = deadline_in(nanos)?;
+    let slot = table.iter_mut().find(|entry| entry.0 == 0)?;
+    *slot = (domain, deadline);
+    Some(deadline)
+}
+
+/// Forgets a domain's timed wait, for the paths that end one early.
+fn forget_deadline(domain: u32) {
+    if let Some(entry) = until().iter_mut().find(|entry| entry.0 == domain) {
+        *entry = (0, 0);
+    }
+}
+
+/// The deadline the next reply carries, if it is a `BLOCK_ON_UNTIL`.
+///
+/// **A static rather than a third element of every answer.** One reply in
+/// hundreds names a deadline; widening `Answer` would have put a word nobody
+/// reads on every path, and threading it through would have touched every
+/// `return` in the dispatcher. Written immediately before the reply that uses
+/// it and cleared by reading, so a stale one cannot ride out on the next.
+static mut DEADLINE: u64 = 0;
+
+fn park_deadline(deadline: u64) {
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    unsafe { DEADLINE = deadline };
+}
+
+fn deadline_word() -> u64 {
+    // SAFETY: as above. Taken rather than read: a deadline left behind would
+    // ride out on the next reply, and the nucleus would arm a timer for a park
+    // that did not ask for one.
+    unsafe {
+        let held = DEADLINE;
+        DEADLINE = 0;
+        held
+    }
+}
+
 /// How long a caller is prepared to wait.
 ///
 /// Named rather than a signed number, because the three cases are decided by
@@ -1822,6 +1903,18 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
         // it instantly instead, which is what the first version did, tells a
         // caller that the interval elapsed when no time passed at all, and
         // turns its retry loop into a spin.
+        // **A timed wait for a key wakes on the key** -- RFC 0057. Parked on
+        // the console's own notification with the deadline armed on it, so the
+        // keystroke and the timer arrive by the same door. Before this, a
+        // positive timeout parked on a timer alone and a key pressed a
+        // millisecond in was not noticed until the interval ended.
+        if let Wait::For(nanos) = timeout
+            && waits_on_console
+            && let Some(deadline) = deadline_for(request.domain, nanos)
+        {
+            park_deadline(deadline);
+            return (REPLY_BLOCK_ON_UNTIL, Answer::ok(INPUT_WAKE));
+        }
         if let Wait::For(nanos) = timeout
             && let Some(slot) = park_until(request.domain, nanos)
         {
@@ -1842,6 +1935,9 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
         // Nothing here can be waited for. Answering now is a spin rather than a
         // park on a wake that would never come, and RFC 0055 says so.
     }
+    // The wait, however it ended, is over: the next `poll` from this domain
+    // starts its own.
+    forget_deadline(request.domain);
     if !copy_out(request.domain, at, entries) {
         return (REPLY_VALUE, Answer::error(-14)); // EFAULT
     }
@@ -2011,6 +2107,15 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
     }
 
     if ready == 0 && timeout != Wait::Now && !took_timed_wait(request.domain) {
+        // Both wake sources when the console is what is being waited for, as
+        // `poll` does and for the same reason -- RFC 0057.
+        if let Wait::For(nanos) = timeout
+            && waits_on_console
+            && let Some(deadline) = deadline_for(request.domain, nanos)
+        {
+            park_deadline(deadline);
+            return (REPLY_BLOCK_ON_UNTIL, Answer::ok(INPUT_WAKE));
+        }
         if let Wait::For(nanos) = timeout
             && let Some(slot) = park_until(request.domain, nanos)
         {
@@ -2020,6 +2125,7 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
             return (REPLY_BLOCK_ON_RETRY, Answer::ok(INPUT_WAKE));
         }
     }
+    forget_deadline(request.domain);
     for (which, at) in sets.iter().enumerate() {
         if *at != 0 && !copy_out(request.domain, *at, &answer[which][..bytes]) {
             return (REPLY_VALUE, Answer::error(-14)); // EFAULT
@@ -5215,7 +5321,10 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
         // The retry, carrying the register frame this program asked for.
         if received.method == FRAME_METHOD {
             let (how, reply) = answer_with_frame(received.badge as u32, args[0], args[1]);
-            let _ = call(syscall::REPLY, 0, how, [reply.value, 0, 0, 0]);
+            // The deadline too: a call that needed its register frame can still
+            // answer a park, and a `BLOCK_ON_UNTIL` replied from here without
+            // one would ask the nucleus to arm a timer for the epoch.
+            let _ = call(syscall::REPLY, 0, how, [reply.value, deadline_word(), 0, 0]);
             continue;
         }
         if received.method == FAULT_METHOD {
@@ -5236,7 +5345,9 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
             received.badge as u32,
         );
         let (how, reply) = answer(&request);
-        let _ = call(syscall::REPLY, 0, how, [reply.value, 0, 0, 0]);
+        // The second word is the deadline a `BLOCK_ON_UNTIL` names, and zero
+        // for every other shape -- see [`REPLY_BLOCK_ON_UNTIL`].
+        let _ = call(syscall::REPLY, 0, how, [reply.value, deadline_word(), 0, 0]);
     }
 
     // The endpoint went away, which happens when the machine is taking itself

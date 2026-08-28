@@ -117,6 +117,26 @@ pub mod reply {
     /// blocking read parks with this and the adapter answers the second time
     /// with the bytes that woke it.
     pub const BLOCK_ON_RETRY: u64 = 8;
+    /// Park the calling thread on the notification in `args[0]`, waking **no
+    /// later than** the deadline in `args[1]`, and ask the question again.
+    ///
+    /// [RFC 0057](../../docs/rfc/0057-a-park-that-names-two-wake-sources.md).
+    /// [`BLOCK_ON_RETRY`] with a second wake source, and it needs no new way of
+    /// waiting: `notify::arm` makes the timer **signal that notification**, so
+    /// one wait already covers a real signal and a deadline. What was missing
+    /// was a way to say so.
+    ///
+    /// **The nucleus arms it, and that is the point.** The adapter holds the
+    /// console's notification with `READ` so that it can park a hosted reader
+    /// and cannot invent a keystroke; `method::ARM` needs `WRITE`. Doing the
+    /// arm here, as part of a park already being performed and behind the same
+    /// grant check, gives the adapter a bounded wait without giving it the
+    /// right it was refused.
+    ///
+    /// **The arm and the disarm are one statement.** A deadline left behind
+    /// fires later and signals a notification whose waiter is by then somebody
+    /// else — a spurious wake for a reader that finds nothing.
+    pub const BLOCK_ON_UNTIL: u64 = 9;
 }
 
 /// What the adapter answered.

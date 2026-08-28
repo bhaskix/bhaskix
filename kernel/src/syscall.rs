@@ -2285,13 +2285,13 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                     [slot as u64, call.number, 0, 0],
                 );
                 let value = match again {
-                    Some((crate::fault::reply::RESTORE, _)) => {
+                    Some((crate::fault::reply::RESTORE, ..)) => {
                         restore_from_slot(frame, slot);
                         crate::fault::give_back(slot);
                         RESTORED.fetch_add(1, Ordering::Relaxed);
                         return Some(frame.kind);
                     }
-                    Some((_, value)) => Some(value),
+                    Some((_, value, _)) => Some(value),
                     None => None,
                 };
                 crate::fault::give_back(slot);
@@ -2319,6 +2319,60 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
             // answers zero when somebody signals it. One notification per parked
             // waiter, which is what makes an exact wake count possible in ring 3
             // and what `notify::wait`'s single-waiter rule wants anyway.
+            // **Two wake sources, through the one wait that already exists**
+            // -- RFC 0057. The deadline is armed on the very notification the
+            // caller parks on, so the timer's signal and a real one arrive by
+            // the same door and whichever is first wins.
+            crate::fault::reply::BLOCK_ON_UNTIL => {
+                if !may_park_on(answer.1, call.domain) {
+                    PARK_UNGRANTED.fetch_add(1, Ordering::Relaxed);
+                    return Some(-11i64 as u64); // EAGAIN
+                }
+                let Some(notification) = adapter_notification(answer.1) else {
+                    PARK_UNNAMED.fetch_add(1, Ordering::Relaxed);
+                    return Some(-11i64 as u64); // EAGAIN
+                };
+                // **Refused rather than parked without its deadline.** Every
+                // deadline slot taken is `Congested`, and a bounded wait turned
+                // into an unbounded one is a caller that never comes back.
+                // **What this counter proves, and what it does not.** It says
+                // the adapter asked for a two-source park and the nucleus took
+                // this path. It does *not* prove the deadline was armed -- a
+                // mutation that skips the arm and keeps this arm of the match
+                // still counts, which was measured rather than assumed. The arm
+                // is proved by the typing lane instead: without a deadline, a
+                // timed `poll` on the console never ends and BusyBox hangs at
+                // its prompt. The two assertions cover the two halves.
+                match crate::notify::arm(notification, answer.2, WAKE_BADGE) {
+                    Err(_) => {
+                        PARK_UNARMED.fetch_add(1, Ordering::Relaxed);
+                        return Some(-11i64 as u64); // EAGAIN
+                    }
+                    Ok(()) => {
+                        // Bring this processor's next timer forward if the
+                        // deadline is sooner than whatever it was going to fire
+                        // for -- the same step `method::ARM` takes, and without
+                        // it the deadline is recorded and waited on by nothing.
+                        crate::time::arm_no_later_than(answer.2);
+                        PARKED_UNTIL.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                BLOCKED.fetch_add(1, Ordering::Relaxed);
+                let outcome = crate::notify::wait(notification);
+                // **Whichever way that ended.** A deadline left armed fires
+                // later and wakes somebody else's waiter.
+                crate::notify::disarm(notification);
+                if outcome.is_err() {
+                    if crate::sched::should_die() {
+                        PARK_ENDED.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+                        PARK_REFUSED_SLOT.store(answer.1, Ordering::Relaxed);
+                    }
+                    return Some(-11i64 as u64);
+                }
+                continue;
+            }
             crate::fault::reply::BLOCK_ON_RETRY => {
                 if !may_park_on(answer.1, call.domain) {
                     PARK_UNGRANTED.fetch_add(1, Ordering::Relaxed);
@@ -2433,12 +2487,12 @@ pub static RESTORED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 ///
 /// `None` when there is no adapter, or when the endpoint has gone.
 pub fn ask_adapter(domain: u64, what: u64, args: [u64; 4]) -> Option<u64> {
-    ask_adapter_full(domain, what, args).map(|(_, value)| value)
+    ask_adapter_full(domain, what, args).map(|(_, value, _)| value)
 }
 
 /// As [`ask_adapter`], but answering the reply's *method* as well as its
 /// value -- which is how the adapter says the answer is not a number.
-fn ask_adapter_full(domain: u64, what: u64, args: [u64; 4]) -> Option<(u64, u64)> {
+fn ask_adapter_full(domain: u64, what: u64, args: [u64; 4]) -> Option<(u64, u64, u64)> {
     ask_adapter_counted(domain, what, args, true)
 }
 
@@ -2456,7 +2510,7 @@ fn ask_adapter_counted(
     what: u64,
     args: [u64; 4],
     counted: bool,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, u64)> {
     let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
     if endpoint == u64::MAX {
         ADAPTER_ABSENT.fetch_add(1, Ordering::Relaxed);
@@ -2517,7 +2571,7 @@ fn ask_adapter_counted(
                     ADAPTER_PRICED.fetch_add(1, Ordering::Relaxed);
                     ADAPTER_FLOOR.fetch_min(spent, Ordering::Relaxed);
                 }
-                return Some((message.method, message.args[0]));
+                return Some((message.method, message.args[0], message.args[1]));
             }
             Err(crate::ipc::IpcError::Congested) => {
                 crate::sched::yield_now();
@@ -2698,6 +2752,23 @@ fn may_park_on(slot: u64, domain: u32) -> bool {
 
 /// Parks refused because the caller's domain was not granted what it named.
 pub static PARK_UNGRANTED: AtomicU64 = AtomicU64::new(0);
+/// Parks that named a deadline as well as a notification — RFC 0057.
+///
+/// Counted because the reply shape is otherwise invisible: a boot where the
+/// adapter never used it and one where the nucleus quietly ignored it look the
+/// same from outside, and both would have the machine merely waiting longer.
+pub static PARKED_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// Parks refused because every deadline slot was taken — RFC 0057.
+pub static PARK_UNARMED: AtomicU64 = AtomicU64::new(0);
+
+/// The badge a nucleus-armed deadline signals with.
+///
+/// One bit, and not zero: `notify::signal` **or**s the badge into the pending
+/// word, so a badge of zero sets nothing and the waiter is never woken. A timer
+/// that fired and woke nobody is the hardest kind of missing wake to see.
+const WAKE_BADGE: u64 = 1;
+
 /// Parks refused because the adapter named a slot holding no notification.
 pub static PARK_UNNAMED: AtomicU64 = AtomicU64::new(0);
 /// Parks that ended because the calling thread was being killed — the ordinary

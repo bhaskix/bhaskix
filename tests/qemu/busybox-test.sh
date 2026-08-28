@@ -236,6 +236,31 @@ else
     status=1
 fi
 
+# **And the two-source park was actually used** -- RFC 0057.
+#
+# The reply shape is otherwise invisible: a boot where the adapter never asked
+# for it and one where the nucleus ignored it look identical from outside, and
+# both would only mean the machine waited longer. BusyBox's line editor polls
+# standard input with a positive timeout, so a passing lane must show at least
+# one park that named a deadline as well as a notification.
+#
+# **Placed after the boot has finished, and that is not a detail.** The line is
+# printed when the interactive corpus ends -- which is when BusyBox exits -- so
+# asserting it before typing `exit` was reading a line that had not been written
+# yet.
+#
+# `0 deadlines left armed` rides along as an end-of-boot leak check. It is not
+# what would catch a missing disarm in the nucleus: with one timed park on this
+# lane the deadline usually fires on its own, so there is nothing left to take
+# back either way. What proves the take-back is the `two sources` gate, on the
+# primitive both paths use.
+if grep -qaE 'input park +[0-9]+ parked on the console, [1-9][0-9]* of them with a deadline as well; none refused, 0 deadlines left armed' "$LOG"; then
+    pass "a timed poll parked on the keystroke and the deadline together"
+else
+    fail "no park named two wake sources: $(grep -aoE 'input park.*' "$LOG" | head -1)"
+    status=1
+fi
+
 exec 3>&-
 wait "$qemu" 2>/dev/null
 

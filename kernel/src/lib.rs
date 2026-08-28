@@ -2945,6 +2945,146 @@ extern "C" fn parked_then_killed(raw: u64) -> ! {
     sched::exit()
 }
 
+/// Which notification [`parks_on_two`] waits on, and how it woke.
+static TWO_SOURCE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TWO_SOURCE_WOKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Parks on a notification with a deadline armed on it, and says how it woke.
+extern "C" fn parks_on_two(raw: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let id = notify::NotificationId::from_parts(raw as u32, (raw >> 32) as u32);
+    TWO_SOURCE_ID.store(raw, Ordering::Release);
+    let woke = notify::wait(id);
+    // The badge says which source it was: the arm below signals bit 1, and the
+    // signal the test sends by hand uses bit 2. A wait that returns both saw
+    // them arrive together, which is not a failure and is worth telling apart.
+    TWO_SOURCE_WOKE.store(
+        match woke {
+            Ok(badge) => badge | 1 << 8,
+            Err(_) => 1 << 9,
+        },
+        Ordering::Release,
+    );
+    sched::exit()
+}
+
+/// RFC 0057: a park wakes on an event **or** a deadline, whichever is first,
+/// and the deadline it did not use is taken back.
+///
+/// # Why the disarm is asserted and not assumed
+///
+/// `notify::arm` replaces per notification, so a deadline left behind fires
+/// later and signals a notification whose waiter is by then somebody else — a
+/// spurious wake for a reader that finds nothing and parks again. That is
+/// invisible from anywhere except a count of armed deadlines, so this takes one
+/// before and after and asserts it came back down.
+///
+/// # Both directions
+///
+/// A far deadline with a signal must wake by the **signal**; a near deadline
+/// with no signal must wake by the **timer**. One without the other proves
+/// half of it: an implementation that never armed would pass the first, and one
+/// that never waited on the notification would pass the second.
+fn two_wake_sources_self_test(cpu: u32, hhdm_base: u64) -> bool {
+    use core::sync::atomic::Ordering;
+
+    /// The badge the timer signals with, matching the nucleus's own.
+    const BY_TIMER: u64 = 1;
+    /// The badge this test signals by hand, so the two are distinguishable.
+    const BY_HAND: u64 = 2;
+    /// Set by the sleeper when `wait` returned successfully.
+    const WOKE: u64 = 1 << 8;
+
+    let mut outcomes = [0u64; 2];
+    let mut leftover = [false; 2];
+    for (round, by_hand) in [true, false].into_iter().enumerate() {
+        let Ok(notification) = notify::create() else {
+            println!("\x1b[91m    two sources    FAILED to create a notification\x1b[0m");
+            return false;
+        };
+        let Ok(doomed) = domain::create("twosrc", domain::ResourceEnvelope::new()) else {
+            println!("\x1b[91m    two sources    FAILED to create a domain\x1b[0m");
+            notify::destroy(notification);
+            return false;
+        };
+        let packed = u64::from(notification.generation()) << 32 | u64::from(notification.index());
+        TWO_SOURCE_ID.store(0, Ordering::Release);
+        TWO_SOURCE_WOKE.store(0, Ordering::Release);
+        let options = sched::SpawnOptions::new()
+            .pinned()
+            .in_domain(doomed.as_u32());
+        if sched::spawn_on_with(cpu, "twosrc", parks_on_two, packed, hhdm_base, options).is_err() {
+            println!("\x1b[91m    two sources    FAILED to spawn the sleeper\x1b[0m");
+            domain::destroy(doomed);
+            notify::destroy(notification);
+            return false;
+        }
+        // Parked, not merely spawned -- asserting against a sleeper that has
+        // not slept proves nothing.
+        if !wait_until(|| notify::waiter_of(notification) != 0, 4_000) {
+            println!("\x1b[91m    two sources    FAILED: the sleeper never parked\x1b[0m");
+            domain::end(doomed, domain::Ending::Killed);
+            notify::destroy(notification);
+            return false;
+        }
+
+        // Far when a signal is going to win, near when the timer must.
+        let ahead = if by_hand { 60_000_000_000 } else { 2_000_000 };
+        if notify::arm(notification, time::now().saturating_add(ahead), BY_TIMER).is_err() {
+            println!("\x1b[91m    two sources    FAILED: no deadline slot\x1b[0m");
+            domain::end(doomed, domain::Ending::Killed);
+            notify::destroy(notification);
+            return false;
+        }
+        time::arm_no_later_than(time::now().saturating_add(ahead));
+        if by_hand {
+            let _ = notify::signal(notification, BY_HAND);
+        }
+        let woke = wait_until(|| TWO_SOURCE_WOKE.load(Ordering::Acquire) != 0, 20_000);
+        outcomes[round] = if woke {
+            TWO_SOURCE_WOKE.load(Ordering::Acquire)
+        } else {
+            0
+        };
+        // **Asked of this notification, not of the table.** The first version
+        // compared `armed_deadlines()` before and after, which is a global that
+        // every other timed park on the machine moves -- it measured other
+        // people's timers and failed for their arithmetic.
+        //
+        // `disarm` answers whether one was armed, which is exactly the local
+        // fact: a deadline whose signal lost the race is still there and must
+        // be taken back, and one that fired cleared itself.
+        leftover[round] = notify::disarm(notification);
+        domain::end(doomed, domain::Ending::Killed);
+        notify::destroy(notification);
+    }
+
+    let by_signal = outcomes[0];
+    let by_timer = outcomes[1];
+    let ok = by_signal & WOKE != 0
+        && by_signal & BY_HAND != 0
+        && by_timer & WOKE != 0
+        && by_timer & BY_TIMER != 0
+        // The signal won, so its deadline never fired and is still armed.
+        && leftover[0]
+        // The timer won, so its deadline fired and cleared itself.
+        && !leftover[1];
+    if ok {
+        println!(
+            "    two sources    a parked thread woke by the signal when one came ({by_signal:#x}) \
+             and by the deadline when none did ({by_timer:#x}); the deadline that lost the race \
+             was still armed and the one that won had cleared itself"
+        );
+    } else {
+        println!(
+            "\x1b[91m    two sources    FAILED: by signal {by_signal:#x}, by deadline \
+             {by_timer:#x}, leftover {leftover:?}\x1b[0m"
+        );
+    }
+    ok
+}
+
 /// A reader parked on a notification is woken when its domain is killed, and
 /// gives the notification back — RFC 0054's unresolved question 1.
 ///
@@ -4137,18 +4277,27 @@ fn park_refusals_report() {
     let refused = syscall::PARK_REFUSED.load(Relaxed);
     let parked = syscall::BLOCKED.load(Relaxed);
     let ended = syscall::PARK_ENDED.load(Relaxed);
-    if ungranted + unnamed + refused == 0 {
+    // **How many named a deadline too, and whether any was left behind** --
+    // RFC 0057. A deadline still armed at the end of the boot is one the
+    // nucleus did not take back, and the next waiter on that notification gets
+    // a wake it did not earn.
+    let timed = syscall::PARKED_UNTIL.load(Relaxed);
+    let unarmed = syscall::PARK_UNARMED.load(Relaxed);
+    let still_armed = crate::notify::armed_deadlines();
+    if ungranted + unnamed + refused + unarmed == 0 {
         println!(
-            "    input park     {parked} parked on the console, none refused ({ended} ended with \
-             their domain)"
+            "    input park     {parked} parked on the console, {timed} of them with a deadline \
+             as well; none refused, {still_armed} deadlines left armed ({ended} ended with their \
+             domain)"
         );
         return;
     }
     println!(
         "\x1b[93m    input park     {parked} parked, {} refused: {ungranted} for a domain with \
-         no grant, {unnamed} naming an empty slot, {refused} by the notification itself \
-         (last slot {slot}) -- a refusal loses a wake and answers EAGAIN\x1b[0m",
-        ungranted + unnamed + refused,
+         no grant, {unnamed} naming an empty slot, {unarmed} with no deadline slot left, \
+         {refused} by the notification itself (last slot {slot}) -- a refusal loses a wake and \
+         answers EAGAIN\x1b[0m",
+        ungranted + unnamed + refused + unarmed,
         slot = syscall::PARK_REFUSED_SLOT.load(Relaxed) as i64
     );
 }
@@ -17224,6 +17373,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // The check prints its own verdict, in detail. `FAILED` anywhere in the log
     // is what every harness here fails on, so there is nothing to accumulate.
     let _ = queue_entry_released_on_death(cpu, hhdm);
+    if !two_wake_sources_self_test(cpu, hhdm) {
+        println!("\x1b[91m    two sources    FAILED\x1b[0m");
+    }
     if !parked_waiter_released_on_death(cpu, hhdm) {
         println!("\x1b[91m    parked wake    FAILED\x1b[0m");
     }

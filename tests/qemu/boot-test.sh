@@ -721,6 +721,25 @@ else
     status=1
 fi
 
+# A park may name two wake sources -- RFC 0057.
+#
+# Both directions in one line, because either alone proves half: an
+# implementation that never armed would still wake by the signal, and one that
+# never waited on the notification would still wake by the timer. The badges
+# tell them apart -- 2 for the signal this test sends by hand, 1 for the timer.
+#
+# And the deadline's own fate, asked of that notification rather than of the
+# table: the one whose signal lost the race is still armed, and the one that won
+# cleared itself. The first version of this compared `armed_deadlines()` before
+# and after, which is a global every other timed park on the machine moves -- it
+# measured other people's timers.
+if grep -qE "two sources +a parked thread woke by the signal when one came \(0x102\) and by the deadline when none did \(0x101\); the deadline that lost the race was still armed and the one that won had cleared itself" "$LOG"; then
+    pass "a park woke by whichever of its two sources came first, and left no timer behind"
+else
+    fail "the two-wake-source test did not report: $(grep -aoE 'two sources.*' "$LOG" | head -1)"
+    status=1
+fi
+
 # A reader parked on a notification must be woken when its domain is killed, and
 # must give the notification back -- RFC 0054's unresolved question 1.
 #

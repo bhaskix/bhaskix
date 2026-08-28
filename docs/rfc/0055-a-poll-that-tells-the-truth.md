@@ -233,8 +233,13 @@ rather than a hypothesis.
    and about a descriptor nobody has, on every boot lane. Watched red twice:
    an ungranted console reporting quiet instead of `POLLERR`, and `select`
    treating a bad descriptor the way `poll` does.
-3. **A deadline a thread can park against.** The positive-timeout limit above,
-   and the reply shape it would need.
+3. ~~**A deadline a thread can park against.**~~ **Answered 2026-08-28 by
+   [RFC 0057](0057-a-park-that-names-two-wake-sources.md)**, which turned out to
+   be one reply shape rather than a new primitive: `notify::arm` already makes a
+   timer *signal* a notification, so a thread parked on that notification with a
+   deadline armed on it wakes on whichever comes first, through the wait that
+   already existed. A positive timeout naming the console now returns as soon as
+   a key arrives. A set naming only sockets still waits out its interval.
 
 ## Implementation plan
 

@@ -176,7 +176,14 @@ asm_budget = 3
 # note below records that exact mistake being made and taken back out once
 # already: `bhaskix-sock` owns that read. Reading this file before raising the
 # number is what caught it -- the gate would have accepted 89 just as readily.
-unsafe_budget = 86
+# 93 as of 2026-08-28, for RFC 0057: two more statics and their accessors --
+# the deadline the next reply carries, and the instant each domain's timed wait
+# ends. Seven lines, one accessor per table plus the writes, which is this
+# crate's convention. The second static is the fix for a wait that restarted its
+# own deadline on every retry; the first exists because one reply in hundreds
+# names a deadline, and widening `Answer` would have put a word nobody reads on
+# every path.
+unsafe_budget = 93
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.
