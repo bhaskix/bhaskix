@@ -559,7 +559,15 @@ asm_budget = 10
 # volatile reads that take its answers back out of the report page. None of it
 # could be safe code: a probe's report is a physical frame reached through the
 # direct map, which is a raw pointer by construction.
-unsafe_budget = 1897
+# 1939 for RFC 0056's socket-poll probe: a second hosted Linux program, whose
+# thread is the socket probe's scaffolding pointed at a different blob. Forty-two
+# lines and not one of them new in kind -- the machine code copied in, the
+# `sockaddr` written beside it, the space installed, the entry into ring 3, and
+# the volatile reads that take its answers back. Cloned rather than shared
+# because the two probes differ in what they map and where they report, and a
+# parameterised one would have been a third thing to get wrong in a path where
+# a mistake is a triple fault.
+unsafe_budget = 1939
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

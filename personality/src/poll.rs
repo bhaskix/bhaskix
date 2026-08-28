@@ -65,11 +65,22 @@ pub enum Condition {
         /// Whether *this* descriptor is the writable end.
         writable_end: bool,
     },
-    /// A descriptor this adapter cannot answer for — a socket, today.
+    /// A bound UDP socket, with whether a datagram is waiting — RFC 0056.
     ///
-    /// **Zero, and not a guess.** RFC 0055 unresolved question 1: a socket's
-    /// readiness lives in the network service, and inventing one here would be
-    /// inventing a fact.
+    /// **Always writable, and that is the truth rather than a convenience.** A
+    /// hosted socket is UDP — a stream is refused at `socket()` — and `sendto`
+    /// hands the payload to the service and answers. There is no buffer to fill
+    /// and no state in which a write would wait.
+    Socket {
+        /// Whether a datagram is waiting to be received.
+        datagram_waiting: bool,
+    },
+    /// A descriptor this adapter cannot answer for.
+    ///
+    /// **Zero, and not a guess.** One holder left: `epoll`, which has no
+    /// readiness of its own until something implements it. Sockets were here
+    /// until RFC 0056 gave the service a way to be asked without being
+    /// emptied.
     Unanswered,
 }
 
@@ -100,6 +111,13 @@ pub fn revents(requested: u16, condition: Condition) -> u16 {
             out
         }
         Condition::File => requested & POLLIN,
+        Condition::Socket { datagram_waiting } => {
+            let mut out = requested & POLLOUT;
+            if datagram_waiting {
+                out |= requested & POLLIN;
+            }
+            out
+        }
         Condition::Pipe {
             bytes,
             room,
@@ -296,6 +314,22 @@ mod tests {
             POLLOUT | POLLERR
         );
         assert_eq!(revents(0, pipe(0, 16, 0, 1, false)), POLLERR);
+    }
+
+    #[test]
+    fn a_socket_is_readable_only_once_a_datagram_is_waiting() {
+        let empty = Condition::Socket {
+            datagram_waiting: false,
+        };
+        let waiting = Condition::Socket {
+            datagram_waiting: true,
+        };
+        assert_eq!(revents(POLLIN, empty), 0);
+        assert_eq!(revents(POLLIN, waiting), POLLIN);
+        // Always writable: `sendto` hands the payload over and answers, so
+        // there is no state in which a write would wait.
+        assert_eq!(revents(POLLOUT, empty), POLLOUT);
+        assert_eq!(revents(POLLIN | POLLOUT, waiting), POLLIN | POLLOUT);
     }
 
     #[test]

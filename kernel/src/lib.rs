@@ -6305,6 +6305,104 @@ const SOCKET_PROBE_CODE: [u8; 181] = [
     0xeb, 0xfe,                               // jmp b3 <done+0x9>
 ];
 
+/// Where [`SOCKET_POLL_CODE`] runs and reports.
+const SOCKET_POLL_CODE_AT: u64 = 0x0000_0000_1B00_0000;
+/// Where the peek probe reports, in physical memory.
+static SOCKET_POLL_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Polls a UDP socket before and after a datagram, then receives it —
+/// [RFC 0056](../../docs/rfc/0056-asking-a-socket-without-emptying-it.md).
+///
+/// # Why the last step is the one that matters
+///
+/// Anyone can make `poll` say a socket is readable. What this asserts is that
+/// asking **did not empty it**: after two polls, the `recvfrom` still returns
+/// the four bytes that were sent. A peek built on `RECV_FROM` would take the
+/// datagram to answer the question, and this last step would come back empty —
+/// which is the whole failure RFC 0056 exists to prevent, caught end to end
+/// rather than argued about.
+///
+/// # No branches
+///
+/// Every call's answer is reported and the Rust side asserts on all of them,
+/// so there is not a single conditional jump here. The socket probe beside this
+/// one has hand-computed displacements to a shared `done`, and adding to it
+/// would have meant recomputing every one of them. A straight line cannot get
+/// them wrong.
+const SOCKET_POLL_CODE: [u8; 249] = [
+    0x49, 0x89, 0xfc, // mov r12, rdi          ; report page
+    0x49, 0x89, 0xf6, // mov r14, rsi          ; the sockaddr, [::1]:7777
+    // socket(AF_INET6, SOCK_DGRAM, 0)
+    0xbf, 0x0a, 0x00, 0x00, 0x00, // mov edi, 10
+    0xbe, 0x02, 0x00, 0x00, 0x00, // mov esi, 2
+    0x31, 0xd2, // xor edx, edx
+    0xb8, 0x29, 0x00, 0x00, 0x00, // mov eax, 41           ; socket
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x00, // mov [r12+0], rax      ; the descriptor
+    0x49, 0x89, 0xc5, // mov r13, rax
+    // bind(fd, addr, 28)
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0x4c, 0x89, 0xf6, // mov rsi, r14
+    0xba, 0x1c, 0x00, 0x00, 0x00, // mov edx, 28
+    0xb8, 0x31, 0x00, 0x00, 0x00, // mov eax, 49           ; bind
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x08, // mov [r12+8], rax
+    // A pollfd at +64 naming that descriptor, asking about readability.
+    0x45, 0x89, 0x6c, 0x24, 0x40, // mov [r12+64], r13d    ; fd
+    0x66, 0x41, 0xc7, 0x44, 0x24, 0x44, 0x01, 0x00, // mov word [r12+68], 1  ; POLLIN
+    0x66, 0x41, 0xc7, 0x44, 0x24, 0x46, 0x00, 0x00, // mov word [r12+70], 0  ; revents
+    // poll(fds, 1, 0) -- nothing has been sent, so nothing must be waiting.
+    0x49, 0x8d, 0x7c, 0x24, 0x40, // lea rdi, [r12+64]
+    0xbe, 0x01, 0x00, 0x00, 0x00, // mov esi, 1
+    0x31, 0xd2, // xor edx, edx          ; timeout 0
+    0xb8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7            ; poll
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x10, // mov [r12+16], rax     ; expected 0
+    // sendto(fd, "dup0", 4, 0, addr, 28) -- to itself.
+    0x41, 0xc7, 0x44, 0x24, 0x60, 0x64, 0x75, 0x70, 0x30, // movl [r12+96], "dup0"
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0x49, 0x8d, 0x74, 0x24, 0x60, // lea rsi, [r12+96]
+    0xba, 0x04, 0x00, 0x00, 0x00, // mov edx, 4
+    0x45, 0x31, 0xd2, // xor r10d, r10d
+    0x4d, 0x89, 0xf0, // mov r8, r14
+    0x41, 0xb9, 0x1c, 0x00, 0x00, 0x00, // mov r9d, 28
+    0xb8, 0x2c, 0x00, 0x00, 0x00, // mov eax, 44           ; sendto
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x18, // mov [r12+24], rax
+    // poll(fds, 1, 200ms) -- now it must become readable.
+    0x49, 0x8d, 0x7c, 0x24, 0x40, // lea rdi, [r12+64]
+    0xbe, 0x01, 0x00, 0x00, 0x00, // mov esi, 1
+    0xba, 0xc8, 0x00, 0x00, 0x00, // mov edx, 200
+    0xb8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7            ; poll
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x20, // mov [r12+32], rax     ; expected 1
+    0x41, 0x0f, 0xb7, 0x44, 0x24, 0x46, // movzx eax, word [r12+70]
+    0x49, 0x89, 0x44, 0x24, 0x28, // mov [r12+40], rax     ; expected POLLIN
+    // recvfrom(fd, +112, 4, 0, NULL, NULL) -- the datagram must still be there.
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0x49, 0x8d, 0x74, 0x24, 0x70, // lea rsi, [r12+112]
+    0xba, 0x04, 0x00, 0x00, 0x00, // mov edx, 4
+    0x45, 0x31, 0xd2, // xor r10d, r10d
+    0x45, 0x31, 0xc0, // xor r8d, r8d
+    0x45, 0x31, 0xc9, // xor r9d, r9d
+    0xb8, 0x2d, 0x00, 0x00, 0x00, // mov eax, 45           ; recvfrom
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x30, // mov [r12+48], rax     ; expected 4
+    0x49, 0x8b, 0x44, 0x24, 0x70, // mov rax, [r12+112]
+    0x49, 0x89, 0x44, 0x24, 0x38, // mov [r12+56], rax     ; what came back
+    // **And close it.** `bin/ipd` holds four sockets and nothing tells it a
+    // client has stopped caring, so a probe whose domain is simply killed
+    // leaks its binding for the rest of the boot -- which is how this was
+    // found: the socket probe that runs next was refused its own bind, and the
+    // adapter reported that as `EADDRINUSE` on a port nobody else held.
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3            ; close
+    0x0f, 0x05, // syscall
+    0x48, 0xff, 0xc0, // inc rax               ; so success is not zero
+    0x49, 0x89, 0x44, 0x24, 0x78, // mov [r12+120], rax    ; the last word written
+    0xeb, 0xfe, // done: jmp $
+];
+
 /// Where the socket the probe binds is placed: a `sockaddr_in6` for `[::1]`
 /// on port 7777, past the code.
 const SOCKET_PROBE_ADDRESS_AT: u64 = 256;
@@ -6550,6 +6648,85 @@ extern "C" fn ring3_socketeer(hhdm_base: u64) -> ! {
             SOCKET_PROBE_CODE_AT,
             BUFFER_AT + 0x0f00,
             [BUFFER_AT, SOCKET_PROBE_CODE_AT + SOCKET_PROBE_ADDRESS_AT],
+        )
+    }
+}
+
+/// The thread that runs [`SOCKET_POLL_CODE`] — RFC 0056's witness.
+///
+/// The socket probe's scaffolding, pointed at a different program: same
+/// pages, same `[::1]:7777` address written the same way. It differs in one
+/// thing — it publishes where its report page landed, because this probe
+/// answers into memory rather than by printing.
+extern "C" fn ring3_socket_poller(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const BUFFER_AT: u64 = SOCKET_POLL_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (SOCKET_POLL_CODE_AT, Protection::ReadExecute),
+        (BUFFER_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(SOCKET_POLL_CODE_AT)) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped frame this space owns, filled through the
+    // direct map; the executable mapping is never writable. The address goes
+    // at a fixed offset past the code, which a `const` assertion above holds
+    // clear of it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            SOCKET_POLL_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            SOCKET_POLL_CODE.len(),
+        );
+        // A `sockaddr_in6` for `[::1]:7777`, laid out the way
+        // `personality::socket::parse_endpoint` reads one: the family in the
+        // first two bytes **little-endian**, the port in the next two
+        // **big-endian**, then four bytes of flow label, then the address.
+        // Two byte orders four bytes apart is exactly the trap that field
+        // layout sets, and it is written here once rather than assembled by
+        // hand in the probe.
+        let mut address = [0u8; 28];
+        address[0..2].copy_from_slice(&10u16.to_le_bytes()); // AF_INET6
+        // **7778 and not 7777**, which is the socket probe's. Both bind on the
+        // same boot and a port is held by one socket at a time: sharing the
+        // number made the second `bind` answer `EADDRINUSE`, and the probe that
+        // lost the race reported a round trip that never happened.
+        address[2..4].copy_from_slice(&7778u16.to_be_bytes());
+        address[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        core::ptr::copy_nonoverlapping(
+            address.as_ptr(),
+            (hhdm_base + code_pa + SOCKET_PROBE_ADDRESS_AT) as *mut u8,
+            address.len(),
+        );
+    }
+    SOCKET_POLL_REPORT_PA.store(
+        space.translate(VirtAddr(BUFFER_AT)).unwrap_or(0),
+        core::sync::atomic::Ordering::Release,
+    );
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page; `rdi` is
+    // the writable page it works in and `rsi` the address beside its code.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            SOCKET_POLL_CODE_AT,
+            BUFFER_AT + 0x0f00,
+            [BUFFER_AT, SOCKET_POLL_CODE_AT + SOCKET_PROBE_ADDRESS_AT],
         )
     }
 }
@@ -7969,6 +8146,152 @@ fn lending_self_test(hhdm: u64) -> bool {
             "    lending        a loan was taken back from the borrower alone: its page is gone \
              and its address is free again, the lender kept both, and the object outlived the \
              loan; the unmapping itself is {unmap_cycles} cycles, best of 8"
+        );
+    }
+    ok
+}
+
+/// RFC 0056's witness: `poll` asks a socket and does not empty it.
+///
+/// Runs only where there is a network to ask, on the same two-way distinction
+/// `socket_self_test` draws: no network is a skip, and a network the adapter
+/// was given none of is a failure.
+///
+/// # The four assertions, and the one that carries the RFC
+///
+/// The socket is polled before anything is sent and must be **quiet** — a
+/// readiness check that answered "ready" for an empty socket would send every
+/// caller into a `recvfrom` that returns nothing. Then a datagram is sent to
+/// itself and the socket must become **readable**, with `POLLIN` and not merely
+/// a non-zero count.
+///
+/// Then it is **received** — and that is the assertion this whole RFC is for.
+/// A peek built on `RECV_FROM` would have taken the datagram to answer the
+/// question, and those four bytes would be gone. Getting them back is what says
+/// asking took nothing.
+fn socket_poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux socket poll skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+    /// `POLLIN`.
+    const IN: u64 = 0x001;
+    /// The four bytes the probe sends itself, as it stores them.
+    const PAYLOAD: u64 = 0x3070_7564;
+
+    let adapter = syscall::ADAPTER_DOMAIN.load(Ordering::Relaxed);
+    let machine_has_network =
+        network_endpoint_capability().is_some() && NET_CONTAINED.load(Ordering::Acquire);
+    let holds_network = adapter != u32::MAX
+        && domain::with(domain::DomainId::from_u32(adapter), |owner| {
+            owner.cspace.get(88).is_some() && owner.cspace.get(89).is_some()
+        }) == Some(true);
+    if !machine_has_network {
+        println!(
+            "    linux socket poll skipped: no network this machine can drive, so there is no \
+             socket to ask about"
+        );
+        return true;
+    }
+    if !holds_network {
+        println!(
+            "\x1b[91m    linux socket poll FAILED: this machine has a network and the adapter \
+             was given none\x1b[0m"
+        );
+        return false;
+    }
+
+    let Ok(realm) = domain::create("sockpoll", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux socket poll FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_none()
+    {
+        println!("\x1b[91m    linux socket poll FAILED: the tag would not set\x1b[0m");
+        domain::destroy(realm);
+        return false;
+    }
+    SOCKET_POLL_REPORT_PA.store(0, Ordering::Release);
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(
+        CPU,
+        "sockpoll",
+        ring3_socket_poller,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    linux socket poll FAILED: the probe would not spawn\x1b[0m");
+        domain::destroy(realm);
+        return false;
+    }
+
+    let mut answers = [0u64; 16];
+    let done = wait_until(
+        || {
+            let report_pa = SOCKET_POLL_REPORT_PA.load(Ordering::Acquire);
+            if report_pa == 0 {
+                return false;
+            }
+            // SAFETY: a frame the probe's own space owns, read through the
+            // direct map -- the idiom every probe's reader here uses.
+            unsafe {
+                for (index, slot) in answers.iter_mut().enumerate() {
+                    *slot = core::ptr::read_volatile(
+                        (hhdm_base + report_pa + 8 * index as u64) as *const u64,
+                    );
+                }
+            }
+            // **The close is the last thing written**, so it is what says the
+            // program finished rather than stopped somewhere in the middle --
+            // and, because it is a `close`, that the socket went back.
+            answers[15] != 0
+        },
+        30_000,
+    );
+    domain::end(realm, domain::Ending::Killed);
+
+    let (fd, bound, quiet, sent) = (answers[0], answers[1], answers[2], answers[3]);
+    let (ready, revents, received, payload) = (answers[4], answers[5], answers[6], answers[7]);
+    // Stored as the answer plus one, so that a successful close is not the
+    // zero an unfinished probe leaves behind.
+    let closed = answers[15];
+    let ok = done
+        && (fd as i64) >= 0
+        && bound == 0
+        && quiet == 0
+        && sent == 4
+        && ready == 1
+        && revents == IN
+        && received == 4
+        && payload == PAYLOAD
+        && closed == 1;
+    if ok {
+        println!(
+            "    linux socket poll a Linux program polled a UDP socket before sending (quiet), \
+             sent to itself, polled again (POLLIN), and then received all four bytes -- so asking \
+             took nothing"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux socket poll FAILED: finished {done}, fd {}, bind {}, quiet \
+             {quiet}, sent {}, ready {ready} revents {revents:#x}, received {}, payload \
+             {payload:#x}, close {}\x1b[0m",
+            fd as i64,
+            bound as i64,
+            sent as i64,
+            received as i64,
+            closed as i64 - 1
         );
     }
     ok
@@ -16949,6 +17272,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // RFC 0005 step 9, after the file probes because it needs the same second
     // CPU and because a failure here should not be read as a filesystem
     // problem.
+    if !socket_poll_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    linux socket poll FAILED\x1b[0m");
+    }
     if !socket_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux socket   FAILED\x1b[0m");
     }

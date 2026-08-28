@@ -2836,6 +2836,28 @@ else
     status=1
 fi
 
+# `poll` on a socket, and the assertion that asking did not empty it --
+# RFC 0056.
+#
+# **The receive is the clause that carries the RFC.** Anyone can make `poll`
+# say a socket is readable; what matters is that answering the question left the
+# datagram alone. The probe polls before sending (quiet), sends to itself, polls
+# again (`POLLIN`), and only then receives -- and a readiness check built on
+# `RECV_FROM` would have taken those four bytes to answer the second poll, so
+# the receive would come back empty.
+#
+# It closes its socket afterwards, and that is asserted with the rest: `bin/ipd`
+# holds four sockets and nothing tells it a client has stopped caring, so a
+# probe that simply ended would leak its binding for the rest of the boot.
+if grep -qE "linux socket poll a Linux program polled a UDP socket before sending \(quiet\), sent to itself, polled again \(POLLIN\), and then received all four bytes -- so asking took nothing" "$LOG"; then
+    pass "poll asked a socket whether a datagram had arrived, and did not take it"
+elif grep -qF "linux socket poll skipped" "$LOG"; then
+    pass "no network this machine can drive, so there is no socket to poll"
+else
+    fail "the socket poll probe did not conclude: $(grep -aoE 'linux socket poll.*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0044's missing number, supplied.
 #
 # That RFC shipped un-measured -- and, worse, first claimed the boot report

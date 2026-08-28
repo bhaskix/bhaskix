@@ -197,10 +197,18 @@ rather than a hypothesis.
 
 ## Unresolved questions
 
-1. **Sockets.** A socket's readiness lives in the network service, and this
-   answers nothing for one: a set containing only sockets and an infinite
-   timeout answers now rather than waiting. No hosted program here opens a
-   socket and polls it, and inventing an answer would be inventing a fact.
+1. ~~**Sockets.**~~ **Answered 2026-08-28 by
+   [RFC 0056](0056-asking-a-socket-without-emptying-it.md)**, which gave the
+   service a way to be asked without being emptied — `RECV_FROM` consumes, so a
+   readiness check built on it would take a datagram every time a program
+   wondered whether there was one. A socket is readable when a datagram is
+   waiting and always writable, the second being true rather than convenient:
+   a hosted socket is UDP and `sendto` does not block.
+
+   What is still open is the *waiting*: a socket becoming readable does not wake
+   a parked poller, because the thing that would wake it is a datagram arriving
+   in another program's ring and there is no notification for that. A positive
+   timeout works, by the same re-examine-on-expiry route everything else uses.
 2. ~~**`ppoll` and `select`.**~~ **Answered 2026-08-28**, along with
    `pselect6`. `ppoll` is this with a `timespec` and a signal mask that is
    accepted and ignored — nothing wakes a parked hosted thread here except what

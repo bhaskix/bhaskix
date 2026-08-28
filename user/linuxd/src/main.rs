@@ -1861,9 +1861,11 @@ fn condition_of(
     use bhaskix_personality::file::Kind;
     use bhaskix_personality::poll::Condition;
 
-    match descriptor_row(request, fd) {
-        None => Condition::Unknown,
-        Some((Kind::Console, ..)) => {
+    let Some(entry) = descriptor_row(request, fd) else {
+        return Condition::Unknown;
+    };
+    match entry.kind {
+        Kind::Console => {
             let (byte_waiting, granted) = match *console {
                 Some(known) => known,
                 None => {
@@ -1890,11 +1892,34 @@ fn condition_of(
                 granted,
             }
         }
-        Some((Kind::File | Kind::Directory | Kind::Proc, ..)) => Condition::File,
-        Some((Kind::Pipe, handle, readable, writable)) => {
-            pipe_condition(handle, readable, writable)
+        Kind::File | Kind::Directory | Kind::Proc => Condition::File,
+        Kind::Pipe => pipe_condition(entry.handle, entry.readable, entry.writable),
+        // **Asked, not guessed** -- RFC 0056. `pending` takes nothing, which is
+        // the whole reason it exists: `recv_from` consumes, so a readiness
+        // check built on it would eat a datagram every time a program wondered
+        // whether there was one.
+        //
+        // An unbound socket has no service to ask -- `bind` is what claims the
+        // capability -- and nothing can arrive on it, so it is quiet rather
+        // than an error.
+        Kind::Socket if entry.handle != u64::MAX => {
+            let port = entry.size as u16;
+            let waiting = if entry.offset != 0 {
+                bhaskix_sock::udp6::Socket6::from_slot(entry.handle, port).pending()
+            } else {
+                bhaskix_sock::udp::Socket::from_slot(entry.handle, port).pending()
+            };
+            Condition::Socket {
+                // A service that will not answer is not a datagram waiting.
+                // Reporting it readable would send the caller into a `recvfrom`
+                // that fails, which is worse than reporting it quiet.
+                datagram_waiting: waiting.is_ok_and(|bytes| bytes > 0),
+            }
         }
-        Some((Kind::Socket | Kind::Epoll, ..)) => Condition::Unanswered,
+        Kind::Socket => Condition::Socket {
+            datagram_waiting: false,
+        },
+        Kind::Epoll => Condition::Unanswered,
     }
 }
 
@@ -2044,13 +2069,20 @@ fn pipe_condition(
     }
 }
 
-/// A descriptor's kind, handle and directions — what [`answer_poll`] needs and
-/// [`descriptor_kind`] does not carry.
-fn descriptor_row(request: &PersonalityCall, fd: u64) -> Option<(Kind, u64, bool, bool)> {
+/// A descriptor's whole row — what `poll` needs and [`descriptor_kind`] does
+/// not carry.
+///
+/// The row rather than a widening tuple of its fields: this wanted the kind and
+/// the handle, then which end of a pipe it is, then a socket's family and port.
+/// Each arrived as one more element, and the fourth was where the tuple stopped
+/// being readable.
+fn descriptor_row(
+    request: &PersonalityCall,
+    fd: u64,
+) -> Option<bhaskix_personality::file::Entry> {
     let descriptor = i32::try_from(fd).ok()?;
     let process = process_for(request.domain)?;
-    let entry = process.descriptors.get(descriptor)?;
-    Some((entry.kind, entry.handle, entry.readable, entry.writable))
+    process.descriptors.get(descriptor).copied()
 }
 
 /// `nanosleep(request, remain)`.

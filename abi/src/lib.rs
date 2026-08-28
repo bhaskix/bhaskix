@@ -939,6 +939,31 @@ pub mod socket {
     /// error.
     pub const RECV_FROM6: u64 = 66;
 
+    /// **How many bytes are waiting on this socket, taking nothing** —
+    /// [RFC 0056](../../docs/rfc/0056-asking-a-socket-without-emptying-it.md).
+    ///
+    /// Invoked on the socket capability, and needs exactly what [`RECV_FROM`]
+    /// needs: a holder that may take a datagram may certainly ask whether there
+    /// is one. Replies [`OK`] with the waiting datagram's length in `args[1]`,
+    /// zero meaning nothing has arrived.
+    ///
+    /// It exists because `RECV_FROM` **consumes**. A readiness check built on
+    /// that would take a datagram every time a program asked whether one was
+    /// there, and the `recvfrom` that followed would find nothing — which is
+    /// what `poll` is for, spelled backwards.
+    ///
+    /// **The service must look at the wire before answering**, exactly as
+    /// `RECV_FROM` does: it is asleep in `receive` with no other wakeup, so a
+    /// client asking is the only event it can act on. A peek that skipped that
+    /// would report "nothing waiting" for a datagram already in the ring.
+    pub const PEEK_FROM: u64 = 68;
+    /// The same for a socket of the second family.
+    ///
+    /// Two numbers rather than one, matching [`SEND_TO`]/[`SEND_TO6`]: one
+    /// service holds both families, and the number is what lets it refuse the
+    /// v4 question asked about a v6 socket.
+    pub const PEEK_FROM6: u64 = 69;
+
     /// It worked.
     pub const OK: u64 = 0;
     /// That port is already bound, or none is free.

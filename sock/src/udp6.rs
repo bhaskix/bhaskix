@@ -170,6 +170,24 @@ impl Socket6 {
         Err(refused(&reply))
     }
 
+    /// How many bytes are waiting, **taking nothing** — RFC 0056.
+    ///
+    /// Zero means nothing has arrived. This is what a readiness check asks:
+    /// [`Self::recv_from`] consumes, so building one on that would take a
+    /// datagram every time a program wondered whether there was one.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal`] if the service would not answer — including a socket of the
+    /// other family, which is refused by name rather than answered wrongly.
+    pub fn pending(&self) -> Result<u16, Refusal> {
+        let reply = call(syscall::CALL, self.slot, socket::PEEK_FROM6, [0; 4]);
+        if reply.kernel_ok() && reply.value == socket::OK {
+            return Ok(reply.second as u16);
+        }
+        Err(refused(&reply))
+    }
+
     /// Gives up the socket: the binding ends and the capability stops
     /// working.
     ///

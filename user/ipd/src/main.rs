@@ -1321,6 +1321,23 @@ fn serve(
                 sockets[index as usize].generation = generation.wrapping_add(1);
                 reply(socket::OK, 0, 0);
             }
+            // **Asking without emptying** -- RFC 0056. The family check is the
+            // same one `SEND_TO` makes, and for the same reason: one service
+            // holds both, so the method number is what says which was meant.
+            socket::PEEK_FROM if held.v6 => reply(socket::WRONG_FAMILY, 0, 0),
+            socket::PEEK_FROM6 if !held.v6 => reply(socket::WRONG_FAMILY, 0, 0),
+            socket::PEEK_FROM | socket::PEEK_FROM6 => {
+                // **Drained first, exactly as `RECV_FROM` does.** This service
+                // is asleep in `receive` and has no other wakeup, so a client
+                // asking is the only event it can act on. A peek that skipped
+                // this would answer "nothing waiting" for a datagram already in
+                // the ring, and a program polling the socket would be told for
+                // ever that nothing had arrived while its datagrams piled up.
+                drain_ring(sockets, me, &mut tail, can_tcp);
+                // The length, and **nothing taken**: the datagram stays where
+                // it is for the `recvfrom` that follows.
+                reply(socket::OK, u64::from(sockets[index as usize].length), 0);
+            }
             socket::SEND_TO if held.v6 => {
                 // A v6 socket asked in the v4 shape. Refused by name rather
                 // than mis-sent: the caller's two words of address would
