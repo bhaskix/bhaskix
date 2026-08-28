@@ -2511,10 +2511,49 @@ fn claim_socket_slot() -> Option<u64> {
 /// failure shape a shared adapter produces (RFC 0031 I5). The first attempt at
 /// a fix reclaimed the slot without telling the service and changed nothing,
 /// which is how the difference between the two halves got noticed.
+/// Sockets this program could not persuade the service to close.
+///
+/// Always zero. A non-zero value is a port held for the rest of the boot by a
+/// program that no longer exists.
+static mut CLOSES_REFUSED: u64 = 0;
+
+/// How many closes were refused, for the boot report.
+#[must_use]
+pub fn closes_refused() -> u64 {
+    // SAFETY: single-threaded by construction, as `dispositions_of`.
+    unsafe { CLOSES_REFUSED }
+}
+
 fn release_socket_slot(slot: u64) {
     // The family does not matter for closing -- both crates send the same
     // message to the same service -- so the v4 constructor serves for either.
-    let _ = bhaskix_sock::udp::Socket::from_slot(slot, 0).close();
+    //
+    // **Retried, because the answer used to be discarded.** A refused close
+    // leaves the binding in `bin/ipd` while this program marks its own slot
+    // free: the port stays held by a program that is gone, and the next caller
+    // to want it is told `EADDRINUSE` for a reason that has nothing to do with
+    // it. The service refuses when it is busy, not when it disagrees, so the
+    // refusal is transient and a few attempts is the whole fix.
+    //
+    // Found as a one-in-nine intermittent in the reclaim gate: everything the
+    // gate asserted about *learning* of the dead domain was true, and the close
+    // that followed simply did not land.
+    let mut closed = false;
+    for _ in 0..4 {
+        if bhaskix_sock::udp::Socket::from_slot(slot, 0)
+            .close()
+            .is_ok()
+        {
+            closed = true;
+            break;
+        }
+    }
+    if !closed {
+        // Counted rather than shrugged at: a socket this program believes it
+        // gave back and the service still holds is a port lost for the boot.
+        // SAFETY: single-threaded by construction, as `dispositions_of`.
+        unsafe { CLOSES_REFUSED += 1 };
+    }
     let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
     let index = (slot - SOCKET_SLOT) as usize;
     // SAFETY: as `claim_socket_slot`.

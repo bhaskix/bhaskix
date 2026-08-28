@@ -574,7 +574,11 @@ asm_budget = 10
 # they differ only in their code, where it lives, which port they bind and
 # whether a second address is written for them. The socket-poll probe was cloned
 # from the socket probe and that showed; this one was not.
-unsafe_budget = 1978
+# 1983 for RFC 0058 Part A's gate: a probe that binds a port and is killed
+# holding it, plus the reads that take its two answers back. Five lines, and it
+# shares the launcher the pair before it introduced -- the probe differs only in
+# its code and where it lives.
+unsafe_budget = 1983
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

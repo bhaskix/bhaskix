@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-08-28**, and **completed 2026-08-28 after acceptance**. *The status line accepted said "both parts built" and that was wrong*: Part B created, granted and rang the bell, and nothing ever waited on it — `bin/linuxd`'s constant for it was **never used**, which the compiler said in as many words and which shipped because the adapter was the one crate `make clippy` did not cover. The park is wired now and the wake is **proved**: a hosted program parks on the bell with no timeout, a second sends it four bytes, and the first wakes and reads them — the sender started only once the nucleus has counted a park *on the bell*, so the order is observed rather than slept for. Watched red both ways: no park (*"the poller never parked"*) and no ring (*"sent 4"*, parked, never woken). Part B is gated: the bell is granted to both sides and the boot asserts `bin/ipd` **rang** it when a datagram arrived, read by peeking the notification rather than taking it, and watched red by removing the signal. **What this does not claim.** *(1)* **Part A has no lane of its own** — proving it needs a hosted domain killed while holding a socket and another taking the same slot afterwards, which no probe here arranges; it is reasoned from the code and the correction it rests on is stated above. *(2)* ~~The parked wake is unproven~~ — **proved 2026-08-28**, see above. *(3)* The leak is **bounded, not closed** — the message arrives on slot reuse. *(4)* One bell for every socket, so a poller wakes for datagrams that were not its own |
+| **Status** | ✅ **ACCEPTED 2026-08-28**, and **completed 2026-08-28 after acceptance**. *The status line accepted said "both parts built" and that was wrong*: Part B created, granted and rang the bell, and nothing ever waited on it — `bin/linuxd`'s constant for it was **never used**, which the compiler said in as many words and which shipped because the adapter was the one crate `make clippy` did not cover. The park is wired now and the wake is **proved**: a hosted program parks on the bell with no timeout, a second sends it four bytes, and the first wakes and reads them — the sender started only once the nucleus has counted a park *on the bell*, so the order is observed rather than slept for. Watched red both ways: no park (*"the poller never parked"*) and no ring (*"sent 4"*, parked, never woken). Part B is gated: the bell is granted to both sides and the boot asserts `bin/ipd` **rang** it when a datagram arrived, read by peeking the notification rather than taking it, and watched red by removing the signal. **What this does not claim.** *(1)* ~~Part A has no lane of its own~~ — **gated 2026-08-28**: one program binds a port and is killed holding it, its domain is waited for until *reaped*, and a second takes that slot and binds the same port. Both preconditions are observed rather than assumed. Building it found a further defect and fixed it — `release_socket_slot` **discarded the close's outcome**, so a refused close left the binding in the service while the adapter marked its slot free. *(2)* ~~The parked wake is unproven~~ — **proved 2026-08-28**, see above. *(3)* The leak is **bounded, not closed** — the message arrives on slot reuse. *(4)* One bell for every socket, so a poller wakes for datagrams that were not its own |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — Core Operating System (L1) |
@@ -164,6 +164,22 @@ taken" and "there are no sockets left" is what a boot spent looking like the
 first while being the second.
 
 ## Unresolved questions
+
+0. **A refused close leaked the socket anyway, and was found by gating Part A.**
+   `release_socket_slot` wrote `let _ = …close()`: the service refuses when it
+   is busy rather than when it disagrees, and the answer was thrown away. The
+   port stayed held by a program that was gone, and the next caller to want it
+   was told `EADDRINUSE` for a reason that had nothing to do with it. It is
+   retried four times now and a residual failure is counted rather than
+   shrugged at.
+
+   It presented as the reclaim gate failing about **one run in nine** —
+   everything the gate asserted about *learning* of the dead domain was true,
+   and the close that followed simply did not land. Sixteen runs since are
+   clean, which is consistent with the fix and is not proof of it: at one in
+   nine, sixteen clean runs would happen by chance about one time in six. The
+   reason to believe it is the discarded return value, which is a cause rather
+   than a correlation.
 
 1. ~~**The parked wake is unproven.**~~ **Closed 2026-08-28**, with the second
    hosted program this question named. What it needed beyond the two programs

@@ -2855,6 +2855,30 @@ else
     status=1
 fi
 
+# A socket held by a *killed* domain comes back -- RFC 0058 Part A, which its
+# own status line said had no lane.
+#
+# **The case is narrower than it sounds, and that matters.** A hosted process
+# that *exits* has its sockets released by `note_exit`, and always did. One
+# killed from outside reaches neither that nor a fatal fault: the only thing
+# that ever learns of it is the `FORGET` message, sent when its domain slot is
+# reused. So one program binds a port and is killed holding it, and a second
+# takes that slot and must bind **the same port**.
+#
+# Both preconditions are observed rather than assumed: the first must have bound
+# before it is killed, and its domain must be *reaped* before the second is
+# made -- `domain::end` marks threads dying and they stop at their own next safe
+# point, so a successor created immediately lands in a different slot and no
+# `FORGET` is sent at all.
+if grep -qF "socket reclaim a domain killed while holding a bound socket gave it back" "$LOG"; then
+    pass "a killed domain's socket came back when its slot was reused"
+elif grep -qF "socket reclaim skipped" "$LOG"; then
+    pass "no network this machine can drive, so there is no socket to reclaim"
+else
+    fail "the socket reclaim did not conclude: $(grep -aoE 'socket reclaim.*' "$LOG" | head -1)"
+    status=1
+fi
+
 # A poller parked on the bell is woken by a datagram -- RFC 0058 Part B, and
 # the thing its own status line said was unproven.
 #

@@ -2763,6 +2763,14 @@ fn may_park_on(slot: u64, domain: u32) -> bool {
 
 /// Parks refused because the caller's domain was not granted what it named.
 pub static PARK_UNGRANTED: AtomicU64 = AtomicU64::new(0);
+/// `FORGET` messages sent to the adapter — RFC 0058 Part A.
+///
+/// A domain slot reused is the only moment the adapter learns that a *killed*
+/// hosted process is gone, so this is the count of times that could have
+/// happened. A reclaim that failed with this at zero and one with it non-zero
+/// are different faults entirely.
+pub static FORGETS_SENT: AtomicU64 = AtomicU64::new(0);
+
 /// Times the datagram bell has been rung — RFC 0058 Part B.
 ///
 /// **Counted rather than peeked.** The first version of this gate read the
@@ -2884,6 +2892,7 @@ fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
     if endpoint != u64::MAX {
         let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
         if held != 0 {
+            FORGETS_SENT.fetch_add(1, Ordering::Relaxed);
             let _ = crate::ipc::call(endpoint, u64::from(domain), FORGET_METHOD, [0; 4]);
         }
         // **And where to find it**, which is no longer computable from the

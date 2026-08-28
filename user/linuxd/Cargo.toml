@@ -183,7 +183,12 @@ asm_budget = 3
 # own deadline on every retry; the first exists because one reply in hundreds
 # names a deadline, and widening `Answer` would have put a word nobody reads on
 # every path.
-unsafe_budget = 93
+# 95 as of 2026-08-28: the counter for closes the service refused, and its
+# accessor. Two lines for a number that must not be invisible -- a socket this
+# program believes it gave back and `bin/ipd` still holds is a port lost for the
+# rest of the boot, and the defect that made it possible was an answer thrown
+# away with `let _ =`.
+unsafe_budget = 95
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

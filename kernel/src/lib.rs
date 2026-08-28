@@ -8341,6 +8341,13 @@ static BELL_SENDER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 const BELL_WAITER_PORT: u16 = 7779;
 /// The port the sender binds, because a socket must be bound to send.
 const BELL_SENDER_PORT: u16 = 7780;
+/// The port RFC 0058 Part A's pair fight over: one binds it and is killed
+/// holding it, the other must be able to bind it afterwards.
+const LEAKED_PORT: u16 = 7781;
+static LEAKER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TAKER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const LEAKER_AT: u64 = 0x0000_0000_2100_0000;
+const TAKER_AT: u64 = 0x0000_0000_2300_0000;
 
 /// Binds a socket, **polls it with no timeout**, and reports what arrived.
 ///
@@ -8434,6 +8441,35 @@ const BELL_SENDER_CODE: [u8; 124] = [
     0xeb, 0xfe, // done: jmp $
 ];
 
+/// Binds a socket and **never closes it**, waiting to be killed.
+///
+/// The other half of RFC 0058: a hosted process that *exits* has its sockets
+/// released by `note_exit`, and one **killed from outside** reaches neither
+/// that nor anything else until its domain slot is reused. This probe is the
+/// one killed from outside, and the assertion is that the next program to take
+/// its slot can bind the port it was holding.
+const BELL_LEAKER_CODE: [u8; 61] = [
+    0x49, 0x89, 0xfc, // mov r12, rdi          ; report page
+    0x49, 0x89, 0xf6, // mov r14, rsi          ; its own address
+    0xbf, 0x0a, 0x00, 0x00, 0x00, // mov edi, 10
+    0xbe, 0x02, 0x00, 0x00, 0x00, // mov esi, 2
+    0x31, 0xd2, // xor edx, edx
+    0xb8, 0x29, 0x00, 0x00, 0x00, // mov eax, 41           ; socket
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x44, 0x24, 0x00, // mov [r12+0], rax
+    0x49, 0x89, 0xc5, // mov r13, rax
+    0x4c, 0x89, 0xef, // mov rdi, r13
+    0x4c, 0x89, 0xf6, // mov rsi, r14
+    0xba, 0x1c, 0x00, 0x00, 0x00, // mov edx, 28
+    0xb8, 0x31, 0x00, 0x00, 0x00, // mov eax, 49           ; bind
+    0x0f, 0x05, // syscall
+    0x48, 0xff, 0xc0, // inc rax               ; success is not zero
+    0x49, 0x89, 0x44, 0x24, 0x08, // mov [r12+8], rax      ; the last word
+    // **And nothing else.** No close, no exit: this program is killed where it
+    // stands, holding the socket, which is the case the gate exists for.
+    0xeb, 0xfe, // done: jmp $
+];
+
 /// A `sockaddr_in6` for `[::1]` on `port`, laid out as `parse_endpoint` reads
 /// one: the family little-endian, the port **big-endian** four bytes away.
 fn loopback6_at(port: u16) -> [u8; 28] {
@@ -8521,6 +8557,28 @@ fn run_bell_program(
     }
 }
 
+extern "C" fn ring3_socket_leaker(hhdm_base: u64) -> ! {
+    run_bell_program(
+        hhdm_base,
+        &BELL_LEAKER_CODE,
+        LEAKER_AT,
+        &LEAKER_PA,
+        LEAKED_PORT,
+        None,
+    )
+}
+
+extern "C" fn ring3_socket_taker(hhdm_base: u64) -> ! {
+    run_bell_program(
+        hhdm_base,
+        &BELL_LEAKER_CODE,
+        TAKER_AT,
+        &TAKER_PA,
+        LEAKED_PORT,
+        None,
+    )
+}
+
 extern "C" fn ring3_bell_waiter(hhdm_base: u64) -> ! {
     run_bell_program(
         hhdm_base,
@@ -8541,6 +8599,163 @@ extern "C" fn ring3_bell_sender(hhdm_base: u64) -> ! {
         BELL_SENDER_PORT,
         Some(BELL_WAITER_PORT),
     )
+}
+
+/// RFC 0058 Part A's witness: a socket held by a **killed** domain comes back.
+///
+/// # The case, and why it is not the one already covered
+///
+/// A hosted process that *exits* has its sockets released by `note_exit`, and
+/// that has always worked. One **killed from outside** reaches neither
+/// `exit_group` nor a fatal fault: the only thing that ever learns of it is the
+/// `FORGET` message, sent when its domain slot is reused, and until RFC 0058
+/// that handler did not release sockets. The port stayed held for the life of
+/// the boot, and the symptom was a *different* program failing to bind.
+///
+/// So: one program binds a port and is killed holding it, and a second is
+/// started to take its slot and must be able to bind **the same port**. If the
+/// release did not happen, the second is refused — which is exactly the failure
+/// this whole part of the RFC was written for, and it is the assertion rather
+/// than a reasoned claim about the code.
+///
+/// **It proves what it can and no more.** The leak is *bounded* rather than
+/// closed: the message arrives on reuse, so a socket held by a domain killed
+/// and never replaced stays held. This gate is the bound working, not the leak
+/// being gone.
+fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    socket reclaim skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    let machine_has_network =
+        network_endpoint_capability().is_some() && NET_CONTAINED.load(Ordering::Acquire);
+    if !machine_has_network {
+        println!(
+            "    socket reclaim skipped: no network this machine can drive, so there is no \
+             socket to hold or give back"
+        );
+        return true;
+    }
+
+    let mut answers = [0u64; 2];
+    let mut held_it = false;
+    let forgets_before = syscall::FORGETS_SENT.load(Ordering::Relaxed);
+    LEAKER_PA.store(0, Ordering::Release);
+    TAKER_PA.store(0, Ordering::Release);
+
+    // The one that binds and is killed holding it.
+    let Ok(leaker) = domain::create("leaker", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    socket reclaim FAILED: no domain\x1b[0m");
+        return false;
+    };
+    let started = domain::with(leaker, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    })
+    .is_some()
+        && sched::spawn_on_with(
+            CPU,
+            "leaker",
+            ring3_socket_leaker,
+            hhdm_base,
+            hhdm_base,
+            sched::SpawnOptions::new()
+                .pinned()
+                .in_domain(leaker.as_u32()),
+        )
+        .is_ok();
+    if started {
+        // **Bound, not merely spawned.** Killing it before it held the port
+        // would leave nothing to reclaim and the second half would pass while
+        // testing nothing.
+        held_it = wait_until(
+            || {
+                let pa = LEAKER_PA.load(Ordering::Acquire);
+                if pa == 0 {
+                    return false;
+                }
+                // SAFETY: a frame the probe's own space owns, direct-mapped.
+                unsafe { core::ptr::read_volatile((hhdm_base + pa + 8) as *const u64) == 1 }
+            },
+            20_000,
+        );
+    }
+    // Killed from outside, holding it: the case the whole gate is about.
+    let leaked_slot = leaker.as_u32();
+    domain::end(leaker, domain::Ending::Killed);
+    // **Reaped, and not merely told to die.** `domain::end` marks its threads
+    // dying and they stop at their own next safe point; the slot is not free
+    // until they have. Creating the successor immediately gave it a *different*
+    // slot, so no `FORGET` was sent for this one and nothing was released --
+    // which presented as the reclaim simply not working.
+    let reaped = wait_until(|| sched::threads_counted_in(leaked_slot) == 0, 20_000);
+
+    // The one that must be able to take the port back. It reuses the slot the
+    // first left, which is what causes the kernel to send `FORGET`.
+    let mut bound_again = false;
+    let mut same_slot = false;
+    if held_it
+        && reaped
+        && let Ok(taker) = domain::create("taker", domain::ResourceEnvelope::new())
+    {
+        // The reclaim rides on the *slot* being reused, so a successor that
+        // landed elsewhere would prove nothing either way. Said out loud rather
+        // than folded into the pass/fail.
+        same_slot = taker.as_u32() == leaked_slot;
+        if domain::with(taker, |owner| {
+            owner.set_personality(domain::Personality::Linux)
+        })
+        .is_some()
+            && sched::spawn_on_with(
+                CPU,
+                "taker",
+                ring3_socket_taker,
+                hhdm_base,
+                hhdm_base,
+                sched::SpawnOptions::new()
+                    .pinned()
+                    .in_domain(taker.as_u32()),
+            )
+            .is_ok()
+        {
+            bound_again = wait_until(
+                || {
+                    let pa = TAKER_PA.load(Ordering::Acquire);
+                    if pa == 0 {
+                        return false;
+                    }
+                    // SAFETY: as above.
+                    unsafe {
+                        answers[0] = core::ptr::read_volatile((hhdm_base + pa) as *const u64);
+                        answers[1] = core::ptr::read_volatile((hhdm_base + pa + 8) as *const u64);
+                    }
+                    answers[1] != 0
+                },
+                20_000,
+            ) && answers[1] == 1;
+        }
+        domain::end(taker, domain::Ending::Killed);
+    }
+
+    if held_it && reaped && same_slot && bound_again {
+        println!(
+            "    socket reclaim a domain killed while holding a bound socket gave it back: the \
+             next hosted program bound the same port"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    socket reclaim FAILED: held {held_it}, reaped {reaped}, same slot \
+             {same_slot}, bound again {bound_again} (fd {}, bind {}), forgets {}\x1b[0m",
+            answers[0] as i64,
+            answers[1] as i64 - 1,
+            syscall::FORGETS_SENT.load(Ordering::Relaxed) - forgets_before
+        );
+        false
+    }
 }
 
 /// RFC 0058's witness: a poller **parked** on the bell is woken by a datagram.
@@ -17980,6 +18195,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     }
     if !socket_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux socket   FAILED\x1b[0m");
+    }
+    if !killed_domain_gives_its_socket_back(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    socket reclaim FAILED\x1b[0m");
     }
     if !bell_wakes_a_poller(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    datagram wake  FAILED\x1b[0m");
