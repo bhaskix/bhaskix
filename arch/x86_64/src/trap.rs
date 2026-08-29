@@ -175,11 +175,132 @@ unsafe extern "C" fn bhaskix_trap_dispatch(frame: *mut TrapFrame) {
     // function pointer. It was checked non-null above.
     let handler: TrapHandler = unsafe { core::mem::transmute::<*mut (), TrapHandler>(handler) };
 
+    // **What the frame looked like on the way in.** See `implausible` for why
+    // this is worth two comparisons.
+    //
+    // SAFETY: as the read above.
+    let arrived = unsafe { implausible(&*frame) };
+
     // SAFETY: the stubs guarantee `frame` points to a fully initialised
     // `TrapFrame` on the current stack, valid for the duration of this call
     // and not aliased -- interrupts are disabled and this is the only
     // reference taken.
     handler(unsafe { &mut *frame });
+
+    // **And on the way out**, which is the half that has evidence waiting for
+    // it. The frame the stub is about to `iretq` through is this one, and a
+    // corrupted selector in it faults *there* -- at an address in the entry
+    // stub, with no indication of what wrote it or when.
+    //
+    // Checking both ends brackets the corruption: arriving bad says it
+    // happened before this dispatch, leaving bad says it happened inside it.
+    // Neither is a fix and neither is a guess; they are the difference between
+    // a `#GP` at `iretq` and a line naming the field and the value.
+    //
+    // SAFETY: as above -- the frame outlives the call.
+    let leaving = unsafe { implausible(&*frame) };
+    if arrived.is_some() || leaving.is_some() {
+        // **Recorded here and printed by the kernel.** This crate is the
+        // bottom of the dependency order and has no console; the kernel reads
+        // these and says so in its boot report and in its own fault path.
+        // Only the first witness is kept: the first is the one that happened
+        // before anything else could have been disturbed by it.
+        if FRAME_IMPLAUSIBLE.fetch_add(1, Ordering::Relaxed) == 0 {
+            // SAFETY: as above.
+            let frame = unsafe { &*frame };
+            for (slot, value) in FRAME_WITNESS.iter().zip([
+                frame.vector,
+                frame.rip,
+                frame.cs,
+                frame.rflags,
+                frame.rsp,
+                frame.ss,
+            ]) {
+                slot.store(value, Ordering::Relaxed);
+            }
+            FRAME_ON_ENTRY.store(arrived.is_some(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// How many frames failed [`implausible`] at either end of a dispatch.
+pub static FRAME_IMPLAUSIBLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The first such frame: vector, rip, cs, rflags, rsp, ss.
+static FRAME_WITNESS: [core::sync::atomic::AtomicU64; 6] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Whether that first one was already wrong when the interrupt arrived.
+static FRAME_ON_ENTRY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// What the frame checks have seen: how many, the first one's fields, and
+/// whether it was already wrong on entry.
+///
+/// **Read by the kernel, because this crate has no console.** Arriving wrong
+/// means the corruption predates the dispatch; leaving wrong means it happened
+/// inside it. That bracket is the whole point of checking twice.
+#[must_use]
+pub fn implausible_frames() -> (u64, [u64; 6], bool) {
+    let mut witness = [0u64; 6];
+    for (slot, value) in FRAME_WITNESS.iter().zip(witness.iter_mut()) {
+        *value = slot.load(Ordering::Relaxed);
+    }
+    (
+        FRAME_IMPLAUSIBLE.load(Ordering::Relaxed),
+        witness,
+        FRAME_ON_ENTRY.load(Ordering::Relaxed),
+    )
+}
+
+/// Which field of `frame` could not be returned through, if any.
+///
+/// # Why this is worth checking twice
+///
+/// An `iretq` through a corrupted frame faults **at the `iretq`** — the report
+/// names the entry stub, which is where every interrupt returns and therefore
+/// tells nobody anything. A `#GP` caught on 2026-08-29 said only
+/// *"referencing selector index 0x1325 in the GDT"*; which field held it, and
+/// whether it was already wrong when the interrupt arrived, the machine could
+/// not say.
+///
+/// **Deliberately not strict.** It rejects only what the processor itself
+/// cannot use — a non-canonical `rip`, a selector that is neither of the two
+/// this kernel installs, a clear `rflags.IF` where the frame says user mode —
+/// because a check that guessed at *policy* would fire on something legitimate
+/// and be turned off.
+fn implausible(frame: &TrapFrame) -> Option<&'static str> {
+    /// The kernel's own code selector, and the only one it ever returns to
+    /// ring 0 through.
+    const KERNEL_CS: u64 = 0x08;
+    /// Its stack selector.
+    const KERNEL_SS: u64 = 0x10;
+
+    let user = frame.cs & 3 != 0;
+    if !user && frame.cs != KERNEL_CS {
+        return Some("cs is neither the kernel's nor a user selector");
+    }
+    if !user && frame.ss != KERNEL_SS && frame.ss != 0 {
+        return Some("ss is not the kernel's, returning to ring 0");
+    }
+    if !canonical(frame.rip) {
+        return Some("rip is not a canonical address");
+    }
+    if !canonical(frame.rsp) {
+        return Some("rsp is not a canonical address");
+    }
+    // Bit 1 of `rflags` reads as one on every x86 since the 8086. A frame
+    // whose flags have it clear is not a frame the processor wrote.
+    if frame.rflags & 0x2 == 0 {
+        return Some("rflags bit 1 is clear, which no processor writes");
+    }
+    None
+}
+
+/// Whether `address` is one this processor could load — the halves of the
+/// address space, with the hole between them excluded.
+const fn canonical(address: u64) -> bool {
+    let top = address >> 47;
+    top == 0 || top == 0x1_ffff
 }
 
 /// Size of each interrupt stub, in bytes.

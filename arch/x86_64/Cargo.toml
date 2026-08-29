@@ -141,7 +141,12 @@ asm_budget = 37
 # registers are and how many there are, the pair of reads per record, and the
 # write-one-to-clear. The decoding is `FaultRecord::from_bits`, which is pure
 # and host-tested -- the register access is all that is charged here.
-unsafe_budget = 1162
+# 1165 for the interrupt-frame check: three reads of the frame the stub built
+# -- one on the way in, one on the way out, and one to copy the offending
+# fields out when they disagree. Each is the same `&*frame` the dispatch
+# already performs to reach the handler, and none of them can be safe: the
+# frame is a raw pointer to the stack the processor wrote.
+unsafe_budget = 1165
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

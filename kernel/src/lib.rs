@@ -3243,6 +3243,9 @@ fn queue_entry_released_on_death(cpu: u32, hhdm_base: u64) -> bool {
 
     if gone {
         println!("    queue cleanup  a thread killed while queued to send left no entry behind");
+        // Beside it, because both are about state that outlives the moment
+        // it was made -- and this one says nothing at all on a healthy boot.
+        implausible_frame_report();
         true
     } else {
         println!(
@@ -4270,6 +4273,30 @@ fn personality_boundary_report() {
 ///
 /// Returns the slot it went in, so the boot report can name it.
 /// What the reply that *parks* refused, and why — RFC 0054.
+/// What the interrupt-frame checks saw, if anything.
+///
+/// **Printed only when there is something to print.** A line saying "no frame
+/// was implausible" on every boot is one nobody reads by the third week, and
+/// the whole value here is that it appears exactly when the intermittent fault
+/// at `iretq` has left evidence behind.
+fn implausible_frame_report() {
+    let (count, witness, on_entry) = bhaskix_arch::trap::implausible_frames();
+    if count == 0 {
+        return;
+    }
+    let [vector, rip, cs, rflags, rsp, ss] = witness;
+    let when = if on_entry {
+        "already wrong when the interrupt arrived, so it was written before the dispatch"
+    } else {
+        "plausible on arrival and wrong on the way out, so it was written during the handler"
+    };
+    println!(
+        "\x1b[91m    frame check    {count} interrupt frame(s) this machine could not return \
+         through -- the first was {when}: vector {vector:#x}, rip {rip:#018x}, cs {cs:#x}, \
+         rflags {rflags:#x}, rsp {rsp:#018x}, ss {ss:#x}\x1b[0m"
+    );
+}
+
 fn park_refusals_report() {
     use core::sync::atomic::Ordering::Relaxed;
     let ungranted = syscall::PARK_UNGRANTED.load(Relaxed);

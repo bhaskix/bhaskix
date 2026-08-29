@@ -1123,6 +1123,45 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (the frame is watched now, at both ends of a dispatch)
+
+**The step the defect row named, taken.** An `iretq` through a corrupted frame
+faults *at the `iretq`* — the report names `isr_common`, which is where every
+interrupt in the machine returns and therefore tells nobody anything. The `#GP`
+caught this morning said only *"referencing selector index 0x1325 in the GDT"*:
+which field held it, and whether it was already wrong when the interrupt
+arrived, the machine could not say.
+
+**`bhaskix_trap_dispatch` checks the frame on the way in and on the way out.**
+That bracket is the point: arriving wrong means the corruption predates the
+dispatch, leaving wrong means it happened inside it. The first offending frame
+is kept whole — vector, `rip`, `cs`, `rflags`, `rsp`, `ss` — and the kernel
+prints it, because the arch crate is the bottom of the dependency order and has
+no console.
+
+**Deliberately not strict.** It rejects only what the processor itself cannot
+use: a non-canonical `rip` or `rsp`, a `cs` that is neither the kernel's nor a
+user selector, an `ss` that is not the kernel's on a return to ring 0, and
+`rflags` with bit 1 clear — which no x86 since the 8086 has ever written. A
+check that guessed at policy would fire on something legitimate and be turned
+off within a week.
+
+**And it says nothing on a healthy boot.** Watched red by injection: the line
+appears, names the end it failed at, and prints the frame. Reverted, it is
+silent — a line reporting "no frame was implausible" every boot is one nobody
+reads by the third week, and the entire value of this is that it appears exactly
+when there is something to see.
+
+**It is an instrument, not a fix.** The corruption is still unexplained, and the
+next specimen will now say which half of the dispatch it happened in.
+
+**Its cost, measured rather than waved at.** The check runs twice per interrupt,
+which is the hottest path in the machine. `test-boot-native-full` timed out at
+120 s on the suite run immediately after — and it was **host load, not the
+check**: the same lane run twice on an idle machine takes 37.1 s and 38.4 s, and
+a full suite on an idle machine is green. The earlier run overlapped three
+QEMUs left from a soak.
+
 ### 2026-08-29 (the fault is at `iretq`, and a segment base written on the wrong CPU)
 
 **Five investigations looked at what was running. It is the frame.** The second
