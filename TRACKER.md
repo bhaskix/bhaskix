@@ -1123,6 +1123,108 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (a third ring-station specimen, and it is the same word CI goes red on)
+
+**`make test` went red here, on the run that was meant to confirm the CI work
+above** -- `wait queues FAILED: 1 ring stations did not retire`, the intermittent
+this tracker has carried open since 2026-08-28. The serial log was kept.
+
+**Why this matters beyond the sched lane.** That line contains the word
+**`FAILED`**, and `shell-test.sh` scans the whole log for `FAILED` as one of four
+blanket markers. So this defect does not only fail the boot lane it is measured
+on: **it fails every lane it fires under, the `interactive shell` job included.**
+The 6%-of-pushes red rate reasoned about above is not a separate mystery needing
+its own hunt -- one of its causes was reproduced locally today.
+
+**What the third specimen adds.** The first two were counted, not read. This one
+names the thread: `cpu 0  thread 15  ring-3  fair Blocked  6377 runs (migrated)`
+while `ring-0` finished with 6483. So the station is **genuinely asleep**, not
+slow, not still spinning, and not unreaped -- and it had run six thousand times
+before it stopped, which rules out a station that never started.
+
+**Two mechanisms refuted by reading the code, so the next person does not
+re-tread them.**
+
+1. *A wake racing a migration.* `wake_with` walks the runqueues **one lock at a
+   time**, so a thread moved between queues mid-scan could be missed entirely --
+   which the `(migrated)` tag makes tempting. It cannot happen to this thread:
+   `steal_candidate` moves only `State::Ready`, by explicit rule, so a `Blocked`
+   station never migrates. The `(migrated)` tag is history, not concurrency.
+2. *A lost wakeup in the wait/wake handshake.* `wait_until` holds the waiters
+   lock across both the predicate and `enqueue_and_block`, and `wake_all` holds
+   that same lock across `take()` and `sched::wake` -- so a waker's scan falls
+   either wholly before or wholly after the sleeper's critical section, and
+   both orders are safe. The remaining window, between `mark_blocked` and the
+   switch, is closed by `block_self` rechecking the state **under the runqueue
+   lock** and counting a `RACES` when it finds it Ready.
+
+**So the handshake is not obviously broken, and that is the finding.** What is
+left is the possibility this tracker already suspects elsewhere: a `state` field
+corrupted by the same thing that corrupts an interrupt return frame. Both are
+rare, both are on this machine, and nothing yet ties them together -- **which is
+said as an open question, not as a fifth mechanism.** The specimen is kept, and
+the next step is to make the retire failure *say which station and what it was
+waiting on*, rather than to guess again.
+
+**One thing was fixed today that this specimen argued for.** Both blanket marker
+scans -- `shell-test.sh` and `boot-test.sh` -- reported only *which word* they
+found. They now print the offending line, because `linux stack FAILED`, `wait
+queues FAILED` and a `#GP` at `iretq` are three different pieces of work and the
+marker alone cannot tell them apart.
+
+### 2026-08-29 (the interactive-shell red is six runs old, and the frame check did not cause it)
+
+**The suspicion recorded below was tested and is wrong, so it is corrected here
+rather than left to stand.** Run 419 went red at the same job as 416, which made
+"the interrupt-frame check did it" look stronger. It is not: the job has failed
+at runs **324, 350, 354, 378, 416 and 419**, and *four of those six predate the
+check by ninety runs*. Six failures across runs 324-419 is about **6% of
+pushes**, and it has been that all along.
+
+**Two things were measured rather than argued.**
+
+*Cost.* The `user` lane timed three times with the check and three times with
+both `implausible` calls compiled out: **38.21 / 37.99 / 38.23s** against
+**38.60 / 38.39 / 38.33s**. The runs *without* the check were marginally slower,
+which is noise -- the honest reading is that two comparisons per interrupt do
+not show up in a 38-second lane at all. The check was restored and the revert
+asserted (`cargo fmt` has silently defeated three reverts this month).
+
+*Reproduction.* Thirty-six lane runs now, none red: `make test-shell` four times
+here (sixteen lanes on QEMU 4.2.1) and `user` and `iommu` four times each on
+**CI's own emulator**, QEMU 8.2.2 -- 22 and 53 gates, eight for eight. The
+`kernel` and `disk` modes still cannot run in that container, and that is still
+a gap in the evidence.
+
+**A way to read a failing CI job without a token, which this project did not
+know it had.** The logs are genuinely out of reach -- `GET /actions/jobs/{id}/logs`
+answers `403 Must have admin rights to Repository` even though this repository is
+public. But **per-step timings are free**, and `make test-shell` runs its four
+modes in sequence and stops at the first failure, so the step's *duration* says
+which mode died:
+
+| run | step | reading |
+|---|---|---|
+| green (415, 417, 418) | 136-139s | four modes, ~34s each |
+| 419 | **98s** | two modes done, died in the third -- `disk` |
+| 416 | **159s** | *longer* than a pass: died last, in `iommu` |
+
+**Two reds, two different modes** -- which is the shape of a rare per-boot event
+that can land anywhere, not of a broken assertion. `make test-shell` boots four
+times, so a fault at 1.6% per boot is a job red at 6% of pushes: the same
+magnitude as the per-boot intermittents this tracker already carries open (the
+interrupt-frame corruption at ~1/300, the hosted futex probe's null dereference
+at 1-2/300). **The likeliest reading is that this job's redness is those open
+faults being counted, not a defect of its own** -- and the shell lane is the
+most interrupt-dense thing here, which is where a frame corrupted at `iretq`
+would be expected to show first.
+
+**What this does not establish.** No specimen has been caught in the act: nothing
+above identifies which fault fired in 416 or 419, and the mode timings are an
+inference from duration, not a log. The claim is that the frame check is
+exonerated -- by four failures that happened before it existed -- and that the
+residue is already-open work, not that the residue is explained.
+
 ### 2026-08-29 (400 boots with the frame check, and a false FAILED of the harness's own making)
 
 **400 boots on one checksummed image with the interrupt-frame check live, and it
@@ -1187,6 +1289,11 @@ build, one red and one green, is a flake by the only definition that means
 anything: the same thing did both. It is not proof the check is innocent, and
 the honest shape of the claim is that nothing has reproduced the red in
 nineteen attempts across two emulators and two CI runs.
+
+**Corrected 2026-08-29 (see the entry above).** "Not proof the check is
+innocent" was the right caution and the wrong conclusion to leave standing: the
+same job failed at runs 324, 350, 354 and 378, all before this check was
+written. It did not cause this.
 
 ### 2026-08-29 (the frame is watched now, at both ends of a dispatch)
 
@@ -1306,7 +1413,8 @@ guessed at.
 
 **And the ring stations missing their four-second retire is now two sightings,
 not one** — the same shape as the 2026-08-16 delayed-wake row, twelve days after
-that row's root cause was fixed.
+that row's root cause was fixed. **Three as of 2026-08-29**, and the third
+is the first that was read rather than counted -- see the entry of that date.
 
 ### 2026-08-28 (the intermittent kernel fault, caught readable at last)
 

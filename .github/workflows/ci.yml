@@ -194,15 +194,47 @@ jobs:
       # user-mode shell's whole claim -- that it can do nothing it was not
       # given a capability for -- is a claim about what happens when someone
       # types at it.
-      - name: Type at both shells and assert on their replies
+      # **One step per mode, and the reason is that logs need a token and step
+      # names do not.** `make test-shell` runs `user`, `kernel`, `disk` and
+      # `iommu` in sequence and stops at the first failure, so as a single step
+      # a red said only "one of four modes died" -- and the mode had to be
+      # inferred from the step's *duration* (a 98s failure against a 136-139s
+      # pass meant the third one). Four steps put the answer in the job's step
+      # names, which `tools/ci-status.sh` reads unauthenticated.
+      #
+      # This job has gone red at runs 324, 350, 354, 378, 416 and 419 -- about
+      # 6% of pushes, four of them long before the interrupt-frame check that
+      # was briefly suspected. Each mode boots once, so the rate is consistent
+      # with the per-boot faults TRACKER carries open rather than with anything
+      # wrong here. Naming the mode is what turns the next one into evidence.
+      #
+      # **The cost of the split, stated rather than discovered later.** This no
+      # longer goes through `make test-shell`, so a fifth mode added to that
+      # target would not run here. The target is still what a developer runs;
+      # if it grows a mode, this list grows with it.
+      - name: Type at the ring 3 shell and assert on its replies
         env:
           # Same reasoning as the boot lane's budget above, and the same
-          # correction: this job went red once (run 324) without being
-          # reproducible locally, and it reaches its prompt in 13.7-28.3s on CI
-          # against 13.4-25.0s here -- **4% of this budget**. Whatever run 324
-          # was, it was not a timeout.
+          # correction: this job's first red (run 324) was not reproducible
+          # locally, and it reaches its prompt in 13.7-28.3s on CI against
+          # 13.4-25.0s here -- **4% of this budget**. It was not a timeout.
           SHELL_TEST_TIMEOUT: 600
-        run: make test-shell
+        run: tests/qemu/shell-test.sh user
+
+      - name: Type at the kernel shell and assert on its replies
+        env:
+          SHELL_TEST_TIMEOUT: 600
+        run: tests/qemu/shell-test.sh kernel
+
+      - name: Type at a shell whose filesystem came off the disk
+        env:
+          SHELL_TEST_TIMEOUT: 600
+        run: tests/qemu/shell-test.sh disk
+
+      - name: Type at a shell on a machine with the IOMMU on
+        env:
+          SHELL_TEST_TIMEOUT: 600
+        run: tests/qemu/shell-test.sh iommu
 
   faults:
     name: fault injection

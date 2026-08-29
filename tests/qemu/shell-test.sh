@@ -640,9 +640,15 @@ for check in "${checks[@]}"; do
 done
 
 # Nothing may have gone wrong on the way.
+# **The line, not just the marker.** These four match anywhere in the log, and
+# for years a hit said only *which word* was found -- so a red told you a boot
+# went wrong and nothing about how. The offending line is what distinguishes a
+# probe reporting `linux stack FAILED` from a `#GP` at `iretq`, and they want
+# different work. Truncated, because a fault dump is long and the first line of
+# it is the part that names the fault.
 for marker in "KERNEL PANIC" "EXCEPTION" "FAILED" "unexpected interrupt on vector"; do
     if grep -qF -- "$marker" "$LOG"; then
-        fail "'$marker' in the log"
+        fail "'$marker' in the log: $(grep -m1 -F -- "$marker" "$LOG" | tr -d '\r' | cut -c1-200)"
         status=1
     fi
 done

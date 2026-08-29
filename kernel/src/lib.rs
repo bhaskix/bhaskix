@@ -22838,6 +22838,41 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
              phase would measure a machine they are still competing on\x1b[0m",
             sched::threads_present_exact(&spawned)
         );
+        // **Which station, and what it was waiting on.** Three sightings of
+        // this failure were counted rather than read, and a count cannot tell
+        // the two candidate mechanisms apart. These numbers can:
+        //
+        // * `asleep` with the station's entry **still queued** (`sleepers` above
+        //   zero) means the retiring `wake_all` never took that entry -- it
+        //   enqueued after the phase was published without seeing it, which is
+        //   an ordering failure.
+        // * `asleep` with **no entry left** means the entry *was* taken and
+        //   `sched::wake` did not find the thread blocked at that instant, so
+        //   the wake was delivered to nobody. That is a lost wakeup, and the
+        //   window it implies is between `mark_blocked` and the switch.
+        //
+        // `token` and `phase` are printed because a station legitimately
+        // asleep on its turn looks identical to a stuck one without them.
+        for (id, name) in NAMES.iter().enumerate() {
+            let state = match sched::is_blocked(spawned[id]) {
+                Some(true) => "asleep",
+                Some(false) => "runnable, not chosen",
+                None => "gone",
+            };
+            println!(
+                "\x1b[91m                   {name} (thread {}) {state}, {} laps\x1b[0m",
+                spawned[id],
+                LAPS[id].load(Ordering::Relaxed)
+            );
+        }
+        println!(
+            "\x1b[91m                   token {}, phase {} (retire is above {PHASE_WAIT}), \
+             {} sleepers still queued, {} overflowed\x1b[0m",
+            TOKEN.load(Ordering::Acquire),
+            PHASE.load(Ordering::Acquire),
+            RING.waiting(),
+            RING.overflowed()
+        );
         ok = false;
     }
 

@@ -513,9 +513,11 @@ else
     status=1
 fi
 
+# The line the marker was found on, for the reason given at the same loop in
+# `shell-test.sh`: the marker names a category and the line names the fault.
 for marker in "${FAILURE_MARKERS[@]}"; do
     if grep -qF "$marker" "$LOG"; then
-        fail "found failure marker: $marker"
+        fail "found failure marker: $marker -- $(grep -m1 -F "$marker" "$LOG" | tr -d '\r' | cut -c1-200)"
         status=1
     fi
 done
