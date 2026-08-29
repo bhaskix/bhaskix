@@ -1339,6 +1339,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         park_refusals_report();
     }
 
+    // **Unconditional, unlike its neighbour, and deliberately.**
+    // `implausible_frame_report` sits inside the success branch of a self-test,
+    // so a boot where that test fails never prints it. This one is about the
+    // lock accounting, which is what is suspected of *causing* such failures --
+    // an instrument that only runs when nothing went wrong is the exact mistake
+    // 2026-08-29 spent a day finding three times. Silent when zero.
+    switched_holding_report();
+
     // Which shell the machine boots to. The user-mode one by default, because
     // it is the one that has to ask permission for everything it does;
     // `shell=kernel` on the command line selects the ring 0 one, which is a
@@ -4298,6 +4306,46 @@ fn personality_boundary_report() {
 /// was implausible" on every boot is one nobody reads by the third week, and
 /// the whole value here is that it appears exactly when the intermittent fault
 /// at `iretq` has left evidence behind.
+/// Whether any switch carried a thread off its CPU with a lock still held.
+///
+/// **Silent when zero, and that is the point.** A boot that never opens the
+/// window says so by printing nothing; a boot that does names the site, which
+/// is what three specimens of 2026-08-29 could not.
+fn switched_holding_report() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let count = sched::SWITCHED_WITH_OPEN_GUARD.load(Relaxed);
+    if count == 0 {
+        return;
+    }
+    let site = sched::GUARD_WITNESS_SITE.load(Relaxed);
+    let rank = sched::GUARD_WITNESS_RANK.load(Relaxed);
+    let age = sched::GUARD_WITNESS_AGE.load(Relaxed);
+    // SAFETY: the value is either zero, checked below, or an address stored
+    // from a `&'static Location` by the guard ledger and never freed.
+    let where_at = if site == 0 {
+        None
+    } else {
+        // SAFETY: non-zero here means the guard ledger stored the address of a
+        // `&'static Location`, which `#[track_caller]` gives it and which lives
+        // in the image for the life of the machine. Zero is the only other
+        // value the store can leave, and it is checked above.
+        Some(unsafe { &*(site as *const core::panic::Location<'static>) })
+    };
+    match where_at {
+        Some(at) => println!(
+            "\x1b[91m    switch holding {count} switch(es) carried a thread off its cpu with a \
+             lock still held -- preempt's veto read empty while it was not; the first was rank \
+             {rank}, open {age} cycles, taken at {}:{}\x1b[0m",
+            at.file(),
+            at.line()
+        ),
+        None => println!(
+            "\x1b[91m    switch holding {count} switch(es) carried a thread off its cpu with a \
+             lock still held; no site was recorded\x1b[0m"
+        ),
+    }
+}
+
 fn implausible_frame_report() {
     let (count, witness, on_entry) = bhaskix_arch::trap::implausible_frames();
     if count == 0 {

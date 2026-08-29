@@ -2736,6 +2736,55 @@ fn preempt_reporting() -> bool {
         return true;
     }
 
+    // **The counter-check on that veto, and the reason is three specimens.**
+    //
+    // The veto above asks `holds_any()` and declines to switch out a lock
+    // holder. Everything below this line switches -- so if that predicate can
+    // read *empty* while a lock is genuinely held, this is the instant the
+    // damage is done: a thread holding the wait queue's lock is carried off the
+    // CPU and nothing releases it.
+    //
+    // That is not idle worry. The accounting is already known to disagree with
+    // itself in the *other* direction: `run-221` (2026-08-29) had a rank mask
+    // remembering a rank with no open guard, and `run-244` had `holds_any()`
+    // answering true while the mask and the count both read zero. One fault
+    // that made it wrong here would explain `run-106`'s hang -- a waker
+    // spinning on a lock whose holder is no longer running -- and the two ring
+    // stations whose wake was consumed while they were off-CPU.
+    //
+    // **The guard ledger is the independent witness**, kept by the guards
+    // themselves rather than by the mask and count this is checking. Eight
+    // slots, so the scan is eight relaxed loads on a path that already takes a
+    // runqueue lock.
+    //
+    // **Aged, and that is what stops it crying wolf.** `sync`'s own header
+    // warns of a two-instruction window where a rank is claimed before the
+    // count reflects it; a guard opened microseconds ago may legitimately not
+    // be counted yet. A guard open for longer than `GUARD_AGE_SUSPICIOUS`
+    // cycles is not that window.
+    {
+        let now = tsc::read();
+        let mut oldest: Option<(&'static core::panic::Location<'static>, u8, u64)> = None;
+        crate::sync::for_each_open_guard(cpu, |at, rank, since| {
+            let age = now.saturating_sub(since);
+            if age < GUARD_AGE_SUSPICIOUS {
+                return;
+            }
+            if oldest.is_none_or(|(_, _, best)| age > best) {
+                oldest = Some((at, rank, age));
+            }
+        });
+        // Only the first witness is kept: the first is the one that happened
+        // before anything else could have been disturbed by it.
+        if let Some((at, rank, age)) = oldest
+            && SWITCHED_WITH_OPEN_GUARD.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            GUARD_WITNESS_SITE.store(at as *const _ as u64, Ordering::Relaxed);
+            GUARD_WITNESS_RANK.store(u64::from(rank), Ordering::Relaxed);
+            GUARD_WITNESS_AGE.store(age, Ordering::Relaxed);
+        }
+    }
+
     // From here to the end of the switch, this must not be re-entered.
     //
     // `preempt` is reached two ways: from the timer interrupt, where delivery
@@ -3371,6 +3420,32 @@ pub fn wedge_own_runqueue() {
     }
     core::mem::forget(QUEUES[cpu].lock());
 }
+
+/// How old an open guard must be before it counts as evidence rather than as
+/// the bookkeeping window `sync`'s header describes.
+///
+/// A few thousand cycles is far beyond "a rank claimed two instructions before
+/// the count caught up" and far below anything a correct holder keeps a
+/// runqueue or wait queue lock for.
+const GUARD_AGE_SUSPICIOUS: u64 = 4_000;
+
+/// Switches made while the guard ledger still showed an aged open guard.
+///
+/// Non-zero means `preempt`'s veto was asked and answered "holds nothing" while
+/// something was held -- the direction that carries a lock holder off its CPU.
+pub static SWITCHED_WITH_OPEN_GUARD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// The first such guard: its `&'static Location` as an address, its rank, and
+/// how old it was. Only the first, because the first is the one that happened
+/// before anything else could have been disturbed by it.
+pub static GUARD_WITNESS_SITE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// The rank of the guard in [`GUARD_WITNESS_SITE`].
+pub static GUARD_WITNESS_RANK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// How many cycles that guard had been open.
+pub static GUARD_WITNESS_AGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// What a report could learn about the running thread without waiting.
 ///

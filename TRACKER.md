@@ -1123,6 +1123,48 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (the veto's blind spot, instrumented and watched red)
+
+**`preempt` refuses to switch out a lock holder by asking `sync::holds_any()`.
+Everything after that question switches** -- so if the predicate can read
+*empty* while a lock is genuinely held, that instant is where a thread holding
+the wait queue's lock is carried off its CPU and nothing releases it. That is
+the one mechanism that would explain all three of the day's specimens at once.
+
+**The guard ledger is an independent witness**, kept by the guards themselves
+rather than by the mask and count being checked. `preempt` now scans it right
+after the veto passes: eight relaxed loads, on a path that already takes a
+runqueue lock. A guard older than `GUARD_AGE_SUSPICIOUS` (4000 cycles) is past
+the two-instruction window `sync`'s header warns about, so it is evidence rather
+than noise. `SWITCHED_WITH_OPEN_GUARD` counts them and the boot report names the
+first -- rank, age and acquisition site -- **printed only when non-zero**.
+
+**Placed unconditionally, and that is deliberate.** `implausible_frame_report`
+sits inside the success branch of a self-test, so a boot where that test fails
+never prints it. An instrument about the lock accounting -- which is what is
+suspected of *causing* such failures -- must not be reachable only when nothing
+went wrong. That mistake was found three separate times today.
+
+**Watched red by injecting the exact corrupt state**: take a lock, leak the
+guard, zero the count and the mask, then drive the scheduler. It fires --
+`4 switch(es) carried a thread off its cpu with a lock still held ... rank 16,
+open 12167420 cycles` -- rank 16 being the lock the injection leaked. Reverted,
+a healthy boot prints nothing.
+
+**Two false trails on the way, both worth keeping.**
+
+*The build error I hid.* `make -s iso >/dev/null 2>&1` swallowed a
+`missing documentation` failure, so a boot ran a **stale image** and the
+instrument looked inert. That is the second stale-image false result of the day.
+Builds in a verification loop are now run with output visible.
+
+*Tickless made the first injection unreachable.* With only the boot thread
+runnable the timer is disarmed, so no tick ever enters `preempt`: the scan
+counter did not move at all across the injection window (13524 -> 13524) while
+interrupts were enabled and the accounting was corrupted exactly as intended.
+The injection had to call the scheduler directly. **An injection that cannot
+reach the code it tests reports "no bug" in the same words as a clean run.**
+
 ### 2026-08-29 (the retire diagnostic earns itself: the stuck station is the one holding the token)
 
 **Two `ring stations did not retire` failures in the first 136 boots of the
