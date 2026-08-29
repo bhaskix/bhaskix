@@ -1349,6 +1349,53 @@ fn fs_base_loaded() -> u64 {
         .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed))
 }
 
+/// Where a thread's newly-set `FS` base actually reaches the hardware.
+///
+/// **Pure, and on the host, for the reason `waited` is.** `set_fs_base` reads
+/// the global run queues and a per-CPU identifier, so the live function cannot
+/// run in a unit test -- and the distinction that matters is not the scan but
+/// this three-way choice, which was previously observable only by booting a
+/// machine and reading a counter. That is how the *first* version of it stayed
+/// wrong: it wrote whichever CPU happened to be executing the call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BaseReach {
+    /// The thread is running here, so the register can be written now.
+    LoadedHere,
+    /// The thread is running on another CPU, whose register this code must not
+    /// write. The base follows at that CPU's next switch, and until then the
+    /// thread runs in user mode with its old one -- the window counted by
+    /// [`FS_BASE_SET_ELSEWHERE`].
+    FollowsAtNextSwitch,
+    /// The thread is not the current thread of any queue, so it cannot be in
+    /// user mode, and its next switch-in loads the base before it runs.
+    NotRunning,
+}
+
+/// The choice above, given what the scan found.
+pub(crate) fn base_reach(
+    running: Option<u32>,
+    thread: u32,
+    queue_cpu: usize,
+    this_cpu: usize,
+) -> BaseReach {
+    if running != Some(thread) {
+        return BaseReach::NotRunning;
+    }
+    if queue_cpu == this_cpu {
+        BaseReach::LoadedHere
+    } else {
+        BaseReach::FollowsAtNextSwitch
+    }
+}
+
+/// How often a thread's `FS` base was set while it ran on **another** CPU.
+///
+/// See the branch that increments it: the register cannot be written from here,
+/// so the base does not reach the thread until that CPU's next switch, and the
+/// thread runs in user mode with its old base until then.
+pub static FS_BASE_SET_ELSEWHERE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Records a thread's `FS` base and loads it now, so the call that asked
 /// for it sees it on return.
 pub fn set_fs_base(thread: u32, base: u64) -> bool {
@@ -1382,9 +1429,36 @@ pub fn set_fs_base(thread: u32, base: u64) -> bool {
             //
             // Every other thread still gets it at its next switch, which is
             // where the base travels.
-            if running == Some(thread) && index == percpu::cpu_id() as usize {
-                // SAFETY: as `load_fs_base`.
-                unsafe { load_fs_base(base) };
+            match base_reach(running, thread, index, percpu::cpu_id() as usize) {
+                BaseReach::LoadedHere => {
+                    // SAFETY: as `load_fs_base`.
+                    unsafe { load_fs_base(base) };
+                }
+                BaseReach::FollowsAtNextSwitch => {
+                    // **The case the fix above does not cover, counted rather than
+                    // assumed away.** The target is running *right now*, on another
+                    // CPU, whose `IA32_FS_BASE` this code must not write. Its
+                    // record is updated, and the base reaches the register at that
+                    // CPU's next switch -- so between here and there the thread
+                    // runs in user mode with the old base, which for a thread that
+                    // never had one is zero.
+                    //
+                    // That is the shape of the fault still open at `rip
+                    // 0x500000a6`: `mov %fs:0x0,%rax` four instructions after
+                    // `arch_prctl(ARCH_SET_FS, ...)`, once or twice in three
+                    // hundred boots. The comment above already says it survived
+                    // because the thread "usually *is* switched before it runs
+                    // again" -- this counter is what turns that sentence into a
+                    // number. Zero across a soak refutes the mechanism; non-zero
+                    // makes it the first suspect and says how often the window
+                    // opens.
+                    //
+                    // Counting, not fixing: closing it means making the *other* CPU
+                    // load the register, which is an IPI and a design decision, not
+                    // an edit.
+                    FS_BASE_SET_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                BaseReach::NotRunning => {}
             }
             return true;
         }
@@ -4625,6 +4699,50 @@ mod tests {
         }
 
         assert_eq!(queue.threads[0].as_ref().unwrap().state, State::Blocked);
+    }
+
+    /// The `FS` base reaches the register now only when the thread is here.
+    ///
+    /// The middle arm is the one that matters: it is the window the fix of
+    /// 2026-08-29 left open, and it existed for a day as a branch nothing could
+    /// reach in a test. `set_fs_base` scans global queues, so this is where the
+    /// choice can be checked at all.
+    #[test]
+    fn a_base_is_loaded_here_only_for_a_thread_running_here() {
+        assert_eq!(
+            base_reach(Some(7), 7, 2, 2),
+            BaseReach::LoadedHere,
+            "the target is the current thread of this cpu's queue, so the \
+             register this code can write is the right one"
+        );
+    }
+
+    /// The counted window: current, but current *somewhere else*.
+    #[test]
+    fn a_base_set_for_a_thread_running_elsewhere_follows_at_its_next_switch() {
+        assert_eq!(
+            base_reach(Some(7), 7, 3, 0),
+            BaseReach::FollowsAtNextSwitch,
+            "writing IA32_FS_BASE here would put the value in this cpu's \
+             register and leave the running thread's untouched -- which is \
+             the bug fixed on 2026-08-29, not the one to reintroduce"
+        );
+    }
+
+    /// Not current anywhere is the safe case, and must not be counted as the
+    /// window: the thread cannot be in user mode, so its next switch-in loads
+    /// the base before it runs.
+    #[test]
+    fn a_base_for_a_thread_that_is_not_running_is_not_the_window() {
+        assert_eq!(base_reach(Some(9), 7, 0, 0), BaseReach::NotRunning);
+        assert_eq!(base_reach(None, 7, 0, 0), BaseReach::NotRunning);
+        assert_eq!(
+            base_reach(Some(9), 7, 3, 0),
+            BaseReach::NotRunning,
+            "a different thread running on another cpu is not this thread \
+             running on another cpu, and counting it would inflate the very \
+             number the window is being judged by"
+        );
     }
 
     /// A dying thread is still schedulable, which is the point of the flag

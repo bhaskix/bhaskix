@@ -1123,6 +1123,56 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (the FS base window the fix did not close, now counted)
+
+**Three more mechanisms refuted by reading, and one narrowed to a countable
+window.** The hosted futex probe's fault -- `rip 0x500000a6`, `mov %fs:0x0,%rax`
+four instructions after `arch_prctl(ARCH_SET_FS, ...)`, once or twice in three
+hundred boots -- means `IA32_FS_BASE` held zero when that instruction ran.
+
+Refuted:
+
+* **User mode rewriting its own base.** `WRFSBASE` would desync `FS_BASE_LOADED`
+  from the register and make the switch skip a load it needed. `CR4.FSGSBASE` is
+  not set anywhere in this tree, so the instruction faults in ring 3 instead.
+* **A zero base being skipped on switch.** The switch loads the arriving
+  thread's base *even when it is zero*, and compares against what the register
+  actually holds rather than against the departing thread's record. Both are
+  deliberate and commented as such.
+* **A shared kernel entry stack**, which would corrupt return frames rather than
+  segment bases, but was on the same list: `install_kernel_stack` writes both
+  `percpu::set_kernel_stack` and `gdt::set_privilege_stack` with the *incoming*
+  thread's stack on every switch, and `TSSES`/`GDTS`/`IST_STACKS` are per-CPU.
+
+**What is left is a window `set_fs_base` cannot close by itself.** It may only
+write the register of the CPU it is running on. When the target thread is
+running *right now on another CPU*, its record is updated and the register
+follows at that CPU's next switch -- and until then the thread is in user mode
+with its old base, which for a thread that never had one is zero. The existing
+comment already says the fault "survived because the thread usually *is*
+switched before it runs again; twice in three hundred boots it was not."
+
+**So it is counted.** `FS_BASE_SET_ELSEWHERE` increments on exactly that branch,
+and the boot report prints a `linux tls` line when it is non-zero. Zero across a
+soak refutes the mechanism; non-zero makes it the first suspect and says how
+often the window opens. **Counted, not fixed** -- closing it means making the
+other CPU load the register, which is an IPI and a design decision rather than an
+edit, and it should be argued before it is written.
+
+**The branch is proven reachable, by the pattern this file already uses for
+`waited`.** `set_fs_base` reads the global run queues and a per-CPU identifier,
+so it cannot run in a unit test -- and for a day the counted branch was one
+nothing could reach except by booting. The three-way choice is now
+`sched::base_reach`, pure and tested on the host: loaded here, follows at the
+next switch, or not running at all. Watched red twice -- inverting the CPU
+comparison fails the first two tests and leaves the third green, removing the
+not-running guard fails only the third -- so each test discriminates rather than
+merely passing beside the others. 250 host tests green.
+
+**Still unverified**: no boot has printed the `linux tls` line, because a soak
+owns the image and rebuilding under it is how the 2026-08-27 soak was
+invalidated. The decision is tested; the report path is not.
+
 ### 2026-08-29 (run 420 named its own failing mode, and the instrument's first version lied)
 
 **The step split paid off on the first red it saw.** Run 420 failed, and

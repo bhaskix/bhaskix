@@ -4167,6 +4167,25 @@ fn personality_boundary_report() {
              named, and none in the nucleus"
         );
     }
+    // **The window the `FS` base fix of 2026-08-29 did not close**, printed
+    // because the fault it belongs to is still open. `sched::set_fs_base` can
+    // only write the register of the CPU it runs on; a target running on
+    // *another* CPU gets its record updated and its register at that CPU's next
+    // switch, and until then it is in user mode with its old base. The fault at
+    // `rip 0x500000a6` -- `mov %fs:0x0,%rax` four instructions after
+    // `arch_prctl(ARCH_SET_FS, ...)` -- is exactly what that window produces.
+    //
+    // Printed only when non-zero, so a healthy boot report is unchanged and a
+    // soak that never opens the window says so by silence rather than by a line
+    // of zeroes nobody reads.
+    let elsewhere = sched::FS_BASE_SET_ELSEWHERE.load(core::sync::atomic::Ordering::Relaxed);
+    if elsewhere > 0 {
+        println!(
+            "\x1b[93m    linux tls      {elsewhere} FS base(s) set for a thread running on \
+             another cpu, so the register followed at that cpu's next switch rather than at \
+             once -- the window the rip 0x500000a6 fault would come through\x1b[0m"
+        );
+    }
     // **And every park that did not happen** — RFC 0054. A refused park loses a
     // wake and answers `EAGAIN` for a reason that is not the caller's, which at
     // a shell is a byte missing from a typed line. That is indistinguishable
