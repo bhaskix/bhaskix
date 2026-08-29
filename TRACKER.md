@@ -1123,6 +1123,70 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (300 boots, one hang, and the instrument built this morning cannot see it)
+
+**300 boots of the `bios` lane on one image, checksummed identical before and
+after: 299 passed and one hung.** No `FAILED` line, no canary, no fault report --
+the log simply stops. Kept as `run-155.log`.
+
+**Where it stops is the whole finding.** The last line is `migration  4 of its 4
+workers retired before the next phase`; the next line on a healthy boot is
+`wait queues  7589 laps around 4 cpus, slowest 1897; 12318 sleeps, 12322
+wakeups, 7 races`. So the machine died **inside `wait_queue_self_test`**, and
+this is a *hang*, not the "stations did not retire" failure counted twice
+before. Same test, different and worse manifestation.
+
+**One candidate eliminated immediately.** `wait_millis` is a bounded spin --
+`spins < 4_000_000_000` on a calibrated clock, a tick count otherwise -- so the
+two-second observation window cannot be where it stopped.
+
+**What is left all takes a lock**: `RING.wake_all` takes the waiters lock,
+`threads_present_exact` takes each runqueue lock, and every `println!` takes the
+console. `block_self` already documents this class in its own instrumentation --
+*"a thread that arrives here holding a lock is switched out still holding it,
+and if it is never chosen again nothing releases it. That is the bring-up
+stall"* -- and names one boot in thirty for the version it was measuring.
+
+**And the silence is itself evidence, in a direction that must not be
+misread.** A thread switched out holding the *console* lock makes every later
+`println!` block for ever. So "no `BLOCK HOLDING` line in the log" is **not**
+proof that no canary fired: the canary prints, and printing is the thing that
+may be stuck. Any reading of this specimen that treats absent output as absent
+events is wrong.
+
+**The instrument added this morning cannot see this failure, and that is worth
+stating plainly.** The retire diagnostic -- station, state, laps, token, phase,
+queued sleepers -- prints only inside `if !ring_retired`, which requires the
+test to *finish*. A machine that hangs inside it prints nothing at all. Built
+for the right defect, blind to this manifestation of it.
+
+**So the answer is breadcrumbs, not another sweep, and they are built.** A hang
+can only be located by output already emitted -- every line this test printed
+came *after* the thing that hung, which is why it printed none. There are now
+two lines: one when the stations exist and the window opens, one before the
+retire, which is where every remaining lock is taken.
+
+**Watched red by injecting a hang in each region**, which is the only way to
+test an instrument whose whole job is to survive a stall:
+
+| injected after | what the log ends on |
+|---|---|
+| breadcrumb A | `4 stations spawned; watching for 2000 ms` |
+| breadcrumb B | `retiring the ring: publishing the phase, then waking every station` |
+
+The two regions are now distinguishable, where before both produced a log ending
+at the *migration* line and said only "somewhere in this function". Neither line
+matches the gate's `laps around` pattern, and `test-boot` passes unchanged.
+
+**A false result on the way, kept because it is the instructive part.** The
+first attempt at the second injection printed a perfectly plausible measurement
+that was not one: `cargo fmt` had wrapped the breadcrumb's `println!` across
+three lines, the exact-match anchor missed, the `&&` chain broke before
+`make iso`, and the boot re-ran the *previous* injection's image. It looked like
+a result and was a stale image. That is the fourth time this month formatting
+has defeated an exact-match revert, and the reason every injection here asserts
+its anchor count before and after.
+
 ### 2026-08-29 (the FS base window the fix did not close, now counted)
 
 **Three more mechanisms refuted by reading, and one narrowed to a countable

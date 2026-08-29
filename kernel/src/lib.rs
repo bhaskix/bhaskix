@@ -22776,6 +22776,21 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         }
     }
 
+    // **A breadcrumb, and the reason is a specimen.** One boot in three hundred
+    // on 2026-08-29 stopped dead here: the last line was the migration report
+    // and the next line on a healthy boot is this test's summary, so the
+    // machine died *inside* this function and 120 seconds of silence said
+    // nothing about where. A hang can only be located by output already
+    // emitted -- every report this test prints comes *after* the thing that
+    // hung, which is why it printed none of them.
+    //
+    // Two lines, before the two regions that can stall. Neither matches the
+    // gate's pattern, which asks for `laps around`, so the assertion is
+    // untouched. This one says the stations exist and the window is starting;
+    // reaching it and not the next one puts the hang in the window or the
+    // counter reads that follow it.
+    println!("    wait queues    {RING_SIZE} stations spawned; watching for 2000 ms");
+
     // Generous, because the budget has to cover the slowest configuration
     // rather than the fastest. A cross-CPU wake waits for the target CPU's
     // next tick, and under UEFI the framebuffer console is slow enough that
@@ -22799,6 +22814,15 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // was missing is the other half: nothing checked they had actually gone.
     // The class phase that follows measures CPU shares, and a ring station
     // still runnable is a competitor it never accounted for.
+    // The second breadcrumb. Everything below this line takes a lock -- the
+    // waiters lock in `wake_all`, a runqueue lock per queue in
+    // `threads_present_exact`, and the console in any report -- and a thread
+    // switched out holding one of them never gives it back. Reaching this line
+    // and not the summary puts the hang there rather than in the window above.
+    println!(
+        "    wait queues    retiring the ring: publishing the phase, then waking every station"
+    );
+
     PHASE.store(PHASE_WAIT + 1, Ordering::Release);
     RING.wake_all();
     let ring_retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
