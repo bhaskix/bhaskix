@@ -155,7 +155,14 @@ done
 #
 # The first five are that family, in the order one tear produces them. The
 # rest are other families with the same habit of reporting without failing.
-CANARIES='COUNT UNDERFLOW|COUNT MISMATCH|BLOCK HOLDING|SAVED HOLDING|SAVED COUNT|INVARIANT VIOLATED|LOCK ORDER|IT IS RUNNING IN SOMEBODY ELSE'
+# **`frame check` and the fault lines are here because an instrument nobody
+# greps for is not an instrument.** The interrupt-frame check added on
+# 2026-08-29 records a frame the machine could not have returned through, and
+# the kernel prints it on a boot that otherwise completes -- so without these
+# patterns such a run counts as a pass, and `keep=0` then *deletes the log that
+# held the only specimen*. That is the exact failure this harness exists to
+# prevent, one level up.
+CANARIES='COUNT UNDERFLOW|COUNT MISMATCH|BLOCK HOLDING|SAVED HOLDING|SAVED COUNT|INVARIANT VIOLATED|LOCK ORDER|IT IS RUNNING IN SOMEBODY ELSE|frame check|FRAME CHANGED|kernel.s own bug'
 
 failed=0
 truncated=0

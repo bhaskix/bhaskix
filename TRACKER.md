@@ -1270,6 +1270,17 @@ futex zeros, no ring stations left behind. At roughly one fault in three hundred
 that is a coin-toss miss rather than evidence of a cure, and it is recorded as
 the former.
 
+**Qualified 2026-08-29, later the same day.** `soak-test.sh`'s canary list did
+not contain `frame check`, `FRAME CHANGED` or `kernel's own bug` until it was
+widened today -- so the *canary count* that run reported could never have shown
+any of them, whatever happened. The claim above is not thereby wrong: that run
+had a failing boot, so the harness kept its logs, and a direct grep over them
+would stand. Which of the two produced "it said nothing" is no longer
+recoverable -- the logs have since been cleaned from `/tmp`. **Read the weaker
+of the two readings**: the 400 boots bound the fault's rate and do not, on this
+evidence, bound the frame check's silence. The harness can report it from now
+on, and the next such number will mean what it says.
+
 **What the 400 did produce was one failure that was not the machine's.**
 `linux stack FAILED: argc 2, entry 0x0, random 0x0 0xacdf41ffe16ae64f` — argc
 right, entry zero, the *first* random word zero and the **second one correct**.
