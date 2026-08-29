@@ -1123,6 +1123,61 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (the retire diagnostic earns itself: the stuck station is the one holding the token)
+
+**Two `ring stations did not retire` failures in the first 136 boots of the
+1200-boot run, and this time the machine said what happened.** The diagnostic
+built this morning printed, and the two specimens agree exactly:
+
+```
+run-5   ring-0 retired 1150   ring-1 retired 1150   ring-2 retired 1150   ring-3 ASLEEP 1149
+        token 3, phase 3, 0 sleepers still queued, 0 overflowed
+run-97  ring-0 retired 952    ring-1 retired 952    ring-3 retired 951    ring-2 ASLEEP 951
+        token 2, phase 3, 0 sleepers still queued, 0 overflowed
+```
+
+**Three facts that did not exist before this instrument.**
+
+1. **The stuck station is the one holding the token.** Token 3, ring-3 asleep;
+   token 2, ring-2 asleep. Its own wait predicate -- `TOKEN == id` -- is
+   *already true*, and it is asleep regardless. It is not waiting for its turn;
+   it slept through it.
+2. **It is exactly one lap behind** the three that retired. One missed turn, not
+   a station that never ran.
+3. **Zero sleepers still queued**, which is the discrimination this diagnostic
+   was written to make. Recorded when it was built: an entry *still queued*
+   means the retiring `wake_all` never took it -- an ordering failure. **No
+   entry left means the entry was taken and the wake reached nobody.**
+
+**So it is a lost wakeup at the token handoff, and the retire only exposes it.**
+The station that passes the token does `TOKEN.store(next)` then `RING.wake_all()`;
+the next station's entry is consumed there. By the time the retire runs, there is
+no entry to take, so the phase never reaches the sleeper and it is never woken
+again by anything.
+
+**Which is a problem, because that handoff looks correct on paper.**
+`wait_until` holds the waiters lock across both the predicate and
+`enqueue_and_block`, and `wake_all` holds the same lock across `take()` and
+`sched::wake`, so the two are mutually exclusive and every interleaving was
+checked by hand on 2026-08-29 and came out safe. `block_self` re-checks the
+state under the runqueue lock and counts a `RACES` when it finds it `Ready`.
+
+**The hypothesis this now points at is the lock accounting, and it is a
+hypothesis.** `preempt` refuses to switch out a thread while `sync::holds_any()`
+is true. `run-244` showed that predicate answering *true* while every number
+read zero, and `run-221` showed a mask remembering a rank with no guard -- so the
+accounting is demonstrably capable of disagreeing with the locks. If it can be
+wrong in the other direction, `preempt` would switch out a thread **holding the
+waiters lock**, and both symptoms follow from that one fault: a waker left
+spinning on a lock its holder is no longer running to release (`run-106`'s hang),
+and a station marked blocked whose wake was consumed while it was off-CPU
+(these two).
+
+**Not established.** Three specimens, one mechanism that would explain all
+three, and no proof that the accounting fails in the direction required. What is
+now true is that the next occurrence of any of them arrives with the station,
+the token, the lap count and the queue depth attached.
+
 ### 2026-08-29 (third soak: no hang, and the lock accounting disagreeing with itself twice)
 
 **300 boots on the image carrying the fault-report fix, checksum identical
