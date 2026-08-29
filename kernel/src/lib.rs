@@ -22854,10 +22854,23 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         // `token` and `phase` are printed because a station legitimately
         // asleep on its turn looks identical to a stuck one without them.
         for (id, name) in NAMES.iter().enumerate() {
-            let state = match sched::is_blocked(spawned[id]) {
-                Some(true) => "asleep",
-                Some(false) => "runnable, not chosen",
-                None => "gone",
+            // **`is_blocked` alone mislabels a station that retired.** It
+            // answers `Some(false)` for every state that is not `Blocked` --
+            // `Finished` included -- so the first version of these lines called
+            // three *retired* stations "runnable, not chosen" and contradicted
+            // the count printed directly above them. `threads_present_exact`
+            // is what separates the two, because it ignores `Finished`.
+            //
+            // Found by the injection that watched this instrument go red, which
+            // is the whole reason for injecting rather than reasoning: the
+            // lines looked right until a station actually retired beside one
+            // that had not.
+            let live = sched::threads_present_exact(core::slice::from_ref(&spawned[id])) > 0;
+            let state = match (live, sched::is_blocked(spawned[id])) {
+                (true, Some(true)) => "asleep",
+                (true, _) => "runnable, not chosen",
+                (false, Some(_)) => "retired",
+                (false, None) => "retired and reaped",
             };
             println!(
                 "\x1b[91m                   {name} (thread {}) {state}, {} laps\x1b[0m",

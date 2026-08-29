@@ -1123,6 +1123,43 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (run 420 named its own failing mode, and the instrument's first version lied)
+
+**The step split paid off on the first red it saw.** Run 420 failed, and
+`ci-status.sh` -- still with no token -- reported not "one of four modes died"
+but the mode: **`interactive shell -- Type at a shell on a machine with the
+IOMMU on`**. No duration arithmetic. That is the seventh failure of this job
+(324, 350, 354, 378, 416, 419, 420, about 7% of pushes) and the **second in
+`iommu` specifically**, since run 416's 159s against a 136-139s pass had already
+pointed there. Two of seven in the longest mode is a hint and not yet a pattern,
+and it is written down as the former.
+
+**The new retire diagnostic was watched red by injection -- and the injection
+caught it lying.** With one station made never to exit, the first version
+printed all four stations as *"runnable, not chosen"*, including three that had
+retired: `sched::is_blocked` answers `Some(false)` for every state that is not
+`Blocked`, `Finished` among them. So the per-station lines contradicted the
+count directly above them, in exactly the situation the lines exist for.
+`threads_present_exact` separates the two, and the second injection reads:
+
+```
+wait queues  FAILED: 1 ring stations did not retire, ...
+             ring-0 (thread 12) retired, 910 laps
+             ring-1 (thread 13) retired, 910 laps
+             ring-2 (thread 14) retired, 910 laps
+             ring-3 (thread 15) runnable, not chosen, 800547 laps
+             token 0, phase 3 (retire is above 2), 0 sleepers still queued, 0 overflowed
+```
+
+which matches the thread table line for line. **The contrast with the real
+defect is the point**: injected, the stuck station is *running* and has spun to
+800,547 laps; on 2026-08-29 the genuine one was **asleep at 6,377**. The
+instrument can tell those apart, which is what the next specimen needs it to do.
+
+**Worth keeping as a general note.** This is the second time this month that an
+injection did not merely confirm a check but corrected it. A check that has only
+ever been reasoned about is a check whose output has never been read.
+
 ### 2026-08-29 (a third ring-station specimen, and it is the same word CI goes red on)
 
 **`make test` went red here, on the run that was meant to confirm the CI work
