@@ -1123,6 +1123,77 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (1200 boots: the fault caught with its registers, and the hypothesis weakened)
+
+**1200 boots, one image, checksum identical either side, and the pre-flight
+confirmed the instruments were actually in it** (`LockHeld x2, breadcrumb x1`) --
+the check that soak 3 got wrong. 1197 passed.
+
+| finding | count |
+|---|---|
+| kernel fault, machine halted (`run-1109`) | 1 |
+| `LOCK ORDER` rank 9 on rank 9, **with an open guard** | 1 (same boot) |
+| `BLOCK HOLDING`, mask 0 and count 0, `wait.rs:221` (`run-600`) | 1 |
+| ring stations did not retire (`run-237`, `run-1111`) | 2 |
+| **`switch holding`** -- the instrument built hours earlier | **0** |
+
+**The day's central claim is now proven in the wild.** The fault report was
+repaired this morning after it was found deadlocking on the faulting CPU's own
+runqueue lock; `gp-held` proved that deterministically, and every soak since had
+produced no real fault to try it on. `run-1109` did, and the report printed
+**everything**:
+
+```
+cpu 3 thread Thread(12); frame at 0xffffa000000ed7e0; error 0x11 cr2 0xffffffffca1f4b28
+EXCEPTION: page fault (#PF)
+  rip 0xffffffffca1f4b28   cs 0x0008   = kernel+0x131b28 in the image
+  protection violation while reading in kernel mode, on an instruction fetch
+  ... sixteen registers, cr0/cr2/cr3/cr4, and the stack ...
+```
+
+Days of soaks produced banners. This one produced a specimen.
+
+**What the specimen says. `rip` equals `cr2`, and the fault is on an instruction
+fetch** -- so control was transferred to `0xffffffffca1f4b28` and the machine
+faulted *fetching* there. This is not a bad pointer being dereferenced; it is a
+bad **jump**. Beside it, printed from another CPU, is
+`UNEXPECTED INTERRUPT on vector 0xf00000018a483c6` -- a trap frame whose vector
+field holds two unrelated halves. **That is frame corruption, observed
+directly**, and it is the same story `THE FRAME CHANGED UNDER THE HANDLER` and
+the `#GP` at `iretq` have been telling since 2026-08-25.
+
+**And a same-rank lock violation, with both sites named**, fired between
+breadcrumb A and B -- during the ring's ordinary token traffic, not the retire:
+`blocking on wait::WaitQueue (rank 9) at wait.rs:232` with
+`open guard rank 9 acquired at wait.rs:195`. Those are `wake_all` and
+`wait_until` respectively.
+
+**The hypothesis this weakens is my own.** The theory from earlier today was
+that `preempt`'s veto reads empty while a lock is held, carrying a holder off
+its CPU -- one fault explaining the hang and both lost wakeups. The instrument
+built to catch exactly that **did not fire once in 1200 boots**, including the
+boot that faulted. That is evidence against it, and it is recorded as evidence
+against it.
+
+**What the specimen suggests instead**, and it is a suggestion: the lock
+accounting may be a *victim* rather than the cause. A trap frame with a garbage
+vector, a jump to an unmapped address, a rank mask disagreeing with its guards,
+and a station whose wake was consumed are all consistent with **one corruption
+scribbling on kernel state**, of which the bookkeeping is simply the most
+instrumented witness. `switch holding` reading zero fits that better than it
+fits the accounting being independently wrong.
+
+**Two cautions on reading `run-1109`.** The log says *"another cpu is still
+reporting; this one waited and is printing anyway"*, so the line order is
+**not** causal order -- the `LOCK ORDER` dump is interrupted mid-way by another
+CPU's banner. And both `wait_until` predicates in this kernel (`RING`'s and
+`RT_GATE`'s) are pure atomic loads, so the violation is not a caller waking a
+queue from inside a predicate; that was checked and ruled out rather than
+assumed.
+
+**Rates on this image**: fault 1 in 1200, zero-mask `BLOCK HOLDING` 1 in 1200,
+ring retire failure 2 in 1200.
+
 ### 2026-08-29 (the veto's blind spot, instrumented and watched red)
 
 **`preempt` refuses to switch out a lock holder by asking `sync::holds_any()`.
