@@ -1123,6 +1123,27 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (CI red once on the interactive shell, and not reproducible)
+
+**Run 416 failed at `interactive shell -- Type at both shells and assert on
+their replies`**, on the commit that added the interrupt-frame check. That check
+runs twice per interrupt, so "it changed timing" is the first thing to suspect
+and the first thing to test.
+
+**It does not reproduce.** All four `shell-test.sh` lanes pass locally — `user`,
+`kernel`, `disk`, `iommu` — and `make test-shell`, which is the four together
+and is what that job runs, passed **three times out of three**. On **CI's own
+emulator** (QEMU 8.2.2, via `tools/boot-on-ci-emulator.sh`, where this machine
+otherwise has 4.2.1) the `user` and `iommu` cells passed **three times each**;
+that tool cannot run the `kernel` or `disk` modes, which is a gap in the
+evidence and is said rather than glossed.
+
+**So: one red, unreproduced in twelve local lane runs and six on CI's
+emulator.** That is not enough to call it a flake and not enough to call it
+real. It is recorded here because this tracker has twice claimed "CI green"
+while it was not, and the correction each time was harder than the note would
+have been. The next push is the next data point.
+
 ### 2026-08-29 (the frame is watched now, at both ends of a dispatch)
 
 **The step the defect row named, taken.** An `iretq` through a corrupted frame
