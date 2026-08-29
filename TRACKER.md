@@ -1123,6 +1123,51 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (third soak: no hang, and the lock accounting disagreeing with itself twice)
+
+**300 boots on the image carrying the fault-report fix, checksum identical
+either side: 298 passed.** No hang this time, and **no `EXCEPTION` at all** -- so
+the fix's claim that a real `#GP` will now print its registers is still
+**untested in the wild**. `gp-held` proves it deterministically; this run did not
+get the chance to. Said plainly rather than counted as support.
+
+**What did appear is the lock accounting contradicting itself, in a second
+form.** `run-244`:
+
+```
+BLOCK HOLDING  a thread blocked holding locks (mask 0b000000, 0 held), at wait.rs:221
+  open guard   none -- the counted hold has no open guard, which is itself the answer
+```
+
+**Mask zero, count zero -- and the line fired anyway.** It is guarded by
+`held_mask() != 0 || holds_any()`, so `holds_any()` was true when it was asked
+and both numbers read zero by the time the message formatted. The 2026-08-18
+specimen of this line had mask zero and count *one*; this one has zero and zero,
+which is further from consistent, not nearer.
+
+**Two specimens, two soaks, one family.** `run-221` had a mask remembering a
+rank with no guard; `run-244` has a predicate true while every number says
+empty. Both are `sync`'s bookkeeping disagreeing with the locks it describes,
+and both were caught at a `wait.rs` line where a thread takes a lock, drops it,
+and blocks. **They are not proven to be one defect** -- and through `preempt`'s
+veto, either shape is a hang mechanism.
+
+**A third intermittent, recorded not chased.** The RFC 0057 gate failed twice:
+`two sources FAILED: by signal 0x102, by deadline 0x101, leftover [false,
+false]` (`run-163`) and the same with **`by signal 0x103`** (`run-95`). Two
+things are off, not one: the leftover pair should show the losing deadline still
+armed and shows neither, and one run's signal word is `0x103` where the gate
+expects `0x102`. 2 in 300.
+
+**A near-miss in this run's own harness, kept because it nearly discarded a
+valid soak.** The pre-flight check meant to prove the fix was in the image
+printed `WARNING: LockHeld not found`. It was there -- twice. Under
+`set -o pipefail`, `strings ... | grep -q PATTERN` reports *failure* on a
+**successful** match, because `grep -q` exits at the first hit and `strings`
+dies of `SIGPIPE`. The previous soak's check used process substitution and so
+never saw it. A guard that fails closed on success is worse than no guard: this
+one argued for throwing away an hour of valid boots.
+
 ### 2026-08-29 (a new intermittent: the reclaim gives back the slot but not the port)
 
 **`make test` went red once on the `iommu` boot lane**, on a gate added earlier
