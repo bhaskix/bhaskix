@@ -1142,7 +1142,14 @@ evidence and is said rather than glossed.
 emulator.** That is not enough to call it a flake and not enough to call it
 real. It is recorded here because this tracker has twice claimed "CI green"
 while it was not, and the correction each time was harder than the note would
-have been. The next push is the next data point.
+have been.
+
+**The next data point came, and it is green.** Run 417 carries the *same kernel
+code* — it adds only this note — and passed, that job included. Two runs of one
+build, one red and one green, is a flake by the only definition that means
+anything: the same thing did both. It is not proof the check is innocent, and
+the honest shape of the claim is that nothing has reproduced the red in
+nineteen attempts across two emulators and two CI runs.
 
 ### 2026-08-29 (the frame is watched now, at both ends of a dispatch)
 
