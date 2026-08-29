@@ -1313,27 +1313,78 @@ impl FxArea {
     }
 }
 
+/// What each CPU's `IA32_FS_BASE` actually holds.
+///
+/// **The register, not a thread's record of it.** The switch path used to skip
+/// its MSR write when the arriving thread's base matched *the departing
+/// thread's `fs_base` field* — a fair proxy for the hardware only while nothing
+/// else could write the register behind it. Something could: [`set_fs_base`]
+/// wrote it from whichever CPU happened to be executing, so a cross-CPU set
+/// left one CPU's record and its register disagreeing, and the next switch
+/// there could skip a write it needed.
+///
+/// Tracking the register itself makes the comparison true by construction.
+static FS_BASE_LOADED: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Puts `base` in this CPU's `IA32_FS_BASE` and records that it is there.
+///
+/// # Safety
+///
+/// `IA32_FS_BASE` is a segment base for *user* accesses: every access through
+/// it is a user-mode access under the caller's own page table, so a wrong value
+/// faults the caller and reaches nothing of the kernel's.
+unsafe fn load_fs_base(base: u64) {
+    // SAFETY: the caller's obligation, restated above.
+    unsafe { bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, base) };
+    if let Some(slot) = FS_BASE_LOADED.get(percpu::cpu_id() as usize) {
+        slot.store(base, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What this CPU's `IA32_FS_BASE` holds, as last loaded.
+fn fs_base_loaded() -> u64 {
+    FS_BASE_LOADED
+        .get(percpu::cpu_id() as usize)
+        .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed))
+}
+
 /// Records a thread's `FS` base and loads it now, so the call that asked
 /// for it sees it on return.
 pub fn set_fs_base(thread: u32, base: u64) -> bool {
-    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+    for (index, queue) in QUEUES
+        .iter()
+        .take(percpu::online_count() as usize)
+        .enumerate()
+    {
         let mut queue = queue.lock();
         let running = queue.threads[queue.current].as_ref().map(|t| t.id);
         if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
             target.fs_base = base;
-            // **Loaded only for the thread that is on this CPU right now.**
-            // The register is one per CPU and the value belongs to a thread,
-            // so writing it for anybody else would hand this CPU's current
-            // thread a base that is not its own -- which became reachable the
-            // moment a supervisor could set another thread's TLS from
-            // outside it (RFC 0032 step 9). Every other thread gets it at its
-            // next switch, which is where the base travels.
-            if running == Some(thread) {
-                // SAFETY: `IA32_FS_BASE` is a segment base for *user*
-                // accesses; every access through it is still a user-mode
-                // access under the caller's own page table, so a wrong value
-                // faults the caller and reaches nothing of the kernel's.
-                unsafe { bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, base) };
+            // **Loaded only when the thread is running on *this* CPU**, and
+            // the emphasis is the fix.
+            //
+            // The register is one per CPU. The old test asked whether the
+            // target was the *current* thread of the queue being scanned —
+            // which is another CPU's queue as often as not — and then wrote the
+            // register of whichever CPU was executing this call. So a
+            // supervisor setting a hosted thread's TLS from its own CPU put the
+            // value in **its** register and left the target's untouched: the
+            // hosted thread returned to user mode and read `%fs:0x0` through a
+            // base that was still zero.
+            //
+            // That is the fault localised on 2026-08-28 from a soak specimen —
+            // a ring-3 null dereference at `rip 0x500000a6`, which
+            // disassembles to `mov %fs:0x0,%rax` four instructions after
+            // `arch_prctl(ARCH_SET_FS, …)`. It survived because the thread
+            // usually *is* switched before it runs again, and the switch path
+            // loads the base properly; twice in three hundred boots it was not.
+            //
+            // Every other thread still gets it at its next switch, which is
+            // where the base travels.
+            if running == Some(thread) && index == percpu::cpu_id() as usize {
+                // SAFETY: as `load_fs_base`.
+                unsafe { load_fs_base(base) };
             }
             return true;
         }
@@ -2792,7 +2843,9 @@ fn preempt_reporting() -> bool {
         // The floating-point file travels with the thread: saved out of the
         // CPU for whoever is leaving, restored for whoever is arriving.
         // This is `CR4.OSFXSR`'s promise being kept.
-        let leaving_base = queue.threads[current].as_ref().map_or(0, |t| t.fs_base);
+        // What the *register* holds, not what the departing thread's record
+        // says it should -- see `FS_BASE_LOADED`.
+        let leaving_base = fs_base_loaded();
         if let Some(from_thread) = queue.threads[current].as_mut() {
             // SAFETY: 512 aligned bytes belonging to the thread being
             // switched away from, and this is its last instant on the CPU.
@@ -2812,10 +2865,8 @@ fn preempt_reporting() -> bool {
             // holds, which is the leaving thread's, so the common case where
             // neither uses TLS still writes no MSR.
             if to_thread.fs_base != leaving_base {
-                // SAFETY: as `set_fs_base` -- a user-mode segment base.
-                unsafe {
-                    bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, to_thread.fs_base)
-                };
+                // SAFETY: as `load_fs_base` -- a user-mode segment base.
+                unsafe { load_fs_base(to_thread.fs_base) };
             }
         }
         if let (Some(from_thread), Some(to_thread)) = (
@@ -3454,7 +3505,8 @@ pub fn block_self() {
                 // As above: the note is about the incoming thread and is
                 // taken whether or not the outgoing slot still holds one.
                 // As above: the floating-point file travels with the thread.
-                let leaving_base = queue.threads[current].as_ref().map_or(0, |t| t.fs_base);
+                // As the other site: the register, not a record of it.
+                let leaving_base = fs_base_loaded();
                 if let Some(from_thread) = queue.threads[current].as_mut() {
                     // SAFETY: as the other switch site.
                     unsafe { bhaskix_arch::cpu::fx_save(from_thread.fx.0.as_mut_ptr()) };
@@ -3467,12 +3519,7 @@ pub fn block_self() {
                     // included, against what the CPU already holds.
                     if to_thread.fs_base != leaving_base {
                         // SAFETY: as above.
-                        unsafe {
-                            bhaskix_arch::msr::write(
-                                bhaskix_arch::msr::IA32_FS_BASE,
-                                to_thread.fs_base,
-                            )
-                        };
+                        unsafe { load_fs_base(to_thread.fs_base) };
                     }
                 }
                 if let (Some(from_thread), Some(to_thread)) = (
