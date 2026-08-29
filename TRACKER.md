@@ -1123,6 +1123,43 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (400 boots with the frame check, and a false FAILED of the harness's own making)
+
+**400 boots on one checksummed image with the interrupt-frame check live, and it
+said nothing** — no `frame check`, no `kernel's own bug`, no `FRAME CHANGED`, no
+futex zeros, no ring stations left behind. At roughly one fault in three hundred
+that is a coin-toss miss rather than evidence of a cure, and it is recorded as
+the former.
+
+**What the 400 did produce was one failure that was not the machine's.**
+`linux stack FAILED: argc 2, entry 0x0, random 0x0 0xacdf41ffe16ae64f` — argc
+right, entry zero, the *first* random word zero and the **second one correct**.
+
+That shape is impossible from a probe that ran wrong and obvious from a **torn
+read**. The reader takes four separate loads of the report page and broke out of
+its poll as soon as *either* random word was non-zero:
+
+```
+if answers[2] != 0 || answers[3] != 0 { break; }
+```
+
+So it sampled the third word before the probe stored it and the fourth after,
+and reported a failure for a probe that was working. It waits for **every** word
+the probe writes now — entry and both random words — which the old condition
+permitted to be missing and the new one cannot.
+
+**Not gated by a reproduction, and that is said rather than implied.** The race
+is one boot in four hundred and cannot be summoned; the justification is the
+specimen's exact signature, which the old condition allows and the new one
+forbids. The `&& false` mutation only makes the poll run its full two seconds,
+which proves nothing about the condition.
+
+**It is the third time this session that a probe's *reader* was the bug**, after
+the migration test sleeping over its workers and my own socket probes needing a
+completion marker as their last store. The rule the three of them teach: a
+report page is only readable when the last thing written to it is visible, and
+"any field is set" is not that.
+
 ### 2026-08-29 (CI red once on the interactive shell, and not reproducible)
 
 **Run 416 failed at `interactive shell -- Type at both shells and assert on

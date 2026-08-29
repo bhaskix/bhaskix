@@ -7502,7 +7502,23 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
                     core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
                 ]
             };
-            if answers[2] != 0 || answers[3] != 0 {
+            // **Every word the probe writes, not any one of them.**
+            //
+            // These four loads happen at four instants, and the probe fills the
+            // page as it walks the auxv — `AT_ENTRY` into the second word, then
+            // `AT_RANDOM`'s two into the third and fourth, in whatever order
+            // the auxv itself lists them. Breaking on *either* random word let
+            // a half-written page out: a boot on 2026-08-29 read `argc 2`, a
+            // zero entry, a zero first random word and a **correct second
+            // one** — the reader having sampled the third word before the probe
+            // stored it and the fourth after. It reported `linux stack FAILED`
+            // for a probe that was working.
+            //
+            // Zero is a safe sentinel for all three: the entry is a load
+            // address this kernel chose, and the two random words are compared
+            // against the entropy below, which is drawn per boot. A boot that
+            // drew a zero there would already be reporting a broken generator.
+            if answers[1] != 0 && answers[2] != 0 && answers[3] != 0 {
                 break;
             }
         }
