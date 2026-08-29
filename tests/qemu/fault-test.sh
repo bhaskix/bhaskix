@@ -57,6 +57,23 @@ while writing'
 kernel stack overflow
 guard page
 own IST stack'
+  # **The one that tests the reporter rather than the report.**
+  #
+  # `gp-held` raises the same #GP as `gp`, but with this CPU's own runqueue lock
+  # already held. That used to wedge the machine: the report read the running
+  # thread through a *blocking* lock, spun for ever on a lock the same CPU was
+  # holding, and printed nothing after its banner. `run-106` of 2026-08-29 is
+  # that log, and `run-80` and `run-312` are most likely the same thing.
+  #
+  # So the assertion is not that the banner is right -- `gp` covers that -- but
+  # that the lines *after* it exist at all. `thread LockHeld` proves both halves:
+  # the report got past the read, and it said so instead of inventing a thread.
+  # Reverting `running_now` to `current_thread_id` fails this at the second line.
+  [gp-held]='EXCEPTION: general protection fault (#GP)
+thread LockHeld
+error code
+selector index'
+
   # The odd one out, and the only one whose point is what happens *next*.
   #
   # The first six are kernel faults and every one of them ends the machine, so
@@ -82,7 +99,7 @@ Nothing left to do at this milestone'
 )
 
 FAULTS=("$@")
-[[ ${#FAULTS[@]} -eq 0 ]] && FAULTS=(de ud bp gp pf df user)
+[[ ${#FAULTS[@]} -eq 0 ]] && FAULTS=(de ud bp gp gp-held pf df user)
 
 # Anything here means the machine did not survive to report cleanly.
 FATAL_MARKERS=(

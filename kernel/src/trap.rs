@@ -784,7 +784,14 @@ fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
     // vector costs one word and the alternative cost a specimen.
     {
         let cpu = bhaskix_arch::percpu::cpu_id();
-        let thread = crate::sched::current_thread_id();
+        // **`running_now`, not `current_thread_id`, and it is the difference
+        // between a report and a wedge.** The blocking one takes this CPU's
+        // runqueue lock, so a fault taken while this CPU already held it spun
+        // for ever on a lock it was itself holding -- and the report died here,
+        // one line after the banner, with everything worth reading still
+        // unprinted. `run-106` of 2026-08-29 is that log; `run-80` and
+        // `run-312` are most likely the same thing read as console trouble.
+        let thread = crate::sched::running_now();
         let cr2 = read_cr2();
         // SAFETY: reading CR3 at CPL 0 has no side effects.
         let cr3 = unsafe { bhaskix_arch::paging::active_page_table() };
@@ -826,8 +833,8 @@ fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
     // is not the space this thread is supposed to be in, that is the fault, and
     // whatever the address looks like is a consequence.
     if frame.from_user_mode()
-        && let Some(me) = crate::sched::current_thread_id()
-        && let Some((name, expected)) = crate::sched::describe(me)
+        && let crate::sched::Running::Thread(me) = crate::sched::running_now()
+        && let Some((name, expected)) = crate::sched::describe_now(me)
     {
         // SAFETY: reading CR3 at CPL 0 has no side effects.
         let loaded = unsafe { bhaskix_arch::paging::active_page_table() };

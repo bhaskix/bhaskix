@@ -62,6 +62,15 @@ pub enum Fault {
     /// A page fault in ring 3 (#PF, vector 14), which ends a domain and not
     /// the machine.
     UserMode,
+    /// A #GP taken while this CPU holds its own runqueue lock.
+    ///
+    /// The shape that wedged the fault report on 2026-08-29: the report read
+    /// the running thread through a blocking runqueue lock, so a fault raised
+    /// with that lock already held spun for ever on a lock the same CPU was
+    /// holding, and the log stopped one line after the banner. This makes that
+    /// deterministic, so the report's own guarantee -- that it prints what it
+    /// knows before it halts -- has something that can falsify it.
+    GeneralProtectionHoldingRunqueue,
 }
 
 impl Fault {
@@ -76,6 +85,7 @@ impl Fault {
             "pf" => Self::PageFault,
             "df" => Self::DoubleFault,
             "user" => Self::UserMode,
+            "gp-held" => Self::GeneralProtectionHoldingRunqueue,
             _ => return None,
         })
     }
@@ -112,6 +122,10 @@ pub fn trigger(fault: Fault) -> bool {
         Fault::InvalidOpcode => invalid_opcode(),
         Fault::Breakpoint => breakpoint(),
         Fault::GeneralProtection => general_protection(),
+        Fault::GeneralProtectionHoldingRunqueue => {
+            crate::sched::wedge_own_runqueue();
+            general_protection();
+        }
         Fault::PageFault => page_fault(),
         Fault::DoubleFault => double_fault(),
         // Handled by the kernel proper: it needs a domain, a loader and a

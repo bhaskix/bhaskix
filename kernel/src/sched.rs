@@ -3353,9 +3353,98 @@ pub fn for_each_verdict(mut f: impl FnMut(u32, u32, &'static str, State, u64, u6
     }
 }
 
+/// Takes this CPU's runqueue lock and never gives it back.
+///
+/// **Fault injection only**, and it exists to make a deadlock deterministic
+/// rather than one boot in three hundred. The fault report used to read the
+/// current thread through a *blocking* runqueue lock, so a fault raised while
+/// this CPU already held that lock spun for ever on a lock it was itself
+/// holding and printed nothing after its banner. Reproducing that needed a
+/// fault taken with the lock held, which is what this arranges.
+///
+/// The guard is deliberately leaked: the machine is about to fault and halt,
+/// and a lock released on the way out would not reproduce anything.
+pub fn wedge_own_runqueue() {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    core::mem::forget(QUEUES[cpu].lock());
+}
+
+/// What a report could learn about the running thread without waiting.
+///
+/// Three answers, because a report must distinguish them: the thread, no
+/// thread, and *could not tell*. Collapsing the last into `None` would print
+/// "no thread" for a CPU that has one, which is a lie in the one place lying is
+/// least affordable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Running {
+    /// The identifier of the thread this CPU is running.
+    Thread(u32),
+    /// The queue was readable and holds no current thread.
+    Nobody,
+    /// The runqueue lock was held, so the question went unanswered.
+    LockHeld,
+}
+
+/// [`current_thread_id`], for a path that must never block.
+///
+/// **`try_lock`, and the reason is a specimen.** `sync`'s rule is that anything
+/// reachable from an interrupt uses `try_lock`; `preempt`, `wake_from_interrupt`
+/// and `block_self` all obey it and the fault report did not. It called
+/// `current_thread_id`, which takes this CPU's runqueue lock *blocking* -- so a
+/// fault taken while that same CPU already held that lock spun for ever on a
+/// spinlock it was itself holding, and the report stopped dead after its banner.
+///
+/// That is where `run-106` of 2026-08-29 stopped, and it reframes `run-80` and
+/// `run-312`, both of which died within five lines of the banner and were read
+/// as console trouble. The interrupt-return path is where the scheduler runs,
+/// which is exactly where this fault has been localised since `isr_common+0x57`
+/// resolved to `iretq` -- so the report was most likely to deadlock precisely
+/// when it had something worth saying.
+#[must_use]
+pub fn running_now() -> Running {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return Running::Nobody;
+    }
+    let Some(queue) = QUEUES[cpu].try_lock() else {
+        return Running::LockHeld;
+    };
+    let current = queue.current;
+    match queue.threads[current].as_ref() {
+        Some(thread) => Running::Thread(thread.id),
+        None => Running::Nobody,
+    }
+}
+
+/// [`describe`], for a path that must never block.
+///
+/// Worse than the one above if left blocking: `describe` locks *every* queue,
+/// so it can wedge on any CPU's held lock rather than only this one. A queue it
+/// cannot read is skipped -- a report that names three of four queues is worth
+/// more than one that names none.
+#[must_use]
+pub fn describe_now(thread: u32) -> Option<(&'static str, u64)> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let Some(queue) = queue.try_lock() else {
+            continue;
+        };
+        if let Some(found) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return Some((found.name, found.space_root));
+        }
+    }
+    None
+}
+
 /// The identifier of the thread running on this CPU.
 ///
 /// `None` before this CPU has a runqueue.
+///
+/// **Blocking, so not for anything reachable from an interrupt** -- see
+/// [`running_now`], which exists because this one deadlocked a fault report
+/// against a lock the faulting CPU was already holding.
 #[must_use]
 pub fn current_thread_id() -> Option<u32> {
     let cpu = percpu::cpu_id() as usize;

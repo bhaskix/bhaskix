@@ -1123,6 +1123,165 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-29 (a new intermittent: the reclaim gives back the slot but not the port)
+
+**`make test` went red once on the `iommu` boot lane**, on a gate added earlier
+this session:
+
+```
+socket reclaim FAILED: held true, reaped true, same slot true,
+                       bound again false (fd 1, bind 1), forgets 1
+```
+
+**Read `bind 1`.** `socket::NO_PORT` is 1, so the rebind was refused *because the
+port was still taken* -- not because the socket was missing, not because the
+slot was gone. The first three clauses say the reclaim worked: the socket was
+held, the domain was reaped, and the same slot came back. So **the slot is
+returned and the port binding is not**, at least sometimes. That is a different
+leak from the one RFC 0058 closed, and it is the shape a gate can only catch
+because it re-binds rather than merely counting slots.
+
+**One sighting in seven.** It did not reproduce in six consecutive runs of that
+lane afterwards. It is recorded as a sighting with its exact numbers, not as a
+diagnosis, and it is **not** attributable to the fault-report work in the same
+change -- that touches only `report_exception` and paths reachable from it, and
+this gate exercises neither.
+
+**Not chased today**, deliberately: two specimens from the soak are already open
+above with named mechanisms, and starting a third hunt would leave all three
+half-done.
+
+### 2026-08-29 (second soak: a specimen for the defect that had none in 450 boots)
+
+**300 boots, image checksum identical either side, breadcrumb string verified
+present in the image before the run: 298 passed, and the two that did not are
+different faults.** The first is `run-106`, written up below. The second is new
+and it matters more.
+
+**`run-221` produced a specimen of the hold-count leak**, which this tracker has
+carried open with the words *"left no specimen in 450 boots"*:
+
+```
+LOCK ORDER  blocking on wait::WaitQueue (rank 9) while holding mask 0b1000000000,
+            at kernel/src/wait.rs:195
+  open guard none -- the counted hold has no open guard, which is itself the answer
+```
+
+**Read the second line before the first.** Mask bit 9 is the `WaitQueue` rank,
+so at face value this is a same-rank double acquisition -- two locks of one rank,
+which `sync` says can close a cycle as easily as an inversion. It is not that.
+**There is no open guard.** The mask remembers a rank that nothing holds, which
+makes this the *bookkeeping* defect rather than a nesting defect, and the guard
+ledger built for exactly this question is what distinguishes them. The
+instrument earned its place here.
+
+**Why a stale mask is a hang and not a cosmetic complaint.** `preempt` vetoes
+whenever `sync::holds_any()` is true -- deliberately, so a lock holder is never
+switched out. A mask or count that never clears is therefore a CPU that vetoes
+**every** preemption for ever. `preempt`'s own comment already reaches for this:
+*"the run-123 specimen is a CPU that ran nothing it was handed for two seconds
+while its resched IPIs arrived and, by some path, did nothing."*
+
+**Where to look, and it is not `wait.rs:195` itself.** That line is where the
+violation was *detected*, not where the mask was corrupted. The suspect is the
+save and restore of `held_locks`/`held_count` across a context switch: the mask
+travels with the thread, and `wait_until` is a place a thread takes a lock,
+releases it, and then blocks -- so a switch lands between the drop and the
+accounting on a path that runs thousands of times a boot. That is a hypothesis
+with a named mechanism and a place to look, not a fifth guess about what was
+running.
+
+**Both specimens are in the same region.** `run-106` hangs in the retire, which
+is `wake_all`; `run-221` trips at `wait_until`. Same wait queue, same boot phase,
+two different symptoms of lock accounting that does not match the locks. They may
+be one defect. **That is not established**, and saying so is the point.
+
+**Rates from this run, on one image**: hang 1 in 300, stale-mask canary 1 in 300.
+The previous 300-boot run on the previous image gave 1 hang and no canary --
+though that harness could not have reported the frame-check signatures either,
+so the comparison is weaker than it looks.
+
+### 2026-08-29 (the breadcrumbs paid on the first soak, and the fault report has been hiding the fault)
+
+**The hang recurred, and the new breadcrumb caught it.** Second 300-boot soak,
+same image throughout, breadcrumb string verified present in the image before
+the run started. `run-106.log` ends on the *second* breadcrumb -- so the
+stations were spawned, the two-second window completed, the counters were read,
+and the machine died **in the retire**. Yesterday's version of this log ended on
+the `migration` line and meant "somewhere in this function".
+
+**And it is not merely a hang. It is the #GP, caught in the act:**
+
+```
+    wait queues    4 stations spawned; watching for 2000 ms
+
+==================================================================
+  EXCEPTION: general protection fault (#GP)
+==================================================================
+    wait queues    retiring the ring: publishing the phase, then waking every station
+```
+
+Read the ordering carefully. The fault struck **during the observation window**,
+on a CPU that is not the boot CPU -- because breadcrumb B, printed by the boot
+thread, appears *after* the banner. The fault report then printed its banner and
+**stopped**. Nothing followed: no `cpu N thread ...` line, no registers, no
+`kernel's own bug`.
+
+**Why it stopped is the finding, and it is a defect in the diagnostic path
+itself.** Between the banner and the first data line, `report_exception` calls
+`cpu_id()`, **`sched::current_thread_id()`**, `read_cr2()` and
+`active_page_table()`. Exactly one of those can block:
+
+```rust
+pub fn current_thread_id() -> Option<u32> {
+    ...
+    let queue = QUEUES[cpu].lock();   // blocking
+```
+
+A fault taken **while that CPU already holds its own runqueue lock** therefore
+spins for ever on a spinlock the same CPU is holding. And the interrupt-return
+path is exactly where the scheduler runs -- which is where this fault has been
+localised since `isr_common+0x57` was resolved to `iretq`. `sched::describe`,
+called a few lines later, is worse: it locks *every* queue, so it can wedge on
+any CPU's held lock rather than only this one.
+
+**`sync`'s own rule says this is wrong**: *"anything reachable from an interrupt
+uses `try_lock`"*. The fault path is reachable from an interrupt. `preempt`,
+`wake_from_interrupt` and `block_self` all obey the rule; the report does not.
+
+**This reframes two earlier specimens rather than adding a third.** The report's
+own comments record run-80 stopping at its fifth line and run-312 cut off five
+lines in, and both were read as console trouble and harness truncation -- the
+answers were `enter_fatal()` and moving the densest line first. Those changes
+were not wrong, and they were not the cause. **The diagnostic has been
+suppressing the fault it exists to report**, which is why days of soaks produced
+banners and no registers.
+
+**No longer an inference: proven the same day, deterministically.** A new
+injection, `bhaskix.fault=gp-held`, takes this CPU's runqueue lock, leaks the
+guard, and raises the same `#GP` as `gp`. With the report's blocking read
+restored, the machine reproduces the specimen exactly -- and the lock checker,
+an instrument entirely independent of this reasoning, names it:
+
+```
+  EXCEPTION: general protection fault (#GP)
+  ==================================================================
+      LOCK ORDER  blocking on sched::QUEUES (rank 10) while holding mask 0b10000000000,
+                  at kernel/src/sched.rs:3454
+        open guard rank 10 acquired at kernel/src/sched.rs:3372
+```
+
+`3372` is the injected hold; `3454` is `current_thread_id`'s blocking
+`QUEUES[cpu].lock()`. The report deadlocks on a runqueue lock the same CPU is
+holding, one line after its banner. With `running_now` the same injection
+reports cleanly and the lane passes.
+
+**The gate is `gp-held`, in the fault lane's default list.** Its expectation is
+not that the banner is right -- `gp` covers that -- but that the lines *after*
+it exist: `thread LockHeld`, `error code`, `selector index`. Reverting
+`running_now` to `current_thread_id` fails it at the second line, which is how
+it was watched red.
+
 ### 2026-08-29 (300 boots, one hang, and the instrument built this morning cannot see it)
 
 **300 boots of the `bios` lane on one image, checksummed identical before and
@@ -1553,7 +1712,9 @@ each soak** — 60, then 90, then 300 — which is the discipline the invalidate
 | `wait queues FAILED: ring stations did not retire` | **2** | 1 in 225 |
 | `linux futex FAILED` with an all-zero report | **2** | 1 in 225 |
 
-**The hold-count underflow left no specimen in 450 boots.** That row says *"the
+**The hold-count underflow left no specimen in 450 boots.** **One arrived
+2026-08-29**, in the second 300-boot soak: a rank mask with no open guard, at
+`wait.rs:195`. See that date's entry; the bound below stands as a bound. That row says *"the
 next specimen names its owner"* — three canaries were built for it on
 2026-08-18, watched red by injection, and on this build none of them fired. That
 is a bound rather than a fix, and it is worth writing down before somebody
