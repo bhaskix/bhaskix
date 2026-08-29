@@ -1123,6 +1123,56 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (a second 1200 boots: the hypothesis is refuted, and the ring signature is five for five)
+
+**A second 1200-boot run, checksum stable throughout: 1197 passed.** Three
+self-test failures, no canary, no exception, no hang.
+
+**`switch holding` has now read zero in 2400 boots**, including the boot that
+faulted. That instrument was built specifically to catch `preempt`'s veto
+answering "holds nothing" while a lock was held -- the one mechanism that would
+have explained the hang and both lost wakeups together. **It never fired.** The
+hypothesis is not weakened now; it is refuted for practical purposes, and the
+honest reading is that the lock accounting is not being wrong in the direction
+that carries holders off their CPUs.
+
+**The ring signature is five for five.** Every specimen examined --
+`run-5`, `run-97`, `run-237`, `run-477`, `run-840` -- shows the same three
+things: the sleeping station **is the token holder**, its entry is **already
+consumed** (`0 sleepers still queued`), and the station that handed it the token
+has one extra lap. `run-477`: token 1, ring-1 asleep at 728 while ring-0 retired
+at 729. `run-840`: token 0, ring-0 asleep, the rest retired.
+
+So the defect is a **lost wakeup at the token handoff**, established by
+repetition rather than by one log: the waker takes the sleeper's entry and the
+sleeper never wakes, leaving a thread whose own predicate is already true asleep
+for ever. The retire merely discovers it.
+
+**Combined rates over 2400 boots**, on two builds of identical kernel source:
+
+| | |
+|---|---|
+| `switch holding` | 0 |
+| kernel fault, readable | 1 |
+| `LOCK ORDER` rank 9 on rank 9, with an open guard | 1 |
+| `BLOCK HOLDING`, mask 0 and count 0 | 1 |
+| ring stations did not retire | 4 |
+| RFC 0057 two sources | 1 |
+
+**One caveat on "the same image".** The two soaks ran on ISOs with *different*
+hashes although the kernel source between them changed only in documentation --
+the image embeds something that varies per build. Each run was internally
+stable, which is what makes its own numbers valid; but they are two builds, not
+one, and the combined table should be read as such.
+
+**Where this leaves the hunt.** The corruption is real and now readable: a jump
+to an unmapped address and a trap frame with a garbage vector. The lock
+bookkeeping anomalies are rarer than the ring failures and, with `switch
+holding` at zero, no longer have a mechanism connecting them to the lost wakeup.
+**The next work is the token handoff itself** -- five identical specimens is
+enough to stop hypothesising about accounting and start reading the handoff for
+a window that a shared lock does not close.
+
 ### 2026-08-29 (1200 boots: the fault caught with its registers, and the hypothesis weakened)
 
 **1200 boots, one image, checksum identical either side, and the pre-flight
