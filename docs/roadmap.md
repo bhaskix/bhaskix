@@ -504,7 +504,7 @@ production readiness. The word for what this is, and the word the release notes 
 | R4 | Networking answers on both address families, measured | met (RFC 0018–0029) |
 | R5 | **Boots on one piece of real hardware** | ✅ **met 2026-08-23** — the report was read off a Lenovo SR550, and its RT wake latency (worst 1.532 µs against a 50 µs target) is the first hardware measurement this project has. One machine of one model, and nothing has run on it longer than a boot |
 | R6 | The design documents reviewed by two people who did not write them | **not met** — Phase 0's own criterion |
-| R7 | A release note that states the gaps above as plainly as the features | to write |
+| R7 | A release note that states the gaps above as plainly as the features | **drafted 2026-08-30** — [release-notes.md](release-notes.md). Every figure in it is dated and must be re-measured on the day |
 
 **R5 and R6 are the two that decide what the release can say.** If they are still unmet on the day,
 the release ships and says so — a preview that boots only under emulation, reviewed by one person,
