@@ -1124,6 +1124,35 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (a number in the release note went stale within hours of being written)
+
+**The principle from this morning was "a number copied is a number
+unverified". Applied to the rest of the release note, it caught one
+immediately, and it was mine.** The note claimed **1092 host unit tests**; the
+count is **1093**, because four tests were added the same afternoon -- three for
+`wait::fate` and one for the deadline-slot release.
+
+**Every other countable claim in it was re-checked and holds**: 119 gates on the
+BIOS boot lane, 22 and 53 on the two shell modes, and **42 of 59 RFCs accepted**,
+re-derived from the RFC headers rather than trusted.
+
+**The interesting part is what *not* to do about it.** The obvious response --
+extend this morning's gate to police the test count -- is wrong. That number
+changes with almost every commit, so gating it would force an edit to the
+release note each time anybody adds a test. It trades a stale number for a worse
+habit: a document edited mechanically to satisfy a check is a document nobody
+reads carefully.
+
+**So the class matters.** A *toolchain version* changes rarely, deliberately,
+and in one commit -- gating it costs nothing and catches a real lie, which is
+why `check-doc-versions.py` exists. A *count* changes constantly and
+incidentally; the honest handling is to date it and re-measure before release,
+which the note already required and now says why, citing this incident by name.
+
+**Recorded because the distinction is the useful part**, not the off-by-one.
+The next person tempted to gate every number in a document should read this
+first.
+
 ### 2026-08-30 (the gate for it, built rather than left as a note)
 
 The entry below recorded a version-consistency check as *worth doing rather than

@@ -8,6 +8,14 @@ number below is a measurement, and every measurement has a date. **They must be
 re-taken on the day** — a release note that ships three-month-old figures is
 making claims it has not checked.
 
+**That is not a formality.** The test count in this document went stale within
+*hours* of being written, because four tests were added the same afternoon. Some
+of these figures change with almost every commit, and gating them would force an
+edit to this file each time a test is added — which trades a stale number for a
+worse habit. So they are dated instead, and re-measuring them is the last step
+before release, not an optional one. The commands are in [Running it](#running-it);
+the counts come from `make test` and `cargo test --workspace`.
+
 ---
 
 ## What this is
@@ -47,7 +55,7 @@ document, release note or README may state or imply that it works."*
 | Loads and runs a real static Linux binary; BusyBox `sh` reaches a prompt and answers what is typed at it | `busybox-test.sh` |
 | **Boots on physical hardware** — a Lenovo SR550, read over serial-over-LAN | 2026-08-23 |
 
-Alongside: **1092 host unit tests**, and **42 of 59 RFCs accepted**, each
+Alongside: **1093 host unit tests**, and **42 of 59 RFCs accepted**, each
 accepted one implemented and measured rather than merely written.
 
 ---
