@@ -236,6 +236,83 @@ jobs:
           SHELL_TEST_TIMEOUT: 600
         run: tests/qemu/shell-test.sh iommu
 
+  boot-iommu:
+    name: boot (iommu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain
+
+      - name: Install QEMU, xorriso
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 xorriso mtools
+
+      - name: Record the environment
+        run: |
+          {
+            qemu-system-x86_64 --version
+            echo "--- intel-iommu support ---"
+            qemu-system-x86_64 -device help 2>&1 | grep -i intel-iommu || echo "no intel-iommu device"
+          } | tee ci-env-iommu.txt
+
+      - name: Fetch Limine
+        run: |
+          git clone --branch v8.x-binary --depth 1 \
+            https://github.com/limine-bootloader/limine.git boot/limine/limine
+          make -C boot/limine/limine
+
+      - name: Build bootable image
+        run: make iso
+
+      # **The only lane in CI that has a filesystem service**, and that is the
+      # whole reason it is here.
+      #
+      # `bin/fsd` mounts a disk through `bin/blkd`, and the block driver is
+      # only given its device once that device has a DMA window -- so no IOMMU
+      # means no window, no block service, no filesystem, and every gate that
+      # needs one skips. Until this job, CI ran `bios` and `uefi` only, and
+      # both of those skip: the hosted file, directory and `execve` gates, the
+      # `fs domain` mount, the lending measurement and the disk-backed shell
+      # checks were **verified by developers locally and by nothing on a
+      # push**. A gate nothing runs is a gate that goes stale without saying
+      # so.
+      #
+      # It also runs the IOMMU itself -- per-device windows, interrupt
+      # remapping, and the pass-through decisions RFC 0043 and RFC 0049 made --
+      # which `iommu-off` deliberately does not, because turning off a unit
+      # that is not there proves nothing.
+      #
+      # **`max` and not both CPU models.** The boot matrix runs `qemu64` and
+      # `max` because they take two different APIC paths; that split is already
+      # covered there, on the same kernel. What is uncovered is the filesystem,
+      # which does not depend on the APIC model -- so this runs one model, and
+      # it is the one every local run of this lane has used.
+      #
+      # **The flake risk, measured before this was added rather than
+      # discovered after.** See TRACKER's entry for the day this job landed:
+      # this lane carries gates that no other lane runs, and it also carries
+      # the networking gates the other lanes already run. A red here should be
+      # read against the open defects in §3 before it is read as a regression.
+      - name: Boot with an IOMMU and a filesystem, and assert on serial output
+        env:
+          QEMU_CPU: max
+          BOOT_TEST_TIMEOUT: 300
+          BHASKIX_BOOT_LOG: boot-iommu.log
+        run: tests/qemu/boot-test.sh iommu
+
+      - name: Upload the boot log and image on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bhaskix-iommu-failed
+          path: |
+            boot-iommu.log
+            ci-env-iommu.txt
+            build/bhaskix.iso
+            target/x86_64-unknown-none/release/bhaskix
+          retention-days: 7
+
   faults:
     name: fault injection
     runs-on: ubuntu-latest

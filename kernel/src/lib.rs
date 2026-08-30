@@ -18391,8 +18391,28 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // same parser the host tools use, and drained from by the filesystem
     // service one page at a time. At slot 21, mapped where the shell says.
     {
-        let staging = shared::create(realm, 16 * bhaskix_mm::FRAME_SIZE)
-            .map_err(|_| "the shell's package staging memory would not be created")?;
+        // **The reason is carried, not discarded.** `map_err(|_| ...)` threw
+        // away which of five limits was hit, and on 2026-08-30 that cost a
+        // boot: RFC 0059 added one memory object, the table's margin went from
+        // four slots to three, and a boot that exhausted it reported only
+        // "would not be created" -- so a global slot shortage looked exactly
+        // like this domain's envelope refusing, which has a different fix.
+        let staging =
+            shared::create(realm, 16 * bhaskix_mm::FRAME_SIZE).map_err(|error| match error {
+                shared::MemoryError::Exhausted => {
+                    "the shell's package staging memory would not be created: no memory-object \
+                     slot left (raise shared::MAX_OBJECTS -- the boot report prints the peak)"
+                }
+                shared::MemoryError::QuotaExceeded => {
+                    "the shell's package staging memory would not be created: the shell's own \
+                     envelope will not cover sixteen pages"
+                }
+                shared::MemoryError::OutOfMemory => {
+                    "the shell's package staging memory would not be created: the physical \
+                     allocator had nothing"
+                }
+                _ => "the shell's package staging memory would not be created",
+            })?;
         let named = shared::name(staging).map_err(|_| "the staging memory would not be named")?;
         if domain::with(realm, |owner| owner.cspace.install_at(21, named).is_ok()) != Some(true) {
             return Err("the staging memory would not install");

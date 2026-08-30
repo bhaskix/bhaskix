@@ -36,13 +36,28 @@ use crate::sync::{Rank, SpinLock};
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 /// Memory objects that can exist at once.
-pub const MAX_OBJECTS: usize = 40;
+pub const MAX_OBJECTS: usize = 48;
 // Raised from 16 on 2026-08-12, from 24 on 2026-08-15, and from 32 on
 // 2026-08-18, each **measured full before being raised**: 16 of 16 on the
 // boot that refused the DHCP client's memory, 24 of 24 on the boot that
 // refused the TCP client's listener rings (RFC 0020 step 5 gives it four),
 // and 32 of 32 on the shell-test's iommu machine when RFC 0029 step 4's
 // udp6 client asked for its two pages.
+//
+// **Raised from 40 on 2026-08-30, and this one was measured by a failure
+// rather than by a full table.** RFC 0059 gave the Linux adapter a staging
+// object for `execve`, which took the peak on the `iommu` lane from 36 of 40
+// to **37 of 40** -- a three-slot margin against a number that varies with how
+// many probe domains have been reaped by the time the shell starts. One boot
+// in twelve then exhausted it, and what failed was not the new object at all:
+// it was `bin/shell`'s package staging, sixteen pages asked for later, so the
+// machine booted with **no user-mode shell** and hung waiting for one.
+//
+// That is the shape worth remembering. A table this close to full does not
+// fail where the last user is added; it fails at whoever asks next, which is
+// how a change to the Linux personality produced a missing shell. The margin
+// is eleven now (37 of 48), and the boot report prints the peak on every boot
+// so the next person does not have to take this comment's word for it.
 //
 // Worth contrasting with `MAX_DOMAINS` on the same day, which was raised from
 // 32 to 64 on a misread failure and measured 9 of 64 when somebody finally
