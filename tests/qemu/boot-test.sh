@@ -163,7 +163,34 @@ run_until() {
     return 0
 }
 
-fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2; }
+# **A failure that CI can read without a token.**
+#
+# Job logs need admin rights on this repository and so do artifacts -- both
+# answer 403 or 401 unauthenticated, which is why `TRACKER.md` carries "CI log
+# access" as a standing limitation. **Annotations are different**: their text is
+# readable by anyone, and `::error::` on stdout is how a step creates one.
+#
+# So every failed assertion emits its own text as an annotation, and
+# `tools/ci-status.sh` prints them. A red run then says *which gate* failed
+# rather than only which job -- the difference between "boot (bios, qemu64)
+# failed" and the sentence naming the thing that went wrong. Run 446 of
+# 2026-08-30 is why: a docs-only commit turned a boot lane red, the log was
+# uploaded exactly so it could be read, and nobody without credentials could
+# read it.
+#
+# Only under Actions, so local output is untouched. One line, ANSI stripped,
+# because an annotation is a single line and colour codes in it are noise.
+github_annotation() {
+    [[ "${GITHUB_ACTIONS:-}" == "true" ]] || return 0
+    local text
+    text=$(printf '%s' "$*" | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' ' ')
+    printf '::error::%s\n' "$text"
+}
+
+fail() {
+    printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2
+    github_annotation "$*"
+}
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 
 [[ -f "$ISO" ]] || { fail "$ISO not found -- run 'make iso' first"; exit 1; }

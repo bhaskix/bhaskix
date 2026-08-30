@@ -736,7 +736,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 |---|---|---|
 | ~~M1-17~~ | ✅ **MET 2026-08-23.** The boot report was read off the SR550 — 19,550 bytes over serial-over-LAN once the kernel wrote to **both** UARTs, and the `serial` line read by a person typing `dmesg` before that. The blocker was reshaped three times — a machine, then a capture, then somebody able to read it — and none of those was the answer: the machine has two serial ports and this kernel only ever probed one. | Tarun Kumar Kushwaha |
 | Repo metadata | GitHub description and topics are unset, and `main` has no branch protection — `GOVERNANCE.md` §2 requires review for non-trivial changes and nothing enforces it. Deploy keys have no API scope, so these need the web UI. | Tarun Kumar Kushwaha |
-| CI log access | ~~Reading Actions logs needs authentication; unauthenticated API gives 60 requests/hour and only pass/fail.~~ **Both halves true, and the conclusion drawn from them was wrong (corrected 2026-08-24).** Pass/fail is available **per job**, unauthenticated -- and the *name of the failing job* is nearly the whole diagnosis: `clippy` red with every other job green points at one command a developer runs locally in seconds. What a token buys is the **log**, which is the last mile and not the first. `tools/ci-status.sh` now asks for exactly what is free and says plainly when it is rate-limited, rather than printing nothing and letting silence read as success. A token would still help and is still wanted; it is no longer what stands between this project and knowing `main` is red. | Tarun Kumar Kushwaha |
+| CI log access | ~~Reading Actions logs needs authentication; unauthenticated API gives 60 requests/hour and only pass/fail.~~ **Both halves true, and the conclusion drawn from them was wrong (corrected 2026-08-24).** Pass/fail is available **per job**, unauthenticated -- and the *name of the failing job* is nearly the whole diagnosis: `clippy` red with every other job green points at one command a developer runs locally in seconds. What a token buys is the **log**, which is the last mile and not the first. `tools/ci-status.sh` now asks for exactly what is free and says plainly when it is rate-limited, rather than printing nothing and letting silence read as success. A token would still help and is still wanted; it is no longer what stands between this project and knowing `main` is red. **Extended 2026-08-30: the gate's own words are free too.** Job logs answer `403 Must have admin rights` and artifacts answer `401`, even on a public repository -- so a boot log uploaded *specifically so a red lane could be read* could not be read. **Annotation text can.** The harnesses now emit every failed assertion as `::error::`, which becomes an annotation, and `tools/ci-status.sh` prints them when `main` is red. A red run says *which gate* failed and not merely which job. The channel was already in use here for `::notice::` timings; this is the same trick pointed at failures. A token is still wanted for the full log; it now buys the *context around* a failure rather than the failure itself. | Tarun Kumar Kushwaha |
 
 ## 4. Upcoming work
 
@@ -1127,6 +1127,41 @@ prompt without a newline and then waits for a key. That last flush point is what
 makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
+
+### 2026-08-30 (run 446 went red on a docs-only commit, and could not be read)
+
+**A boot lane failed on a commit that edits two Markdown files.** `boot (bios,
+qemu64) -- Boot and assert on serial output`, run 446. The change cannot boot
+anything, so it is one of the intermittents this file now lists -- but *which*
+one was unknowable.
+
+**What CI gave for free:** the step failed after **38s** against a 120s budget,
+so a gate failed rather than the machine hanging; and `Upload the boot log and
+image on failure` **succeeded**, so the evidence existed.
+
+**And could not be read.** Artifacts answer `401 Requires authentication`, as
+job logs answer `403`. The workflow uploads that log *specifically so a red boot
+lane can be read*, and without credentials nobody can. **Fifteen local runs of
+the same lane did not reproduce it**, so the artifact was the only evidence
+there was.
+
+**Annotation text, however, is free** -- which this repository already knew,
+since `ci-status.sh` has been reading `::notice::` timings that way since
+2026-08-25. The same channel was never pointed at failures.
+
+**So it is now.** `fail()` in both harnesses emits `::error::<text>` under
+Actions, one line with ANSI stripped, and `ci-status.sh` prints failure-level
+annotations whenever `main` is red -- skipping the runner's own
+`Process completed with exit code 1`, which says nothing the result line has not.
+Local output is unchanged, which was checked rather than assumed.
+
+**It reports its own ignorance correctly.** Asked about run 446 it says the run
+*predates* the annotations rather than printing nothing -- the distinction
+between "no gate failed" and "this tool cannot see" being exactly what a
+diagnostic must never blur.
+
+**What this does not do**: help run 446. That specimen is lost, and the next one
+will not be.
 
 ### 2026-08-30 (this file's headline contradicted its own detail for a week)
 
