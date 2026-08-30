@@ -1124,6 +1124,42 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (the two-sources gate: a plausible cause, tested and refuted)
+
+**The RFC 0057 gate fails about 2 boots in 1200**, with `leftover [false,
+false]` and once `by signal 0x103`. Decoded against its own constants
+(`BY_TIMER = 1`, `BY_HAND = 2`, `WOKE = 1 << 8`), `0x103` is a wake carrying
+**both** badges -- and `parks_on_two` says in its own comment that a wait
+returning both *"is not a failure and is worth telling apart"*, while the gate
+counts it as one. Both symptoms are the same event seen twice: **round one's
+deadline fired**, when it is the round the *signal* is supposed to win.
+
+**A plausible cause, found by reading.** Round one arms its deadline
+`60_000_000_000` ahead, and `time::now` is `tsc::read` -- so that is sixty
+billion *cycles*, twenty to sixty seconds at these clocks, the same order as the
+gate's own twenty-second `wait_until`. A "far" deadline that is comparable to
+the test's own duration is exactly the shape of a rare failure.
+
+**Tested, and it is not the cause.** Round one's deadline was shortened to
+**one millisecond** -- thousands of times nearer than it has ever been -- and
+the gate **still passed**. If a deadline that near cannot break it, one at
+twenty seconds cannot either. The hypothesis is refuted, not weakened.
+
+**Kept anyway, for its own reasons and with the claim corrected.** "Far" should
+mean a *time*, not a cycle count, so the value now derives from the calibrated
+rate. The comment says plainly that this does **not** fix the intermittent and
+that a one-millisecond deadline still passes, so the next reader does not spend
+an afternoon on the same idea.
+
+**What is left.** Whatever sets `BY_TIMER` in round one arrives by a route other
+than that deadline expiring. Two candidates worth a look *when someone is
+looking*: a deadline left behind by an earlier park on a recycled notification
+-- `notify::arm` replaces per notification, and this test creates and destroys
+one per round -- or a badge surviving `notify::destroy` into the next round's
+notification. **Neither is investigated**, and the gate stays strict rather than
+being relaxed to accept `0x103`, because a gate loosened on an unexplained
+failure is how a real defect gets normalised.
+
 ### 2026-08-30 ("1 in 7" was one sighting, and 36 runs say so)
 
 **The release note written earlier today listed this defect as "1 in 7

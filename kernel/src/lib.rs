@@ -3065,7 +3065,30 @@ fn two_wake_sources_self_test(cpu: u32, hhdm_base: u64) -> bool {
         }
 
         // Far when a signal is going to win, near when the timer must.
-        let ahead = if by_hand { 60_000_000_000 } else { 2_000_000 };
+        //
+        // **"Far" should mean a *time*, and this used to be a cycle count.**
+        // `time::now` is `tsc::read`, so `60_000_000_000` was sixty billion
+        // *ticks* -- twenty to sixty seconds at these clocks, which is the same
+        // order as this test's own twenty-second `wait_until`. Deriving it from
+        // the calibrated rate removes the guess about the clock; the fallback
+        // covers a machine with no calibration, where a quarter of the range is
+        // still unreachable.
+        //
+        // **It is not the cause of this gate's intermittent failure, and that
+        // was tested rather than assumed.** The gate fails about 2 boots in
+        // 1200 with `leftover [false, false]`, once also reporting
+        // `by signal 0x103` -- a wake carrying *both* badges, which
+        // `parks_on_two` documents as "not a failure" while this gate counts it
+        // as one. Shortening round one's deadline to **one millisecond** --
+        // thousands of times nearer than it has ever been -- still **passes**,
+        // so a deadline that is merely "not far enough" cannot be what fires
+        // it. Whatever sets `BY_TIMER` in round one arrives by another route.
+        // Recorded so the next reader does not spend the afternoon here.
+        let ahead = if by_hand {
+            bhaskix_arch::tsc::from_micros(3_600_000_000).unwrap_or(u64::MAX / 4)
+        } else {
+            2_000_000
+        };
         if notify::arm(notification, time::now().saturating_add(ahead), BY_TIMER).is_err() {
             println!("\x1b[91m    two sources    FAILED: no deadline slot\x1b[0m");
             domain::end(doomed, domain::Ending::Killed);
