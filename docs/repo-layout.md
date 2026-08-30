@@ -22,6 +22,8 @@ bhaskix/
 │   ├── coding-style.md     ← read before your first PR
 │   ├── roadmap.md
 │   ├── release-notes.md
+│   ├── review-guide.md
+│   ├── review/               findings from R6 reviewers
 │   ├── repo-layout.md      you are here
 │   └── rfc/                numbered design proposals; 0000-template.md
 │

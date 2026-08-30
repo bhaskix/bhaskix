@@ -248,6 +248,13 @@ Right now the most valuable contribution is **review of the design documents** �
 [docs/architecture.md](docs/architecture.md) §8. Finding a flaw in a document costs an afternoon.
 Finding the same flaw in Phase 3 costs a year.
 
+**[docs/review-guide.md](docs/review-guide.md) is the packet for that**, and it sizes the ask
+honestly: the design documents are about **44,000 words, roughly 3½ hours**. `TRACKER.md` and the
+RFCs are evidence you may sample, *not* required reading — anyone who says otherwise is quoting a
+number five times too large. A partial review that is honest about its scope is worth having. This
+is release criterion **R6**, unmet since Phase 0, and it needs two people who did not write the
+documents.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [GOVERNANCE.md](GOVERNANCE.md).
 
 **Found a security bug?** Do not open a public issue — see

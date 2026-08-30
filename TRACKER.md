@@ -1124,6 +1124,44 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (R7 written, and R6 made askable)
+
+**R7 is drafted** -- [docs/release-notes.md](docs/release-notes.md). Every
+capability claim points at the gate that proves it, which is the roadmap's rule
+rather than the note's invention, and the figures are measured on the day rather
+than recalled: 119 gates on the BIOS boot lane, 22 and 53 on two shell modes,
+1092 host tests, 42 of 59 RFCs accepted. The gaps get the same prominence as the
+features -- no libc, no self-hosting, an unauthenticated kernel, no signatures,
+**networking never run on physical hardware**, no L1-L4 milestone -- and six
+known defects are listed with their rates rather than left to be discovered. It
+is marked DRAFT because a note shipping three-month-old numbers is making claims
+it has not checked.
+
+**R6 cannot be done here; what could be done is making it askable.** The
+criterion needs two people who did not write the documents, and it has been
+unmet since Phase 0. The obstacle was never willingness -- `README.md` has asked
+for exactly this review for months -- it was that **nobody knew what the ask
+cost**.
+
+**Measured, and the answer changes the question.** The design documents are
+**~44,000 words, about 3.5 hours**. `TRACKER.md` alone is **283,000** and the
+RFCs another **222,000**. A prospective reviewer who assumes R6 means the
+repository is contemplating a forty-hour job and will decline; the honest scope
+is an afternoon.
+
+So [docs/review-guide.md](docs/review-guide.md) states the size per document,
+says plainly that the tracker and RFCs are **evidence to sample, not required
+reading**, gives a suggested order, names the five things worth looking for --
+claims unsupported by evidence, gaps softened, documents contradicting each
+other, a dishonest threat model, a newcomer misled -- and provides
+`docs/review/0000-template.md` for findings, which asks reviewers to record
+**what they did not read**. It says a partial review honestly scoped is worth
+having, and that R6 asks for two *independent* reviews rather than one
+negotiated one.
+
+**This does not satisfy R6 and the row does not claim it does.** It removes the
+reason to say no.
+
 ### 2026-08-30 (both fixes are guards that never fired, and the rate did not move)
 
 **1200 boots on the `Unseen` kernel, checksum identical: 1198 passed.** One ring
