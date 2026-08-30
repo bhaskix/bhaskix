@@ -1347,6 +1347,20 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // 2026-08-29 spent a day finding three times. Silent when zero.
     switched_holding_report();
 
+    // **Wakes that found their sleeper present but not blocked.** The entry is
+    // kept now instead of consumed, so each of these is a wake that would
+    // previously have lost its sleeper for ever. Silent when zero, which is
+    // also the answer to whether the window is real.
+    {
+        let lost = wait::LOST_WAKES.load(core::sync::atomic::Ordering::Relaxed);
+        if lost > 0 {
+            println!(
+                "\x1b[93m    wake retries   {lost} wake(s) found their sleeper present but not \
+                 blocked; the entry was kept for the next waker rather than consumed\x1b[0m"
+            );
+        }
+    }
+
     // Which shell the machine boots to. The user-mode one by default, because
     // it is the one that has to ask permission for everything it does;
     // `shell=kernel` on the command line selects the ring 0 one, which is a

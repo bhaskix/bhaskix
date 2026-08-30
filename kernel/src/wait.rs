@@ -147,6 +147,44 @@ impl Waiters {
     }
 }
 
+/// What becomes of a queue entry after a wake was attempted on it.
+///
+/// **Pure, and on the host, for the reason `sched::waited` is.** `wake_all`
+/// reads the global run queues through `sched::wake`, so the live loop cannot
+/// run in a unit test -- and the decision that matters is not the scan but this
+/// three-way choice. Getting it wrong is not a slow wake, it is a sleeper that
+/// no longer exists as far as the queue is concerned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Fate {
+    /// The wake landed; the entry has done its job and goes.
+    Delivered,
+    /// No queue holds that thread: it exited. The entry can never be woken, and
+    /// keeping it would waste one of very few slots.
+    Stale,
+    /// It is still there and the wake did not take. **Keep the entry** so the
+    /// next waker tries again -- the difference between a delayed wake and a
+    /// lost one.
+    Retained,
+}
+
+/// The choice above, given what the wake attempt found.
+pub(crate) fn fate(woke: bool, still_present: bool) -> Fate {
+    if woke {
+        Fate::Delivered
+    } else if still_present {
+        Fate::Retained
+    } else {
+        Fate::Stale
+    }
+}
+
+/// Wakes that found their thread present but not `Blocked`.
+///
+/// The entry is **kept** when this happens, so a later waker retries. Non-zero
+/// means the window is real and being hit; zero across a soak means the loss
+/// these specimens show comes from somewhere else and this fix is only a guard.
+pub static LOST_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// A queue of threads waiting for a condition.
 pub struct WaitQueue {
     waiters: SpinLock<Waiters>,
@@ -231,10 +269,33 @@ impl WaitQueue {
         {
             let mut waiters = self.waiters.lock();
             for entry in &mut waiters.entries {
-                if let Some(waiter) = entry.take()
-                    && sched::wake(waiter.id)
-                {
-                    woken += 1;
+                let Some(waiter) = *entry else {
+                    continue;
+                };
+                // **The entry is given up only when the wake lands.**
+                //
+                // This used to be `entry.take()` in the same expression as the
+                // wake, so the waiter was removed *whether or not*
+                // `sched::wake` found it. A wake that does not land then loses
+                // the sleeper twice over: it is not runnable, and it is no
+                // longer in the queue for anyone else to find. Nothing wakes it
+                // again, ever.
+                //
+                // That is precisely what five specimens show (2026-08-29/30,
+                // `run-5`, `run-97`, `run-237`, `run-477`, `run-840`): the
+                // sleeping ring station is **the token holder**, so its own
+                // predicate is already true, and the queue holds **zero**
+                // entries. Entry consumed, wake reached nobody.
+                let woke = sched::wake(waiter.id);
+                match fate(woke, sched::is_blocked(waiter.id).is_some()) {
+                    Fate::Delivered => {
+                        *entry = None;
+                        woken += 1;
+                    }
+                    Fate::Stale => *entry = None,
+                    Fate::Retained => {
+                        LOST_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -255,11 +316,23 @@ impl WaitQueue {
             let mut waiters = self.waiters.lock();
             let mut woken = false;
             for entry in &mut waiters.entries {
-                if let Some(waiter) = *entry {
-                    *entry = None;
-                    if sched::wake(waiter.id) {
+                let Some(waiter) = *entry else {
+                    continue;
+                };
+                // Same rule as `wake_all`, and it mattered more here: this
+                // cleared the entry *before* testing the wake and then moved on
+                // to the next one, so a wake that did not land consumed a
+                // sleeper and woke somebody else in its place.
+                let woke = sched::wake(waiter.id);
+                match fate(woke, sched::is_blocked(waiter.id).is_some()) {
+                    Fate::Delivered => {
+                        *entry = None;
                         woken = true;
                         break;
+                    }
+                    Fate::Stale => *entry = None,
+                    Fate::Retained => {
+                        LOST_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -300,6 +373,40 @@ mod tests {
     /// these exercise the list alone -- which is what they are for.
     fn queued(waiters: &Waiters) -> usize {
         waiters.entries.iter().filter(|e| e.is_some()).count()
+    }
+
+    /// A wake that landed gives the entry up; one that did not must not.
+    ///
+    /// This is the rule five specimens were violations of: the sleeping ring
+    /// station was the token holder, its predicate already true, and the queue
+    /// held nothing. Entry consumed, wake reached nobody, and nothing could
+    /// ever find it again.
+    #[test]
+    fn an_entry_is_given_up_only_when_the_wake_landed() {
+        assert_eq!(fate(true, true), Fate::Delivered);
+        assert_eq!(fate(true, false), Fate::Delivered);
+    }
+
+    /// The case the old code got wrong.
+    #[test]
+    fn a_wake_that_did_not_land_keeps_its_entry() {
+        assert_eq!(
+            fate(false, true),
+            Fate::Retained,
+            "the thread is still there and was not woken: dropping the entry \
+             here is how a sleeper stops existing"
+        );
+    }
+
+    /// And the case that argues against simply always keeping it.
+    #[test]
+    fn an_exited_thread_does_not_hold_a_slot_for_ever() {
+        assert_eq!(
+            fate(false, false),
+            Fate::Stale,
+            "no queue holds it, so no wake can ever land: keeping this entry \
+             spends one of very few slots on a thread that is gone"
+        );
     }
 
     #[test]
