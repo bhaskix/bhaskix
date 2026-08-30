@@ -1124,6 +1124,40 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (the gate for it, built rather than left as a note)
+
+The entry below recorded a version-consistency check as *worth doing rather than
+done*, because it wanted a decision about which documents it should police.
+**The decision is made and the gate exists**: `tools/check-doc-versions.py`, in
+`make gates`.
+
+**Source of truth is `rust-toolchain.toml`.** Anything else is a document's
+opinion about the tree.
+
+**It polices tracked Markdown except `TRACKER.md` and `docs/rfc/`.** Both are
+historical records, and an RFC saying what the toolchain was when it was written
+is correct *by not being updated*. Everything else describes the tree as it
+stands, so a stale version there is a false claim rather than a dated one.
+Policing by exclusion rather than by a list, so a document added tomorrow is
+checked without anybody remembering to add it -- a hardcoded list is a gate that
+rots.
+
+**It requires three components.** `Rust 1.98.0` is a claim about what this
+builds with; `Rust 1.97` is usually prose about when something changed, as in
+`arch/x86_64/src/context.rs`, which records the release a lint began rejecting
+something and is still true. Demanding the patch level keeps the check on claims
+and off history -- verified against all three strings rather than assumed.
+
+**Whitespace is collapsed before matching**, because these documents are wrapped
+and `README.md` says `Verified with Rust\n1.98.0` -- one claim across two lines,
+which a naive pattern misses. That is the shape of the bug it is for, so getting
+it wrong would have been fitting and useless.
+
+**Watched red** by restoring the old claim: it fails, names `README.md`, and
+prints what to do. Restored, it passes and reports the three claims it checked,
+so a run that silently policed nothing is distinguishable from one that policed
+something.
+
 ### 2026-08-30 (three documents claimed a Rust version the tree stopped using eight days ago)
 
 **`rust-toolchain.toml` has pinned 1.98.0 since 2026-08-22 (`01eeb29`), and

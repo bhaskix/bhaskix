@@ -815,6 +815,7 @@ gates:
 	tools/check-unsafe-budget.py --self-test
 	tools/check-unsafe-budget.py
 	tools/check-instruction-containment.py
+	tools/check-doc-versions.py
 # And watched refusing one. `architecture.md` §7 claimed for a year that
 # architecture-specific instructions appear only in `arch/` while nothing checked
 # it; the fixture is a crate holding one instruction and declaring no budget,
