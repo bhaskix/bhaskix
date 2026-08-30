@@ -1123,6 +1123,53 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (the wake fix is real and is not the cause; what the station last saw)
+
+**`wake_all` consumed a waiter's entry whether or not the wake landed** --
+`entry.take()` and `sched::wake` in one expression -- so a wake that did not
+land lost the sleeper twice: not runnable, and no longer in the queue for any
+later waker. `wake_one` was worse, clearing the entry *before* testing the wake
+and then waking somebody else in its place. Both are fixed in `1c8e253`: the
+entry is given up only on `Fate::Delivered`, kept on `Retained`, dropped on
+`Stale` when no queue holds the thread at all.
+
+**That is a real hole, and it is demonstrably not what the specimens are.** The
+soak on the fixed kernel produced the same failure at boot 195, identical in
+shape -- `ring-3 asleep, 6038 laps, token 3, 0 sleepers still queued` -- with
+**`wake retries` at zero**. `LOST_WAKES` never incremented, so no wake ever
+failed with its thread present. The wake **landed**, the entry was legitimately
+given up, and the station is `Blocked` anyway with nothing queued.
+
+**The fix earns its place regardless, and that was measured rather than
+asserted.** With one wake in sixty-four forced to fail, the machine **completed
+its boot** and reported `wake retries 3 ... the entry was kept for the next
+waker rather than consumed`. Three sleepers that the old code would have lost
+for ever were delivered by a later waker instead.
+
+**A gap in my own work, closed.** `LOST_WAKES` was committed without ever being
+watched fire -- the exact mistake this file recorded twice the day before. The
+first attempt to prove it failed *every* wake, which broke the machine so
+thoroughly that the boot never reached the report: `boot completed: 0`, the log
+stopping at `spawn retry`. An instrument verified by an injection that kills the
+machine before the report is not verified. The gentler injection is what proved
+it.
+
+**So the next instrument asks what the sleeper saw.** `SEEN_TOKEN` records the
+token value at each predicate evaluation -- *inside* the closure, where the
+decision is made and the queue's lock is held, because anything sampled outside
+it is a different instant. `PREDICATE_EVALS` counts the evaluations. Together
+they separate the remaining stories:
+
+* `seen == id` -- it saw its own turn and blocked regardless, which no reading
+  of `wait_until` permits.
+* `seen != id` with `evals` frozen -- it blocked on a stale view and was never
+  given another look, so a store-then-wake missed it.
+* `seen != id` with `evals` still climbing -- it is waking and re-blocking, and
+  the token is what is wrong rather than the wake.
+
+Watched red by the injection that stops one station retiring: the report prints
+`last saw token N, M predicate evaluations` beside every station.
+
 ### 2026-08-30 (a second 1200 boots: the hypothesis is refuted, and the ring signature is five for five)
 
 **A second 1200-boot run, checksum stable throughout: 1197 passed.** Three

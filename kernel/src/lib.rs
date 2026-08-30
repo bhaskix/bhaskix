@@ -22190,6 +22190,40 @@ static LAPS: [core::sync::atomic::AtomicU64; 4] = [
     core::sync::atomic::AtomicU64::new(0),
 ];
 
+/// What each station's predicate saw the last time it ran, and how often it
+/// has run at all.
+///
+/// **Built because the fix did not fix it.** `wake_all` no longer consumes an
+/// entry whose wake did not land, and the failure came back unchanged on the
+/// very next soak with `LOST_WAKES` at zero -- so the wake *landed*, the entry
+/// was legitimately given up, and the station is asleep anyway with nothing
+/// queued. These two numbers separate the remaining stories:
+///
+/// * `seen == id` -- the predicate saw its own turn and the station blocked
+///   regardless, which no reading of `wait_until` allows.
+/// * `seen != id` and `evals` frozen -- it blocked on a stale view and was
+///   never woken again, so a store-then-wake missed it while its entry was out.
+/// * `seen != id` and `evals` still climbing -- it is waking and re-blocking,
+///   and the token is what is wrong rather than the wake.
+static SEEN_TOKEN: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+];
+
+/// How many times each station's predicate has been evaluated.
+///
+/// Every pass of `wait_until`'s loop evaluates it once, so this counts how
+/// often the station has been given a chance to look -- which is the difference
+/// between "never woken" and "woken and blocked again".
+static PREDICATE_EVALS: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
 /// One station in the ring: sleep until the token arrives, pass it on, repeat.
 ///
 /// Deliberately shaped so that a single lost wakeup stops *everything*. The
@@ -22200,7 +22234,19 @@ extern "C" fn ring_station(id: u64) -> ! {
     use core::sync::atomic::Ordering;
     loop {
         RING.wait_until(|| {
-            TOKEN.load(Ordering::Acquire) == id || PHASE.load(Ordering::Acquire) > PHASE_WAIT
+            let token = TOKEN.load(Ordering::Acquire);
+            let phase = PHASE.load(Ordering::Acquire);
+            // Recorded *inside* the predicate, which is where the decision is
+            // actually made and where the queue's lock is held. Anything
+            // sampled outside it is a different instant and would answer a
+            // question nobody asked.
+            if let Some(slot) = SEEN_TOKEN.get(id as usize) {
+                slot.store(token, Ordering::Relaxed);
+            }
+            if let Some(slot) = PREDICATE_EVALS.get(id as usize) {
+                slot.fetch_add(1, Ordering::Relaxed);
+            }
+            token == id || phase > PHASE_WAIT
         });
 
         if PHASE.load(Ordering::Acquire) > PHASE_WAIT {
@@ -22977,10 +23023,14 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 (false, Some(_)) => "retired",
                 (false, None) => "retired and reaped",
             };
+            let seen = SEEN_TOKEN[id].load(Ordering::Relaxed);
             println!(
-                "\x1b[91m                   {name} (thread {}) {state}, {} laps\x1b[0m",
+                "\x1b[91m                   {name} (thread {}) {state}, {} laps, last saw token \
+                 {}, {} predicate evaluations\x1b[0m",
                 spawned[id],
-                LAPS[id].load(Ordering::Relaxed)
+                LAPS[id].load(Ordering::Relaxed),
+                if seen == u64::MAX { -1 } else { seen as i64 },
+                PREDICATE_EVALS[id].load(Ordering::Relaxed)
             );
         }
         println!(
