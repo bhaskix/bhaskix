@@ -78,6 +78,22 @@ pub mod report {
     /// cost of using it.
     pub const LEND_AT: usize = COPY_AT + 16;
 
+    /// The socket record: closes `bin/ipd` refused, and how many attempts the
+    /// last successful close needed.
+    ///
+    /// **Added because the counter for the first of these already existed and
+    /// nothing read it.** `bin/linuxd` has incremented a `CLOSES_REFUSED`
+    /// since RFC 0058, behind a `closes_refused()` whose own doc comment says
+    /// "for the boot report" — and that function had no caller, so the number
+    /// the adapter kept specifically to make a lost port visible was never
+    /// once printed. Every socket-reclaim failure to date has been silent
+    /// about the one question that separates its two candidate causes.
+    ///
+    /// The second word is there because a retry that succeeds on its last
+    /// attempt and one that succeeds on its first are the same "no failure" to
+    /// every gate, and the difference is the whole margin.
+    pub const SOCKET_AT: usize = LEND_AT + 16;
+
     /// Where bulk staging begins.
     ///
     /// Rounded up to 512 from the end of the records, so the boundary is
@@ -99,7 +115,7 @@ pub mod report {
     pub const PAGE: usize = 4096;
 
     /// Every record ends before the scratch begins.
-    const _: () = assert!(LEND_AT + 16 <= SCRATCH_AT);
+    const _: () = assert!(SOCKET_AT + 16 <= SCRATCH_AT);
     /// And the scratch ends inside the page.
     const _: () = assert!(SCRATCH_AT + SCRATCH_BYTES == PAGE);
     /// The fault log is past the traces, which is what it used to claim and

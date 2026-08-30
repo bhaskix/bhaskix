@@ -4000,6 +4000,45 @@ fn adapter_file_record() -> (i64, i64, u64) {
 /// wrong exec by the time the second one had run, and the gate that compares
 /// this pid against the program's own `getpid` would have failed for a reason
 /// that had nothing to do with the exec.
+/// The adapter's socket record: closes the service refused, and the worst
+/// number of attempts any one close needed.
+///
+/// Read for the reason the exec record is: the counter existed and nothing
+/// printed it, so the failure it was built to explain stayed unexplained.
+fn adapter_socket_record() -> (u64, u64) {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return (0, 0);
+    }
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 2];
+    let mut at = 0usize;
+    const SOCKET_RECORD_BYTE: usize = bhaskix_personality::report::SOCKET_AT;
+    const SOCKET_RECORD_WORD: usize = SOCKET_RECORD_BYTE / 8;
+    // `drain_into` reads from the object's beginning every time, so the words
+    // before this record are walked past rather than resumed -- the same shape
+    // `adapter_exec_record` uses, and the same reason its comment gives.
+    let taken = shared::drain_into(object, SOCKET_RECORD_BYTE + 16, &mut |chunk: &[u8]| {
+        for word in chunk.as_chunks::<8>().0 {
+            if at >= SOCKET_RECORD_WORD + 2 {
+                break;
+            }
+            if at >= SOCKET_RECORD_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - SOCKET_RECORD_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    if taken.is_some() {
+        (record[0], record[1])
+    } else {
+        (0, 0)
+    }
+}
+
 fn adapter_exec_record() -> Option<[u64; 3]> {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
@@ -18770,6 +18809,32 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     }
     if !killed_domain_gives_its_socket_back(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    socket reclaim FAILED\x1b[0m");
+    }
+    // **Immediately after the gate it explains, and not in `kernel_main`.**
+    // The first version of this was up with the other personality reports,
+    // which run before this bring-up thread has started a single hosted
+    // program -- so it would have read an empty record and printed a
+    // reassuring zero on every boot, including the failing ones. That is the
+    // same mistake `report_lending_cost` records making, fifteen lines below,
+    // and the second time in one day it was caught by reading its comment.
+    //
+    // Together these two numbers decide the socket-reclaim defect's two
+    // candidate causes, which no boot could tell apart until now: a port left
+    // held because the adapter's close to `bin/ipd` was refused, or one left
+    // held because the adapter never heard the domain was gone.
+    let (closes_refused, close_attempts) = adapter_socket_record();
+    let forgets_refused = syscall::FORGETS_REFUSED.load(core::sync::atomic::Ordering::Relaxed);
+    if closes_refused != 0 || forgets_refused != 0 {
+        println!(
+            "\x1b[91m    socket close   {closes_refused} closes bin/ipd refused and \
+             {forgets_refused} FORGETs it never received: that many ports are held for the rest \
+             of this boot by programs that do not exist\x1b[0m"
+        );
+    } else if close_attempts != 0 {
+        println!(
+            "    socket close   every close landed; the worst needed {close_attempts} of 4 \
+             attempts, and no FORGET was refused"
+        );
     }
     if !bell_wakes_a_poller(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    datagram wake  FAILED\x1b[0m");

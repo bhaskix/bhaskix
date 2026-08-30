@@ -2577,6 +2577,30 @@ const _: () = {
 /// program that no longer exists.
 static mut CLOSES_REFUSED: u64 = 0;
 
+/// The most attempts any one close has needed, successful or not.
+///
+/// The retry above allows four. This says how much of that budget the machine
+/// has actually used, which is the difference between "the retry is working"
+/// and "the retry is one attempt from not working".
+static mut CLOSE_ATTEMPTS_WORST: u64 = 0;
+
+/// Where the socket record lives in the page the kernel reads.
+const SOCKET_RECORD_AT: u64 = REPORT_AT + report::SOCKET_AT as u64;
+
+/// Publishes both numbers where the boot report can read them.
+///
+/// **This is the wiring that was missing.** `closes_refused` has existed since
+/// RFC 0058 with the doc comment "for the boot report" and no caller, so the
+/// counter kept specifically to make a lost port visible was never printed.
+fn write_socket_record() {
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // at an offset `personality::report` asserts is before the scratch area.
+    unsafe {
+        core::ptr::write_volatile(SOCKET_RECORD_AT as *mut u64, CLOSES_REFUSED);
+        core::ptr::write_volatile((SOCKET_RECORD_AT + 8) as *mut u64, CLOSE_ATTEMPTS_WORST);
+    }
+}
+
 /// How many closes were refused, for the boot report.
 #[must_use]
 pub fn closes_refused() -> u64 {
@@ -2599,7 +2623,9 @@ fn release_socket_slot(slot: u64) {
     // gate asserted about *learning* of the dead domain was true, and the close
     // that followed simply did not land.
     let mut closed = false;
+    let mut attempts = 0u64;
     for _ in 0..4 {
+        attempts += 1;
         if bhaskix_sock::udp::Socket::from_slot(slot, 0)
             .close()
             .is_ok()
@@ -2614,6 +2640,20 @@ fn release_socket_slot(slot: u64) {
         // SAFETY: single-threaded by construction, as `dispositions_of`.
         unsafe { CLOSES_REFUSED += 1 };
     }
+    // **And how hard it was**, which nothing recorded. A close that succeeded
+    // on its fourth attempt and one that succeeded on its first are the same
+    // silence to every gate here, and the difference between them is the
+    // entire margin this retry has. If the failing boots turn out to be
+    // spending all four, the loop is too short; if they are spending one and
+    // failing anyway, the refusal is not congestion and the retry was never
+    // the fix.
+    // SAFETY: as above.
+    unsafe {
+        if attempts > CLOSE_ATTEMPTS_WORST {
+            CLOSE_ATTEMPTS_WORST = attempts;
+        }
+    }
+    write_socket_record();
     let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
     let index = (slot - SOCKET_SLOT) as usize;
     // SAFETY: as `claim_socket_slot`.

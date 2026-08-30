@@ -211,7 +211,16 @@ asm_budget = 3
 # through capability invocations, and the bytes reach it through `COPY_OUT`
 # from an object — so the largest thing this program does to another domain
 # still dereferences nothing belonging to anybody else.
-unsafe_budget = 99
+# 108 for the socket-reclaim hunt, 2026-08-30, and the nine lines buy an
+# answer this program has been unable to give since RFC 0058: two volatile
+# writes publishing the socket record, the accessor pattern around the worst-
+# attempt counter, and the borrows they need. `closes_refused()` has existed
+# since that RFC with the doc comment "for the boot report" and **no caller**,
+# so the counter kept specifically to make a lost port visible was never once
+# printed -- and every socket-reclaim failure has been silent about the single
+# question that separates its two causes. Nine lines to stop a defect being
+# invisible is the cheapest thing in this file.
+unsafe_budget = 108
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

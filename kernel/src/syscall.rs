@@ -2771,6 +2771,17 @@ pub static PARK_UNGRANTED: AtomicU64 = AtomicU64::new(0);
 /// are different faults entirely.
 pub static FORGETS_SENT: AtomicU64 = AtomicU64::new(0);
 
+/// `FORGET` messages the adapter never received.
+///
+/// Attempted minus delivered. [`FORGETS_SENT`] counts the *try* — it is
+/// incremented before the call — so on its own it cannot tell a message that
+/// arrived from one the endpoint refused, and `ipc::call` can refuse with
+/// `Congested`, `Exhausted`, `NoSuchEndpoint` or `ServerGone`.
+///
+/// Non-zero means a killed hosted process's sockets were never released and
+/// its port is held for the rest of the boot by a program that does not exist.
+pub static FORGETS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
 /// Times the datagram bell has been rung — RFC 0058 Part B.
 ///
 /// **Counted rather than peeked.** The first version of this gate read the
@@ -2893,7 +2904,21 @@ fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
         let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
         if held != 0 {
             FORGETS_SENT.fetch_add(1, Ordering::Relaxed);
-            let _ = crate::ipc::call(endpoint, u64::from(domain), FORGET_METHOD, [0; 4]);
+            // **The answer is kept, and this is why.** It was `let _ =`, and
+            // `FORGETS_SENT` is incremented *before* the call — so a `FORGET`
+            // the adapter never received still reported as one sent, and the
+            // reclaim gate's own `forgets 1` meant only "the kernel tried".
+            // Its comment says a reclaim that failed with this at zero and one
+            // with it non-zero "are different faults entirely", which was true
+            // and undecidable at the same time.
+            //
+            // This is the third time in this project an answer thrown away
+            // with `let _ =` has hidden a fault: `bin/linuxd`'s socket close
+            // was the second, and the retry loop that fixed it exists because
+            // of the first.
+            if crate::ipc::call(endpoint, u64::from(domain), FORGET_METHOD, [0; 4]).is_err() {
+                FORGETS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // **And where to find it**, which is no longer computable from the
         // domain id. Sent after the forget, so an adapter that clears its row
