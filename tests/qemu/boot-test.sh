@@ -191,6 +191,50 @@ fail() {
     printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2
     github_annotation "$*"
 }
+# The lines a failing gate printed **under** its verdict, as annotations.
+#
+# A marker names a category and the first line names the fault; neither carries
+# the numbers a gate prints beneath them to explain it. That cost a real
+# specimen: `ci` run 450 caught the ring-station lost wakeup -- roughly a one in
+# twelve hundred event, and the first ever seen off a developer's own host --
+# and the `recent wakes: N landed, M not found, K contended` line that TRACKER
+# §3 says would answer its open question *in one line* died with the runner.
+# The `interactive shell` job uploads no artifact, and job logs and artifacts
+# both need credentials (401 and 403, measured at `c6524ec`). Annotations do
+# not.
+#
+# Deliberately generic rather than a rule about wait queues: any gate that
+# prints indented detail under its verdict gets it carried out, so the next
+# instrument somebody builds is readable on CI without being told about this
+# function. Bounded, because an annotation flood is its own way of hiding an
+# answer.
+#
+# ANSI is stripped **before** the indent is tested: the kernel writes the
+# colour escape first and the spaces after it, so a pattern anchored at the
+# start of the raw line matches nothing. Found by running it against a real
+# report rather than by reading the format string.
+#
+# The indent is measured with `match`, **not** with an interval like
+# `/^[ ]{15,}/`. That was the first spelling, and `mawk` -- which is `awk` on
+# Debian and therefore on the CI runner -- does not implement interval
+# expressions, so the pattern matched nothing at all and this function printed
+# a confident silence. It was caught by running it against a fixture; reading
+# it would not have.
+annotate_failure_detail() {
+    local marker="$1" line
+    [[ "${GITHUB_ACTIONS:-}" == "true" ]] || return 0
+    while IFS= read -r line; do
+        github_annotation "$line"
+    done < <(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | tr -d '\r' | awk -v marker="$marker" '
+        !seen && index($0, marker) { seen = 1; next }
+        seen {
+            first = match($0, /[^ \t]/)
+            if (first > 15) { print; next }
+            exit
+        }
+    ' | head -12)
+}
+
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 
 [[ -f "$ISO" ]] || { fail "$ISO not found -- run 'make iso' first"; exit 1; }
@@ -545,6 +589,7 @@ fi
 for marker in "${FAILURE_MARKERS[@]}"; do
     if grep -qF "$marker" "$LOG"; then
         fail "found failure marker: $marker -- $(grep -m1 -F "$marker" "$LOG" | tr -d '\r' | cut -c1-200)"
+        annotate_failure_detail "$marker"
         status=1
     fi
 done
