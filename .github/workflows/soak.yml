@@ -75,7 +75,7 @@ jobs:
     # limit is six hours; this bounds it at something a human would wait for.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain
 
       - name: Install QEMU, xorriso
@@ -127,7 +127,7 @@ jobs:
         # The whole output of a soak is its logs, and a run that reports "3 of
         # 40 did not finish" without them leaves nothing to look at.
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-logs
           path: soak-logs/

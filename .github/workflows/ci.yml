@@ -29,7 +29,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain   # honours rust-toolchain.toml
       - run: make fmt
 
@@ -43,7 +43,7 @@ jobs:
       # single commit by default, so the tool would compute different dates
       # here than anywhere else and the gate would fail for a reason that has
       # nothing to do with the change under test. It did, on `13a7faf`.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Containment, vendor strings, SPDX, unsafe budgets, dependencies
@@ -55,7 +55,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain
       - run: make clippy
 
@@ -63,7 +63,7 @@ jobs:
     name: host unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain
       - run: make test-host
 
@@ -85,7 +85,7 @@ jobs:
         # given machine.
         cpu: [qemu64, max]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain
 
       - name: Install QEMU, xorriso, OVMF
@@ -152,7 +152,7 @@ jobs:
 
       - name: Upload the boot log and image on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bhaskix-${{ matrix.firmware }}-${{ matrix.cpu }}-failed
           # **The serial log first, because it is the only thing here that
@@ -172,7 +172,7 @@ jobs:
     name: interactive shell
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain
 
       - name: Install QEMU, xorriso
@@ -240,7 +240,7 @@ jobs:
     name: fault injection
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain
 
       - name: Install QEMU, xorriso
